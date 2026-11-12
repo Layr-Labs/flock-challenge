@@ -11842,18 +11842,19 @@ kernel void NAME(                                                       \
 LC_KERNEL(lc_fold_stripes, 4)
 "#;
 
-    /// Supplemental byte-table B4 kernel with a factored 6+2-bit table
+    /// Supplemental byte-table B4 kernel with a factored 5+3-bit table
     /// builder. This lives in its own MSL string/library/PSO so a frontend or
     /// pipeline failure cannot disturb the incumbent `lc_fold_stripes` PSO.
     ///
     /// For one stripe, the incumbent assigns one thread to each byte value
     /// and rebuilds that value as the subset XOR of all eight eq lanes
     /// (1024 lane XORs over the 256-entry table). The factored builder assigns
-    /// 64 threads to a stripe. Thread `h` first builds the subset of eq[0..6)
-    /// selected by the low six bits, then emits the four entries obtained by
-    /// choosing neither/eq6/eq7/both. The stores are disjoint and exhaustive:
-    /// `h`, `h+64`, `h+128`, `h+192`. Explicit common subexpressions make the
-    /// construction 384 lane XORs per stripe independent of backend CSE. It
+    /// 32 threads to a stripe. Thread `h` first builds the subset of eq[0..5)
+    /// selected by the low five bits, then emits the eight entries obtained by
+    /// adding each subset of eq5/eq6/eq7. The stores are disjoint and
+    /// exhaustive: `h + 32 t` for `t < 8`. Explicit common subexpressions make
+    /// the construction 304 lane XORs per stripe (80 + 7 x 32) independent of
+    /// backend CSE. It
     /// retains the incumbent's exact three converged barriers per B4 block
     /// and its 16.5 KiB threadgroup footprint.
     const LC_FACTORED_B4_MSL_SOURCE: &str = r#"
@@ -11915,27 +11916,34 @@ kernel void lc_fold_stripes_factored_b4(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Four stripes x 64 builders exactly occupy the 256-lane group.
-        // For a short final block, stale tables for s >= ns are never read.
-        if (lid < ns * 64u) {
-            uint s = lid >> 6;
-            uint h = lid & 63u;
+        // Four stripes x 32 builders occupy the first 128 lanes; the other
+        // lanes skip the build but still reach every barrier below. For a
+        // short final block, stale tables for s >= ns are never read.
+        if (lid < ns * 32u) {
+            uint s = lid >> 5;
+            uint h = lid & 31u;
             uint eq_base = s * 8u;
-            uint4 l6 = uint4(0u);
+            uint4 lo = uint4(0u);
             uint hm = h;
             while (hm != 0u) {
-                l6 ^= tg_eq[eq_base + ctz(hm)];
+                lo ^= tg_eq[eq_base + ctz(hm)];
                 hm &= hm - 1u;
             }
+            uint4 e5 = tg_eq[eq_base + 5u];
             uint4 e6 = tg_eq[eq_base + 6u];
             uint4 e7 = tg_eq[eq_base + 7u];
-            uint4 l6e6 = l6 ^ e6;
-            uint4 l6e7 = l6 ^ e7;
+            uint4 l5 = lo ^ e5;
+            uint4 l6 = lo ^ e6;
+            uint4 l56 = l5 ^ e6;
             uint tab_base = s * 256u + h;
-            tab[tab_base]        = l6;
-            tab[tab_base + 64u]  = l6e6;
-            tab[tab_base + 128u] = l6e7;
-            tab[tab_base + 192u] = l6e6 ^ e7;
+            tab[tab_base]        = lo;
+            tab[tab_base + 32u]  = l5;
+            tab[tab_base + 64u]  = l6;
+            tab[tab_base + 96u]  = l56;
+            tab[tab_base + 128u] = lo ^ e7;
+            tab[tab_base + 160u] = l5 ^ e7;
+            tab[tab_base + 192u] = l6 ^ e7;
+            tab[tab_base + 224u] = l56 ^ e7;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
