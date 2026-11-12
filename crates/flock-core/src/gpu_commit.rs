@@ -350,6 +350,58 @@ pub(crate) fn gpu_zerocheck_debug() -> bool {
 /// is XOR: associative and commutative, so any claim partition works).
 pub const ENV_NO_GPU_LINCHECK: &str = "FLOCK_NO_GPU_LINCHECK";
 
+/// Lincheck GPU wake (`FLOCK_NO_LC_GPU_WAKE=1`, exact, kills). The GPU sits
+/// idle from the zerocheck round-two arm (~28 ms before zerocheck returns)
+/// to the lincheck prefix fold, long enough to enter its deep idle state:
+/// the prefix then starts ~0.62 ms after submit (mini1, `GPUStartTime` minus
+/// the submit mark; still 0.61-0.64 ms with the CPU held idle after the
+/// submit, so it is GPU wake, not CPU starvation), and nine cores wait
+/// ~0.55-0.65 ms at the drain. Buffers submitted onto a GPU idle for up to
+/// ~3.5 ms start in ~0.1 ms. One 256-thread BLAKE3-leaf threadgroup on a
+/// private 264 KiB scratch pair, committed at zerocheck's first tri pass
+/// (~1.8 ms before the lincheck launch on mini1; `FLOCK_LC_GPU_WAKE_AT`
+/// moves it: tri pass index, 99 = after the tri loop, 100 = zerocheck
+/// return), wakes it: launch-to-start 0.09 ms, drain wait ~0. It touches no
+/// prove buffer, nothing waits on it, and it runs only in timed proves
+/// (after the warmup tuned the split). A gated precommit of the prefix
+/// itself (encodeWaitForEvent on a second queue, opened from the CPU at
+/// launch) does NOT wake the GPU: gate-to-start stayed 0.64 ms; an empty
+/// encoder does not either.
+pub const ENV_NO_LC_GPU_WAKE: &str = "FLOCK_NO_LC_GPU_WAKE";
+
+pub(crate) fn lc_gpu_wake_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var(ENV_NO_LC_GPU_WAKE).is_ok_and(|v| v == "1")
+    });
+    *ON
+}
+
+/// Armed by the prover for the ranked lincheck GPU arm; consumed by the
+/// first [`lc_gpu_wake_fire`] (zerocheck's tail).
+static LC_GPU_WAKE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm (or, with `false`, disarm) the lincheck GPU wake for this prove.
+pub fn lc_gpu_wake_arm(on: bool) {
+    if !on {
+        lc_gpu_wake_fire(100);
+    }
+    LC_GPU_WAKE_ARMED.store(on && lc_gpu_wake_enabled(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Fire the armed lincheck GPU wake (once per arm) at wake point `point`
+/// when it is the configured one (`FLOCK_LC_GPU_WAKE_AT`: zerocheck tri pass
+/// index, `99` = after the tri loop, `100` = zerocheck return).
+pub(crate) fn lc_gpu_wake_fire(point: u32) {
+    static AT: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_LC_GPU_WAKE_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if point != *AT || !LC_GPU_WAKE_ARMED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::lc_gpu_wake();
+}
+
 pub(crate) fn gpu_lincheck_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());
@@ -13504,6 +13556,45 @@ kernel void lc_fold_stripes_factored_b4(
             arm: FoldArm::Zc,
         };
         Some((eq, job, submitted))
+    }
+
+    /// Lincheck GPU wake (see `ENV_NO_LC_GPU_WAKE`): one leaf-kernel
+    /// threadgroup on a private scratch pair, fire-and-forget on the main
+    /// queue. Only once the lincheck split is tuned (timed proves) and only
+    /// while the arm is on.
+    pub(crate) fn lc_gpu_wake() {
+        if !super::gpu_lincheck_enabled() {
+            return;
+        }
+        let arm = FoldArm::Lincheck;
+        let tuned = arm.tuned().load(std::sync::atomic::Ordering::Relaxed);
+        if arm.claim_override().is_none() && (tuned == usize::MAX || tuned == 0) {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        static SCRATCH: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+        let Some((data, tree)) = *SCRATCH.get_or_init(|| unsafe {
+            match (gpu.new_buffer(256 * 1024), gpu.new_buffer(256 * 32)) {
+                (Ok(d), Ok(t)) => Some((d as usize, t as usize)),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            if let Ok(cb) = gpu.command_buffer()
+                && let Ok(enc) = gpu.compute_encoder(cb)
+            {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, data as Id, 0, 0);
+                gpu.set_buffer(enc, tree as Id, 0, 1);
+                gpu.dispatch(enc, 1, 256);
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb);
+            }
+            gpu.pool_pop(pool);
+        }
     }
 
     /// Submit the GPU prefix of the LINCHECK window's witness-stripe fold —
