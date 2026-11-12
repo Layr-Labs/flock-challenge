@@ -54,6 +54,8 @@ static GUEST: std::sync::atomic::AtomicPtr<&'static GuestFn<'static>> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 static GUESTS: AtomicUsize = AtomicUsize::new(0);
 
+const GUEST_MIN_CHUNKS_PER_WORKER: usize = 8;
+
 /// Publishes `guest` for the duration of `body`, then closes the slot and
 /// waits for any guest still inside it before returning (also on unwind).
 fn with_guest_slot<R>(guest: &GuestFn<'_>, body: impl FnOnce() -> R) -> R {
@@ -927,7 +929,7 @@ fn run_chunks_with_helper_arm<F>(
             .with_max_len(1)
             .for_each(|_| worker());
     };
-    match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+    let run = || match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
             let helper_body = || {
@@ -947,6 +949,23 @@ fn run_chunks_with_helper_arm<F>(
             drain_hetero(main_threads, &worker, ep, &helper_body, detached);
         }
         None => drain_main(),
+    };
+    if n_chunks >= GUEST_MIN_CHUNKS_PER_WORKER * main_threads {
+        let guest = |stop: &dyn Fn() -> bool| -> usize {
+            let mut ran = 0usize;
+            while !stop() {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n_chunks {
+                    break;
+                }
+                guard.main_run(|| f(i));
+                ran += 1;
+            }
+            ran
+        };
+        with_guest_slot(&guest, run)
+    } else {
+        run()
     }
 }
 
