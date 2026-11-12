@@ -8320,17 +8320,19 @@ kernel void blake3_pow_scan(
     }
 
     /// Parallel copy out of a raw GPU buffer.
+    ///
     fn copy_bytes_parallel(src: *const u8, dst: &mut [u8]) {
         use rayon::prelude::*;
+        const CHUNK_LOG: usize = 20;
         let src_addr = src as usize;
-        dst.par_chunks_mut(1 << 22)
+        dst.par_chunks_mut(1 << CHUNK_LOG)
             .enumerate()
             .for_each(|(i, chunk)| {
                 // SAFETY: caller guarantees `src` points at least `dst.len()`
                 // bytes; chunks are disjoint.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        (src_addr as *const u8).add(i << 22),
+                        (src_addr as *const u8).add(i << CHUNK_LOG),
                         chunk.as_mut_ptr(),
                         chunk.len(),
                     );
