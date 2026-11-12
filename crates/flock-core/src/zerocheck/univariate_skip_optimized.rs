@@ -1012,6 +1012,7 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
         identity_prefix,
         tail,
         None,
+        None,
     )
 }
 
@@ -1114,6 +1115,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
         identity_prefix,
         tail,
         fused.then_some(producer),
+        None,
     )
 }
 
@@ -1159,7 +1161,76 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
         identity_prefix,
         None,
         None,
+        None,
     )
+}
+
+/// Output backing for repeated exact-tune replays: allocated and zeroed
+/// ONCE (untimed, before the split sweep), then reused by every replay.
+///
+/// The plain replay above takes a scratch buffer per call, finds no
+/// provenance token, and so zero-fills all `2^m / 8` bytes on one thread
+/// before any transform job starts, then stores every dead tail row. The
+/// timed prove's arm does neither (its backing is a token hit, so it skips
+/// the fill and takes the compact store arm). The fill is a single-threaded
+/// 512 MiB memset at the very start of each replay: it delays the replay's
+/// real work by milliseconds and adds a burst of write traffic that the
+/// GPU prefix and the CPU suffix of the graph sample then contend with, so
+/// every sweep sample saw more A/B work left (and more memory traffic) than
+/// the timed commit window does. A backing that every byte of has been
+/// written lets the replay take the timed prove's own store arm: the
+/// replay's output is discarded, so which bytes the compact arm leaves
+/// alone never matters, only that all of them are initialized.
+pub struct ExactTuneBacking(Vec<F128>);
+
+impl ExactTuneBacking {
+    /// Zeroed backing for an `m`-variable A/B replay.
+    pub fn zeroed(m: usize) -> Self {
+        let n = (1usize << m) / 8 / core::mem::size_of::<F128>();
+        let mut v = crate::scratch::take_f128(n);
+        // SAFETY: exclusively owned, `n` F128s long; zero is a valid F128.
+        unsafe { core::ptr::write_bytes(v.as_mut_ptr().cast::<u8>(), 0, n * core::mem::size_of::<F128>()) };
+        Self(v)
+    }
+}
+
+impl Drop for ExactTuneBacking {
+    fn drop(&mut self) {
+        crate::scratch::give_f128(core::mem::take(&mut self.0));
+    }
+}
+
+/// [`precompute_round1_ab_inner_packed_padded_for_exact_tune`] into a
+/// reused, fully initialized [`ExactTuneBacking`], with the timed prove's
+/// store flavor (compact dead-row skip). Returns the backing for the next
+/// replay. The transform output is discarded by every caller.
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune_into(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    backing: ExactTuneBacking,
+) -> ExactTuneBacking {
+    let mut inner = precompute_round1_ab_inner_packed_padded_body(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        ab_compact_store_enabled(),
+        false,
+        identity_prefix,
+        None,
+        None,
+        Some(backing),
+    );
+    ExactTuneBacking(core::mem::take(&mut inner.storage))
 }
 
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
@@ -1180,7 +1251,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 ) -> Round1AbInner {
     precompute_round1_ab_inner_packed_padded_body(
         a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true, identity_prefix,
-        None, None,
+        None, None, None,
     )
 }
 
@@ -1198,6 +1269,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Option<Round1AbProducer<'_>>,
+    backing: Option<ExactTuneBacking>,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -1242,7 +1314,12 @@ fn precompute_round1_ab_inner_packed_padded_body(
     // raw-zero the complete allocation before constructing any reference and
     // force the historical full-store arm for that warmup/fail-safe proof.
     let storage_len = total_bytes / core::mem::size_of::<F128>();
-    let (mut storage, token_hit) = if use_provenance {
+    let (mut storage, token_hit) = if let Some(mut b) = backing {
+        // Fully initialized by construction (`ExactTuneBacking::zeroed`):
+        // treat as a hit so the fill is skipped and the compact arm runs.
+        assert_eq!(b.0.len(), storage_len);
+        (core::mem::take(&mut b.0), true)
+    } else if use_provenance {
         crate::scratch::take_f128_with_token(storage_len, AB_COMPACT_R2_FULL_INIT_TAG)
     } else {
         (crate::scratch::take_f128(storage_len), false)
@@ -1797,21 +1874,43 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             && kernels::aarch64::ab_bstatic_z_enabled()
             && kernels::aarch64::ab_row_setup_hoist_enabled()
         {
-            kernels::aarch64::bstatic_horner_window_rows_hoisted::<{
-                kernels::aarch64::AB_Z_VARIANT
-                    | kernels::aarch64::ABV_INLINE_WINDOW
-                    | kernels::aarch64::ABV_KARA_XOR16
-                    | kernels::aarch64::ABV_BSTATIC_Z
-            }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
+            // Uop cuts on top (same lookups, same bytes): the x^4 Karatsuba
+            // image's per-slot-pair addresses (`FLOCK_NO_ZC_AB_KARA_SLOT`
+            // kills), the z apply's superset-transform index word
+            // (`FLOCK_NO_ZC_AB_Z_MT` kills) and the two-degree Horner carry
+            // fold (`FLOCK_NO_ZC_AB_HORNER2` kills).
+            const V0: u16 = kernels::aarch64::AB_Z_VARIANT
+                | kernels::aarch64::ABV_INLINE_WINDOW
+                | kernels::aarch64::ABV_KARA_XOR16
+                | kernels::aarch64::ABV_BSTATIC_Z;
+            macro_rules! rows {
+                ($v:expr) => {
+                    kernels::aarch64::bstatic_horner_window_rows_hoisted::<{ $v }>(
+                        within_hash_outer,
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        partials,
+                        out_outer,
+                        direct,
+                    )
+                };
+            }
+            // One kill switch drops its piece and keeps the other two; two or
+            // more fall back to the incumbent form.
+            use kernels::aarch64::{ABV_HORNER2, ABV_KARA_SLOT, ABV_Z_MT};
+            match (
+                kernels::aarch64::ab_kara_slot_enabled(),
+                kernels::aarch64::ab_z_mt_enabled(),
+                kernels::aarch64::ab_horner2_enabled(),
+            ) {
+                (true, true, true) => rows!(V0 | ABV_KARA_SLOT | ABV_Z_MT | ABV_HORNER2),
+                (false, true, true) => rows!(V0 | ABV_Z_MT | ABV_HORNER2),
+                (true, false, true) => rows!(V0 | ABV_KARA_SLOT | ABV_HORNER2),
+                (true, true, false) => rows!(V0 | ABV_KARA_SLOT | ABV_Z_MT),
+                _ => rows!(V0),
+            }
         } else if kernels::aarch64::ab_kara_enabled()
             && kernels::aarch64::ab_kara_unscaled_enabled()
             && kernels::aarch64::ab_z_enabled()
@@ -1841,6 +1940,21 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             );
         } else if kernels::aarch64::ab_kara_enabled() {
             kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_ROWS_VARIANT }>(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_hz_helper_enabled() && kernels::aarch64::ab_horner2_enabled() {
+            // The efficiency-core form with the two-degree Horner carry fold
+            // (`FLOCK_NO_ZC_AB_HORNER2` kills; same bytes).
+            kernels::aarch64::bstatic_horner_window_rows::<{
+                kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2
+            }>(
                 within_hash_outer,
                 a_packed,
                 b_packed,
@@ -6677,6 +6791,11 @@ mod tests {
                 for w0 in [true, false] {
                     let (plain, hz) = kernels::aarch64::ab_mixed_row_plain_and_hz(&a, &b, &table, base, w0);
                     assert_eq!(hz, plain, "trial={trial} base={base} w0={w0}");
+                    let (incumbent, slot_mt) = kernels::aarch64::ab_mixed_row_incumbent_and_slot_mt(&a, &b, &table, base, w0);
+                    assert_eq!(slot_mt, incumbent, "slot+mt: trial={trial} base={base} w0={w0}");
+                    if !w0 || trial % 4 == 1 {
+                        assert_eq!(incumbent, plain, "incumbent z form: trial={trial} base={base} w0={w0}");
+                    }
                 }
             }
         }
@@ -6835,14 +6954,21 @@ mod tests {
                         check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16);
                         check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z);
                         check!(kernels::aarch64::AB_Z_VARIANT | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z | kernels::aarch64::ABV_KARA_SCALED_UNSCALED);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z | kernels::aarch64::ABV_KARA_SLOT);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z | kernels::aarch64::ABV_Z_MT);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z | kernels::aarch64::ABV_KARA_SLOT | kernels::aarch64::ABV_Z_MT);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z | kernels::aarch64::ABV_HORNER2);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z | kernels::aarch64::ABV_KARA_SLOT | kernels::aarch64::ABV_Z_MT | kernels::aarch64::ABV_HORNER2);
                         check!(kernels::aarch64::ABV_HZ);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW | ABV_INLINE_WINDOW);
+                        check!(kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2);
                     }
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 20);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 27);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
@@ -7019,6 +7145,99 @@ mod tests {
             eprintln!(
                 "[ab-kara-timing] {:2} {:32} min {:.3} p25 {:.3} median {:.3} ns per row, checksum {:016x}",
                 pick[form], forms[form].0, t[0], t[6], t[12], sums[form]
+            );
+        }
+    }
+
+    /// Local timing probe of the production static-B window form (hoisted
+    /// bounds check) against candidate variant bits on top of it (not a
+    /// correctness test; the forms' checksums must agree). Same harness as
+    /// [`ab_kara_rows_timing`]. `FLOCK_PROBE_FORMS=0,1` picks forms.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "timing probe"]
+    fn ab_rows_variant_timing() {
+        use kernels::aarch64::{
+            bstatic_horner_window_rows_impl as imp, AB_Z_VARIANT, ABV_BSTATIC_Z, ABV_INLINE_WINDOW,
+            ABV_KARA_SCALED_UNSCALED, ABV_KARA_SLOT, ABV_KARA_XOR16, ABV_Z_MT,
+        };
+        const V0: u16 = AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 | ABV_BSTATIC_Z;
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xB57A_71C0_7131_0005);
+        let context =
+            kernels::aarch64::prepare_static_b_context_with_policy(&table, true, false, false)
+                .expect("enabled static-B context");
+        let kernels::aarch64::StaticBContext::Prepared { partials, .. } = context else {
+            unreachable!("prepared static-B context");
+        };
+        const CHUNKS: usize = 64;
+        let a_packed: Vec<u8> =
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+        let mut b: Vec<u8> =
+            (0..CHUNKS * 2048 + 64).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
+        for c in 0..CHUNKS {
+            for w in 0..2usize {
+                let (lo, hi) = kernels::aarch64::BSTATIC_HORNER_WINDOW_ROWS[w];
+                for b_med in lo..hi {
+                    let blk = w * (1 << N_MEDIUM) + b_med;
+                    for k in 0..N_CHUNKS {
+                        let off = c * 2048 + w * 1024 + b_med * N_CHUNKS * 8 + k * N_CHUNKS;
+                        let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                        let word = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                        b[off..off + 8].copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                    }
+                }
+            }
+        }
+        let mut out = vec![0u8; 16 * 64];
+        const REPS: usize = 40;
+        type RowsFn = fn(usize, &[u8], &[u8], &InvNttTableByteSingleGf8, usize, &'static [[u8; 64]; 248], &mut [u8], bool);
+        let all: Vec<(&str, RowsFn)> = vec![
+            ("production (hoisted)", imp::<{ V0 }, true>),
+            ("+ x4 Kara unscaled", imp::<{ V0 | ABV_KARA_SCALED_UNSCALED }, true>),
+            ("+ KARA_SLOT", imp::<{ V0 | ABV_KARA_SLOT }, true>),
+            ("+ Z_MT", imp::<{ V0 | ABV_Z_MT }, true>),
+            ("+ KARA_SLOT + Z_MT", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT }, true>),
+            ("+ HORNER2", imp::<{ V0 | kernels::aarch64::ABV_HORNER2 }, true>),
+            ("+ KARA_SLOT + Z_MT + HORNER2", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT | kernels::aarch64::ABV_HORNER2 }, true>),
+            ("E-core HZ", imp::<{ kernels::aarch64::AB_HZ_VARIANT }, false>),
+            ("E-core HZ + HORNER2", imp::<{ kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2 }, false>),
+        ];
+        let pick: Vec<usize> = std::env::var("FLOCK_PROBE_FORMS")
+            .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+            .unwrap_or_else(|_| (0..all.len()).collect());
+        let forms: Vec<(&str, RowsFn)> = pick.iter().map(|&i| all[i]).collect();
+        let f = forms.len();
+        let mut times: Vec<Vec<f64>> = vec![Vec::new(); f];
+        let mut sums = vec![0u64; f];
+        for round in 0..41 {
+            for k in 0..f {
+                let form = (k + round) % f;
+                let run = forms[form].1;
+                let mut sum = 0u64;
+                let t0 = std::time::Instant::now();
+                for _ in 0..REPS {
+                    for c in 0..CHUNKS {
+                        for w in 0..2usize {
+                            let base = c * 2048 + w * 1024;
+                            run(w, &a_packed, &b, &table, base, partials, &mut out, false);
+                            sum = sum.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                ^ u64::from_le_bytes(out[5 * 64..5 * 64 + 8].try_into().unwrap());
+                        }
+                    }
+                }
+                if round > 0 {
+                    times[form].push(t0.elapsed().as_secs_f64() * 1e9 / (REPS * CHUNKS * 26) as f64);
+                }
+                sums[form] = sum;
+            }
+        }
+        assert!(sums.iter().all(|&x| x == sums[0]), "forms disagree");
+        for (form, t) in times.iter_mut().enumerate() {
+            t.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            eprintln!(
+                "[ab-v-timing] {:2} {:32} min {:.3} p25 {:.3} median {:.3} ns per row, checksum {:016x}",
+                pick[form], forms[form].0, t[0], t[10], t[20], sums[form]
             );
         }
     }
