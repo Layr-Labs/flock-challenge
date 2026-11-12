@@ -1012,6 +1012,7 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
         identity_prefix,
         tail,
         None,
+        None,
     )
 }
 
@@ -1114,6 +1115,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
         identity_prefix,
         tail,
         fused.then_some(producer),
+        None,
     )
 }
 
@@ -1159,7 +1161,76 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
         identity_prefix,
         None,
         None,
+        None,
     )
+}
+
+/// Output backing for repeated exact-tune replays: allocated and zeroed
+/// ONCE (untimed, before the split sweep), then reused by every replay.
+///
+/// The plain replay above takes a scratch buffer per call, finds no
+/// provenance token, and so zero-fills all `2^m / 8` bytes on one thread
+/// before any transform job starts, then stores every dead tail row. The
+/// timed prove's arm does neither (its backing is a token hit, so it skips
+/// the fill and takes the compact store arm). The fill is a single-threaded
+/// 512 MiB memset at the very start of each replay: it delays the replay's
+/// real work by milliseconds and adds a burst of write traffic that the
+/// GPU prefix and the CPU suffix of the graph sample then contend with, so
+/// every sweep sample saw more A/B work left (and more memory traffic) than
+/// the timed commit window does. A backing that every byte of has been
+/// written lets the replay take the timed prove's own store arm: the
+/// replay's output is discarded, so which bytes the compact arm leaves
+/// alone never matters, only that all of them are initialized.
+pub struct ExactTuneBacking(Vec<F128>);
+
+impl ExactTuneBacking {
+    /// Zeroed backing for an `m`-variable A/B replay.
+    pub fn zeroed(m: usize) -> Self {
+        let n = (1usize << m) / 8 / core::mem::size_of::<F128>();
+        let mut v = crate::scratch::take_f128(n);
+        // SAFETY: exclusively owned, `n` F128s long; zero is a valid F128.
+        unsafe { core::ptr::write_bytes(v.as_mut_ptr().cast::<u8>(), 0, n * core::mem::size_of::<F128>()) };
+        Self(v)
+    }
+}
+
+impl Drop for ExactTuneBacking {
+    fn drop(&mut self) {
+        crate::scratch::give_f128(core::mem::take(&mut self.0));
+    }
+}
+
+/// [`precompute_round1_ab_inner_packed_padded_for_exact_tune`] into a
+/// reused, fully initialized [`ExactTuneBacking`], with the timed prove's
+/// store flavor (compact dead-row skip). Returns the backing for the next
+/// replay. The transform output is discarded by every caller.
+#[allow(clippy::too_many_arguments)]
+pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune_into(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    backing: ExactTuneBacking,
+) -> ExactTuneBacking {
+    let mut inner = precompute_round1_ab_inner_packed_padded_body(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        ab_pre_nt_enabled(),
+        ab_compact_store_enabled(),
+        false,
+        identity_prefix,
+        None,
+        None,
+        Some(backing),
+    );
+    ExactTuneBacking(core::mem::take(&mut inner.storage))
 }
 
 /// Store-flavor-parameterized body; the public wrapper passes the latched env
@@ -1180,7 +1251,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 ) -> Round1AbInner {
     precompute_round1_ab_inner_packed_padded_body(
         a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true, identity_prefix,
-        None, None,
+        None, None, None,
     )
 }
 
@@ -1198,6 +1269,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Option<Round1AbProducer<'_>>,
+    backing: Option<ExactTuneBacking>,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -1242,7 +1314,12 @@ fn precompute_round1_ab_inner_packed_padded_body(
     // raw-zero the complete allocation before constructing any reference and
     // force the historical full-store arm for that warmup/fail-safe proof.
     let storage_len = total_bytes / core::mem::size_of::<F128>();
-    let (mut storage, token_hit) = if use_provenance {
+    let (mut storage, token_hit) = if let Some(mut b) = backing {
+        // Fully initialized by construction (`ExactTuneBacking::zeroed`):
+        // treat as a hit so the fill is skipped and the compact arm runs.
+        assert_eq!(b.0.len(), storage_len);
+        (core::mem::take(&mut b.0), true)
+    } else if use_provenance {
         crate::scratch::take_f128_with_token(storage_len, AB_COMPACT_R2_FULL_INIT_TAG)
     } else {
         (crate::scratch::take_f128(storage_len), false)
