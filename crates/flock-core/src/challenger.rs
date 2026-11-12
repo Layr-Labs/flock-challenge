@@ -610,6 +610,9 @@ impl Challenger for FsChallenger {
                     // high-cost ranked dispatch sizes in both orders on this
                     // transcript state.  Fixed windows remove the warm seed's
                     // random first-hit distance from the admission decision.
+                    // Compile any lazily built grind pipeline outside the
+                    // timed calibration draws.
+                    crate::gpu_commit::gpu_pow_prepare();
                     let cpu_1_started = std::time::Instant::now();
                     let cpu_1 = cpu_gpu_grind_calibration(&state_digest);
                     let cpu_1_time = cpu_1_started.elapsed();
@@ -771,6 +774,11 @@ static GPU_GRIND_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// production search it intentionally drains every chunk, making runtime
 /// independent of the first matching nonce while retaining the same P+E-core
 /// hash kernel and queue shape.
+#[cfg(test)]
+pub(crate) fn cpu_pow_window_for_test(state_digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<u64> {
+    cpu_blake3_pow_window(state_digest, start, len, bits)
+}
+
 fn cpu_blake3_pow_window(state_digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<u64> {
     cpu_blake3_pow_window_inner(state_digest, start, len, bits, None)
 }
@@ -1170,7 +1178,8 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                     );
                 }
                 // The abandoned GPU scan finishes on its worker; its result
-                // goes to the dropped receiver.
+                // goes to the dropped receiver. Retire it early.
+                crate::gpu_commit::gpu_pow_abort();
                 drop(done_rx);
                 return Ok(n);
             }
