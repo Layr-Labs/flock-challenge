@@ -44,25 +44,6 @@ pub(crate) fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     unsafe { aarch64::round0(witness, basis) }
 }
 
-/// [`round0`] over `(witness, basis + delta)`: stores `basis[i] += delta(i)`
-/// (called once per slot, in slot order) and returns the round-zero message
-/// of the updated basis from the same deferred-reduction streams, without a
-/// second pass over the completed basis. Bit-identical to the update loop
-/// followed by [`round0`].
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline]
-pub(crate) fn round0_add_basis<D: FnMut(usize) -> F128>(
-    witness: &[F128],
-    basis: &mut [F128],
-    delta: D,
-) -> (F128, F128) {
-    assert_eq!(witness.len(), basis.len());
-    assert!(witness.len().is_multiple_of(2));
-    // SAFETY: the cfg gate supplies PMULL through `aes`; the checks above are
-    // the complete slice-shape contract of the architecture kernel.
-    unsafe { aarch64::round0_add_basis(witness, basis, delta) }
-}
-
 /// Accumulate the two sufficient statistics for a factorized LSB equality
 /// basis:
 ///

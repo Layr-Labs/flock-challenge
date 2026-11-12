@@ -3059,8 +3059,8 @@ fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
     let n_lo = n_lo_and_inner - N_INNER;
     let n_banks = 1usize << bank_bits;
     let bank_mask = n_banks - 1;
-    // First-touch stores need the range to open with every bank exactly once.
-    let store_first = lo_range.start == 0 && lo_range.end >= n_banks;
+    let range_start = lo_range.start;
+    let store_first = lo_range.len() >= n_banks;
     let unscaled = zc_ab_unscaled_enabled();
     let seeded = zc_ab_seeded_enabled();
     if !store_first {
@@ -3071,7 +3071,7 @@ fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
-        let first_touch = store_first && x_outer_lo < n_banks;
+        let first_touch = store_first && x_outer_lo - range_start < n_banks;
         let w = x_outer_lo >> bank_bits;
         let u = x_outer_lo & bank_mask;
         let bank: &mut [F128; ELL] = (&mut banks[u * ELL..(u + 1) * ELL])
