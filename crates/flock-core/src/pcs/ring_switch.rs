@@ -2083,19 +2083,32 @@ fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128]
             *gb = fold_one_slot(e_b * e_hi, base);
         }
     }
-    // Per byte position: subset-sum doubling over that byte's 8 generators.
-    // Every entry is written exactly once (t[0] = 0, then each doubling round
-    // writes the upper half from the lower).
     for k in 0..FOLD_N_BYTES {
-        let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
-        t[0] = F128::ZERO;
-        for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
-            let half = 1usize << bit;
-            for v in 0..half {
-                t[v + half] = t[v] + gv;
+        let t: &mut [F128; FOLD_TABLE_SIZE] = (&mut out
+            [k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE])
+            .try_into()
+            .unwrap();
+        let gk: &[F128; 8] = g[k * 8..k * 8 + 8].try_into().unwrap();
+        let lo = nibble_subset_sums([gk[0], gk[1], gk[2], gk[3]]);
+        let hi = nibble_subset_sums([gk[4], gk[5], gk[6], gk[7]]);
+        for (row, &h) in t.chunks_exact_mut(16).zip(hi.iter()) {
+            for (entry, &l) in row.iter_mut().zip(lo.iter()) {
+                *entry = h + l;
             }
         }
     }
+}
+
+#[inline(always)]
+fn nibble_subset_sums(g: [F128; 4]) -> [F128; 16] {
+    let mut s = [F128::ZERO; 16];
+    for (bit, &gv) in g.iter().enumerate() {
+        let half = 1usize << bit;
+        for v in 0..half {
+            s[v + half] = s[v] + gv;
+        }
+    }
+    s
 }
 /// Encode `x ↦ Σ_d fold_weight[d] · Φ(low_eq[d]·x)` as a byte table,
 /// where `base` encodes the γ-baked linear map `Φ`.
