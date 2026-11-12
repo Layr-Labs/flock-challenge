@@ -3125,8 +3125,6 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
 
 /// Number of trailing AB-completion chunks claimed as two half-ranges
 /// (`FLOCK_NO_ZC_AB_TAIL_SPLIT=1` → 0; `FLOCK_ZC_AB_TAIL_SPLIT_N=<n>` tunes,
-/// default 16). Zero unless the low range splits evenly into halves that
-/// each still cover every bank.
 fn ab_tail_split_chunks(hi_size: usize, big_lo_size: usize, n_banks: usize) -> usize {
     static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         if std::env::var_os("FLOCK_NO_ZC_AB_TAIL_SPLIT").is_some() {
@@ -3135,7 +3133,7 @@ fn ab_tail_split_chunks(hi_size: usize, big_lo_size: usize, n_banks: usize) -> u
         std::env::var("FLOCK_ZC_AB_TAIL_SPLIT_N")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(16)
+            .unwrap_or(24)
     });
     if big_lo_size % 2 != 0 || big_lo_size / 2 < n_banks {
         return 0;
