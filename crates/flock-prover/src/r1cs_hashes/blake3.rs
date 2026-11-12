@@ -4011,7 +4011,8 @@ pub(crate) mod witgen_simd {
             // Tail band of 64 gps keeps 8 hetero slabs (WITGEN_HETERO_SLAB =
             // 64 jobs) so its drain still parallelizes across the pool.
             const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
-            const TAPERED_SCHEDULE: &[usize] = &[512, 512, 512, 512, 512, 512, 512, 448, 64];
+            const TAPERED_SCHEDULE: &[usize] =
+                &[64, 448, 512, 512, 512, 512, 512, 512, 448, 64];
             // A/B-CONTROL: set to `false` for the official-harness control
             // build. The env kill switch exists for same-binary diagnostics.
             const STREAM_TAPER_DEFAULT: bool = true;
