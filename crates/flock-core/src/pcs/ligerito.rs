@@ -6138,7 +6138,7 @@ fn fold_and_msg_lsb_into(
     }
     let one_plus_r = F128::ONE + r;
 
-    const PAR_THRESHOLD: usize = 4096;
+    const PAR_THRESHOLD: usize = 8192;
     if half < PAR_THRESHOLD {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         if half >= 2 && half.is_multiple_of(2) && small_fold_neon_enabled() {
