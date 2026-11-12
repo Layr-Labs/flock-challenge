@@ -1040,6 +1040,7 @@ fn cpu_race_scan(
     const CHUNK: u64 = 960;
     const PENDING: u64 = u64::MAX;
     const NO_MATCH: u64 = u64::MAX - 1;
+    const FINE_SUB: u64 = 96;
     let block: u64 = 1 << (bits.min(24) + 1);
     let n_chunks = usize::try_from(block.div_ceil(CHUNK)).ok()?;
     let mut start = 0u64;
@@ -1058,18 +1059,32 @@ fn cpu_race_scan(
             if c >= n_chunks || c >= bound.load(Ordering::Relaxed) {
                 break;
             }
-            match pow_scan(
-                state_digest,
-                start.saturating_add(c as u64 * CHUNK),
-                CHUNK,
-                bits,
-                HashKind::Blake3,
-            ) {
-                Some(n) => {
+            let base = start.saturating_add(c as u64 * CHUNK);
+            let found = {
+                let mut off = 0u64;
+                loop {
+                    if off >= CHUNK {
+                        break Some(None);
+                    }
+                    if off > 0 && stop.load(Ordering::Relaxed) {
+                        break None;
+                    }
+                    let len = FINE_SUB.min(CHUNK - off);
+                    if let Some(n) =
+                        pow_scan(state_digest, base.saturating_add(off), len, bits, HashKind::Blake3)
+                    {
+                        break Some(Some(n));
+                    }
+                    off += len;
+                }
+            };
+            match found {
+                Some(Some(n)) => {
                     results[c].store(n, Ordering::Release);
                     bound.fetch_min(c, Ordering::Relaxed);
                 }
-                None => results[c].store(NO_MATCH, Ordering::Release),
+                Some(None) => results[c].store(NO_MATCH, Ordering::Release),
+                None => break,
             }
         };
         let main_threads = rayon::current_num_threads();
