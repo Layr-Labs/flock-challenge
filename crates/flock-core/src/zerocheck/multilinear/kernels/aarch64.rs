@@ -1392,6 +1392,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 /// `[a0^a1, 0] == [a0^a1, b0^b1]` delta), so the compact state produced by
 /// the lookahead kernel is byte-identical to the incumbent's.
 ///
+/// The delta pair goes out from the general registers with one `STP`
+/// ([`store_delta_pair_gpr`], as the Horner kernel already does) instead of a
+/// `[u64; 2]` -> q transmute + `vst1q_u64`: the same 16 little-endian bytes.
+///
 /// Returns the four folded rows plus whether the b≡1 shortcut was taken.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -1458,17 +1462,14 @@ unsafe fn r2_pair_fold_and_store(
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
-            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+            store_delta_a_only_gpr(deltas.add(x_lo * 16), a0_code, a1_code);
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        let delta_pair =
-            core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, b0_code ^ b1_code]);
-        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+        store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
         (a0, a1, b0, b1, false)
     }
 }
@@ -1846,6 +1847,24 @@ unsafe fn store_delta_pair_gpr(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64)
             b1 = in(reg) b1,
             ta = out(reg) _,
             tb = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// [`store_delta_pair_gpr`] for a degenerate (`b == 1`) pair, whose delta is
+/// `[a0 ^ a1, 0]`: the zero half is `XZR`, so no register or `MOVI` is needed.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_a_only_gpr(dst: *mut u8, a0: u64, a1: u64) {
+    unsafe {
+        core::arch::asm!(
+            "eor {ta}, {a0}, {a1}",
+            "stp {ta}, xzr, [{dst}]",
+            dst = in(reg) dst,
+            a0 = in(reg) a0,
+            a1 = in(reg) a1,
+            ta = out(reg) _,
             options(nostack, preserves_flags),
         );
     }
