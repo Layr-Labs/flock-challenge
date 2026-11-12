@@ -11854,8 +11854,9 @@ LC_KERNEL(lc_fold_stripes, 4)
     /// choosing neither/eq6/eq7/both. The stores are disjoint and exhaustive:
     /// `h`, `h+64`, `h+128`, `h+192`. Explicit common subexpressions make the
     /// construction 384 lane XORs per stripe independent of backend CSE. It
-    /// retains the incumbent's exact three converged barriers per B4 block
-    /// and its 16.5 KiB threadgroup footprint.
+    /// uses two converged barriers to protect table reuse and publication.
+    /// Equality generators are read directly from the immutable device buffer;
+    /// the threadgroup footprint is the 16 KiB table.
     const LC_FACTORED_B4_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -11884,7 +11885,6 @@ kernel void lc_fold_stripes_factored_b4(
     uint lid  [[thread_position_in_threadgroup]])
 {
     constexpr uint B = 4u;
-    threadgroup uint4 tg_eq[B * 8u];
     threadgroup uint4 tab[B * 256u];
 
     uint chunk  = tgid / p.i_groups;
@@ -11910,25 +11910,23 @@ kernel void lc_fold_stripes_factored_b4(
         // All lanes rendezvous before the next block reuses tables that the
         // previous block's lookups may still be reading.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lid < ns * 8u) {
-            tg_eq[lid] = eq[sb * 8u + lid];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Equality generators are immutable for this dispatch; direct reads
+        // remove their staging array and producer-consumer barrier.
 
         // Four stripes x 64 builders exactly occupy the 256-lane group.
         // For a short final block, stale tables for s >= ns are never read.
         if (lid < ns * 64u) {
             uint s = lid >> 6;
             uint h = lid & 63u;
-            uint eq_base = s * 8u;
+            uint eq_base = (sb + s) * 8u;
             uint4 l6 = uint4(0u);
             uint hm = h;
             while (hm != 0u) {
-                l6 ^= tg_eq[eq_base + ctz(hm)];
+                l6 ^= eq[eq_base + ctz(hm)];
                 hm &= hm - 1u;
             }
-            uint4 e6 = tg_eq[eq_base + 6u];
-            uint4 e7 = tg_eq[eq_base + 7u];
+            uint4 e6 = eq[eq_base + 6u];
+            uint4 e7 = eq[eq_base + 7u];
             uint4 l6e6 = l6 ^ e6;
             uint4 l6e7 = l6 ^ e7;
             uint tab_base = s * 256u + h;
