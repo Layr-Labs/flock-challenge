@@ -44,6 +44,77 @@ use std::sync::{Arc, OnceLock};
 
 use rayon::prelude::*;
 
+/// Guest claim loop of the main-pool chunk queue currently draining (if any),
+/// so a pool worker that is blocked on something else (the commit arm waiting
+/// on the GPU first pass) can claim chunks one at a time and hand itself back
+/// the moment its own condition holds. Published only by the first drain to
+/// claim the slot; `GUESTS` is the hazard count that makes closing safe.
+type GuestFn<'a> = dyn Fn(&dyn Fn() -> bool) -> usize + Sync + 'a;
+static GUEST: std::sync::atomic::AtomicPtr<&'static GuestFn<'static>> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static GUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Publishes `guest` for the duration of `body`, then closes the slot and
+/// waits for any guest still inside it before returning (also on unwind).
+fn with_guest_slot<R>(guest: &GuestFn<'_>, body: impl FnOnce() -> R) -> R {
+    // SAFETY: lifetime erased only while published; `Close` unpublishes and
+    // waits for every guest to leave before `guest`'s borrow ends.
+    let erased: &'static GuestFn<'static> =
+        unsafe { std::mem::transmute::<&GuestFn<'_>, &'static GuestFn<'static>>(guest) };
+    let cell: &&'static GuestFn<'static> = &erased;
+    let ptr = cell as *const &'static GuestFn<'static> as *mut &'static GuestFn<'static>;
+    let published = GUEST
+        .compare_exchange(std::ptr::null_mut(), ptr, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+    struct Close(bool, *mut &'static GuestFn<'static>);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            if self.0 {
+                let _ = GUEST.compare_exchange(self.1, std::ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst);
+                while GUESTS.load(Ordering::SeqCst) != 0 {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+    let _close = Close(published, ptr);
+    body()
+}
+
+/// Claim chunks of the currently draining main-pool queue on this thread
+/// until `done()` holds or the queue is empty; returns the chunks run. When
+/// no queue is draining yet it polls for up to `wait_for_queue`. Callers then
+/// perform their ordinary (exact) wait. No-op when `enabled` is false.
+pub(crate) fn help_guest_until(
+    enabled: bool,
+    wait_for_queue: std::time::Duration,
+    done: &dyn Fn() -> bool,
+) -> usize {
+    if !enabled {
+        return 0;
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if done() {
+            return 0;
+        }
+        GUESTS.fetch_add(1, Ordering::SeqCst);
+        let p = GUEST.load(Ordering::SeqCst);
+        if !p.is_null() {
+            // SAFETY: the publisher cannot return while GUESTS > 0 and it
+            // unpublishes (SeqCst) before checking GUESTS.
+            let ran = unsafe { (**p)(done) };
+            GUESTS.fetch_sub(1, Ordering::SeqCst);
+            return ran;
+        }
+        GUESTS.fetch_sub(1, Ordering::SeqCst);
+        if started.elapsed() >= wait_for_queue {
+            return 0;
+        }
+        std::hint::spin_loop();
+    }
+}
+
 /// Logical efficiency-core count on Apple Silicon macOS, else 0.
 ///
 /// Queries `hw.perflevel1.logicalcpu` through the `sysctlbyname` *syscall* —
@@ -959,7 +1030,22 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
             .with_max_len(1)
             .for_each(|_| worker());
     };
-    match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+    // Guest claim loop (see `help_guest_until`): same queue, same chunk
+    // function, one chunk per stop check, no tail.
+    let guest = |stop: &dyn Fn() -> bool| -> usize {
+        let mut state = init();
+        let mut ran = 0usize;
+        while !stop() {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            guard.main_run(|| f(&mut state, i));
+            ran += 1;
+        }
+        ran
+    };
+    with_guest_slot(&guest, || match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
             let helper_body = || {
@@ -980,7 +1066,7 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
             drain_hetero(main_threads, &worker, ep, &helper_body, detached);
         }
         None => drain_main(),
-    }
+    })
 }
 
 /// `Send + Sync` wrapper for a raw base pointer shared across the two pools.
@@ -1012,6 +1098,56 @@ unsafe impl<T> Sync for SyncPtr<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest claims chunks of the draining queue one at a time, returns as
+    /// soon as its own condition holds, and every chunk still runs exactly
+    /// once; with no queue draining it gives up after its poll budget.
+    #[test]
+    fn help_guest_until_returns_early_and_keeps_every_chunk_once() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
+        let n = 4096;
+        let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let flag = AtomicBool::new(false);
+        let guest_ran = AtomicUsize::new(0);
+        let left_at = AtomicUsize::new(usize::MAX);
+        let done_chunks = AtomicUsize::new(0);
+        pool.install(|| {
+            rayon::join(
+                || {
+                    let ran = help_guest_until(true, std::time::Duration::from_secs(5), &|| {
+                        flag.load(Ordering::Acquire)
+                    });
+                    guest_ran.store(ran, Ordering::Release);
+                    left_at.store(done_chunks.load(Ordering::Acquire), Ordering::Release);
+                },
+                || {
+                    run_chunks_with_helper_stateful_arm_tail(
+                        n,
+                        &|| (),
+                        &|_: &mut (), i| {
+                            counts[i].fetch_add(1, Ordering::Relaxed);
+                            if i == 256 {
+                                flag.store(true, Ordering::Release);
+                            }
+                            std::thread::sleep(std::time::Duration::from_micros(20));
+                            done_chunks.fetch_add(1, Ordering::AcqRel);
+                        },
+                        None,
+                        false,
+                        None,
+                    );
+                },
+            );
+        });
+        assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+        assert!(guest_ran.load(Ordering::Relaxed) > 0, "guest never joined the queue");
+        assert!(left_at.load(Ordering::Relaxed) < n, "guest stayed until the queue drained");
+        // Disabled, or nothing draining: no chunks, bounded wait.
+        assert_eq!(help_guest_until(false, std::time::Duration::from_secs(5), &|| false), 0);
+        let t = std::time::Instant::now();
+        assert_eq!(help_guest_until(true, std::time::Duration::from_millis(5), &|| false), 0);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     /// Every chunk index is executed exactly once when both pools drain the
     /// queue concurrently.

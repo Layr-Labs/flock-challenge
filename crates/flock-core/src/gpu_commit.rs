@@ -1391,6 +1391,49 @@ fn hybrid_cb2_spin_enabled() -> bool {
     })
 }
 
+/// Kill switch for the commit arm's work-helping GPU waits:
+/// `FLOCK_NO_GPU_WAIT_HELP=1` restores the incumbent spin/blocking waits.
+///
+/// The commit arm runs on one of the ten main-pool workers (the calling side
+/// of the commit/AB `rayon::join`). While it waits for the streamed first
+/// pass (the hybrid split) or for the whole early graph (pure-GPU split), that
+/// worker used to spin or park, so the round-one AB queue drained on nine
+/// P-workers for the whole wait. The help loop instead joins the draining
+/// main-pool chunk queue as a guest (`epool::help_guest_until`): it claims
+/// one AB chunk at a time, re-checks the command buffer between chunks, and
+/// returns to the commit arm within one chunk of the GPU finishing (or when
+/// the queue is empty), then performs the incumbent wait. A whole stolen
+/// claim loop (`rayon::yield_now`) was measured to keep the thread in AB
+/// until it drained, delaying the CPU suffix NTT that otherwise overlaps the
+/// compute-bound AB arm. Scheduling only: every AB chunk is still claimed
+/// exactly once, and the GPU command buffers are consumed with the same
+/// status check — proof bytes cannot change.
+pub const ENV_NO_GPU_WAIT_HELP: &str = "FLOCK_NO_GPU_WAIT_HELP";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn gpu_wait_help_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_WAIT_HELP).is_none())
+}
+
+/// Run pending main-pool jobs on this worker until `done()` holds or the pool
+/// has nothing to hand out. Returns without waiting in either case; the caller
+/// then performs its ordinary (exact) wait. No-op off a pool worker.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn help_pool_until(done: impl Fn() -> bool) -> usize {
+    crate::epool::help_guest_until(
+        gpu_wait_help_enabled(),
+        std::time::Duration::from_millis(2),
+        &done,
+    )
+}
+
 #[cfg(test)]
 mod hybrid_cb2_spin_gate_tests {
     use std::ffi::OsStr;
@@ -7961,6 +8004,15 @@ kernel void blake3_pow_scan(
             let mut last_end = 0.0f64;
             let n_bands = self.pending.len();
             crate::tmark::mark("bands drain entry");
+            // The bands share one serial queue, so the last one completing
+            // implies all have; help the pool until then (or until it has
+            // nothing pending), then drain exactly as before.
+            if let Some(&last) = self.pending.last() {
+                let gpu = self.gpu;
+                if super::help_pool_until(|| unsafe { gpu.cb_status(last) } >= 4) > 0 {
+                    crate::tmark::mark("bands help done");
+                }
+            }
             // The streamed bands were committed behind CPU-side tile work
             // and are usually all complete by the time finish drains them —
             // yet each blocking wait still pays Metal's fixed park +
@@ -8543,7 +8595,17 @@ kernel void blake3_pow_scan(
                 1usize << (log_d - 4),
             );
             gpu.end_encoding(enc);
-            gpu.commit_and_wait(cb1)
+            if super::gpu_wait_help_enabled() && rayon::current_thread_index().is_some() {
+                // The exact-contention tuner re-primes inside its graph arm
+                // beside the AB replay: help that replay exactly as the timed
+                // commit arm helps the AB arm while its first pass streams,
+                // so the sweep prices the split under the same contention.
+                gpu.commit_async(cb1);
+                super::help_pool_until(|| gpu.cb_status(cb1) >= 4);
+                gpu.wait_cb(cb1)
+            } else {
+                gpu.commit_and_wait(cb1)
+            }
         }
     }
 
@@ -11110,6 +11172,8 @@ kernel void blake3_pow_scan(
             .early_graph
             .take()
             .map(|cb| {
+                let gpu = stream.gpu;
+                super::help_pool_until(|| unsafe { gpu.cb_status(cb) } >= 4);
                 let r = unsafe { stream.gpu.wait_cb(cb) };
                 crate::tmark::mark("early graph waited");
                 (cb, r)
