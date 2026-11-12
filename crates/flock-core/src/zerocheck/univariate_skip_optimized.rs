@@ -2896,20 +2896,64 @@ fn process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
     banks: &mut [F128],
     partial_ab: &mut [F128; ELL],
 ) {
+    process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
+        x_hi,
+        0..big_lo_size,
+        big_lo_size,
+        n_lo_and_inner,
+        within_outer_mask,
+        b_med_counts,
+        ab_inner,
+        representation,
+        eq_bot,
+        eq_hi_val,
+        tables,
+        bank_bits,
+        bank_deferred,
+        banks,
+        partial_ab,
+    );
+}
+
+/// [`process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded`] over the
+/// `x_outer_lo` sub-range `lo_range` only. The chunk's partial is linear in
+/// its `x_outer_lo` terms (XOR-accumulated banks, then the exact field
+/// fold), so the partials of a split range XOR to the whole range's partial
+/// bit for bit.
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
+    x_hi: usize,
+    lo_range: std::ops::Range<usize>,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    representation: Round1AbRepresentation,
+    eq_bot: &[F128],
+    eq_hi_val: F128,
+    tables: &[F128],
+    bank_bits: usize,
+    bank_deferred: bool,
+    banks: &mut [F128],
+    partial_ab: &mut [F128; ELL],
+) {
     debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
     debug_assert_eq!(eq_bot.len(), 1usize << bank_bits);
+    debug_assert!(lo_range.end <= big_lo_size);
 
     let n_lo = n_lo_and_inner - N_INNER;
     let n_banks = 1usize << bank_bits;
     let bank_mask = n_banks - 1;
-    let store_first = big_lo_size >= n_banks;
+    // First-touch stores need the range to open with every bank exactly once.
+    let store_first = lo_range.start == 0 && lo_range.end >= n_banks;
     let unscaled = zc_ab_unscaled_enabled();
     let seeded = zc_ab_seeded_enabled();
     if !store_first {
         banks.fill(F128::ZERO);
     }
 
-    for x_outer_lo in 0..big_lo_size {
+    for x_outer_lo in lo_range {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
@@ -3024,6 +3068,38 @@ pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed(
     )
 }
 
+/// [`round1_shift_reduce_ab_packed_padded_with_precomputed`] with two
+/// challenge-only side jobs folded into the completion's FS-serial edges
+/// (`FLOCK_NO_ZC_ENTRY_OVERLAP=1` restores the serial order at the call
+/// site): `pre` runs concurrently with the completion's table setup (rayon
+/// join; it must not touch the completion's inputs or outputs) and `tail`
+/// runs on the calling thread as soon as its own queue claims run out, i.e.
+/// inside the queue's ragged tail. Neither may read the AB result. Returns
+/// the identical AB message plus `tail`'s result.
+pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed_overlapped<T, R>(
+    ab_inner: &Round1AbInner,
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    padding: &PaddingSpec,
+    pre: &(dyn Fn() + Sync),
+    tail: T,
+) -> (Vec<F128>, R)
+where
+    T: FnOnce() -> R,
+{
+    round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold_and(
+        ab_inner,
+        m,
+        k_skip,
+        r,
+        padding,
+        ab_eq_fold_from_env(),
+        pre,
+        tail,
+    )
+}
+
 /// [`round1_shift_reduce_ab_packed_padded_with_precomputed`] with the `eq_lo`
 /// fold policy supplied explicitly. Every arm must return the same bytes.
 fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
@@ -3034,6 +3110,68 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
     padding: &PaddingSpec,
     fold: AbEqFold,
 ) -> Vec<F128> {
+    let (ab, ()) = round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold_and(
+        ab_inner,
+        m,
+        k_skip,
+        r,
+        padding,
+        fold,
+        &|| {},
+        || {},
+    );
+    ab
+}
+
+/// Number of trailing AB-completion chunks claimed as two half-ranges
+/// (`FLOCK_NO_ZC_AB_TAIL_SPLIT=1` → 0; `FLOCK_ZC_AB_TAIL_SPLIT_N=<n>` tunes,
+/// default 16). Zero unless the low range splits evenly into halves that
+/// each still cover every bank.
+fn ab_tail_split_chunks(hi_size: usize, big_lo_size: usize, n_banks: usize) -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_ZC_AB_TAIL_SPLIT").is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_ZC_AB_TAIL_SPLIT_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    });
+    if big_lo_size % 2 != 0 || big_lo_size / 2 < n_banks {
+        return 0;
+    }
+    (*N).min(hi_size)
+}
+
+/// Completion set-up: everything the chunk queue reads besides `ab_inner`.
+enum AbCompletionSetup {
+    Plain {
+        eq: SplitEqGhash,
+        eq_lo_scaled: Vec<F128>,
+    },
+    Folded {
+        eq: SplitEqGhash,
+        bank_bits: usize,
+        eq_bot: Vec<F128>,
+        tables: Vec<F128>,
+        bank_deferred: bool,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold_and<T, R>(
+    ab_inner: &Round1AbInner,
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    padding: &PaddingSpec,
+    fold: AbEqFold,
+    pre: &(dyn Fn() + Sync),
+    tail: T,
+) -> (Vec<F128>, R)
+where
+    T: FnOnce() -> R,
+{
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     let total_bytes = (1usize << m) / 8;
     assert_eq!(ab_inner.len_bytes(), total_bytes);
@@ -3048,55 +3186,18 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
     let n_hi = fold4_n_hi.min(r_outer.len());
     let n_lo = r_outer.len() - n_hi;
     let bank_bits = fold.bank_bits(n_lo);
-    let eq = if bank_bits.is_some() {
-        // The folded arm builds its low factors below and never reads eq.lo.
-        SplitEqGhash {
-            n_lo,
-            n_hi,
-            lo: Vec::new(),
-            hi: build_eq(&r_outer[n_lo..]),
-        }
-    } else {
-        SplitEqGhash::with_n_hi(r_outer, fold4_n_hi)
-    };
-    let big_lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    let n_lo_and_inner = eq.n_lo + N_INNER;
-    let convert = convert_table();
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    let ab_inner_bytes = ab_inner.as_bytes();
-
-    let mut partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(hi_size);
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-    match bank_bits {
-        None => {
-            let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
-            crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-                let mut partial = [F128::ZERO; ELL];
-                process_one_x_hi_with_precomputed_ab_fold4_ab(
-                    x_hi,
-                    big_lo_size,
-                    n_lo_and_inner,
-                    within_outer_mask,
-                    &b_med_counts,
-                    ab_inner_bytes,
-                    ab_inner.representation,
-                    &eq_lo_scaled,
-                    eq.hi[x_hi],
-                    convert,
-                    None,
-                    &mut partial,
-                );
-                // SAFETY: each queue index owns one disjoint output slot and
-                // the synchronous queue join publishes all writes before
-                // reduction.
-                unsafe { *partials_base.ptr().add(x_hi) = partial };
-            });
-        }
-        Some(bank_bits) => {
+    let setup = || {
+        if let Some(bank_bits) = bank_bits {
+            // The folded arm builds its low factors below and never reads eq.lo.
+            let eq = SplitEqGhash {
+                n_lo,
+                n_hi,
+                lo: Vec::new(),
+                hi: build_eq(&r_outer[n_lo..]),
+            };
             let r_lo = &r[k_skip + N_INNER..k_skip + N_INNER + eq.n_lo];
             let (eq_bot, eq_top_scaled) = ab_eq_fold_factors(r_lo, bank_bits);
-            let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert);
+            let tables = build_ab_eq_fold_tables(&eq_top_scaled, convert_table());
             let bank_len = eq_bot.len() * ELL;
             let bank_deferred = ranked_ab_bank_deferred_shape(
                 m,
@@ -3110,15 +3211,42 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                 rayon::current_num_threads(),
                 zc_ab_bank_deferred_enabled(),
             );
-            crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-                let mut partial = [F128::ZERO; ELL];
-                AB_EQ_FOLD_BANKS.with(|cell| {
-                    let mut banks = cell.borrow_mut();
-                    if banks.len() != bank_len {
-                        banks.clear();
-                        banks.resize(bank_len, F128::ZERO);
-                    }
-                    process_one_x_hi_with_precomputed_ab_fold4_ab_eq_folded(
+            AbCompletionSetup::Folded {
+                eq,
+                bank_bits,
+                eq_bot,
+                tables,
+                bank_deferred,
+            }
+        } else {
+            let eq = SplitEqGhash::with_n_hi(r_outer, fold4_n_hi);
+            let eq_lo_scaled: Vec<F128> = eq.lo.iter().map(|v| *v * d_inv()).collect();
+            AbCompletionSetup::Plain { eq, eq_lo_scaled }
+        }
+    };
+    let setup = if bank_bits.is_some() && n_hi > 0 {
+        rayon::join(setup, pre).0
+    } else {
+        let s = setup();
+        pre();
+        s
+    };
+    let hi_size = 1usize << n_hi;
+    let big_lo_size = 1usize << n_lo;
+    let n_lo_and_inner = n_lo + N_INNER;
+    let convert = convert_table();
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let ab_inner_bytes = ab_inner.as_bytes();
+
+    let mut partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(hi_size);
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    let tail_out = match setup {
+        AbCompletionSetup::Plain { eq, eq_lo_scaled } => {
+            crate::epool::run_hetero_chunks_caller_tail(
+                hi_size,
+                |x_hi| {
+                    let mut partial = [F128::ZERO; ELL];
+                    process_one_x_hi_with_precomputed_ab_fold4_ab(
                         x_hi,
                         big_lo_size,
                         n_lo_and_inner,
@@ -3126,25 +3254,101 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
                         &b_med_counts,
                         ab_inner_bytes,
                         ab_inner.representation,
-                        &eq_bot,
+                        &eq_lo_scaled,
                         eq.hi[x_hi],
-                        &tables,
-                        bank_bits,
-                        bank_deferred,
-                        &mut banks,
+                        convert,
+                        None,
                         &mut partial,
                     );
-                });
-                // SAFETY: each queue index owns one disjoint output slot and
-                // the synchronous queue join publishes all writes before
-                // reduction.
-                unsafe { *partials_base.ptr().add(x_hi) = partial };
-            });
-            crate::scratch::give_f128(tables);
+                    // SAFETY: each queue index owns one disjoint output slot and
+                    // the synchronous queue join publishes all writes before
+                    // reduction.
+                    unsafe { *partials_base.ptr().add(x_hi) = partial };
+                },
+                tail,
+            )
         }
-    }
+        AbCompletionSetup::Folded {
+            eq,
+            bank_bits,
+            eq_bot,
+            tables,
+            bank_deferred,
+        } => {
+            let bank_len = eq_bot.len() * ELL;
+            // Tail split (`FLOCK_NO_ZC_AB_TAIL_SPLIT=1` kills): the last
+            // `split` chunks of the queue are claimed as two half-ranges of
+            // `x_outer_lo` each, halving the queue's ragged-tail grain. The
+            // two half partials XOR to the whole chunk's partial exactly.
+            let split = ab_tail_split_chunks(hi_size, big_lo_size, 1usize << bank_bits);
+            let whole = hi_size - split;
+            let half_lo = big_lo_size / 2;
+            let mut half_partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(2 * split);
+            let half_base = crate::epool::SyncPtr(half_partials.as_mut_ptr());
+            let out = crate::epool::run_hetero_chunks_caller_tail(
+                whole + 2 * split,
+                |i| {
+                    let (x_hi, range) = if i < whole {
+                        (i, 0..big_lo_size)
+                    } else {
+                        let j = i - whole;
+                        let h = j & 1;
+                        (whole + j / 2, h * half_lo..(h + 1) * half_lo)
+                    };
+                    let mut partial = [F128::ZERO; ELL];
+                    AB_EQ_FOLD_BANKS.with(|cell| {
+                        let mut banks = cell.borrow_mut();
+                        if banks.len() != bank_len {
+                            banks.clear();
+                            banks.resize(bank_len, F128::ZERO);
+                        }
+                        process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
+                            x_hi,
+                            range,
+                            big_lo_size,
+                            n_lo_and_inner,
+                            within_outer_mask,
+                            &b_med_counts,
+                            ab_inner_bytes,
+                            ab_inner.representation,
+                            &eq_bot,
+                            eq.hi[x_hi],
+                            &tables,
+                            bank_bits,
+                            bank_deferred,
+                            &mut banks,
+                            &mut partial,
+                        );
+                    });
+                    // SAFETY: each queue index owns one disjoint output slot
+                    // (whole chunks in `partials`, halves in
+                    // `half_partials`) and the synchronous queue join
+                    // publishes all writes before reduction.
+                    unsafe {
+                        if i < whole {
+                            *partials_base.ptr().add(x_hi) = partial;
+                        } else {
+                            *half_base.ptr().add(i - whole) = partial;
+                        }
+                    }
+                },
+                tail,
+            );
+            crate::scratch::give_f128(tables);
+            // Reassemble each split chunk's partial (XOR is exact).
+            for k in 0..split {
+                let (a, b) = (half_partials[2 * k], half_partials[2 * k + 1]);
+                let mut p = a;
+                for lane in 0..ELL {
+                    p[lane] += b[lane];
+                }
+                partials[whole + k] = p;
+            }
+            out
+        }
+    };
 
-    partials
+    let ab = partials
         .into_iter()
         .fold([F128::ZERO; ELL], |mut left, right| {
             for lane in 0..ELL {
@@ -3152,7 +3356,8 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
             }
             left
         })
-        .to_vec()
+        .to_vec();
+    (ab, tail_out)
 }
 
 /// Challenge-derived inputs shared by both round-one C variants.
@@ -7734,6 +7939,30 @@ mod tests {
                     got_entry, want,
                     "entry-point AB mismatch at m={m}, useful={useful}"
                 );
+                // Overlapped entry: same bytes; `pre` runs once, `tail` runs
+                // once on this thread and its value comes back.
+                let pre_runs = std::sync::atomic::AtomicUsize::new(0);
+                let me = std::thread::current().id();
+                let tail_thread = std::cell::Cell::new(None);
+                let (got_overlap, tail_value) =
+                    round1_shift_reduce_ab_packed_padded_with_precomputed_overlapped(
+                        &ab_inner,
+                        m,
+                        K_SKIP,
+                        &r,
+                        &padding,
+                        &|| {
+                            pre_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        },
+                        || {
+                            tail_thread.set(Some(std::thread::current().id()));
+                            m * 7
+                        },
+                    );
+                assert_eq!(got_overlap, want, "overlapped AB mismatch at m={m}, useful={useful}");
+                assert_eq!(tail_value, m * 7);
+                assert_eq!(pre_runs.load(std::sync::atomic::Ordering::Relaxed), 1);
+                assert_eq!(tail_thread.get(), Some(me), "tail must run on the caller");
             }
         }
     }

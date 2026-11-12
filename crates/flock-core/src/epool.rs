@@ -584,6 +584,52 @@ where
     run_chunks_with_helper(n_chunks, &f, epool());
 }
 
+/// [`run_hetero_chunks`] plus one caller-thread tail job: the calling thread
+/// drains the shared queue like every other main worker, and the moment its
+/// own claim loop finds the queue exhausted it runs `tail` while the other
+/// workers are still finishing their last chunks (the queue's ragged tail).
+/// Returns `tail`'s result. `tail` must not depend on any chunk's output;
+/// it runs exactly once, always on the calling thread (so it may hold
+/// thread-bound state such as a `MutexGuard`). If the calling thread never
+/// reached the end of a claim loop, `tail` runs after the queue joins.
+///
+/// Scheduling only: every chunk index is still claimed exactly once from the
+/// same cursor and `f(i)` does not depend on which thread runs it.
+pub fn run_hetero_chunks_caller_tail<F, T, R>(n_chunks: usize, f: F, tail: T) -> R
+where
+    F: Fn(usize) + Sync,
+    T: FnOnce() -> R,
+{
+    struct CallerOnly<X>(std::cell::UnsafeCell<Option<X>>);
+    // SAFETY: the cells are only ever touched on the thread whose id is
+    // `caller` (checked before every access), so no two threads access them.
+    unsafe impl<X> Sync for CallerOnly<X> {}
+    let caller = std::thread::current().id();
+    let tail_cell = CallerOnly(std::cell::UnsafeCell::new(Some(tail)));
+    let out_cell: CallerOnly<R> = CallerOnly(std::cell::UnsafeCell::new(None));
+    // Whole-struct references: a closure naming `tail_cell.0` directly
+    // would capture the (non-Sync) field instead of the Sync wrapper.
+    let (tail_ref, out_ref) = (&tail_cell, &out_cell);
+    let after = || {
+        if std::thread::current().id() != caller {
+            return;
+        }
+        // SAFETY: caller thread only (above). `take` ends the borrow before
+        // `t()` runs, so a re-entrant call (the caller stealing another
+        // queue task inside `t`'s nested joins) sees `None` and returns.
+        let t = unsafe { (*tail_ref.0.get()).take() };
+        if let Some(t) = t {
+            let r = t();
+            unsafe { *out_ref.0.get() = Some(r) };
+        }
+    };
+    run_chunks_with_helper_arm_after(n_chunks, &f, epool(), detached_enabled(), &after);
+    match tail_cell.0.into_inner() {
+        Some(t) => t(),
+        None => out_cell.0.into_inner().expect("caller tail ran"),
+    }
+}
+
 /// Try to process chunks exclusively on the efficiency-core helper pool.
 ///
 /// Unlike [`run_hetero_chunks`], the calling thread and the main Rayon pool do
@@ -895,7 +941,23 @@ fn run_chunks_with_helper_arm<F>(
 ) where
     F: Fn(usize) + Sync,
 {
+    run_chunks_with_helper_arm_after(n_chunks, f, helper, detached, &|| {});
+}
+
+/// [`run_chunks_with_helper_arm`] with `after` run by every main-pool queue
+/// task once its claim loop finds the queue exhausted.
+fn run_chunks_with_helper_arm_after<F, A>(
+    n_chunks: usize,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    detached: bool,
+    after: &A,
+) where
+    F: Fn(usize) + Sync,
+    A: Fn() + Sync,
+{
     if n_chunks == 0 {
+        after();
         return;
     }
     let main_threads = rayon::current_num_threads();
@@ -905,6 +967,7 @@ fn run_chunks_with_helper_arm<F>(
         for i in 0..n_chunks {
             f(i);
         }
+        after();
         return;
     }
     let next = AtomicUsize::new(0);
@@ -917,6 +980,7 @@ fn run_chunks_with_helper_arm<F>(
             }
             guard.main_run(|| f(i));
         }
+        after();
     };
     // Main-pool side: one queue-draining task per worker. `with_max_len(1)`
     // splits down to single indices so every main worker can pick one up;
