@@ -3967,7 +3967,6 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     /// before the first table build, and every build reads them from there.
     /// Same tables, same butterflies in the same order: bit-identical. The
     /// 512-byte twiddle array is taken from the never-read residency pad, so
-    /// the group still allocates 12,736 B of threadgroup memory.
     const NTT_G4X2_TWL_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -3996,6 +3995,29 @@ static inline uint4 gf_shl16(uint4 a) {
     r.z = (a.z << 16) | (a.y >> 16);
     r.y = (a.y << 16) | (a.x >> 16);
     r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// a * x^4 mod P. The 4 bits shifted out fold back as h * (x^7+x^2+x+1)
+// (<= bit 10), entirely in the low word.
+static inline uint4 gf_shl4(uint4 a) {
+    uint h = a.w >> 28;
+    uint4 r;
+    r.w = (a.w << 4) | (a.z >> 28);
+    r.z = (a.z << 4) | (a.y >> 28);
+    r.y = (a.y << 4) | (a.x >> 28);
+    r.x = (a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// a * x^8 mod P (<= bit 14 folded back into the low word).
+static inline uint4 gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
     return r;
 }
 
@@ -4062,7 +4084,9 @@ static inline void gf_build_byte16(
 // twiddle in breadth-first order) and its x^8 multiple read from the group's
 // threadgroup copy `twl` instead of device memory: the same table entries,
 // the same two barriers, but no dependent device load and no 8-step mulx
-// chain between them.
+// chain between them. The eight generators come from two independent
+// 3-step chains (f0 = e0 * x^4 in one shift-fold), so the path between the
+// barriers is 4 dependent steps instead of 7. Same field values.
 static inline void gf_build_byte16_twl(
     threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
 {
@@ -4071,9 +4095,10 @@ static inline void gf_build_byte16_twl(
     const uint u  = lid & 31u;
     const uint aa = u & 3u;          // owns entry bits 2..3
     const uint cc = u >> 2;          // owns entry bits 5..7
-    uint4 e0 = twl[(t << 4) + k];
-    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
-    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    const uint4 e0 = twl[(t << 4) + k];
+    const uint4 f0 = gf_shl4(e0);
+    const uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    const uint4 f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
     uint4 A = uint4(0u);
     if (aa & 1u) { A ^= e2; }
     if (aa & 2u) { A ^= e3; }
@@ -4164,10 +4189,9 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
         const uint q  = lid + 1u;
         const uint jj = 31u - clz(q);
         const uint cj = q - (1u << jj);
-        uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cj];
+        const uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cj];
         twl[lid] = g;
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-        twl[16u + lid] = g;
+        twl[16u + lid] = gf_shl8(g);
     }
 
     for (uint it = 0; it < 2u; it++) {
