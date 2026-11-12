@@ -1745,18 +1745,26 @@ fn prove_padded_inner<Ch: Challenger>(
         };
     // 3b. Optional capture: copy the pre-sumcheck z_vec into the dead eq_inner
     //     allocation for downstream reuse (PCS open's AB-claim s_hat_v skipping
-    //     fold_1b_rows), avoiding a fresh 2^k_log F128 allocation.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec && eq_inner.len() == z_vec.len() {
-        let mut cap = eq_inner;
-        cap.copy_from_slice(&z_vec);
-        Some(cap)
-    } else {
-        crate::scratch::give_lincheck_eq(eq_inner);
-        if capture_z_vec {
-            Some(z_vec.clone())
+    let par_min = lc_sumcheck_par_min(k);
+    let capture = || -> Option<Vec<F128>> {
+        if capture_z_vec && eq_inner.len() == z_vec.len() {
+            let mut cap = eq_inner;
+            cap.copy_from_slice(&z_vec);
+            Some(cap)
         } else {
-            None
+            crate::scratch::give_lincheck_eq(eq_inner);
+            if capture_z_vec {
+                Some(z_vec.clone())
+            } else {
+                None
+            }
         }
+    };
+    let round0 = || (inner_rest_len > 0).then(|| sumcheck_round_eval_par(&comb_vec, &z_vec, par_min));
+    let (captured_z_vec, first_msg) = if capture_z_vec {
+        rayon::join(capture, round0)
+    } else {
+        (capture(), round0())
     };
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
@@ -1771,12 +1779,10 @@ fn prove_padded_inner<Ch: Challenger>(
     //    rayon when the residual table is large enough.
     let mut rounds = Vec::with_capacity(inner_rest_len);
     let mut r_rounds = Vec::with_capacity(inner_rest_len);
-    if inner_rest_len > 0 {
+    if let Some((mut e1, mut einf)) = first_msg {
         // Round 0's message is the only standalone evaluation pass; every later
         // round's message falls out of binding the previous round (fold +
         // next-eval fused into one pass — see `sumcheck_bind_both_and_eval_next`).
-        let par_min = lc_sumcheck_par_min(k);
-        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec, par_min);
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
