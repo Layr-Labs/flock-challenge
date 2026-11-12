@@ -601,57 +601,9 @@ pub fn build_eq_table(point: &[F128]) -> Vec<F128> {
 /// buffer (see `gpu_commit::zc_fold_eq_table`), which deletes the launch's
 /// 4 MiB upload memcpy. `out.len()` must be exactly `1 << point.len()`.
 pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
-    use rayon::prelude::*;
-
-    let d = point.len();
-    assert_eq!(out.len(), 1usize << d);
-    if d >= 14 {
-        let a = d / 2;
-        let mut lo = vec![F128::ZERO; 1usize << a];
-        let mut hi = vec![F128::ZERO; 1usize << (d - a)];
-        build_eq_table_into(&point[..a], &mut lo);
-        build_eq_table_into(&point[a..], &mut hi);
-        let lo = &lo;
-        out.par_chunks_mut(1usize << a)
-            .zip(hi.par_iter())
-            .for_each(|(chunk, &s)| {
-                crate::field::f128_slice::scale_slice_into(chunk, lo, s);
-            });
-        return;
-    }
-    out[0] = F128::ONE;
-    const PAR_THRESHOLD: usize = 1 << 12;
-    for j in 0..d {
-        let r_j = point[j];
-        let len = 1usize << j;
-        let (lo, rest) = out.split_at_mut(len);
-        let hi = &mut rest[..len];
-        // For each existing entry i ∈ [0, len), produce two children:
-        //   hi[i] = v * r_j              ← new bit_j = 1
-        //   lo[i] = v * (1 + r_j)
-        //         = v + hi[i]             ← new bit_j = 0
-        // The distributive identity saves one field multiplication per pair.
-        let build_pair = |lo_i: &mut F128, hi_i: &mut F128| {
-            let v = *lo_i;
-            let vr = v * r_j;
-            *hi_i = vr;
-            *lo_i = v + vr;
-        };
-        if len < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
-        } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
-        }
-    }
+    build_eq_table_optimized_into(point, out);
 }
 
-/// Architecture-optimized equality-table builder used by callers that opt in
-/// independently of [`build_eq_table`]. Keeping this separate leaves the
-/// generic builder available as an exact same-binary control.
 pub(crate) fn build_eq_table_optimized(point: &[F128]) -> Vec<F128> {
     let mut out = crate::alloc_uninit_f128_vec(1usize << point.len());
     build_eq_table_optimized_into(point, &mut out);
@@ -2198,10 +2150,9 @@ mod tests {
 
     // ---- Unit tests for the kernels ----
 
-    /// `build_eq_table` produces eq(point, i) for all boolean i.
     #[test]
     fn eq_table_matches_direct_formula() {
-        for &d in &[1usize, 2, 3, 5, 8] {
+        for &d in &[0usize, 1, 2, 3, 5, 7, 8, 10, 12, 13, 14, 15, 16] {
             let mut rng = Rng::new(11 + d as u64);
             let point = rng.f128_vec(d);
             let table = build_eq_table(&point);
@@ -2220,22 +2171,6 @@ mod tests {
                 }
                 assert_eq!(table[i], expected, "mismatch at d={d}, i={i}");
             }
-        }
-    }
-
-    /// The opt-in vector builder is an exact replacement at every expansion
-    /// geometry, including its first parallel level (crossed at d ≥ 15; the
-    /// generic builder parallelizes from d ≥ 13). d = 16 also covers the
-    /// largest ranked recursion-OOD dim now routed through the optimized
-    /// builder (micro-stack item 3); 7/10/13 cover the deeper ranked levels.
-    #[test]
-    fn optimized_eq_table_matches_generic_bytes() {
-        for &d in &[0usize, 1, 2, 3, 5, 7, 8, 10, 12, 13, 16] {
-            let mut rng = Rng::new(0x4551_4f50 + d as u64);
-            let point = rng.f128_vec(d);
-            let generic = build_eq_table(&point);
-            let optimized = build_eq_table_optimized(&point);
-            assert_eq!(optimized, generic, "dimension={d}");
         }
     }
 
