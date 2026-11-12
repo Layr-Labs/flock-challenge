@@ -1849,6 +1849,56 @@ unsafe fn store_delta_pair_gpr(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64)
     }
 }
 
+/// [`load_code_pair_gpr`] at an immediate byte offset `OFF` from `p` (no
+/// address `ADD` for the second pair of a round-two group).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn load_code_pair_gpr_off<const OFF: usize>(p: *const u8) -> (u64, u64) {
+    let (lo, hi): (u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "ldp {lo}, {hi}, [{p}, #{off}]",
+            p = in(reg) p,
+            off = const OFF,
+            lo = lateout(reg) lo,
+            hi = lateout(reg) hi,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    (lo, hi)
+}
+
+/// [`store_delta_pair_gpr`] at an immediate byte offset `OFF` from `dst`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_pair_gpr_off<const OFF: usize>(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64) {
+    unsafe {
+        core::arch::asm!(
+            "eor {ta}, {a0}, {a1}",
+            "eor {tb}, {b0}, {b1}",
+            "stp {ta}, {tb}, [{dst}, #{off}]",
+            dst = in(reg) dst,
+            off = const OFF,
+            a0 = in(reg) a0,
+            a1 = in(reg) a1,
+            b0 = in(reg) b0,
+            b1 = in(reg) b1,
+            ta = out(reg) _,
+            tb = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Kill switch for the immediate-offset addressing of the pre-scaled
+/// round-two kernel's second pair per group (`FLOCK_NO_R2_IMM_OFF=1`
+/// restores the per-pair pointer forms). Same loads and stores.
+#[cfg(target_arch = "aarch64")]
+fn r2_imm_off_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_IMM_OFF").is_none_or(|v| v != *"1"))
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn store_delta_a_only_gpr(dst: *mut u8, a0: u64, a1: u64) {
@@ -2340,7 +2390,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
 ) {
     unsafe {
         match (r2_gpr_delta_enabled(), r2_fixed_pads_enabled()) {
-            (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true>(
+            (true, true) if r2_imm_off_enabled() => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2355,7 +2405,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (true, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false>(
+            (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2370,7 +2420,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (false, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true>(
+            (true, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2385,7 +2435,22 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (false, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false>(
+            (false, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2410,6 +2475,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
 unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
     const GPR_DELTA: bool,
     const FIXED_PADS: bool,
+    const IMM: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -2439,6 +2505,21 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
             );
         }
     }
+
+    #[inline(always)]
+    unsafe fn store_anchor_pair_nt_off<const OFF: usize>(dst: *mut F128, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stnp {a:q}, {b:q}, [{dst}, #{off}]",
+                dst = in(reg) dst,
+                off = const OFF,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+    const { assert!(GPR_DELTA || !IMM) };
 
     unsafe {
         let zero = vdupq_n_u64(0);
@@ -2541,8 +2622,40 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 }
                                 (a, b, a_odd, b_odd, deg)
                             };
-                            let (a0, b0, a1c, b1c, deg0) = pair(x_lo0, pad0);
-                            let (a2, b2, a3c, b3c, deg1) = pair(x_lo1, pad1);
+                            // `IMM`: one base per stream for the group, the
+                            // second pair at immediate offsets (16 code / delta
+                            // bytes, 32 anchor bytes).
+                            let a_row0 = a_packed.add(2 * x_lo0 * 8);
+                            let b_row0 = b_packed.add(2 * x_lo0 * 8);
+                            let anc0 = anchors.add(2 * x_lo0);
+                            let del0 = deltas.add(x_lo0 * 16);
+                            macro_rules! pair_imm {
+                                ($pad:expr, $oc:literal, $oa:literal) => {{
+                                    if $pad {
+                                        if !skip_dead {
+                                            store_anchor_pair_nt_off::<$oa>(anc0, zero, zero);
+                                            vst1q_u64(del0.add($oc).cast::<u64>(), zero);
+                                        }
+                                        (zero, zero, 0u64, 0u64, false)
+                                    } else {
+                                        let (a_even, a_odd) = load_code_pair_gpr_off::<$oc>(a_row0);
+                                        let (b_even, b_odd) = load_code_pair_gpr_off::<$oc>(b_row0);
+                                        let deg = degen && (b_even & b_odd) == u64::MAX;
+                                        let (a, b) = if deg {
+                                            (fold_row_code_q(table_data, a_even), b_ones)
+                                        } else {
+                                            fold_two_row_codes_q(table_data, a_even, b_even)
+                                        };
+                                        store_anchor_pair_nt_off::<$oa>(anc0, a, b);
+                                        store_delta_pair_gpr_off::<$oc>(del0, a_even, a_odd, b_even, b_odd);
+                                        (a, b, a_odd, b_odd, deg)
+                                    }
+                                }};
+                            }
+                            let (a0, b0, a1c, b1c, deg0) =
+                                if IMM { pair_imm!(pad0, 0, 0) } else { pair(x_lo0, pad0) };
+                            let (a2, b2, a3c, b3c, deg1) =
+                                if IMM { pair_imm!(pad1, 16, 32) } else { pair(x_lo1, pad1) };
                             if pad0 & pad1 {
                                 break 'group;
                             }
@@ -6078,10 +6191,11 @@ mod tests {
                                 unsafe {
                                     let kernel = match variant {
                                         0 => fold_round2_compact_chunk_neon_horner_8_impl::<true, false>,
-                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false>,
-                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false>,
-                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true>,
-                                        _ => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true>,
+                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false>,
+                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false>,
+                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false>,
+                                        4 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false>,
+                                        _ => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true>,
                                     };
                                     kernel(
                                         table.data.as_ptr().cast::<u8>(),
@@ -6102,7 +6216,7 @@ mod tests {
                                 (anchors, deltas, out)
                             };
                             let horner = run(0);
-                            for variant in 1..=4 {
+                            for variant in 1..=5 {
                                 let prescaled = run(variant);
                                 let at = format!("v {variant} z {z_case} r {challenge_case} mask {mask} base {base} degen {degen} skip {skip_dead}");
                                 assert_eq!(prescaled.0, horner.0, "anchors: {at}");
@@ -7376,5 +7490,131 @@ impl ProdAcc {
     #[inline(always)]
     pub(crate) fn reduce(self) -> F128 {
         self.0.reduce()
+    }
+}
+
+/// Probe (ignored): single-P-core ns per pair of the pre-scaled round-two
+/// kernel on dumped real rows (`ZK_DIR` = a FLOCK_ZK_DUMP dir with r2_*.bin),
+/// incumbent per-pair pointers vs immediate-offset second pair; plus no_mangle
+/// census anchors. `cargo test --release -p flock-core --lib r2imm_probe -- --ignored --nocapture`.
+#[cfg(all(test, target_arch = "aarch64", target_feature = "sha3"))]
+mod r2imm_probe {
+    use super::*;
+    use std::time::Instant;
+
+    type R2 = unsafe fn(
+        *const u8, *const u8, *const u8, *mut F128, *mut u8, *const F128, usize, usize, usize,
+        usize, bool, bool, *mut F128,
+    );
+
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    #[target_feature(enable = "aes")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn r2imm_census_record(
+        t: *const u8, a: *const u8, b: *const u8, anc: *mut F128, del: *mut u8, eq: *const F128,
+        lo: usize, base: usize, mask: usize, useful: usize, degen: bool, skip: bool, out: *mut F128,
+    ) {
+        unsafe {
+            fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false>(
+                t, a, b, anc, del, eq, lo, base, mask, useful, degen, skip, out,
+            )
+        }
+    }
+
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    #[target_feature(enable = "aes")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn r2imm_census_imm(
+        t: *const u8, a: *const u8, b: *const u8, anc: *mut F128, del: *mut u8, eq: *const F128,
+        lo: usize, base: usize, mask: usize, useful: usize, degen: bool, skip: bool, out: *mut F128,
+    ) {
+        unsafe {
+            fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true>(
+                t, a, b, anc, del, eq, lo, base, mask, useful, degen, skip, out,
+            )
+        }
+    }
+
+    fn f128s(b: &[u8]) -> Vec<F128> {
+        b.chunks_exact(16)
+            .map(|c| F128 {
+                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn r2imm_probe() {
+        std::thread::spawn(|| {
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
+            }
+            // SAFETY: plain libSystem call on this thread (P-core QoS).
+            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+            let d: std::path::PathBuf = std::env::var_os("ZK_DIR").expect("ZK_DIR").into();
+            let meta: std::collections::HashMap<String, String> = std::fs::read_to_string(d.join("r2_meta.txt"))
+                .unwrap()
+                .lines()
+                .filter_map(|l| l.split_once('=').map(|(k, v)| (k.into(), v.into())))
+                .collect();
+            let g = |k: &str| meta[k].parse::<usize>().unwrap();
+            let (lo_size, x0, nck, mask, useful) = (g("lo_size"), g("x0"), g("nck"), g("mask"), g("useful"));
+            let degen = meta["degen"] == "true";
+            let a = std::fs::read(d.join("r2_a.bin")).unwrap();
+            let b = std::fs::read(d.join("r2_b.bin")).unwrap();
+            let table = f128s(&std::fs::read(d.join("r2_table.bin")).unwrap());
+            let eq = f128s(&std::fs::read(d.join("r2_eqlo.bin")).unwrap());
+            let row_bytes = lo_size * 2 * 8;
+            let (anc_len, del_len) = (2 * lo_size, 16 * lo_size);
+            let forms: [(&str, R2); 2] = [("record", r2imm_census_record), ("imm offsets", r2imm_census_imm)];
+            let run = |f: R2, skip: bool| {
+                let mut anc = vec![F128::ZERO; anc_len * nck];
+                let mut del = vec![0u8; del_len * nck];
+                let mut outs = vec![F128::ZERO; 8 * nck];
+                for c in 0..nck {
+                    unsafe {
+                        f(
+                            table.as_ptr().cast(), a.as_ptr().add(c * row_bytes), b.as_ptr().add(c * row_bytes),
+                            anc.as_mut_ptr().add(c * anc_len), del.as_mut_ptr().add(c * del_len), eq.as_ptr(),
+                            lo_size, (x0 + c) * lo_size, mask, useful, degen, skip, outs.as_mut_ptr().add(8 * c),
+                        );
+                    }
+                }
+                (anc, del, outs)
+            };
+            for skip in [false, true] {
+                let w = run(forms[0].1, skip);
+                let got = run(forms[1].1, skip);
+                assert!(w.0 == got.0 && w.1 == got.1 && w.2 == got.2, "imm differs (skip_dead {skip})");
+            }
+            println!("r2imm: identical on {nck} real chunks (lo_size {lo_size}, degen {degen})");
+            let rounds: usize = std::env::var("PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(301);
+            let pairs = (nck * lo_size) as f64;
+            let mut times = [Vec::new(), Vec::new()];
+            for r in 0..rounds + 1 {
+                for k in 0..2 {
+                    let i = (k + r) % 2;
+                    let t0 = Instant::now();
+                    std::hint::black_box(run(forms[i].1, true));
+                    if r > 0 {
+                        times[i].push(t0.elapsed().as_nanos() as f64 / pairs);
+                    }
+                }
+            }
+            let mut p: Vec<f64> = (0..rounds).map(|r| times[1][r] / times[0][r]).collect();
+            p.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            for (i, (n, _)) in forms.iter().enumerate() {
+                let v = &mut times[i];
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!("  {n:<14} lq {:7.3} med {:7.3} ns/pair", v[v.len() / 4], v[v.len() / 2]);
+            }
+            println!("  paired imm/record: lq {:.4} med {:.4}", p[p.len() / 4], p[p.len() / 2]);
+        })
+        .join()
+        .unwrap();
     }
 }

@@ -538,13 +538,40 @@ pub(super) fn accumulate_convert_ab_nomul<const STORE: bool, const U: bool>(
     // SAFETY: aarch64 statically guarantees NEON and the fixed arrays cover
     // every table-selected load and every bank slot drained.
     unsafe {
-        aarch64::accumulate_convert_ab_nomul::<STORE, U>(
-            chunk_ab_bytes,
-            first_b_med,
-            n_b_med,
-            convert,
-            bank,
-        );
+        if U && aarch64::ab_nomul_unroll_enabled() {
+            // Diagnostic (`FLOCK_ZC_AB_UNROLL_CHECK=1`, never ranked): run
+            // the incumbent pair loop on a copy of the bank for every real
+            // chunk and assert the unrolled drain wrote the same bytes.
+            static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let check = *CHECK.get_or_init(|| std::env::var_os("FLOCK_ZC_AB_UNROLL_CHECK").is_some());
+            let mut want = if check { Some(*bank) } else { None };
+            if let Some(w) = want.as_mut() {
+                aarch64::accumulate_convert_ab_nomul::<STORE, true>(chunk_ab_bytes, first_b_med, n_b_med, convert, w);
+            }
+            aarch64::accumulate_convert_ab_nomul_unrolled::<STORE, false>(
+                chunk_ab_bytes,
+                first_b_med,
+                n_b_med,
+                convert,
+                bank,
+            );
+            if let Some(w) = want {
+                assert!(w == *bank, "unrolled AB drain mismatch (first {first_b_med}, n {n_b_med})");
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if k.is_power_of_two() && k >= 1 << 16 {
+                    eprintln!("[zc-ab-unroll-check] {k} real chunks identical");
+                }
+            }
+        } else {
+            aarch64::accumulate_convert_ab_nomul::<STORE, U>(
+                chunk_ab_bytes,
+                first_b_med,
+                n_b_med,
+                convert,
+                bank,
+            );
+        }
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -586,7 +613,20 @@ pub(super) fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     assert_eq!(convert.len(), 16 * 256);
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        aarch64::accumulate_convert_ab_nomul_seeded::<U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        if U && aarch64::ab_nomul_unroll_enabled() {
+            static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let check = *CHECK.get_or_init(|| std::env::var_os("FLOCK_ZC_AB_UNROLL_CHECK").is_some());
+            let mut want = if check { Some(*bank) } else { None };
+            if let Some(w) = want.as_mut() {
+                aarch64::accumulate_convert_ab_nomul_seeded::<true>(chunk_ab_bytes, first_b_med, n_b_med, convert, w);
+            }
+            aarch64::accumulate_convert_ab_nomul_unrolled::<false, true>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+            if let Some(w) = want {
+                assert!(w == *bank, "unrolled seeded AB drain mismatch (first {first_b_med}, n {n_b_med})");
+            }
+        } else {
+            aarch64::accumulate_convert_ab_nomul_seeded::<U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     accumulate_convert_ab_nomul::<false, U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);

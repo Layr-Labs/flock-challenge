@@ -7577,6 +7577,40 @@ mod tests {
         }
     }
 
+    /// The unrolled AB completion drain (default for the unscaled form) in all
+    /// three modes (store, XOR drain, seeded) against the scaled-index pair
+    /// loop, which never takes the unrolled path, for every pair count.
+    #[test]
+    fn ab_completion_unrolled_drain_matches_pair_loop() {
+        let mut rng = Rng::new(0x0A11_D0A1);
+        let table = rng.f128_vec(CONVERT_TABLE_SIZE);
+        for trial in 0..4 {
+            let mut rows = [[0u8; 64]; 16];
+            for row in rows.iter_mut() {
+                for byte in row.iter_mut() {
+                    *byte = if trial == 0 { 0xff } else { rng.next_u64() as u8 };
+                }
+            }
+            let start: [F128; ELL] = core::array::from_fn(|_| rng.f128());
+            for first in (0..=16).step_by(2) {
+                for end in first..=16 {
+                    let (mut want, mut got) = (start, start);
+                    kernels::accumulate_convert_ab_nomul::<true, false>(&rows, first, end, &table, &mut want);
+                    kernels::accumulate_convert_ab_nomul::<true, true>(&rows, first, end, &table, &mut got);
+                    assert_eq!(got, want, "store trial={trial} first={first} end={end}");
+                    let (mut want, mut got) = (start, start);
+                    kernels::accumulate_convert_ab_nomul::<false, false>(&rows, first, end, &table, &mut want);
+                    kernels::accumulate_convert_ab_nomul::<false, true>(&rows, first, end, &table, &mut got);
+                    assert_eq!(got, want, "xor trial={trial} first={first} end={end}");
+                    let (mut want, mut got) = (start, start);
+                    kernels::accumulate_convert_ab_nomul_seeded::<false>(&rows, first, end, &table, &mut want);
+                    kernels::accumulate_convert_ab_nomul_seeded::<true>(&rows, first, end, &table, &mut got);
+                    assert_eq!(got, want, "seeded trial={trial} first={first} end={end}");
+                }
+            }
+        }
+    }
+
     /// The gather is an XOR chain over convert rows, so the pre-scaled table
     /// has to keep the convert table's F₂-linearity in the gathered byte (and
     /// its zero row). That is exactly what makes the scaled gather equal the
@@ -8692,3 +8726,126 @@ mod tests {
 // chewy-cadence: r578 20260806T044834Z
 
 // chewy-cadence: r582 20260806T045819Z
+
+/// Probe (ignored): single-P-core ns per active chunk of the round-one AB
+/// completion drain on a dumped real band (`ZK_DIR` = a FLOCK_ZK_DUMP dir
+/// with c_*.bin), record pair loop (store + seeded) vs the unrolled drain.
+/// `cargo test --release -p flock-core drain2_probe -- --ignored --nocapture`.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod drain2_probe {
+    use super::*;
+    use std::time::Instant;
+
+    fn f128s(b: &[u8]) -> Vec<F128> {
+        b.chunks_exact(16)
+            .map(|c| F128 {
+                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+            })
+            .collect()
+    }
+
+    /// Disassembly anchors for the instruction census (never called in tests).
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    pub(super) fn drain2_census_record(r: &[[u8; 64]; 16], f: usize, e: usize, t: &[F128], b: &mut [F128; ELL]) {
+        unsafe { kernels::aarch64::accumulate_convert_ab_nomul_seeded::<true>(r, f, e, t, b) }
+    }
+    #[inline(never)]
+    #[unsafe(no_mangle)]
+    pub(super) fn drain2_census_unrolled(r: &[[u8; 64]; 16], f: usize, e: usize, t: &[F128], b: &mut [F128; ELL]) {
+        unsafe { kernels::aarch64::accumulate_convert_ab_nomul_unrolled::<false, true>(r, f, e, t, b) }
+    }
+
+    #[test]
+    #[ignore]
+    fn drain2_probe() {
+        std::thread::spawn(|| {
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
+            }
+            // SAFETY: plain libSystem call on the current thread.
+            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+            let d: std::path::PathBuf = std::env::var_os("ZK_DIR").expect("ZK_DIR").into();
+            let meta: std::collections::HashMap<String, String> = std::fs::read_to_string(d.join("c_meta.txt"))
+                .unwrap()
+                .lines()
+                .filter_map(|l| l.split_once('=').map(|(k, v)| (k.into(), v.into())))
+                .collect();
+            let bank_bits: usize = meta["bank_bits"].parse().unwrap();
+            let big: usize = meta["big_lo_size"].parse().unwrap();
+            let idx = std::fs::read(d.join("c_idx.bin")).unwrap();
+            let rows = std::fs::read(d.join("c_rows.bin")).unwrap();
+            let tables = f128s(&std::fs::read(d.join("c_tables.bin")).unwrap());
+            let n_banks = 1usize << bank_bits;
+            let active = (0..big).filter(|&x| idx[2 * x + 1] > idx[2 * x]).count();
+            let mut hist = [0usize; 17];
+            for x in 0..big {
+                let (f, e) = (idx[2 * x] as usize, idx[2 * x + 1] as usize);
+                if e > f {
+                    hist[e - f] += 1;
+                }
+            }
+            let band = |unrolled: bool, banks: &mut [F128]| {
+                for x in 0..big {
+                    let (f, e) = (idx[2 * x] as usize, idx[2 * x + 1] as usize);
+                    let w = x >> bank_bits;
+                    let u = x & (n_banks - 1);
+                    let first = x < n_banks;
+                    let b: &mut [F128; ELL] = (&mut banks[u * ELL..(u + 1) * ELL]).try_into().unwrap();
+                    if e == 0 {
+                        if first {
+                            b.fill(F128::ZERO);
+                        }
+                        continue;
+                    }
+                    // SAFETY: 1 KiB per chunk in the dump; NEON on aarch64.
+                    let r: &[[u8; 64]; 16] = unsafe { &*rows.as_ptr().add(x * 1024).cast() };
+                    let t = &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE];
+                    unsafe {
+                        match (first, unrolled) {
+                            (true, false) => kernels::aarch64::accumulate_convert_ab_nomul::<true, true>(r, f, e, t, b),
+                            (false, false) => kernels::aarch64::accumulate_convert_ab_nomul_seeded::<true>(r, f, e, t, b),
+                            (true, true) => kernels::aarch64::accumulate_convert_ab_nomul_unrolled::<true, false>(r, f, e, t, b),
+                            (false, true) => kernels::aarch64::accumulate_convert_ab_nomul_unrolled::<false, true>(r, f, e, t, b),
+                        }
+                    }
+                }
+            };
+            {
+                let fs: [fn(&[[u8; 64]; 16], usize, usize, &[F128], &mut [F128; ELL]); 2] =
+                    [drain2_census_record, drain2_census_unrolled];
+                std::hint::black_box(fs);
+            }
+            let mut want = vec![F128 { lo: 1, hi: 2 }; n_banks * ELL];
+            let mut got = want.clone();
+            band(false, &mut want);
+            band(true, &mut got);
+            assert!(want == got, "unrolled drain differs");
+            println!("drain2: bank_bits {bank_bits} big_lo {big} active {active}; span histogram {hist:?}; identical");
+            let rounds: usize = std::env::var("PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(301);
+            let mut times = [Vec::new(), Vec::new()];
+            for r in 0..rounds {
+                for k in 0..2 {
+                    let i = (k + r) % 2;
+                    let t0 = Instant::now();
+                    for _ in 0..4 {
+                        band(i == 1, &mut got);
+                    }
+                    times[i].push(t0.elapsed().as_nanos() as f64 / (4.0 * active as f64));
+                }
+            }
+            std::hint::black_box(&got);
+            let mut paired: Vec<f64> = (0..rounds).map(|r| times[1][r] / times[0][r]).collect();
+            paired.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            for (i, n) in ["record pair loop", "unrolled drain"].iter().enumerate() {
+                let v = &mut times[i];
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!("  {n:<20} lq {:8.2} med {:8.2} ns/active chunk", v[v.len() / 4], v[v.len() / 2]);
+            }
+            println!("  paired new/record ratio: lq {:.4} med {:.4}", paired[paired.len() / 4], paired[paired.len() / 2]);
+        })
+        .join()
+        .unwrap();
+    }
+}

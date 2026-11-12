@@ -527,6 +527,155 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     }
 }
 
+/// [`accumulate_convert_ab_nomul`] / [`accumulate_convert_ab_nomul_seeded`]
+/// (unscaled loads) with the `b_med` pair loop fully unrolled at a
+/// compile-time pair count `NP` (plus the odd trailing `b_med` when `ODD`).
+/// Every table base is `tables + 4096·b` for a constant `b` (hoisted out of
+/// the lane loop) and every row word is an immediate offset from the lane
+/// pointer, so the per-pair loop counters, the per-pair odd-table address and
+/// the trip branch are gone. `STORE`: store the accumulators; `SEED`: seed
+/// them from the bank and store; neither: XOR them into the bank at the drain. Same loads, same XOR terms
+/// per lane (XOR is exact): same bytes.
+///
+/// # Safety
+/// `rows` points at `2·NP + ODD` 64-byte rows and `tables` at as many
+/// 256 × 16-byte tables (the incumbent's `first_b_med..n_b_med` ranges).
+#[inline(always)]
+unsafe fn accumulate_convert_ab_nomul_np<const STORE: bool, const SEED: bool, const NP: usize, const ODD: bool>(
+    rows: *const u8,
+    tables: *const u8,
+    bank: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let t = |b: usize| tables.add(b * 256 * 16);
+        for lane in (0..64).step_by(8) {
+            let r = rows.add(lane);
+            let slot = bank.as_mut_ptr().add(lane) as *mut u8;
+            let word = |b: usize| (r.add(b * 64) as *const u64).read_unaligned() as usize;
+            let init = |o: usize| if SEED { vld1q_u8(slot.add(o)) } else { vdupq_n_u8(0) };
+            let mut ab0 = init(0);
+            let mut ab1 = init(16);
+            let mut ab2 = init(32);
+            let mut ab3 = init(48);
+            let mut ab4 = init(64);
+            let mut ab5 = init(80);
+            let mut ab6 = init(96);
+            let mut ab7 = init(112);
+            macro_rules! pair {
+                ($p:literal) => {
+                    if $p < NP {
+                        let (te, to) = (t(2 * $p), t(2 * $p + 1));
+                        let (we, wo) = (word(2 * $p), word(2 * $p + 1));
+                        ab0 = xor3_u8(ab0, ab_ld::<true, 0>(te, we), ab_ld::<true, 0>(to, wo));
+                        ab1 = xor3_u8(ab1, ab_ld::<true, 8>(te, we), ab_ld::<true, 8>(to, wo));
+                        ab2 = xor3_u8(ab2, ab_ld::<true, 16>(te, we), ab_ld::<true, 16>(to, wo));
+                        ab3 = xor3_u8(ab3, ab_ld::<true, 24>(te, we), ab_ld::<true, 24>(to, wo));
+                        ab4 = xor3_u8(ab4, ab_ld::<true, 32>(te, we), ab_ld::<true, 32>(to, wo));
+                        ab5 = xor3_u8(ab5, ab_ld::<true, 40>(te, we), ab_ld::<true, 40>(to, wo));
+                        ab6 = xor3_u8(ab6, ab_ld::<true, 48>(te, we), ab_ld::<true, 48>(to, wo));
+                        ab7 = xor3_u8(ab7, ab_ld::<true, 56>(te, we), ab_ld::<true, 56>(to, wo));
+                    }
+                };
+            }
+            pair!(0);
+            pair!(1);
+            pair!(2);
+            pair!(3);
+            pair!(4);
+            pair!(5);
+            pair!(6);
+            pair!(7);
+            if ODD {
+                let table = t(2 * NP);
+                let wa = word(2 * NP);
+                ab0 = veorq_u8(ab0, ab_ld::<true, 0>(table, wa));
+                ab1 = veorq_u8(ab1, ab_ld::<true, 8>(table, wa));
+                ab2 = veorq_u8(ab2, ab_ld::<true, 16>(table, wa));
+                ab3 = veorq_u8(ab3, ab_ld::<true, 24>(table, wa));
+                ab4 = veorq_u8(ab4, ab_ld::<true, 32>(table, wa));
+                ab5 = veorq_u8(ab5, ab_ld::<true, 40>(table, wa));
+                ab6 = veorq_u8(ab6, ab_ld::<true, 48>(table, wa));
+                ab7 = veorq_u8(ab7, ab_ld::<true, 56>(table, wa));
+            }
+            macro_rules! drain_lane {
+                ($o:literal, $ab:ident) => {{
+                    let s = slot.add($o * 16);
+                    if !STORE && !SEED {
+                        vst1q_u8(s, veorq_u8(vld1q_u8(s), $ab));
+                    } else {
+                        vst1q_u8(s, $ab);
+                    }
+                }};
+            }
+            drain_lane!(0, ab0);
+            drain_lane!(1, ab1);
+            drain_lane!(2, ab2);
+            drain_lane!(3, ab3);
+            drain_lane!(4, ab4);
+            drain_lane!(5, ab5);
+            drain_lane!(6, ab6);
+            drain_lane!(7, ab7);
+        }
+    }
+}
+
+/// Whether the unrolled round-one AB completion drain is on
+/// (`FLOCK_NO_ZC_AB_UNROLL=1` keeps the incumbent pair loop; read once).
+pub(crate) fn ab_nomul_unroll_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_UNROLL").is_none_or(|v| v != *"1"))
+}
+
+/// The unscaled AB completion drain dispatched to the unrolled form by pair
+/// count (modes as [`accumulate_convert_ab_nomul_np`]). Same contract and
+/// bytes as [`accumulate_convert_ab_nomul`]`::<STORE, true>` (`!SEED`) and
+/// [`accumulate_convert_ab_nomul_seeded`]`::<true>` (`SEED`).
+///
+/// # Safety
+/// As [`accumulate_convert_ab_nomul`].
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_unrolled<const STORE: bool, const SEED: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[F128],
+    bank: &mut [F128; 64],
+) {
+    debug_assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
+    debug_assert_eq!(convert.len(), 16 * 256);
+    unsafe {
+        let rows = chunk_ab_bytes.as_ptr().add(first_b_med) as *const u8;
+        let tables = (convert.as_ptr() as *const u8).add(first_b_med * 256 * 16);
+        let n = n_b_med - first_b_med;
+        macro_rules! go {
+            ($np:literal, $odd:literal) => {
+                accumulate_convert_ab_nomul_np::<STORE, SEED, $np, $odd>(rows, tables, bank)
+            };
+        }
+        match n {
+            0 => go!(0, false),
+            1 => go!(0, true),
+            2 => go!(1, false),
+            3 => go!(1, true),
+            4 => go!(2, false),
+            5 => go!(2, true),
+            6 => go!(3, false),
+            7 => go!(3, true),
+            8 => go!(4, false),
+            9 => go!(4, true),
+            10 => go!(5, false),
+            11 => go!(5, true),
+            12 => go!(6, false),
+            13 => go!(6, true),
+            14 => go!(7, false),
+            15 => go!(7, true),
+            _ => go!(8, false),
+        }
+    }
+}
+
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
 ///
 /// Three phases, no multiplies, no convert-table gathers, and **no per-`b_med`
