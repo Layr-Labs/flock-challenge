@@ -8852,6 +8852,13 @@ kernel void blake3_pow_scan(
                             16 - k_cpu16,
                             fine_m,
                             || {
+                                // The CPU arm is idle until the GPU signals the
+                                // boundary sixteenth's layers 4..8: help the
+                                // draining main-pool queue until the signal (or
+                                // a failed cb2), then the exact wait below.
+                                super::help_pool_until(|| {
+                                    gpu.event_signaled_value(ev) >= want || gpu_cb_failed(gpu, cb2)
+                                });
                                 let mut spins = 0u32;
                                 while gpu.event_signaled_value(ev) < want {
                                     if gpu_cb_failed(gpu, cb2) {
