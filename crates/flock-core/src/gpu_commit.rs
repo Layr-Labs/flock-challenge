@@ -9395,7 +9395,7 @@ kernel void blake3_pow_scan(
     /// cost (the boundary sub-blocks add a separate layer-8 pair).
     const FINE_CPU_SHARE: f64 = 1.15;
     /// The fine split must beat the chosen split's measured window by this.
-    const FINE_MARGIN: f64 = 0.005;
+    const FINE_MARGIN: f64 = 0.0025;
 
     /// Per-sample `(k_split, cb2 GPU ms, CPU suffix ms, cb3 GPU ms)` from the
     /// GPU-suffix-hash path, recorded beside [`record_hybrid_arms`]. Unlike
