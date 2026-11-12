@@ -8446,7 +8446,9 @@ kernel void blake3_pow_scan(
                 // Passes 2..: layers 4..log_d in place over staging.
                 encode_ntt_and_merkle(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves);
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)?;
+                gpu.commit_async(cb);
+                super::help_pool_until(|| gpu.cb_status(cb) >= 4);
+                gpu.wait_cb(cb)?;
                 record_pure_gpu_arm(gpu, cb);
                 if window_trace_enabled() {
                     let (s, e) = cb_gpu_interval(gpu, cb);
@@ -9120,6 +9122,7 @@ kernel void blake3_pow_scan(
                 // join, and a sibling thread that still has work must be
                 // able to take the core (deferred-stripe join rationale).
                 // Past the budget it degrades to the exact blocking wait.
+                super::help_pool_until(|| gpu.cb_status(cb2) >= 4);
                 if super::hybrid_cb2_spin_enabled() {
                     gpu.yield_wait_cb_until(
                         cb2,
