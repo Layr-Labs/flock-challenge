@@ -6203,12 +6203,7 @@ fn fold_and_msg_lsb_into(
             (u0, u2)
         }
     };
-    // Hetero queue when the round is wide enough that every chunk claim is
-    // useful work: `half` is a power of two, so `half / CHUNK` chunks divide
-    // the outputs exactly; each chunk owns `[ci*CHUNK, (ci+1)*CHUNK)` of both
-    // outputs and one partial slot. Same chunk grid as the rayon path below,
-    // so bytes are identical either way.
-    if half >= 16 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+    if half >= 4 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
         let n_chunks = half / CHUNK;
         let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
         let f_base = crate::epool::SyncPtr(nf.as_mut_ptr());
@@ -6344,10 +6339,7 @@ fn fold_and_msg_lsb_into_with_lazy_ood_eq(
 
     // Hetero queue over the same per-`high_index` chunk grid (chunk width =
     // `eq_lo.len()`, one chunk per `eq_hi` entry — 128 × 2,048 at L1,
-    // 16 × 2,048 at L2, and 4 × 1,024 at L3). Identical kernels and chunk
-    // bases, so bytes are unchanged. The exact two-chunk L4 shape returned
-    // through the serial arm above.
-    if eq_hi.len() >= 16 && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+    if eq_hi.len() >= 4 && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
         let n_chunks = eq_hi.len();
         let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
         let f_base = crate::epool::SyncPtr(nf.as_mut_ptr());
@@ -6606,7 +6598,7 @@ fn fold2_and_msg_lsb(
             )
         };
         // Hetero queue over the identical chunk grid — bytes unchanged.
-        if quarter >= 16 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+        if quarter >= 4 * CHUNK && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
             let n_chunks = quarter / CHUNK;
             let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
             let f_base = crate::epool::SyncPtr(wf.as_mut_ptr());
