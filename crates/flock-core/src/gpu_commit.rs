@@ -9524,16 +9524,11 @@ kernel void blake3_pow_scan(
     /// fallback on its own, since it may have measured slowest. The published
     /// share is still byte-checked against the CPU commit.
     fn choose_hybrid_k(candidates: &[usize], best_ms: &[f64], default_k: usize) -> Option<usize> {
-        // Near-tie band: 2.0% (was 1.5%). With graph-arm scoring the band
-        // adjudicates real k differences rather than AB-dominated join noise,
-        // so a slightly wider GPU-ward bias is safe and prefers the smaller
-        // CPU share when margins are thin. `FLOCK_HYBRID_TIE_BAND=0.015`
-        // restores the old 1.5% width.
         let tie = std::env::var("FLOCK_HYBRID_TIE_BAND")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0 && *v < 0.1)
-            .unwrap_or(0.02);
+            .unwrap_or(0.03);
         let keep_default = std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some();
         choose_hybrid_k_with(candidates, best_ms, default_k, tie, keep_default)
     }
@@ -13939,7 +13934,6 @@ kernel void lc_fold_stripes_factored_b4(
 
         #[test]
         fn near_tie_prefers_smaller_share_not_default() {
-            // k=3 fastest; default k=5 within 2% band but larger share → k=3.
             let ms = [200.0, 150.0, 100.0, 101.5];
             assert_eq!(choose_hybrid_k(&C, &ms, DEFAULT_HYBRID_K), Some(3));
         }
