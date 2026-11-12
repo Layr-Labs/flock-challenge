@@ -7350,6 +7350,56 @@ fn direct_fold8_odd_slot_live_banks(padding: Option<(usize, usize)>) -> usize {
     }
 }
 
+/// Compose one direct claim's table into `scratch`: the nibble encoding
+/// (first [`super::ring_switch::FOLD_NIB_LEN`] entries) when `COMPACT`, else
+/// the byte encoding (all of it). Pair with [`direct_slot`] of the same form.
+#[inline(always)]
+fn direct_compose<const COMPACT: bool>(e_hi: F128, base: &[F128], scratch: &mut [F128]) {
+    if COMPACT {
+        super::ring_switch::compose_fold_nibble_table_into(e_hi, base, scratch);
+    } else {
+        super::ring_switch::compose_fold_byte_table_into(e_hi, base, scratch);
+    }
+}
+
+/// One slot's fold through the table [`direct_compose`] of the same form wrote.
+#[inline(always)]
+fn direct_slot<const COMPACT: bool>(elem: F128, tables: &[F128]) -> F128 {
+    if COMPACT {
+        super::ring_switch::fold_one_slot_nib(elem, tables)
+    } else {
+        super::ring_switch::fold_one_slot(elem, tables)
+    }
+}
+
+/// Direct basis of one block when `f_out` already holds the GPU's witness
+/// fold: the first claim's slot folds, the remaining claims' slot folds, then
+/// the block's round-zero partial, all lookups through the `COMPACT` form.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline(always)]
+fn fold8_b_only_body<const COMPACT: bool>(
+    claims: &[super::ring_switch::DirectFold8Factors],
+    direct_tables: &[Vec<F128>],
+    scratch: &mut Vec<F128>,
+    block: usize,
+    b_out: &mut [F128],
+    f_out: &[F128],
+) -> (F128, F128) {
+    let (first_claim, rest_claims) = claims.split_first().unwrap();
+    let (first_table, rest_tables) = direct_tables.split_first().unwrap();
+    direct_compose::<COMPACT>(first_claim.eq_hi[block], first_table, scratch);
+    for (slot, out) in b_out.iter_mut().enumerate() {
+        *out = direct_slot::<COMPACT>(first_claim.eq_lo[slot], scratch);
+    }
+    for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
+        direct_compose::<COMPACT>(claim.eq_hi[block], table, scratch);
+        for (slot, out) in b_out.iter_mut().enumerate() {
+            *out += direct_slot::<COMPACT>(claim.eq_lo[slot], scratch);
+        }
+    }
+    super::round0_deferred(f_out, b_out)
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from the direct
 /// factor state before this function binds the witness and combined basis in
 /// one N→N/64 pass. It emits M6 — the round message of the folded
@@ -7368,6 +7418,11 @@ fn materialize_direct_fold8(
     let has_ordinary = !ordinary_basis.is_empty();
     assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(64));
+    // Nibble-encoded composed tables (8 KiB written per claim and block
+    // instead of 64 KiB, 32 lookups per slot instead of 16) for the
+    // no-ordinary two-claim shape only; decided once per materialize.
+    let compact =
+        !has_ordinary && claims.len() == 2 && super::ring_switch::compact_compose_enabled();
 
     let zf_t0 = std::time::Instant::now();
     // GPU share of the witness fold (ranked hetero shape only, no ordinary
@@ -7445,7 +7500,7 @@ fn materialize_direct_fold8(
     // closure, token for token, and each form is compiled without the
     // others' code and with its bank split as a constant.
     macro_rules! fold8_block_body {
-        ($whole:literal, $odd_live:literal) => {
+        ($whole:literal, $odd_live:literal, $compact:literal) => {
     |scratch: &mut Vec<F128>,
                        block: usize,
                        b_out: &mut [F128],
@@ -7475,7 +7530,7 @@ fn materialize_direct_fold8(
 
         let (first_claim, rest_claims) = claims.split_first().unwrap();
         let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-        super::ring_switch::compose_fold_byte_table_into(
+        direct_compose::<$compact>(
             first_claim.eq_hi[block],
             first_table,
             scratch,
@@ -7502,13 +7557,13 @@ fn materialize_direct_fold8(
                     f_out[slot + 3] = folded_f[3];
                 }
 
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct0 = direct_slot::<$compact>(first_claim.eq_lo[slot], scratch);
                 let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
+                    direct_slot::<$compact>(first_claim.eq_lo[slot + 1], scratch);
                 let direct2 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
+                    direct_slot::<$compact>(first_claim.eq_lo[slot + 2], scratch);
                 let direct3 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
+                    direct_slot::<$compact>(first_claim.eq_lo[slot + 3], scratch);
                 if has_ordinary {
                     let folded_b = crate::field::f128_slice::fold_banked_slots4::<64>(
                         &fold_weight,
@@ -7537,9 +7592,9 @@ fn materialize_direct_fold8(
                 f_out[slot] = folded_f[0];
                 f_out[slot + 1] = folded_f[1];
 
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct0 = direct_slot::<$compact>(first_claim.eq_lo[slot], scratch);
                 let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
+                    direct_slot::<$compact>(first_claim.eq_lo[slot + 1], scratch);
                 if has_ordinary {
                     let folded_b = crate::field::f128_slice::fold_banked_slots2::<64>(
                         &fold_weight,
@@ -7556,7 +7611,7 @@ fn materialize_direct_fold8(
         }
         while slot < block_len {
             f_out[slot] = fold64(f_in, slot);
-            let direct = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+            let direct = direct_slot::<$compact>(first_claim.eq_lo[slot], scratch);
             b_out[slot] = if has_ordinary {
                 direct + fold64(b_in, slot)
             } else {
@@ -7565,29 +7620,33 @@ fn materialize_direct_fold8(
             slot += 1;
         }
         for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
+            direct_compose::<$compact>(claim.eq_hi[block], table, scratch);
             for (slot, out) in b_out.iter_mut().enumerate() {
-                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                *out += direct_slot::<$compact>(claim.eq_lo[slot], scratch);
             }
         }
         super::round0_deferred(f_out, b_out)
     }
         };
     }
-    let fold8_block_incumbent = fold8_block_body!(false, 64);
-    let fold8_block_whole = fold8_block_body!(true, 64);
-    let fold8_block_whole_tail = fold8_block_body!(true, 57);
+    let fold8_block_incumbent = fold8_block_body!(false, 64, false);
+    let fold8_block_whole = fold8_block_body!(true, 64, false);
+    let fold8_block_whole_tail = fold8_block_body!(true, 57, false);
+    let fold8_block_incumbent_c = fold8_block_body!(false, 64, true);
+    let fold8_block_whole_c = fold8_block_body!(true, 64, true);
+    let fold8_block_whole_tail_c = fold8_block_body!(true, 57, true);
     let fold8_block = |scratch: &mut Vec<F128>,
                        block: usize,
                        b_out: &mut [F128],
                        f_out: &mut [F128]|
      -> (F128, F128) {
-        if whole_fold64 && odd_slot_live == 57 {
-            fold8_block_whole_tail(scratch, block, b_out, f_out)
-        } else if whole_fold64 {
-            fold8_block_whole(scratch, block, b_out, f_out)
-        } else {
-            fold8_block_incumbent(scratch, block, b_out, f_out)
+        match (compact, whole_fold64, odd_slot_live == 57) {
+            (true, true, true) => fold8_block_whole_tail_c(scratch, block, b_out, f_out),
+            (true, true, false) => fold8_block_whole_c(scratch, block, b_out, f_out),
+            (true, false, _) => fold8_block_incumbent_c(scratch, block, b_out, f_out),
+            (false, true, true) => fold8_block_whole_tail(scratch, block, b_out, f_out),
+            (false, true, false) => fold8_block_whole(scratch, block, b_out, f_out),
+            (false, false, _) => fold8_block_incumbent(scratch, block, b_out, f_out),
         }
     };
     // The same block body when `f_out` already holds the GPU's witness fold
@@ -7601,23 +7660,11 @@ fn materialize_direct_fold8(
                         f_out: &[F128]|
      -> (F128, F128) {
         debug_assert!(!has_ordinary);
-        let (first_claim, rest_claims) = claims.split_first().unwrap();
-        let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-        super::ring_switch::compose_fold_byte_table_into(
-            first_claim.eq_hi[block],
-            first_table,
-            scratch,
-        );
-        for (slot, out) in b_out.iter_mut().enumerate() {
-            *out = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+        if compact {
+            fold8_b_only_body::<true>(claims, &direct_tables, scratch, block, b_out, f_out)
+        } else {
+            fold8_b_only_body::<false>(claims, &direct_tables, scratch, block, b_out, f_out)
         }
-        for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
-            for (slot, out) in b_out.iter_mut().enumerate() {
-                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-            }
-        }
-        super::round0_deferred(f_out, b_out)
     };
 
     let mut folded_f = crate::scratch::take_f128(out_len);
