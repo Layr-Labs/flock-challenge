@@ -2007,8 +2007,29 @@ fn commit_with_round1_ab_precompute(
             stripe_help,
         )
     };
+    // Replay output backing, zeroed once before the sweep and reused by
+    // every replay (`ExactTuneBacking`); `FLOCK_NO_TUNE_REPLAY_BACKING=1`
+    // restores the per-replay scratch take + full zero-fill.
+    let replay_backing: std::sync::Mutex<
+        Option<zerocheck::univariate_skip_optimized::ExactTuneBacking>,
+    > = std::sync::Mutex::new(None);
     let precompute_ab_replay = || {
-        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune(
+        let reuse = replay_backing.lock().unwrap().take();
+        if let Some(b) = reuse {
+            let b = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune_into(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+                identity_prefix_contract,
+                b,
+            );
+            *replay_backing.lock().unwrap() = Some(b);
+            return;
+        }
+        let replayed = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune(
             a_packed,
             b_packed,
             pcs_params.m,
@@ -2016,7 +2037,8 @@ fn commit_with_round1_ab_precompute(
             inv_table,
             padding,
             identity_prefix_contract,
-        )
+        );
+        std::hint::black_box(&replayed);
     };
     // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
     // generation. A valid cache hit may satisfy it inside the commit arm;
@@ -2088,15 +2110,18 @@ fn commit_with_round1_ab_precompute(
 
     flock_core::tmark::mark("commit join end");
     if run_ranked_exact_tune {
+        if std::env::var_os("FLOCK_NO_TUNE_REPLAY_BACKING").is_none() {
+            *replay_backing.lock().unwrap() = Some(
+                zerocheck::univariate_skip_optimized::ExactTuneBacking::zeroed(pcs_params.m),
+            );
+        }
         flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(
             pcs_params,
             &result.0.1.codeword,
             &result.0.1.merkle_tree,
-            || {
-                let replayed = precompute_ab_replay();
-                std::hint::black_box(&replayed);
-            },
+            precompute_ab_replay,
         );
+        drop(replay_backing.lock().unwrap().take());
     }
     result
 }
@@ -2489,6 +2514,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
     bind_statement(challenger, r1cs, &commitment);
     flock_core::tmark::mark("zc start");
+    // Lincheck GPU wake (see `flock_core::gpu_commit::ENV_NO_LC_GPU_WAKE`):
+    // zerocheck's tail wakes the idle GPU ahead of the lincheck prefix.
+    flock_core::gpu_commit::lc_gpu_wake_arm(true);
     // Hetero-queue linger (see `flock_core::epool::set_linger_phase`): armed
     // from lincheck through the PCS open, whose many short queues sit between
     // short serial steps. Zerocheck's long bandwidth-bound kernels measured
@@ -2554,6 +2582,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
+    flock_core::gpu_commit::lc_gpu_wake_arm(false);
     flock_core::tmark::mark("zc end");
     let cpu_lc0 = phase_timing.then(process_cpu_ms);
     let t_lc = std::time::Instant::now();

@@ -350,6 +350,58 @@ pub(crate) fn gpu_zerocheck_debug() -> bool {
 /// is XOR: associative and commutative, so any claim partition works).
 pub const ENV_NO_GPU_LINCHECK: &str = "FLOCK_NO_GPU_LINCHECK";
 
+/// Lincheck GPU wake (`FLOCK_NO_LC_GPU_WAKE=1`, exact, kills). The GPU sits
+/// idle from the zerocheck round-two arm (~28 ms before zerocheck returns)
+/// to the lincheck prefix fold, long enough to enter its deep idle state:
+/// the prefix then starts ~0.62 ms after submit (mini1, `GPUStartTime` minus
+/// the submit mark; still 0.61-0.64 ms with the CPU held idle after the
+/// submit, so it is GPU wake, not CPU starvation), and nine cores wait
+/// ~0.55-0.65 ms at the drain. Buffers submitted onto a GPU idle for up to
+/// ~3.5 ms start in ~0.1 ms. One 256-thread BLAKE3-leaf threadgroup on a
+/// private 264 KiB scratch pair, committed at zerocheck's first tri pass
+/// (~1.8 ms before the lincheck launch on mini1; `FLOCK_LC_GPU_WAKE_AT`
+/// moves it: tri pass index, 99 = after the tri loop, 100 = zerocheck
+/// return), wakes it: launch-to-start 0.09 ms, drain wait ~0. It touches no
+/// prove buffer, nothing waits on it, and it runs only in timed proves
+/// (after the warmup tuned the split). A gated precommit of the prefix
+/// itself (encodeWaitForEvent on a second queue, opened from the CPU at
+/// launch) does NOT wake the GPU: gate-to-start stayed 0.64 ms; an empty
+/// encoder does not either.
+pub const ENV_NO_LC_GPU_WAKE: &str = "FLOCK_NO_LC_GPU_WAKE";
+
+pub(crate) fn lc_gpu_wake_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var(ENV_NO_LC_GPU_WAKE).is_ok_and(|v| v == "1")
+    });
+    *ON
+}
+
+/// Armed by the prover for the ranked lincheck GPU arm; consumed by the
+/// first [`lc_gpu_wake_fire`] (zerocheck's tail).
+static LC_GPU_WAKE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm (or, with `false`, disarm) the lincheck GPU wake for this prove.
+pub fn lc_gpu_wake_arm(on: bool) {
+    if !on {
+        lc_gpu_wake_fire(100);
+    }
+    LC_GPU_WAKE_ARMED.store(on && lc_gpu_wake_enabled(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Fire the armed lincheck GPU wake (once per arm) at wake point `point`
+/// when it is the configured one (`FLOCK_LC_GPU_WAKE_AT`: zerocheck tri pass
+/// index, `99` = after the tri loop, `100` = zerocheck return).
+pub(crate) fn lc_gpu_wake_fire(point: u32) {
+    static AT: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_LC_GPU_WAKE_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if point != *AT || !LC_GPU_WAKE_ARMED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::lc_gpu_wake();
+}
+
 pub(crate) fn gpu_lincheck_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());
@@ -8622,6 +8674,42 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// [`run_from_z_first_pass`] that runs `next` right after the first
+    /// pass is committed and before waiting for it, so a command buffer
+    /// `next` commits queues directly behind the first pass on the GPU (the
+    /// timed prove's streamed path commits its cb2 behind the final tile).
+    unsafe fn run_from_z_first_pass_then(
+        gpu: &Gpu,
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        log_d: usize,
+        next: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        unsafe {
+            let cb1 = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb1)?;
+            FromZFirstPassPlan::new(log_d).encode_range(
+                gpu,
+                enc,
+                staging,
+                tw_buf,
+                z_buf,
+                log_d,
+                0,
+                1usize << (log_d - 4),
+            );
+            gpu.end_encoding(enc);
+            gpu.commit_async(cb1);
+            let queued = next();
+            if super::gpu_wait_help_enabled() && rayon::current_thread_index().is_some() {
+                super::help_pool_until(|| gpu.cb_status(cb1) >= 4);
+            }
+            let waited = gpu.wait_cb(cb1);
+            queued.and(waited)
+        }
+    }
+
     /// Hybrid GPU/CPU commit graph: the GPU runs the shared from-z top pass
     /// (layers 0..3) over the full codeword, then owns the position prefix
     /// (first `16 - k` sixteenths: remaining NTT passes + its aligned Merkle
@@ -8870,6 +8958,8 @@ kernel void blake3_pow_scan(
                         )?;
                     }
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
+                    // Same clock as the command buffers' GPU timestamps.
+                    let cpu_done_s = crate::tmark::now_ns() as f64 * 1e-9;
                     crate::tmark::mark("hybrid cpu ntt done");
                     let cb3 = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb3)?;
@@ -8912,6 +9002,9 @@ kernel void blake3_pow_scan(
                     crate::tmark::mark_gpu("cb3 gpu start", "cb3 gpu end", cb3_s, cb3_e);
                     record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
                     record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
+                    if cpu_done_s > cb2_e {
+                        record_cb3_launch_latency((cb3_s - cpu_done_s) * 1e3);
+                    }
                     if window_trace_enabled() {
                         eprintln!(
                             "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}, m={fine_m}): gpu dur {:.2} ms, \
@@ -9479,6 +9572,157 @@ kernel void blake3_pow_scan(
         } else {
             k
         }
+    }
+
+    /// Per-sample latency from the CPU suffix's end to cb3's GPU start, for
+    /// the samples whose CPU suffix finished after cb2 (cb3 is encoded and
+    /// committed only once the CPU suffix is done, so a CPU-late window pays
+    /// this on top of the CPU arm; a GPU-late window finds cb3 queued).
+    fn cb3_launch_latency_samples() -> &'static std::sync::Mutex<Vec<f64>> {
+        static V: std::sync::OnceLock<std::sync::Mutex<Vec<f64>>> = std::sync::OnceLock::new();
+        V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn record_cb3_launch_latency(ms: f64) {
+        if !hybrid_arm_recording() || !ms.is_finite() || !(0.0..20.0).contains(&ms) {
+            return;
+        }
+        if let Ok(mut v) = cb3_launch_latency_samples().lock() {
+            v.push(ms);
+        }
+    }
+
+    /// Median cb3 launch latency of the sweep, or 0 with none recorded or
+    /// under `FLOCK_NO_TUNE_CB3_LAT=1`.
+    fn tune_cb3_launch_latency_ms() -> f64 {
+        if std::env::var_os("FLOCK_NO_TUNE_CB3_LAT").is_some() {
+            return 0.0;
+        }
+        let mut v = cb3_launch_latency_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    }
+
+    /// `FLOCK_NO_TUNE_FIT=1` restores the per-split cheapest-sample pick
+    /// (`split_from_arms` + `fine_split_from_arms`) for a same-binary
+    /// comparison. Read once, at tune time; never changes proof bytes.
+    /// `FLOCK_TUNE_FIT_FINE_SHARES=1` prices fine splits with the
+    /// incumbent boundary shares instead of the straight lines.
+    fn tune_fit_fine_shares_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_TUNE_FIT_FINE_SHARES").is_some())
+    }
+
+    fn tune_fit_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TUNE_FIT").is_none())
+    }
+
+    /// Theil-Sen line `y = a + b x`: the median of the pairwise slopes over
+    /// distinct `x`, intercept the median of `y - b x`. One slow sample (a
+    /// contended reprime, a GPU clock dip) moves an ordinary least-squares
+    /// line by its full residual over `n`; here it moves the line not at all
+    /// until it is most of the samples.
+    fn theil_sen(xs: &[f64], ys: &[f64]) -> Option<(f64, f64)> {
+        fn median(v: &mut [f64]) -> f64 {
+            v.sort_by(|a, b| a.total_cmp(b));
+            let n = v.len();
+            if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+        }
+        let mut slopes = Vec::new();
+        for i in 0..xs.len() {
+            for j in i + 1..xs.len() {
+                if xs[j] != xs[i] {
+                    slopes.push((ys[j] - ys[i]) / (xs[j] - xs[i]));
+                }
+            }
+        }
+        if slopes.is_empty() {
+            return None;
+        }
+        let b = median(&mut slopes);
+        let mut r: Vec<f64> = xs.iter().zip(ys).map(|(x, y)| y - b * x).collect();
+        Some((median(&mut r), b))
+    }
+
+    /// The split, in the storable `k + 16 * m` form, that minimises the
+    /// commit window `max(cb2, cpu) + cb3` predicted by lines fitted through
+    /// EVERY hybrid sample of the sweep (each arm against the CPU share in
+    /// 256ths), or `None` to keep the incumbent pick.
+    ///
+    /// The incumbent prices each split from its single cheapest sample and
+    /// then interpolates between two of them, so one lucky or unlucky draw
+    /// of the ~12 moves the split by up to a sixteenth; the per-sample arms
+    /// scatter by 3-6 ms on a quiet host. All arms are near-linear in the
+    /// CPU share over the swept range (the CPU suffix's work and the GPU
+    /// prefix's work are both proportional to their ranges), so a robust
+    /// line through all samples locates the crossing to a few 256ths.
+    /// Fine (non-sixteenth) splits keep the incumbent's boundary-sixteenth
+    /// shares ([`FINE_GPU_SHARE`], [`FINE_CPU_SHARE`]) on top of the lines.
+    fn split_from_fit(
+        samples: &[(usize, f64, f64, f64)],
+        allow_fine: bool,
+        cb3_launch_ms: f64,
+    ) -> Option<usize> {
+        let rows: Vec<&(usize, f64, f64, f64)> = samples
+            .iter()
+            .filter(|s| {
+                let (k, m) = decode_hybrid_split(s.0);
+                m == 0 && (1..=ARM_SPLIT_MAX_K).contains(&k)
+            })
+            .collect();
+        let mut ks: Vec<usize> = rows.iter().map(|s| s.0).collect();
+        ks.sort_unstable();
+        ks.dedup();
+        if ks.len() < 3 {
+            return None;
+        }
+        let xs: Vec<f64> = rows.iter().map(|s| 16.0 * s.0 as f64).collect();
+        let col = |f: fn(&(usize, f64, f64, f64)) -> f64| rows.iter().map(|s| f(s)).collect::<Vec<f64>>();
+        let (ag, bg) = theil_sen(&xs, &col(|s| s.1))?;
+        let (ac, bc) = theil_sen(&xs, &col(|s| s.2))?;
+        let (ah, bh) = theil_sen(&xs, &col(|s| s.3))?;
+        // The prefix must shrink and the suffix grow with the CPU share,
+        // or the lines describe noise, not the two arms.
+        if !(bg < 0.0 && bc > 0.0 && [ag, ac, ah, bh].iter().all(|v| v.is_finite())) {
+            return None;
+        }
+        let line = |a: f64, b: f64, c: f64| a + b * c;
+        let lo = 16 * ks[0];
+        let hi = 16 * ks[ks.len() - 1];
+        let mut best = (0usize, f64::INFINITY);
+        for c in (lo..=hi).step_by(if allow_fine { 1 } else { 16 }) {
+            let (k, m) = (c / 16, c % 16);
+            let t = m as f64 / 16.0;
+            let x0 = 16.0 * k as f64;
+            let (g, cpu) = if m == 0 || !tune_fit_fine_shares_enabled() {
+                // Straight lines through the sub-blocks too: the timed
+                // proofs' arms at fine splits sit on the coarse samples'
+                // lines (measured), not on the boundary-share model.
+                (line(ag, bg, c as f64), line(ac, bc, c as f64))
+            } else {
+                // Boundary sixteenth: the GPU keeps its layers 4..8 and the
+                // CPU pays a separate layer-8 pair, as in the incumbent model.
+                (
+                    line(ag, bg, x0) + FINE_GPU_SHARE * bg * 16.0 * t,
+                    line(ac, bc, x0) + FINE_CPU_SHARE * bc * 16.0 * t,
+                )
+            };
+            // The finish line: cb3 runs behind cb2 on the queue, but is only
+            // committed once the CPU suffix is done.
+            let w = g.max(cpu + cb3_launch_ms) + line(ah, bh, c as f64).max(0.0);
+            if w < best.1 {
+                best = (c, w);
+            }
+        }
+        let (k, m) = (best.0 / 16, best.0 % 16);
+        if k == 0 || k >= 16 {
+            return None;
+        }
+        Some(k + 16 * m)
     }
 
     /// CPU reference-commit wall from the cache-miss warmup. Cache
@@ -10069,6 +10313,7 @@ kernel void blake3_pow_scan(
             tw_buf: latched.tw_buf,
             tree_buf: latched.tree_buf,
         };
+        let staged_cb2 = std::sync::atomic::AtomicUsize::new(0);
         let timed_graph = |k: usize| -> Result<(), String> {
             let c = &ctx;
             unsafe {
@@ -10082,6 +10327,7 @@ kernel void blake3_pow_scan(
                         params.n_leaves(),
                     )
                 } else {
+                    let pre = staged_cb2.swap(0, Ordering::AcqRel);
                     run_commit_graph_from_z_hybrid_impl(
                         c.gpu,
                         c.z_buf,
@@ -10092,7 +10338,7 @@ kernel void blake3_pow_scan(
                         params.n_leaves(),
                         k,
                         true,
-                        None,
+                        (pre != 0).then_some(pre as Id),
                     )
                 }
             }
@@ -10108,6 +10354,34 @@ kernel void blake3_pow_scan(
             let c = &ctx;
             unsafe {
                 run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, params.k_code())
+            }
+        };
+        // Queue each hybrid sample's cb2 directly behind its re-prime, as
+        // the timed prove's streamed path queues it behind the final first
+        // pass tile: the GPU then runs the first pass and the prefix back to
+        // back with no host round trip between them, as it does when timed.
+        // `FLOCK_NO_TUNE_PRE_CB2=1` restores the late cb2 commit.
+        let pre_cb2 = std::env::var_os("FLOCK_NO_TUNE_PRE_CB2").is_none();
+        let reprime_for = |k: usize| {
+            let c = &ctx;
+            unsafe {
+                run_from_z_first_pass_then(c.gpu, c.z_buf, c.staging, c.tw_buf, params.k_code(), || {
+                    if !pre_cb2 || k == 0 || !(1..16).contains(&k) {
+                        return Ok(());
+                    }
+                    let cb2 = encode_hybrid_prefix_cb2(
+                        c.gpu,
+                        c.staging,
+                        c.tw_buf,
+                        c.tree_buf,
+                        params.k_code(),
+                        params.n_leaves(),
+                        k,
+                    )?;
+                    c.gpu.commit_async(cb2);
+                    staged_cb2.store(cb2 as usize, Ordering::Release);
+                    Ok(())
+                })
             }
         };
         let (lead, extend, phi) = hybrid_tune_sampling();
@@ -10127,7 +10401,7 @@ kernel void blake3_pow_scan(
                 None
             };
             let (score, fp_ms) = sample_ranked_exact_graph(
-                &reprime,
+                || reprime_for(k),
                 || timed_graph(k),
                 &replay_ab,
                 delay,
@@ -10150,6 +10424,9 @@ kernel void blake3_pow_scan(
                 v.clear();
             }
             if let Ok(mut v) = fine_arm_samples().lock() {
+                v.clear();
+            }
+            if let Ok(mut v) = cb3_launch_latency_samples().lock() {
                 v.clear();
             }
             let _recording = ArmRecordScope::enter();
@@ -10193,7 +10470,18 @@ kernel void blake3_pow_scan(
             None => swept,
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
-        let chosen = if hybrid_fine_enabled() {
+        let fit = if tune_fit_enabled() && chosen != 0 {
+            split_from_fit(
+                &fine_samples,
+                hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled(),
+                tune_cb3_launch_latency_ms(),
+            )
+        } else {
+            None
+        };
+        let chosen = if let Some(s) = fit {
+            s
+        } else if hybrid_fine_enabled() {
             fine_split_from_arms(&fine_samples, chosen)
         } else {
             chosen
@@ -10203,7 +10491,11 @@ kernel void blake3_pow_scan(
                 .iter()
                 .map(|s| format!("k={}:{:.1}/{:.1}/{:.1}", s.0, s.1, s.2, s.3))
                 .collect();
-            eprintln!("[gpu-commit] fine split: chosen {chosen} | cb2/cpu/cb3 {}", rows.join(" "));
+            eprintln!(
+                "[gpu-commit] fine split: chosen {chosen} cb3-lat {:.2} | cb2/cpu/cb3 {}",
+                tune_cb3_launch_latency_ms(),
+                rows.join(" ")
+            );
         }
         if dbg {
             let arms: Vec<String> = candidates
@@ -13506,6 +13798,45 @@ kernel void lc_fold_stripes_factored_b4(
         Some((eq, job, submitted))
     }
 
+    /// Lincheck GPU wake (see `ENV_NO_LC_GPU_WAKE`): one leaf-kernel
+    /// threadgroup on a private scratch pair, fire-and-forget on the main
+    /// queue. Only once the lincheck split is tuned (timed proves) and only
+    /// while the arm is on.
+    pub(crate) fn lc_gpu_wake() {
+        if !super::gpu_lincheck_enabled() {
+            return;
+        }
+        let arm = FoldArm::Lincheck;
+        let tuned = arm.tuned().load(std::sync::atomic::Ordering::Relaxed);
+        if arm.claim_override().is_none() && (tuned == usize::MAX || tuned == 0) {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        static SCRATCH: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+        let Some((data, tree)) = *SCRATCH.get_or_init(|| unsafe {
+            match (gpu.new_buffer(256 * 1024), gpu.new_buffer(256 * 32)) {
+                (Ok(d), Ok(t)) => Some((d as usize, t as usize)),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            if let Ok(cb) = gpu.command_buffer()
+                && let Ok(enc) = gpu.compute_encoder(cb)
+            {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, data as Id, 0, 0);
+                gpu.set_buffer(enc, tree as Id, 0, 1);
+                gpu.dispatch(enc, 1, 256);
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb);
+            }
+            gpu.pool_pop(pool);
+        }
+    }
+
     /// Submit the GPU prefix of the LINCHECK window's witness-stripe fold —
     /// the same gather+XOR kernel over the same no-copy wrapped stripe and
     /// the same oblock claim partition as the round-one C fold, gated by
@@ -13703,6 +14034,39 @@ kernel void lc_fold_stripes_factored_b4(
     #[cfg(test)]
     mod hybrid_balance_tests {
         use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
+
+        #[test]
+        fn theil_sen_ignores_one_outlier() {
+            let xs = [32.0, 48.0, 64.0, 80.0, 32.0, 48.0, 64.0, 80.0];
+            let mut ys: Vec<f64> = xs.iter().map(|x| 60.0 - 0.25 * x).collect();
+            ys[2] += 9.0;
+            let (a, b) = super::theil_sen(&xs, &ys).unwrap();
+            assert!((b + 0.25).abs() < 1e-9 && (a - 60.0).abs() < 1e-9, "{a} {b}");
+            assert!(super::theil_sen(&[1.0, 1.0], &[2.0, 3.0]).is_none());
+        }
+
+        #[test]
+        fn split_from_fit_finds_the_crossing() {
+            // cb2 = 58 - 0.25 c, cpu = 20 + 0.30 c (256ths): crossing at
+            // c = 69.09; with a 0.55 ms cb3 launch on CPU-late splits the
+            // window max(cb2, cpu + 0.55) + cb3 is minimal at c = 68.
+            let mut s = Vec::new();
+            for k in [2usize, 3, 4, 5, 5, 4, 3, 2] {
+                let c = 16.0 * k as f64;
+                s.push((k, 58.0 - 0.25 * c, 20.0 + 0.30 * c, 0.4 * k as f64));
+            }
+            let fine = super::split_from_fit(&s, true, 0.0).unwrap();
+            assert_eq!(super::decode_hybrid_split(fine), (4, 5));
+            let fine = super::split_from_fit(&s, true, 0.55).unwrap();
+            assert_eq!(super::decode_hybrid_split(fine), (4, 4));
+            // Coarse only: k = 4 (64) beats k = 5 (80).
+            assert_eq!(super::split_from_fit(&s, false, 0.0), Some(4));
+            // Too few distinct splits, or arms that do not cross: keep the
+            // incumbent pick.
+            assert_eq!(super::split_from_fit(&s[..1], true, 0.0), None);
+            let flat: Vec<_> = s.iter().map(|r| (r.0, 40.0, 40.0 - r.0 as f64, 1.0)).collect();
+            assert_eq!(super::split_from_fit(&flat, true, 0.0), None);
+        }
 
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
         #[test]
