@@ -915,6 +915,94 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
     }
 }
 
+/// [`round0`] fused with the final additive basis update: for every slot,
+/// `basis[i] += delta(i)` is stored and the updated value feeds the same
+/// four raw Karatsuba streams, so the completed basis is never re-read.
+/// `delta` is called once per slot in increasing slot order.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). `witness` and `basis` must have
+/// equal lengths divisible by two.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn round0_add_basis<D: FnMut(usize) -> F128>(
+    witness: &[F128],
+    basis: &mut [F128],
+    mut delta: D,
+) -> (F128, F128) {
+    unsafe {
+        debug_assert_eq!(witness.len(), basis.len());
+        debug_assert!(witness.len().is_multiple_of(2));
+
+        let zero = vdupq_n_u64(0);
+        let mut u0_a = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut u0_b = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut u2_a = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+        let mut u2_b = KaratsubaNeon {
+            ll: zero,
+            hh: zero,
+            mm: zero,
+        };
+
+        let n = witness.len();
+        let main = n & !3;
+        let wp = witness.as_ptr();
+        let bp = basis.as_mut_ptr();
+        // SAFETY (closure): `j < n = basis.len()` at every call site below.
+        let mut update = |j: usize| -> uint64x2_t {
+            let v = *bp.add(j) + delta(j);
+            *bp.add(j) = v;
+            transmute::<F128, uint64x2_t>(v)
+        };
+        let mut i = 0usize;
+        while i < main {
+            let a0 = vld1q_u64(wp.add(i).cast::<u64>());
+            let a1 = vld1q_u64(wp.add(i + 1).cast::<u64>());
+            let a2 = vld1q_u64(wp.add(i + 2).cast::<u64>());
+            let a3 = vld1q_u64(wp.add(i + 3).cast::<u64>());
+            let b0 = update(i);
+            let b1 = update(i + 1);
+            let b2 = update(i + 2);
+            let b3 = update(i + 3);
+            xor_karatsuba_variable(&mut u0_a, a0, b0);
+            xor_karatsuba_variable(&mut u0_b, a2, b2);
+            xor_karatsuba_variable(&mut u2_a, veorq_u64(a0, a1), veorq_u64(b0, b1));
+            xor_karatsuba_variable(&mut u2_b, veorq_u64(a2, a3), veorq_u64(b2, b3));
+            i += 4;
+        }
+        while i < n {
+            let a0 = vld1q_u64(wp.add(i).cast::<u64>());
+            let a1 = vld1q_u64(wp.add(i + 1).cast::<u64>());
+            let b0 = update(i);
+            let b1 = update(i + 1);
+            xor_karatsuba_variable(&mut u0_a, a0, b0);
+            xor_karatsuba_variable(&mut u2_a, veorq_u64(a0, a1), veorq_u64(b0, b1));
+            i += 2;
+        }
+
+        for (left, right) in [(&mut u0_a, u0_b), (&mut u2_a, u2_b)] {
+            left.ll = veorq_u64(left.ll, right.ll);
+            left.hh = veorq_u64(left.hh, right.hh);
+            left.mm = veorq_u64(left.mm, right.mm);
+        }
+        let red = |value: KaratsubaNeon| {
+            transmute::<uint64x2_t, F128>(reduce_wide(karatsuba_to_wide(value)))
+        };
+        (red(u0_a), red(u2_a))
+    }
+}
+
 /// Deferred-reduction sufficient statistics for a factorized LSB equality
 /// basis. Each tail value multiplies the even and odd witness values. Their
 /// product streams remain in raw Karatsuba form until the end; after reducing,

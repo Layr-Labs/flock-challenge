@@ -7350,6 +7350,71 @@ fn direct_fold8_odd_slot_live_banks(padding: Option<(usize, usize)>) -> usize {
     }
 }
 
+/// Exact same-binary rollback for fusing the last direct claim's basis
+/// update with the block's round-zero statistics: any value of
+/// `FLOCK_NO_ROUND0_BASIS_FUSION` keeps the separate update loop followed by
+/// [`super::round0_deferred`]. Same bytes either way.
+#[cfg_attr(
+    not(all(target_arch = "aarch64", target_feature = "aes")),
+    allow(dead_code)
+)]
+fn round0_basis_fusion_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ROUND0_BASIS_FUSION").is_none());
+    *ON
+}
+
+/// Add the remaining direct claims' slot folds into `b_out` and return the
+/// block's round-zero partial over `(f_out, b_out)`. On the deferred-reduction
+/// AArch64 path the last claim's update runs inside the round-zero streams
+/// (`f128_slice::round0_add_basis`), so the completed basis is not re-read;
+/// every other configuration runs the separate loops and
+/// [`super::round0_deferred`]. Both write the same `b_out` and partial.
+#[inline(always)]
+fn direct_fold8_rest_claims_round0(
+    rest_claims: &[super::ring_switch::DirectFold8Factors],
+    rest_tables: &[Vec<F128>],
+    block: usize,
+    scratch: &mut Vec<F128>,
+    b_out: &mut [F128],
+    f_out: &[F128],
+) -> (F128, F128) {
+    assert_eq!(f_out.len(), b_out.len());
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if let (Some((last_claim, init_claims)), Some((last_table, init_tables))) =
+        (rest_claims.split_last(), rest_tables.split_last())
+        && rest_claims.len() == rest_tables.len()
+        && super::use_fold_deferred_reduce()
+        && round0_basis_fusion_enabled()
+        && b_out.len().is_multiple_of(2)
+        && last_claim.eq_lo.len() == b_out.len()
+    {
+        for (claim, table) in init_claims.iter().zip(init_tables.iter()) {
+            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
+            for (slot, out) in b_out.iter_mut().enumerate() {
+                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+            }
+        }
+        super::ring_switch::compose_fold_byte_table_into(
+            last_claim.eq_hi[block],
+            last_table,
+            scratch,
+        );
+        let tables: &[F128] = scratch;
+        let eq_lo: &[F128] = &last_claim.eq_lo;
+        return crate::field::f128_slice::round0_add_basis(f_out, b_out, |slot| {
+            super::ring_switch::fold_one_slot(eq_lo[slot], tables)
+        });
+    }
+    for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
+        super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
+        for (slot, out) in b_out.iter_mut().enumerate() {
+            *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+        }
+    }
+    super::round0_deferred(f_out, b_out)
+}
+
 /// Sixty-four-bank materializer. Six challenges are sampled from the direct
 /// factor state before this function binds the witness and combined basis in
 /// one N→N/64 pass. It emits M6 — the round message of the folded
@@ -7564,13 +7629,7 @@ fn materialize_direct_fold8(
             };
             slot += 1;
         }
-        for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
-            for (slot, out) in b_out.iter_mut().enumerate() {
-                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-            }
-        }
-        super::round0_deferred(f_out, b_out)
+        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
     }
         };
     }
@@ -7611,13 +7670,7 @@ fn materialize_direct_fold8(
         for (slot, out) in b_out.iter_mut().enumerate() {
             *out = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
         }
-        for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
-            for (slot, out) in b_out.iter_mut().enumerate() {
-                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-            }
-        }
-        super::round0_deferred(f_out, b_out)
+        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
     };
 
     let mut folded_f = crate::scratch::take_f128(out_len);
