@@ -98,16 +98,18 @@ pub(crate) fn help_guest_until(
         if done() {
             return 0;
         }
-        GUESTS.fetch_add(1, Ordering::SeqCst);
-        let p = GUEST.load(Ordering::SeqCst);
-        if !p.is_null() {
-            // SAFETY: the publisher cannot return while GUESTS > 0 and it
-            // unpublishes (SeqCst) before checking GUESTS.
-            let ran = unsafe { (**p)(done) };
+        if !GUEST.load(Ordering::Relaxed).is_null() {
+            GUESTS.fetch_add(1, Ordering::SeqCst);
+            let p = GUEST.load(Ordering::SeqCst);
+            if !p.is_null() {
+                // SAFETY: the publisher cannot return while GUESTS > 0 and it
+                // unpublishes (SeqCst) before checking GUESTS.
+                let ran = unsafe { (**p)(done) };
+                GUESTS.fetch_sub(1, Ordering::SeqCst);
+                return ran;
+            }
             GUESTS.fetch_sub(1, Ordering::SeqCst);
-            return ran;
         }
-        GUESTS.fetch_sub(1, Ordering::SeqCst);
         if started.elapsed() >= wait_for_queue {
             return 0;
         }
