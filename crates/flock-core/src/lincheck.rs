@@ -1533,6 +1533,46 @@ fn sumcheck_bind_both_and_eval_next(
     (e1, einf)
 }
 
+fn sumcheck_bind_both_into_and_eval_next_serial(
+    comb: &mut Vec<F128>,
+    z_src: &[F128],
+    z_dst: &mut Vec<F128>,
+    r: F128,
+) -> (F128, F128) {
+    let len = comb.len();
+    debug_assert_eq!(z_src.len(), len);
+    let half = len / 2;
+    let half2 = half / 2;
+    debug_assert!(half2 >= 1, "fused step needs a well-defined next round");
+    assert!(z_dst.len() >= half);
+    z_dst.truncate(half);
+
+    let (c_lo, c_hi) = comb.split_at_mut(half);
+    let (cq0, cq1) = c_lo.split_at_mut(half2);
+    let (cq2, cq3) = c_hi.split_at(half2);
+    let (z_lo, z_hi) = z_src.split_at(half);
+    let (zq0, zq1) = z_lo.split_at(half2);
+    let (zq2, zq3) = z_hi.split_at(half2);
+    let (zd0, zd1) = z_dst.split_at_mut(half2);
+
+    let mut e1 = crate::field::F256Unreduced::ZERO;
+    let mut einf = crate::field::F256Unreduced::ZERO;
+    for i in 0..half2 {
+        let lo = cq0[i] + r * (cq2[i] + cq0[i]);
+        let hi = cq1[i] + r * (cq3[i] + cq1[i]);
+        let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
+        let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+        cq0[i] = lo;
+        cq1[i] = hi;
+        zd0[i] = zlo;
+        zd1[i] = zhi;
+        e1 ^= hi.mul_unreduced(zhi);
+        einf ^= (hi + lo).mul_unreduced(zhi + zlo);
+    }
+    comb.truncate(half);
+    (e1.reduce(), einf.reduce())
+}
+
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
@@ -1743,21 +1783,25 @@ fn prove_padded_inner<Ch: Challenger>(
         } else {
             rayon::join(comb_branch, z_branch)
         };
-    // 3b. Optional capture: copy the pre-sumcheck z_vec into the dead eq_inner
-    //     allocation for downstream reuse (PCS open's AB-claim s_hat_v skipping
-    //     fold_1b_rows), avoiding a fresh 2^k_log F128 allocation.
-    let captured_z_vec: Option<Vec<F128>> = if capture_z_vec && eq_inner.len() == z_vec.len() {
-        let mut cap = eq_inner;
-        cap.copy_from_slice(&z_vec);
-        Some(cap)
-    } else {
-        crate::scratch::give_lincheck_eq(eq_inner);
-        if capture_z_vec {
-            Some(z_vec.clone())
+    let mut z_bind_dst: Option<Vec<F128>> = None;
+    let mut captured_z_vec: Option<Vec<F128>> =
+        if capture_z_vec && eq_inner.len() == z_vec.len() {
+            if inner_rest_len >= 2 && lc_sumcheck_par_min(k) == usize::MAX {
+                z_bind_dst = Some(eq_inner);
+                None
+            } else {
+                let mut cap = eq_inner;
+                cap.copy_from_slice(&z_vec);
+                Some(cap)
+            }
         } else {
-            None
-        }
-    };
+            crate::scratch::give_lincheck_eq(eq_inner);
+            if capture_z_vec {
+                Some(z_vec.clone())
+            } else {
+                None
+            }
+        };
     let t_sumcheck_start = if trace {
         Some(std::time::Instant::now())
     } else {
@@ -1785,7 +1829,18 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r, par_min);
+                let (ne1, neinf) = if let Some(mut dst) = z_bind_dst.take() {
+                    let next = sumcheck_bind_both_into_and_eval_next_serial(
+                        &mut comb_vec,
+                        &z_vec,
+                        &mut dst,
+                        r,
+                    );
+                    captured_z_vec = Some(std::mem::replace(&mut z_vec, dst));
+                    next
+                } else {
+                    sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r, par_min)
+                };
                 e1 = ne1;
                 einf = neinf;
             } else {
