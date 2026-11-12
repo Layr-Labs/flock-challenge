@@ -9533,7 +9533,7 @@ kernel void blake3_pow_scan(
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0 && *v < 0.1)
-            .unwrap_or(0.02);
+            .unwrap_or(0.015);
         let keep_default = std::env::var_os("FLOCK_HYBRID_KEEP_DEFAULT_BAND").is_some();
         choose_hybrid_k_with(candidates, best_ms, default_k, tie, keep_default)
     }
