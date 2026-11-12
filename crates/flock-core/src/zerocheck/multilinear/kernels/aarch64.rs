@@ -1441,20 +1441,8 @@ unsafe fn r2_pair_fold_and_store(
             return (zero, zero, zero, zero, false);
         }
 
-        let row0 = 2 * x_lo;
-        let row1 = row0 + 1;
-        let a0_code = u64::from_le(core::ptr::read_unaligned(
-            a_packed.add(row0 * 8).cast::<u64>(),
-        ));
-        let a1_code = u64::from_le(core::ptr::read_unaligned(
-            a_packed.add(row1 * 8).cast::<u64>(),
-        ));
-        let b0_code = u64::from_le(core::ptr::read_unaligned(
-            b_packed.add(row0 * 8).cast::<u64>(),
-        ));
-        let b1_code = u64::from_le(core::ptr::read_unaligned(
-            b_packed.add(row1 * 8).cast::<u64>(),
-        ));
+        let (a0_code, a1_code) = load_code_pair_gpr(a_packed.add(2 * x_lo * 8).cast::<u64>());
+        let (b0_code, b1_code) = load_code_pair_gpr(b_packed.add(2 * x_lo * 8).cast::<u64>());
 
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
