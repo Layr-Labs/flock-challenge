@@ -216,6 +216,10 @@ fn spawn_lingerers(main_threads: usize) {
     }
 }
 
+pub fn prewake_lingerers() {
+    spawn_lingerers(rayon::current_num_threads());
+}
+
 thread_local! {
     static IN_LINGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

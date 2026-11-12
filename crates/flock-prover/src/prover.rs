@@ -2566,6 +2566,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     flock_core::epool::set_linger_phase(true);
     let (lc_proof, lc_claim, z_vec_pre) = flock_core::in_pool(|| {
         flock_core::tmark::mark("lc body start");
+        flock_core::epool::prewake_lingerers();
         lincheck::prove_padded_capture_z_vec(
             &z_packed_lincheck,
             r1cs.m,
