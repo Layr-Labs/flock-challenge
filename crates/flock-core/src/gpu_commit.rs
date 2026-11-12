@@ -1367,9 +1367,6 @@ mod z_pin_gate_tests {
 }
 
 /// Strict kill switch for the bounded yield-spin drains on the hybrid
-/// commit's GPU waits: the streamed per-band drain at finish entry and the
-/// cb2 deep-prefix join after the CPU suffix. Only exact value `1` restores
-/// the incumbent blocking `waitUntilCompleted` at both sites. The spin
 /// consumes the same completed command buffers in the same order with the
 /// same status check, and past its budget degrades to the exact blocking
 /// wait — proof bytes are untouched either way; the switch is purely the
@@ -11178,16 +11175,22 @@ kernel void blake3_pow_scan(
 
         let total_r = 1usize << (stream.log_d - 4);
         // Early pure-GPU graph: it is queued behind every streamed band, so
-        // one blocking wait on it covers the whole first pass too; the band
-        // drain below then finds every band complete at its first status
-        // poll instead of yield-polling a 4 ms budget on this rayon worker.
         let early_graph_wait = stream
             .early_graph
             .take()
             .map(|cb| {
                 let gpu = stream.gpu;
                 super::help_pool_until(|| unsafe { gpu.cb_status(cb) } >= 4);
-                let r = unsafe { stream.gpu.wait_cb(cb) };
+                let r = if super::hybrid_cb2_spin_enabled() {
+                    unsafe {
+                        stream.gpu.yield_wait_cb_until(
+                            cb,
+                            std::time::Instant::now() + std::time::Duration::from_millis(4),
+                        )
+                    }
+                } else {
+                    unsafe { stream.gpu.wait_cb(cb) }
+                };
                 crate::tmark::mark("early graph waited");
                 (cb, r)
             });
