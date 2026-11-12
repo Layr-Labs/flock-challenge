@@ -509,12 +509,17 @@ pub(crate) fn drain_hetero<H>(
 /// same atomic cursor (the main workers drain to the end), and `f(i)` does not
 /// depend on which thread runs it, so outputs are byte-identical.
 /// `FLOCK_NO_EPOOL_TAIL_GUARD=1` restores unconditional helper claims.
+///
+#[repr(align(128))]
 struct TailGuard {
     on: bool,
     main_threads: u64,
     main_ns: AtomicU64,
     main_cnt: AtomicU64,
 }
+
+#[repr(align(128))]
+struct LineCursor(AtomicUsize);
 
 fn tail_guard_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -907,7 +912,8 @@ fn run_chunks_with_helper_arm<F>(
         }
         return;
     }
-    let next = AtomicUsize::new(0);
+    let next = LineCursor(AtomicUsize::new(0));
+    let next = &next.0;
     let guard = TailGuard::new(main_threads);
     let worker = || {
         loop {
@@ -1009,7 +1015,8 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
         }
         return;
     }
-    let next = AtomicUsize::new(0);
+    let next = LineCursor(AtomicUsize::new(0));
+    let next = &next.0;
     let guard = TailGuard::new(main_threads);
     let worker = || {
         let mut state = init();
