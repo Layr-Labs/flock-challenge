@@ -8870,6 +8870,7 @@ kernel void blake3_pow_scan(
                         )?;
                     }
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
+                    let cpu_done_s = crate::tmark::now_ns() as f64 * 1e-9;
                     crate::tmark::mark("hybrid cpu ntt done");
                     let cb3 = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb3)?;
@@ -8912,6 +8913,9 @@ kernel void blake3_pow_scan(
                     crate::tmark::mark_gpu("cb3 gpu start", "cb3 gpu end", cb3_s, cb3_e);
                     record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
                     record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
+                    if cpu_done_s > cb2_e {
+                        record_cb3_launch_latency((cb3_s - cpu_done_s) * 1e3);
+                    }
                     if window_trace_enabled() {
                         eprintln!(
                             "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}, m={fine_m}): gpu dur {:.2} ms, \
@@ -9479,6 +9483,96 @@ kernel void blake3_pow_scan(
         } else {
             k
         }
+    }
+
+    fn cb3_launch_latency_samples() -> &'static std::sync::Mutex<Vec<f64>> {
+        static V: std::sync::OnceLock<std::sync::Mutex<Vec<f64>>> = std::sync::OnceLock::new();
+        V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn record_cb3_launch_latency(ms: f64) {
+        if !hybrid_arm_recording() || !ms.is_finite() || !(0.0..20.0).contains(&ms) {
+            return;
+        }
+        if let Ok(mut v) = cb3_launch_latency_samples().lock() {
+            v.push(ms);
+        }
+    }
+
+    fn tune_cb3_launch_latency_ms() -> f64 {
+        let mut v = cb3_launch_latency_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    }
+
+    fn theil_sen(xs: &[f64], ys: &[f64]) -> Option<(f64, f64)> {
+        fn median(v: &mut [f64]) -> f64 {
+            v.sort_by(|a, b| a.total_cmp(b));
+            let n = v.len();
+            if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+        }
+        let mut slopes = Vec::new();
+        for i in 0..xs.len() {
+            for j in i + 1..xs.len() {
+                if xs[j] != xs[i] {
+                    slopes.push((ys[j] - ys[i]) / (xs[j] - xs[i]));
+                }
+            }
+        }
+        if slopes.is_empty() {
+            return None;
+        }
+        let b = median(&mut slopes);
+        let mut r: Vec<f64> = xs.iter().zip(ys).map(|(x, y)| y - b * x).collect();
+        Some((median(&mut r), b))
+    }
+
+    ///
+    fn split_from_fit(
+        samples: &[(usize, f64, f64, f64)],
+        allow_fine: bool,
+        cb3_launch_ms: f64,
+    ) -> Option<usize> {
+        let rows: Vec<&(usize, f64, f64, f64)> = samples
+            .iter()
+            .filter(|s| {
+                let (k, m) = decode_hybrid_split(s.0);
+                m == 0 && (1..=ARM_SPLIT_MAX_K).contains(&k)
+            })
+            .collect();
+        let mut ks: Vec<usize> = rows.iter().map(|s| s.0).collect();
+        ks.sort_unstable();
+        ks.dedup();
+        if ks.len() < 3 {
+            return None;
+        }
+        let xs: Vec<f64> = rows.iter().map(|s| 16.0 * s.0 as f64).collect();
+        let col = |f: fn(&(usize, f64, f64, f64)) -> f64| rows.iter().map(|s| f(s)).collect::<Vec<f64>>();
+        let (ag, bg) = theil_sen(&xs, &col(|s| s.1))?;
+        let (ac, bc) = theil_sen(&xs, &col(|s| s.2))?;
+        let (ah, bh) = theil_sen(&xs, &col(|s| s.3))?;
+        if !(bg < 0.0 && bc > 0.0 && [ag, ac, ah, bh].iter().all(|v| v.is_finite())) {
+            return None;
+        }
+        let line = |a: f64, b: f64, c: f64| a + b * c;
+        let lo = 16 * ks[0];
+        let hi = 16 * ks[ks.len() - 1];
+        let mut best = (0usize, f64::INFINITY);
+        for c in (lo..=hi).step_by(if allow_fine { 1 } else { 16 }) {
+            let (g, cpu) = (line(ag, bg, c as f64), line(ac, bc, c as f64));
+            let w = g.max(cpu + cb3_launch_ms) + line(ah, bh, c as f64).max(0.0);
+            if w < best.1 {
+                best = (c, w);
+            }
+        }
+        let (k, m) = (best.0 / 16, best.0 % 16);
+        if k == 0 || k >= 16 {
+            return None;
+        }
+        Some(k + 16 * m)
     }
 
     /// CPU reference-commit wall from the cache-miss warmup. Cache
@@ -10152,6 +10246,9 @@ kernel void blake3_pow_scan(
             if let Ok(mut v) = fine_arm_samples().lock() {
                 v.clear();
             }
+            if let Ok(mut v) = cb3_launch_latency_samples().lock() {
+                v.clear();
+            }
             let _recording = ArmRecordScope::enter();
             match collect_ranked_exact_samples(extend, sample) {
                 Ok(samples) => samples,
@@ -10193,7 +10290,18 @@ kernel void blake3_pow_scan(
             None => swept,
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
-        let chosen = if hybrid_fine_enabled() {
+        let fit = if chosen != 0 {
+            split_from_fit(
+                &fine_samples,
+                hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled(),
+                tune_cb3_launch_latency_ms(),
+            )
+        } else {
+            None
+        };
+        let chosen = if let Some(s) = fit {
+            s
+        } else if hybrid_fine_enabled() {
             fine_split_from_arms(&fine_samples, chosen)
         } else {
             chosen
@@ -10203,7 +10311,11 @@ kernel void blake3_pow_scan(
                 .iter()
                 .map(|s| format!("k={}:{:.1}/{:.1}/{:.1}", s.0, s.1, s.2, s.3))
                 .collect();
-            eprintln!("[gpu-commit] fine split: chosen {chosen} | cb2/cpu/cb3 {}", rows.join(" "));
+            eprintln!(
+                "[gpu-commit] fine split: chosen {chosen} cb3-lat {:.2} | cb2/cpu/cb3 {}",
+                tune_cb3_launch_latency_ms(),
+                rows.join(" ")
+            );
         }
         if dbg {
             let arms: Vec<String> = candidates
@@ -13703,6 +13815,33 @@ kernel void lc_fold_stripes_factored_b4(
     #[cfg(test)]
     mod hybrid_balance_tests {
         use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
+
+        #[test]
+        fn theil_sen_ignores_one_outlier() {
+            let xs = [32.0, 48.0, 64.0, 80.0, 32.0, 48.0, 64.0, 80.0];
+            let mut ys: Vec<f64> = xs.iter().map(|x| 60.0 - 0.25 * x).collect();
+            ys[2] += 9.0;
+            let (a, b) = super::theil_sen(&xs, &ys).unwrap();
+            assert!((b + 0.25).abs() < 1e-9 && (a - 60.0).abs() < 1e-9, "{a} {b}");
+            assert!(super::theil_sen(&[1.0, 1.0], &[2.0, 3.0]).is_none());
+        }
+
+        #[test]
+        fn split_from_fit_finds_the_crossing() {
+            let mut s = Vec::new();
+            for k in [2usize, 3, 4, 5, 5, 4, 3, 2] {
+                let c = 16.0 * k as f64;
+                s.push((k, 58.0 - 0.25 * c, 20.0 + 0.30 * c, 0.4 * k as f64));
+            }
+            let fine = super::split_from_fit(&s, true, 0.0).unwrap();
+            assert_eq!(super::decode_hybrid_split(fine), (4, 5));
+            let fine = super::split_from_fit(&s, true, 0.55).unwrap();
+            assert_eq!(super::decode_hybrid_split(fine), (4, 4));
+            assert_eq!(super::split_from_fit(&s, false, 0.0), Some(4));
+            assert_eq!(super::split_from_fit(&s[..1], true, 0.0), None);
+            let flat: Vec<_> = s.iter().map(|r| (r.0, 40.0, 40.0 - r.0 as f64, 1.0)).collect();
+            assert_eq!(super::split_from_fit(&flat, true, 0.0), None);
+        }
 
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
         #[test]
