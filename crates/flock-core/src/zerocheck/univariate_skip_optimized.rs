@@ -6593,16 +6593,32 @@ mod tests {
                         macro_rules! check {
                             ($v:expr) => {{
                                 let mut want = vec![0x5au8; 16 * 64];
-                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, false>(
+                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, false, { kernels::aarch64::NT_RUNTIME }>(
                                     w, &a, &bb, &table, 0, partials, &mut want, nt,
                                 );
                                 let mut got = vec![0x5au8; 16 * 64];
-                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, true>(
+                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, true, { kernels::aarch64::NT_RUNTIME }>(
                                     w, &a, &bb, &table, 0, partials, &mut got, nt,
                                 );
                                 assert_eq!(
                                     got, want,
                                     "hoisted variant {} differs (case={case}, w={w}, satisfied={satisfied}, nt={nt})",
+                                    $v
+                                );
+                                // Store flavour fixed at compile time.
+                                let mut got = vec![0x5au8; 16 * 64];
+                                if nt {
+                                    kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, true, { kernels::aarch64::NT_ON }>(
+                                        w, &a, &bb, &table, 0, partials, &mut got, nt,
+                                    );
+                                } else {
+                                    kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, true, { kernels::aarch64::NT_OFF }>(
+                                        w, &a, &bb, &table, 0, partials, &mut got, nt,
+                                    );
+                                }
+                                assert_eq!(
+                                    got, want,
+                                    "compile-time store variant {} differs (case={case}, w={w}, satisfied={satisfied}, nt={nt})",
                                     $v
                                 );
                                 cases += 1;
@@ -6641,6 +6657,7 @@ mod tests {
         kernels::aarch64::bstatic_horner_window_rows_impl::<
             { AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 },
             true,
+            { kernels::aarch64::NT_ON },
         >(0, &a, &b, &table, 0, partials, &mut out, true);
     }
 
