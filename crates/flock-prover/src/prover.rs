@@ -2007,8 +2007,26 @@ fn commit_with_round1_ab_precompute(
             stripe_help,
         )
     };
+    let replay_backing: std::sync::Mutex<
+        Option<zerocheck::univariate_skip_optimized::ExactTuneBacking>,
+    > = std::sync::Mutex::new(None);
     let precompute_ab_replay = || {
-        zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune(
+        let reuse = replay_backing.lock().unwrap().take();
+        if let Some(b) = reuse {
+            let b = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune_into(
+                a_packed,
+                b_packed,
+                pcs_params.m,
+                k_skip,
+                inv_table,
+                padding,
+                identity_prefix_contract,
+                b,
+            );
+            *replay_backing.lock().unwrap() = Some(b);
+            return;
+        }
+        let replayed = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune(
             a_packed,
             b_packed,
             pcs_params.m,
@@ -2016,7 +2034,8 @@ fn commit_with_round1_ab_precompute(
             inv_table,
             padding,
             identity_prefix_contract,
-        )
+        );
+        std::hint::black_box(&replayed);
     };
     // `Blake3Setup::prove_fast` issues this ticket before call-zero witness
     // generation. A valid cache hit may satisfy it inside the commit arm;
@@ -2088,15 +2107,16 @@ fn commit_with_round1_ab_precompute(
 
     flock_core::tmark::mark("commit join end");
     if run_ranked_exact_tune {
+        *replay_backing.lock().unwrap() = Some(
+            zerocheck::univariate_skip_optimized::ExactTuneBacking::zeroed(pcs_params.m),
+        );
         flock_core::gpu_commit::retune_ranked_hybrid_with_exact_contention(
             pcs_params,
             &result.0.1.codeword,
             &result.0.1.merkle_tree,
-            || {
-                let replayed = precompute_ab_replay();
-                std::hint::black_box(&replayed);
-            },
+            precompute_ab_replay,
         );
+        drop(replay_backing.lock().unwrap().take());
     }
     result
 }
