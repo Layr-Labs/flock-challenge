@@ -4240,6 +4240,18 @@ static inline uint4 gf_shl4(uint4 a) {
     return r;
 }
 
+// a * x^8 mod P. The 8 bits shifted out (h) fold back as h * (x^7+x^2+x+1),
+// which spans at most bit 14 and lands entirely in the low word.
+static inline uint4 gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
 static inline uint4 gf_shl16(uint4 a) {
     uint h = a.w >> 16;
     uint4 r;
@@ -4376,13 +4388,15 @@ static inline void gf_build_mid3(
     const uint u  = lid & 31u;
     const uint aa = u & 3u;
     const uint cc = u >> 2;
+    // Generators tw*x^(8t+k), k < 8: one x^8 step for the upper half, then
+    // two independent 4-long chains (f0 = e0*x^4), so the critical path
+    // inside the barrier pair is 5 steps instead of 15. Same field values.
     uint4 g = twiddles[idx];
-    if (t != 0u) {
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-    }
-    uint4 e0 = g;
-    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
-    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    if (t != 0u) { g = gf_shl8(g); }
+    const uint4 e0 = g;
+    const uint4 f0 = gf_shl4(e0);
+    const uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    const uint4 f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
     uint4 A = uint4(0u);
     if (aa & 1u) { A ^= e2; }
     if (aa & 2u) { A ^= e3; }
@@ -4407,10 +4421,10 @@ static inline void gf_build_mid3(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// gf_build_byte16 of the main library, unchanged: rebuild the live
-// twiddle's two byte tables (tab[b] = b*tw, tab[256 + b] = (b*x^8)*tw)
-// between a leading barrier (retires the previous table's readers) and a
-// trailing one (publishes the new table). 64 threads.
+// gf_build_byte16 of the main library with gf_build_mid3's short generator
+// path: rebuild the live twiddle's two byte tables (tab[b] = b*tw,
+// tab[256 + b] = (b*x^8)*tw) between a leading barrier (retires the previous
+// table's readers) and a trailing one (publishes the new table). 64 threads.
 static inline void gf_build_byte16(
     threadgroup uint4* tabB, device const uint4* twiddles, uint idx, uint lid)
 {
@@ -4420,12 +4434,11 @@ static inline void gf_build_byte16(
     const uint aa = u & 3u;
     const uint cc = u >> 2;
     uint4 g = twiddles[idx];
-    if (t != 0u) {
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-    }
-    uint4 e0 = g;
-    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
-    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    if (t != 0u) { g = gf_shl8(g); }
+    const uint4 e0 = g;
+    const uint4 f0 = gf_shl4(e0);
+    const uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    const uint4 f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
     uint4 A = uint4(0u);
     if (aa & 1u) { A ^= e2; }
     if (aa & 2u) { A ^= e3; }
