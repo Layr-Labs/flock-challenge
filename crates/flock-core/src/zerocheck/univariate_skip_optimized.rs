@@ -6721,6 +6721,40 @@ mod tests {
         assert!(seen.iter().all(|&n| n > 0), "plan shapes {seen:?}");
     }
 
+    /// A static-B word whose varying bytes are exactly bytes 5..8 gets the
+    /// same image from its partial image plus the mirrored low z-form image
+    /// of those bytes as from the per-byte partial path: every plan word of
+    /// that shape, its static bytes, zero / all-one / single-bit / random
+    /// varying bytes.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_bstatic_z_high3_matches_partial_path() {
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xB57A_7C2_41F);
+        let mut seen = 0usize;
+        for blk in 0..31 {
+            for k in 0..N_CHUNKS {
+                let (mask, expected) = kernels::aarch64::BSTATIC_MASKS[blk][k];
+                if !mask != 0xffff_ff00_0000_0000 {
+                    continue;
+                }
+                seen += 1;
+                for trial in 0..(2 + 24 + 512) {
+                    let vary = match trial {
+                        0 => 0,
+                        1 => !mask,
+                        t if t < 26 => 1u64 << (40 + (t - 2)),
+                        _ => rng.next_u64() & !mask,
+                    };
+                    let w = (expected & mask) | vary;
+                    let (want, got) = kernels::aarch64::ab_bstatic_z_high3_forms(&table, blk, k, w);
+                    assert_eq!(got, want, "blk={blk} k={k} w={w:016x}");
+                }
+            }
+        }
+        assert!(seen > 0, "no suffix-3 plan words");
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn ab_kernel_variants_match_baseline() {

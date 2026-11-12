@@ -3646,7 +3646,9 @@ pub(crate) fn ab_kara_xor16_enabled() -> bool {
 /// Row-body variant bit (with [`ABV_Z`] and [`ABV_Z_REC`]): a static-B word
 /// whose varying bytes are exactly bytes `0..NB` (`NB` = 2, 3 or 4) takes
 /// its partial image plus [`apply_word_z_low`] of the varying bytes instead
-/// of the per-byte rows or the whole-word apply. Same output bytes.
+/// of the per-byte rows or the whole-word apply, and one whose varying bytes
+/// are exactly bytes `5..8` takes its partial image plus
+/// [`apply_word_z_high::<3>`]. Same output bytes.
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_BSTATIC_Z: u16 = 4096;
 
@@ -3718,6 +3720,68 @@ unsafe fn apply_word_z_low<const NB: u32>(
             (veorq_u8(l0, b0), veorq_u8(l1, b1), veorq_u8(l2, b2), veorq_u8(l3, b3))
         }
     }
+}
+
+/// [`apply_word_z_low`] of the word restricted to its bytes `8 - NB..8`.
+///
+/// Byte `j` reaches output block `n` through `R_{n ^ j}` of the one plain
+/// image (see [`xor_vary_ext`]), so `F(w)[n] = XOR_j R_{n ^ j}(w_j)`.
+/// Reversing the bytes maps `j` to `j ^ 7`, hence
+/// `F(w.swap_bytes())[n ^ 7] = F(w)[n]`: the high bytes of `w` are the low
+/// bytes of `w.swap_bytes()`, and block `n ^ 7 = 2 (q ^ 3) + (h ^ 1)` puts
+/// output register `q` at register `3 - q` with its halves swapped. Same
+/// tables and lookups as the low form plus one `rev` and four `ext`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z_high<const NB: u32>(
+    t0: *const u8,
+    kara: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let (z0, z1, z2, z3) = apply_word_z_low::<NB>(t0, kara, w.swap_bytes());
+        (vextq_u8::<8>(z3, z3), vextq_u8::<8>(z2, z2), vextq_u8::<8>(z1, z1), vextq_u8::<8>(z0, z0))
+    }
+}
+
+/// Test access: one static-B word `(blk, k)` of a plan whose varying bytes
+/// are `5..8`, through the partial path (per-byte rows, the generated
+/// `[(5, 6)], [7]` order) and through the partial image plus
+/// [`apply_word_z_high::<3>`]; `w` must match the plan's static bytes.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn ab_bstatic_z_high3_forms(
+    inv_table: &InvNttTableByteSingleGf8,
+    blk: usize,
+    k: usize,
+    w: u64,
+) -> ([u8; 64], [u8; 64]) {
+    use core::arch::aarch64::*;
+    let partials = bstatic_partials(inv_table);
+    let kara = ab_kara_tables(inv_table);
+    let plain = inv_table.data_ptr();
+    let mut out = ([0u8; 64], [0u8; 64]);
+    unsafe {
+        let pp = partials[blk * 8 + k].as_ptr();
+        let mut d = [vld1q_u8(pp), vld1q_u8(pp.add(16)), vld1q_u8(pp.add(32)), vld1q_u8(pp.add(48))];
+        {
+            let [d0, d1, d2, d3] = &mut d;
+            xor_vary_ext::<5, 6>(plain, w, [d0, d1, d2, d3]);
+            xor_vary_ext::<7, 8>(plain, w, [d0, d1, d2, d3]);
+        }
+        let z = apply_word_z_high::<3>(plain, kara, w);
+        let e = [veorq_u8(vld1q_u8(pp), z.0), veorq_u8(vld1q_u8(pp.add(16)), z.1), veorq_u8(vld1q_u8(pp.add(32)), z.2), veorq_u8(vld1q_u8(pp.add(48)), z.3)];
+        for i in 0..4 {
+            vst1q_u8(out.0.as_mut_ptr().add(16 * i), d[i]);
+            vst1q_u8(out.1.as_mut_ptr().add(16 * i), e[i]);
+        }
+    }
+    out
 }
 
 /// Test access: one static-B word `(blk, k)` of a plan whose varying bytes
