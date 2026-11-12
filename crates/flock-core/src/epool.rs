@@ -116,7 +116,6 @@ pub(crate) fn help_guest_until(
 }
 
 /// Post-drain linger (`FLOCK_NO_EPOOL_LINGER=1` kills; window
-/// `FLOCK_EPOOL_LINGER_US`, default 200). Between back-to-back hetero queues
 /// separated by a short serial stretch (the opening's recursive levels) the
 /// main-pool workers fall asleep in Rayon's
 /// idle path, and the next queue pays the wake cascade: measured ~80 µs mean
@@ -146,7 +145,7 @@ fn linger_window_ns() -> u64 {
         std::env::var("FLOCK_EPOOL_LINGER_US")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(200)
+            .unwrap_or(150)
             * 1000
     })
 }
