@@ -8846,11 +8846,20 @@ kernel void blake3_pow_scan(
                         // last `fine_m` layer-8 sub-blocks of that sixteenth.
                         let ev = gpu.fine_split_event();
                         let want = FINE_SPLIT_WAIT.load(std::sync::atomic::Ordering::Acquire);
+                        // Deep-first (`FLOCK_NO_FINE_DEEP_FIRST`, any value,
+                        // kills): a boundary not yet signaled after the
+                        // full blocks' layers 4..10 lets their deep pairs run
+                        // before the wait. A ready (or killed) probe keeps
+                        // the single combined deep pass.
+                        static DEEP_FIRST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        let deep_first = *DEEP_FIRST
+                            .get_or_init(|| std::env::var_os("FLOCK_NO_FINE_DEEP_FIRST").is_none());
                         ntt.forward_transform_interleaved_ranked_fine_range_and_then(
                             data,
                             64,
                             16 - k_cpu16,
                             fine_m,
+                            || !deep_first || gpu.event_signaled_value(ev) >= want,
                             || {
                                 let mut spins = 0u32;
                                 while gpu.event_signaled_value(ev) < want {

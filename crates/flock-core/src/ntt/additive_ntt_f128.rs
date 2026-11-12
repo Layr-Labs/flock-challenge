@@ -1293,17 +1293,29 @@ impl AdditiveNttF128 {
     /// that block's last `fine_m` layer-8 sub-blocks, then ONE deep-pair pass
     /// over the contiguous layer-10 range covering both. Absolute twiddles:
     /// bit-identical to the unsplit transform.
-    pub(crate) fn forward_transform_interleaved_ranked_fine_range_and_then<F, W>(
+    ///
+    /// If `boundary_ready` (a non-blocking probe, polled once after the
+    /// full blocks' layers 4..10) reports the boundary not yet ready, the
+    /// full blocks' layer-10 sub-NTTs `[b_start << 6, 1024)` run their deep
+    /// pairs before `wait_boundary` (they never read the boundary block),
+    /// and the deep pass after the wait covers only the boundary's
+    /// `[sb_start << 2, b_start << 6)`. Every layer-10 sub-NTT is
+    /// independent and gets the same absolute index, twiddles, tail and
+    /// `finish_chunk` offset either way; only the pass it lands in changes.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_transform_interleaved_ranked_fine_range_and_then<F, R, W>(
         &self,
         data: &mut [F128],
         num_ntts: usize,
         b_start: usize,
         fine_m: usize,
+        boundary_ready: R,
         wait_boundary: W,
         finish_chunk: F,
     ) -> Result<(), String>
     where
         F: Fn(usize, &[F128]) + Sync + Send,
+        R: FnOnce() -> bool,
         W: FnOnce() -> Result<(), String>,
     {
         const DEEP_LAYER: usize = 10;
@@ -1317,6 +1329,21 @@ impl AdditiveNttF128 {
         );
         let sb_end = b_start << 4;
         let sb_start = sb_end - fine_m;
+        let full_sub = b_start << (DEEP_LAYER - 4);
+        let deep_end = 16 << (DEEP_LAYER - 4);
+        let deep_first = !boundary_ready();
+        if deep_first {
+            self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                data,
+                num_ntts,
+                DEEP_LAYER,
+                log_d,
+                full_sub,
+                deep_end,
+                odd_tail,
+                &finish_chunk,
+            );
+        }
         wait_boundary()?;
         self.forward_transform_interleaved_block_range(
             data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
@@ -1327,7 +1354,7 @@ impl AdditiveNttF128 {
             DEEP_LAYER,
             log_d,
             sb_start << (DEEP_LAYER - 8),
-            16 << (DEEP_LAYER - 4),
+            if deep_first { full_sub } else { deep_end },
             odd_tail,
             &finish_chunk,
         );
