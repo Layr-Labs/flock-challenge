@@ -697,6 +697,7 @@ impl TailGuard {
 
     /// Whether a helper whose average chunk time is `own_ns` (0 = unknown)
     /// should still claim, given the queue cursor `next`.
+    ///
     #[inline]
     fn helper_may_claim(&self, own_ns: u64, next: usize, n_chunks: usize) -> bool {
         if !self.on || own_ns == 0 {
@@ -708,7 +709,7 @@ impl TailGuard {
         }
         let t_main = self.main_ns.load(Ordering::Relaxed) / cnt;
         let remaining = n_chunks.saturating_sub(next) as u64;
-        own_ns.saturating_mul(self.main_threads) <= remaining.saturating_mul(t_main)
+        tail_claim_pays(own_ns, self.main_threads, remaining, t_main)
     }
 
     /// Run helper chunk `i`, updating the helper's own average.
@@ -723,6 +724,18 @@ impl TailGuard {
         let ns = (started.elapsed().as_nanos() as u64).max(1);
         *own_ns = if *own_ns == 0 { ns } else { (*own_ns + ns) / 2 };
     }
+}
+
+#[inline]
+fn tail_claim_pays(own_ns: u64, width: u64, remaining: u64, t_main: u64) -> bool {
+    if remaining == 0 {
+        return false;
+    }
+    own_ns.saturating_mul(width).saturating_mul(2)
+        <= (remaining - 1)
+            .saturating_mul(t_main)
+            .saturating_mul(2)
+            .saturating_add(width.saturating_mul(t_main))
 }
 
 pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
@@ -927,7 +940,7 @@ impl<'a> HelpQueue<'a> {
         let t_main = self.main_ns.load(Ordering::Relaxed) / cnt;
         let remaining = self.n_chunks.saturating_sub(self.next.load(Ordering::Relaxed)) as u64;
         let width = active.max(self.main_width);
-        own_ns.saturating_mul(width) <= remaining.saturating_mul(t_main)
+        tail_claim_pays(own_ns, width, remaining, t_main)
     }
 
     fn drain_helper(&self) -> usize {
