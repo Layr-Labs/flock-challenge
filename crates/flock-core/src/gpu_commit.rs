@@ -12579,7 +12579,7 @@ kernel void lc_fold_stripes_factored_b4(
             // buffer, same status check, same consumed output either way —
             // proof bytes are untouched. A/B-CONTROL:
             // FLOCK_NO_ZCFOLD_SPIN=1 (exact '1') restores the incumbent
-            // blocking wait.
+            super::help_pool_until(|| unsafe { gpu.cb_status(cb) } >= 4);
             let wait = if zc_fold_spin_enabled() {
                 unsafe {
                     gpu.yield_wait_cb_until(
