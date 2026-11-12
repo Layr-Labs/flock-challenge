@@ -1949,32 +1949,37 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 out_outer,
                 direct,
             );
-        } else if kernels::aarch64::ab_hz_helper_enabled() && kernels::aarch64::ab_horner2_enabled() {
-            // The efficiency-core form with the two-degree Horner carry fold
-            // (`FLOCK_NO_ZC_AB_HORNER2` kills; same bytes).
-            kernels::aarch64::bstatic_horner_window_rows::<{
-                kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2
-            }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
         } else if kernels::aarch64::ab_hz_helper_enabled() {
-            kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_HZ_VARIANT }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
+            // The efficiency-core form, optionally with the two-degree Horner
+            // carry fold (`FLOCK_NO_ZC_AB_HORNER2` kills; same bytes). Its
+            // inlined window body takes the same one-per-window bounds check
+            // as the P-core arm (`FLOCK_NO_ZC_AB_ROW_SETUP_HOIST`, any value,
+            // restores one check per row; same bytes).
+            macro_rules! hz_rows {
+                ($entry:ident, $v:expr) => {
+                    kernels::aarch64::$entry::<{ $v }>(
+                        within_hash_outer,
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        partials,
+                        out_outer,
+                        direct,
+                    )
+                };
+            }
+            const HZ: u16 = kernels::aarch64::AB_HZ_VARIANT;
+            const HZ2: u16 = kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2;
+            match (
+                kernels::aarch64::ab_horner2_enabled(),
+                kernels::aarch64::ab_row_setup_hoist_enabled(),
+            ) {
+                (true, true) => hz_rows!(bstatic_horner_window_rows_hoisted, HZ2),
+                (true, false) => hz_rows!(bstatic_horner_window_rows, HZ2),
+                (false, true) => hz_rows!(bstatic_horner_window_rows_hoisted, HZ),
+                (false, false) => hz_rows!(bstatic_horner_window_rows, HZ),
+            }
         } else {
             kernels::aarch64::bstatic_horner_window_rows::<0>(
                 within_hash_outer,
