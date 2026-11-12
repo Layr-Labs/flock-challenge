@@ -17800,20 +17800,25 @@ static inline uint4 gf_shl16(uint4 a) {
     return r;
 }
 
+// Generators of challenge `I`'s table: consts[ZF_GEN(I) + 8 t + k] =
+// (t ? c x^8 : c) x^k for k < 8, computed once per launch on the host.
+#define ZF_GEN(I) (12u + 16u * (I))
+
 // The commit NTT's 64-thread byte-table build (gf_build_byte16) for one
-// constant `c`: tab[b] = b * c, tab[256 + b] = b * (c x^8). `c8` is the
-// host-computed `c x^8` (consts[6 + i] for consts[i]), so the upper half no
-// longer runs an 8-step gf_mulx chain inside every group's barrier pair.
-static inline void zf_build(threadgroup uint4* tabB, uint4 c, uint4 c8, uint lid)
+// constant `c`: tab[b] = b * c, tab[256 + b] = b * (c x^8). `g` points at the
+// constant's sixteen host-computed generators (`c x^k`, then `c x^8 x^k`,
+// k < 8), so no group runs the seven-step gf_mulx chain inside its barrier
+// pair; each half-group reads its eight generators (uniform addresses).
+static inline void zf_build(threadgroup uint4* tabB, device const uint4* g, uint lid)
 {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint t  = lid >> 5;
     const uint u  = lid & 31u;
     const uint aa = u & 3u;
     const uint cc = u >> 2;
-    uint4 e0 = (t != 0u) ? c8 : c;
-    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
-    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    device const uint4* gt = g + (t << 3);
+    uint4 e0 = gt[0], e1 = gt[1], e2 = gt[2], e3 = gt[3];
+    uint4 f0 = gt[4], f1 = gt[5], f2 = gt[6], f3 = gt[7];
     uint4 A = uint4(0u);
     if (aa & 1u) { A ^= e2; }
     if (aa & 2u) { A ^= e3; }
@@ -17858,7 +17863,7 @@ static inline void zf_mul_x2(uint4 va, uint4 vb,
 #define ZF_LEVEL(J)                                                    \
     {                                                                  \
         constexpr uint st = 1u << (J);                                 \
-        zf_build(tabB, consts[2u + (J)], consts[8u + (J)], lid);       \
+        zf_build(tabB, consts + ZF_GEN(2u + (J)), lid);                \
         for (uint e = 0u; e < 16u; e += 2u * st) {                     \
             uint4 pa;                                                  \
             uint4 pb;                                                  \
@@ -17901,7 +17906,7 @@ kernel void zf_fold8(device const uint4* z      [[buffer(0)]],
     ZF_LEVEL(3u)
     uint4 ra = ea[0];
     uint4 rb = eb[0];
-    zf_build(tabB, consts[0], consts[6], lid);
+    zf_build(tabB, consts + ZF_GEN(0u), lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(1));
         uint4 sb = simd_shuffle_xor(rb, ushort(1));
@@ -17913,7 +17918,7 @@ kernel void zf_fold8(device const uint4* z      [[buffer(0)]],
         ra = la ^ pa;
         rb = lb ^ pb;
     }
-    zf_build(tabB, consts[1], consts[7], lid);
+    zf_build(tabB, consts + ZF_GEN(1u), lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(2));
         uint4 sb = simd_shuffle_xor(rb, ushort(2));
@@ -18119,18 +18124,30 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
         /// Outputs folded by one 64-thread group.
         pub(crate) const ZF_OUTS_PER_TG: usize = 32;
 
-        pub(crate) const ZF_CONSTS_BYTES: usize = 12 * 16;
+        /// Entries of the consts buffer: the six challenges, their `x^8`
+        /// multiples, then per challenge `i` the sixteen table generators
+        /// `[ZF_GEN_BASE + 16 i + 8 t + k] = c_i x^(8 t + k)` (`ZF_GEN` in
+        /// the shader). Rewritten by every launch from its own challenges.
+        pub(crate) const ZF_CONSTS_LEN: usize = ZF_GEN_BASE + 6 * 16;
+        pub(crate) const ZF_GEN_BASE: usize = 12;
+        pub(crate) const ZF_CONSTS_BYTES: usize = ZF_CONSTS_LEN * 16;
 
-        pub(crate) fn zf_consts(challenges: &[F128; 6]) -> [F128; 12] {
-            std::array::from_fn(|i| {
-                let mut v = challenges[i % 6];
-                if i >= 6 {
-                    for _ in 0..8 {
-                        v = crate::field::mul_by_x(v);
+        pub(crate) fn zf_consts(challenges: &[F128; 6]) -> [F128; ZF_CONSTS_LEN] {
+            let mut out = [F128::ZERO; ZF_CONSTS_LEN];
+            for (i, &challenge) in challenges.iter().enumerate() {
+                out[i] = challenge;
+                let mut value = challenge;
+                for power in 0..16 {
+                    out[ZF_GEN_BASE + 16 * i + power] = value;
+                    if power == 8 {
+                        out[6 + i] = value;
+                    }
+                    if power < 15 {
+                        value = crate::field::mul_by_x(value);
                     }
                 }
-                v
-            })
+            }
+            out
         }
 
         #[repr(C)]
@@ -18935,15 +18952,12 @@ mod tests {
             .collect();
         let base = zfold::ZF_MSL_SOURCE.to_string();
         let nobuild = base
-            .replace(
-                "zf_build(tabB, consts[2u + (J)], consts[8u + (J)], lid);",
-                "",
-            )
-            .replace("zf_build(tabB, consts[0], consts[6], lid);", "")
-            .replace("zf_build(tabB, consts[1], consts[7], lid);", "")
+            .replace("zf_build(tabB, consts + ZF_GEN(2u + (J)), lid);", "")
+            .replace("zf_build(tabB, consts + ZF_GEN(0u), lid);", "")
+            .replace("zf_build(tabB, consts + ZF_GEN(1u), lid);", "")
             .replace(
                 "    uint4 eb[16];\n",
-                "    uint4 eb[16];\n    zf_build(tabB, consts[0], consts[6], lid);\n",
+                "    uint4 eb[16];\n    zf_build(tabB, consts + ZF_GEN(0u), lid);\n",
             );
         let contig = base
             .replace("const uint ba = (oa << 6) + q;", "const uint ba = (oa << 6) + (q << 4);")
@@ -18951,17 +18965,14 @@ mod tests {
             .replace("ea[e] = z[ba + (e << 2)];", "ea[e] = z[ba + e];")
             .replace("eb[e] = z[bb + (e << 2)];", "eb[e] = z[bb + e];")
             .replace(
-                "zf_build(tabB, consts[0], consts[6], lid);",
-                "zf_build(tabB, consts[4], consts[10], lid);",
+                "zf_build(tabB, consts + ZF_GEN(0u), lid);",
+                "zf_build(tabB, consts + ZF_GEN(4u), lid);",
             )
             .replace(
-                "zf_build(tabB, consts[1], consts[7], lid);",
-                "zf_build(tabB, consts[5], consts[11], lid);",
+                "zf_build(tabB, consts + ZF_GEN(1u), lid);",
+                "zf_build(tabB, consts + ZF_GEN(5u), lid);",
             )
-            .replace(
-                "consts[2u + (J)], consts[8u + (J)]",
-                "consts[(J)], consts[6u + (J)]",
-            );
+            .replace("consts + ZF_GEN(2u + (J))", "consts + ZF_GEN((J))");
         unsafe {
             let pool = gpu.pool_push();
             let zbuf = gpu.wrap_buffer(z.as_mut_ptr().cast::<u8>(), n * 16).unwrap();
@@ -19043,6 +19054,15 @@ mod tests {
             for i in 0..6 {
                 assert_eq!(k[i], ch[i], "round {round} challenge {i}");
                 assert_eq!(k[6 + i], ch[i] * x8, "round {round} x^8 multiple {i}");
+                let mut xp = F128::ONE;
+                for e in 0..16 {
+                    assert_eq!(
+                        k[zfold::ZF_GEN_BASE + 16 * i + e],
+                        ch[i] * xp,
+                        "round {round} generator {i} x^{e}"
+                    );
+                    xp = crate::field::mul_by_x(xp);
+                }
             }
         }
     }
