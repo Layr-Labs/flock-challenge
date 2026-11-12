@@ -1406,6 +1406,25 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128], par_min: usize) -> (F128, F12
         .reduce(|| (F128::ZERO, F128::ZERO), |a, b| (a.0 + b.0, a.1 + b.1))
 }
 
+fn sumcheck_round_eval_serial_with_copy(c: &[F128], z: &[F128], dst: &mut [F128]) -> (F128, F128) {
+    let half = c.len() / 2;
+    assert_eq!(z.len(), c.len());
+    assert_eq!(dst.len(), z.len());
+    let (clo, chi) = c.split_at(half);
+    let (zlo, zhi) = z.split_at(half);
+    let (dlo, dhi) = dst.split_at_mut(half);
+    let mut e1 = crate::field::F256Unreduced::ZERO;
+    let mut einf = crate::field::F256Unreduced::ZERO;
+    for i in 0..half {
+        let (zl, zh) = (zlo[i], zhi[i]);
+        dlo[i] = zl;
+        dhi[i] = zh;
+        e1 ^= chi[i].mul_unreduced(zh);
+        einf ^= (chi[i] + clo[i]).mul_unreduced(zh + zl);
+    }
+    (e1.reduce(), einf.reduce())
+}
+
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
 /// r·(v[i+half] + v[i])` for `i ∈ [0, half)`, then truncate to `half`. In-place.
 fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128, par_min: usize) {
@@ -1745,10 +1764,14 @@ fn prove_padded_inner<Ch: Challenger>(
         };
     // 3b. Optional capture: copy the pre-sumcheck z_vec into the dead eq_inner
     //     allocation for downstream reuse (PCS open's AB-claim s_hat_v skipping
-    //     fold_1b_rows), avoiding a fresh 2^k_log F128 allocation.
+    let mut round0_msg: Option<(F128, F128)> = None;
     let captured_z_vec: Option<Vec<F128>> = if capture_z_vec && eq_inner.len() == z_vec.len() {
         let mut cap = eq_inner;
-        cap.copy_from_slice(&z_vec);
+        if inner_rest_len > 0 && lc_sumcheck_par_min(k) == usize::MAX {
+            round0_msg = Some(sumcheck_round_eval_serial_with_copy(&comb_vec, &z_vec, &mut cap));
+        } else {
+            cap.copy_from_slice(&z_vec);
+        }
         Some(cap)
     } else {
         crate::scratch::give_lincheck_eq(eq_inner);
@@ -1776,7 +1799,8 @@ fn prove_padded_inner<Ch: Challenger>(
         // round's message falls out of binding the previous round (fold +
         // next-eval fused into one pass — see `sumcheck_bind_both_and_eval_next`).
         let par_min = lc_sumcheck_par_min(k);
-        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec, par_min);
+        let (mut e1, mut einf) =
+            round0_msg.unwrap_or_else(|| sumcheck_round_eval_par(&comb_vec, &z_vec, par_min));
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
