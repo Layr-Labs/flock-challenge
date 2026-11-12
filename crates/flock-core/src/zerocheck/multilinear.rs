@@ -915,6 +915,11 @@ pub struct UniSkipCompactFold {
     /// ([`fold2_compact_and_round45_into`]) accepts such a state; it treats
     /// those pairs as the known zeros the dense state stores.
     pub dead_tail: bool,
+    /// Full round-two GPU arm: `(anchors, deltas, pairs)` — the first
+    /// `pairs` pairs' anchors and deltas live at these two addresses (same
+    /// layout as the two fields above) instead of in them. Only the cascade
+    /// K pass accepts such a state.
+    pub gpu_prefix: Option<(usize, usize, usize)>,
 }
 
 impl UniSkipCompactFold {
@@ -998,6 +1003,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
         dead_tail: false,
+        gpu_prefix: None,
     };
 
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1030,6 +1036,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        None,
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
@@ -1180,6 +1187,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         );
         match res {
             crate::gpu_commit::ZcR2Result::Calibrated => {}
+            crate::gpu_commit::ZcR2Result::Full(..) => unreachable!("the full arm is lookahead-only"),
             crate::gpu_commit::ZcR2Result::Prefix(vals) => {
                 // XOR the parities back together: this sweep only ever wanted
                 // the summed pair the arm used to return.
@@ -1280,6 +1288,7 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
             anchors: crate::scratch::take_f128(2 * n_pairs),
             deltas: ScratchBytes::take_full_overwrite(2 * n_pairs * n_chunks),
             dead_tail: false,
+            gpu_prefix: None,
         };
 
         let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1830,6 +1839,7 @@ fn cascade_k_pairs_per_chunk(n_pairs: usize) -> usize {
 /// or delta stores and the state is marked [`UniSkipCompactFold::dead_tail`].
 /// The round-two message and lookahead are unchanged; every live slot holds
 /// the same bytes.
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     a_packed: &[u8],
@@ -1864,6 +1874,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
         dead_tail: false,
+        gpu_prefix: None,
     };
 
     let n_vars = mlv_challenges.len() - 1;
@@ -1940,6 +1951,19 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        // Full arm only for a state the cascade K pass alone reads, whose K
+        // chunks coincide with these chunks, over initialized delta bytes.
+        (k_pass_only
+            && cascade_k_pairs_per_chunk(n_pairs) == lo_size
+            && compact.deltas.is_fully_initialized())
+        .then(|| {
+            (
+                compact.anchors.as_mut_ptr().cast::<u8>(),
+                compact.anchors.len() * core::mem::size_of::<F128>(),
+                compact.deltas.full_overwrite_ptr(),
+                compact.deltas.len(),
+            )
+        }),
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
@@ -1951,6 +1975,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let odd_on_gpu = gpu_prefix > 0 && zc_r2_odd_offload_enabled();
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_full = gpu_prefix > 0 && gpu_job.as_ref().is_some_and(|j| j.is_full());
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1984,6 +2010,15 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
+                // Full-arm chunk: the GPU writes its anchors and deltas and
+                // owns all eight sums; its values replace both slots after
+                // the join.
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                if !full && gpu_full {
+                    *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
+                    *la_base.ptr().add(x_hi) = [F128::ZERO; 6];
+                    return;
+                }
                 if full {
                     fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                         t,
@@ -2145,7 +2180,47 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // to skip it.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
-        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        let mut cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+        // Full-arm calibration: the warmup sweep is the process's first and
+        // can run beside one-off start-up work, which inflates its wall and
+        // so the GPU share. Re-price the CPU from two replays of the last
+        // quarter of the chunks (same kernel, same stores: every replayed
+        // byte rewrites the identical value) and keep the cheapest estimate.
+        if job.is_calibration() && job.is_full() {
+            let reps = (hi_size / 4).max(1);
+            for _ in 0..2 {
+                let t_rep = std::time::Instant::now();
+                crate::epool::run_hetero_chunks(reps, |i| {
+                    let x_hi = hi_size - reps + i;
+                    let pair_idx_base = x_hi * lo_size;
+                    let row_base = pair_idx_base * 2;
+                    let mut out = [F128::ZERO; 8];
+                    // SAFETY: as in the sweep above; chunk x_hi owns its
+                    // anchor/delta ranges and the writes repeat its bytes.
+                    unsafe {
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr().add(row_base * n_chunks),
+                            b_packed.as_ptr().add(row_base * n_chunks),
+                            anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                            deltas_base.ptr().add(x_hi * delta_chunk_size),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            periodic_padding,
+                            skip_dead,
+                            out.as_mut_ptr(),
+                        );
+                    }
+                    std::hint::black_box(out);
+                });
+                let est = t_rep.elapsed().as_secs_f64() * 1e3 * (hi_size as f64 / reps as f64);
+                cpu_wall_ms = cpu_wall_ms.min(est);
+            }
+        }
         let calib = job.is_calibration();
         let prefix = job.cpu_split();
         let res = crate::gpu_commit::zc_r2_wait(
@@ -2172,6 +2247,51 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         la_partials[x_hi][0] = v[2];
                         la_partials[x_hi][1] = v[3];
                     }
+                }
+            }
+            crate::gpu_commit::ZcR2Result::Full(vals, anc, del) => {
+                for (x_hi, v) in vals.iter().enumerate() {
+                    partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
+                    la_partials[x_hi] = [v[2], v[3], v[4], v[5], v[6], v[7]];
+                }
+                compact.gpu_prefix = Some((anc, del, prefix * lo_size));
+            }
+            crate::gpu_commit::ZcR2Result::Failed if gpu_full => {
+                // The full arm owned these chunks' anchors and deltas too:
+                // redo every prefix chunk completely, into the real state.
+                for x_hi in 0..prefix {
+                    let pair_idx_base = x_hi * lo_size;
+                    let row_base = pair_idx_base * 2;
+                    let mut out = [F128::ZERO; 8];
+                    unsafe {
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                            table.data.as_ptr().cast::<u8>(),
+                            a_packed.as_ptr().add(row_base * n_chunks),
+                            b_packed.as_ptr().add(row_base * n_chunks),
+                            anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                            deltas_base.ptr().add(x_hi * delta_chunk_size),
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            periodic_padding,
+                            false,
+                            out.as_mut_ptr(),
+                        );
+                    }
+                    let eq_h = eq_hi[x_hi];
+                    partials[x_hi] = (
+                        eq_h * (kappa * out[0] + out[2]),
+                        eq_h * (kappa * out[1] + out[3]),
+                    );
+                    la_partials[x_hi] = out[2..8]
+                        .iter()
+                        .map(|v| eq_h * *v)
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .expect("six lookahead slots");
                 }
             }
             crate::gpu_commit::ZcR2Result::Failed => {
@@ -2657,8 +2777,18 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
 
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            let anchors = compact.anchors.as_ptr().add(2 * pair_base);
-            let deltas = compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2);
+            // A full-arm prefix chunk reads the GPU's copy (K chunks coincide
+            // with round-two chunks, checked by the producer).
+            let (anchors, deltas) = match compact.gpu_prefix {
+                Some((anc, del, pairs)) if pair_base < pairs => (
+                    (anc as *const F128).add(2 * pair_base),
+                    (del as *const u8).add(pair_base * table.n_chunks * 2),
+                ),
+                _ => (
+                    compact.anchors.as_ptr().add(2 * pair_base),
+                    compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
+                ),
+            };
             let (t1, t3) = (
                 table_l1.as_ptr().cast::<u8>(),
                 table_l3.as_ptr().cast::<u8>(),

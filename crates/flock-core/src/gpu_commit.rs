@@ -529,6 +529,18 @@ fn gpu_zc_r2_horner_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
 
+/// Kill switch for the full round-two GPU arm: `FLOCK_NO_ZC_R2_FULL_GPU=1`
+/// keeps the products-only Horner arm, whose chunks the CPU still sweeps for
+/// their anchors, deltas and round-three aggregates. With the full arm the
+/// GPU also writes those chunks' compact anchors and deltas and returns
+/// their four deferred round-three sums, and the CPU skips them entirely.
+pub const ENV_NO_ZC_R2_FULL_GPU: &str = "FLOCK_NO_ZC_R2_FULL_GPU";
+
+pub(crate) fn zc_r2_full_gpu_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_R2_FULL_GPU).is_none_or(|v| v != *"1"))
+}
+
 fn gpu_zc_r2_horner_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -15386,6 +15398,100 @@ kernel void zc_r2_products_horner(
     zc_r2_write_partials(acc1, acci, red, eq_hi, partials, hi_chunk, tgid, lid);
 }
 
+
+// Full round-two arm (see `ENV_NO_ZC_R2_FULL_GPU`). Two physical groups per
+// logical hi chunk; each thread owns one (window, small_hi) and both pairs
+// `x_lo = window<<6 | medium<<2 | small_hi<<1 | parity` of every round-three
+// group across all sixteen medium positions. Besides the four parity-split
+// round-two products it accumulates the four deferred round-three aggregates
+// (on the odd pair's weight, as the CPU lookahead kernel does) and writes the
+// compact anchors and raw deltas of its pairs, so the CPU skips these chunks.
+// Partial slots per physical group: [p1_e, pinf_e, p1_o, pinf_o, W0, W3, W4, W5].
+kernel void zc_r2_full_horner(
+    device const uint4* a_in  [[buffer(0)]],
+    device const uint4* b_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcR2Params& p          [[buffer(6)]],
+    device uint4*       anchors     [[buffer(7)]],
+    device uint4*       deltas      [[buffer(8)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint sl   [[thread_index_in_simdgroup]],
+    uint nsg  [[simdgroups_per_threadgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup uint4 red[8 * 32];
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint hi_chunk = tgid >> 1;
+    uint window = ((tgid & 1u) << 7) | (lid >> 1);
+    uint small_hi = lid & 1u;
+    // Accumulator slots: p1_e, pinf_e, p1_o, pinf_o, W0, W3, W4, W5.
+    U320k h[8];
+#pragma clang loop unroll(disable)
+    for (uint k = 0u; k < 8u; k++) { h[k] = U320k{0ul, 0ul, 0ul, 0ul, 0ul}; }
+    // Kept rolled (both loops): one copy of the field product keeps the
+    // runtime compile of this library short; it is compiled per process.
+#pragma clang loop unroll(disable)
+    for (uint step = 0u; step < 16u; step++) {
+        if (step != 0u) {
+#pragma clang loop unroll(disable)
+            for (uint k = 0u; k < 8u; k++) { zc_r2_horner_shift(h[k]); }
+        }
+        uint medium = 15u - step;
+        uint x_lo = (window << 6) | (medium << 2) | (small_hi << 1);
+        uint pe = hi_chunk * p.lo_size + x_lo;
+        uint po = pe + 1u;
+        bool pad_e = (pe & p.mask) >= p.useful;
+        bool pad_o = (po & p.mask) >= p.useful;
+        uint4 ae = pad_e ? uint4(0u) : a_in[pe];
+        uint4 be = pad_e ? uint4(0u) : b_in[pe];
+        uint4 ao = pad_o ? uint4(0u) : a_in[po];
+        uint4 bo = pad_o ? uint4(0u) : b_in[po];
+        uint4 a0 = zc_r2_fold8(ae.x, ae.y, nib);
+        uint4 a1 = zc_r2_fold8(ae.z, ae.w, nib);
+        uint4 b0 = zc_r2_fold8(be.x, be.y, nib);
+        uint4 b1 = zc_r2_fold8(be.z, be.w, nib);
+        uint4 a2 = zc_r2_fold8(ao.x, ao.y, nib);
+        uint4 a3 = zc_r2_fold8(ao.z, ao.w, nib);
+        uint4 b2 = zc_r2_fold8(bo.x, bo.y, nib);
+        uint4 b3 = zc_r2_fold8(bo.z, bo.w, nib);
+        anchors[2u * pe] = a0;
+        anchors[2u * pe + 1u] = b0;
+        anchors[2u * po] = a2;
+        anchors[2u * po + 1u] = b2;
+        deltas[pe] = uint4(ae.x ^ ae.z, ae.y ^ ae.w, be.x ^ be.z, be.y ^ be.w);
+        deltas[po] = uint4(ao.x ^ ao.z, ao.y ^ ao.w, bo.x ^ bo.z, bo.y ^ bo.w);
+        if (pad_e) { continue; }
+        // A padded odd pair is all zeros, so its products vanish exactly.
+        uint4 xs[8] = {a1, a0 ^ a1, a3, a2 ^ a3, a2, a0 ^ a2, a1 ^ a3, a0 ^ a1 ^ a2 ^ a3};
+        uint4 ys[8] = {b1, b0 ^ b1, b3, b2 ^ b3, b2, b0 ^ b2, b1 ^ b3, b0 ^ b1 ^ b2 ^ b3};
+#pragma clang loop unroll(disable)
+        for (uint k = 0u; k < 8u; k++) { zc_r2_horner_add(h[k], clmul128(xs[k], ys[k])); }
+    }
+    uint4 le = eq_lo[window * 4u + 2u * small_hi];
+    uint4 lo = eq_lo[window * 4u + 2u * small_hi + 1u];
+#pragma clang loop unroll(disable)
+    for (uint k = 0u; k < 8u; k++) {
+        uint4 x = gf_reduce(clmul128(k < 2u ? le : lo, zc_r2_horner_reduce(h[k])));
+        for (ushort m = 16; m >= 1; m >>= 1) {
+            x ^= simd_shuffle_xor(x, m);
+        }
+        if (sl == 0u) { red[sg * 8u + k] = x; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 8u) {
+        uint4 acc = uint4(0u);
+        for (uint s = 0u; s < nsg; s++) { acc ^= red[s * 8u + lid]; }
+        partials[tgid * 8u + lid] = gf_reduce(clmul128(eq_hi[hi_chunk], acc));
+    }
+}
+
 "#;
 
     fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
@@ -15465,6 +15571,15 @@ kernel void zc_r2_horner_oracle(
         eq_hi_cap: usize,
         part_buf: Id,
         part_cap: usize,
+        /// Full-arm PSO (`NIL` when it did not build), its partials, and the
+        /// process-lifetime anchor/delta targets of its chunks.
+        full_pso: Id,
+        full_part_buf: Id,
+        full_part_cap: usize,
+        cal_anc_buf: Id,
+        cal_anc_cap: usize,
+        cal_del_buf: Id,
+        cal_del_cap: usize,
         /// Cached no-copy wraps of the packed witness inputs `(ptr, len, buf)`.
         wraps: Vec<(usize, usize, Id)>,
         /// In-flight ZC-idle-fill primer command buffer (see
@@ -15581,6 +15696,16 @@ kernel void zc_r2_horner_oracle(
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
+    /// Full-arm share: the CPU does no work on a GPU chunk, so the balance
+    /// point of `(hi - g)·u_cpu = g·u_gpu` is `hi / (ratio + 1)`. A ratio at
+    /// or above the floor bound (or unusable) keeps the arm off.
+    pub(crate) fn zc_r2_full_gate_share(ratio: f64, hi_size: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 || ratio >= ZC_R2_FLOOR_MAX_RATIO {
+            return 0;
+        }
+        ((hi_size as f64 / (ratio + 1.0)).round() as usize).min(hi_size)
+    }
+
     pub(crate) fn zc_r2_gate_share(ratio: f64, hi_size: usize) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
@@ -15603,7 +15728,7 @@ kernel void zc_r2_horner_oracle(
     fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
         unsafe {
             let pool = gpu.pool_push();
-            let built = (|| -> Result<(Id, Id), String> {
+            let built = (|| -> Result<(Id, Id, Id), String> {
                 let source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled());
                 let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
@@ -15660,11 +15785,24 @@ kernel void zc_r2_horner_oracle(
                     },
                     Err(e) => Err(e),
                 };
+                let full = if built.is_ok() {
+                    match make_pipeline("zc_r2_full_horner") {
+                        Ok(f) => f,
+                        Err(e) => {
+                            if super::gpu_zc_r2_debug() {
+                                eprintln!("[zc-r2] full arm unavailable: {e}");
+                            }
+                            NIL
+                        }
+                    }
+                } else {
+                    NIL
+                };
                 gpu.release(library);
-                built
+                built.map(|(a, b)| (a, b, full))
             })();
             gpu.pool_pop(pool);
-            let (pso, horner_pso) = built?;
+            let (pso, horner_pso, full_pso) = built?;
             let horner_resources = (
                 send!(
                     gpu.api,
@@ -15702,6 +15840,13 @@ kernel void zc_r2_horner_oracle(
                 eq_hi_cap: 0,
                 part_buf: NIL,
                 part_cap: 0,
+                full_pso,
+                full_part_buf: NIL,
+                full_part_cap: 0,
+                cal_anc_buf: NIL,
+                cal_anc_cap: 0,
+                cal_del_buf: NIL,
+                cal_del_cap: 0,
                 wraps: Vec::new(),
                 prefetch_cb: NIL,
             })
@@ -15729,6 +15874,11 @@ kernel void zc_r2_horner_oracle(
         cb: Id,
         a_buf: Id,
         b_buf: Id,
+        /// Full arm: the anchor/delta targets it binds (the caller's compact
+        /// state, or the calibration probe's private buffers) and the
+        /// caller's compact base pointers for the calibration oracle.
+        full: Option<(Id, Id)>,
+        cpu_compact: (usize, usize),
         pub chunks: usize,
         calibration: bool,
         horner: bool,
@@ -15754,6 +15904,11 @@ kernel void zc_r2_horner_oracle(
             self.calibration
         }
 
+        /// Whether this job is the full arm (the CPU skips its chunks).
+        pub(crate) fn is_full(&self) -> bool {
+            self.full.is_some()
+        }
+
         #[cfg(test)]
         pub(crate) fn uses_horner(&self) -> bool {
             self.horner
@@ -15768,6 +15923,11 @@ kernel void zc_r2_horner_oracle(
         /// Timed-prove prefix partials, bit-exact per chunk, parity-split as
         /// `[p1_even, pinf_even, p1_odd, pinf_odd]` (all eq_hi-weighted).
         Prefix(Vec<[F128; 4]>),
+        /// Full-arm prefix: `[p1_e, pinf_e, p1_o, pinf_o, W0, W3, W4, W5]` per
+        /// chunk (all eq_hi-weighted), plus the base addresses of the GPU
+        /// buffers holding the prefix's anchors and deltas (valid until the
+        /// next round-two launch).
+        Full(Vec<[F128; 8]>, usize, usize),
         /// Metal failed after admission; the caller must CPU-redo the
         /// prefix products. The arm is poisoned for the process.
         Failed,
@@ -15783,6 +15943,7 @@ kernel void zc_r2_horner_oracle(
         mask: u32,
         useful: u32,
         horner: bool,
+        full: Option<(Id, Id)>,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -15806,6 +15967,23 @@ kernel void zc_r2_horner_oracle(
                 std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let cb = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb)?;
+            if let Some((anc_buf, del_buf)) = full {
+                gpu.set_pipeline(enc, state.full_pso);
+                gpu.set_buffer(enc, a_buf, 0, 0);
+                gpu.set_buffer(enc, b_buf, 0, 1);
+                gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
+                gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
+                gpu.set_buffer(enc, state.nib_buf, 0, 4);
+                gpu.set_buffer(enc, state.full_part_buf, 0, 5);
+                gpu.set_bytes(enc, pb, 6);
+                gpu.set_buffer(enc, anc_buf, 0, 7);
+                gpu.set_buffer(enc, del_buf, 0, 8);
+                gpu.dispatch(enc, (chunks * 2) as u64, 256);
+                gpu.end_encoding(enc);
+                let cb = gpu.retain(cb);
+                gpu.commit_async(cb);
+                return Ok(cb);
+            }
             gpu.set_pipeline(enc, if horner { state.horner_pso } else { state.pso });
             gpu.set_buffer(enc, a_buf, 0, 0);
             gpu.set_buffer(enc, b_buf, 0, 1);
@@ -15819,6 +15997,40 @@ kernel void zc_r2_horner_oracle(
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
             Ok(cb)
+        }
+    }
+
+    /// Full-arm prefix target: a page-aligned host allocation owned by the
+    /// arm's state for the process lifetime, behind one no-copy view.
+    /// Returns the view and the allocation's byte size.
+    unsafe fn zc_r2_host_alloc(gpu: &Gpu, len: usize) -> Option<(Id, usize)> {
+        const PAGE: usize = 16384;
+        let size = len.div_ceil(PAGE).max(1) * PAGE;
+        let layout = std::alloc::Layout::from_size_align(size, PAGE).ok()?;
+        unsafe {
+            let p = std::alloc::alloc(layout);
+            if p.is_null() {
+                return None;
+            }
+            match gpu.wrap_buffer(p, size) {
+                Ok(b) => Some((b, size)),
+                Err(_) => {
+                    std::alloc::dealloc(p, layout);
+                    None
+                }
+            }
+        }
+    }
+
+    /// Release a [`zc_r2_host_alloc`] view and free its allocation.
+    unsafe fn zc_r2_host_free(gpu: &Gpu, buf: Id, size: usize) {
+        if size == 0 || buf.is_null() {
+            return;
+        }
+        unsafe {
+            let p = gpu.buffer_contents(buf);
+            gpu.release(buf);
+            std::alloc::dealloc(p, std::alloc::Layout::from_size_align_unchecked(size, 16384));
         }
     }
 
@@ -16016,6 +16228,7 @@ kernel void zc_r2_horner_oracle(
                     pair_in_block_mask as u32,
                     useful_pairs_inclusive as u32,
                     horner,
+                    None,
                 )?;
                 state.prefetch_cb = cb;
                 Ok(())
@@ -16054,6 +16267,7 @@ kernel void zc_r2_horner_oracle(
         hi_size: usize,
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
+        full_out: Option<(*mut u8, usize, *mut u8, usize)>,
     ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
@@ -16147,6 +16361,50 @@ kernel void zc_r2_horner_oracle(
             }
             let a_buf = zc_r2_wrap(&mut state, gpu, a_packed).ok()?;
             let b_buf = zc_r2_wrap(&mut state, gpu, b_packed).ok()?;
+            // Full arm: the probe's (calibration) or the prefix's (timed)
+            // anchors (32 B per pair) and deltas (16 B per pair) go to two
+            // process-lifetime GPU buffers, grown on demand and reused every
+            // prove, so the timed prove never pays wrap creation, page
+            // wiring or first-touch faults. The caller's compact reader takes
+            // the leading pairs from them (`UniSkipCompactFold::gpu_prefix`).
+            let mut cpu_compact = (0usize, 0usize);
+            let full = match full_out {
+                Some((ap, al, dp, dl))
+                    if horner
+                        && super::zc_r2_full_gpu_enabled()
+                        && !state.full_pso.is_null()
+                        && al == hi_size * lo_size * 32
+                        && dl == hi_size * lo_size * 16 =>
+                {
+                    cpu_compact = (ap as usize, dp as usize);
+                    let need_part = hi_size * 2 * 8 * 16;
+                    if state.full_part_cap < need_part {
+                        if state.full_part_cap > 0 {
+                            gpu.release(state.full_part_buf);
+                        }
+                        state.full_part_buf = gpu.new_buffer(need_part).ok()?;
+                        state.full_part_cap = need_part;
+                    }
+                    let need_a = chunks * lo_size * 32;
+                    let need_d = chunks * lo_size * 16;
+                    if state.cal_anc_cap < need_a {
+                        zc_r2_host_free(gpu, state.cal_anc_buf, state.cal_anc_cap);
+                        state.cal_anc_cap = 0;
+                        let (b, cap) = zc_r2_host_alloc(gpu, need_a)?;
+                        state.cal_anc_buf = b;
+                        state.cal_anc_cap = cap;
+                    }
+                    if state.cal_del_cap < need_d {
+                        zc_r2_host_free(gpu, state.cal_del_buf, state.cal_del_cap);
+                        state.cal_del_cap = 0;
+                        let (b, cap) = zc_r2_host_alloc(gpu, need_d)?;
+                        state.cal_del_buf = b;
+                        state.cal_del_cap = cap;
+                    }
+                    Some((state.cal_anc_buf, state.cal_del_buf))
+                }
+                _ => None,
+            };
             let cb = zc_r2_submit(
                 gpu,
                 &state,
@@ -16157,12 +16415,15 @@ kernel void zc_r2_horner_oracle(
                 pair_in_block_mask as u32,
                 useful_pairs_inclusive as u32,
                 horner,
+                full,
             )
             .ok()?;
             Some(ZcR2Job {
                 cb,
                 a_buf,
                 b_buf,
+                full,
+                cpu_compact,
                 chunks,
                 calibration,
                 horner,
@@ -16222,6 +16483,70 @@ kernel void zc_r2_horner_oracle(
                     return poison(job.cb);
                 }
             };
+            if let Some((anc_buf, del_buf)) = job.full {
+                let parts = gpu.buffer_contents(state.full_part_buf).cast::<F128>();
+                let mut out8: Vec<[F128; 8]> = Vec::with_capacity(job.chunks);
+                for c in 0..job.chunks {
+                    let mut m = [F128::ZERO; 8];
+                    for g in 0..2 {
+                        for (k, slot) in m.iter_mut().enumerate() {
+                            *slot += *parts.add((c * 2 + g) * 8 + k);
+                        }
+                    }
+                    out8.push(m);
+                }
+                if !job.calibration {
+                    gpu.release(job.cb);
+                    let anc = gpu.buffer_contents(anc_buf) as usize;
+                    let del = gpu.buffer_contents(del_buf) as usize;
+                    if let Some(submitted) = job.submitted {
+                        eprintln!(
+                            "[zc-r2] timed full prefix {}/{} chunks: gpu={first_wall:.2}ms \
+                             cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms",
+                            job.chunks,
+                            hi_size,
+                            submitted.elapsed().as_secs_f64() * 1e3,
+                        );
+                    }
+                    return ZcR2Result::Full(out8, anc, del);
+                }
+                // Calibration oracle: every product and deferred sum, and the
+                // anchor/delta bytes of every live pair of the leading probe
+                // chunks, must equal the CPU's own values bit-for-bit.
+                let (Some(cpu_all), Some(cpu_la)) = (cpu_partials, cpu_la) else {
+                    return poison(job.cb);
+                };
+                for c in 0..job.chunks {
+                    let m = &out8[c];
+                    let ok = (m[0] + m[2], m[1] + m[3]) == cpu_all[c]
+                        && cpu_la[c] == [m[2], m[3], m[4], m[5], m[6], m[7]];
+                    if !ok {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!("[zc-r2] FULL CALIBRATION MISMATCH (sums) at chunk {c} — poisoned");
+                        }
+                        return poison(job.cb);
+                    }
+                }
+                let (ca, cd) = job.cpu_compact;
+                let ga = gpu.buffer_contents(anc_buf);
+                let gd = gpu.buffer_contents(del_buf);
+                let check_pairs = job.chunks.min(16) * job.lo_size;
+                for pair in 0..check_pairs {
+                    if (pair as u32 & job.mask) >= job.useful {
+                        continue;
+                    }
+                    let a_ok = std::slice::from_raw_parts(ga.add(pair * 32), 32)
+                        == std::slice::from_raw_parts((ca as *const u8).add(pair * 32), 32);
+                    let d_ok = std::slice::from_raw_parts(gd.add(pair * 16), 16)
+                        == std::slice::from_raw_parts((cd as *const u8).add(pair * 16), 16);
+                    if !(a_ok && d_ok) {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!("[zc-r2] FULL CALIBRATION MISMATCH (compact) at pair {pair} — poisoned");
+                        }
+                        return poison(job.cb);
+                    }
+                }
+            }
             let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
             let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
             let groups = if job.horner { 4 } else { 1 };
@@ -16265,7 +16590,7 @@ kernel void zc_r2_horner_oracle(
             // odd-parity half the round-three lookahead consumes are checked,
             // so a kernel that got the right total from the wrong split
             // cannot be admitted.
-            for c in 0..job.chunks {
+            for c in 0..if job.full.is_some() { 0 } else { job.chunks } {
                 let summed = (out[c][0] + out[c][2], out[c][1] + out[c][3]);
                 let split_ok =
                     cpu_la.is_none_or(|la| la[c][0] == out[c][2] && la[c][1] == out[c][3]);
@@ -16303,6 +16628,7 @@ kernel void zc_r2_horner_oracle(
                     job.mask,
                     job.useful,
                     job.horner,
+                    job.full,
                 ) else {
                     break;
                 };
@@ -16333,7 +16659,11 @@ kernel void zc_r2_horner_oracle(
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
-                let g = zc_r2_gate_share(ratio, hi_size);
+                let g = if job.full.is_some() {
+                    zc_r2_full_gate_share(ratio, hi_size)
+                } else {
+                    zc_r2_gate_share(ratio, hi_size)
+                };
                 if super::gpu_zc_r2_debug() {
                     eprintln!("[zc-r2] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
@@ -16346,6 +16676,71 @@ kernel void zc_r2_horner_oracle(
             } else {
                 0
             };
+            // Full arm: size its two GPU buffers for the published share now,
+            // in the untimed warmup, and touch them from both sides (CPU
+            // stores, then one full-share GPU dispatch), so the timed prove
+            // pays no allocation, page wiring or first-touch faults.
+            if share > 0 && job.full.is_some() {
+                let ok = (|| -> Option<()> {
+                    let mut state = zc_r2_state()?.lock().ok()?;
+                    let need_a = share * job.lo_size * 32;
+                    let need_d = share * job.lo_size * 16;
+                    if state.cal_anc_cap < need_a {
+                        zc_r2_host_free(gpu, state.cal_anc_buf, state.cal_anc_cap);
+                        state.cal_anc_cap = 0;
+                        let (b, cap) = zc_r2_host_alloc(gpu, need_a)?;
+                        state.cal_anc_buf = b;
+                        state.cal_anc_cap = cap;
+                    }
+                    if state.cal_del_cap < need_d {
+                        zc_r2_host_free(gpu, state.cal_del_buf, state.cal_del_cap);
+                        state.cal_del_cap = 0;
+                        let (b, cap) = zc_r2_host_alloc(gpu, need_d)?;
+                        state.cal_del_buf = b;
+                        state.cal_del_cap = cap;
+                    }
+                    std::ptr::write_bytes(gpu.buffer_contents(state.cal_anc_buf), 0, state.cal_anc_cap);
+                    std::ptr::write_bytes(gpu.buffer_contents(state.cal_del_buf), 0, state.cal_del_cap);
+                    let cb = zc_r2_submit(
+                        gpu,
+                        &state,
+                        job.a_buf,
+                        job.b_buf,
+                        share,
+                        job.lo_size,
+                        job.mask,
+                        job.useful,
+                        job.horner,
+                        Some((state.cal_anc_buf, state.cal_del_buf)),
+                    )
+                    .ok()?;
+                    let waited = gpu.wait_cb(cb).is_ok();
+                    gpu.release(cb);
+                    // Read both buffers once from the CPU after the GPU wrote
+                    // them, so the timed K pass is not their first CPU read.
+                    for (buf, cap) in [(state.cal_anc_buf, state.cal_anc_cap), (state.cal_del_buf, state.cal_del_cap)] {
+                        let base = crate::epool::SyncPtr(gpu.buffer_contents(buf));
+                        let chunk = 1usize << 20;
+                        crate::epool::run_hetero_chunks(cap.div_ceil(chunk), |i| {
+                            let p = base.ptr().cast_const();
+                            let lo = i * chunk;
+                            let hi = (lo + chunk).min(cap);
+                            let mut acc = 0u64;
+                            let mut off = lo;
+                            while off < hi {
+                                acc ^= std::ptr::read_volatile(p.add(off).cast::<u64>());
+                                off += 64;
+                            }
+                            std::hint::black_box(acc);
+                        });
+                    }
+                    waited.then_some(())
+                })();
+                if ok.is_none() {
+                    ZC_R2_TUNED.store(0, Ordering::Relaxed);
+                    return ZcR2Result::Calibrated;
+                }
+            }
             ZC_R2_TUNED.store(share, Ordering::Relaxed);
             ZcR2Result::Calibrated
         }
@@ -21640,6 +22035,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             hi_size,
             mask,
             useful,
+            None,
         )
         .expect("calibration launch must succeed on real Metal");
         assert_eq!(
@@ -21670,6 +22066,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             hi_size,
             mask,
             useful,
+            None,
         )
         .expect("timed launch must succeed");
         assert_eq!(
@@ -21746,6 +22143,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             hi_size,
             mask,
             useful,
+            None,
         )
         .expect("changed-input launch must succeed");
         assert_eq!(
