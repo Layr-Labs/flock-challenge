@@ -1727,6 +1727,25 @@ fn r2_fixed_pads_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_R2_FIXED_PADS").is_none())
 }
 
+/// Kill switch for the hoisted degenerate-pair flag of the GPU-covered
+/// round-two kernels (Horner and pre-scaled): `FLOCK_NO_R2_HORNER_AL=1` keeps
+/// the runtime `degen` test in every pair. Otherwise the flag is a const
+/// generic (`DEG` = 1 false, 2 true), so the per-pair `degen &&` disappears
+/// and the fixed-pad loops carry no runtime predicate at all. Same outputs.
+#[cfg(target_arch = "aarch64")]
+fn r2_horner_al_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_HORNER_AL").is_none_or(|v| v != *"1"))
+}
+
+/// `DEG` code for [`r2_horner_al_enabled`]: 0 runtime flag, 1 const false,
+/// 2 const true.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn r2_deg_code(degen: bool) -> u8 {
+    if r2_horner_al_enabled() { 1 + degen as u8 } else { 0 }
+}
+
 /// GPU-covered round-two lookahead with the four fixed medium weights
 /// deferred until after a 16-position polynomial Horner sum.
 ///
@@ -1762,8 +1781,8 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
     out: *mut F128,
 ) {
     unsafe {
-        if r2_gpr_delta_enabled() {
-            fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, true>(
+        match (r2_gpr_delta_enabled(), r2_deg_code(degen)) {
+            (true, 0) => fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, true, 0>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -1777,9 +1796,8 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
                 degen,
                 skip_dead,
                 out,
-            )
-        } else {
-            fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, false>(
+            ),
+            (true, 1) => fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, true, 1>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -1793,7 +1811,67 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
                 degen,
                 skip_dead,
                 out,
-            )
+            ),
+            (true, _) => fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, true, 2>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, 0) => fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, false, 0>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, 1) => fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, false, 1>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, _) => fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, false, 2>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
         }
     }
 }
@@ -1870,6 +1948,7 @@ unsafe fn store_delta_a_only_gpr(dst: *mut u8, a0: u64, a1: u64) {
 unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
     const SKIP_FIRST_SHIFT: bool,
     const GPR_DELTA: bool,
+    const DEG: u8,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -2058,6 +2137,12 @@ unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
 
     unsafe {
         let zero = vdupq_n_u64(0);
+        // `DEG` != 0: the degenerate flag is a compile-time constant.
+        let degen = match DEG {
+            1 => false,
+            2 => true,
+            _ => degen,
+        };
         let mut sum0 = zero;
         let mut sum3 = zero;
         let mut sum4 = zero;
@@ -2339,8 +2424,8 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
     out: *mut F128,
 ) {
     unsafe {
-        match (r2_gpr_delta_enabled(), r2_fixed_pads_enabled()) {
-            (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true>(
+        match (r2_gpr_delta_enabled(), r2_fixed_pads_enabled(), r2_deg_code(degen)) {
+            (true, true, 0) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, 0>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2355,7 +2440,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (true, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false>(
+            (true, true, 1) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, 1>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2370,7 +2455,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (false, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true>(
+            (true, true, _) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, 2>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2385,7 +2470,127 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (false, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false>(
+            (true, false, 0) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, 0>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (true, false, 1) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, 1>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (true, false, _) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, 2>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, true, 0) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, 0>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, true, 1) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, 1>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, true, _) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, 2>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, false, 0) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, 0>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, false, 1) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, 1>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                skip_dead,
+                out,
+            ),
+            (false, false, _) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, 2>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2410,6 +2615,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
 unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
     const GPR_DELTA: bool,
     const FIXED_PADS: bool,
+    const DEG: u8,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -2442,6 +2648,12 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
 
     unsafe {
         let zero = vdupq_n_u64(0);
+        // `DEG` != 0: the degenerate flag is a compile-time constant.
+        let degen = match DEG {
+            1 => false,
+            2 => true,
+            _ => degen,
+        };
         let k87 = vdupq_n_u64(0x87);
         let tri_zero = TriNeon {
             ll: zero,
@@ -5954,10 +6166,10 @@ mod tests {
                             let mut out = [poison; 8];
                             unsafe {
                                 let kernel = match (gpr, peel) {
-                                    (true, true) => fold_round2_compact_chunk_neon_horner_8_impl::<true, true>,
-                                    (false, true) => fold_round2_compact_chunk_neon_horner_8_impl::<true, false>,
-                                    (true, false) => fold_round2_compact_chunk_neon_horner_8_impl::<false, true>,
-                                    (false, false) => fold_round2_compact_chunk_neon_horner_8_impl::<false, false>,
+                                    (true, true) => fold_round2_compact_chunk_neon_horner_8_impl::<true, true, 0>,
+                                    (false, true) => fold_round2_compact_chunk_neon_horner_8_impl::<true, false, 0>,
+                                    (true, false) => fold_round2_compact_chunk_neon_horner_8_impl::<false, true, 0>,
+                                    (false, false) => fold_round2_compact_chunk_neon_horner_8_impl::<false, false, 0>,
                                 };
                                 kernel(
                                     table.data.as_ptr().cast::<u8>(),
@@ -6077,11 +6289,18 @@ mod tests {
                                 let mut out = [poison; 8];
                                 unsafe {
                                     let kernel = match variant {
-                                        0 => fold_round2_compact_chunk_neon_horner_8_impl::<true, false>,
-                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false>,
-                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false>,
-                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true>,
-                                        _ => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true>,
+                                        0 => fold_round2_compact_chunk_neon_horner_8_impl::<true, false, 0>,
+                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, 0>,
+                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, 0>,
+                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, 0>,
+                                        4 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, 0>,
+                                        // Hoisted degenerate flag (`DEG` = 1 + degen).
+                                        5 if degen => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, 2>,
+                                        5 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, 1>,
+                                        6 if degen => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, 2>,
+                                        6 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, 1>,
+                                        7 if degen => fold_round2_compact_chunk_neon_horner_8_impl::<true, true, 2>,
+                                        _ => fold_round2_compact_chunk_neon_horner_8_impl::<true, true, 1>,
                                     };
                                     kernel(
                                         table.data.as_ptr().cast::<u8>(),
@@ -6102,7 +6321,7 @@ mod tests {
                                 (anchors, deltas, out)
                             };
                             let horner = run(0);
-                            for variant in 1..=4 {
+                            for variant in 1..=7 {
                                 let prescaled = run(variant);
                                 let at = format!("v {variant} z {z_case} r {challenge_case} mask {mask} base {base} degen {degen} skip {skip_dead}");
                                 assert_eq!(prescaled.0, horner.0, "anchors: {at}");
@@ -7376,5 +7595,126 @@ impl ProdAcc {
     #[inline(always)]
     pub(crate) fn reduce(self) -> F128 {
         self.0.reduce()
+    }
+}
+
+/// One-core timing + byte-identity of the GPU-covered round-two kernels
+/// with the runtime vs hoisted degenerate flag, on real dumped inputs
+/// (`AZ_DIR` = a `FLOCK_ZK_DUMP` directory with r2_a.bin, r2_b.bin,
+/// r2_table.bin, r2_eqlo.bin, r2_meta.txt). Run with `--ignored`.
+#[cfg(all(test, target_arch = "aarch64", target_feature = "sha3"))]
+mod hal_probe {
+    use super::*;
+    use std::time::Instant;
+
+    fn f128s(b: &[u8]) -> Vec<F128> {
+        b.chunks_exact(16)
+            .map(|c| F128 {
+                lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
+                hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+            })
+            .collect()
+    }
+
+    type HFn = unsafe fn(
+        *const u8, *const u8, *const u8, *mut F128, *mut u8, *const F128, usize, usize, usize,
+        usize, bool, bool, *mut F128,
+    );
+
+    #[test]
+    #[ignore]
+    fn hal_r2_forms() {
+        std::thread::spawn(|| {
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
+            }
+            // SAFETY: plain libSystem call on this thread (P-core QoS).
+            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+            let d: std::path::PathBuf = std::env::var_os("AZ_DIR").expect("AZ_DIR").into();
+            let meta: std::collections::HashMap<String, String> =
+                std::fs::read_to_string(d.join("r2_meta.txt"))
+                    .unwrap()
+                    .lines()
+                    .filter_map(|l| l.split_once('=').map(|(k, v)| (k.into(), v.into())))
+                    .collect();
+            let g = |k: &str| meta[k].parse::<usize>().unwrap();
+            let (lo_size, x0, nck) = (g("lo_size"), g("x0"), g("nck"));
+            let degen = meta["degen"] == "true";
+            let a = std::fs::read(d.join("r2_a.bin")).unwrap();
+            let b = std::fs::read(d.join("r2_b.bin")).unwrap();
+            let table = f128s(&std::fs::read(d.join("r2_table.bin")).unwrap());
+            let eq_lo = f128s(&std::fs::read(d.join("r2_eqlo.bin")).unwrap());
+            let tp = table.as_ptr().cast::<u8>();
+            let row_bytes = lo_size * 2 * 8;
+            let anc_len = 2 * lo_size;
+            let del_len = 16 * lo_size;
+            let dg = if degen { 2 } else { 1 };
+            let forms: Vec<(&str, HFn)> = vec![
+                ("prescaled rec", fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, 0>),
+                (
+                    "prescaled AL",
+                    if dg == 2 {
+                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, 2>
+                    } else {
+                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, 1>
+                    },
+                ),
+                ("horner rec", fold_round2_compact_chunk_neon_horner_8_impl::<true, true, 0>),
+                (
+                    "horner AL",
+                    if dg == 2 {
+                        fold_round2_compact_chunk_neon_horner_8_impl::<true, true, 2>
+                    } else {
+                        fold_round2_compact_chunk_neon_horner_8_impl::<true, true, 1>
+                    },
+                ),
+            ];
+            let run = |f: HFn, skip_dead: bool| {
+                let mut anc = vec![F128::ZERO; anc_len * nck];
+                let mut del = vec![0u8; del_len * nck];
+                let mut outs = vec![F128::ZERO; 8 * nck];
+                for c in 0..nck {
+                    unsafe {
+                        f(tp, a.as_ptr().add(c * row_bytes), b.as_ptr().add(c * row_bytes),
+                          anc.as_mut_ptr().add(c * anc_len), del.as_mut_ptr().add(c * del_len),
+                          eq_lo.as_ptr(), lo_size, (x0 + c) * lo_size, 127, 121, degen,
+                          skip_dead, outs.as_mut_ptr().add(8 * c));
+                    }
+                }
+                (anc, del, outs)
+            };
+            for sd in [false, true] {
+                for pair in [(0usize, 1usize), (2, 3)] {
+                    let w = run(forms[pair.0].1, sd);
+                    let got = run(forms[pair.1].1, sd);
+                    assert!(w.0 == got.0 && w.1 == got.1 && w.2 == got.2, "{} differs (sd {sd})", forms[pair.1].0);
+                }
+                // Prescaled and Horner must agree with each other as well.
+                let p = run(forms[0].1, sd);
+                let h = run(forms[2].1, sd);
+                assert!(p.0 == h.0 && p.1 == h.1 && p.2 == h.2, "prescaled vs horner (sd {sd})");
+            }
+            println!("hal r2: forms byte-identical on {nck} real chunks (lo_size {lo_size}, degen {degen})");
+            let rounds: usize = std::env::var("AZ_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(41);
+            let groups = (nck * lo_size / 2) as f64;
+            let mut t = vec![Vec::new(); forms.len()];
+            for r in 0..rounds + 1 {
+                for k in 0..forms.len() {
+                    let i = (k + r) % forms.len();
+                    let t0 = Instant::now();
+                    std::hint::black_box(run(forms[i].1, true));
+                    if r > 0 {
+                        t[i].push(t0.elapsed().as_nanos() as f64 / groups);
+                    }
+                }
+            }
+            for (i, (n, _)) in forms.iter().enumerate() {
+                let v = &mut t[i];
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!("  {n:<16} lq {:7.3} med {:7.3} ns/group", v[v.len() / 4], v[v.len() / 2]);
+            }
+        })
+        .join()
+        .unwrap();
     }
 }

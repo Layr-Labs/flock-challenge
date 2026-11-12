@@ -1243,7 +1243,7 @@ impl AdditiveNttF128 {
         // match the unsplit transform exactly.
         let sub_start = b_start << (DEEP_LAYER - start_layer);
         let sub_end = b_end << (DEEP_LAYER - start_layer);
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+        self.forward_transform_interleaved_deep_fused_pairs_range_and_then_sched(
             data,
             num_ntts,
             DEEP_LAYER,
@@ -1252,6 +1252,7 @@ impl AdditiveNttF128 {
             sub_end,
             odd_tail,
             &finish_chunk,
+            hybrid_ntt_ecore_enabled(),
         );
     }
 
@@ -1289,7 +1290,7 @@ impl AdditiveNttF128 {
         self.forward_transform_interleaved_block_range(
             data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
         );
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+        self.forward_transform_interleaved_deep_fused_pairs_range_and_then_sched(
             data,
             num_ntts,
             DEEP_LAYER,
@@ -1298,6 +1299,7 @@ impl AdditiveNttF128 {
             16 << (DEEP_LAYER - 4),
             odd_tail,
             &finish_chunk,
+            hybrid_ntt_ecore_enabled(),
         );
         Ok(())
     }
@@ -1952,6 +1954,32 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
+        self.forward_transform_interleaved_deep_fused_pairs_range_and_then_sched(
+            data, num_ntts, n_top, log_d, sub_start, sub_end, zero_tail, finish_chunk, false,
+        );
+    }
+
+    /// [`Self::forward_transform_interleaved_deep_fused_pairs_range_and_then`]
+    /// with the sub-NTT queue optionally shared with the efficiency-core
+    /// helper pool (`hetero`, see [`hybrid_ntt_ecore_enabled`]). Every
+    /// layer-`n_top` sub-NTT is still computed exactly once by the same code
+    /// on its own disjoint 1 MiB slice; only which thread runs it changes.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_transform_interleaved_deep_fused_pairs_range_and_then_sched<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        n_top: usize,
+        log_d: usize,
+        sub_start: usize,
+        sub_end: usize,
+        // Trailing lanes known zero at every odd position; 0 = dense.
+        zero_tail: usize,
+        finish_chunk: &F,
+        hetero: bool,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
         use rayon::prelude::*;
 
         debug_assert!(n_top <= log_d);
@@ -1965,10 +1993,7 @@ impl AdditiveNttF128 {
         let range_start = sub_start * sub_elems;
         let range_end = sub_end * sub_elems;
 
-        data[range_start..range_end]
-            .par_chunks_mut(sub_elems)
-            .enumerate()
-            .for_each(|(local_sub_idx, sub_data)| {
+        let one_sub = |local_sub_idx: usize, sub_data: &mut [F128]| {
                 let sub_idx = sub_start + local_sub_idx;
                 let mut layer = n_top;
                 while layer + 1 < log_d {
@@ -2042,7 +2067,23 @@ impl AdditiveNttF128 {
                     }
                 }
                 finish_chunk(sub_idx * sub_elems, sub_data);
+            };
+        if hetero {
+            let base = crate::epool::SyncPtr(data[range_start..range_end].as_mut_ptr());
+            crate::epool::run_hetero_chunks(sub_end - sub_start, |local_sub_idx| {
+                // SAFETY: the queue hands out each index exactly once and the
+                // sub-NTT slices are disjoint `sub_elems` windows of `data`.
+                let sub_data = unsafe {
+                    core::slice::from_raw_parts_mut(base.ptr().add(local_sub_idx * sub_elems), sub_elems)
+                };
+                one_sub(local_sub_idx, sub_data);
             });
+        } else {
+            data[range_start..range_end]
+                .par_chunks_mut(sub_elems)
+                .enumerate()
+                .for_each(|(local_sub_idx, sub_data)| one_sub(local_sub_idx, sub_data));
+        }
     }
 
     /// Scalar reference implementation. Used as the test oracle and on
@@ -4243,6 +4284,30 @@ mod zero_lane_skip {
         let skipped = run(&src, TAIL);
         assert_eq!(dense, skipped, "zero-lane skip changed the codeword");
 
+        // Same schedule with the deep pairs on the P+E hetero queue
+        // (`hybrid_ntt_ecore_enabled`): identical codeword and chunk offsets.
+        let offs = std::sync::Mutex::new(Vec::new());
+        let mut het = src.clone();
+        ntt.forward_transform_interleaved_block_range(
+            &mut het, NUM_NTTS, start_layer, n_top, 0, 1 << start_layer, TAIL,
+        );
+        ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then_sched(
+            &mut het,
+            NUM_NTTS,
+            n_top,
+            log_d,
+            0,
+            1 << n_top,
+            TAIL,
+            &|o, _| offs.lock().unwrap().push(o),
+            true,
+        );
+        assert_eq!(dense, het, "hetero deep-pair queue changed the codeword");
+        let mut offs = offs.into_inner().unwrap();
+        offs.sort_unstable();
+        let sub = (1usize << (log_d - n_top)) * NUM_NTTS;
+        assert_eq!(offs, (0..1usize << n_top).map(|i| i * sub).collect::<Vec<_>>());
+
         // The schedule itself must still be the true transform.
         let mut oracle = src.clone();
         ntt.forward_transform_interleaved_scalar_from_layer(&mut oracle, NUM_NTTS, start_layer);
@@ -4334,4 +4399,14 @@ mod zero_lane_skip {
         }
         assert_eq!(ranked_zero_odd_tail_lanes(ZERO_TAIL_LOG_D, NUM_NTTS), 0);
     }
+}
+
+/// Hybrid-commit CPU suffix: share the deep-pair sub-NTT queue (1 MiB
+/// cache-local layer-10 sub-NTTs, the last ~8 ms of the CPU arm) with the
+/// efficiency-core helper pool, which otherwise idles from the end of the
+/// round-one AB queue to the commitment root. Tail-guarded hetero queue;
+/// scheduling only, byte-identical codewords. `FLOCK_NO_NTT_ECORE=1` kills.
+pub(crate) fn hybrid_ntt_ecore_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_ECORE").as_deref() != Some(std::ffi::OsStr::new("1")))
 }
