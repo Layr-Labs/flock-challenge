@@ -196,6 +196,7 @@ mod imp {
     /// [`pool_spin_release`] after witness generation. Scheduling only: the
     /// jobs are the same jobs, run by the same pool.
     ///
+    ///
     /// `FLOCK_NO_POOL_SPIN=1` keeps the detached-thread keep-alive instead.
     pub(super) fn pool_spin_start() -> bool {
         if std::env::var_os("FLOCK_NO_CPU_KEEPALIVE").is_some()
@@ -216,6 +217,11 @@ mod imp {
             }
             pool_spin_body(deadline);
         });
+        if std::env::var_os("FLOCK_NO_EPOOL_SPIN").is_none() {
+            if let Some(helpers) = crate::epool::helper_pool() {
+                helpers.spawn_broadcast(move |_| pool_spin_body(deadline));
+            }
+        }
         true
     }
 
