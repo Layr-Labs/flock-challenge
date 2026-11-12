@@ -1026,6 +1026,14 @@ fn grind_race_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_RACE").is_none())
 }
 
+/// See the fine-stop comment in [`cpu_race_scan`]; exact `1` kills.
+fn grind_race_fine_stop_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("FLOCK_NO_GRIND_RACE_FINE_STOP").map_or(true, |v| v != "1")
+    })
+}
+
 /// Ascending CPU scan for the race: blocks of `2^(bits+1)` nonces drained by
 /// the main pool and the E-core helpers from one chunk cursor. Returns the
 /// smallest satisfying nonce once it is definitive (every lower chunk fully
@@ -1040,6 +1048,9 @@ fn cpu_race_scan(
     const CHUNK: u64 = 960;
     const PENDING: u64 = u64::MAX;
     const NO_MATCH: u64 = u64::MAX - 1;
+    // Two 48-nonce kernel batches per stop check.
+    const FINE_SUB: u64 = 96;
+    let fine_stop = grind_race_fine_stop_enabled();
     let block: u64 = 1 << (bits.min(24) + 1);
     let n_chunks = usize::try_from(block.div_ceil(CHUNK)).ok()?;
     let mut start = 0u64;
@@ -1058,18 +1069,42 @@ fn cpu_race_scan(
             if c >= n_chunks || c >= bound.load(Ordering::Relaxed) {
                 break;
             }
-            match pow_scan(
-                state_digest,
-                start.saturating_add(c as u64 * CHUNK),
-                CHUNK,
-                bits,
-                HashKind::Blake3,
-            ) {
-                Some(n) => {
+            let base = start.saturating_add(c as u64 * CHUNK);
+            // Fine stop (`FLOCK_NO_GRIND_RACE_FINE_STOP=1` kills): scan the
+            // chunk in ascending sub-blocks and re-check `stop` between
+            // them, so a GPU hit retires every core within one sub-block
+            // instead of one whole chunk (an E-core chunk is the race's
+            // longest tail). An abandoned chunk stays PENDING, which makes
+            // the CPU answer non-definitive: the GPU nonce (the same global
+            // minimum) is used. The first sub-block holding a match gives
+            // the chunk's smallest match, as the whole-chunk scan would.
+            let found = if fine_stop {
+                let mut off = 0u64;
+                loop {
+                    if off >= CHUNK {
+                        break Some(None);
+                    }
+                    if off > 0 && stop.load(Ordering::Relaxed) {
+                        break None;
+                    }
+                    let len = FINE_SUB.min(CHUNK - off);
+                    if let Some(n) =
+                        pow_scan(state_digest, base.saturating_add(off), len, bits, HashKind::Blake3)
+                    {
+                        break Some(Some(n));
+                    }
+                    off += len;
+                }
+            } else {
+                Some(pow_scan(state_digest, base, CHUNK, bits, HashKind::Blake3))
+            };
+            match found {
+                Some(Some(n)) => {
                     results[c].store(n, Ordering::Release);
                     bound.fetch_min(c, Ordering::Relaxed);
                 }
-                None => results[c].store(NO_MATCH, Ordering::Release),
+                Some(None) => results[c].store(NO_MATCH, Ordering::Release),
+                None => break,
             }
         };
         let main_threads = rayon::current_num_threads();

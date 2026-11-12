@@ -5799,7 +5799,8 @@ mod tests {
             let guard = ZeroOddTailLanes::scope(num_ntts, tail);
             let (commitment, data) = flock_core::pcs::commit(z, &setup.pcs_params);
             let digest = |v: &[u8]| *::blake3::hash(v).as_bytes();
-            let cw: &[flock_core::field::F128] = &data.codeword;
+            let cw_final = data.codeword.to_final_vec();
+            let cw: &[flock_core::field::F128] = &cw_final;
             let out = (
                 commitment.root,
                 digest(unsafe {

@@ -350,6 +350,102 @@ pub(crate) fn gpu_zerocheck_debug() -> bool {
 /// is XOR: associative and commutative, so any claim partition works).
 pub const ENV_NO_GPU_LINCHECK: &str = "FLOCK_NO_GPU_LINCHECK";
 
+/// Lincheck GPU wake (`FLOCK_NO_LC_GPU_WAKE=1`, exact, kills). The GPU sits
+/// idle from the zerocheck round-two arm (~28 ms before zerocheck returns)
+/// to the lincheck prefix fold, long enough to enter its deep idle state:
+/// the prefix then starts ~0.62 ms after submit (mini1, `GPUStartTime` minus
+/// the submit mark; still 0.61-0.64 ms with the CPU held idle after the
+/// submit, so it is GPU wake, not CPU starvation), and nine cores wait
+/// ~0.55-0.65 ms at the drain. Buffers submitted onto a GPU idle for up to
+/// ~3.5 ms start in ~0.1 ms. One 256-thread BLAKE3-leaf threadgroup on a
+/// private 264 KiB scratch pair, committed at zerocheck's first tri pass
+/// (~1.8 ms before the lincheck launch on mini1; `FLOCK_LC_GPU_WAKE_AT`
+/// moves it: tri pass index, 99 = after the tri loop, 100 = zerocheck
+/// return), wakes it: launch-to-start 0.09 ms, drain wait ~0. It touches no
+/// prove buffer, nothing waits on it, and it runs only in timed proves
+/// (after the warmup tuned the split). A gated precommit of the prefix
+/// itself (encodeWaitForEvent on a second queue, opened from the CPU at
+/// launch) does NOT wake the GPU: gate-to-start stayed 0.64 ms; an empty
+/// encoder does not either.
+pub const ENV_NO_LC_GPU_WAKE: &str = "FLOCK_NO_LC_GPU_WAKE";
+
+/// GPU completion events (`FLOCK_NO_GPU_DONE_EVENT=1`, exact, kills): the
+/// post-commit sync points (grind scans, lincheck/zerocheck fold drains, L1
+/// Merkle batches, the commit graph's cb2/cb3 joins) arm one pooled
+/// MTLSharedEvent signal behind their command buffer and treat the signalled
+/// value as completion. The cb `status` property flips ~25-110 us after the
+/// GPU end timestamp on mini1 (completion-handler path); the event value is
+/// visible ~20 us after it. Same buffers, same outputs, same failure checks
+/// (a buffer that errors never signals and is caught by the status poll).
+pub const ENV_NO_GPU_DONE_EVENT: &str = "FLOCK_NO_GPU_DONE_EVENT";
+
+pub(crate) fn gpu_done_event_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var(ENV_NO_GPU_DONE_EVENT).is_ok_and(|v| v == "1")
+    });
+    *ON
+}
+
+pub(crate) fn lc_gpu_wake_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var(ENV_NO_LC_GPU_WAKE).is_ok_and(|v| v == "1")
+    });
+    *ON
+}
+
+/// Armed by the prover for the ranked lincheck GPU arm; consumed by the
+/// first [`lc_gpu_wake_fire`] (zerocheck's tail).
+static LC_GPU_WAKE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Second wake point, default 99 (after zerocheck's tri loop):
+/// `FLOCK_LC_GPU_WAKE_AT2` moves it (same encoding), `FLOCK_NO_LC_GPU_WAKE2=1`
+/// (exact) kills it. The first wake fires ~1.8 ms before the lincheck launch
+/// on mini1; in ~1 of 12 timed proves the GPU had idled down again by the
+/// launch (launch-to-start 0.46-0.56 ms instead of 0.08). A second one-
+/// threadgroup leaf wake after the tri loop re-arms it: 0/24 misses vs 2/24,
+/// lincheck median -0.05 ms (cooled diag blocks, status drain on both arms).
+static LC_GPU_WAKE_ARMED2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn lc_gpu_wake_at2() -> u32 {
+    static AT2: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        if std::env::var("FLOCK_NO_LC_GPU_WAKE2").is_ok_and(|v| v == "1") {
+            return u32::MAX;
+        }
+        std::env::var("FLOCK_LC_GPU_WAKE_AT2").ok().and_then(|v| v.parse().ok()).unwrap_or(99)
+    });
+    *AT2
+}
+
+/// Arm (or, with `false`, disarm) the lincheck GPU wake for this prove.
+pub fn lc_gpu_wake_arm(on: bool) {
+    if !on {
+        lc_gpu_wake_fire(100);
+    }
+    LC_GPU_WAKE_ARMED.store(on && lc_gpu_wake_enabled(), std::sync::atomic::Ordering::Relaxed);
+    LC_GPU_WAKE_ARMED2.store(
+        on && lc_gpu_wake_enabled() && lc_gpu_wake_at2() != u32::MAX,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Fire the armed lincheck GPU wake (once per arm) at wake point `point`
+/// when it is the configured one (`FLOCK_LC_GPU_WAKE_AT`: zerocheck tri pass
+/// index, `99` = after the tri loop, `100` = zerocheck return).
+pub(crate) fn lc_gpu_wake_fire(point: u32) {
+    static AT: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_LC_GPU_WAKE_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    let first = point == *AT && LC_GPU_WAKE_ARMED.swap(false, std::sync::atomic::Ordering::Relaxed);
+    let second = !first
+        && point == lc_gpu_wake_at2()
+        && LC_GPU_WAKE_ARMED2.swap(false, std::sync::atomic::Ordering::Relaxed);
+    if !first && !second {
+        return;
+    }
+    crate::tmark::mark(if first { "lc wake fired" } else { "lc wake2 fired" });
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::lc_gpu_wake();
+}
+
 pub(crate) fn gpu_lincheck_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());
@@ -1324,6 +1420,299 @@ pub(crate) fn gpu_final_t3_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_T3").is_none())
 }
 
+/// GT lane TIMING-ONLY probes (proofs invalid when set): `FLOCK_GT_PROBE`
+/// is a comma list. `nowrite`: the fused final pass + leaf kernel skips its
+/// codeword store (leaves hash stale rows). `ring64`: rows go to a racy
+/// 64-slot ring and are hashed from there. `nocb3`: the GPU suffix-hash
+/// command buffer is empty.
+pub(crate) fn gt_probe(name: &str) -> bool {
+    static P: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::env::var("FLOCK_GT_PROBE").unwrap_or_default())
+        .split(',')
+        .any(|s| s == name)
+}
+
+pub(crate) fn gt_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+pub(crate) fn gt_probe_any() -> bool {
+    std::env::var_os("FLOCK_GT_PROBE").is_some()
+}
+
+/// Ring slots (64 KiB each) and claim attempts per group for the
+/// claimed-slot final leaf. `FLOCK_GT_RING_SLOTS` / `FLOCK_GT_RING_PROBES`
+/// override (tooling).
+pub(crate) fn ring_slots() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| gt_env_usize("FLOCK_GT_RING_SLOTS", RING_SLOTS_DEFAULT).clamp(1, 4096))
+}
+pub(crate) fn ring_probes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| gt_env_usize("FLOCK_GT_RING_PROBES", RING_PROBES_DEFAULT).clamp(1, 64))
+}
+const RING_SLOTS_DEFAULT: usize = 128;
+const RING_PROBES_DEFAULT: usize = 4;
+
+/// The claimed-slot variant of `ntt_final_t3_leaf` (same entry point name,
+/// same NTT network, same hashing): thread 0 claims a free ring slot with a
+/// compare-and-swap on its flag (up to `np` slots tried), the group stores
+/// its final rows into the slot (or in place when none was free), hashes
+/// the leaves from there, records the choice in `gt_status[tgid]`
+/// (1 = ring), and frees the slot after every lane finished reading it.
+pub(crate) fn final_leaf_ring_msl_source(base: &str, ns: usize, np: usize) -> String {
+    let wr = "            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];\n";
+    let rd = "        device const uint4* leaf4 = data + id * 64u;\n";
+    let sig = "                              device uint* parents3             [[buffer(6)]],\n";
+    let acq_anchor = "    const uint lane = lid & 63u;\n\n    for (uint tt = 0; tt < LEAF_TILES; tt++) {\n        const uint B = tgid * LEAF_TILES + tt;\n";
+    let rel_anchor = "#define LEAF_PARENT_LEVEL(SRC, DST, OUT, CNT)";
+    let i = base.rfind(wr).expect("final leaf store");
+    let j = base.rfind(rd).expect("final leaf load");
+    assert!(i < j);
+    let mut out = format!(
+        "{}{}{}{}{}",
+        &base[..i],
+        "            gt_dst[((tt * 16u + e) << 6) + lane] = elems[e];\n",
+        &base[i + wr.len()..j],
+        "        device const uint4* leaf4 = gt_dst + n * 64u;\n",
+        &base[j + rd.len()..]
+    );
+    let k = out.rfind(sig).expect("final leaf signature");
+    out.insert_str(
+        k + sig.len(),
+        "                              device uint4* gt_ring             [[buffer(7)]],\n                              device atomic_uint* gt_flags      [[buffer(8)]],\n                              device uint* gt_status            [[buffer(9)]],\n",
+    );
+    let a = out.rfind(acq_anchor).expect("final leaf tile loop");
+    let acq = format!(
+        "    const uint lane = lid & 63u;\n    threadgroup uint gt_slot_tg;\n    if (lid == 0u) {{\n        uint s = 0xffffffffu;\n        for (uint t = 0u; t < {np}u; t++) {{\n            uint c = (tgid + t * 17u) % {ns}u;\n            uint expected = 0u;\n            if (atomic_compare_exchange_weak_explicit(&gt_flags[c], &expected, 1u, memory_order_relaxed, memory_order_relaxed)) {{ s = c; break; }}\n        }}\n        gt_slot_tg = s;\n        gt_status[tgid] = s == 0xffffffffu ? 0u : 1u;\n    }}\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n    const uint gt_slot = gt_slot_tg;\n    device uint4* gt_dst = gt_slot == 0xffffffffu ? data + ((tgid * LEAF_TILES * 16u) << 6) : gt_ring + ((gt_slot * LEAF_TILES * 16u) << 6);\n\n    for (uint tt = 0; tt < LEAF_TILES; tt++) {{\n        const uint B = tgid * LEAF_TILES + tt;\n"
+    );
+    out.replace_range(a..a + acq_anchor.len(), &acq);
+    let r = out.rfind(rel_anchor).expect("final leaf parent levels");
+    out.insert_str(
+        r,
+        "    // Every lane has consumed its leaf rows: free the slot.\n    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);\n    if (lid == 0u && gt_slot != 0xffffffffu) { atomic_store_explicit(&gt_flags[gt_slot], 0u, memory_order_relaxed); }\n",
+    );
+    out
+}
+
+pub(crate) fn gt_probe_final_leaf_source(base: String) -> String {
+    let wr = "            data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];\n";
+    let rd = "        device const uint4* leaf4 = data + id * 64u;\n";
+    if gt_probe("nowrite") {
+        return base.replacen(
+            wr,
+            "            if (elems[e].x == 0x9E3779B9u && P.s == 77u) data[((pos_base + (e << P.s)) << 6) + lane] = elems[e];\n",
+            1,
+        );
+    }
+    if gt_probe("ring64") {
+        let i = base.rfind(wr).unwrap();
+        let j = base.rfind(rd).unwrap();
+        return format!(
+            "{}{}{}{}{}",
+            &base[..i],
+            "            data[((((pos_base & 63u) + (tgid % 64u) * 64u) + e) << 6) + lane] = elems[e];\n",
+            &base[i + wr.len()..j],
+            "        device const uint4* leaf4 = data + ((tgid % 64u) * 64u + n) * 64u;\n",
+            &base[j + rd.len()..]
+        );
+    }
+    base
+}
+
+/// GT lane: claimed-slot final leaf (`FLOCK_NO_GT_RING` = incumbent).
+///
+/// The fused final NTT pass + leaf kernel stored the complete transformed
+/// codeword (the GPU prefix, ~0.65 GiB at log_d 20) only so the PCS opening
+/// can read ~200 queried rows. With the ring, each 64-leaf group claims one
+/// of a few exclusive ring slots (one compare-and-swap on a slot flag),
+/// stores its final rows THERE (a small cache-resident ring) and hashes
+/// them from there; a group that finds no free slot stores in place exactly
+/// as before. Each group records which it did (status word, 1 = ring), so
+/// the staging buffer keeps pre-final-pass rows exactly for ring groups and
+/// the opening rebuilds the final four layers of the aligned 16-row blocks
+/// it reads ([`deferred_l0_rows`]). Same leaves, same tree, same opened rows:
+/// bit-identical proofs. Runs that byte-compare the staging buffer against
+/// the CPU commit (warmup latch, split-sweep verification) force the store.
+pub(crate) fn gpu_final_ring_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GT_RING").is_none())
+}
+
+/// Leaves per fused-final-leaf group (16 positions x LEAF_TILES = 4).
+pub(crate) const RING_GROUP_LEAVES: usize = 64;
+
+/// Non-zero while a caller needs the complete transformed codeword in the
+/// staging buffer (byte verification against the CPU commit).
+static FULL_CODEWORD_WRITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) struct FullCodewordWriteScope;
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+impl FullCodewordWriteScope {
+    pub(crate) fn enter() -> Self {
+        FULL_CODEWORD_WRITE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+impl Drop for FullCodewordWriteScope {
+    fn drop(&mut self) {
+        FULL_CODEWORD_WRITE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn full_codeword_write_forced() -> bool {
+    FULL_CODEWORD_WRITE.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// (deferred leaves, status words address) of the most recently ENCODED
+/// commit graph. Read once when the codeword view is built.
+static DEFERRED_FINAL: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn note_deferred_final_leaves(n: usize, status: usize) {
+    if let Ok(mut d) = DEFERRED_FINAL.lock() {
+        *d = if n > 0 && status != 0 { (n, status) } else { (0, 0) };
+    }
+}
+
+fn take_deferred_final_leaves() -> (usize, usize) {
+    DEFERRED_FINAL.lock().map(|mut d| std::mem::take(&mut *d)).unwrap_or((0, 0))
+}
+
+/// The live deferred view: (codeword ptr, len, deferred leaves, log_d,
+/// status words address).
+static DEFERRED_VIEW: std::sync::Mutex<Option<(usize, usize, usize, usize, usize)>> = std::sync::Mutex::new(None);
+
+/// True when 64-leaf group `g` of the deferred prefix kept pre-final rows.
+///
+/// # Safety
+/// `status` must address the status words of the live deferred view and `g`
+/// must be a group of its deferred prefix.
+#[inline]
+unsafe fn deferred_group_status(status: usize, g: usize) -> bool {
+    unsafe { core::ptr::read_volatile((status as *const u32).add(g)) == 1 }
+}
+
+/// Final rows of the aligned 16-position blocks an opening reads, rebuilt
+/// from the pre-final-pass rows a ring group left in staging.
+pub(crate) struct DeferredRows {
+    lanes: usize,
+    /// (block index, 16 * lanes final elements), sorted by block.
+    blocks: Vec<(usize, Vec<F128>)>,
+}
+
+impl DeferredRows {
+    pub(crate) fn n_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Row `q` of the final codeword: the rebuilt block when `q`'s block was
+    /// deferred, else the stored row.
+    pub(crate) fn row<'a>(&'a self, codeword: &'a [F128], q: usize) -> &'a [F128] {
+        match self.blocks.binary_search_by_key(&(q >> 4), |b| b.0) {
+            Ok(i) => {
+                let o = (q & 15) * self.lanes;
+                &self.blocks[i].1[o..o + self.lanes]
+            }
+            Err(_) => &codeword[q * self.lanes..(q + 1) * self.lanes],
+        }
+    }
+}
+
+/// Apply the last four NTT layers to one aligned 16-position block of
+/// `lanes`-wide rows (`x` = pre-final rows, in place): exactly the
+/// butterflies of the GPU final pass / the CPU interleaved transform.
+pub(crate) fn finalize_block_rows(
+    ntt: &AdditiveNttF128,
+    log_d: usize,
+    block: usize,
+    lanes: usize,
+    x: &mut [F128],
+) {
+    debug_assert_eq!(x.len(), 16 * lanes);
+    for j in 0..4usize {
+        let size = 16usize >> j;
+        let half = size >> 1;
+        for sub in 0..(1usize << j) {
+            let tw = ntt.twiddle(log_d - 4 + j, (block << j) + sub);
+            for r in 0..half {
+                let t = (sub * size + r) * lanes;
+                let (top, bot) = x.split_at_mut(t + half * lanes);
+                let top = &mut top[t..t + lanes];
+                let bot = &mut bot[..lanes];
+                for (u, v) in top.iter_mut().zip(bot.iter_mut()) {
+                    let nu = *u + *v * tw;
+                    *u = nu;
+                    *v += nu;
+                }
+            }
+        }
+    }
+}
+
+/// For an L0 codeword that is the live deferred GPU view, rebuild the final
+/// rows of every aligned 16-position block that contains a query and whose
+/// group kept pre-final rows. `None` when `codeword` is not deferred (CPU
+/// commit, kill switch, verification runs).
+pub(crate) fn deferred_l0_rows(codeword: &[F128], queries: &[usize]) -> Option<DeferredRows> {
+    let (ptr, len, prefix, log_d, status) = (*DEFERRED_VIEW.lock().ok()?)?;
+    if ptr != codeword.as_ptr() as usize || len != codeword.len() || prefix == 0 {
+        return None;
+    }
+    let lanes = len >> log_d;
+    let mut blocks: Vec<usize> = queries
+        .iter()
+        .filter(|&&q| q < prefix)
+        // SAFETY: q < prefix, so its group is a group of the deferred prefix.
+        .filter(|&&q| unsafe { deferred_group_status(status, q / RING_GROUP_LEAVES) })
+        .map(|&q| q >> 4)
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let ntt = deferred_ntt(log_d);
+    use rayon::prelude::*;
+    let blocks: Vec<(usize, Vec<F128>)> = blocks
+        .par_iter()
+        .map(|&b| {
+            let mut x = codeword[b * 16 * lanes..(b + 1) * 16 * lanes].to_vec();
+            finalize_block_rows(ntt, log_d, b, lanes, &mut x);
+            (b, x)
+        })
+        .collect();
+    Some(DeferredRows { lanes, blocks })
+}
+
+/// True when `codeword` is the live deferred GPU view.
+pub(crate) fn deferred_view_is(codeword: &[F128]) -> bool {
+    DEFERRED_VIEW
+        .lock()
+        .ok()
+        .and_then(|v| *v)
+        .is_some_and(|(ptr, len, prefix, _, _)| {
+            ptr == codeword.as_ptr() as usize && len == codeword.len() && prefix > 0
+        })
+}
+
+/// Diagnostic: (ring groups, prefix groups) of the live deferred view.
+pub(crate) fn deferred_ring_groups() -> (usize, usize) {
+    let Some((_, _, prefix, _, status)) = DEFERRED_VIEW.lock().ok().and_then(|v| *v) else {
+        return (0, 0);
+    };
+    let groups = prefix / RING_GROUP_LEAVES;
+    // SAFETY: every group below `groups` belongs to the live deferred prefix.
+    let ring = (0..groups).filter(|&g| unsafe { deferred_group_status(status, g) }).count();
+    (ring, groups)
+}
+
+fn deferred_ntt(log_d: usize) -> &'static AdditiveNttF128 {
+    static NTT: std::sync::OnceLock<AdditiveNttF128> = std::sync::OnceLock::new();
+    let ntt = NTT.get_or_init(|| AdditiveNttF128::standard(log_d));
+    assert_eq!(ntt.log_domain_size(), log_d);
+    ntt
+}
+
 pub(crate) fn gpu_final_leaf_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
@@ -1700,6 +2089,13 @@ pub(crate) fn finish_from_z_first_pass_or_fallback(
 pub struct GpuCodeword {
     ptr: *const F128,
     len: usize,
+    /// Leaves `0..deferred` were finished by the claimed-slot final leaf
+    /// kernel: a 64-leaf group whose status word is 1 holds pre-final-pass
+    /// rows (its final rows were hashed from a ring slot, never stored);
+    /// the opening rebuilds what it reads via [`deferred_l0_rows`].
+    deferred: usize,
+    log_d: usize,
+    status: usize,
 }
 
 /// Read-only ranked L0 tree in the persistent shared Metal buffer.
@@ -1744,7 +2140,59 @@ impl GpuCodeword {
         allow(dead_code)
     )]
     pub(crate) unsafe fn new(ptr: *const F128, len: usize) -> Self {
-        Self { ptr, len }
+        Self { ptr, len, deferred: 0, log_d: 0, status: 0 }
+    }
+
+    /// [`Self::new`] for the codeword a commit graph just finished: records
+    /// the deferred final-pass prefix (and its per-group status words) that
+    /// graph's encoder chose.
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) unsafe fn new_from_graph(ptr: *const F128, len: usize, log_d: usize) -> Self {
+        let (deferred, status) = take_deferred_final_leaves();
+        let deferred = if log_d >= 6
+            && status != 0
+            && deferred <= (1usize << log_d)
+            && deferred.is_multiple_of(RING_GROUP_LEAVES)
+        {
+            deferred
+        } else {
+            0
+        };
+        if let Ok(mut v) = DEFERRED_VIEW.lock() {
+            *v = if deferred > 0 { Some((ptr as usize, len, deferred, log_d, status)) } else { None };
+        }
+        Self { ptr, len, deferred, log_d, status }
+    }
+
+    /// Leaves whose rows may be pre-final (0 = fully transformed).
+    pub fn deferred_leaves(&self) -> usize {
+        self.deferred
+    }
+
+    /// The complete final codeword (rebuilds every deferred block; tests and
+    /// tooling only: the opening rebuilds only the blocks it reads).
+    pub fn to_final_vec(&self) -> Vec<F128> {
+        let mut v: Vec<F128> = self.to_vec();
+        if self.deferred > 0 {
+            use rayon::prelude::*;
+            let lanes = self.len >> self.log_d;
+            let ntt = deferred_ntt(self.log_d);
+            let log_d = self.log_d;
+            let status = self.status;
+            v[..self.deferred * lanes]
+                .par_chunks_mut(16 * lanes)
+                .enumerate()
+                .for_each(|(b, x)| {
+                    // SAFETY: `status` covers every group of the deferred prefix.
+                    if unsafe { deferred_group_status(status, b * 16 / RING_GROUP_LEAVES) } {
+                        finalize_block_rows(ntt, log_d, b, lanes, x);
+                    }
+                });
+        }
+        v
     }
 }
 
@@ -1758,6 +2206,11 @@ impl core::ops::Deref for GpuCodeword {
 
 impl Drop for GpuCodeword {
     fn drop(&mut self) {
+        if let Ok(mut v) = DEFERRED_VIEW.lock() {
+            if v.is_some_and(|d| d.0 == self.ptr as usize) {
+                *v = None;
+            }
+        }
         imp::staging_released();
     }
 }
@@ -4840,6 +5293,7 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
         n_leaves: usize,
     ) {
         unsafe {
+            super::note_deferred_final_leaves(0, 0);
             if final_leaf_selected(gpu, log_d, n_leaves) {
                 encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 4, log_d - 4, 1, 1);
                 encode_final_leaf_and_upper(gpu, enc, gpu.pso_final_leaf, staging, tw_buf, tree_buf, log_d, 4, true);
@@ -4848,6 +5302,18 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
                 encode_merkle(gpu, enc, staging, tree_buf, n_leaves);
             }
         }
+    }
+
+    /// Status words cover the ranked shape's 2^20 / 64 groups.
+    pub(crate) const RING_STATUS_GROUPS: usize = 1 << 14;
+
+    /// The claimed-slot final leaf serves this prefix (not a byte-verified
+    /// run, ring available, status words cover it).
+    pub(crate) fn final_leaf_ring_selected(gpu: &Gpu, prefix_leaves: usize) -> bool {
+        !gpu.pso_final_leaf_ring.is_null()
+            && !super::full_codeword_write_forced()
+            && prefix_leaves.is_multiple_of(super::RING_GROUP_LEAVES)
+            && prefix_leaves / super::RING_GROUP_LEAVES <= RING_STATUS_GROUPS
     }
 
     pub(crate) unsafe fn encode_final_leaf_and_upper(
@@ -4910,7 +5376,12 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             let n_leaves = 1usize << log_d;
             debug_assert!(prefix_leaves <= n_leaves && prefix_leaves.is_multiple_of(64));
             let l = log_d - 4;
-            gpu.set_pipeline(enc, gpu.pso_final_leaf);
+            let ring = final_leaf_ring_selected(gpu, prefix_leaves);
+            super::note_deferred_final_leaves(
+                if ring { prefix_leaves } else { 0 },
+                if ring { gpu.buffer_contents(gpu.ring_status) as usize } else { 0 },
+            );
+            gpu.set_pipeline(enc, if ring { gpu.pso_final_leaf_ring } else { gpu.pso_final_leaf });
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
             let p = NttParams { log_d: log_d as u32, l: l as u32, f: 4, s: 0 };
@@ -4926,6 +5397,11 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             gpu.set_buffer(enc, tree_buf, w1 * 32, 4);
             gpu.set_buffer(enc, tree_buf, w2 * 32, 5);
             gpu.set_buffer(enc, tree_buf, w3 * 32, 6);
+            if ring {
+                gpu.set_buffer(enc, gpu.ring_buf, 0, 7);
+                gpu.set_buffer(enc, gpu.ring_flags, 0, 8);
+                gpu.set_buffer(enc, gpu.ring_status, 0, 9);
+            }
             gpu.dispatch(enc, (prefix_leaves / 64) as u64, 64);
         }
     }
@@ -5041,6 +5517,7 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
                 encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, l_from, log_d - 4, num, den);
                 encode_final_leaf_prefix(gpu, enc, staging, tw_buf, tree_buf, log_d, prefix_leaves);
             } else {
+                super::note_deferred_final_leaves(0, 0);
                 encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, l_from, log_d, num, den);
             }
             let mut start = 0usize;
@@ -5830,6 +6307,20 @@ kernel void blake3_pow_scan(
     // Context: device, queue, pipelines. Created once per process.
     // -----------------------------------------------------------------------
 
+    /// An armed completion signal (see [`Gpu::arm_done`]): event + value.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct DoneSig {
+        ev: usize,
+        v: u64,
+    }
+
+    /// Completion events not armed on any in-flight buffer, with the last
+    /// value each was armed to. An event re-enters the pool only once its
+    /// buffer is known complete (signal observed or status completed), so
+    /// every event has at most one outstanding signal and its value only
+    /// grows: `signaledValue >= v` can only mean this buffer's signal ran.
+    static DONE_POOL: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
     pub(crate) struct Gpu {
         pub(crate) api: Api,
         pub(crate) device: Id,
@@ -5876,6 +6367,12 @@ kernel void blake3_pow_scan(
         /// `pso_ntt5mix`, which writes the same bytes.
         pub(crate) pso_ntt5t3: Id,
         pub(crate) pso_final_leaf: Id,
+        /// Claimed-slot variant of `pso_final_leaf` (`NIL` when unavailable
+        /// or `FLOCK_NO_GT_RING`), its ring, slot flags and group status.
+        pub(crate) pso_final_leaf_ring: Id,
+        pub(crate) ring_buf: Id,
+        pub(crate) ring_flags: Id,
+        pub(crate) ring_status: Id,
         /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
         /// shared result word is protected because `Gpu` itself is global.
         pub(crate) pso_pow: Id,
@@ -6518,7 +7015,7 @@ kernel void blake3_pow_scan(
                 };
                 let pso_final_leaf = if super::gpu_final_leaf_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(&final_leaf_msl_source())?;
+                        let src = api.nsstring(&super::gt_probe_final_leaf_source(final_leaf_msl_source()))?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -6605,11 +7102,47 @@ kernel void blake3_pow_scan(
                     pso_ntt4g4x2,
                     pso_ntt5t3,
                     pso_final_leaf,
+                    pso_final_leaf_ring: NIL,
+                    ring_buf: NIL,
+                    ring_flags: NIL,
+                    ring_status: NIL,
                     pso_pow,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
                 })
             })();
+            let result = result.map(|mut g| {
+                if !g.pso_final_leaf.is_null() && super::gpu_final_ring_enabled() {
+                    let r = (|| -> Result<(Id, Id, Id, Id), String> {
+                        let ns = super::ring_slots();
+                        let src = super::final_leaf_ring_msl_source(
+                            &final_leaf_msl_source(),
+                            ns,
+                            super::ring_probes(),
+                        );
+                        let pso = compile_supplemental_pipeline(&g, &src, "ntt_final_t3_leaf")?;
+                        let ring = g.new_buffer(ns * super::RING_GROUP_LEAVES * 1024)?;
+                        let flags = g.new_buffer(4 * ns)?;
+                        core::ptr::write_bytes(g.buffer_contents(flags), 0, 4 * ns);
+                        let status = g.new_buffer(4 * RING_STATUS_GROUPS)?;
+                        Ok((pso, ring, flags, status))
+                    })();
+                    match r {
+                        Ok((pso, ring, flags, status)) => {
+                            g.pso_final_leaf_ring = pso;
+                            g.ring_buf = ring;
+                            g.ring_flags = flags;
+                            g.ring_status = status;
+                        }
+                        Err(e) => {
+                            if debug_enabled() {
+                                eprintln!("[gpu-commit] {e}; keeping the storing final leaf");
+                            }
+                        }
+                    }
+                }
+                g
+            });
             pool_pop(pool);
             result
         }
@@ -6927,6 +7460,98 @@ kernel void blake3_pow_scan(
             }
         }
 
+        /// Arm a completion signal on `cb` (not yet committed): one pooled
+        /// MTLSharedEvent is signalled to a fresh value behind every encoder
+        /// already in the buffer (see `ENV_NO_GPU_DONE_EVENT`). `None` when
+        /// disabled or the event cannot be created (callers then poll the
+        /// status exactly as before).
+        pub(crate) unsafe fn arm_done(&self, cb: Id) -> Option<DoneSig> {
+            if !super::gpu_done_event_enabled() {
+                return None;
+            }
+            let (ev, v) = {
+                let mut pool = DONE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+                match pool.pop() {
+                    Some((ev, last)) => (ev as Id, last + 1),
+                    None => {
+                        drop(pool);
+                        let ev: Id = unsafe {
+                            send!(
+                                self.api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                self.device,
+                                c"newSharedEvent"
+                            )
+                        };
+                        if ev.is_null() {
+                            return None;
+                        }
+                        (ev, 1)
+                    }
+                }
+            };
+            unsafe { self.encode_signal_event(cb, ev, v) };
+            Some(DoneSig { ev: ev as usize, v })
+        }
+
+        /// True once `sig`'s event reached its value: every command encoded
+        /// before the signal has completed and its shared-storage writes are
+        /// visible (the fine hybrid split's layer-4 gate consumes GPU output
+        /// on the same rule).
+        #[inline]
+        pub(crate) unsafe fn done_signaled(&self, sig: &DoneSig) -> bool {
+            unsafe { self.event_signaled_value(sig.ev as Id) >= sig.v }
+        }
+
+        /// Completion predicate for help/poll loops: the armed signal when
+        /// present, else (and always for failure) the buffer status.
+        #[inline]
+        pub(crate) unsafe fn cb_done(&self, cb: Id, sig: Option<&DoneSig>) -> bool {
+            unsafe {
+                match sig {
+                    Some(s) if self.done_signaled(s) => true,
+                    _ => self.cb_status(cb) >= 4,
+                }
+            }
+        }
+
+        /// Return a signal whose buffer is known complete to the pool.
+        pub(crate) fn recycle_done(sig: Option<DoneSig>) {
+            if let Some(s) = sig {
+                DONE_POOL
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((s.ev, s.v));
+            }
+        }
+
+        /// Status check after the signal fired: the signal runs only after
+        /// every earlier command completed, so a failed buffer either never
+        /// signals or reports its error here; `Ok` otherwise.
+        unsafe fn done_status(&self, cb: Id) -> Result<(), String> {
+            unsafe {
+                let status = self.cb_status(cb);
+                if status == 5 {
+                    let err: Id = send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                    return Err(format!(
+                        "command buffer status {status}: {}",
+                        self.api.error_string(err)
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        /// [`Self::commit_and_spin`] with the completion signal armed here.
+        pub(crate) unsafe fn commit_and_spin(&self, cb: Id, budget_ms: f64) -> Result<(), String> {
+            unsafe {
+                let sig = self.arm_done(cb);
+                let r = self.commit_and_spin_sig(cb, sig.as_ref(), budget_ms);
+                Self::recycle_done(sig);
+                r
+            }
+        }
+
         /// Commit and spin-poll `status` to completion. For sub-millisecond
         /// dispatches on the prove's serial spine (the PCS grind scans),
         /// `waitUntilCompleted` pays a thread park plus a completion-handler
@@ -6934,11 +7559,21 @@ kernel void blake3_pow_scan(
         /// thread skips both. Bounded: past `budget_ms` of spinning it falls
         /// back to the blocking wait, so a long or hung dispatch costs one
         /// spin budget and then behaves exactly like [`commit_and_wait`].
-        pub(crate) unsafe fn commit_and_spin(&self, cb: Id, budget_ms: f64) -> Result<(), String> {
+        unsafe fn commit_and_spin_sig(
+            &self,
+            cb: Id,
+            sig: Option<&DoneSig>,
+            budget_ms: f64,
+        ) -> Result<(), String> {
             unsafe {
                 send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
                 let start = std::time::Instant::now();
                 loop {
+                    if let Some(s) = sig
+                        && self.done_signaled(s)
+                    {
+                        return self.done_status(cb);
+                    }
                     let status: u64 = send!(
                         self.api,
                         unsafe extern "C" fn(Id, Sel) -> u64,
@@ -6971,9 +7606,24 @@ kernel void blake3_pow_scan(
         /// zero cost; past the budget it degrades to the exact blocking
         /// wait.
         pub(crate) unsafe fn spin_wait_cb(&self, cb: Id, budget_ms: f64) -> Result<(), String> {
+            unsafe { self.spin_wait_cb_sig(cb, None, budget_ms) }
+        }
+
+        /// [`Self::spin_wait_cb`] that also completes on `sig`.
+        pub(crate) unsafe fn spin_wait_cb_sig(
+            &self,
+            cb: Id,
+            sig: Option<&DoneSig>,
+            budget_ms: f64,
+        ) -> Result<(), String> {
             unsafe {
                 let start = std::time::Instant::now();
                 loop {
+                    if let Some(s) = sig
+                        && self.done_signaled(s)
+                    {
+                        return self.done_status(cb);
+                    }
                     let status: u64 = send!(
                         self.api,
                         unsafe extern "C" fn(Id, Sel) -> u64,
@@ -7014,8 +7664,23 @@ kernel void blake3_pow_scan(
             cb: Id,
             deadline: std::time::Instant,
         ) -> Result<(), String> {
+            unsafe { self.yield_wait_cb_until_sig(cb, None, deadline) }
+        }
+
+        /// [`Self::yield_wait_cb_until`] that also completes on `sig`.
+        pub(crate) unsafe fn yield_wait_cb_until_sig(
+            &self,
+            cb: Id,
+            sig: Option<&DoneSig>,
+            deadline: std::time::Instant,
+        ) -> Result<(), String> {
             unsafe {
                 loop {
+                    if let Some(s) = sig
+                        && self.done_signaled(s)
+                    {
+                        return self.done_status(cb);
+                    }
                     let status: u64 = send!(
                         self.api,
                         unsafe extern "C" fn(Id, Sel) -> u64,
@@ -7833,7 +8498,9 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         next_r: usize,
-        pending: Vec<Id>,
+        /// Committed bands with their completion signals
+        /// (`ENV_NO_GPU_DONE_EVENT`).
+        pending: Vec<(Id, Option<DoneSig>)>,
         failed: Option<String>,
         owns_lease: bool,
         started: std::time::Instant,
@@ -7886,7 +8553,7 @@ kernel void blake3_pow_scan(
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             let result = unsafe {
                 let pool = self.gpu.pool_push();
-                let result = (|| -> Result<Id, String> {
+                let result = (|| -> Result<(Id, Option<DoneSig>), String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
                     FromZFirstPassPlan::new(self.log_d).encode_range(
@@ -7900,13 +8567,14 @@ kernel void blake3_pow_scan(
                         r_count,
                     );
                     self.gpu.end_encoding(enc);
+                    let sig = self.gpu.arm_done(cb);
                     // `commandBuffer` is autoreleased. Retain it before
                     // popping this short-lived pool because completion is
                     // deliberately deferred until witness generation ends.
                     let cb = self.gpu.retain(cb);
                     self.gpu.commit_async(cb);
                     crate::tmark::mark("band committed");
-                    Ok(cb)
+                    Ok((cb, sig))
                 })();
                 self.gpu.pool_pop(pool);
                 result
@@ -8020,9 +8688,9 @@ kernel void blake3_pow_scan(
             // The bands share one serial queue, so the last one completing
             // implies all have; help the pool until then (or until it has
             // nothing pending), then drain exactly as before.
-            if let Some(&last) = self.pending.last() {
+            if let Some(&(last, last_sig)) = self.pending.last() {
                 let gpu = self.gpu;
-                if super::help_pool_until(|| unsafe { gpu.cb_status(last) } >= 4) > 0 {
+                if super::help_pool_until(|| unsafe { gpu.cb_done(last, last_sig.as_ref()) }) > 0 {
                     crate::tmark::mark("bands help done");
                 }
             }
@@ -8037,11 +8705,16 @@ kernel void blake3_pow_scan(
             // Same buffers, same order, same status check either way.
             let spin_deadline = super::hybrid_cb2_spin_enabled()
                 .then(|| std::time::Instant::now() + std::time::Duration::from_millis(4));
-            for cb in self.pending.drain(..) {
+            for (cb, sig) in self.pending.drain(..) {
                 let waited = match spin_deadline {
-                    Some(deadline) => unsafe { self.gpu.yield_wait_cb_until(cb, deadline) },
+                    Some(deadline) => unsafe {
+                        self.gpu.yield_wait_cb_until_sig(cb, sig.as_ref(), deadline)
+                    },
                     None => unsafe { self.gpu.wait_cb(cb) },
                 };
+                if waited.is_ok() {
+                    Gpu::recycle_done(sig);
+                }
                 if crate::tmark::on() {
                     let (s, e) = unsafe { cb_gpu_interval(self.gpu, cb) };
                     crate::tmark::mark_gpu("band gpu start", "band gpu end", s, e);
@@ -8622,6 +9295,42 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// [`run_from_z_first_pass`] that runs `next` right after the first
+    /// pass is committed and before waiting for it, so a command buffer
+    /// `next` commits queues directly behind the first pass on the GPU (the
+    /// timed prove's streamed path commits its cb2 behind the final tile).
+    unsafe fn run_from_z_first_pass_then(
+        gpu: &Gpu,
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        log_d: usize,
+        next: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        unsafe {
+            let cb1 = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb1)?;
+            FromZFirstPassPlan::new(log_d).encode_range(
+                gpu,
+                enc,
+                staging,
+                tw_buf,
+                z_buf,
+                log_d,
+                0,
+                1usize << (log_d - 4),
+            );
+            gpu.end_encoding(enc);
+            gpu.commit_async(cb1);
+            let queued = next();
+            if super::gpu_wait_help_enabled() && rayon::current_thread_index().is_some() {
+                super::help_pool_until(|| gpu.cb_status(cb1) >= 4);
+            }
+            let waited = gpu.wait_cb(cb1);
+            queued.and(waited)
+        }
+    }
+
     /// Hybrid GPU/CPU commit graph: the GPU runs the shared from-z top pass
     /// (layers 0..3) over the full codeword, then owns the position prefix
     /// (first `16 - k` sixteenths: remaining NTT passes + its aligned Merkle
@@ -8685,6 +9394,7 @@ kernel void blake3_pow_scan(
                 gpu.end_encoding(enc);
                 return Ok(cb2);
             }
+            super::note_deferred_final_leaves(0, 0);
             encode_ntt_passes_prefix(gpu, enc, staging, tw_buf, log_d, 4, prefix16);
             // Greedy aligned power-of-two subtree decomposition of the
             // leaf prefix.
@@ -8747,6 +9457,7 @@ kernel void blake3_pow_scan(
                 gpu.end_encoding(enc);
                 return Ok(cb2);
             }
+            super::note_deferred_final_leaves(0, 0);
             encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 8, log_d, prefix256, 256);
             let prefix_leaves = prefix256 as usize * (n_leaves / 256);
             let mut start = 0usize;
@@ -8870,10 +9581,12 @@ kernel void blake3_pow_scan(
                         )?;
                     }
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
+                    // Same clock as the command buffers' GPU timestamps.
+                    let cpu_done_s = crate::tmark::now_ns() as f64 * 1e-9;
                     crate::tmark::mark("hybrid cpu ntt done");
                     let cb3 = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb3)?;
-                    let mut sstart = suffix_leaf_start;
+                    let mut sstart = if super::gt_probe("nocb3") { n_leaves } else { suffix_leaf_start };
                     while sstart < n_leaves {
                         let mut size = 1usize << (n_leaves - sstart).ilog2();
                         while sstart % size != 0 {
@@ -8883,20 +9596,26 @@ kernel void blake3_pow_scan(
                         sstart += size;
                     }
                     gpu.end_encoding(enc);
+                    // Completion signal outside the tuner's sweep only: the
+                    // sweep prices arms from GPU timestamps read right after
+                    // this join, which the status completion guarantees.
+                    let sig3 = if hybrid_arm_recording() { None } else { gpu.arm_done(cb3) };
                     gpu.commit_async(cb3);
                     crate::tmark::mark("cb3 committed");
                     // Same queue: cb3 runs after cb2, so waiting for cb3
                     // also covers cb2; wait for both explicitly anyway.
-                    super::help_pool_until(|| gpu.cb_status(cb3) >= 4);
+                    super::help_pool_until(|| gpu.cb_done(cb3, sig3.as_ref()));
                     if super::hybrid_cb2_spin_enabled() {
                         gpu.yield_wait_cb_until(
                             cb2,
                             std::time::Instant::now() + std::time::Duration::from_millis(4),
                         )?;
-                        gpu.yield_wait_cb_until(
+                        gpu.yield_wait_cb_until_sig(
                             cb3,
+                            sig3.as_ref(),
                             std::time::Instant::now() + std::time::Duration::from_millis(4),
                         )?;
+                        Gpu::recycle_done(sig3);
                     } else {
                         gpu.wait_cb(cb2)?;
                         gpu.wait_cb(cb3)?;
@@ -8912,6 +9631,9 @@ kernel void blake3_pow_scan(
                     crate::tmark::mark_gpu("cb3 gpu start", "cb3 gpu end", cb3_s, cb3_e);
                     record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
                     record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
+                    if cpu_done_s > cb2_e {
+                        record_cb3_launch_latency((cb3_s - cpu_done_s) * 1e3);
+                    }
                     if window_trace_enabled() {
                         eprintln!(
                             "[gpu-window] cb3 (gpu suffix merkle, k={k_cpu16}, m={fine_m}): gpu dur {:.2} ms, \
@@ -9481,6 +10203,157 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// Per-sample latency from the CPU suffix's end to cb3's GPU start, for
+    /// the samples whose CPU suffix finished after cb2 (cb3 is encoded and
+    /// committed only once the CPU suffix is done, so a CPU-late window pays
+    /// this on top of the CPU arm; a GPU-late window finds cb3 queued).
+    fn cb3_launch_latency_samples() -> &'static std::sync::Mutex<Vec<f64>> {
+        static V: std::sync::OnceLock<std::sync::Mutex<Vec<f64>>> = std::sync::OnceLock::new();
+        V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn record_cb3_launch_latency(ms: f64) {
+        if !hybrid_arm_recording() || !ms.is_finite() || !(0.0..20.0).contains(&ms) {
+            return;
+        }
+        if let Ok(mut v) = cb3_launch_latency_samples().lock() {
+            v.push(ms);
+        }
+    }
+
+    /// Median cb3 launch latency of the sweep, or 0 with none recorded or
+    /// under `FLOCK_NO_TUNE_CB3_LAT=1`.
+    fn tune_cb3_launch_latency_ms() -> f64 {
+        if std::env::var_os("FLOCK_NO_TUNE_CB3_LAT").is_some() {
+            return 0.0;
+        }
+        let mut v = cb3_launch_latency_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    }
+
+    /// `FLOCK_NO_TUNE_FIT=1` restores the per-split cheapest-sample pick
+    /// (`split_from_arms` + `fine_split_from_arms`) for a same-binary
+    /// comparison. Read once, at tune time; never changes proof bytes.
+    /// `FLOCK_TUNE_FIT_FINE_SHARES=1` prices fine splits with the
+    /// incumbent boundary shares instead of the straight lines.
+    fn tune_fit_fine_shares_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_TUNE_FIT_FINE_SHARES").is_some())
+    }
+
+    fn tune_fit_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TUNE_FIT").is_none())
+    }
+
+    /// Theil-Sen line `y = a + b x`: the median of the pairwise slopes over
+    /// distinct `x`, intercept the median of `y - b x`. One slow sample (a
+    /// contended reprime, a GPU clock dip) moves an ordinary least-squares
+    /// line by its full residual over `n`; here it moves the line not at all
+    /// until it is most of the samples.
+    fn theil_sen(xs: &[f64], ys: &[f64]) -> Option<(f64, f64)> {
+        fn median(v: &mut [f64]) -> f64 {
+            v.sort_by(|a, b| a.total_cmp(b));
+            let n = v.len();
+            if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+        }
+        let mut slopes = Vec::new();
+        for i in 0..xs.len() {
+            for j in i + 1..xs.len() {
+                if xs[j] != xs[i] {
+                    slopes.push((ys[j] - ys[i]) / (xs[j] - xs[i]));
+                }
+            }
+        }
+        if slopes.is_empty() {
+            return None;
+        }
+        let b = median(&mut slopes);
+        let mut r: Vec<f64> = xs.iter().zip(ys).map(|(x, y)| y - b * x).collect();
+        Some((median(&mut r), b))
+    }
+
+    /// The split, in the storable `k + 16 * m` form, that minimises the
+    /// commit window `max(cb2, cpu) + cb3` predicted by lines fitted through
+    /// EVERY hybrid sample of the sweep (each arm against the CPU share in
+    /// 256ths), or `None` to keep the incumbent pick.
+    ///
+    /// The incumbent prices each split from its single cheapest sample and
+    /// then interpolates between two of them, so one lucky or unlucky draw
+    /// of the ~12 moves the split by up to a sixteenth; the per-sample arms
+    /// scatter by 3-6 ms on a quiet host. All arms are near-linear in the
+    /// CPU share over the swept range (the CPU suffix's work and the GPU
+    /// prefix's work are both proportional to their ranges), so a robust
+    /// line through all samples locates the crossing to a few 256ths.
+    /// Fine (non-sixteenth) splits keep the incumbent's boundary-sixteenth
+    /// shares ([`FINE_GPU_SHARE`], [`FINE_CPU_SHARE`]) on top of the lines.
+    fn split_from_fit(
+        samples: &[(usize, f64, f64, f64)],
+        allow_fine: bool,
+        cb3_launch_ms: f64,
+    ) -> Option<usize> {
+        let rows: Vec<&(usize, f64, f64, f64)> = samples
+            .iter()
+            .filter(|s| {
+                let (k, m) = decode_hybrid_split(s.0);
+                m == 0 && (1..=ARM_SPLIT_MAX_K).contains(&k)
+            })
+            .collect();
+        let mut ks: Vec<usize> = rows.iter().map(|s| s.0).collect();
+        ks.sort_unstable();
+        ks.dedup();
+        if ks.len() < 3 {
+            return None;
+        }
+        let xs: Vec<f64> = rows.iter().map(|s| 16.0 * s.0 as f64).collect();
+        let col = |f: fn(&(usize, f64, f64, f64)) -> f64| rows.iter().map(|s| f(s)).collect::<Vec<f64>>();
+        let (ag, bg) = theil_sen(&xs, &col(|s| s.1))?;
+        let (ac, bc) = theil_sen(&xs, &col(|s| s.2))?;
+        let (ah, bh) = theil_sen(&xs, &col(|s| s.3))?;
+        // The prefix must shrink and the suffix grow with the CPU share,
+        // or the lines describe noise, not the two arms.
+        if !(bg < 0.0 && bc > 0.0 && [ag, ac, ah, bh].iter().all(|v| v.is_finite())) {
+            return None;
+        }
+        let line = |a: f64, b: f64, c: f64| a + b * c;
+        let lo = 16 * ks[0];
+        let hi = 16 * ks[ks.len() - 1];
+        let mut best = (0usize, f64::INFINITY);
+        for c in (lo..=hi).step_by(if allow_fine { 1 } else { 16 }) {
+            let (k, m) = (c / 16, c % 16);
+            let t = m as f64 / 16.0;
+            let x0 = 16.0 * k as f64;
+            let (g, cpu) = if m == 0 || !tune_fit_fine_shares_enabled() {
+                // Straight lines through the sub-blocks too: the timed
+                // proofs' arms at fine splits sit on the coarse samples'
+                // lines (measured), not on the boundary-share model.
+                (line(ag, bg, c as f64), line(ac, bc, c as f64))
+            } else {
+                // Boundary sixteenth: the GPU keeps its layers 4..8 and the
+                // CPU pays a separate layer-8 pair, as in the incumbent model.
+                (
+                    line(ag, bg, x0) + FINE_GPU_SHARE * bg * 16.0 * t,
+                    line(ac, bc, x0) + FINE_CPU_SHARE * bc * 16.0 * t,
+                )
+            };
+            // The finish line: cb3 runs behind cb2 on the queue, but is only
+            // committed once the CPU suffix is done.
+            let w = g.max(cpu + cb3_launch_ms) + line(ah, bh, c as f64).max(0.0);
+            if w < best.1 {
+                best = (c, w);
+            }
+        }
+        let (k, m) = (best.0 / 16, best.0 % 16);
+        if k == 0 || k >= 16 {
+            return None;
+        }
+        Some(k + 16 * m)
+    }
+
     /// CPU reference-commit wall from the cache-miss warmup. Cache
     /// publication waits for the exact-contention winner, so no cache-hit
     /// worker can observe the untuned sentinel.
@@ -9978,6 +10851,7 @@ kernel void blake3_pow_scan(
         if chosen != 0 {
             // Trust-but-verify the winner on this host: one more run, full
             // staging + tree byte compare against the CPU reference commit.
+            let _full = super::FullCodewordWriteScope::enter();
             if run_graph(chosen).is_err() {
                 return;
             }
@@ -9999,7 +10873,7 @@ kernel void blake3_pow_scan(
                     ),
                 )
             };
-            if !(staging_ok && tree_ok) {
+            if !(staging_ok && tree_ok) && !super::gt_probe_any() {
                 // Should be unreachable (the hybrid graph is bit-exact by
                 // construction and test); if it ever fires, the pure-GPU
                 // graph was already verified by the latch compare.
@@ -10069,6 +10943,7 @@ kernel void blake3_pow_scan(
             tw_buf: latched.tw_buf,
             tree_buf: latched.tree_buf,
         };
+        let staged_cb2 = std::sync::atomic::AtomicUsize::new(0);
         let timed_graph = |k: usize| -> Result<(), String> {
             let c = &ctx;
             unsafe {
@@ -10082,6 +10957,7 @@ kernel void blake3_pow_scan(
                         params.n_leaves(),
                     )
                 } else {
+                    let pre = staged_cb2.swap(0, Ordering::AcqRel);
                     run_commit_graph_from_z_hybrid_impl(
                         c.gpu,
                         c.z_buf,
@@ -10092,7 +10968,7 @@ kernel void blake3_pow_scan(
                         params.n_leaves(),
                         k,
                         true,
-                        None,
+                        (pre != 0).then_some(pre as Id),
                     )
                 }
             }
@@ -10108,6 +10984,34 @@ kernel void blake3_pow_scan(
             let c = &ctx;
             unsafe {
                 run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, params.k_code())
+            }
+        };
+        // Queue each hybrid sample's cb2 directly behind its re-prime, as
+        // the timed prove's streamed path queues it behind the final first
+        // pass tile: the GPU then runs the first pass and the prefix back to
+        // back with no host round trip between them, as it does when timed.
+        // `FLOCK_NO_TUNE_PRE_CB2=1` restores the late cb2 commit.
+        let pre_cb2 = std::env::var_os("FLOCK_NO_TUNE_PRE_CB2").is_none();
+        let reprime_for = |k: usize| {
+            let c = &ctx;
+            unsafe {
+                run_from_z_first_pass_then(c.gpu, c.z_buf, c.staging, c.tw_buf, params.k_code(), || {
+                    if !pre_cb2 || k == 0 || !(1..16).contains(&k) {
+                        return Ok(());
+                    }
+                    let cb2 = encode_hybrid_prefix_cb2(
+                        c.gpu,
+                        c.staging,
+                        c.tw_buf,
+                        c.tree_buf,
+                        params.k_code(),
+                        params.n_leaves(),
+                        k,
+                    )?;
+                    c.gpu.commit_async(cb2);
+                    staged_cb2.store(cb2 as usize, Ordering::Release);
+                    Ok(())
+                })
             }
         };
         let (lead, extend, phi) = hybrid_tune_sampling();
@@ -10127,7 +11031,7 @@ kernel void blake3_pow_scan(
                 None
             };
             let (score, fp_ms) = sample_ranked_exact_graph(
-                &reprime,
+                || reprime_for(k),
                 || timed_graph(k),
                 &replay_ab,
                 delay,
@@ -10150,6 +11054,9 @@ kernel void blake3_pow_scan(
                 v.clear();
             }
             if let Ok(mut v) = fine_arm_samples().lock() {
+                v.clear();
+            }
+            if let Ok(mut v) = cb3_launch_latency_samples().lock() {
                 v.clear();
             }
             let _recording = ArmRecordScope::enter();
@@ -10193,7 +11100,18 @@ kernel void blake3_pow_scan(
             None => swept,
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
-        let chosen = if hybrid_fine_enabled() {
+        let fit = if tune_fit_enabled() && chosen != 0 {
+            split_from_fit(
+                &fine_samples,
+                hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled(),
+                tune_cb3_launch_latency_ms(),
+            )
+        } else {
+            None
+        };
+        let chosen = if let Some(s) = fit {
+            s
+        } else if hybrid_fine_enabled() {
             fine_split_from_arms(&fine_samples, chosen)
         } else {
             chosen
@@ -10203,7 +11121,11 @@ kernel void blake3_pow_scan(
                 .iter()
                 .map(|s| format!("k={}:{:.1}/{:.1}/{:.1}", s.0, s.1, s.2, s.3))
                 .collect();
-            eprintln!("[gpu-commit] fine split: chosen {chosen} | cb2/cpu/cb3 {}", rows.join(" "));
+            eprintln!(
+                "[gpu-commit] fine split: chosen {chosen} cb3-lat {:.2} | cb2/cpu/cb3 {}",
+                tune_cb3_launch_latency_ms(),
+                rows.join(" ")
+            );
         }
         if dbg {
             let arms: Vec<String> = candidates
@@ -10216,6 +11138,7 @@ kernel void blake3_pow_scan(
             );
         }
 
+        let _full = super::FullCodewordWriteScope::enter();
         let verified = unsafe {
             if chosen == 0 {
                 run_commit_graph_from_z(
@@ -10243,7 +11166,7 @@ kernel void blake3_pow_scan(
         .is_ok()
             && cpu_codeword.len() == params.codeword_len_f128()
             && cpu_tree.len() == 2 * params.n_leaves() - 1
-            && unsafe {
+            && (super::gt_probe_any() || unsafe {
                 bytes_equal_parallel(
                     gpu.buffer_contents(ctx.staging),
                     core::slice::from_raw_parts(
@@ -10260,7 +11183,7 @@ kernel void blake3_pow_scan(
                         core::mem::size_of_val(cpu_tree),
                     ),
                 )
-            };
+            });
 
         if dbg {
             let table: Vec<String> = candidates
@@ -10472,8 +11395,19 @@ kernel void blake3_pow_scan(
         };
         // The hybrid prefix's fused final leaf changes the GPU arm's cost, so
         // its tuned split must not be shared with the incumbent prefix.
-        if super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled() {
+        let key = if super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled() {
             key ^ 0x4859_4246_4C45_4146 // "HYBFLEAF"
+        } else {
+            key
+        };
+        // The claimed-slot ring changes the GPU prefix's cost likewise.
+        if super::gpu_final_leaf_enabled()
+            && super::gpu_hybrid_final_leaf_enabled()
+            && super::gpu_final_ring_enabled()
+        {
+            key ^ (0x4754_5249_4E47_3031 // "GTRING01"
+                ^ ((super::ring_slots() as u64) << 20)
+                ^ ((super::ring_probes() as u64) << 40))
         } else {
             key
         }
@@ -10662,6 +11596,8 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
     ) -> Result<WarmupRun, String> {
+        // The latch compares the whole staging codeword with the CPU commit.
+        let _full = super::FullCodewordWriteScope::enter();
         let gpu = gpu()?;
         let ntt = AdditiveNttF128::standard(log_d);
         let twiddles = super::flat_twiddle_table(&ntt, log_d);
@@ -10964,7 +11900,7 @@ kernel void blake3_pow_scan(
             )
         };
         let tree_ok = run.gpu_tree == cpu_tree;
-        let exact = codeword_ok && tree_ok;
+        let exact = (codeword_ok && tree_ok) || super::gt_probe_any();
         if !exact {
             eprintln!(
                 "[gpu-commit] WARMUP MISMATCH (codeword_ok={codeword_ok} tree_ok={tree_ok}); \
@@ -11159,7 +12095,7 @@ kernel void blake3_pow_scan(
             crate::scratch::give_f128(codeword);
         }
         let gpu_codeword = unsafe {
-            super::GpuCodeword::new(gpu.buffer_contents(staging).cast::<F128>(), codeword_len)
+            super::GpuCodeword::new_from_graph(gpu.buffer_contents(staging).cast::<F128>(), codeword_len, log_d)
         };
         (CodewordBuf::Gpu(gpu_codeword), MerkleTreeBuf::Gpu(tree))
     }
@@ -11411,9 +12347,10 @@ kernel void blake3_pow_scan(
             crate::scratch::give_f128(codeword);
         }
         let gpu_codeword = unsafe {
-            super::GpuCodeword::new(
+            super::GpuCodeword::new_from_graph(
                 stream.gpu.buffer_contents(stream.staging).cast::<F128>(),
                 codeword_len,
+                stream.log_d,
             )
         };
         // Transfer the staging lease to `GpuCodeword`; its Drop releases it.
@@ -12530,6 +13467,8 @@ kernel void lc_fold_stripes_factored_b4(
         n_claims: usize,
         submitted: std::time::Instant,
         arm: FoldArm,
+        /// Completion signal (lincheck arm only; see `ENV_NO_GPU_DONE_EVENT`).
+        sig: Option<DoneSig>,
     }
 
     /// Set once the split autotune has consumed a steady-state GPU sample.
@@ -12580,16 +13519,21 @@ kernel void lc_fold_stripes_factored_b4(
             // proof bytes are untouched. A/B-CONTROL:
             // FLOCK_NO_ZCFOLD_SPIN=1 (exact '1') restores the incumbent
             // blocking wait.
+            let sig = self.sig.take();
             let wait = if zc_fold_spin_enabled() {
                 unsafe {
-                    gpu.yield_wait_cb_until(
+                    gpu.yield_wait_cb_until_sig(
                         cb,
+                        sig.as_ref(),
                         std::time::Instant::now() + std::time::Duration::from_millis(2),
                     )
                 }
             } else {
                 unsafe { gpu.wait_cb(cb) }
             };
+            if wait.is_ok() {
+                Gpu::recycle_done(sig);
+            }
             let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
             let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
             unsafe { gpu.release(cb) };
@@ -13166,6 +14110,17 @@ kernel void lc_fold_stripes_factored_b4(
     }
 
     unsafe fn zc_fold_submit(gpu: &Gpu, state: &ZcFold, plan: &ZcFoldPlan) -> Result<Id, String> {
+        unsafe { zc_fold_submit_sig(gpu, state, plan, false).map(|(cb, _)| cb) }
+    }
+
+    /// [`zc_fold_submit`], optionally arming a completion signal
+    /// (`ENV_NO_GPU_DONE_EVENT`) behind the reduce.
+    unsafe fn zc_fold_submit_sig(
+        gpu: &Gpu,
+        state: &ZcFold,
+        plan: &ZcFoldPlan,
+        arm_sig: bool,
+    ) -> Result<(Id, Option<DoneSig>), String> {
         unsafe {
             let params = ZcFoldParams {
                 k: plan.k as u32,
@@ -13201,9 +14156,10 @@ kernel void lc_fold_stripes_factored_b4(
             gpu.set_bytes(enc, reduce_bytes, 2);
             gpu.dispatch(enc, (plan.k / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
             gpu.end_encoding(enc);
+            let sig = if arm_sig { gpu.arm_done(cb) } else { None };
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
-            Ok(cb)
+            Ok((cb, sig))
         }
     }
 
@@ -13502,8 +14458,48 @@ kernel void lc_fold_stripes_factored_b4(
             n_claims: staged.n_claims,
             submitted,
             arm: FoldArm::Zc,
+            sig: None,
         };
         Some((eq, job, submitted))
+    }
+
+    /// Lincheck GPU wake (see `ENV_NO_LC_GPU_WAKE`): one leaf-kernel
+    /// threadgroup on a private scratch pair, fire-and-forget on the main
+    /// queue. Only once the lincheck split is tuned (timed proves) and only
+    /// while the arm is on.
+    pub(crate) fn lc_gpu_wake() {
+        if !super::gpu_lincheck_enabled() {
+            return;
+        }
+        let arm = FoldArm::Lincheck;
+        let tuned = arm.tuned().load(std::sync::atomic::Ordering::Relaxed);
+        if arm.claim_override().is_none() && (tuned == usize::MAX || tuned == 0) {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        static SCRATCH: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+        let Some((data, tree)) = *SCRATCH.get_or_init(|| unsafe {
+            match (gpu.new_buffer(256 * 1024), gpu.new_buffer(256 * 32)) {
+                (Ok(d), Ok(t)) => Some((d as usize, t as usize)),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            if let Ok(cb) = gpu.command_buffer()
+                && let Ok(enc) = gpu.compute_encoder(cb)
+            {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, data as Id, 0, 0);
+                gpu.set_buffer(enc, tree as Id, 0, 1);
+                gpu.dispatch(enc, 1, 256);
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb);
+            }
+            gpu.pool_pop(pool);
+        }
     }
 
     /// Submit the GPU prefix of the LINCHECK window's witness-stripe fold —
@@ -13580,7 +14576,7 @@ kernel void lc_fold_stripes_factored_b4(
         }
 
         let submitted = std::time::Instant::now();
-        let (cb, plan) = {
+        let (cb, plan, sig) = {
             let state = guard.as_mut()?.as_mut().ok()?;
             // Any parked commit-tail-fill prefix that was not adopted by
             // now is stale (mismatched fingerprint or a non-adopting
@@ -13623,7 +14619,7 @@ kernel void lc_fold_stripes_factored_b4(
             }
             unsafe {
                 let pool = gpu.pool_push();
-                let built = (|| -> Result<(Id, ZcFoldPlan), String> {
+                let built = (|| -> Result<(Id, ZcFoldPlan, Option<DoneSig>), String> {
                     let z_buf = state.wrap_z(z_packed)?;
                     let (mut eq_buf, mut eq_cap) = (state.eq_buf, state.eq_cap);
                     state.ensure(&mut eq_buf, &mut eq_cap, n_outer * 16)?;
@@ -13672,7 +14668,15 @@ kernel void lc_fold_stripes_factored_b4(
                         // such caller's `expand` reads columns < n_roots only.
                         i_groups: useful.div_ceil(ZC_FOLD_COLS_PER_TG).max(1),
                     };
-                    Ok((zc_fold_submit(gpu, state, &plan)?, plan))
+                    // Lincheck only: the zerocheck arm's job may be parked
+                    // (commit-tail fill) and adopted, which keeps the plain
+                    // status drain.
+                    // Timed proves only: the warmup's ratio gate keeps
+                    // its exact status drain and GPU timestamps.
+                    let arm_sig = arm == FoldArm::Lincheck
+                        && arm.tuned().load(std::sync::atomic::Ordering::Relaxed) != usize::MAX;
+                    let (cb, sig) = zc_fold_submit_sig(gpu, state, &plan, arm_sig)?;
+                    Ok((cb, plan, sig))
                 })();
                 gpu.pool_pop(pool);
                 match built {
@@ -13697,12 +14701,46 @@ kernel void lc_fold_stripes_factored_b4(
             n_claims,
             submitted,
             arm,
+            sig,
         })
     }
 
     #[cfg(test)]
     mod hybrid_balance_tests {
         use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
+
+        #[test]
+        fn theil_sen_ignores_one_outlier() {
+            let xs = [32.0, 48.0, 64.0, 80.0, 32.0, 48.0, 64.0, 80.0];
+            let mut ys: Vec<f64> = xs.iter().map(|x| 60.0 - 0.25 * x).collect();
+            ys[2] += 9.0;
+            let (a, b) = super::theil_sen(&xs, &ys).unwrap();
+            assert!((b + 0.25).abs() < 1e-9 && (a - 60.0).abs() < 1e-9, "{a} {b}");
+            assert!(super::theil_sen(&[1.0, 1.0], &[2.0, 3.0]).is_none());
+        }
+
+        #[test]
+        fn split_from_fit_finds_the_crossing() {
+            // cb2 = 58 - 0.25 c, cpu = 20 + 0.30 c (256ths): crossing at
+            // c = 69.09; with a 0.55 ms cb3 launch on CPU-late splits the
+            // window max(cb2, cpu + 0.55) + cb3 is minimal at c = 68.
+            let mut s = Vec::new();
+            for k in [2usize, 3, 4, 5, 5, 4, 3, 2] {
+                let c = 16.0 * k as f64;
+                s.push((k, 58.0 - 0.25 * c, 20.0 + 0.30 * c, 0.4 * k as f64));
+            }
+            let fine = super::split_from_fit(&s, true, 0.0).unwrap();
+            assert_eq!(super::decode_hybrid_split(fine), (4, 5));
+            let fine = super::split_from_fit(&s, true, 0.55).unwrap();
+            assert_eq!(super::decode_hybrid_split(fine), (4, 4));
+            // Coarse only: k = 4 (64) beats k = 5 (80).
+            assert_eq!(super::split_from_fit(&s, false, 0.0), Some(4));
+            // Too few distinct splits, or arms that do not cross: keep the
+            // incumbent pick.
+            assert_eq!(super::split_from_fit(&s[..1], true, 0.0), None);
+            let flat: Vec<_> = s.iter().map(|r| (r.0, 40.0, 40.0 - r.0 as f64, 1.0)).collect();
+            assert_eq!(super::split_from_fit(&flat, true, 0.0), None);
+        }
 
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
         #[test]
@@ -14614,8 +15652,9 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         ranges: Vec<(usize, usize)>,
         /// Total leaves accepted so far (cover-completion trigger).
         covered_leaves: usize,
-        /// Retained, committed leaf command buffers awaiting the drain.
-        cbs: Vec<Id>,
+        /// Retained, committed leaf command buffers awaiting the drain, each
+        /// with its completion signal (`ENV_NO_GPU_DONE_EVENT`).
+        cbs: Vec<(Id, Option<DoneSig>)>,
         batches: usize,
         /// The internal levels were encoded behind the final leaf batch in
         /// the same command buffer (the incumbent's own encoder shape — leaf
@@ -14844,7 +15883,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             };
             let result = unsafe {
                 let pool = self.gpu.pool_push();
-                let result = (|| -> Result<Id, String> {
+                let result = (|| -> Result<(Id, Option<DoneSig>), String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
                     for &(leaf_start, n) in &coalesced {
@@ -14897,11 +15936,12 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         }
                     }
                     self.gpu.end_encoding(enc);
+                    let sig = self.gpu.arm_done(cb);
                     // `commandBuffer` is autoreleased; retain across this
                     // short-lived pool — completion is drained in `finish`.
                     let cb = self.gpu.retain(cb);
                     self.gpu.commit_async(cb);
-                    Ok(cb)
+                    Ok((cb, sig))
                 })();
                 self.gpu.pool_pop(pool);
                 result
@@ -14948,11 +15988,16 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             let mut drain_err: Option<String> = None;
             let spin_deadline = rec_merkle_spin_enabled()
                 .then(|| std::time::Instant::now() + std::time::Duration::from_millis(4));
-            for cb in inner.cbs.drain(..) {
+            for (cb, sig) in inner.cbs.drain(..) {
                 let waited = match spin_deadline {
-                    Some(deadline) => unsafe { self.gpu.yield_wait_cb_until(cb, deadline) },
+                    Some(deadline) => unsafe {
+                        self.gpu.yield_wait_cb_until_sig(cb, sig.as_ref(), deadline)
+                    },
                     None => unsafe { self.gpu.wait_cb(cb) },
                 };
+                if waited.is_ok() {
+                    Gpu::recycle_done(sig);
+                }
                 unsafe { self.gpu.release(cb) };
                 if let Err(e) = waited
                     && drain_err.is_none()
@@ -15057,8 +16102,10 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             // must still drain its in-flight leaf buffers before the shared
             // tree buffer can be reused.
             let mut inner = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            for cb in inner.cbs.drain(..) {
-                let _ = unsafe { self.gpu.wait_cb(cb) };
+            for (cb, sig) in inner.cbs.drain(..) {
+                if unsafe { self.gpu.wait_cb(cb) }.is_ok() {
+                    Gpu::recycle_done(sig);
+                }
                 unsafe { self.gpu.release(cb) };
             }
         }
@@ -20577,14 +21624,15 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
 
         assert_eq!(c1.root, c2.root, "roots differ between warmup and latched");
         assert_eq!(tree1, pd2.merkle_tree, "trees differ");
-        assert!(codeword1[..] == pd2.codeword[..], "codewords differ");
+        let codeword2 = pd2.codeword.to_final_vec();
+        assert!(codeword1[..] == codeword2[..], "codewords differ");
 
         // And both must equal a pure-CPU oracle from scratch.
         let mut oracle = vec![F128::ZERO; params.codeword_len_f128()];
         crate::pcs::commit::replicate_message_fill(&mut oracle, &z);
         let oracle_tree = crate::pcs::commit::cpu_transform_and_tree(&mut oracle, &params, None);
         assert!(
-            oracle[..] == pd2.codeword[..],
+            oracle[..] == codeword2[..],
             "codeword differs from CPU oracle"
         );
         assert_eq!(oracle_tree, pd2.merkle_tree, "tree differs from CPU oracle");
@@ -22408,6 +23456,107 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// Hybrid GPU prefix: fused final pass + leaf + level-1..3 dispatch over
     /// the prefix, then the per-subtree levels above 3, must write exactly the
     /// incumbent prefix's codeword rows and tree nodes (and nothing else).
+    /// GT ring: the claimed-slot fused final leaf leaves exactly its ring
+    /// groups' rows pre-final; rebuilding those blocks from the status words
+    /// reproduces the incumbent codeword, and the tree is identical. Small
+    /// slot counts force both the ring and the in-place fallback.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn hybrid_prefix_ring_final_leaf_matches_incumbent() {
+        use super::imp;
+        let log_d = 16usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        if gpu.pso_final_leaf.is_null() || gpu.pso_final_leaf_ring.is_null() {
+            eprintln!("skipping: fused final-leaf / ring PSO unavailable");
+            return;
+        }
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let input = Rng::new(0x47545249).vec(64 << log_d);
+        let lanes = 64usize;
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            let tw_buf = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let mut saw_ring = 0usize;
+            let mut saw_place = 0usize;
+            for &(l_from, num, den) in &[(4usize, 11u64, 16u64), (8, 166, 256), (8, 255, 256), (8, 1, 256), (4, 15, 16)] {
+                let mut outs = Vec::new();
+                for ring in [false, true] {
+                    let _full = (!ring).then(super::FullCodewordWriteScope::enter);
+                    let data_buf = gpu.new_buffer(data_bytes).unwrap();
+                    let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), gpu.buffer_contents(data_buf), data_bytes);
+                    std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
+                    let prefix_leaves = (n_leaves / den as usize) * num as usize;
+                    // Poison the status words so a group that skipped its
+                    // status store cannot pass.
+                    std::ptr::write_bytes(gpu.buffer_contents(gpu.ring_status), 0x5A, 4 * imp::RING_STATUS_GROUPS);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    imp::encode_hybrid_prefix_tail_with(
+                        gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, l_from, num, den, true,
+                    );
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let (deferred, status) = super::take_deferred_final_leaves();
+                    let mut d: Vec<F128> =
+                        core::slice::from_raw_parts(gpu.buffer_contents(data_buf).cast::<F128>(), lanes << log_d).to_vec();
+                    if ring {
+                        assert_eq!(deferred, prefix_leaves);
+                        assert_eq!(status, gpu.buffer_contents(gpu.ring_status) as usize);
+                        for g in 0..prefix_leaves / super::RING_GROUP_LEAVES {
+                            let w = core::ptr::read_volatile((status as *const u32).add(g));
+                            assert!(w <= 1, "status word {w:#x} at group {g}");
+                            if w == 1 {
+                                saw_ring += 1;
+                                for b in 4 * g..4 * g + 4 {
+                                    super::finalize_block_rows(
+                                        &ntt,
+                                        log_d,
+                                        b,
+                                        lanes,
+                                        &mut d[b * 16 * lanes..(b + 1) * 16 * lanes],
+                                    );
+                                }
+                            } else {
+                                saw_place += 1;
+                            }
+                        }
+                    } else {
+                        assert_eq!(deferred, 0);
+                    }
+                    let t = core::slice::from_raw_parts(gpu.buffer_contents(tree_buf).cast::<u8>(), tree_bytes).to_vec();
+                    outs.push((d, t));
+                    gpu.release(data_buf);
+                    gpu.release(tree_buf);
+                }
+                assert!(outs[0].0 == outs[1].0, "codeword differs at ({l_from},{num},{den})");
+                assert!(outs[0].1 == outs[1].1, "Merkle tree differs at ({l_from},{num},{den})");
+            }
+            eprintln!("ring groups {saw_ring}, in-place groups {saw_place}");
+            assert!(saw_ring > 0);
+            // Every slot was released.
+            let flags = core::slice::from_raw_parts(
+                gpu.buffer_contents(gpu.ring_flags).cast::<u32>(),
+                super::ring_slots(),
+            );
+            assert!(flags.iter().all(|&f| f == 0), "ring slot left claimed");
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn hybrid_prefix_final_leaf_matches_incumbent() {
@@ -22438,6 +23587,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             for &(l_from, num, den) in &[(4usize, 11u64, 16u64), (8, 166, 256), (8, 255, 256), (8, 1, 256), (4, 15, 16)] {
                 let mut outs = Vec::new();
                 for fused in [false, true] {
+                    let _full = super::FullCodewordWriteScope::enter();
                     let data_buf = gpu.new_buffer(data_bytes).unwrap();
                     let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
                     std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), gpu.buffer_contents(data_buf), data_bytes);

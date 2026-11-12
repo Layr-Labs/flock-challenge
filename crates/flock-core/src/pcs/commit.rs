@@ -206,6 +206,17 @@ impl PartialEq<MerkleTreeBuf> for Vec<Hash> {
     }
 }
 
+impl CodewordBuf {
+    /// The complete final codeword as an owned vector. A claimed-slot GPU
+    /// view has its deferred prefix blocks rebuilt; tests and tooling only.
+    pub fn to_final_vec(&self) -> Vec<F128> {
+        match self {
+            CodewordBuf::Cpu(v) => v.clone(),
+            CodewordBuf::Gpu(g) => g.to_final_vec(),
+        }
+    }
+}
+
 impl core::ops::Deref for CodewordBuf {
     type Target = [F128];
     fn deref(&self) -> &[F128] {
@@ -1076,7 +1087,7 @@ mod tests {
             ntt.forward_transform_interleaved(&mut oracle, params.num_ntts());
 
             assert!(
-                pd.codeword[..] == oracle[..],
+                pd.codeword.to_final_vec()[..] == oracle[..],
                 "codeword mismatch at m={m} r={log_inv_rate}"
             );
             let oracle_bytes: &[u8] = unsafe {
@@ -1146,8 +1157,9 @@ mod tests {
         let (_, pd1) = commit(&pack(&z1), &params);
         let (_, pd2) = commit(&pack(&z2), &params);
         let (_, pd_x) = commit(&pack(&z_xor), &params);
-        for (i, (&c1, &c2)) in pd1.codeword.iter().zip(pd2.codeword.iter()).enumerate() {
-            assert_eq!(c1 + c2, pd_x.codeword[i], "linearity fails at i={i}");
+        let (pd1, pd2, pd_x) = (pd1.codeword.to_final_vec(), pd2.codeword.to_final_vec(), pd_x.codeword.to_final_vec());
+        for (i, (&c1, &c2)) in pd1.iter().zip(pd2.iter()).enumerate() {
+            assert_eq!(c1 + c2, pd_x[i], "linearity fails at i={i}");
         }
     }
 

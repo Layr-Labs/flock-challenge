@@ -9599,6 +9599,37 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+    // A claimed-slot GPU commit left pre-final rows in some prefix groups:
+    // rebuild the aligned 16-row blocks of the queried rows in those groups
+    // once, here (see `gpu_commit::deferred_l0_rows`).
+    // The rebuild runs beside the L0 Merkle multi-proof (independent work),
+    // whose result `open_l0` then takes instead of recomputing it.
+    let t_fix = std::time::Instant::now();
+    let (l0_fixed, l0_proof_pre) = if crate::gpu_commit::deferred_view_is(l0_codeword) {
+        let (proof, fixed) = rayon::join(
+            || merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0),
+            || crate::gpu_commit::deferred_l0_rows(l0_codeword, &queries_0),
+        );
+        (fixed, Some(proof))
+    } else {
+        (None, None)
+    };
+    let l0_proof_pre = std::sync::Mutex::new(l0_proof_pre);
+    if trace {
+        eprintln!(
+            "  L0 deferred rows: {} ({} blocks rebuilt) in {:.3} ms; ring groups {:?}",
+            l0_fixed.is_some(),
+            l0_fixed.as_ref().map_or(0, |f| f.n_blocks()),
+            t_fix.elapsed().as_secs_f64() * 1e3,
+            crate::gpu_commit::deferred_ring_groups()
+        );
+    }
+    let l0_row = |q: usize| -> &[F128] {
+        match &l0_fixed {
+            Some(f) => f.row(l0_codeword, q),
+            None => l0_row(q),
+        }
+    };
     let use_c2 = c2::enabled(
         use_lazy_l1_ood,
         std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
@@ -9606,7 +9637,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let open_l0 = || {
         use rayon::prelude::*;
         rayon::join(
-            || merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0),
+            || {
+                l0_proof_pre
+                    .lock()
+                    .ok()
+                    .and_then(|mut p| p.take())
+                    .unwrap_or_else(|| merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0))
+            },
             || queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect::<Vec<Vec<F128>>>(),
         )
     };
