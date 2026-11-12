@@ -46,15 +46,22 @@ fn bstatic_horner_blk<const BLK: usize, const V: u16>(
     out: &mut [u8; 64],
     nt_store: bool,
 ) {
-    bstatic_horner_blk_body::<BLK, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, out, nt_store);
+    bstatic_horner_blk_body::<BLK, V, false>(
+        a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, out, nt_store,
+    );
 }
 
 /// Body of [`bstatic_horner_blk`]. `kara` is [`ab_kara_tables`] when `V`
 /// has `ABV_KARA` and is not dereferenced otherwise.
+///
+/// `HOIST = true` (window rows only, see [`bstatic_horner_window_rows`]):
+/// the caller has already checked that the row's eight K words lie inside
+/// both slices (one check for the window's largest `b_med`), so the row
+/// does not repeat it. `HOIST = false`: the row checks its own bounds.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
+fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -68,7 +75,11 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
     use core::arch::aarch64::*;
     let b_med = BLK % 16;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-    assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
+    if HOIST {
+        debug_assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
+    } else {
+        assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
+    }
     let plain = inv_table.data_ptr();
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
@@ -124,6 +135,25 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                     apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw!($k))
                 } else {
                     bimg_s!($blk, $k, $pairs, $singles)
+                }
+            }};
+        }
+        // A static b word whose varying bytes are exactly bytes 0..NB: under
+        // `ABV_BSTATIC_Z` its partial image plus the varying bytes' z-form
+        // image; otherwise the incumbent form `$inc`.
+        macro_rules! bimg_lz {
+            ($blk:literal, $k:literal, $nb:literal, $inc:expr) => {{
+                if V & ABV_BSTATIC_Z != 0 {
+                    let pp = pbase.add(($blk * 8 + $k) * 64);
+                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(plain, kplain, bw!($k));
+                    (
+                        veorq_u8(vld1q_u8(pp), z0),
+                        veorq_u8(vld1q_u8(pp.add(16)), z1),
+                        veorq_u8(vld1q_u8(pp.add(32)), z2),
+                        veorq_u8(vld1q_u8(pp.add(48)), z3),
+                    )
+                } else {
+                    $inc
                 }
             }};
         }
@@ -213,8 +243,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(5, 1, [(3, 4), (5, 6)], [7]));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(5, 5, [(2, 3), (4, 5), (6, 7)], []));
                 horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(5, 0, [(0, 1), (2, 3)], []));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(5, 4, [(0, 1)], [2]));
+                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_lz!(5, 0, 4, bimg_sk!(5, 0, [(0, 1), (2, 3)], [])));
+                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_lz!(5, 4, 3, bimg_s!(5, 4, [(0, 1)], [2])));
                 horner_absorb(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
@@ -232,8 +262,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(6, 1, [(2, 3), (4, 5), (6, 7)], []));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
                 horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(6, 0, [(0, 1)], [2]));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(6, 4, [(0, 1)], []));
+                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_lz!(6, 0, 3, bimg_s!(6, 0, [(0, 1)], [2])));
+                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_lz!(6, 4, 2, bimg_s!(6, 4, [(0, 1)], [])));
                 horner_absorb(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
@@ -299,8 +329,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(10, 3, [(0, 1), (2, 3)], []));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(10, 7, [(0, 1)], [2]));
+                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_lz!(10, 3, 4, bimg_sk!(10, 3, [(0, 1), (2, 3)], [])));
+                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_lz!(10, 7, 3, bimg_s!(10, 7, [(0, 1)], [2])));
                 let mut acc = seed!(lo3, hi3);
                 let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
                 let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
@@ -318,8 +348,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                     bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
                     return;
                 }
-                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(11, 3, [(0, 1)], []));
-                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_s!(11, 7, [(0, 1)], []));
+                let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_lz!(11, 3, 2, bimg_s!(11, 3, [(0, 1)], [])));
+                let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_lz!(11, 7, 2, bimg_s!(11, 7, [(0, 1)], [])));
                 let mut acc = seed!(lo3, hi3);
                 let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
                 let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
@@ -397,8 +427,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                 let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(15, 3, [(3, 4), (5, 6)], [7]));
                 let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(15, 7, [(3, 4), (5, 6)], [7]));
                 let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(15, 2, [(0, 1), (2, 3)], []));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(15, 6, [(0, 1), (2, 3)], []));
+                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_lz!(15, 2, 4, bimg_sk!(15, 2, [(0, 1), (2, 3)], [])));
+                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_lz!(15, 6, 4, bimg_sk!(15, 6, [(0, 1), (2, 3)], [])));
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
@@ -416,8 +446,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                 let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(16, 3, [(2, 3), (4, 5), (6, 7)], []));
                 let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
                 let mut acc = seed!(lo3, hi3);
-                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(16, 2, [(0, 1)], [2]));
-                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(16, 6, [(0, 1)], []));
+                let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_lz!(16, 2, 3, bimg_s!(16, 2, [(0, 1)], [2])));
+                let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_lz!(16, 6, 2, bimg_s!(16, 6, [(0, 1)], [])));
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
@@ -496,7 +526,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                 let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(20, 6, [(3, 4), (5, 6)], [7]));
                 horner_absorb_first(&mut acc, &lo2, &hi2);
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(20, 1, [(0, 1), (2, 3)], [4]));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(20, 5, [(0, 1), (2, 3)], []));
+                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_lz!(20, 5, 4, bimg_sk!(20, 5, [(0, 1), (2, 3)], [])));
                 horner_absorb(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
@@ -514,8 +544,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                 let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(21, 2, [(2, 3), (4, 5), (6, 7)], []));
                 let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(21, 6, [(2, 3), (4, 5), (6, 7)], []));
                 horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(21, 1, [(0, 1)], [2]));
-                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(21, 5, [(0, 1)], [2]));
+                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_lz!(21, 1, 3, bimg_s!(21, 1, [(0, 1)], [2])));
+                let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_lz!(21, 5, 3, bimg_s!(21, 5, [(0, 1)], [2])));
                 horner_absorb(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                 let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
@@ -533,7 +563,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                 let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
                 let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
                 horner_absorb_first(&mut acc, &lo2, &hi2);
-                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(22, 1, [(0, 1)], []));
+                let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_lz!(22, 1, 2, bimg_s!(22, 1, [(0, 1)], [])));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(22, 5, [], [0]));
                 horner_absorb(&mut acc, &lo1, &hi1, carry_not);
                 let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
@@ -612,8 +642,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(26, 1, [(3, 4), (5, 6)], [7]));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(26, 5, [(2, 3), (4, 5), (6, 7)], []));
                 horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(26, 0, [(0, 1), (2, 3)], []));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(26, 4, [(0, 1)], [2]));
+                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_lz!(26, 0, 4, bimg_sk!(26, 0, [(0, 1), (2, 3)], [])));
+                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_lz!(26, 4, 3, bimg_s!(26, 4, [(0, 1)], [2])));
                 horner_absorb(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
@@ -631,8 +661,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16>(
                 let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                 let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
                 horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_s!(27, 0, [(0, 1)], []));
-                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_s!(27, 4, [(0, 1)], []));
+                let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_lz!(27, 0, 2, bimg_s!(27, 0, [(0, 1)], [])));
+                let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_lz!(27, 4, 2, bimg_s!(27, 4, [(0, 1)], [])));
                 horner_absorb(&mut acc, &lo0, &hi0, carry_not);
                 acc
             }
@@ -721,11 +751,23 @@ pub(crate) fn shift_reduce_inner_ab_bstatic_horner(
 #[cfg(target_arch = "aarch64")]
 pub(crate) const BSTATIC_HORNER_WINDOW_ROWS: [(usize, usize); 2] = [(3, 16), (0, 13)];
 
+/// Kill switch for the hoisted bounds check of the inlined static-B window
+/// rows: any value of `FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` restores one bounds
+/// check per row. Read once per process. The rows written are
+/// byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_row_setup_hoist_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_ROW_SETUP_HOIST").is_none())
+}
+
 /// All static-B Horner rows of window `w` (see [`BSTATIC_HORNER_WINDOW_ROWS`])
 /// as one unrolled sequence of direct calls into the per-arm bodies, writing
-/// row `b_med` to `out_outer[b_med * 64..][..64]`.
+/// row `b_med` to `out_outer[b_med * 64..][..64]`. Each row checks its own
+/// bounds.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
+#[inline]
 pub(crate) fn bstatic_horner_window_rows<const V: u16>(
     w: usize,
     a_packed: &[u8],
@@ -736,7 +778,55 @@ pub(crate) fn bstatic_horner_window_rows<const V: u16>(
     out_outer: &mut [u8],
     nt_store: bool,
 ) {
+    bstatic_horner_window_rows_impl::<V, false>(
+        w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
+    );
+}
+
+/// [`bstatic_horner_window_rows`] with one bounds check per window instead
+/// of one per row (`V` must have [`ABV_INLINE_WINDOW`]).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn bstatic_horner_window_rows_hoisted<const V: u16>(
+    w: usize,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    partials: &'static [[u8; 64]; 248],
+    out_outer: &mut [u8],
+    nt_store: bool,
+) {
+    const { assert!(V & ABV_INLINE_WINDOW != 0) };
+    bstatic_horner_window_rows_impl::<V, true>(
+        w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
+    );
+}
+
+/// [`bstatic_horner_window_rows`] with the per-row bounds check hoisted to
+/// one check per window (`HOIST = true`, inlined bodies only) or not.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) fn bstatic_horner_window_rows_impl<const V: u16, const HOIST: bool>(
+    w: usize,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    partials: &'static [[u8; 64]; 248],
+    out_outer: &mut [u8],
+    nt_store: bool,
+) {
     assert!(w <= 1 && out_outer.len() >= 16 * 64);
+    // Every row of window `w` has `b_med < hi` and reads bytes up to
+    // `chunk_byte_base + (b_med + 1) * 8 * N_CHUNKS`; this one check is the
+    // last row's own check, so it covers every row's and is never stricter.
+    if HOIST {
+        let end = chunk_byte_base + BSTATIC_HORNER_WINDOW_ROWS[w].1 * N_CHUNKS * 8;
+        assert!(end <= a_packed.len() && end <= b_packed.len());
+    }
     let out = out_outer.as_mut_ptr();
     let kara = if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
@@ -751,7 +841,9 @@ pub(crate) fn bstatic_horner_window_rows<const V: u16>(
                 // SAFETY: `$blk % 16 < 16` and `out_outer` holds 16 rows of 64 bytes.
                 let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
                 if V & ABV_INLINE_WINDOW != 0 {
-                    bstatic_horner_blk_body::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store);
+                    bstatic_horner_blk_body::<$blk, V, HOIST>(
+                        a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store,
+                    );
                 } else {
                     bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store);
                 }

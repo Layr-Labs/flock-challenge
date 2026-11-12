@@ -2535,6 +2535,40 @@ pub(crate) fn fold2_compact_and_round45_into(
     a_out: &mut [F128],
     b_out: &mut [F128],
 ) -> (F128, F128, Round3Lookahead) {
+    let (m1, minf, la, _) =
+        fold2_compact_and_round45_into_packed(compact, table, rho1, rho2, r_next4, a_out, b_out, false);
+    (m1, minf, la)
+}
+
+/// Kill switch for the dead-tail-packed K output (`FLOCK_NO_ZC_K_DEAD_PACK`,
+/// any value): the K pass writes every output, the structural zeros
+/// included, and the tri pass reads them back. Packed, the K pass writes 61
+/// of every 64 outputs (`kernels::aarch64::PACK_SUPER` layout) and the tri
+/// pass reads those 61, taking the three zeros as zero registers. Same
+/// values, same messages. Read once per process.
+pub(crate) fn zc_k_dead_pack_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_DEAD_PACK").is_none())
+}
+
+/// [`fold2_compact_and_round45_into`] that, with `pack` and when the state
+/// and split allow it (one-table fused kernel, dead-tail state, chunks of
+/// whole four-block superblocks), writes the dead-tail-packed layout: the
+/// first `n_groups / 256 * 244` entries of `a_out` / `b_out` (see
+/// `kernels::aarch64::PACK_SUPER`); outputs 61..63 of every 64 are zero and
+/// are not written. Returns whether it packed (otherwise every output is
+/// written as usual).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_compact_and_round45_into_packed(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    pack: bool,
+) -> (F128, F128, Round3Lookahead, bool) {
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
     assert!(n_groups >= 4 && n_groups.is_power_of_two());
@@ -2600,14 +2634,22 @@ pub(crate) fn fold2_compact_and_round45_into(
     let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
     let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    // Packed: one-table fused kernel on a dead-tail state, every chunk a
+    // whole number of four-block (256-output) superblocks.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let pack = pack && compact.dead_tail && one_table && out_chunk.is_multiple_of(256);
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+    let pack = {
+        let _ = pack;
+        false
+    };
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
-        // writes before the reduction below reads them.
+        // writes before the reduction below reads them. Packed: each of a
+        // chunk's `out_chunk / 256` superblocks takes 244 entries.
         let (a_ptr, b_ptr) = unsafe {
-            (
-                a_base.ptr().add(x_hi * out_chunk),
-                b_base.ptr().add(x_hi * out_chunk),
-            )
+            let o = if pack { x_hi * out_chunk / 256 * 244 } else { x_hi * out_chunk };
+            (a_base.ptr().add(o), b_base.ptr().add(o))
         };
         // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
         let pair_base = 2 * x_hi * out_chunk;
@@ -2625,11 +2667,17 @@ pub(crate) fn fold2_compact_and_round45_into(
             let out_ptr = outv.as_mut_ptr();
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
-                (true, true) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true>(
+                (true, true) if one_table && pack => {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                    )
+                }
+                #[cfg(target_feature = "sha3")]
+                (true, true) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
                     t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
                 ),
                 #[cfg(target_feature = "sha3")]
-                (true, false) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false>(
+                (true, false) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
                     t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
                 ),
                 #[cfg(target_feature = "sha3")]
@@ -2686,7 +2734,7 @@ pub(crate) fn fold2_compact_and_round45_into(
         c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
     };
 
-    (r_next4[0] * sum1, sum_inf, la5)
+    (r_next4[0] * sum1, sum_inf, la5, pack)
 }
 
 /// Portable reference for one cascade K chunk (non-AArch64 builds). Same
@@ -3323,10 +3371,32 @@ pub(crate) fn fold_cascade_t_into(
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
+    fold_cascade_t_into_packed(a, b, false, a_out, b_out, rhos, r_next)
+}
+
+/// [`fold_cascade_t_into`] whose input, with `packed`, is in the
+/// dead-tail-packed layout of [`fold2_compact_and_round45_into_packed`]
+/// (depth two only): `a` / `b` hold 244 entries per 256 logical inputs and
+/// logical inputs 61..63 of every 64 are zero.
+pub(crate) fn fold_cascade_t_into_packed(
+    a: &[F128],
+    b: &[F128],
+    packed: bool,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+) -> (F128, F128, Round3Lookahead, Lookahead2) {
     let depth = rhos.len();
     assert!(depth == 2 || depth == 3);
-    let n = a.len();
-    assert_eq!(b.len(), n);
+    let n = if packed {
+        assert_eq!(depth, 2, "a packed input is the K pass output (depth two)");
+        assert!(a.len().is_multiple_of(244));
+        a.len() / 244 * 256
+    } else {
+        a.len()
+    };
+    assert_eq!(b.len(), a.len());
     let out_n = n >> depth;
     assert!(n.is_power_of_two() && out_n >= 8);
     assert_eq!(a_out.len(), out_n);
@@ -3350,9 +3420,31 @@ pub(crate) fn fold_cascade_t_into(
     let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
     let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
 
+    // Chunk `x_hi`'s input entries: `chunk_in` logical inputs, 244 entries
+    // per 256 of them when packed.
+    let per_chunk = if packed {
+        assert!(chunk_in.is_multiple_of(256));
+        chunk_in / 256 * 244
+    } else {
+        chunk_in
+    };
+    let inputs = |x_hi: usize| -> (&[F128], &[F128]) {
+        (
+            &a[x_hi * per_chunk..(x_hi + 1) * per_chunk],
+            &b[x_hi * per_chunk..(x_hi + 1) * per_chunk],
+        )
+    };
     let chunk = |a_in: &[F128], b_in: &[F128], a_o: &mut [F128], b_o: &mut [F128]| -> [F128; 26] {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
+            if packed {
+                use kernels::aarch64::fold_tri_and_message_packed_aarch64 as kp;
+                return if nt_stores {
+                    kp::<true>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo)
+                } else {
+                    kp::<false>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo)
+                };
+            }
             use kernels::aarch64::fold_tri_and_message_aarch64 as k;
             match (depth, nt_stores) {
                 (2, true) => k::<2, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
@@ -3363,6 +3455,7 @@ pub(crate) fn fold_cascade_t_into(
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
         {
+            assert!(!packed, "the packed K output is produced on AArch64 only");
             let _ = rho_c;
             tri_chunk_scalar(a_in, b_in, a_o, b_o, rhos, eq_lo)
         }
@@ -3386,12 +3479,8 @@ pub(crate) fn fold_cascade_t_into(
                     std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
                 )
             };
-            let outv = chunk(
-                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                a_o,
-                b_o,
-            );
+            let (a_in, b_in) = inputs(x_hi);
+            let outv = chunk(a_in, b_in, a_o, b_o);
             // SAFETY: exclusive owner of partials[x_hi].
             unsafe {
                 *partials_base.ptr().add(x_hi) = outv;
@@ -3399,7 +3488,8 @@ pub(crate) fn fold_cascade_t_into(
         });
         partials
     } else if hi_size == 1 {
-        vec![chunk(a, b, a_out, b_out)]
+        let (a_in, b_in) = inputs(0);
+        vec![chunk(a_in, b_in, a_out, b_out)]
     } else {
         use rayon::prelude::*;
         a_out
@@ -3407,12 +3497,8 @@ pub(crate) fn fold_cascade_t_into(
             .zip(b_out.par_chunks_mut(chunk_out))
             .enumerate()
             .map(|(x_hi, (a_o, b_o))| {
-                chunk(
-                    &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                    &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                    a_o,
-                    b_o,
-                )
+                let (a_in, b_in) = inputs(x_hi);
+                chunk(a_in, b_in, a_o, b_o)
             })
             .collect()
     };

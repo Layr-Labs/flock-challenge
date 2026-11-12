@@ -2146,9 +2146,12 @@ fn shift_reduce_inner_mixed_const_b_h4<
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
     let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
-    // Karatsuba images (see `ab_kara_tables`); dangling and unused otherwise.
+    // Karatsuba images (see `ab_kara_tables`), or under `ABV_HZ` the sigma
+    // tables (see `ab_hz_tables`); dangling and unused otherwise.
     let kplain = if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
+    } else if V & ABV_HZ != 0 {
+        ab_hz_tables(inv_table)
     } else {
         core::ptr::null()
     };
@@ -2257,15 +2260,34 @@ fn shift_reduce_inner_mixed_const_b_h4<
         ];
 
         let carry_not = vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16));
-        let lo2 = products!(plain, plain_sw, kplain, 2);
-        let hi2 = products!(scaled, scaled_sw, kscaled, 6);
-        horner_absorb_first(&mut acc, &lo2, &hi2);
-        let lo1 = products!(plain, plain_sw, kplain, 1);
-        let hi1 = products!(scaled, scaled_sw, kscaled, 5);
-        horner_absorb(&mut acc, &lo1, &hi1, carry_not);
-        let lo0 = products!(plain, plain_sw, kplain, 0);
-        let hi0 = products!(scaled, scaled_sw, kscaled, 4);
-        horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+        if V & ABV_HZ != 0 {
+            // Same terms, absorbed one image at a time: the `x^4` image's
+            // products are formed after the plain image's are already in
+            // `acc`, so only one set of eight products is live at a time.
+            let zero = [vdupq_n_u16(0); 8];
+            let lo2 = products!(plain, plain_sw, kplain, 2);
+            horner_absorb_first(&mut acc, &lo2, &zero);
+            let hi2 = products!(scaled, scaled_sw, kscaled, 6);
+            xor_into_acc(&mut acc, &hi2);
+            let lo1 = products!(plain, plain_sw, kplain, 1);
+            horner_absorb_one(&mut acc, &lo1, carry_not);
+            let hi1 = products!(scaled, scaled_sw, kscaled, 5);
+            xor_into_acc(&mut acc, &hi1);
+            let lo0 = products!(plain, plain_sw, kplain, 0);
+            horner_absorb_one(&mut acc, &lo0, carry_not);
+            let hi0 = products!(scaled, scaled_sw, kscaled, 4);
+            xor_into_acc(&mut acc, &hi0);
+        } else {
+            let lo2 = products!(plain, plain_sw, kplain, 2);
+            let hi2 = products!(scaled, scaled_sw, kscaled, 6);
+            horner_absorb_first(&mut acc, &lo2, &hi2);
+            let lo1 = products!(plain, plain_sw, kplain, 1);
+            let hi1 = products!(scaled, scaled_sw, kscaled, 5);
+            horner_absorb(&mut acc, &lo1, &hi1, carry_not);
+            let lo0 = products!(plain, plain_sw, kplain, 0);
+            let hi0 = products!(scaled, scaled_sw, kscaled, 4);
+            horner_absorb(&mut acc, &lo0, &hi0, carry_not);
+        }
 
         let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
         let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
@@ -2273,6 +2295,38 @@ fn shift_reduce_inner_mixed_const_b_h4<
         let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
 
         store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
+    }
+}
+
+/// [`horner_absorb`] with a single product set: `acc = acc·x ⊕ lo`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn horner_absorb_one(
+    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
+    lo: &[core::arch::aarch64::uint16x8_t; 8],
+    carry_not: core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for i in 0..8 {
+            let cur = acc[i];
+            let shifted = vreinterpretq_u8_u16(vshlq_n_u16::<1>(cur));
+            let msb = vreinterpretq_u8_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(cur)));
+            let folded = bcax_u8(shifted, msb, carry_not);
+            acc[i] = vreinterpretq_u16_u8(veorq_u8(folded, vreinterpretq_u8_u16(lo[i])));
+        }
+    }
+}
+
+/// `acc ⊕= p`, lane by lane.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_into_acc(acc: &mut [core::arch::aarch64::uint16x8_t; 8], p: &[core::arch::aarch64::uint16x8_t; 8]) {
+    use core::arch::aarch64::*;
+    unsafe {
+        for i in 0..8 {
+            acc[i] = veorq_u16(acc[i], p[i]);
+        }
     }
 }
 
@@ -3472,6 +3526,40 @@ unsafe fn apply_word_kara<const V: u16, const SCALED: bool>(
         let (e0b, o0b) = (ld!(word, 2, 1), ld!(word, 3, 1));
         let (e1a, o1a) = (ld!(word, 4, 2), ld!(word, 5, 2));
         let (e1b, o1b) = (ld!(word, 6, 3), ld!(word, 7, 3));
+        if V & ABV_KARA_XOR16 != 0 {
+            // The same eighteen lookups, recombined. The form below returns
+            // `out_q = e_q ^ sw(o_q)` with `sw` the 8-byte half exchange
+            // (`ext #8`), a fixed byte permutation and therefore GF(2)-linear:
+            // `sw(a ^ b) = sw(a) ^ sw(b)`. Expanding its `e_q` / `o_q` chains:
+            //   out0 = (e0a^e0b^e1a^e1b) ^ sw(o0a^o0b^o1a^o1b)
+            //   out1 = out0 ^ e0s ^ e1s ^ sw(o0s ^ o1s)
+            //   out2 = out0 ^ d2,  d2 = esa ^ esb ^ sw(osa ^ osb)
+            //   out3 = out1 ^ d2 ^ ess ^ sw(oss)
+            // Every output is the same XOR of the same table bytes: twelve
+            // XORs and four `ext` instead of fifteen XORs and four `ext`.
+            let o0 = veorq_u8(xor3_u8(o0a, o0b, o1a), o1b);
+            let out0 = xor3_u8(xor3_u8(e0a, e0b, e1a), e1b, vextq_u8::<8>(o0, o0));
+            let (e0s, o0s) = (ld!(u, 0, 4), ld!(u, 1, 4));
+            let (e1s, o1s) = (ld!(u, 4, 5), ld!(u, 5, 5));
+            let t1 = veorq_u8(o0s, o1s);
+            let out1 = veorq_u8(xor3_u8(out0, e0s, e1s), vextq_u8::<8>(t1, t1));
+            let (esa, osa) = (ld!(s, 0, 6), ld!(s, 1, 6));
+            let (esb, osb) = (ld!(s, 2, 7), ld!(s, 3, 7));
+            let t2 = veorq_u8(osa, osb);
+            let d2 = xor3_u8(esa, esb, vextq_u8::<8>(t2, t2));
+            let out2 = veorq_u8(out0, d2);
+            let ninth = kara.add(AB_KARA_NINTH);
+            let (ess, oss) = if (!SCALED || V & ABV_KARA_SCALED_UNSCALED != 0) && V & ABV_KARA_UNSCALED != 0 {
+                (ab_ld::<true, 0>(ninth, v as usize), ab_ld::<true, 8>(ninth, v as usize))
+            } else {
+                (
+                    vld1q_u8(ninth.add(byte_from_word::<0>(v) * 16)),
+                    vld1q_u8(ninth.add(byte_from_word::<1>(v) * 16)),
+                )
+            };
+            let out3 = veorq_u8(xor3_u8(out1, d2, ess), vextq_u8::<8>(oss, oss));
+            return (out0, out1, out2, out3);
+        }
         let e0 = veorq_u8(xor3_u8(e0a, e0b, e1a), e1b);
         let o0 = veorq_u8(xor3_u8(o0a, o0b, o1a), o1b);
         let (e0s, o0s) = (ld!(u, 0, 4), ld!(u, 1, 4));
@@ -3539,6 +3627,138 @@ pub(crate) fn ab_z_enabled() -> bool {
 /// Row-body variant bit: the plain image uses the z-basis apply.
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_Z: u16 = 8;
+/// Row-body variant bit: a word that keeps the Karatsuba apply (the `x^4`
+/// image under [`ABV_Z`]) recombines its eighteen lookups with twelve XORs
+/// and four `ext` instead of fifteen XORs and four `ext` (see
+/// [`apply_word_kara`]). Same lookups, same output bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_KARA_XOR16: u16 = 512;
+
+/// Kill switch for [`ABV_KARA_XOR16`]: any value of
+/// `FLOCK_NO_ZC_AB_KARA_XOR16` restores the incumbent recombination in the
+/// same binary. Read once per process. The rows written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_kara_xor16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_KARA_XOR16").is_none())
+}
+
+/// Row-body variant bit (with [`ABV_Z`] and [`ABV_Z_REC`]): a static-B word
+/// whose varying bytes are exactly bytes `0..NB` (`NB` = 2, 3 or 4) takes
+/// its partial image plus [`apply_word_z_low`] of the varying bytes instead
+/// of the per-byte rows or the whole-word apply. Same output bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_BSTATIC_Z: u16 = 4096;
+
+/// Kill switch for [`ABV_BSTATIC_Z`]: any value of
+/// `FLOCK_NO_ZC_AB_BSTATIC_Z` keeps the incumbent static-B word forms. Read
+/// once per process. The rows written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_bstatic_z_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_BSTATIC_Z").is_none())
+}
+
+/// [`apply_word_z`] (record form) of the word `w` restricted to its bytes
+/// `0..NB` (`2 <= NB <= 4`), the other bytes taken as zero. The apply is
+/// F2-linear in each lookup index and every table's row 0 is zero, so the
+/// lookups whose index involves only bytes `NB..8` are dropped: the plain
+/// row, the `{1,3,5,7}` record pair, and for `NB >= 3` the `{2,3,6,7}` pair,
+/// for `NB = 4` the `{3,7}` pair (8, 10 or 12 loads). `t0` is the plain
+/// image, `kara` its [`ab_kara_tables`] base.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z_low<const NB: u32>(
+    t0: *const u8,
+    kara: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let v = w & ((1u64 << (8 * NB)) - 1);
+        let z = kara.add(2 * AB_KARA_IMAGE_BYTES);
+        let ys = v ^ (v >> 8);
+        let yl1 = v ^ (v >> 16);
+        let yall = ys ^ (ys >> 16);
+        let ld = |base: *const u8, off: usize| vld1q_u8(base.add(off));
+        let r0 = t0.add(ab_z_idx::<0, 6>(yall));
+        let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
+        let rec = |i: usize| -> *const u8 {
+            let a: usize;
+            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) z.add(AB_Z_REC), i = in(reg) i,
+                options(pure, nomem, nostack, preserves_flags));
+            a as *const u8
+        };
+        // {1,3,5,7}: bytes 1 ^ 3.
+        let a = rec(ab_z_idx::<1, 7>(yl1));
+        let (mut p, mut q) = (ld(a, 64), ld(a, 80));
+        if NB >= 4 {
+            // {3,7}: byte 3.
+            let a = rec(ab_z_idx::<3, 7>(v));
+            p = veorq_u8(p, ld(a, 96));
+            q = veorq_u8(q, ld(a, 112));
+        }
+        let p = vreinterpretq_u64_u8(p);
+        let q = vreinterpretq_u64_u8(q);
+        let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
+        let b1 = vreinterpretq_u8_u64(vzip2q_u64(p, p));
+        let b2 = vreinterpretq_u8_u64(vzip1q_u64(q, q));
+        let b3 = vreinterpretq_u8_u64(vzip2q_u64(q, q));
+        if NB >= 3 {
+            // {2,3,6,7}: bytes 2 ^ 3.
+            let a = rec(ab_z_idx::<2, 7>(ys));
+            let (m0, m2) = (ld(a, 0), ld(a, 16));
+            (xor3_u8(l0, m0, b0), xor3_u8(l1, m0, b1), xor3_u8(l2, m2, b2), xor3_u8(l3, m2, b3))
+        } else {
+            (veorq_u8(l0, b0), veorq_u8(l1, b1), veorq_u8(l2, b2), veorq_u8(l3, b3))
+        }
+    }
+}
+
+/// Test access: one static-B word `(blk, k)` of a plan whose varying bytes
+/// are `0..NB`, through the partial path (per-byte rows) and through the
+/// partial image plus [`apply_word_z_low`]; `w` must match the plan's
+/// static bytes.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn ab_bstatic_z_low_forms<const NB: u32>(
+    inv_table: &InvNttTableByteSingleGf8,
+    blk: usize,
+    k: usize,
+    w: u64,
+) -> ([u8; 64], [u8; 64]) {
+    use core::arch::aarch64::*;
+    let partials = bstatic_partials(inv_table);
+    let kara = ab_kara_tables(inv_table);
+    let plain = inv_table.data_ptr();
+    let mut out = ([0u8; 64], [0u8; 64]);
+    unsafe {
+        let pp = partials[blk * 8 + k].as_ptr();
+        let mut d = [vld1q_u8(pp), vld1q_u8(pp.add(16)), vld1q_u8(pp.add(32)), vld1q_u8(pp.add(48))];
+        {
+            let [d0, d1, d2, d3] = &mut d;
+            xor_vary_ext::<0, 1>(plain, w, [d0, d1, d2, d3]);
+            if NB == 3 {
+                xor_vary_ext::<2, 8>(plain, w, [d0, d1, d2, d3]);
+            }
+            if NB == 4 {
+                xor_vary_ext::<2, 3>(plain, w, [d0, d1, d2, d3]);
+            }
+        }
+        let z = apply_word_z_low::<NB>(plain, kara, w);
+        let e = [veorq_u8(vld1q_u8(pp), z.0), veorq_u8(vld1q_u8(pp.add(16)), z.1), veorq_u8(vld1q_u8(pp.add(32)), z.2), veorq_u8(vld1q_u8(pp.add(48)), z.3)];
+        for i in 0..4 {
+            vst1q_u8(out.0.as_mut_ptr().add(16 * i), d[i]);
+            vst1q_u8(out.1.as_mut_ptr().add(16 * i), e[i]);
+        }
+    }
+    out
+}
+
 /// Row-body variant bit (with [`ABV_Z`]): the `x^4` image uses it too.
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_Z_SCALED: u16 = 16;
@@ -3787,6 +4007,45 @@ pub(crate) fn ab_hz_helper_enabled() -> bool {
         std::env::var_os(ENV_NO_ZC_AB_HZ).is_none_or(|v| v != *"1")
     });
     *ON && !ab_kara_enabled()
+}
+
+/// Kill switch for [`ab_mixed_hz_enabled`]: any value of
+/// `FLOCK_NO_ZC_AB_MIXED_HZ` keeps the plain apply in the two mixed
+/// const-one rows of a thread that keeps the plain apply. Read once per
+/// process. The rows written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ENV_NO_ZC_AB_MIXED_HZ: &str = "FLOCK_NO_ZC_AB_MIXED_HZ";
+
+/// Whether this thread's mixed const-one rows apply the table in the
+/// half-pair z form (24 loads per word instead of 32): a thread that keeps
+/// the plain apply and runs its static-B rows in [`AB_HZ_VARIANT`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn ab_mixed_hz_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_MIXED_HZ).is_none()) && ab_hz_helper_enabled()
+}
+
+/// Test access: one mixed const-one row (`window 0, b_med 2` mask `0x03`
+/// when `w0`, else `window 1, b_med 13` mask `0xf0`) through the plain apply
+/// and through the half-pair z apply.
+#[cfg(all(test, target_arch = "aarch64"))]
+pub(crate) fn ab_mixed_row_plain_and_hz(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    byte_base_b: usize,
+    w0: bool,
+) -> ([u8; 64], [u8; 64]) {
+    let mut out = ([0u8; 64], [0u8; 64]);
+    if w0 {
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, 0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_HZ }>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.1, false);
+    } else {
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, 0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_HZ }>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.1, false);
+    }
+    out
 }
 
 /// Bytes of one image's sigma table (256 x 32).
@@ -4225,7 +4484,17 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     )
                 });
                 if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
-                    if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
+                    if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            None,
+                            out,
+                            nt_store,
+                        );
+                    } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT }>(
                             a_packed,
                             b_packed,
@@ -4247,6 +4516,16 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                         );
                     } else if ab_kara_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_KARA }>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            byte_base_b,
+                            None,
+                            out,
+                            nt_store,
+                        );
+                    } else if ab_mixed_hz_enabled() {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_HZ }>(
                             a_packed,
                             b_packed,
                             inv_table,
@@ -4311,7 +4590,17 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
         0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
             if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
+                if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
+                    shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        None,
+                        out,
+                        nt_store,
+                    );
+                } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { AB_Z_VARIANT }>(
                         a_packed,
                         b_packed,
@@ -4333,6 +4622,16 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     );
                 } else if ab_kara_enabled() {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_KARA }>(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        byte_base_b,
+                        None,
+                        out,
+                        nt_store,
+                    );
+                } else if ab_mixed_hz_enabled() {
+                    shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_HZ }>(
                         a_packed,
                         b_packed,
                         inv_table,
