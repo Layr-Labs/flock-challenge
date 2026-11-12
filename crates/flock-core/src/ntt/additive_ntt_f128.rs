@@ -1334,6 +1334,40 @@ impl AdditiveNttF128 {
         Ok(())
     }
 
+    /// Hybrid commit work stealing: complete layers 8..log_d of the ranked
+    /// transform over the absolute layer-8 sub-blocks `[sb_start, sb_end)`
+    /// whose layers 0..8 are already final (the GPU's first pass and its
+    /// layer-4 pass). Same kernels and absolute twiddles as the fine split's
+    /// boundary sub-blocks: layers 8..10 over the range, then the deep pairs
+    /// over its layer-10 sub-NTTs. Bit-identical to the unsplit transform.
+    pub(crate) fn forward_transform_interleaved_ranked_sub_range(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        sb_start: usize,
+        sb_end: usize,
+    ) {
+        const DEEP_LAYER: usize = 10;
+        let log_d = log2_pow2(data.len() / num_ntts);
+        assert_eq!(log_d, 20, "ranked sub-range requires log_d=20");
+        assert_eq!(num_ntts, 64, "ranked sub-range requires 64 lanes");
+        assert!(sb_start < sb_end && sb_end <= 1 << 8);
+        let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
+        self.forward_transform_interleaved_block_range(
+            data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
+        );
+        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+            data,
+            num_ntts,
+            DEEP_LAYER,
+            log_d,
+            sb_start << (DEEP_LAYER - 8),
+            sb_end << (DEEP_LAYER - 8),
+            odd_tail,
+            &|_: usize, _: &[F128]| {},
+        );
+    }
+
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
     /// `finish_chunk` exactly as the unsplit transform does.
     #[inline]

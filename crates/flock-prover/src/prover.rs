@@ -2489,6 +2489,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
     bind_statement(challenger, r1cs, &commitment);
     flock_core::tmark::mark("zc start");
+    // Lincheck GPU wake (see `flock_core::gpu_commit::ENV_NO_LC_GPU_WAKE`):
+    // zerocheck's tail wakes the idle GPU ahead of the lincheck prefix.
+    flock_core::gpu_commit::lc_gpu_wake_arm(true);
     // Hetero-queue linger (see `flock_core::epool::set_linger_phase`): armed
     // from lincheck through the PCS open, whose many short queues sit between
     // short serial steps. Zerocheck's long bandwidth-bound kernels measured
@@ -2554,6 +2557,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
+    flock_core::gpu_commit::lc_gpu_wake_arm(false);
     flock_core::tmark::mark("zc end");
     let cpu_lc0 = phase_timing.then(process_cpu_ms);
     let t_lc = std::time::Instant::now();

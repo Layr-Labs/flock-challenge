@@ -350,6 +350,58 @@ pub(crate) fn gpu_zerocheck_debug() -> bool {
 /// is XOR: associative and commutative, so any claim partition works).
 pub const ENV_NO_GPU_LINCHECK: &str = "FLOCK_NO_GPU_LINCHECK";
 
+/// Lincheck GPU wake (`FLOCK_NO_LC_GPU_WAKE=1`, exact, kills). The GPU sits
+/// idle from the zerocheck round-two arm (~28 ms before zerocheck returns)
+/// to the lincheck prefix fold, long enough to enter its deep idle state:
+/// the prefix then starts ~0.62 ms after submit (mini1, `GPUStartTime` minus
+/// the submit mark; still 0.61-0.64 ms with the CPU held idle after the
+/// submit, so it is GPU wake, not CPU starvation), and nine cores wait
+/// ~0.55-0.65 ms at the drain. Buffers submitted onto a GPU idle for up to
+/// ~3.5 ms start in ~0.1 ms. One 256-thread BLAKE3-leaf threadgroup on a
+/// private 264 KiB scratch pair, committed at zerocheck's first tri pass
+/// (~1.8 ms before the lincheck launch on mini1; `FLOCK_LC_GPU_WAKE_AT`
+/// moves it: tri pass index, 99 = after the tri loop, 100 = zerocheck
+/// return), wakes it: launch-to-start 0.09 ms, drain wait ~0. It touches no
+/// prove buffer, nothing waits on it, and it runs only in timed proves
+/// (after the warmup tuned the split). A gated precommit of the prefix
+/// itself (encodeWaitForEvent on a second queue, opened from the CPU at
+/// launch) does NOT wake the GPU: gate-to-start stayed 0.64 ms; an empty
+/// encoder does not either.
+pub const ENV_NO_LC_GPU_WAKE: &str = "FLOCK_NO_LC_GPU_WAKE";
+
+pub(crate) fn lc_gpu_wake_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var(ENV_NO_LC_GPU_WAKE).is_ok_and(|v| v == "1")
+    });
+    *ON
+}
+
+/// Armed by the prover for the ranked lincheck GPU arm; consumed by the
+/// first [`lc_gpu_wake_fire`] (zerocheck's tail).
+static LC_GPU_WAKE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm (or, with `false`, disarm) the lincheck GPU wake for this prove.
+pub fn lc_gpu_wake_arm(on: bool) {
+    if !on {
+        lc_gpu_wake_fire(100);
+    }
+    LC_GPU_WAKE_ARMED.store(on && lc_gpu_wake_enabled(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Fire the armed lincheck GPU wake (once per arm) at wake point `point`
+/// when it is the configured one (`FLOCK_LC_GPU_WAKE_AT`: zerocheck tri pass
+/// index, `99` = after the tri loop, `100` = zerocheck return).
+pub(crate) fn lc_gpu_wake_fire(point: u32) {
+    static AT: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_LC_GPU_WAKE_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    });
+    if point != *AT || !LC_GPU_WAKE_ARMED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::lc_gpu_wake();
+}
+
 pub(crate) fn gpu_lincheck_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());
@@ -8669,6 +8721,16 @@ kernel void blake3_pow_scan(
         n_leaves: usize,
         k_split: usize,
     ) -> Result<Id, String> {
+        if let Some(plan) = active_steal_plan(k_split) {
+            match unsafe { encode_steal_cb2(gpu, staging, tw_buf, tree_buf, log_d, n_leaves, plan) } {
+                Ok(cb2) => return Ok(cb2),
+                Err(e) => {
+                    if debug_enabled() {
+                        eprintln!("[gpu-commit] steal cb2 encode failed ({e}); static split");
+                    }
+                }
+            }
+        }
         let (k_cpu16, m) = decode_hybrid_split(k_split);
         debug_assert!((1..16).contains(&k_cpu16) && m < 16);
         if m > 0 {
@@ -8763,6 +8825,721 @@ kernel void blake3_pow_scan(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // CW steal: dynamic CPU/GPU balance of the hybrid commit.
+    //
+    // The warm-up tuner fixes the CPU/GPU split once per process from
+    // samples taken beside a replayed A/B arm; the timed window then finishes
+    // whichever arm is late, while the other sits idle (measured on mini1:
+    // the GPU prefix ends 2-4 ms after the CPU suffix in quiet runs and the
+    // CPU ends 3 ms after the GPU in loaded ones). A steal plan instead puts a
+    // ZONE of 256ths between a static CPU suffix and a static GPU prefix,
+    // each 16 256ths (`FLOCK_CW_STEAL_ZONE`) below the tuned share, so the
+    // zone spans the tuned split +-16. The GPU's layer-4 pass covers the
+    // zone (its sixteenths
+    // are GPU sixteenths), and then the two sides claim the zone's 256ths
+    // from opposite ends under one mutex: the GPU ascending, in aligned
+    // chunks of 4 a feeder thread encodes just in time (one queued ahead,
+    // the first granted when the static prefix starts its final pass); the
+    // CPU descending, one 256th per worker, after its static suffix. Every
+    // 256th's layers 8..20 + leaves are computed exactly once, by the same
+    // kernels with the same absolute twiddles, so the codeword and tree are
+    // bit-identical for any meeting point:
+    // - a GPU chunk runs the production pass kernels over a sub-range by
+    //   binding the staging/tree buffers at the chunk's offsets and remapping
+    //   its layer index into a small per-chunk twiddle table (the kernels
+    //   index twiddles only as `(1 << (l + j)) - 1 + (B << j) + c` and data
+    //   only through `log_d - l`, so `l' = log2(blocks)`, `log_d' = log_d -
+    //   l + l'` addresses the identical twiddles and positions);
+    // - a CPU 256th runs the fine split's boundary schedule (layers 8..10,
+    //   then the deep pairs) and its leaves are hashed by cb3 with the static
+    //   suffix's;
+    // - the tree above the 256 subtree roots is recomputed on the CPU.
+    // `FLOCK_NO_CW_STEAL=1` restores the static split.
+    // -----------------------------------------------------------------------
+
+    fn cw_steal_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_CW_STEAL").is_none())
+    }
+
+    /// GPU chunk size in 256ths (aligned). Diagnostic override
+    /// `FLOCK_CW_STEAL_CHUNK` (power of two, 1..=16).
+    fn cw_steal_chunk() -> usize {
+        static C: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *C.get_or_init(|| {
+            std::env::var("FLOCK_CW_STEAL_CHUNK")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|c| c.is_power_of_two() && *c <= 16)
+                .unwrap_or(4)
+        })
+    }
+
+    /// How far (256ths) each static share sits below the tuned one.
+    /// Diagnostic override `FLOCK_CW_STEAL_ZONE`.
+    fn cw_steal_zone() -> usize {
+        static Z: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *Z.get_or_init(|| {
+            std::env::var("FLOCK_CW_STEAL_ZONE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|z| *z <= 64)
+                .unwrap_or(16)
+        })
+    }
+
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct StealPlan {
+        /// The tuned split this plan replaces (`k + 16 m`).
+        k_split: usize,
+        /// Static CPU suffix in sixteenths.
+        k_cpu16: usize,
+        /// Zone `[z0, z1)` in 256ths; `z1 = 16 * (16 - k_cpu16)`.
+        z0: usize,
+        z1: usize,
+        /// GPU chunk size in 256ths.
+        c: usize,
+    }
+
+    impl StealPlan {
+        #[cfg(test)]
+        pub(crate) fn for_test(k_split: usize, k_cpu16: usize, z0: usize, z1: usize, c: usize) -> Self {
+            StealPlan { k_split, k_cpu16, z0, z1, c }
+        }
+
+        fn nchunks(&self) -> usize {
+            (self.z1 - self.z0) / self.c
+        }
+    }
+
+    /// Plan for a tuned split: the static CPU suffix is one sixteenth below
+    /// the tuned share (rounded down), and the zone extends the reachable CPU
+    /// share well above it, so either arm running late is absorbed.
+    fn steal_plan_for(k_split: usize) -> Option<StealPlan> {
+        if k_split == 0 || !hybrid_split_valid(k_split) {
+            return None;
+        }
+        let (k, m) = decode_hybrid_split(k_split);
+        let s = 16 * k + m;
+        let c = cw_steal_chunk();
+        let reach = cw_steal_zone();
+        // Static CPU suffix: whole sixteenths at least `reach` below the
+        // tuned share; static GPU prefix: `reach` below the tuned GPU share.
+        let k_cpu16 = (s.saturating_sub(reach) / 16).max(1);
+        let z1 = 16 * (16 - k_cpu16);
+        let z0 = ((256usize.saturating_sub(s + reach)) / c * c).max(16);
+        if z0 + c > z1 {
+            return None;
+        }
+        Some(StealPlan { k_split, k_cpu16, z0, z1, c })
+    }
+
+    /// Published plan (set by the exact tune after it picks a split).
+    static STEAL_PLAN: std::sync::Mutex<Option<StealPlan>> = std::sync::Mutex::new(None);
+
+    fn active_steal_plan(k_split: usize) -> Option<StealPlan> {
+        if !cw_steal_enabled() || hybrid_arm_recording() {
+            return None;
+        }
+        let p = (*STEAL_PLAN.lock().ok()?)?;
+        (p.k_split == k_split).then_some(p)
+    }
+
+    /// Per-chunk remapped twiddle tables (one Metal buffer, retained for the
+    /// process) and the plan they were built for.
+    struct StealTables {
+        buf: Id,
+        plan: StealPlan,
+    }
+    unsafe impl Send for StealTables {}
+    static STEAL_TABLES: std::sync::Mutex<Option<StealTables>> = std::sync::Mutex::new(None);
+
+    /// The three passes a chunk runs: `(l, f)` with `l` in {8, 12, 16}.
+    const STEAL_PASS_L: [usize; 3] = [8, 12, 16];
+
+    /// Entries of the remapped table of one chunk's pass `l` (layers
+    /// `l..l+4` remapped to `lp..lp+4`, `lp = log2(c) + l - 8`).
+    fn steal_table_len(c: usize, l: usize) -> usize {
+        let lp = c.trailing_zeros() as usize + l - 8;
+        1usize << (lp + 4)
+    }
+
+    fn steal_chunk_table_len(c: usize) -> usize {
+        STEAL_PASS_L.iter().map(|&l| steal_table_len(c, l)).sum()
+    }
+
+    /// Byte offset of chunk `i`'s pass-`l` table.
+    fn steal_table_offset(c: usize, i: usize, l: usize) -> usize {
+        let mut off = i * steal_chunk_table_len(c);
+        for &pl in STEAL_PASS_L.iter() {
+            if pl == l {
+                break;
+            }
+            off += steal_table_len(c, pl);
+        }
+        off * core::mem::size_of::<F128>()
+    }
+
+    /// Build (or reuse) the remapped twiddle tables for `plan` from the flat
+    /// twiddle table in `tw_buf`. Untimed (called by the warm-up tune).
+    pub(crate) unsafe fn ensure_steal_tables(gpu: &Gpu, tw_buf: Id, plan: StealPlan) -> Result<(), String> {
+        let mut g = STEAL_TABLES.lock().map_err(|_| "steal tables poisoned".to_string())?;
+        if let Some(t) = g.as_ref() {
+            if t.plan.z0 == plan.z0 && t.plan.z1 == plan.z1 && t.plan.c == plan.c {
+                return Ok(());
+            }
+        }
+        let c = plan.c;
+        let n = plan.nchunks();
+        let total = n * steal_chunk_table_len(c);
+        unsafe {
+            let buf = gpu.new_buffer(total * core::mem::size_of::<F128>())?;
+            let dst = gpu.buffer_contents(buf).cast::<F128>();
+            let src = gpu.buffer_contents(tw_buf).cast::<F128>() as *const F128;
+            for i in 0..n {
+                let a = plan.z0 + i * c;
+                for &l in STEAL_PASS_L.iter() {
+                    let lp = c.trailing_zeros() as usize + l - 8;
+                    let base = dst.add(steal_table_offset(c, i, l) / core::mem::size_of::<F128>());
+                    for j in 0..4usize {
+                        let cnt = c << (l - 8 + j);
+                        let from = (1usize << (l + j)) - 1 + (a << (l - 8 + j));
+                        let to = (1usize << (lp + j)) - 1;
+                        core::ptr::copy_nonoverlapping(src.add(from), base.add(to), cnt);
+                    }
+                }
+            }
+            if let Some(old) = g.take() {
+                gpu.release(old.buf);
+            }
+            *g = Some(StealTables { buf, plan });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn steal_tables_buf(plan: StealPlan) -> Option<Id> {
+        let g = STEAL_TABLES.lock().ok()?;
+        let t = g.as_ref()?;
+        (t.plan.z0 == plan.z0 && t.plan.z1 == plan.z1 && t.plan.c == plan.c).then_some(t.buf)
+    }
+
+    /// Encode GPU chunk `i` of `plan` (256ths `[z0 + i c, z0 + (i+1) c)`):
+    /// layers 8..16 with the production pass kernels, the fused final pass +
+    /// leaves + levels 1..3, then the chunk subtree's levels above 3.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn encode_steal_chunk(
+        gpu: &Gpu,
+        enc: Id,
+        staging: Id,
+        tables: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        plan: StealPlan,
+        i: usize,
+    ) {
+        let c = plan.c;
+        let a = plan.z0 + i * c;
+        let pos_per_256 = (1usize << log_d) / 256;
+        let data_off = a * pos_per_256 * 64 * core::mem::size_of::<F128>();
+        let lc = c.trailing_zeros() as usize;
+        unsafe {
+            for (l, f) in super::plan_passes(log_d, 4) {
+                if !(8..log_d - 4).contains(&l) {
+                    continue;
+                }
+                let s = log_d - l - f;
+                let (pso, tpg, groups) = match f {
+                    4 if s > 2 && !gpu.pso_ntt4g4x2.is_null() => {
+                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - 2))
+                    }
+                    4 if s >= 2 => (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - 2)),
+                    _ => unreachable!("steal chunk pass shape"),
+                };
+                let lp = lc + l - 8;
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, staging, data_off, 0);
+                gpu.set_buffer(enc, tables, steal_table_offset(c, i, l), 1);
+                let p = NttParams {
+                    log_d: (log_d - l + lp) as u32,
+                    l: lp as u32,
+                    f: f as u32,
+                    s: s as u32,
+                };
+                gpu.set_bytes(
+                    enc,
+                    core::slice::from_raw_parts(
+                        (&p as *const NttParams).cast::<u8>(),
+                        core::mem::size_of::<NttParams>(),
+                    ),
+                    2,
+                );
+                gpu.dispatch(enc, groups / 256 * c as u64, tpg);
+            }
+            // Fused final pass + leaf + parents 1..3 (layers 16..20).
+            let l = log_d - 4;
+            let lp = lc + l - 8;
+            gpu.set_pipeline(enc, gpu.pso_final_leaf);
+            gpu.set_buffer(enc, staging, data_off, 0);
+            gpu.set_buffer(enc, tables, steal_table_offset(c, i, l), 1);
+            let p = NttParams { log_d: (log_d - l + lp) as u32, l: lp as u32, f: 4, s: 0 };
+            gpu.set_bytes(
+                enc,
+                core::slice::from_raw_parts(
+                    (&p as *const NttParams).cast::<u8>(),
+                    core::mem::size_of::<NttParams>(),
+                ),
+                2,
+            );
+            let leaf0 = a * (n_leaves / 256);
+            let w1 = n_leaves;
+            let w2 = w1 + n_leaves / 2;
+            let w3 = w2 + n_leaves / 4;
+            gpu.set_buffer(enc, tree_buf, leaf0 * 32, 3);
+            gpu.set_buffer(enc, tree_buf, (w1 + leaf0 / 2) * 32, 4);
+            gpu.set_buffer(enc, tree_buf, (w2 + leaf0 / 4) * 32, 5);
+            gpu.set_buffer(enc, tree_buf, (w3 + leaf0 / 8) * 32, 6);
+            gpu.dispatch(enc, (c * (n_leaves / 256) / 64) as u64, 64);
+            encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, leaf0, c * (n_leaves / 256));
+        }
+    }
+
+    /// Claim state of one steal run, in 256ths: the GPU owns `[.., lo)`, the
+    /// CPU `[hi, ..)`; `[lo, hi)` is unclaimed.
+    struct StealRun {
+        plan: StealPlan,
+        /// Fine-split event value after the layer-4 pass; `+1` the static
+        /// tail's final pass started, `+2` cb2 done, `+3 + i` GPU chunk `i`.
+        ev_base: u64,
+        /// The cb2 this run was encoded into.
+        cb2: usize,
+        lo: usize,
+        hi: usize,
+        /// Chunk command buffers the feeder committed (retained).
+        cbs: Vec<Id>,
+    }
+    unsafe impl Send for StealRun {}
+
+    /// Armed by the cb2 encode, consumed by the hybrid graph.
+    static STEAL_RUN: std::sync::Mutex<Option<StealRun>> = std::sync::Mutex::new(None);
+
+    /// Steal-plan cb2: layer-4 pass over the GPU sixteenths (zone included),
+    /// event, the static prefix's passes 8..16, event, its final pass +
+    /// leaves + subtrees, event. Zone chunks follow as their own buffers.
+    unsafe fn encode_steal_cb2(
+        gpu: &Gpu,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        plan: StealPlan,
+    ) -> Result<Id, String> {
+        let Some(tables) = steal_tables_buf(plan) else {
+            return Err("steal tables missing".into());
+        };
+        unsafe {
+            let ev = gpu.fine_split_event();
+            if ev.is_null() {
+                return Err("newSharedEvent failed".into());
+            }
+            let n = plan.nchunks() as u64;
+            // v: layer-4 pass done; v+1: static prefix's passes 8..16 done
+            // (its final pass is running); v+2: cb2 done; v+3+i: GPU chunk i.
+            let v = FINE_SPLIT_SEQ.fetch_add(3 + n, std::sync::atomic::Ordering::Relaxed) + 1;
+            let cb2 = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb2)?;
+            let prefix16 = (16 - plan.k_cpu16) as u64;
+            encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 4, 8, prefix16, 16);
+            gpu.end_encoding(enc);
+            gpu.encode_signal_event(cb2, ev, v);
+            FINE_SPLIT_WAIT.store(v, std::sync::atomic::Ordering::Release);
+            // The fused prefix tail (`encode_hybrid_prefix_tail_with`,
+            // fused), split around the final pass for the feeder's signal.
+            let enc = gpu.compute_encoder(cb2)?;
+            encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 8, log_d - 4, plan.z0 as u64, 256);
+            gpu.end_encoding(enc);
+            gpu.encode_signal_event(cb2, ev, v + 1);
+            let enc = gpu.compute_encoder(cb2)?;
+            let prefix_leaves = plan.z0 * (n_leaves / 256);
+            encode_final_leaf_prefix(gpu, enc, staging, tw_buf, tree_buf, log_d, prefix_leaves);
+            let mut start = 0usize;
+            while start < prefix_leaves {
+                let mut size = 1usize << (prefix_leaves - start).ilog2();
+                while start % size != 0 {
+                    size >>= 1;
+                }
+                encode_merkle_subtree_above3(gpu, enc, tree_buf, n_leaves, start, size);
+                start += size;
+            }
+            gpu.end_encoding(enc);
+            gpu.encode_signal_event(cb2, ev, v + 2);
+            let mut g = STEAL_RUN.lock().map_err(|_| "steal run poisoned".to_string())?;
+            *g = Some(StealRun {
+                plan,
+                ev_base: v,
+                cb2: cb2 as usize,
+                lo: plan.z0,
+                hi: plan.z1,
+                cbs: Vec::new(),
+            });
+            Ok(cb2)
+        }
+    }
+
+    /// Feeder: grant the next zone chunk to the GPU once the chunk granted
+    /// two before it has completed (one chunk always queued behind the one
+    /// running), until the CPU has claimed the rest. Encodes + commits each
+    /// chunk as its own command buffer on the shared queue.
+    unsafe fn steal_feeder(
+        gpu: &Gpu,
+        staging: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        cb2: Id,
+    ) -> Result<(), String> {
+        let (plan, ev_base) = {
+            let g = STEAL_RUN.lock().map_err(|_| "steal run poisoned".to_string())?;
+            let r = g.as_ref().ok_or("steal run missing")?;
+            (r.plan, r.ev_base)
+        };
+        let tables = steal_tables_buf(plan).ok_or("steal tables missing")?;
+        let ev = unsafe { gpu.fine_split_event() };
+        let c = plan.c;
+        let mut next = 0usize;
+        loop {
+            // Chunk `next` is granted once the GPU work two steps before it
+            // is done (one step always queued): step -2 = the static tail's
+            // passes 8..16, step -1 = cb2, step i = chunk i. Bail out as soon
+            // as nothing is left to claim.
+            let want = ev_base + 1 + next as u64;
+            loop {
+                {
+                    let g = STEAL_RUN.lock().map_err(|_| "steal run poisoned".to_string())?;
+                    let r = g.as_ref().ok_or("steal run missing")?;
+                    if r.lo + c > r.hi {
+                        return Ok(());
+                    }
+                }
+                if unsafe { gpu.event_signaled_value(ev) } >= want {
+                    break;
+                }
+                if unsafe { gpu_cb_failed(gpu, cb2) } {
+                    return Err("steal: cb2 failed".into());
+                }
+                std::thread::sleep(std::time::Duration::from_micros(40));
+            }
+            // Claim + encode under the lock so the CPU sees the claim only
+            // together with its committed buffer.
+            let mut g = STEAL_RUN.lock().map_err(|_| "steal run poisoned".to_string())?;
+            let r = g.as_mut().ok_or("steal run missing")?;
+            if r.lo + c > r.hi {
+                return Ok(());
+            }
+            debug_assert_eq!(r.lo, plan.z0 + next * c);
+            r.lo += c;
+            unsafe {
+                let pool = gpu.pool_push();
+                let res = (|| -> Result<Id, String> {
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    encode_steal_chunk(gpu, enc, staging, tables, tree_buf, log_d, n_leaves, plan, next);
+                    gpu.end_encoding(enc);
+                    gpu.encode_signal_event(cb, ev, ev_base + 3 + next as u64);
+                    let cb = gpu.retain(cb);
+                    gpu.commit_async(cb);
+                    Ok(cb)
+                })();
+                gpu.pool_pop(pool);
+                match res {
+                    Ok(cb) => r.cbs.push(cb),
+                    Err(e) => {
+                        // Give the chunk back to the CPU side.
+                        r.lo -= c;
+                        return Err(e);
+                    }
+                }
+            }
+            drop(g);
+            next += 1;
+        }
+    }
+
+    /// CPU side of the steal: claim one 256th from the top of the zone.
+    fn steal_claim_cpu() -> Option<usize> {
+        let mut g = STEAL_RUN.lock().ok()?;
+        let r = g.as_mut()?;
+        if r.hi > r.lo {
+            r.hi -= 1;
+            Some(r.hi)
+        } else {
+            None
+        }
+    }
+
+    /// The steal plan `cb2` was encoded under, if it was (and still is armed).
+    fn steal_armed_for(cb2: Id, k_split: usize) -> Option<StealPlan> {
+        let g = STEAL_RUN.lock().ok()?;
+        let r = g.as_ref()?;
+        (r.cb2 == cb2 as usize && r.plan.k_split == k_split).then_some(r.plan)
+    }
+
+    /// Cache-hit workers skip the exact tune: publish the steal plan for the
+    /// cached split and byte-check it here (one untimed hybrid graph run,
+    /// whole-tree root against the cached CPU-authoritative root). On any
+    /// mismatch the plan is dropped and the pure-GPU graph restores staging.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn cw_steal_publish_cached(
+        gpu: &Gpu,
+        latched: &Latched,
+        log_d: usize,
+        n_leaves: usize,
+        k_split: usize,
+        root: &Hash,
+        dbg: bool,
+    ) {
+        if k_split == 0
+            || !cw_steal_enabled()
+            || log_d != 20
+            || !hybrid_final_leaf_selected(gpu, log_d, n_leaves)
+        {
+            return;
+        }
+        let Some(plan) = steal_plan_for(k_split) else { return };
+        unsafe {
+            if ensure_steal_tables(gpu, latched.tw_buf, plan).is_err() {
+                return;
+            }
+            if let Ok(mut g) = STEAL_PLAN.lock() {
+                *g = Some(plan);
+            }
+            let z_buf = latched.wraps[0].2;
+            let ran = run_commit_graph_from_z_hybrid(
+                gpu,
+                z_buf,
+                latched.staging,
+                latched.tw_buf,
+                latched.tree_buf,
+                log_d,
+                n_leaves,
+                k_split,
+            );
+            let got = *gpu.buffer_contents(latched.tree_buf).cast::<Hash>().add(2 * n_leaves - 2);
+            let ok = ran.is_ok() && got == *root;
+            if dbg {
+                eprintln!("[gpu-commit] cw steal plan {plan:?} (cache hit) verified={ok}");
+            }
+            if !ok {
+                eprintln!("[gpu-commit] CW STEAL CACHE VERIFY MISMATCH at k={k_split}; static split");
+                if let Ok(mut g) = STEAL_PLAN.lock() {
+                    *g = None;
+                }
+                let _ = run_commit_graph_from_z(
+                    gpu,
+                    z_buf,
+                    latched.staging,
+                    latched.tw_buf,
+                    latched.tree_buf,
+                    log_d,
+                    n_leaves,
+                );
+            }
+        }
+    }
+
+    /// Run the steal-plan hybrid graph after cb2 (committed) is in flight.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_steal_graph(
+        gpu: &Gpu,
+        staging: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        cb2: Id,
+        plan: StealPlan,
+    ) -> Result<(), String> {
+        use rayon::prelude::*;
+        let ntt = hybrid_suffix_ntt(log_d);
+        let ev = unsafe { gpu.fine_split_event() };
+        let want = FINE_SPLIT_WAIT.load(std::sync::atomic::Ordering::Acquire);
+        let data_ptr = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(staging).cast::<F128>() });
+        let data_len = n_leaves * 64;
+        let tree_base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(tree_buf).cast::<Hash>() });
+        let t_cpu = std::time::Instant::now();
+        let mut feeder_res: Result<(), String> = Ok(());
+        std::thread::scope(|s| {
+            let (st_u, tr_u, cb2_u) = (staging as usize, tree_buf as usize, cb2 as usize);
+            let feeder = s.spawn(move || unsafe {
+                steal_feeder(gpu, st_u as Id, tr_u as Id, log_d, n_leaves, cb2_u as Id)
+            });
+            // Static CPU suffix (whole sixteenths; layers 4.. from the shared
+            // first pass).
+            {
+                // SAFETY: the static suffix is CPU-owned; the GPU never
+                // touches it before cb3, which is committed after this.
+                let data = unsafe { core::slice::from_raw_parts_mut(data_ptr.ptr(), data_len) };
+                ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                    data,
+                    64,
+                    4,
+                    log_d,
+                    16 - plan.k_cpu16,
+                    16,
+                    |_e: usize, _c: &[F128]| {},
+                );
+            }
+            crate::tmark::mark("steal cpu static done");
+            // The zone's layers 4..8 are the GPU's (cb2's first encoder).
+            let mut spins = 0u32;
+            while unsafe { gpu.event_signaled_value(ev) } < want {
+                if unsafe { gpu_cb_failed(gpu, cb2) } {
+                    break;
+                }
+                spins = spins.wrapping_add(1);
+                if spins % 64 == 0 {
+                    std::thread::yield_now();
+                } else {
+                    core::hint::spin_loop();
+                }
+            }
+            if unsafe { gpu.event_signaled_value(ev) } >= want {
+                let nw = rayon::current_num_threads().max(1);
+                (0..nw).into_par_iter().for_each(|_| {
+                    while let Some(sb) = steal_claim_cpu() {
+                        // SAFETY: 256th `sb` was claimed exclusively; every
+                        // write of the sub-range call stays inside it.
+                        let data =
+                            unsafe { core::slice::from_raw_parts_mut(data_ptr.ptr(), data_len) };
+                        ntt.forward_transform_interleaved_ranked_sub_range(data, 64, sb, sb + 1);
+                    }
+                });
+            }
+            feeder_res = feeder.join().unwrap_or_else(|_| Err("steal feeder panicked".into()));
+        });
+        let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
+        crate::tmark::mark("hybrid cpu ntt done");
+        let (bd, chunk_cbs) = {
+            let mut g = STEAL_RUN.lock().map_err(|_| "steal run poisoned".to_string())?;
+            let r = g.take().ok_or("steal run missing")?;
+            (r.hi, r.cbs)
+        };
+        let run = (|| -> Result<(), String> {
+            feeder_res.clone()?;
+            if unsafe { gpu.event_signaled_value(ev) } < want {
+                return Err("steal: GPU prefix failed before layer-4 signal".into());
+            }
+            debug_assert!(bd >= plan.z0 && bd <= plan.z1);
+            // cb3: leaves + subtrees of everything the CPU finished.
+            let leaves_per = n_leaves / 256;
+            let cb3 = unsafe { gpu.command_buffer()? };
+            let enc = unsafe { gpu.compute_encoder(cb3)? };
+            let mut sstart = bd * leaves_per;
+            while sstart < n_leaves {
+                let mut size = 1usize << (n_leaves - sstart).ilog2();
+                while sstart % size != 0 {
+                    size >>= 1;
+                }
+                unsafe { encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size) };
+                sstart += size;
+            }
+            unsafe {
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb3);
+            }
+            crate::tmark::mark("cb3 committed");
+            super::help_pool_until(|| unsafe { gpu.cb_status(cb3) } >= 4);
+            unsafe {
+                gpu.wait_cb(cb2)?;
+                for &cb in &chunk_cbs {
+                    gpu.wait_cb(cb)?;
+                }
+                gpu.wait_cb(cb3)?;
+            }
+            crate::tmark::mark("cb3 host woke");
+            unsafe {
+                let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
+                let (cb3_s, cb3_e) = cb_gpu_interval(gpu, cb3);
+                crate::tmark::mark_gpu("cb2 gpu start", "cb2 gpu end", cb2_s, cb2_e);
+                crate::tmark::mark_gpu("cb3 gpu start", "cb3 gpu end", cb3_s, cb3_e);
+                if window_trace_enabled() {
+                    let last_e = chunk_cbs
+                        .last()
+                        .map(|&cb| cb_gpu_interval(gpu, cb).1)
+                        .unwrap_or(cb2_e);
+                    let mut gaps = 0.0f64;
+                    let mut busy = 0.0f64;
+                    let mut prev = cb2_e;
+                    for &cb in chunk_cbs.iter() {
+                        let (s, e) = cb_gpu_interval(gpu, cb);
+                        gaps += (s - prev).max(0.0);
+                        busy += e - s;
+                        prev = e;
+                    }
+                    eprintln!(
+                        "[gpu-window] steal chunks: n {} busy {:.2} ms gaps {:.2} ms (per chunk {:.3} ms), cb3 gap {:.2} ms",
+                        chunk_cbs.len(),
+                        busy * 1e3,
+                        gaps * 1e3,
+                        if chunk_cbs.is_empty() { 0.0 } else { busy * 1e3 / chunk_cbs.len() as f64 },
+                        (cb3_s - prev).max(0.0) * 1e3
+                    );
+                    eprintln!(
+                        "[gpu-window] steal (k={} zone {}..{} c={}): boundary {bd} (gpu chunks {} + {} fed), \
+                         cb2 gpu dur {:.2} ms, chunks end +{:.2} ms, cb3 gpu dur {:.2} ms, cpu {cpu_ms:.2} ms, \
+                         cb2 start to cb3 end {:.2} ms",
+                        plan.k_cpu16,
+                        plan.z0,
+                        plan.z1,
+                        plan.c,
+                        0,
+                        chunk_cbs.len(),
+                        (cb2_e - cb2_s) * 1e3,
+                        (last_e - cb2_e) * 1e3,
+                        (cb3_e - cb3_s) * 1e3,
+                        (cb3_e - cb2_s) * 1e3
+                    );
+                }
+            }
+            // Every subtree root at the 256-node level is final; rebuild the
+            // eight levels above it.
+            let mut level_start = 0usize;
+            let mut level_len = n_leaves;
+            while level_len > 256 {
+                level_start += level_len;
+                level_len /= 2;
+            }
+            while level_len > 1 {
+                let write_start = level_start + level_len;
+                unsafe {
+                    let read = core::slice::from_raw_parts(tree_base.ptr().add(level_start), level_len);
+                    let write = core::slice::from_raw_parts_mut(
+                        tree_base.ptr().add(write_start),
+                        level_len / 2,
+                    );
+                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                }
+                level_start = write_start;
+                level_len /= 2;
+            }
+            Ok(())
+        })();
+        for cb in chunk_cbs {
+            // Completed (or failed) above; a failed run still drains every
+            // committed buffer before releasing it.
+            if run.is_err() {
+                let _ = unsafe { gpu.wait_cb(cb) };
+            }
+            unsafe { gpu.release(cb) };
+        }
+        if run.is_err() {
+            let _ = unsafe { gpu.wait_cb(cb2) };
+        }
+        run
+    }
+
     unsafe fn run_commit_graph_from_z_hybrid_impl(
         gpu: &Gpu,
         z_buf: Id,
@@ -8804,6 +9581,9 @@ kernel void blake3_pow_scan(
                         cb2
                     }
                 };
+                if let Some(plan) = steal_armed_for(cb2, k_split) {
+                    return run_steal_graph(gpu, staging, tree_buf, log_d, n_leaves, cb2, plan);
+                }
                 let prefix_leaves = hybrid_prefix256(k_split) * (n_leaves / 256);
 
                 // CPU: suffix NTT completion + leaves + subtree parents.
@@ -10216,7 +10996,33 @@ kernel void blake3_pow_scan(
             );
         }
 
-        let verified = unsafe {
+        // CW steal: publish the plan for the chosen split (tables built
+        // here, untimed) so the byte verify below exercises the steal graph.
+        let steal_on = chosen != 0
+            && cw_steal_enabled()
+            && hybrid_final_leaf_selected(gpu, params.k_code(), params.n_leaves())
+            && params.k_code() == 20
+            && match steal_plan_for(chosen) {
+                Some(plan) => match unsafe { ensure_steal_tables(gpu, ctx.tw_buf, plan) } {
+                    Ok(()) => {
+                        if let Ok(mut g) = STEAL_PLAN.lock() {
+                            *g = Some(plan);
+                        }
+                        if dbg {
+                            eprintln!("[gpu-commit] cw steal plan {plan:?}");
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        if dbg {
+                            eprintln!("[gpu-commit] cw steal tables failed ({e})");
+                        }
+                        false
+                    }
+                },
+                None => false,
+            };
+        let verify = || unsafe {
             if chosen == 0 {
                 run_commit_graph_from_z(
                     gpu,
@@ -10261,6 +11067,17 @@ kernel void blake3_pow_scan(
                     ),
                 )
             };
+        let verified = verify() || {
+            // A steal-graph mismatch (never expected: bit-exact by
+            // construction) drops the plan and re-verifies the static split.
+            steal_on && {
+                eprintln!("[gpu-commit] CW STEAL VERIFY MISMATCH at k={chosen}; static split");
+                if let Ok(mut g) = STEAL_PLAN.lock() {
+                    *g = None;
+                }
+                verify()
+            }
+        };
 
         if dbg {
             let table: Vec<String> = candidates
@@ -10815,6 +11632,19 @@ kernel void blake3_pow_scan(
                             );
                         }
                         TUNED_HYBRID_K.store(cache.tuned_k, std::sync::atomic::Ordering::Relaxed);
+                        if let Ok(gpu) = gpu() {
+                            unsafe {
+                                cw_steal_publish_cached(
+                                    gpu,
+                                    &run.latched,
+                                    params.k_code(),
+                                    params.n_leaves(),
+                                    cache.tuned_k,
+                                    &cache.cpu_root,
+                                    dbg,
+                                )
+                            };
+                        }
                         // The publishing worker already completed the exact
                         // replay; keep cache-hit workers out of calibration.
                         super::satisfy_ranked_exact_contention_tune();
@@ -13504,6 +14334,45 @@ kernel void lc_fold_stripes_factored_b4(
             arm: FoldArm::Zc,
         };
         Some((eq, job, submitted))
+    }
+
+    /// Lincheck GPU wake (see `ENV_NO_LC_GPU_WAKE`): one leaf-kernel
+    /// threadgroup on a private scratch pair, fire-and-forget on the main
+    /// queue. Only once the lincheck split is tuned (timed proves) and only
+    /// while the arm is on.
+    pub(crate) fn lc_gpu_wake() {
+        if !super::gpu_lincheck_enabled() {
+            return;
+        }
+        let arm = FoldArm::Lincheck;
+        let tuned = arm.tuned().load(std::sync::atomic::Ordering::Relaxed);
+        if arm.claim_override().is_none() && (tuned == usize::MAX || tuned == 0) {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        static SCRATCH: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+        let Some((data, tree)) = *SCRATCH.get_or_init(|| unsafe {
+            match (gpu.new_buffer(256 * 1024), gpu.new_buffer(256 * 32)) {
+                (Ok(d), Ok(t)) => Some((d as usize, t as usize)),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            if let Ok(cb) = gpu.command_buffer()
+                && let Ok(enc) = gpu.compute_encoder(cb)
+            {
+                gpu.set_pipeline(enc, gpu.pso_leaf);
+                gpu.set_buffer(enc, data as Id, 0, 0);
+                gpu.set_buffer(enc, tree as Id, 0, 1);
+                gpu.dispatch(enc, 1, 256);
+                gpu.end_encoding(enc);
+                gpu.commit_async(cb);
+            }
+            gpu.pool_pop(pool);
+        }
     }
 
     /// Submit the GPU prefix of the LINCHECK window's witness-stripe fold —
@@ -22462,6 +23331,196 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 assert_ne!(&outs[1].1[..32], &[0x3Cu8; 32][..]);
                 assert_eq!(&outs[1].1[prefix_leaves * 32..prefix_leaves * 32 + 32], &[0x3Cu8; 32][..]);
             }
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// CW steal: GPU zone chunks (remapped twiddle tables, offset bindings)
+    /// over `[z0, z1)` after the static prefix `[0, z0)` write exactly the
+    /// bytes the incumbent prefix tail writes over `[0, z1)`: whole codeword
+    /// and every tree node from the leaves up to the 256th subtree roots.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn cw_steal_chunks_match_prefix_tail() {
+        use super::imp;
+        let log_d = 20usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        if gpu.pso_final_leaf.is_null() {
+            eprintln!("skipping: fused final-leaf PSO unavailable");
+            return;
+        }
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let input = Rng::new(0x5737_4C31).vec(64 << log_d);
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            let tw_buf = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            // (z0, z1, c): chunk sizes 1, 4, 16; zone ends on and off a
+            // sixteenth boundary.
+            for &(z0, z1, c) in &[(160usize, 208usize, 4usize), (100, 132, 1), (64, 192, 16)] {
+                let plan = imp::StealPlan::for_test(0, 16 - z1 / 16, z0, z1, c);
+                imp::ensure_steal_tables(gpu, tw_buf, plan).unwrap();
+                let tables = imp::steal_tables_buf(plan).unwrap();
+                let mut outs = Vec::new();
+                for steal in [false, true] {
+                    let data_buf = gpu.new_buffer(data_bytes).unwrap();
+                    let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), gpu.buffer_contents(data_buf), data_bytes);
+                    std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0x3C, tree_bytes);
+                    let cb = gpu.command_buffer().unwrap();
+                    if steal {
+                        let enc = gpu.compute_encoder(cb).unwrap();
+                        imp::encode_hybrid_prefix_tail_with(
+                            gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, 8, z0 as u64, 256, true,
+                        );
+                        gpu.end_encoding(enc);
+                        for i in 0..(z1 - z0) / c {
+                            let enc = gpu.compute_encoder(cb).unwrap();
+                            imp::encode_steal_chunk(gpu, enc, data_buf, tables, tree_buf, log_d, n_leaves, plan, i);
+                            gpu.end_encoding(enc);
+                        }
+                    } else {
+                        let enc = gpu.compute_encoder(cb).unwrap();
+                        imp::encode_hybrid_prefix_tail_with(
+                            gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, 8, z1 as u64, 256, true,
+                        );
+                        gpu.end_encoding(enc);
+                    }
+                    gpu.commit_and_wait(cb).unwrap();
+                    let d = core::slice::from_raw_parts(gpu.buffer_contents(data_buf).cast::<u8>(), data_bytes).to_vec();
+                    let t = core::slice::from_raw_parts(gpu.buffer_contents(tree_buf).cast::<u8>(), tree_bytes).to_vec();
+                    outs.push((d, t));
+                    gpu.release(data_buf);
+                    gpu.release(tree_buf);
+                }
+                assert!(outs[0].0 == outs[1].0, "codeword differs at zone {z0}..{z1} c={c}");
+                // Leaves .. 256th roots over [0, z1).
+                let mut level_start = 0usize;
+                let mut level_len = n_leaves;
+                while level_len >= 256 {
+                    let n = level_len / 256 * z1;
+                    let (a, b) = (level_start * 32, (level_start + n) * 32);
+                    assert!(
+                        outs[0].1[a..b] == outs[1].1[a..b],
+                        "tree level {} differs at zone {z0}..{z1} c={c}",
+                        (n_leaves / level_len).ilog2()
+                    );
+                    assert_ne!(&outs[1].1[b - 32..b], &[0x3Cu8; 32][..]);
+                    level_start += level_len;
+                    level_len /= 2;
+                }
+            }
+            gpu.release(tw_buf);
+            gpu.pool_pop(pool);
+        }
+    }
+
+    /// Timing probe (ignored): GPU cost of the zone as pass-major prefix
+    /// tail vs aligned steal chunks of size c, one command buffer each.
+    #[test]
+    #[ignore]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn cw_steal_chunk_cost_probe() {
+        use super::imp;
+        let log_d = 20usize;
+        let n_leaves = 1usize << log_d;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let input = Rng::new(0x5737_4C32).vec(64 << log_d);
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = (64usize << log_d) * 16;
+            let tree_bytes = (2 * n_leaves - 1) * 32;
+            let tw_buf = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw_buf),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let data_buf = gpu.new_buffer(data_bytes).unwrap();
+            let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+            std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), gpu.buffer_contents(data_buf), data_bytes);
+            let (z0, z1) = (64usize, 192usize);
+            let time_cb = |f: &dyn Fn(imp::Id)| -> f64 {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                f(enc);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            };
+            for rep in 0..3 {
+                let full = time_cb(&|enc| {
+                    imp::encode_hybrid_prefix_tail_with(
+                        gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, 8, z1 as u64, 256, true,
+                    )
+                });
+                let pre = time_cb(&|enc| {
+                    imp::encode_hybrid_prefix_tail_with(
+                        gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, 8, z0 as u64, 256, true,
+                    )
+                });
+                let mut line = format!(
+                    "[cw-probe] rep {rep}: tail [0,{z1}) {full:.2} ms, [0,{z0}) {pre:.2} ms -> zone pass-major {:.3} ms/256th",
+                    (full - pre) / (z1 - z0) as f64
+                );
+                for c in [4usize, 8, 16, 32] {
+                    let plan = imp::StealPlan::for_test(0, 1, z0, z1, c);
+                    imp::ensure_steal_tables(gpu, tw_buf, plan).unwrap();
+                    let tables = imp::steal_tables_buf(plan).unwrap();
+                    // One chunk per command buffer, as the feeder commits.
+                    let mut tot = 0.0;
+                    let mut cbs = Vec::new();
+                    for i in 0..(z1 - z0) / c {
+                        let cb = gpu.command_buffer().unwrap();
+                        let enc = gpu.compute_encoder(cb).unwrap();
+                        imp::encode_steal_chunk(gpu, enc, data_buf, tables, tree_buf, log_d, n_leaves, plan, i);
+                        gpu.end_encoding(enc);
+                        gpu.commit_async(cb);
+                        cbs.push(cb);
+                    }
+                    let mut first = f64::INFINITY;
+                    let mut last = 0.0f64;
+                    for &cb in &cbs {
+                        gpu.wait_cb(cb).unwrap();
+                        let (s, e) = imp::cb_gpu_interval(gpu, cb);
+                        tot += e - s;
+                        first = first.min(s);
+                        last = last.max(e);
+                    }
+                    let one_enc = time_cb(&|enc| {
+                        for i in 0..(z1 - z0) / c {
+                            imp::encode_steal_chunk(gpu, enc, data_buf, tables, tree_buf, log_d, n_leaves, plan, i);
+                        }
+                    });
+                    line += &format!(
+                        " | c={c}: busy {:.3} span {:.3} one-enc {:.3} ms/256th",
+                        tot * 1e3 / (z1 - z0) as f64,
+                        (last - first) * 1e3 / (z1 - z0) as f64,
+                        one_enc / (z1 - z0) as f64
+                    );
+                }
+                eprintln!("{line}");
+            }
+            gpu.release(data_buf);
+            gpu.release(tree_buf);
             gpu.release(tw_buf);
             gpu.pool_pop(pool);
         }
