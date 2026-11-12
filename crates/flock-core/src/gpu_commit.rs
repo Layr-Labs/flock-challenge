@@ -8887,6 +8887,7 @@ kernel void blake3_pow_scan(
                     crate::tmark::mark("cb3 committed");
                     // Same queue: cb3 runs after cb2, so waiting for cb3
                     // also covers cb2; wait for both explicitly anyway.
+                    super::help_pool_until(|| gpu.cb_status(cb3) >= 4);
                     if super::hybrid_cb2_spin_enabled() {
                         gpu.yield_wait_cb_until(
                             cb2,
