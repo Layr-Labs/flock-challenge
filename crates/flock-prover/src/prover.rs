@@ -592,6 +592,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         }),
     };
     let [ab, c] = claims;
+    flock_core::epool::set_linger_phase(false);
     flock_core::tmark::mark("open returned");
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
@@ -2488,6 +2489,14 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
     bind_statement(challenger, r1cs, &commitment);
     flock_core::tmark::mark("zc start");
+    // Hetero-queue linger (see `flock_core::epool::set_linger_phase`): armed
+    // from lincheck through the PCS open, whose many short queues sit between
+    // short serial steps. Zerocheck's long bandwidth-bound kernels measured
+    // neutral-to-worse with it, so it stays off there unless
+    // `FLOCK_EPOOL_LINGER_ZC=1`.
+    if std::env::var("FLOCK_EPOOL_LINGER_ZC").is_ok_and(|v| v == "1") {
+        flock_core::epool::set_linger_phase(true);
+    }
     let cpu_zc0 = phase_timing.then(process_cpu_ms);
     let t_zc = std::time::Instant::now();
 
@@ -2554,6 +2563,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
     // Lincheck runs on a main-pool worker (`flock_core::in_pool`), as above.
     flock_core::tmark::mark("lc call");
+    flock_core::epool::set_linger_phase(true);
     let (lc_proof, lc_claim, z_vec_pre) = flock_core::in_pool(|| {
         flock_core::tmark::mark("lc body start");
         lincheck::prove_padded_capture_z_vec(

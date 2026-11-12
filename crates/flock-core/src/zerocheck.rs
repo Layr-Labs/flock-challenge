@@ -384,6 +384,14 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
 /// outer fold instead of draining the row-major witness into 32 field banks.
 /// The proof and transcript remain byte-identical to the ordinary Fold4 path.
 #[allow(clippy::too_many_arguments)]
+/// ZC entry overlap gate (`FLOCK_NO_ZC_ENTRY_OVERLAP=1` kills; scheduling
+/// only, proofs byte-identical either way).
+fn zc_entry_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_ENTRY_OVERLAP").is_none());
+    *ON
+}
+
 pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<C: Challenger>(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -572,97 +580,126 @@ fn prove_packed_padded_inner<C: Challenger>(
             // eq table is NOT: its point is the mlv bind-challenge tail,
             // sampled only after the round messages below are observed.)
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            if c_prelude.gpu_in_flight()
+            let r2_stage_wanted = c_prelude.gpu_in_flight()
                 && crate::gpu_commit::zc_idle_fill_enabled()
-                && crate::gpu_commit::zc_r2_idle_fill_viable()
-            {
-                crate::zerocheck::multilinear::stage_round2_gpu_window_from_r1_challenges(
-                    a_packed, b_packed, m, k_skip, &r, padding,
-                );
-            }
+                && crate::gpu_commit::zc_r2_idle_fill_viable();
+            let r2_stage = || {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                if r2_stage_wanted {
+                    crate::zerocheck::multilinear::stage_round2_gpu_window_from_r1_challenges(
+                        a_packed, b_packed, m, k_skip, &r, padding,
+                    );
+                }
+            };
+            let recover_identity_prefix = ab_inner.identity_prefix_was_omitted();
+            let recover_output_window = ab_inner.output_window_was_omitted();
+            let r_ref: &[F128] = &r;
+            // The C fold reads only the stripe, r and the C prelude — never
+            // the AB completion — so it may run anywhere before z is sampled.
+            // It must run on THIS thread: the adopted prelude holds the fold
+            // state's MutexGuard.
+            let c_fold = move || {
+                let cpu_c = crate::pcs::commit::commit_cpu_ms();
+                let t_c = std::time::Instant::now();
+                if crate::pcs::ranked_direct_fold8_enabled() {
+                    let (c, s_hat_v_c, quad, fold8, recovered_ab) =
+                        crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
+                            c_lincheck,
+                            m,
+                            padding.k_log,
+                            k_skip,
+                            padding.useful_bits_per_block,
+                            r_ref,
+                            inv_table,
+                            c_prelude,
+                            recover_identity_prefix,
+                            recover_output_window,
+                        );
+                    if zc_timing {
+                        eprintln!(
+                            "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
+                            t_c.elapsed().as_secs_f64() * 1e3,
+                            crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                        );
+                    }
+                    (
+                        c,
+                        Some(CapturedSHatVC {
+                            s_hat_v_c,
+                            quad,
+                            fold4: None,
+                            fold8: Some(fold8),
+                        }),
+                        recovered_ab,
+                    )
+                } else {
+                    let (c, s_hat_v_c, quad, fold4, recovered_ab) =
+                        crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
+                            c_lincheck,
+                            m,
+                            padding.k_log,
+                            k_skip,
+                            padding.useful_bits_per_block,
+                            r_ref,
+                            inv_table,
+                            c_prelude,
+                            recover_identity_prefix,
+                            recover_output_window,
+                        );
+                    if zc_timing {
+                        eprintln!(
+                            "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
+                            t_c.elapsed().as_secs_f64() * 1e3,
+                            crate::pcs::commit::commit_cpu_ms() - cpu_c,
+                        );
+                    }
+                    (
+                        c,
+                        Some(CapturedSHatVC {
+                            s_hat_v_c,
+                            quad,
+                            fold4: Some(fold4),
+                            fold8: None,
+                        }),
+                        recovered_ab,
+                    )
+                }
+            };
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
             let t_ab = std::time::Instant::now();
-            let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
-                ab_inner,
-                m,
-                k_skip,
-                &r,
-                padding,
-            );
+            // ZC entry overlap (`FLOCK_NO_ZC_ENTRY_OVERLAP=1` restores the
+            // serial order): the round-two GPU staging runs beside the AB
+            // completion's table set-up, and the C fold runs on this thread
+            // inside the completion queue's ragged tail. Neither touches the
+            // completion's inputs or outputs; same values, same transcript.
+            let (ab, (c, capture, recovered_ab)) = if zc_entry_overlap_enabled() {
+                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed_overlapped(
+                    ab_inner,
+                    m,
+                    k_skip,
+                    &r,
+                    padding,
+                    &r2_stage,
+                    c_fold,
+                )
+            } else {
+                r2_stage();
+                let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                    ab_inner,
+                    m,
+                    k_skip,
+                    &r,
+                    padding,
+                );
+                (ab, c_fold())
+            };
             if zc_timing {
                 eprintln!(
-                    "[zc-timing] round1 AB completion: {:.2} ms cpu={:.1}",
+                    "[zc-timing] round1 AB completion + C: {:.2} ms cpu={:.1}",
                     t_ab.elapsed().as_secs_f64() * 1e3,
                     crate::pcs::commit::commit_cpu_ms() - cpu_ab,
                 );
             }
-            let cpu_c = crate::pcs::commit::commit_cpu_ms();
-            let t_c = std::time::Instant::now();
-            let recover_identity_prefix = ab_inner.identity_prefix_was_omitted();
-            let recover_output_window = ab_inner.output_window_was_omitted();
-            let (c, capture, recovered_ab) = if crate::pcs::ranked_direct_fold8_enabled() {
-                let (c, s_hat_v_c, quad, fold8, recovered_ab) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold8_from_lincheck_stripe(
-                        c_lincheck,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
-                        c_prelude,
-                        recover_identity_prefix,
-                        recover_output_window,
-                    );
-                if zc_timing {
-                    eprintln!(
-                        "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
-                        t_c.elapsed().as_secs_f64() * 1e3,
-                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
-                    );
-                }
-                (
-                    c,
-                    Some(CapturedSHatVC {
-                        s_hat_v_c,
-                        quad,
-                        fold4: None,
-                        fold8: Some(fold8),
-                    }),
-                    recovered_ab,
-                )
-            } else {
-                let (c, s_hat_v_c, quad, fold4, recovered_ab) =
-                    crate::zerocheck::univariate_skip_optimized::round1_c_fold4_from_lincheck_stripe(
-                        c_lincheck,
-                        m,
-                        padding.k_log,
-                        k_skip,
-                        padding.useful_bits_per_block,
-                        &r,
-                        inv_table,
-                        c_prelude,
-                        recover_identity_prefix,
-                        recover_output_window,
-                    );
-                if zc_timing {
-                    eprintln!(
-                        "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
-                        t_c.elapsed().as_secs_f64() * 1e3,
-                        crate::pcs::commit::commit_cpu_ms() - cpu_c,
-                    );
-                }
-                (
-                    c,
-                    Some(CapturedSHatVC {
-                        s_hat_v_c,
-                        quad,
-                        fold4: Some(fold4),
-                        fold8: None,
-                    }),
-                    recovered_ab,
-                )
-            };
             let mut ab = ab;
             if let Some(recovered) = recovered_ab {
                 for (dst, value) in ab.iter_mut().zip(recovered) {

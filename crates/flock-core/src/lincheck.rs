@@ -1269,6 +1269,25 @@ fn inner_product(a: &[F128], b: &[F128]) -> F128 {
 /// rayon. Below it, sequential beats dispatch overhead.
 const SUMCHECK_PAR_THRESHOLD: usize = 1usize << 12;
 
+/// Serial lincheck sumcheck (`FLOCK_NO_LC_SC_SERIAL=1` kills): at k ≤ 2^14
+/// (the ranked shape) the eight product-sumcheck rounds total ~65k field
+/// products — tens of microseconds on one core — yet each round opened a
+/// Rayon region whose wake/split/reduce latency dominated (the main pool is
+/// asleep after the lincheck fold's GPU drain). Same per-element formulas;
+/// the e1/e∞ sums use deferred reduction (reduction is F2-linear, so the sum
+/// of unreduced products reduces to the same element), so every message and
+/// bound value is bit-identical.
+fn lc_sumcheck_par_min(k: usize) -> usize {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var("FLOCK_NO_LC_SC_SERIAL").is_ok_and(|v| v == "1")
+    });
+    if *ON && k <= (1usize << 14) {
+        usize::MAX
+    } else {
+        SUMCHECK_PAR_THRESHOLD
+    }
+}
+
 /// Fused `sparse_row_fold(A) + α-batch + sparse_row_fold(B)`: produces the
 /// `comb_vec[c] = α · (A^T·eq)[c] + (B^T·eq)[c]` in a single pass, halving the
 /// allocations and reduction phases vs. two separate sparse_row_folds + an
@@ -1353,13 +1372,22 @@ fn sparse_row_fold_alpha_batched(
 /// One round of product-sumcheck on `(c, z)`: compute `(q(1), q(∞))` =
 /// `(Σ c_hi·z_hi, Σ (c_hi+c_lo)·(z_hi+z_lo))` over the top-bit split. The
 /// `len()` of `c` and `z` is even; `half = len/2`.
-fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
+fn sumcheck_round_eval_par(c: &[F128], z: &[F128], par_min: usize) -> (F128, F128) {
     use rayon::prelude::*;
     let half = c.len() / 2;
     debug_assert_eq!(z.len(), c.len());
     let (clo, chi) = c.split_at(half);
     let (zlo, zhi) = z.split_at(half);
-    if half < SUMCHECK_PAR_THRESHOLD {
+    if par_min == usize::MAX {
+        let mut e1 = crate::field::F256Unreduced::ZERO;
+        let mut einf = crate::field::F256Unreduced::ZERO;
+        for i in 0..half {
+            e1 ^= chi[i].mul_unreduced(zhi[i]);
+            einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
+        }
+        return (e1.reduce(), einf.reduce());
+    }
+    if half < par_min {
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
         for i in 0..half {
@@ -1380,10 +1408,10 @@ fn sumcheck_round_eval_par(c: &[F128], z: &[F128]) -> (F128, F128) {
 
 /// Bind the top remaining variable of `v` at challenge `r`: `v[i] ← v[i] +
 /// r·(v[i+half] + v[i])` for `i ∈ [0, half)`, then truncate to `half`. In-place.
-fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128) {
+fn sumcheck_bind_top_in_place_par(v: &mut Vec<F128>, r: F128, par_min: usize) {
     use rayon::prelude::*;
     let half = v.len() / 2;
-    if half < SUMCHECK_PAR_THRESHOLD {
+    if half < par_min {
         for i in 0..half {
             v[i] = v[i] + r * (v[i + half] + v[i]);
         }
@@ -1428,6 +1456,7 @@ fn sumcheck_bind_both_and_eval_next(
     comb: &mut Vec<F128>,
     z: &mut Vec<F128>,
     r: F128,
+    par_min: usize,
 ) -> (F128, F128) {
     use rayon::prelude::*;
     let len = comb.len();
@@ -1444,7 +1473,23 @@ fn sumcheck_bind_both_and_eval_next(
     let (zq0, zq1) = z_lo.split_at_mut(half2);
     let (zq2, zq3) = z_hi.split_at(half2);
 
-    let (e1, einf) = if half2 < SUMCHECK_PAR_THRESHOLD {
+    let (e1, einf) = if par_min == usize::MAX {
+        let mut e1 = crate::field::F256Unreduced::ZERO;
+        let mut einf = crate::field::F256Unreduced::ZERO;
+        for i in 0..half2 {
+            let lo = cq0[i] + r * (cq2[i] + cq0[i]);
+            let hi = cq1[i] + r * (cq3[i] + cq1[i]);
+            let zlo = zq0[i] + r * (zq2[i] + zq0[i]);
+            let zhi = zq1[i] + r * (zq3[i] + zq1[i]);
+            cq0[i] = lo;
+            cq1[i] = hi;
+            zq0[i] = zlo;
+            zq1[i] = zhi;
+            e1 ^= hi.mul_unreduced(zhi);
+            einf ^= (hi + lo).mul_unreduced(zhi + zlo);
+        }
+        (e1.reduce(), einf.reduce())
+    } else if half2 < par_min {
         let mut e1 = F128::ZERO;
         let mut einf = F128::ZERO;
         for i in 0..half2 {
@@ -1730,7 +1775,8 @@ fn prove_padded_inner<Ch: Challenger>(
         // Round 0's message is the only standalone evaluation pass; every later
         // round's message falls out of binding the previous round (fold +
         // next-eval fused into one pass — see `sumcheck_bind_both_and_eval_next`).
-        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec);
+        let par_min = lc_sumcheck_par_min(k);
+        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec, par_min);
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
@@ -1739,12 +1785,12 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r);
+                let (ne1, neinf) = sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r, par_min);
                 e1 = ne1;
                 einf = neinf;
             } else {
                 // Final round: just fold z_vec to z_partial (comb_vec is dead).
-                sumcheck_bind_top_in_place_par(&mut z_vec, r);
+                sumcheck_bind_top_in_place_par(&mut z_vec, r, par_min);
             }
         }
     }
@@ -1909,7 +1955,7 @@ pub fn verify<Ch: Challenger>(
         let c1 = e0 + e1 + einf;
         running = einf * r * r + c1 * r + e0;
         // Fold comb_vec at the same r (mirrors prover's fold).
-        sumcheck_bind_top_in_place_par(&mut comb_vec, r);
+        sumcheck_bind_top_in_place_par(&mut comb_vec, r, SUMCHECK_PAR_THRESHOLD);
         r_rounds.push(r);
     }
     debug_assert_eq!(comb_vec.len(), n_skip);
@@ -1996,6 +2042,33 @@ mod tests {
         }
         fn bits(&mut self, n: usize) -> Vec<bool> {
             (0..n).map(|_| self.next_u64() & 1 == 1).collect()
+        }
+    }
+
+    /// Serial deferred-reduction sumcheck (ranked k = 2^14) vs the Rayon
+    /// path (par_min = 0 forces every round parallel) and the incumbent
+    /// threshold: every round message and every bound table identical.
+    #[test]
+    fn lc_sumcheck_serial_matches_parallel_rounds() {
+        for (seed, k_log) in [(0x5C5Eu64, 14usize), (0x5C5F, 12), (0x5C60, 3)] {
+            let mut rng = Rng::new(seed);
+            let k = 1usize << k_log;
+            let comb0 = rng.f128_vec(k);
+            let z0 = rng.f128_vec(k);
+            let rs: Vec<F128> = (0..k_log).map(|_| rng.f128()).collect();
+            let run = |par_min: usize| {
+                let (mut c, mut z) = (comb0.clone(), z0.clone());
+                let mut msgs = vec![sumcheck_round_eval_par(&c, &z, par_min)];
+                for (t, &r) in rs.iter().enumerate().take(k_log - 2) {
+                    let _ = t;
+                    msgs.push(sumcheck_bind_both_and_eval_next(&mut c, &mut z, r, par_min));
+                }
+                sumcheck_bind_top_in_place_par(&mut z, rs[k_log - 1], par_min);
+                (msgs, c, z)
+            };
+            let serial = run(usize::MAX);
+            assert_eq!(serial, run(0), "k_log={k_log}");
+            assert_eq!(serial, run(SUMCHECK_PAR_THRESHOLD), "k_log={k_log}");
         }
     }
 

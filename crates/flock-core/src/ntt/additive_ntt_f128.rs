@@ -387,6 +387,38 @@ fn trace_recursive_ntt_epool() -> bool {
     *ENABLED
 }
 
+#[cfg(test)]
+static L1_TAIL_SPLIT_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Ragged-tail split of the recursive L1 deep pass
+/// (`FLOCK_NO_L1_TAIL_SPLIT=1` kills; `FLOCK_L1_TAIL_SPLIT_N` sets how many
+/// of the 32 trailing subtrees are claimed as two half-claims, default 8).
+/// Scheduling only: the codeword is bit-identical either way.
+fn l1_tail_split_count(log_d: usize, start_layer: usize, num_subs: usize) -> usize {
+    #[cfg(test)]
+    {
+        let o = L1_TAIL_SPLIT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if o != usize::MAX && (log_d, start_layer, num_subs) == (18, 5, 32) {
+            return o.min(num_subs);
+        }
+    }
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var("FLOCK_NO_L1_TAIL_SPLIT").is_ok_and(|v| v == "1") {
+            return 0;
+        }
+        std::env::var("FLOCK_L1_TAIL_SPLIT_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    });
+    if (log_d, start_layer, num_subs) == (18, 5, 32) {
+        (*N).min(num_subs)
+    } else {
+        0
+    }
+}
+
 /// Kill switch for the heterogeneous claim-queue producer on the recursive
 /// L1/L2 from-message radix-8 top (`FLOCK_NO_RECURSIVE_TOP_HETERO=1`):
 /// restores the incumbent main-Rayon `into_par_iter` fan-out for the top
@@ -1699,6 +1731,91 @@ impl AdditiveNttF128 {
         debug_assert_eq!(data.len(), num_subs * sub_bytes);
 
         let base = crate::epool::SyncPtr(data.as_mut_ptr());
+        // Ragged-tail split (L1 only: 13 deep layers, the first one alone).
+        // The last `n_split` subtrees run as two claims each: claim A does
+        // the subtree's lone first layer (the only butterfly that couples its
+        // halves), publishes it, then finishes layers 6.. on the first half;
+        // claim B waits for that publish and finishes the second half. The
+        // halves are exactly the n_top = 6 sub-transforms `2s` and `2s+1`
+        // (same blocks, same twiddles, same kernels — the block/twiddle index
+        // algebra is `s·2^(L-5) + h·2^(L-6) + b = (2s+h)·2^(L-6) + b`), so the
+        // codeword is bit-identical; only the claim granularity of the queue's
+        // last subtrees changes. A is always claimed before B (ascending
+        // cursor) and never waits, so B's wait is bounded by one layer.
+        let n_split = l1_tail_split_count(log_d, start_layer, num_subs);
+        if n_split > 0 {
+            let n_whole = num_subs - n_split;
+            let half_bytes = sub_bytes / 2;
+            let first_done: Vec<std::sync::atomic::AtomicBool> = (0..n_split)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect();
+            let run_job = |job: usize| {
+                if job < n_whole {
+                    // SAFETY: as in `run_sub` below — one disjoint subtree.
+                    let sub_data = unsafe {
+                        std::slice::from_raw_parts_mut(base.ptr().add(job * sub_bytes), sub_bytes)
+                    };
+                    self.forward_transform_interleaved_deep_subtree(
+                        sub_data, num_ntts, start_layer, N_TOP, log_d, job,
+                    );
+                    finish_chunk(job * sub_bytes, sub_data);
+                    return;
+                }
+                let k = (job - n_whole) / 2;
+                let sub_idx = n_whole + k;
+                let half = (job - n_whole) % 2;
+                if half == 0 {
+                    // SAFETY: claim A owns the whole subtree until it
+                    // publishes `first_done[k]`; afterwards it touches only
+                    // the first half.
+                    let sub_data = unsafe {
+                        std::slice::from_raw_parts_mut(base.ptr().add(sub_idx * sub_bytes), sub_bytes)
+                    };
+                    let twiddle = self.twiddle(start_layer, sub_idx);
+                    butterfly_interleaved_block(sub_data, twiddle, sub_size_positions >> 1, num_ntts);
+                    first_done[k].store(true, std::sync::atomic::Ordering::Release);
+                    let lo = &mut sub_data[..half_bytes];
+                    self.forward_transform_interleaved_deep_subtree(
+                        lo,
+                        num_ntts,
+                        start_layer + 1,
+                        N_TOP + 1,
+                        log_d,
+                        2 * sub_idx,
+                    );
+                    finish_chunk(sub_idx * sub_bytes, lo);
+                } else {
+                    let mut spins = 0u32;
+                    while !first_done[k].load(std::sync::atomic::Ordering::Acquire) {
+                        spins += 1;
+                        if spins < 4096 {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::yield_now();
+                        }
+                    }
+                    // SAFETY: after the Acquire above, claim A no longer
+                    // touches the second half; this claim owns it alone.
+                    let hi = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            base.ptr().add(sub_idx * sub_bytes + half_bytes),
+                            half_bytes,
+                        )
+                    };
+                    self.forward_transform_interleaved_deep_subtree(
+                        hi,
+                        num_ntts,
+                        start_layer + 1,
+                        N_TOP + 1,
+                        log_d,
+                        2 * sub_idx + 1,
+                    );
+                    finish_chunk(sub_idx * sub_bytes + half_bytes, hi);
+                }
+            };
+            crate::epool::run_chunks_with_helper(n_whole + 2 * n_split, &run_job, Some(helper));
+            return;
+        }
         let run_sub = |sub_idx: usize| {
             // SAFETY: the shared queue issues each `sub_idx` once. Its range
             // is exactly one disjoint `sub_bytes` partition of `data`, and
@@ -3543,6 +3660,70 @@ mod tests {
             "injected helper never claimed an exact-shape deep subtree"
         );
         assert_eq!(candidate, incumbent);
+    }
+
+    /// L1 deep-pass ragged-tail split: every split count (0 = incumbent
+    /// whole-subtree claims, 32 = every subtree as two half-claims) must
+    /// reproduce the single-pool reference codeword byte for byte, and the
+    /// finished-chunk callback must cover every element exactly once.
+    #[test]
+    fn recursive_l1_tail_split_matches_incumbent_all_counts() {
+        const LOG_D: usize = 18;
+        const NUM_NTTS: usize = 8;
+        const START_LAYER: usize = 2;
+        let main = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("l1-split-main-test-{i}"))
+            .build()
+            .unwrap();
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("l1-split-helper-test-{i}"))
+            .build()
+            .unwrap();
+        let mut rng = Rng::new(0x5EB1_17A1_1500_D00D);
+        let msg_len = (1usize << (LOG_D - START_LAYER)) * NUM_NTTS;
+        let msg = rand_vec(&mut rng, msg_len);
+        let poison = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
+        let mut incumbent = vec![poison; msg_len << START_LAYER];
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        main.install(|| {
+            ntt.forward_transform_interleaved_from_message_fused3_with_helper(
+                &msg,
+                &mut incumbent,
+                NUM_NTTS,
+                START_LAYER,
+                LOG_D,
+                None,
+            );
+        });
+        for n_split in [0usize, 1, 3, 8, 16, 31, 32] {
+            L1_TAIL_SPLIT_OVERRIDE.store(n_split, std::sync::atomic::Ordering::Relaxed);
+            let mut candidate = vec![poison; msg_len << START_LAYER];
+            let covered = std::sync::Mutex::new(Vec::<(usize, usize)>::new());
+            main.install(|| {
+                ntt.forward_transform_interleaved_from_message_fused3_with_helper_and_then(
+                    &msg,
+                    &mut candidate,
+                    NUM_NTTS,
+                    START_LAYER,
+                    LOG_D,
+                    Some(&helper),
+                    |off, chunk| covered.lock().unwrap().push((off, chunk.len())),
+                );
+            });
+            L1_TAIL_SPLIT_OVERRIDE.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(candidate, incumbent, "n_split={n_split}");
+            let mut c = covered.into_inner().unwrap();
+            c.sort_unstable();
+            let mut next = 0usize;
+            for (off, len) in &c {
+                assert_eq!(*off, next, "n_split={n_split}: gap/overlap in finished chunks");
+                next += len;
+            }
+            assert_eq!(next, incumbent.len(), "n_split={n_split}: chunks do not cover");
+            assert_eq!(c.len(), 32 + n_split, "n_split={n_split}: chunk count");
+        }
     }
 
     /// Exercise the exact L2 production geometry (log_d 16, 8 lanes, rate

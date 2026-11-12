@@ -115,6 +115,154 @@ pub(crate) fn help_guest_until(
     }
 }
 
+/// Post-drain linger (`FLOCK_NO_EPOOL_LINGER=1` kills; window
+/// `FLOCK_EPOOL_LINGER_US`, default 200). Between back-to-back hetero queues
+/// separated by a short serial stretch (the opening's recursive levels) the
+/// main-pool workers fall asleep in Rayon's
+/// idle path, and the next queue pays the wake cascade: measured ~80 µs mean
+/// / ~125 µs worst join delay per queue on 10 P-cores. Once a queue has
+/// joined, its caller hands every other main worker one short-lived linger
+/// job that,
+/// for at most the window, (a) runs any pending Rayon job (`yield_now`) and
+/// (b) joins the next queue the moment its drain publishes itself in
+/// `LINGER_SLOT`, claiming chunks from the same atomic cursor as everyone
+/// else. Scheduling only: every chunk index is still claimed exactly once and
+/// `f(i)` does not depend on the thread, so outputs are byte-identical. Armed
+/// only between [`set_linger_phase`] calls (lincheck and the PCS open: the
+/// opening's recursive levels are many short queues between short serial
+/// steps; zerocheck's long kernels measured neutral).
+static LINGER_SLOT: std::sync::atomic::AtomicPtr<&'static GuestFn<'static>> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static LINGERS: AtomicUsize = AtomicUsize::new(0);
+static LINGER_EPOCH: AtomicU64 = AtomicU64::new(0);
+static LINGER_PHASE: AtomicBool = AtomicBool::new(false);
+
+fn linger_window_ns() -> u64 {
+    static NS: OnceLock<u64> = OnceLock::new();
+    *NS.get_or_init(|| {
+        if std::env::var("FLOCK_NO_EPOOL_LINGER").is_ok_and(|v| v == "1") {
+            return 0;
+        }
+        std::env::var("FLOCK_EPOOL_LINGER_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200)
+            * 1000
+    })
+}
+
+/// Arm (`true`) or disarm the post-drain linger. The prover arms it for the
+/// post-commit phases only.
+pub fn set_linger_phase(on: bool) {
+    LINGER_PHASE.store(on && linger_window_ns() > 0, Ordering::SeqCst);
+}
+
+/// Publishes `guest` as the linger target for the duration of `body` (first
+/// drain wins; nested drains run unpublished), then unpublishes and waits for
+/// every linger guest still inside it.
+fn with_linger_slot<R>(guest: &GuestFn<'_>, body: impl FnOnce() -> R) -> R {
+    if !LINGER_PHASE.load(Ordering::Relaxed) {
+        return body();
+    }
+    // SAFETY: lifetime erased only while published; `Close` unpublishes and
+    // waits for every linger guest to leave before `guest`'s borrow ends.
+    let erased: &'static GuestFn<'static> =
+        unsafe { std::mem::transmute::<&GuestFn<'_>, &'static GuestFn<'static>>(guest) };
+    let cell: &&'static GuestFn<'static> = &erased;
+    let ptr = cell as *const &'static GuestFn<'static> as *mut &'static GuestFn<'static>;
+    // Bump the epoch before publishing: a linger guest reads the epoch after
+    // the slot, so it never pairs a new slot with a stale epoch.
+    LINGER_EPOCH.fetch_add(1, Ordering::SeqCst);
+    let published = LINGER_SLOT
+        .compare_exchange(std::ptr::null_mut(), ptr, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+    struct Close(bool, *mut &'static GuestFn<'static>);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            if self.0 {
+                let _ = LINGER_SLOT.compare_exchange(
+                    self.1,
+                    std::ptr::null_mut(),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                while LINGERS.load(Ordering::SeqCst) != 0 {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+    let _close = Close(published, ptr);
+    body()
+}
+
+/// Called by the drain's caller once its queue has fully joined: hand the
+/// pool's other workers one linger job each. Spawned here — at the caller's
+/// own level, after the drain's join — rather than from inside a queue task,
+/// because a job spawned inside a join frame is popped and run inline by that
+/// frame before its sibling, which would hold the drain's join for the whole
+/// window. The workers that just left the drain are still awake in Rayon's
+/// idle loop and steal these immediately.
+fn spawn_lingerers(main_threads: usize) {
+    if !LINGER_PHASE.load(Ordering::Relaxed) || IN_LINGER.with(|c| c.get()) {
+        return;
+    }
+    let Some(me) = rayon::current_thread_index() else {
+        return;
+    };
+    let deadline = crate::tmark::now_ns() + linger_window_ns();
+    for _ in 1..main_threads {
+        rayon::spawn(move || linger_loop(deadline, Some(me)));
+    }
+}
+
+thread_local! {
+    static IN_LINGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn linger_loop(mut deadline: u64, caller: Option<usize>) {
+    // A drain caller blocked in its join may steal this job; it must not
+    // spin here while its own latch is set.
+    if rayon::current_thread_index() == caller || IN_LINGER.with(|c| c.replace(true)) {
+        return;
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            IN_LINGER.with(|c| c.set(false));
+        }
+    }
+    let _reset = Reset;
+    let mut done_epoch = u64::MAX;
+    loop {
+        // Touch the hazard count only for a queue this guest has not joined
+        // yet: polling an already-joined slot must not hold `LINGERS` up, or
+        // the publisher's close would wait out the whole linger window.
+        let seen = LINGER_EPOCH.load(Ordering::Acquire);
+        if seen != done_epoch && !LINGER_SLOT.load(Ordering::Acquire).is_null() {
+            LINGERS.fetch_add(1, Ordering::SeqCst);
+            let p = LINGER_SLOT.load(Ordering::SeqCst);
+            let epoch = LINGER_EPOCH.load(Ordering::SeqCst);
+            if !p.is_null() && epoch != done_epoch {
+                // SAFETY: the publisher cannot return while LINGERS > 0 and
+                // it unpublishes (SeqCst) before checking LINGERS.
+                let ran = unsafe { (**p)(&|| false) };
+                done_epoch = epoch;
+                if ran > 0 {
+                    deadline = crate::tmark::now_ns() + linger_window_ns();
+                }
+            }
+            LINGERS.fetch_sub(1, Ordering::SeqCst);
+        }
+        if !LINGER_PHASE.load(Ordering::Relaxed) || crate::tmark::now_ns() >= deadline {
+            return;
+        }
+        if rayon::yield_now() != Some(rayon::Yield::Executed) {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 /// Logical efficiency-core count on Apple Silicon macOS, else 0.
 ///
 /// Queries `hw.perflevel1.logicalcpu` through the `sysctlbyname` *syscall* —
@@ -584,6 +732,52 @@ where
     run_chunks_with_helper(n_chunks, &f, epool());
 }
 
+/// [`run_hetero_chunks`] plus one caller-thread tail job: the calling thread
+/// drains the shared queue like every other main worker, and the moment its
+/// own claim loop finds the queue exhausted it runs `tail` while the other
+/// workers are still finishing their last chunks (the queue's ragged tail).
+/// Returns `tail`'s result. `tail` must not depend on any chunk's output;
+/// it runs exactly once, always on the calling thread (so it may hold
+/// thread-bound state such as a `MutexGuard`). If the calling thread never
+/// reached the end of a claim loop, `tail` runs after the queue joins.
+///
+/// Scheduling only: every chunk index is still claimed exactly once from the
+/// same cursor and `f(i)` does not depend on which thread runs it.
+pub fn run_hetero_chunks_caller_tail<F, T, R>(n_chunks: usize, f: F, tail: T) -> R
+where
+    F: Fn(usize) + Sync,
+    T: FnOnce() -> R,
+{
+    struct CallerOnly<X>(std::cell::UnsafeCell<Option<X>>);
+    // SAFETY: the cells are only ever touched on the thread whose id is
+    // `caller` (checked before every access), so no two threads access them.
+    unsafe impl<X> Sync for CallerOnly<X> {}
+    let caller = std::thread::current().id();
+    let tail_cell = CallerOnly(std::cell::UnsafeCell::new(Some(tail)));
+    let out_cell: CallerOnly<R> = CallerOnly(std::cell::UnsafeCell::new(None));
+    // Whole-struct references: a closure naming `tail_cell.0` directly
+    // would capture the (non-Sync) field instead of the Sync wrapper.
+    let (tail_ref, out_ref) = (&tail_cell, &out_cell);
+    let after = || {
+        if std::thread::current().id() != caller {
+            return;
+        }
+        // SAFETY: caller thread only (above). `take` ends the borrow before
+        // `t()` runs, so a re-entrant call (the caller stealing another
+        // queue task inside `t`'s nested joins) sees `None` and returns.
+        let t = unsafe { (*tail_ref.0.get()).take() };
+        if let Some(t) = t {
+            let r = t();
+            unsafe { *out_ref.0.get() = Some(r) };
+        }
+    };
+    run_chunks_with_helper_arm_after(n_chunks, &f, epool(), detached_enabled(), &after);
+    match tail_cell.0.into_inner() {
+        Some(t) => t(),
+        None => out_cell.0.into_inner().expect("caller tail ran"),
+    }
+}
+
 /// Try to process chunks exclusively on the efficiency-core helper pool.
 ///
 /// Unlike [`run_hetero_chunks`], the calling thread and the main Rayon pool do
@@ -895,7 +1089,23 @@ fn run_chunks_with_helper_arm<F>(
 ) where
     F: Fn(usize) + Sync,
 {
+    run_chunks_with_helper_arm_after(n_chunks, f, helper, detached, &|| {});
+}
+
+/// [`run_chunks_with_helper_arm`] with `after` run by every main-pool queue
+/// task once its claim loop finds the queue exhausted.
+fn run_chunks_with_helper_arm_after<F, A>(
+    n_chunks: usize,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    detached: bool,
+    after: &A,
+) where
+    F: Fn(usize) + Sync,
+    A: Fn() + Sync,
+{
     if n_chunks == 0 {
+        after();
         return;
     }
     let main_threads = rayon::current_num_threads();
@@ -905,6 +1115,7 @@ fn run_chunks_with_helper_arm<F>(
         for i in 0..n_chunks {
             f(i);
         }
+        after();
         return;
     }
     let next = AtomicUsize::new(0);
@@ -917,6 +1128,19 @@ fn run_chunks_with_helper_arm<F>(
             }
             guard.main_run(|| f(i));
         }
+        after();
+    };
+    let linger_guest = |_stop: &dyn Fn() -> bool| -> usize {
+        let mut ran = 0usize;
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            guard.main_run(|| f(i));
+            ran += 1;
+        }
+        ran
     };
     // Main-pool side: one queue-draining task per worker. `with_max_len(1)`
     // splits down to single indices so every main worker can pick one up;
@@ -944,10 +1168,13 @@ fn run_chunks_with_helper_arm<F>(
                     guard.helper_run(&mut own_ns, || f(i));
                 }
             };
-            drain_hetero(main_threads, &worker, ep, &helper_body, detached);
+            with_linger_slot(&linger_guest, || {
+                drain_hetero(main_threads, &worker, ep, &helper_body, detached)
+            });
         }
-        None => drain_main(),
+        None => with_linger_slot(&linger_guest, drain_main),
     }
+    spawn_lingerers(main_threads);
 }
 
 /// [`run_hetero_chunks_stateful`] with an explicit helper pool, so tests can
@@ -1024,6 +1251,19 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
             tail();
         }
     };
+    let linger_guest = |_stop: &dyn Fn() -> bool| -> usize {
+        let mut state = init();
+        let mut ran = 0usize;
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n_chunks {
+                break;
+            }
+            guard.main_run(|| f(&mut state, i));
+            ran += 1;
+        }
+        ran
+    };
     let drain_main = || {
         (0..main_threads)
             .into_par_iter()
@@ -1045,7 +1285,7 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
         }
         ran
     };
-    with_guest_slot(&guest, || match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+    with_linger_slot(&linger_guest, || with_guest_slot(&guest, || match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
             let helper_body = || {
@@ -1066,7 +1306,8 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
             drain_hetero(main_threads, &worker, ep, &helper_body, detached);
         }
         None => drain_main(),
-    })
+    }));
+    spawn_lingerers(main_threads);
 }
 
 /// `Send + Sync` wrapper for a raw base pointer shared across the two pools.
@@ -1102,6 +1343,64 @@ mod tests {
     /// A guest claims chunks of the draining queue one at a time, returns as
     /// soon as its own condition holds, and every chunk still runs exactly
     /// once; with no queue draining it gives up after its poll budget.
+    #[test]
+    fn linger_chains_keep_every_chunk_exactly_once() {
+        let main = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let helper = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        set_linger_phase(true);
+        let linger_on = LINGER_PHASE.load(Ordering::SeqCst);
+        let joined = AtomicUsize::new(0);
+        main.install(|| {
+            for rep in 0..200usize {
+                let n = 16 + (rep % 7) * 37;
+                let counts: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+                let t0 = crate::tmark::now_ns();
+                // Mostly the plain arm: the stateful arm also publishes the
+                // commit-guest slot, which a concurrently running guest test
+                // could otherwise join.
+                if rep % 16 != 0 {
+                    run_chunks_with_helper_arm(
+                        n,
+                        &|i| {
+                            counts[i].fetch_add(1, Ordering::Relaxed);
+                            std::hint::black_box((0..200).fold(i, |a, b| a ^ b));
+                        },
+                        Some(&helper),
+                        rep % 4 == 0,
+                    );
+                } else {
+                    run_chunks_with_helper_stateful_arm_tail(
+                        n,
+                        &|| 0usize,
+                        &|st: &mut usize, i| {
+                            *st += 1;
+                            counts[i].fetch_add(1, Ordering::Relaxed);
+                        },
+                        Some(&helper),
+                        rep % 3 == 0,
+                        None,
+                    );
+                }
+                assert!(
+                    counts.iter().all(|c| c.load(Ordering::Relaxed) == 1),
+                    "rep {rep}: a chunk ran zero or several times"
+                );
+                // Serial stretch shorter than the linger window, plus a
+                // nested Rayon region the lingering workers must still run.
+                while crate::tmark::now_ns() - t0 < 30_000 {
+                    std::hint::spin_loop();
+                }
+                let s: usize = (0..64usize).into_par_iter().map(|x| x * 3).sum();
+                assert_eq!(s, 3 * 63 * 64 / 2);
+                if LINGERS.load(Ordering::SeqCst) > 0 {
+                    joined.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        set_linger_phase(false);
+        let _ = (linger_on, joined.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn help_guest_until_returns_early_and_keeps_every_chunk_once() {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
