@@ -1864,25 +1864,29 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         // Same rows, same bytes: the Karatsuba table apply (18 loads per
         // word) or, with `FLOCK_NO_ZC_AB_KARA=1`, the plain apply (32). The
         // first arm runs the twelve-XOR Karatsuba recombination, the low-byte
-        // z form of static B words and one bounds check per window; any of
-        // `FLOCK_NO_ZC_AB_KARA_XOR16`, `FLOCK_NO_ZC_AB_BSTATIC_Z` or
-        // `FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` (any value) takes the arms below.
+        // z form of static B words and one bounds check per window.
+        // Defaults only: the performance-core window form with all its
+        // default pieces (plus the opt-in `FLOCK_ZC_AB_Z_MT` form) and the
+        // efficiency-core HZ form with the Horner carry fold. Every AB kill
+        // switch (FLOCK_NO_ZC_AB_KARA, _KARA_UNSCALED, _Z, _KARA_XOR16,
+        // _BSTATIC_Z, _ROW_SETUP_HOIST, _KARA_SLOT, _HORNER2, _HZ) falls back
+        // to the plain generic apply, which writes the same bytes. Each
+        // intermediate fallback was its own ~100 KB straight-line instance and
+        // its own share of the build.
+        use kernels::aarch64::{ABV_HORNER2, ABV_KARA_SLOT, ABV_Z_MT};
+        const V0: u16 = kernels::aarch64::AB_Z_VARIANT
+            | kernels::aarch64::ABV_INLINE_WINDOW
+            | kernels::aarch64::ABV_KARA_XOR16
+            | kernels::aarch64::ABV_BSTATIC_Z;
         if kernels::aarch64::ab_kara_enabled()
             && kernels::aarch64::ab_kara_unscaled_enabled()
             && kernels::aarch64::ab_z_enabled()
             && kernels::aarch64::ab_kara_xor16_enabled()
             && kernels::aarch64::ab_bstatic_z_enabled()
             && kernels::aarch64::ab_row_setup_hoist_enabled()
+            && kernels::aarch64::ab_kara_slot_enabled()
+            && kernels::aarch64::ab_horner2_enabled()
         {
-            // Uop cuts on top (same lookups, same bytes): the x^4 Karatsuba
-            // image's per-slot-pair addresses (`FLOCK_NO_ZC_AB_KARA_SLOT`
-            // kills), the z apply's superset-transform index word
-            // (`FLOCK_NO_ZC_AB_Z_MT` kills) and the two-degree Horner carry
-            // fold (`FLOCK_NO_ZC_AB_HORNER2` kills).
-            const V0: u16 = kernels::aarch64::AB_Z_VARIANT
-                | kernels::aarch64::ABV_INLINE_WINDOW
-                | kernels::aarch64::ABV_KARA_XOR16
-                | kernels::aarch64::ABV_BSTATIC_Z;
             macro_rules! rows {
                 ($v:expr) => {
                     kernels::aarch64::bstatic_horner_window_rows_hoisted::<{ $v }>(
@@ -1897,75 +1901,17 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     )
                 };
             }
-            // One kill switch drops its piece and keeps the other two; two or
-            // more fall back to the incumbent form.
-            use kernels::aarch64::{ABV_HORNER2, ABV_KARA_SLOT, ABV_Z_MT};
-            match (
-                kernels::aarch64::ab_kara_slot_enabled(),
-                kernels::aarch64::ab_z_mt_enabled(),
-                kernels::aarch64::ab_horner2_enabled(),
-            ) {
-                (true, true, true) => rows!(V0 | ABV_KARA_SLOT | ABV_Z_MT | ABV_HORNER2),
-                (false, true, true) => rows!(V0 | ABV_Z_MT | ABV_HORNER2),
-                (true, false, true) => rows!(V0 | ABV_KARA_SLOT | ABV_HORNER2),
-                (true, true, false) => rows!(V0 | ABV_KARA_SLOT | ABV_Z_MT),
-                _ => rows!(V0),
+            if kernels::aarch64::ab_z_mt_enabled() {
+                rows!(V0 | ABV_KARA_SLOT | ABV_Z_MT | ABV_HORNER2)
+            } else {
+                rows!(V0 | ABV_KARA_SLOT | ABV_HORNER2)
             }
-        } else if kernels::aarch64::ab_kara_enabled()
-            && kernels::aarch64::ab_kara_unscaled_enabled()
-            && kernels::aarch64::ab_z_enabled()
-        {
-            kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_Z_VARIANT | kernels::aarch64::ABV_INLINE_WINDOW }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
-        } else if kernels::aarch64::ab_kara_enabled() && kernels::aarch64::ab_kara_unscaled_enabled() {
-            kernels::aarch64::bstatic_horner_window_rows::<{
-                kernels::aarch64::AB_ROWS_VARIANT | kernels::aarch64::ABV_KARA_UNSCALED
-            }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
-        } else if kernels::aarch64::ab_kara_enabled() {
-            kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_ROWS_VARIANT }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
         } else if kernels::aarch64::ab_hz_helper_enabled() && kernels::aarch64::ab_horner2_enabled() {
             // The efficiency-core form with the two-degree Horner carry fold
             // (`FLOCK_NO_ZC_AB_HORNER2` kills; same bytes).
             kernels::aarch64::bstatic_horner_window_rows::<{
                 kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2
             }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
-        } else if kernels::aarch64::ab_hz_helper_enabled() {
-            kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_HZ_VARIANT }>(
                 within_hash_outer,
                 a_packed,
                 b_packed,

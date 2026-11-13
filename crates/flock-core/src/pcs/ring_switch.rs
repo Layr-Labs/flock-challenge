@@ -1488,7 +1488,7 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let (z0, z1) = z_vec.split_at(half);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            let mut out = vec![F128::ZERO; half];
+            let mut out = crate::alloc_uninit_f128_vec(half);
             let mut i = 0;
             while i < half {
                 let x0 = z0[i] + z1[i];
@@ -1566,75 +1566,13 @@ fn s_hat_v_fold8_from_z_vec_generic(
 pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_fold8.len(), 64 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 6);
-    let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
-    let mut out = crate::alloc_uninit_f128_vec(n_packed);
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        let w0 = low_eq[0];
-        let mut i = 0;
-        while i < n_packed {
-            let prod0 = unsafe {
-                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
-                    w0,
-                    [s_hat_v_fold8[i], s_hat_v_fold8[i + 1]],
-                )
-            };
-            let prod1 = unsafe {
-                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
-                    w0,
-                    [s_hat_v_fold8[i + 2], s_hat_v_fold8[i + 3]],
-                )
-            };
-            out[i] = prod0[0];
-            out[i + 1] = prod0[1];
-            out[i + 2] = prod1[0];
-            out[i + 3] = prod1[1];
-            i += 4;
-        }
-        for bank in 1..64 {
-            let w = low_eq[bank];
-            let bank_src = &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed];
-            let mut i = 0;
-            while i < n_packed {
-                let prod0 = unsafe {
-                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
-                        w,
-                        [bank_src[i], bank_src[i + 1]],
-                    )
-                };
-                let prod1 = unsafe {
-                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
-                        w,
-                        [bank_src[i + 2], bank_src[i + 3]],
-                    )
-                };
-                out[i] += prod0[0];
-                out[i + 1] += prod0[1];
-                out[i + 2] += prod1[0];
-                out[i + 3] += prod1[1];
-                i += 4;
-            }
-        }
-        return out;
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    {
-        let w0 = low_eq[0];
-        for (dst, &src) in out.iter_mut().zip(&s_hat_v_fold8[..n_packed]) {
-            *dst = w0 * src;
-        }
-        for bank in 1..64 {
-            let w = low_eq[bank];
-            for (dst, &src) in out
-                .iter_mut()
-                .zip(&s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed])
-            {
-                *dst += w * src;
-            }
-        }
-        out
-    }
+    let weights: &[F128; 64] = low_eq[..64]
+        .try_into()
+        .expect("fold8 collapse needs exactly 64 low-eq weights");
+    let mut out = [F128::ZERO; 1usize << LOG_PACKING];
+    crate::field::f128_slice::fold_bank_major_64x128_rows2(weights, s_hat_v_fold8, &mut out);
+    out.to_vec()
 }
 
 /// Compute the slice-MLE vector `s_hat_v` (length 128) from a packed witness
@@ -2832,24 +2770,24 @@ pub fn prove<Ch: Challenger>(
 
     // Suffix is x_outer[1..] (length m-7); first coord becomes the 7th-bit factor.
     let suffix = &x_outer[1..];
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let suffix_tensor = build_eq_parallel(suffix);
     if trace {
         eprintln!(
             "    [rs::prove] build_eq(suffix L={}): {:6.2} ms",
             suffix.len(),
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
     debug_assert_eq!(suffix_tensor.len(), l);
 
     // Compute and send s_hat_v.
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let s_hat_v = fold_1b_rows_naive(packed_witness, &suffix_tensor);
     if trace {
         eprintln!(
             "    [rs::prove] fold_1b_rows:          {:6.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
     challenger.observe_f128_slice(&s_hat_v);
@@ -2863,12 +2801,12 @@ pub fn prove<Ch: Challenger>(
     let sumcheck_claim = inner_product(&s_hat_u, &eq_r_dprime);
 
     // Compute transparent multilinear rs_eq_ind.
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let rs_eq_ind = fold_b128_elems(&suffix_tensor, &eq_r_dprime);
     if trace {
         eprintln!(
             "    [rs::prove] fold_b128_elems:       {:6.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
@@ -3064,7 +3002,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         && sparse_needs_fold.is_empty()
         && crate::pcs::ranked_direct_fold8_enabled()
         && rs_elide_dead_basis_enabled();
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
@@ -3096,7 +3034,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             dense_suffixes.len(),
             if use_split { "split" } else { "full" },
             sparse_supports.len(),
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
@@ -3108,7 +3046,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //    supplied by the caller. dense_s_hat_v/sparse_s_hat_v are still
     //    indexed by classify-time index `d` / `s`; we splice precomputed
     //    values in at those slots and run the kernel only on the others.
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
     // Fill precomputed slots first.
@@ -3206,7 +3144,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             "    [rs::prove_batched] fold_1b_rows dense(k={})+sparse(k={}): {:6.2} ms",
             dense_s_hat_v.len(),
             sparse_s_hat_v.len(),
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
@@ -3216,7 +3154,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //    (b) Sample γ_rs after all observations (Schwartz-Zippel-sound).
     //    (c) Per claim: bake γ_k into eq_r_dprime, fold. Output rs_eq_ind
     //        already has γ_k baked in — pcs combine just adds.
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
 
     struct ClaimWork<'a> {
         s_hat_v: Vec<F128>,
@@ -3543,7 +3481,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         eprintln!(
             "    [rs::prove_batched] per-opening tail ×{}: {:6.2} ms",
             n,
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 

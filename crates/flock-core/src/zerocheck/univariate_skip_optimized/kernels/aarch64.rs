@@ -3192,6 +3192,7 @@ unsafe fn xor_vary_pair<const J0: u32, const J1: u32>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 unsafe fn fused_apply_one_k_with_b<const K: i32>(
     table_base: *const u8,
     half_swapped_table_base: *const u8,
@@ -3303,6 +3304,7 @@ unsafe fn fused_apply_one_k_with_b<const K: i32>(
 /// arithmetic in `mul_x2_nibble_tables_match_field`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 unsafe fn gf8_mul_x2_vec16(a: core::arch::aarch64::uint8x16_t) -> core::arch::aarch64::uint8x16_t {
     use core::arch::aarch64::*;
     unsafe {
@@ -3316,10 +3318,12 @@ unsafe fn gf8_mul_x2_vec16(a: core::arch::aarch64::uint8x16_t) -> core::arch::aa
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 pub(crate) const MUL_X2_LO: [u8; 16] = [
     0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20, 0x24, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c,
 ];
 #[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 pub(crate) const MUL_X2_HI: [u8; 16] = [
     0x00, 0x40, 0x80, 0xc0, 0x1b, 0x5b, 0x9b, 0xdb, 0x36, 0x76, 0xb6, 0xf6, 0x2d, 0x6d, 0xad, 0xed,
 ];
@@ -3331,6 +3335,7 @@ pub(crate) const MUL_X2_HI: [u8; 16] = [
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 unsafe fn accumulate_raw_one_k<const R: i32, const MUL_X2: bool>(
     da0: core::arch::aarch64::uint8x16_t,
     da1: core::arch::aarch64::uint8x16_t,
@@ -3389,6 +3394,7 @@ unsafe fn accumulate_raw_one_k<const R: i32, const MUL_X2: bool>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 unsafe fn fused_apply_one_k_fast<const R: i32, const MUL_X2: bool>(
     a_table: *const u8,
     a_table_sw: *const u8,
@@ -3421,6 +3427,7 @@ unsafe fn fused_apply_one_k_fast<const R: i32, const MUL_X2: bool>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 unsafe fn fused_apply_one_k_with_b_fast<const R: i32, const MUL_X2: bool>(
     a_table: *const u8,
     a_table_sw: *const u8,
@@ -3493,8 +3500,11 @@ pub(crate) fn ab_kara_unscaled_enabled() -> bool {
     });
     *ON
 }
-/// The form of the static-B Horner rows when [`ab_kara_enabled`].
+/// The form of the static-B Horner rows when [`ab_kara_enabled`] (now only
+/// exercised by the variant tests; production kill switches take the plain
+/// generic apply).
 #[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const AB_ROWS_VARIANT: u16 = ABV_KARA | ABV_INLINE_WINDOW;
 
 /// Kill switch for the Karatsuba table apply in the round-one AB rows:
@@ -5307,17 +5317,13 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     nt_store,
                 )
             } else {
-                shift_reduce_inner_ab_bstatic::<false>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    bstatic_w,
-                    context,
-                    out,
-                    nt_store,
-                )
+                // `FLOCK_NO_FAST_SHIFT_REDUCE`: the generic h4 apply below
+                // writes the same bytes. The per-K guarded static-B kernel
+                // (`shift_reduce_inner_ab_bstatic`, ~170 KB of straight-line
+                // code) is no longer compiled into production for this
+                // kill-switch-only arm; its tests still exercise it.
+                let _ = context;
+                false
             };
         if handled {
             return;
@@ -5365,6 +5371,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
 /// register). The result is bit-identical to `veorq_u16(acc, pmull_*_u16(a, b))`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 unsafe fn fused_pmull8_acc<const HI: bool>(
     acc: core::arch::aarch64::uint16x8_t,
     a: core::arch::aarch64::uint8x16_t,
