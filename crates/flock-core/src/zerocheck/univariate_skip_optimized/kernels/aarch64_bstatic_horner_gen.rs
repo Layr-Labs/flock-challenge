@@ -143,7 +143,10 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u16, const HOIST: bool>(
         // image; otherwise the incumbent form `$inc`.
         macro_rules! bimg_lz {
             ($blk:literal, $k:literal, $nb:literal, $inc:expr) => {{
-                if V & ABV_BSTATIC_Z != 0 {
+                if V & ABV_BSTATIC_Z != 0 && V & ABV_Z_M1 != 0 && V & ABV_ZK != 0 {
+                    let pp = pbase.add(($blk * 8 + $k) * 64);
+                    apply_word_z_low_pp::<$nb, true>(plain, kplain, bw!($k), pp)
+                } else if V & ABV_BSTATIC_Z != 0 {
                     let pp = pbase.add(($blk * 8 + $k) * 64);
                     let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(plain, kplain, bw!($k));
                     (
