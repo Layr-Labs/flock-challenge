@@ -29,6 +29,15 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if r.len() >= 3
+            && !*OFF.get_or_init(|| std::env::var_os("FLOCK_NO_X1_EQ_OPT").is_some())
+        {
+            return crate::lincheck::build_eq_table_optimized(r);
+        }
+    }
     build_eq_scaled(r, F128::ONE)
 }
 
@@ -699,6 +708,17 @@ mod tests {
         }
         fn f128_vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
+        }
+    }
+
+    #[test]
+    fn x1_build_eq_matches_optimized_builder_and_scalar_doubling() {
+        let mut rng = Rng::new(0x51DE_E900);
+        for d in 0..=16usize {
+            let r = rng.f128_vec(d);
+            let scalar = build_eq_scaled(&r, F128::ONE);
+            assert_eq!(build_eq(&r), scalar, "build_eq d={d}");
+            assert_eq!(crate::lincheck::build_eq_table_optimized(&r), scalar, "optimized d={d}");
         }
     }
 
