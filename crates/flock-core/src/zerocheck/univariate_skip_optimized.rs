@@ -2772,6 +2772,7 @@ fn process_one_x_hi_with_precomputed_ab(
     split_ab_c: bool,
     direct_ab_rows: bool,
     c_drain4: bool,
+    c_drain8: bool,
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -2838,7 +2839,13 @@ fn process_one_x_hi_with_precomputed_ab(
                 n_b_med,
                 c_tables,
                 &mut state.partial_c,
-                c_drain4,
+                if c_drain8 {
+                    8
+                } else if c_drain4 {
+                    4
+                } else {
+                    1
+                },
             );
         }
     } else {
@@ -5025,6 +5032,12 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
     let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
     let c_drain4 = std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none();
+    // The ranked Apple shape has enough independent table lookups to fill an
+    // eight-lane window. Keep every other target/shape on the frontier's
+    // four-lane policy; the flag is a narrow same-binary ranked control.
+    let c_drain8 = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && m == 32
+        && std::env::var_os("FLOCK_NO_ZC_C_DRAIN8").is_none();
 
     // The challenge-independent AB transform finishes while the commitment is
     // still running. Its challenge-weighted completion is therefore a live
@@ -5052,6 +5065,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
             split_ab_c,
             direct_ab_rows,
             c_drain4,
+            c_drain8,
             &mut state,
         );
         // SAFETY: the queue hands out each x_hi exactly once, so this task is

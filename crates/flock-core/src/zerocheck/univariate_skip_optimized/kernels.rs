@@ -294,7 +294,7 @@ pub(super) fn accumulate_c_banks(
     mask_tables: &[super::F128],
     partial_c: &mut [[super::F128; 64]; 8],
 ) {
-    accumulate_c_banks_with_policy(c_block, n_b_med, mask_tables, partial_c, true);
+    accumulate_c_banks_with_policy(c_block, n_b_med, mask_tables, partial_c, 4);
 }
 
 #[inline]
@@ -303,18 +303,20 @@ pub(super) fn accumulate_c_banks_with_policy(
     n_b_med: usize,
     mask_tables: &[super::F128],
     partial_c: &mut [[super::F128; 64]; 8],
-    drain4: bool,
+    drain_lanes: usize,
 ) {
+    debug_assert!(matches!(drain_lanes, 1 | 4 | 8));
+
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 statically guarantees NEON; the fixed-size arrays cover
     // every load/store and the table halves bound every `u8`-scaled index.
     unsafe {
-        aarch64::accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c, drain4);
+        aarch64::accumulate_c_banks(c_block, n_b_med, mask_tables, partial_c, drain_lanes);
     }
 
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = drain4;
+        let _ = drain_lanes;
         accumulate_c_banks_scalar(c_block, n_b_med, mask_tables, partial_c);
     }
 }
