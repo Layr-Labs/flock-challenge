@@ -1558,58 +1558,6 @@ fn s_hat_v_fold8_from_z_vec_generic(
         )
 }
 
-/// One already-collapsed canonical statistic, keyed to the exact sixty-four-
-/// bank buffer it was collapsed from (address, length and both end elements).
-struct CollapsedFold8Stash {
-    addr: usize,
-    len: usize,
-    first: F128,
-    last: F128,
-    canonical: Vec<F128>,
-}
-
-static COLLAPSED_FOLD8_STASH: std::sync::Mutex<Option<CollapsedFold8Stash>> =
-    std::sync::Mutex::new(None);
-
-/// Hand the batched ring-switch the canonical 128-vector a producer already
-/// derived from `fold8` (zerocheck round 1 collapses C's sixty-four-bank
-/// statistic to `s_hat_v_c` for its own round message). The open then takes
-/// it instead of re-collapsing the same buffer under the same six suffix
-/// coordinates (8,192 constant products). The caller owns the claim that
-/// `canonical == collapse_s_hat_v_fold8(fold8, suffix[..6])` for the claim
-/// that passes this exact `fold8` slice; a shape mismatch stashes nothing.
-pub fn stash_collapsed_s_hat_v_fold8(fold8: &[F128], canonical: &[F128]) {
-    let n_packed = 1usize << LOG_PACKING;
-    if fold8.len() != 64 * n_packed || canonical.len() != n_packed {
-        return;
-    }
-    *COLLAPSED_FOLD8_STASH.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(CollapsedFold8Stash {
-            addr: fold8.as_ptr() as usize,
-            len: fold8.len(),
-            first: fold8[0],
-            last: fold8[fold8.len() - 1],
-            canonical: canonical.to_vec(),
-        });
-}
-
-/// Drop any unconsumed stash (the open is over, or never ran).
-pub fn clear_collapsed_s_hat_v_fold8() {
-    *COLLAPSED_FOLD8_STASH.lock().unwrap_or_else(|e| e.into_inner()) = None;
-}
-
-/// Consume the stash iff it was made for exactly this `fold8` buffer.
-fn take_collapsed_s_hat_v_fold8(fold8: &[F128]) -> Option<Vec<F128>> {
-    let mut slot = COLLAPSED_FOLD8_STASH.lock().unwrap_or_else(|e| e.into_inner());
-    let hit = slot.as_ref().is_some_and(|st| {
-        st.addr == fold8.as_ptr() as usize
-            && st.len == fold8.len()
-            && st.first == fold8[0]
-            && st.last == fold8[fold8.len() - 1]
-    });
-    if hit { slot.take().map(|st| st.canonical) } else { None }
-}
-
 /// Collapse the sixty-four-bank direct-fold8 intake under the first six
 /// suffix coordinates, recovering the canonical transcript-visible
 /// 128-vector. Bitwise identical to `collapse_s_hat_v_fold4` of the 16-bank
@@ -1945,7 +1893,7 @@ fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    let mut tables = crate::alloc_uninit_f128_vec(FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         let table = &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE];
@@ -2171,7 +2119,7 @@ pub(crate) fn build_direct_fold8_table_from_w_prime(
 pub(crate) fn build_direct_fold8_table_from_generators(generators: &[F128]) -> Vec<F128> {
     assert_eq!(generators.len(), 1 << LOG_PACKING);
 
-    let mut out = crate::alloc_uninit_f128_vec(FOLD_TABLE_LEN);
+    let mut out = vec![F128::ZERO; FOLD_TABLE_LEN];
     for byte in 0..FOLD_N_BYTES {
         let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
         table[0] = F128::ZERO;
@@ -2697,15 +2645,6 @@ fn rs_fold8_par_enabled() -> bool {
     *ON
 }
 
-/// `FLOCK_NO_RS_FOLD8_DIRECT_STATE=1` restores the collect-then-scatter build
-/// of the direct-fold8 `a_state` / `w_state` factor tables.
-fn rs_fold8_direct_state_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_NO_RS_FOLD8_DIRECT_STATE").map_or(true, |v| v != "1")
-    });
-    *ON
-}
-
 fn rs_elide_dead_basis_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_ELIDE_DEAD_BASIS").is_none());
@@ -3118,8 +3057,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     dense_suffixes[d].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
                 );
-                take_collapsed_s_hat_v_fold8(p)
-                    .unwrap_or_else(|| collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6]))
+                collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6])
             } else if p.len() == 16 * n_packed {
                 assert!(
                     dense_suffixes[d].len() >= 4,
@@ -3376,59 +3314,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                         // then reuse the owned `fold8` allocation for `w_state`.
                         let mut a_state = crate::alloc_uninit_f128_vec(64 * n_packed);
                         let mut w_state = crate::alloc_uninit_f128_vec(64 * n_packed);
-                        if rs_fold8_par_enabled() && rs_fold8_direct_state_enabled() {
-                            // Same two parallel families as the arm below,
-                            // but every task stores its values straight into
-                            // their final bit-major slots: no two collected
-                            // 64x128 staging vectors, no zero-filled column
-                            // arrays, and no second (serial, strided) scatter
-                            // pass over both states. Values are identical.
-                            use rayon::prelude::*;
-                            let a_base = crate::epool::SyncPtr(a_state.as_mut_ptr());
-                            let w_base = crate::epool::SyncPtr(w_state.as_mut_ptr());
-                            let (fold8, table) = (&fold8, &table);
-                            rayon::join(
-                                || {
-                                    (0..64usize).into_par_iter().with_min_len(8).for_each(|e| {
-                                        let mut transposed = [F128::ZERO; 1 << LOG_PACKING];
-                                        tensor_algebra_transpose_into(
-                                            &fold8[e * n_packed..(e + 1) * n_packed],
-                                            &mut transposed,
-                                        );
-                                        for (bit, &value) in transposed.iter().enumerate() {
-                                            // SAFETY: `bit * 64 + e < 64 * n_packed`
-                                            // (the state length); bank `e` is
-                                            // claimed by exactly one task, so
-                                            // the slots are disjoint.
-                                            unsafe { a_base.ptr().add(bit * 64 + e).write(value) };
-                                        }
-                                    })
-                                },
-                                || {
-                                    (0..64usize).into_par_iter().with_min_len(8).for_each(
-                                        |d_low| {
-                                            let mut basis_product = low_eq[d_low];
-                                            // SAFETY: as above, with `d_low`
-                                            // owned by exactly one task.
-                                            unsafe {
-                                                w_base
-                                                    .ptr()
-                                                    .add(d_low)
-                                                    .write(fold_one_slot(basis_product, table));
-                                            }
-                                            for bit in 1..n_packed {
-                                                basis_product = mul_by_x(basis_product);
-                                                unsafe {
-                                                    w_base.ptr().add(bit * 64 + d_low).write(
-                                                        fold_one_slot(basis_product, table),
-                                                    );
-                                                }
-                                            }
-                                        },
-                                    )
-                                },
-                            );
-                        } else if rs_fold8_par_enabled() {
+                        if rs_fold8_par_enabled() {
                             use rayon::prelude::*;
                             let (banks, cols): (Vec<[F128; 1 << LOG_PACKING]>, Vec<[F128; 1 << LOG_PACKING]>) =
                                 rayon::join(

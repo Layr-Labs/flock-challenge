@@ -1404,14 +1404,6 @@ pub(crate) fn gpu_tw_prefetch_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_TW_PREFETCH").is_none())
 }
 
-/// Kill switch for the four-bit-shift table bases in the zero-root from-z
-/// library: `FLOCK_NO_ZERO_ROOT_SHL4_BASES` (any value) keeps
-/// `FROM_Z_ZERO_ROOT_MSL_SOURCE` as written. Both write the same bytes.
-pub(crate) fn gpu_zero_root_shl4_bases_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZERO_ROOT_SHL4_BASES").is_none())
-}
-
 /// Kill switch for the two-tiles-per-thread g4 NTT pass
 /// (`ntt_fused_reg4g4x2`): `FLOCK_NO_GPU_G4X2` (any value) keeps
 /// `ntt_fused_reg4g4`. Both kernels write the same bytes.
@@ -3613,9 +3605,6 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
     /// reuse the rejected device-table preload design: every group constructs
     /// its own compact 11-table image directly from the existing raw twiddle
     /// buffer, then executes explicit zero/nonzero butterflies.
-    #[cfg(test)]
-    pub(crate) const FROM_Z_ZERO_ROOT_MSL_SOURCE_FOR_TEST: &str = FROM_Z_ZERO_ROOT_MSL_SOURCE;
-
     const FROM_Z_ZERO_ROOT_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -3818,49 +3807,6 @@ kernel void export_from_z_zero_root_tabs(
     }
 }
 "#;
-
-    /// The zero-root library source in use: `FROM_Z_ZERO_ROOT_MSL_SOURCE` with
-    /// the table bases formed by `bank` four-bit shifts (`gf_shl4_zero_root`)
-    /// instead of `4 * bank` single-bit steps, unless
-    /// `FLOCK_NO_ZERO_ROOT_SHL4_BASES` is set. Same base values.
-    pub(crate) fn zero_root_msl_source() -> &'static str {
-        if super::gpu_zero_root_shl4_bases_enabled() {
-            zero_root_shl4_bases_source()
-        } else {
-            FROM_Z_ZERO_ROOT_MSL_SOURCE
-        }
-    }
-
-    pub(crate) fn zero_root_shl4_bases_source() -> &'static str {
-        static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        SRC.get_or_init(|| {
-            let helper_anchor = "static inline uint4 gf_shl16_zero_root(uint4 a) {";
-            let helper = "static inline uint4 gf_shl4_zero_root(uint4 a) {
-    uint h = a.w >> 28;
-    uint4 r;
-    r.w = (a.w << 4) | (a.z >> 28);
-    r.z = (a.z << 4) | (a.y >> 28);
-    r.y = (a.y << 4) | (a.x >> 28);
-    r.x = (a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
-    return r;
-}
-
-";
-            let bases_old = "        for (uint m = 0u; m < bank * 4u; m++) {
-            p = gf_mulx_zero_root(p);
-        }
-        bases[lid] = p;";
-            let bases_new = "        for (uint m = 0u; m < bank; m++) {
-            p = gf_shl4_zero_root(p);
-        }
-        bases[lid] = p;";
-            let src = FROM_Z_ZERO_ROOT_MSL_SOURCE;
-            assert_eq!(src.matches(helper_anchor).count(), 1, "zero-root helper anchor");
-            assert_eq!(src.matches(bases_old).count(), 1, "zero-root bases anchor");
-            src.replacen(helper_anchor, &format!("{helper}{helper_anchor}"), 1)
-                .replacen(bases_old, bases_new, 1)
-        })
-    }
 
     #[cfg(test)]
     pub(crate) fn zero_root_pair_test_source() -> String {
@@ -6215,7 +6161,7 @@ kernel void blake3_pow_scan(
                 // selects the incumbent pso_ntt4zg4 below.
                 let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
                     if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
-                        let src = api.nsstring(zero_root_msl_source())?;
+                        let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -11041,7 +10987,7 @@ kernel void blake3_pow_scan(
     fn warmup_cache_msl_fnv_for(zero_root: bool, leaf_vec4: bool) -> u64 {
         let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
-            key ^= fnv1a64(zero_root_msl_source()).rotate_left(1) ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
+            key ^= fnv1a64(FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1) ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
         }
         if leaf_vec4 {
             key ^= fnv1a64(LEAF_VEC4_MSL_SOURCE).rotate_left(2) ^ 0x4C45_4146_5F56_3431; // "LEAF_V41"
@@ -11091,7 +11037,7 @@ kernel void blake3_pow_scan(
             assert_eq!(
                 candidate,
                 incumbent
-                    ^ super::fnv1a64(super::zero_root_msl_source()).rotate_left(1)
+                    ^ super::fnv1a64(super::FROM_Z_ZERO_ROOT_MSL_SOURCE).rotate_left(1)
                     ^ 0x5A52_4F4F_545F_3131
             );
             // The leaf-vec4 dimension is independent and non-degenerate:
@@ -19836,62 +19782,6 @@ mod tests {
             let _ = job.finish(wait);
         }
         unsafe { gpu.release(zbuf) };
-    }
-
-    /// The four-bit-shift bases build exactly the incumbent zero-root table
-    /// image (all 11 x 64 entries) from random twiddles.
-    #[test]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn zero_root_shl4_bases_match_incumbent_tables_on_metal() {
-        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
-            Some(g) => unsafe { &*g },
-            None => return,
-        };
-        let new_src = imp::zero_root_shl4_bases_source();
-        let old_src = imp::FROM_Z_ZERO_ROOT_MSL_SOURCE_FOR_TEST;
-        assert_ne!(new_src, old_src);
-        let mut rng = Rng::new(0x5A52_5348);
-        unsafe {
-            let pool = gpu.pool_push();
-            let pso_new =
-                imp::compile_supplemental_pipeline(gpu, new_src, "export_from_z_zero_root_tabs")
-                    .unwrap();
-            let pso_old =
-                imp::compile_supplemental_pipeline(gpu, old_src, "export_from_z_zero_root_tabs")
-                    .unwrap();
-            let entries = 11usize * 64;
-            let tw_buf = gpu.new_buffer(16 * 16).unwrap();
-            let out_new = gpu.new_buffer(entries * 16).unwrap();
-            let out_old = gpu.new_buffer(entries * 16).unwrap();
-            for case in 0..8 {
-                let mut tw = rng.vec(16);
-                if case == 0 {
-                    for v in tw.iter_mut() {
-                        v.hi |= 0xF000_0000_0000_0000;
-                    }
-                }
-                std::ptr::copy_nonoverlapping(tw.as_ptr().cast::<u8>(), gpu.buffer_contents(tw_buf), 16 * 16);
-                std::ptr::write_bytes(gpu.buffer_contents(out_new), 0xa5, entries * 16);
-                std::ptr::write_bytes(gpu.buffer_contents(out_old), 0x5a, entries * 16);
-                let cb = gpu.command_buffer().unwrap();
-                let enc = gpu.compute_encoder(cb).unwrap();
-                for (pso, out) in [(pso_new, out_new), (pso_old, out_old)] {
-                    gpu.set_pipeline(enc, pso);
-                    gpu.set_buffer(enc, tw_buf, 0, 0);
-                    gpu.set_buffer(enc, out, 0, 1);
-                    gpu.dispatch(enc, 1, 64);
-                }
-                gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb).unwrap();
-                let got = core::slice::from_raw_parts(gpu.buffer_contents(out_new).cast::<F128>(), entries);
-                let want = core::slice::from_raw_parts(gpu.buffer_contents(out_old).cast::<F128>(), entries);
-                assert_eq!(got, want, "case={case}");
-            }
-            for buf in [tw_buf, out_new, out_old] {
-                gpu.release(buf);
-            }
-            gpu.pool_pop(pool);
-        }
     }
 
     /// Skip (with a note) when Metal is unavailable; fail on real GPU errors.
