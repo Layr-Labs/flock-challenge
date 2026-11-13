@@ -1016,7 +1016,8 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     active.dedup();
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
-    let mut proof = Vec::new();
+    let depth = num_leaves.trailing_zeros() as usize;
+    let mut proof = Vec::with_capacity(active.len() * depth);
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
     let mut next = Vec::with_capacity(active.len());

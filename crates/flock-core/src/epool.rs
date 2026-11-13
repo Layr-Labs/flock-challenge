@@ -571,9 +571,11 @@ impl Gate {
 
 /// Closes a drain's [`Gate`] when the drain's frame ends — on the normal path
 /// and while unwinding — so no admitted helper outlives the borrowed state.
-struct CloseOnDrop(Arc<Gate>);
+// The caller retains its Arc until after this guard closes the gate. Only
+// the detached broadcast needs an additional owning reference.
+struct CloseOnDrop<'a>(&'a Gate);
 
-impl Drop for CloseOnDrop {
+impl Drop for CloseOnDrop<'_> {
     fn drop(&mut self) {
         if self.0.close_and_wait() && !std::thread::panicking() {
             panic!("epool: helper-pool chunk panicked");
@@ -617,7 +619,7 @@ pub(crate) fn drain_hetero<H>(
             panicked: AtomicBool::new(false),
             body: JobPtr::new(helper),
         });
-        let close = CloseOnDrop(Arc::clone(&gate));
+        let close = CloseOnDrop(&gate);
         let posted = AtomicBool::new(false);
         (0..main_threads)
             .into_par_iter()
@@ -1035,8 +1037,9 @@ pub fn run_queue_with_helper_only(
 }
 
 /// Stateful sibling of [`run_hetero_chunks`]. Each queue-draining worker
-/// calls `init` exactly once, then reuses that private state for every chunk
-/// it claims. This is intended for kernels with moderately large scratch
+/// calls `init` only after its first successful chunk claim, then reuses
+/// that private state for every subsequent chunk. Empty drainers allocate
+/// no state. This is intended for kernels with moderately large scratch
 /// (for example a 64 KiB lookup table) where initializing once per chunk or
 /// once per Rayon split would erase the benefit of fine-grained work stealing.
 ///
@@ -1137,6 +1140,12 @@ fn run_chunks_with_helper_arm_after<F, A>(
         after();
     };
     let linger_guest = |_stop: &dyn Fn() -> bool| -> usize {
+        // The cursor only increases during this drain. A stale low hint
+        // falls through to the ordinary atomic claim and bounds check.
+        // Already-empty late joiners need not modify the shared cursor.
+        if next.load(Ordering::Relaxed) >= n_chunks {
+            return 0;
+        }
         let mut ran = 0usize;
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
@@ -1245,27 +1254,35 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
     let next = AtomicUsize::new(0);
     let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
     let worker = || {
-        let mut state = init();
+        let mut state = None;
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n_chunks {
                 break;
             }
-            guard.main_run(|| f(&mut state, i));
+            let state = state.get_or_insert_with(init);
+            guard.main_run(|| f(state, i));
         }
         if let Some(tail) = tail {
             tail();
         }
     };
     let linger_guest = |_stop: &dyn Fn() -> bool| -> usize {
-        let mut state = init();
+        // The cursor only increases during this drain. A stale low hint
+        // falls through to the ordinary atomic claim and bounds check.
+        // Already-empty late joiners need not modify the shared cursor.
+        if next.load(Ordering::Relaxed) >= n_chunks {
+            return 0;
+        }
+        let mut state = None;
         let mut ran = 0usize;
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n_chunks {
                 break;
             }
-            guard.main_run(|| f(&mut state, i));
+            let state = state.get_or_insert_with(init);
+            guard.main_run(|| f(state, i));
             ran += 1;
         }
         ran
@@ -1279,14 +1296,15 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
     // Guest claim loop (see `help_guest_until`): same queue, same chunk
     // function, one chunk per stop check, no tail.
     let guest = |stop: &dyn Fn() -> bool| -> usize {
-        let mut state = init();
+        let mut state = None;
         let mut ran = 0usize;
         while !stop() {
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n_chunks {
                 break;
             }
-            guard.main_run(|| f(&mut state, i));
+            let state = state.get_or_insert_with(init);
+            guard.main_run(|| f(state, i));
             ran += 1;
         }
         ran
@@ -1295,7 +1313,7 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
             let helper_body = || {
-                let mut state = init();
+                let mut state = None;
                 let mut own_ns = 0u64;
                 loop {
                     if !guard.helper_may_claim(own_ns, next.load(Ordering::Relaxed), n_chunks) {
@@ -1306,7 +1324,8 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
                         break;
                     }
                     EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
-                    guard.helper_run(&mut own_ns, || f(&mut state, i));
+                    let state = state.get_or_insert_with(init);
+                    guard.helper_run(&mut own_ns, || f(state, i));
                 }
             };
             drain_hetero(main_threads, &worker, ep, &helper_body, detached);
@@ -1530,6 +1549,30 @@ mod tests {
         assert!(absent.helper_may_claim(u64::MAX, 0, 1));
     }
 
+    #[test]
+    fn borrowed_close_guard_keeps_owner_and_closes_on_unwind() {
+        for unwind in [false, true] {
+            let body = || panic!("closed gate must not execute its body");
+            let gate = Arc::new(Gate {
+                state: AtomicUsize::new(0),
+                panicked: AtomicBool::new(false),
+                body: JobPtr::new(&body),
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let close = CloseOnDrop(&gate);
+                assert_eq!(Arc::strong_count(&gate), 1);
+                if unwind {
+                    panic!("exercise guard unwind");
+                }
+                drop(close);
+            }));
+            assert_eq!(outcome.is_err(), unwind);
+            assert_eq!(gate.state.load(Ordering::Acquire), GATE_CLOSED);
+            assert_eq!(Arc::strong_count(&gate), 1);
+            assert!(!gate.enter());
+        }
+    }
+
     /// Zero chunks is a no-op.
     #[test]
     fn zero_chunks_is_noop() {
@@ -1633,6 +1676,67 @@ mod tests {
         inline_queue.drain_inline();
         inline_queue.wait_done();
         assert!(inline_counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+    }
+
+    /// Empty main tasks must not construct scratch. The tail still runs once
+    /// for every main task; any guest work may belong to another active queue.
+    #[test]
+    fn stateful_empty_drainers_do_not_initialize() {
+        let main = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let inits = AtomicUsize::new(0);
+        let claims = AtomicUsize::new(0);
+        let tails = AtomicUsize::new(0);
+        main.install(|| {
+            run_chunks_with_helper_stateful_arm_tail(
+                1,
+                &|| { inits.fetch_add(1, Ordering::Relaxed); },
+                &|_, i| {
+                    assert_eq!(i, 0);
+                    claims.fetch_add(1, Ordering::Relaxed);
+                },
+                None,
+                true,
+                Some(&|| {
+                    tails.fetch_add(1, Ordering::Relaxed);
+                    // The process-global slot is first-publisher-wins: another
+                    // test or a surrounding drain may own it. Helping that
+                    // queue is legal and says nothing about this queue's claims.
+                    let _ = help_guest_until(true, std::time::Duration::ZERO, &|| false);
+                }),
+            );
+        });
+        assert_eq!(claims.load(Ordering::Relaxed), 1);
+        assert_eq!(tails.load(Ordering::Relaxed), 4);
+        assert_eq!(inits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn stateful_every_initialized_state_processes_work() {
+        let main = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let helper = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        for detached in [false, true] {
+            for n in [0, 1, 3, 4, 17, 257] {
+                let inits = AtomicUsize::new(0);
+                let used = AtomicUsize::new(0);
+                let counts: Vec<_> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+                main.install(|| run_chunks_with_helper_stateful_arm(
+                    n,
+                    &|| { inits.fetch_add(1, Ordering::Relaxed); false },
+                    &|state: &mut bool, i| {
+                        if !*state {
+                            *state = true;
+                            used.fetch_add(1, Ordering::Relaxed);
+                        }
+                        counts[i].fetch_add(1, Ordering::Relaxed);
+                    },
+                    Some(&helper),
+                    detached,
+                ));
+                assert!(counts.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+                assert_eq!(inits.load(Ordering::Relaxed), used.load(Ordering::Relaxed));
+                assert!(inits.load(Ordering::Relaxed) <= n);
+            }
+        }
     }
 
     /// Stateful workers initialize private scratch once and reuse it across
