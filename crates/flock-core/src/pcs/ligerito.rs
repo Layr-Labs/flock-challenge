@@ -5220,15 +5220,30 @@ fn transpose_forward_ntt_sparse_hashmap_impl(
     let window_len = 1usize << prefix_k;
     let window_mask = window_len - 1;
 
-    let mut windows: HashMap<usize, Vec<F128>> = HashMap::new();
-    for (&position, &value) in positions.iter().zip(values) {
-        let window = windows
-            .entry(position >> prefix_k)
-            .or_insert_with(|| vec![F128::ZERO; window_len]);
-        window[position & window_mask] += value;
+    // Sort the sparse positions by window index and materialize each window
+    // directly: no per-position hashing and a deterministic window order.
+    // Exactness: each window's slots accumulate field additions only, and
+    // F128 addition is XOR (commutative and associative), so every window's
+    // contents are independent of the within-window order; the transform and
+    // the scatter below address windows by index, so the output is
+    // bit-identical to the HashMap path.
+    let mut pairs: Vec<(usize, F128)> =
+        positions.iter().copied().zip(values.iter().copied()).collect();
+    pairs.sort_unstable_by_key(|&(position, _)| position >> prefix_k);
+    let mut windows: Vec<(usize, Vec<F128>)> = Vec::new();
+    for (position, value) in pairs {
+        let window_index = position >> prefix_k;
+        match windows.last_mut() {
+            Some((index, window)) if *index == window_index => {
+                window[position & window_mask] += value;
+            }
+            _ => {
+                let mut window = vec![F128::ZERO; window_len];
+                window[position & window_mask] += value;
+                windows.push((window_index, window));
+            }
+        }
     }
-
-    let windows: Vec<(usize, Vec<F128>)> = windows.into_iter().collect();
     let processed: Vec<(usize, Vec<F128>)> = windows
         .into_par_iter()
         .with_min_len(small_ntt_min_jobs(window_len))
@@ -8903,6 +8918,8 @@ fn sample_distinct_queries_probe<Ch: Challenger>(
         }
     });
     out.sort_unstable();
+    debug_assert!(out.windows(2).all(|w| w[0] < w[1]) && out.last().map_or(true, |&q| q < block_len),
+        "sampled queries must be strictly increasing and in-domain");
     out
 }
 
@@ -8932,6 +8949,8 @@ fn sample_distinct_queries_with<Ch: Challenger>(
         }
     }
     out.sort_unstable();
+    debug_assert!(out.windows(2).all(|w| w[0] < w[1]) && out.last().map_or(true, |&q| q < block_len),
+        "sampled queries must be strictly increasing and in-domain");
     out
 }
 
