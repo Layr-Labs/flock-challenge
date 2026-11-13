@@ -1160,6 +1160,24 @@ pub fn gpu_keepwarm_resume() {
     imp::keepwarm_arm();
 }
 
+/// Init-only: start the GPU bring-up (device, queue, pipelines) and the
+/// round-two products pipelines on a background thread, so their Metal
+/// compiles overlap the setup's and the warm-up's CPU work instead of
+/// blocking the first GPU use. The same `OnceLock`s are filled with the same
+/// objects either way; a later caller simply waits for the in-flight init.
+/// `FLOCK_NO_GPU_PREWARM` (any value) keeps the incumbent on-demand init.
+pub fn prewarm_gpu_background() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if std::env::var_os("FLOCK_NO_GPU_PREWARM").is_some() || !gpu_commit_enabled() {
+            return;
+        }
+        let _ = std::thread::Builder::new()
+            .name("flock-gpu-prewarm".into())
+            .spawn(imp::prewarm_gpu_and_zc_r2);
+    }
+}
+
 /// Scan one ascending nonce block with the retained Metal PCS-grind state.
 /// Returns the smallest satisfying nonce in the block, or `None` when the
 /// block has no match.  All recurring work (output reset, command creation,
@@ -1420,9 +1438,27 @@ pub(crate) fn gpu_final_t3_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_T3").is_none())
 }
 
+/// Init-time only: defer the backend compiles of the main library's
+/// pipelines the ranked path never selects to their first use.
+/// `FLOCK_NO_GPU_LAZY_PSO` (any value) compiles all of them at init.
+pub(crate) fn gpu_lazy_pso_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_LAZY_PSO").is_none())
+}
+
 pub(crate) fn gpu_final_leaf_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
+}
+
+pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB2").is_none())
+}
+
+pub(crate) fn gpu_t3_bytetab_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB").is_none())
 }
 
 /// Hybrid-split GPU prefix uses the fused final NTT pass + Merkle leaf kernel
@@ -4315,6 +4351,384 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     /// order and its exact field product are unchanged, so the output is
     /// bit-identical. Its own library: a compile failure keeps
     /// `ntt_pass5_mixed`.
+    const T3_BYTETAB3_BUILD: &str = "    threadgroup uint* tab3 = (threadgroup uint*)tabB;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    const uint cc = lid >> 3;
+    const uint base = (lid & 7u) * 32u;
+    const uint tw3 = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cc].x;
+    uint hb = 0u;
+    for (uint k = 5u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= tw3 << k; } }
+    for (uint i = 0u; i < 32u; i++) {
+        uint v = hb;
+        for (uint k = 0u; k < 5u; k++) { if ((i >> k) & 1u) { v ^= tw3 << k; } }
+        tab3[cc * 256u + base + i] = v;
+    }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    constexpr uint j = 3u;
+";
+    const T3_BYTETAB3_MUL: &str = "            const uint cb = c * 256u;
+        const uint4 V = elems[ev];
+        uint q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u, q4 = 0u;
+        #define T3B(W, LO, HI) { \\
+            const uint t0 = tab3[cb + ((W) & 255u)]; LO ^= t0; \\
+            const uint t1 = tab3[cb + extract_bits((W), 8, 8)]; LO ^= t1 << 8; HI ^= t1 >> 24; \\
+            const uint t2 = tab3[cb + extract_bits((W), 16, 8)]; LO ^= t2 << 16; HI ^= t2 >> 16; \\
+            const uint t4 = tab3[cb + ((W) >> 24)]; LO ^= t4 << 24; HI ^= t4 >> 8; }
+        T3B(V.x, q0, q1) T3B(V.y, q1, q2) T3B(V.z, q2, q3) T3B(V.w, q3, q4)
+        #undef T3B
+        q0 ^= q4 ^ (q4 << 1) ^ (q4 << 2) ^ (q4 << 7);
+        uint4 acc = uint4(q0, q1, q2, q3);
+";
+
+    const T3_SUB3_HORNER: &str = "            threadgroup const uint* nb = &nibB[c * NNIB];
+            uint4 V0 = elems[ev];
+            uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+            uint4 acc = uint4(0u);
+            for (int q = (int)NNIB - 1; q >= 0; q--) {
+                acc = gf_shl4(acc);
+                uint n = nb[q];
+                if (n & 1u) acc ^= V0;
+                if (n & 2u) acc ^= V1;
+                if (n & 4u) acc ^= V2;
+                if (n & 8u) acc ^= V3;
+            }
+";
+
+    fn with_fused_bytetab3(src: &str) -> Option<String> {
+        let indent = |t: &str| t.lines().map(|l| if l.is_empty() { String::new() } else { format!("    {l}") }).collect::<Vec<_>>().join("\\n") + "\\n";
+        let pre = "        {\\n            constexpr uint j = 3u;\\n";
+        let sub3 = indent(T3_SUB3_HORNER);
+        if src.matches(pre).count() != 1 || src.matches(sub3.as_str()).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(sub3.as_str(), T3_BYTETAB3_MUL, 1))
+    }
+
+    fn with_t3_bytetab3(src: &str) -> Option<String> {
+        let pre = "    {\n        constexpr uint j = 3u;\n";
+        if src.matches(pre).count() != 1 || src.matches(T3_SUB3_HORNER).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(T3_SUB3_HORNER, T3_BYTETAB3_MUL, 1))
+    }
+
+    const T3_BYTETAB2: &str = "    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        threadgroup ulong* tab64 = (threadgroup ulong*)tabB;
+        const uint cc = lid >> 4;
+        const uint base = (lid & 15u) * 16u;
+        const uint4 tw4 = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2) + cc];
+        const ulong t = ulong(tw4.x) | (ulong(tw4.y) << 32);
+        ulong hb = 0ul;
+        for (uint k = 4u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= t << k; } }
+        for (uint i = 0u; i < 16u; i++) {
+            ulong v = hb;
+            for (uint k = 0u; k < 4u; k++) { if ((i >> k) & 1u) { v ^= t << k; } }
+            tab64[cc * 256u + base + i] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        threadgroup const ulong* tab64 = (threadgroup const ulong*)tabB;
+        for (uint b = 0; b < 8u; b++) {
+            const uint eu = ((b >> 1) << 2) | (b & 1u);
+            const uint ev = eu | 2u;
+            threadgroup const ulong* T = tab64 + (b >> 1) * 256u;
+            const uint4 V = elems[ev];
+            ulong a0 = 0ul, a1 = 0ul, a2 = 0ul;
+            #define BT2(W, SH, LO, HI) { \\
+                const ulong e = T[extract_bits((W), (SH) & 31u, 8)]; \\
+                LO ^= e << (SH); if ((SH) != 0u) { HI ^= e >> (64u - (SH)); } }
+            BT2(V.x, 0u, a0, a1) BT2(V.x, 8u, a0, a1) BT2(V.x, 16u, a0, a1) BT2(V.x, 24u, a0, a1)
+            BT2(V.y, 32u, a0, a1) BT2(V.y, 40u, a0, a1) BT2(V.y, 48u, a0, a1) BT2(V.y, 56u, a0, a1)
+            BT2(V.z, 0u, a1, a2) BT2(V.z, 8u, a1, a2) BT2(V.z, 16u, a1, a2) BT2(V.z, 24u, a1, a2)
+            BT2(V.w, 32u, a1, a2) BT2(V.w, 40u, a1, a2) BT2(V.w, 48u, a1, a2) BT2(V.w, 56u, a1, a2)
+            #undef BT2
+            a0 ^= a2 ^ (a2 << 1) ^ (a2 << 2) ^ (a2 << 7);
+            const uint4 pr = uint4(uint(a0), uint(a0 >> 32), uint(a1), uint(a1 >> 32));
+            const uint4 nu = elems[eu] ^ pr;
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+";
+
+    fn with_t3_bytetab2(src: &str) -> Option<String> {
+        let old = "    NTT_T3_SHORT_PAIR(2u, 0u)\n    NTT_T3_SHORT_PAIR(2u, 2u)\n";
+        if src.matches(old).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(old, T3_BYTETAB2, 1))
+    }
+
+    fn final_t3_msl_source() -> std::borrow::Cow<'static, str> {
+        let mut s = std::borrow::Cow::Borrowed(NTT_FINAL_T3_MSL_SOURCE);
+        if super::gpu_t3_bytetab_enabled() {
+            if let Some(x) = with_t3_bytetab3(&s) {
+                s = std::borrow::Cow::Owned(x);
+            }
+        }
+        if super::gpu_t3_bytetab2_enabled() {
+            if let Some(x) = with_t3_bytetab2(&s) {
+                s = std::borrow::Cow::Owned(x);
+            }
+        }
+        s
+    }
+
+    #[cfg(test)]
+    mod t3_bytetab2_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab2_splice_applies_alone_and_after_sub3() {
+            let a = with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).expect("sub-layer 2 not found");
+            assert!(a.contains("tab64[cc * 256u + base + i] = v;") && !a.contains("NTT_T3_SHORT_PAIR(2u, 0u)"));
+            let b = with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).expect("not after sub-layer 3");
+            assert!(b.contains("tab64[cc * 256u + base + i] = v;") && b.contains("tab3[cc * 256u + base + i] = v;"));
+        }
+
+        #[test]
+        fn t3_bytetab2_twiddle_bound_holds() {
+            assert!(super::super::max_twiddle_bits(20, 18) <= 40);
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab2_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let groups = 256usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = groups * 16 * 64 * 16;
+                let input: Vec<u8> = {
+                    let mut x = 0x0123_4567_89AB_CDEFu64;
+                    (0..len / 8)
+                        .flat_map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            x.to_le_bytes()
+                        })
+                        .collect()
+                };
+                let data = gpu.new_buffer(len).unwrap();
+                let run = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, groups as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                };
+                let inc = run(NTT_FINAL_T3_MSL_SOURCE);
+                let two = run(&with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                let both = run(&with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).unwrap());
+                assert!(inc != input, "the pass did not run");
+                assert!(inc == two, "byte-table sub-layer 2 changed the final pass's output");
+                assert!(inc == both, "both byte-table sub-layers changed the final pass's output");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod t3_bytetab_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab_splice_applies() {
+            let out = with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).expect("incumbent sub-layer 3 not found");
+            assert!(out.contains("tab3[cc * 256u + base + i] = v;"));
+            assert!(!out.contains("acc = gf_shl4(acc);"));
+            assert!(out.contains("kernel void ntt_final_t3("));
+        }
+
+        #[test]
+        fn t3_bytetab_twiddle_bound_holds() {
+            assert!(super::super::pass5_mixed_ok(20, 16, 4));
+            assert!(super::super::max_twiddle_bits(20, 19) <= 20);
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let groups = 256usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = groups * 16 * 64 * 16;
+                let input: Vec<u8> = {
+                    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+                    (0..len / 8)
+                        .flat_map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            x.to_le_bytes()
+                        })
+                        .collect()
+                };
+                let data = gpu.new_buffer(len).unwrap();
+                let run = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, groups as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                };
+                let inc = run(NTT_FINAL_T3_MSL_SOURCE);
+                let new = run(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                assert!(inc != input, "the pass did not run");
+                assert!(inc == new, "byte-table sub-layer 3 changed the final pass's output");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod t3_form_probe {
+        use super::*;
+
+        fn variant(name: &str) -> String {
+            match name {
+                "incumbent" => NTT_FINAL_T3_MSL_SOURCE.to_owned(),
+                "bytetab3" => with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap(),
+                "bytetab2" => with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).unwrap(),
+                "both" => with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).unwrap(),
+                _ => panic!("unknown variant {name}"),
+            }
+        }
+
+        #[test]
+        #[ignore]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_form_probe() {
+            let names: Vec<String> = std::env::var("T3_PROBE_VARIANTS")
+                .unwrap_or_else(|_| "incumbent,bytetab3,bytetab2,both".into())
+                .split(',')
+                .map(|s| s.to_owned())
+                .collect();
+            let rounds: usize = std::env::var("T3_PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let gpu = gpu().expect("gpu");
+            let log_d = 20usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let mut psos = Vec::new();
+                for n in &names {
+                    let pso = compile_supplemental_pipeline(gpu, &variant(n), "ntt_final_t3")
+                        .unwrap_or_else(|e| panic!("{n}: {e}"));
+                    let (tg, w, maxt) = gpu.pipeline_resources(pso);
+                    println!("variant {n}: threadgroup mem {tg} B, simd {w}, max threads {maxt}");
+                    psos.push(pso);
+                }
+                let data_len = (1usize << log_d) * 64 * 16;
+                let input = gpu.new_buffer(data_len).unwrap();
+                let data = gpu.new_buffer(data_len).unwrap();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let w = gpu.buffer_contents(input).cast::<u64>();
+                let mut x = 0x2545_F491_4F6C_DD1Du64;
+                for i in 0..data_len / 8 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *w.add(i) = x;
+                }
+                let run = |pso: Id| -> (f64, u64) {
+                    std::ptr::copy_nonoverlapping(gpu.buffer_contents(input), gpu.buffer_contents(data), data_len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let (s, e) = cb_gpu_interval(gpu, cb);
+                    let words = std::slice::from_raw_parts(gpu.buffer_contents(data).cast::<u64>(), data_len / 8);
+                    let mut h = 0xcbf2_9ce4_8422_2325u64;
+                    for &w in words.iter().step_by(7) {
+                        h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                    }
+                    ((e - s) * 1e3, h)
+                };
+                let (_, h_ref) = run(psos[0]);
+                let mut times: Vec<Vec<f64>> = vec![Vec::new(); psos.len()];
+                for r in 0..rounds {
+                    let k = psos.len();
+                    for j in 0..k {
+                        let i = (r + j) % k;
+                        let (ms, h) = run(psos[i]);
+                        if !names[i].starts_with("x_") {
+                            assert_eq!(h, h_ref, "variant {} output differs", names[i]);
+                        }
+                        times[i].push(ms);
+                    }
+                }
+                for (i, n) in names.iter().enumerate() {
+                    let mut t = times[i].clone();
+                    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let mut d: Vec<f64> = times[i].iter().zip(&times[0]).map(|(a, b)| a - b).collect();
+                    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let lower = times[i].iter().zip(&times[0]).filter(|(a, b)| a < b).count();
+                    println!(
+                        "summary {n}: median {:.2} ms, min {:.2} ms, paired median vs incumbent {:+.2} ms, lower in {lower} of {}",
+                        t[t.len() / 2], t[0], d[d.len() / 2], t.len()
+                    );
+                }
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
     const NTT_FINAL_T3_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -4923,7 +5337,19 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
 "#;
 
     pub(crate) fn final_leaf_msl_source() -> String {
-        format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}")
+        let extra: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(NTT_FINAL_LEAF_EXTRA_MSL);
+        let extra = if super::gpu_t3_bytetab_enabled() {
+            with_fused_bytetab3(&extra).unwrap_or(extra.into_owned()).into()
+        } else {
+            extra
+        };
+        let extra: std::borrow::Cow<'static, str> = if super::gpu_t3_bytetab2_enabled() {
+            let old = "        NTT_T3_SHORT_PAIR(2u, 0u)\n        NTT_T3_SHORT_PAIR(2u, 2u)\n";
+            if extra.matches(old).count() == 1 { extra.replacen(old, T3_BYTETAB2, 1).into() } else { extra }
+        } else {
+            extra
+        };
+        format!("{}{extra}", final_t3_msl_source())
     }
 
     pub(crate) fn final_leaf_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
@@ -5933,6 +6359,118 @@ kernel void blake3_pow_scan(
     }
 
     // -----------------------------------------------------------------------
+    // Embedded precompiled metallibs for the SUPPLEMENTAL libraries.
+    //
+    // Same idea as `gpu_shaders.metallib`, extended to every supplemental
+    // library that a fresh ranked worker builds at init (zero-root, parent3,
+    // leaf-vec4, final-t3/leaf, g4x2, pow, zc/lc fold, rec-merkle, zc r2/t3/
+    // loop, zfold). Under the benchmark's sandbox profile Metal cannot keep
+    // its shader cache, so each of the 120 fresh workers re-runs the MSL
+    // frontend for every one of them. Init only: it precedes the untimed
+    // warm-up prove, so no timed work changes; the backend (AIR -> GPU)
+    // compile in `newComputePipelineStateWithFunction:` still runs, and the
+    // kernels are compiled from the very same source text.
+    //
+    // Keyed by the FNV-1a of the exact source string handed to Metal, so a
+    // changed or differently composed source simply misses the table and
+    // takes the incumbent `newLibraryWithSource:` path. Any load failure
+    // falls back to it as well. `FLOCK_NO_GPU_METALLIB=1` disables this
+    // together with the main embedded library.
+    // -----------------------------------------------------------------------
+
+    // Generated by: run a ranked worker with FLOCK_DUMP_SUPP_MSL=<dir>, then
+    // per dumped `<fnv>.metal`: `xcrun -sdk macosx metal
+    // -mmacosx-version-min=13.0 -c <fnv>.metal -o <fnv>.air && xcrun -sdk
+    // macosx metallib <fnv>.air -o supp_metallibs/<fnv>.metallib` (same AIR
+    // target, air64_v25 / macOS 13, as `gpu_shaders.metallib`).
+    static SUPP_METALLIBS: &[(u64, &[u8])] = &[
+        (0x0f53f61e34ef78e7, include_bytes!("supp_metallibs/0f53f61e34ef78e7.metallib")),
+        (0x291b88a831340962, include_bytes!("supp_metallibs/291b88a831340962.metallib")),
+        (0x404f4ab0fb778e78, include_bytes!("supp_metallibs/404f4ab0fb778e78.metallib")),
+        (0x405dbfdc40ebb542, include_bytes!("supp_metallibs/405dbfdc40ebb542.metallib")),
+        (0x45c3af9fd3b4d07e, include_bytes!("supp_metallibs/45c3af9fd3b4d07e.metallib")),
+        (0x4a1cd4507c41d257, include_bytes!("supp_metallibs/4a1cd4507c41d257.metallib")),
+        (0x5d3456201a1fe4cb, include_bytes!("supp_metallibs/5d3456201a1fe4cb.metallib")),
+        (0x8613bd0620d7dfad, include_bytes!("supp_metallibs/8613bd0620d7dfad.metallib")),
+        (0x9b202e4d10ab9929, include_bytes!("supp_metallibs/9b202e4d10ab9929.metallib")),
+        (0xc2b2c7ad30c02220, include_bytes!("supp_metallibs/c2b2c7ad30c02220.metallib")),
+        (0xc318a94f19d42e5e, include_bytes!("supp_metallibs/c318a94f19d42e5e.metallib")),
+        (0xd1e10c8328f43032, include_bytes!("supp_metallibs/d1e10c8328f43032.metallib")),
+        (0xd619da745a231b04, include_bytes!("supp_metallibs/d619da745a231b04.metallib")),
+        (0xf36eb2a940171d80, include_bytes!("supp_metallibs/f36eb2a940171d80.metallib")),
+        (0xf78ffb63e303cbb7, include_bytes!("supp_metallibs/f78ffb63e303cbb7.metallib")),
+        (0xfd79534df62711f9, include_bytes!("supp_metallibs/fd79534df62711f9.metallib")),
+    ];
+
+    /// Build a supplemental library: the embedded metallib whose source hash
+    /// matches `msl`, else `newLibraryWithSource:options:error:` on `src`
+    /// (the NSString of `msl`) exactly as before.
+    unsafe fn supp_library(api: &Api, device: Id, msl: &str, src: Id, err: &mut Id) -> Id {
+        let h = fnv1a64(msl);
+        if let Some(dir) = std::env::var_os("FLOCK_DUMP_SUPP_MSL") {
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join(format!("{h:016x}.metal")),
+                msl,
+            );
+        }
+        // Diagnostic only (`FLOCK_SUPP_TRACE=1`): which path built each
+        // library and how long the library creation took.
+        let trace = std::env::var_os("FLOCK_SUPP_TRACE").is_some();
+        let t0 = trace.then(std::time::Instant::now);
+        let lib = unsafe { supp_library_inner(api, device, h, src, err) };
+        if let Some(t0) = t0 {
+            eprintln!(
+                "[supp-lib] {h:016x} {} {:.2} ms",
+                if lib.1 { "embedded" } else { "source" },
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        lib.0
+    }
+
+    unsafe fn supp_library_inner(api: &Api, device: Id, h: u64, src: Id, err: &mut Id) -> (Id, bool) {
+        if super::gpu_metallib_enabled() {
+            if let (Some(&(_, bytes)), Some(create)) = (
+                SUPP_METALLIBS.iter().find(|e| e.0 == h),
+                api.dispatch_data_create,
+            ) {
+                unsafe {
+                    let data = create(bytes.as_ptr().cast(), bytes.len(), NIL, NIL);
+                    if !data.is_null() {
+                        let mut data_err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithData:error:",
+                            data,
+                            &mut data_err
+                        );
+                        if let Some(release) = api.dispatch_release {
+                            release(data);
+                        }
+                        if !library.is_null() {
+                            return (library, true);
+                        }
+                    }
+                }
+            }
+        }
+        let library: Id = unsafe {
+            send!(
+                api,
+                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                device,
+                c"newLibraryWithSource:options:error:",
+                src,
+                NIL,
+                err as *mut Id
+            )
+        };
+        (library, false)
+    }
+
+    // -----------------------------------------------------------------------
     // Context: device, queue, pipelines. Created once per process.
     // -----------------------------------------------------------------------
 
@@ -5950,18 +6488,38 @@ kernel void blake3_pow_scan(
     /// grows: `signaledValue >= v` can only mean this buffer's signal ran.
     static DONE_POOL: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
 
+    /// A main-library pipeline whose backend compile may be deferred to its
+    /// first use (`Gpu::lazy_pso`); built eagerly when lazy mode is off.
+    pub(crate) struct LazyPso {
+        name: &'static str,
+        cell: OnceLock<usize>,
+    }
+
+    impl LazyPso {
+        fn new(name: &'static str, built: Id) -> Self {
+            let cell = OnceLock::new();
+            if !built.is_null() {
+                let _ = cell.set(built as usize);
+            }
+            Self { name, cell }
+        }
+    }
+
     pub(crate) struct Gpu {
         pub(crate) api: Api,
         pub(crate) device: Id,
         pub(crate) queue: Id,
-        pub(crate) pso_ntt: Id,
-        pub(crate) pso_ntt4g4: Id,
-        pub(crate) pso_ntt4: Id,
-        pub(crate) pso_ntt3: Id,
-        pub(crate) pso_ntt4z: Id,
+        /// Main library retained for the lazy pipelines (NIL when every
+        /// pipeline was built at init).
+        lazy_lib: Id,
+        pub(crate) pso_ntt: LazyPso,
+        pub(crate) pso_ntt4g4: LazyPso,
+        pub(crate) pso_ntt4: LazyPso,
+        pub(crate) pso_ntt3: LazyPso,
+        pub(crate) pso_ntt4z: LazyPso,
         /// Pass-tuned variants: g4 shared-table from-z with the zero-region
         /// sub-layer skipped, and the half-footprint final-pass kernel.
-        pub(crate) pso_ntt4zg4: Id,
+        pub(crate) pso_ntt4zg4: LazyPso,
         /// Ranked-only direct zero-root specialization. This supplemental
         /// PSO constructs eleven compact tables per group; it never reads a
         /// prebuilt device table.
@@ -5970,8 +6528,8 @@ kernel void blake3_pow_scan(
         /// `NIL` outside `cfg(test)`.
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) pso_export_from_z_zero_root_tabs: Id,
-        pub(crate) pso_ntt4h8: Id,
-        pub(crate) pso_ntt5mix: Id,
+        pub(crate) pso_ntt4h8: LazyPso,
+        pub(crate) pso_ntt5mix: LazyPso,
         pub(crate) pso_leaf: Id,
         pub(crate) pso_parent: Id,
         pub(crate) pso_parent3: Id,
@@ -6069,6 +6627,22 @@ kernel void blake3_pow_scan(
                     "parent_hash",
                     "parent_hash3",
                 ];
+                // Kernels whose pipelines the ranked path never selects (its
+                // NTT passes run the supplemental zero-root / g4x2 / final-T3 /
+                // final-leaf pipelines). Their backend compiles are deferred to
+                // first use; `FLOCK_NO_GPU_LAZY_PSO` (any value) builds all
+                // eleven at init as before. Same pipelines either way.
+                const LAZY_KERNELS: [&str; 8] = [
+                    "ntt_fused",
+                    "ntt_fused_reg4g4",
+                    "ntt_fused_reg4",
+                    "ntt_fused_reg3",
+                    "ntt_fused_reg4_from_z",
+                    "ntt_fused_reg4_from_zg4",
+                    "ntt_fused_reg4h8",
+                    "ntt_pass5_mixed",
+                ];
+                let lazy = super::gpu_lazy_pso_enabled();
                 let build_psos = |library: Id| -> Result<[Id; 11], String> {
                     let mut out = [NIL; 11];
                     for (slot, name) in out.iter_mut().zip(KERNELS) {
@@ -6082,6 +6656,13 @@ kernel void blake3_pow_scan(
                         );
                         if f.is_null() {
                             return Err(format!("kernel {name} not found"));
+                        }
+                        // Lazy kernels: the function exists (checked above),
+                        // but its backend compile is deferred to first use
+                        // (`Gpu::lazy_pso`). NIL marks "not built yet".
+                        if lazy && LAZY_KERNELS.contains(&name) {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                            continue;
                         }
                         let mut err: Id = NIL;
                         let p: Id = send!(
@@ -6101,17 +6682,24 @@ kernel void blake3_pow_scan(
                     Ok(out)
                 };
                 let mut psos: Option<[Id; 11]> = None;
+                // The library the lazy kernels compile from; retained for the
+                // process lifetime when lazy mode is on (NIL otherwise).
+                let mut lazy_lib: Id = NIL;
                 let prebuilt = try_embedded_metallib(&api, device);
                 if !prebuilt.is_null() {
                     if let Ok(p) = build_psos(prebuilt) {
                         psos = Some(p);
                     }
-                    send!(
-                        api,
-                        unsafe extern "C" fn(Id, Sel) -> Id,
-                        prebuilt,
-                        c"release"
-                    );
+                    if lazy && psos.is_some() {
+                        lazy_lib = prebuilt;
+                    } else {
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            prebuilt,
+                            c"release"
+                        );
+                    }
                 }
                 let [
                     pso_ntt,
@@ -6146,12 +6734,16 @@ kernel void blake3_pow_scan(
                             ));
                         }
                         let p = build_psos(library)?;
-                        send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel) -> Id,
-                            library,
-                            c"release"
-                        );
+                        if lazy {
+                            lazy_lib = library;
+                        } else {
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                library,
+                                c"release"
+                            );
+                        }
                         p
                     }
                 };
@@ -6163,15 +6755,8 @@ kernel void blake3_pow_scan(
                     if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
                         let src = api.nsstring(FROM_Z_ZERO_ROOT_MSL_SOURCE)?;
                         let mut err: Id = NIL;
-                        let library: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
-                        );
+                        let library: Id =
+                            supp_library(&api, device, FROM_Z_ZERO_ROOT_MSL_SOURCE, src, &mut err);
                         if library.is_null() {
                             return Err(format!(
                                 "from-z zero-root shader compile failed: {}",
@@ -6233,15 +6818,8 @@ kernel void blake3_pow_scan(
                     (|| -> Result<Id, String> {
                         let src = api.nsstring(LEAF_PARENT3_MSL_SOURCE)?;
                         let mut err: Id = NIL;
-                        let library: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
-                        );
+                        let library: Id =
+                            supp_library(&api, device, LEAF_PARENT3_MSL_SOURCE, src, &mut err);
                         if library.is_null() {
                             return Err(format!(
                                 "leaf_parent3 shader compile failed: {}",
@@ -6310,15 +6888,8 @@ kernel void blake3_pow_scan(
                     let built = (|| -> Result<(Id, Id), String> {
                         let src = api.nsstring(LEAF_VEC4_MSL_SOURCE)?;
                         let mut err: Id = NIL;
-                        let library: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
-                        );
+                        let library: Id =
+                            supp_library(&api, device, LEAF_VEC4_MSL_SOURCE, src, &mut err);
                         if library.is_null() {
                             return Err(format!(
                                 "leaf-vec4 shader compile failed: {}",
@@ -6420,15 +6991,8 @@ kernel void blake3_pow_scan(
                     (|| -> Result<(Id, Id), String> {
                         let src = api.nsstring(POW_MSL_SOURCE)?;
                         let mut err: Id = NIL;
-                        let library: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
-                        );
+                        let library: Id =
+                            supp_library(&api, device, POW_MSL_SOURCE, src, &mut err);
                         if library.is_null() {
                             return Err(format!(
                                 "PCS grind shader compile failed: {}",
@@ -6503,17 +7067,10 @@ kernel void blake3_pow_scan(
                 // `ntt_fused_reg4g4`.
                 let pso_ntt4g4x2 = if super::gpu_g4x2_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(g4x2_msl_source())?;
+                        let msl = g4x2_msl_source();
+                        let src = api.nsstring(msl)?;
                         let mut err: Id = NIL;
-                        let library: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
-                        );
+                        let library: Id = supp_library(&api, device, msl, src, &mut err);
                         if library.is_null() {
                             return Err(format!(
                                 "g4x2 shader compile failed: {}",
@@ -6572,17 +7129,10 @@ kernel void blake3_pow_scan(
                 // leaves NIL and the encoders keep `ntt_pass5_mixed`.
                 let pso_ntt5t3 = if super::gpu_final_t3_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(NTT_FINAL_T3_MSL_SOURCE)?;
+                        let msl = final_t3_msl_source();
+                        let src = api.nsstring(&msl)?;
                         let mut err: Id = NIL;
-                        let library: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
-                        );
+                        let library: Id = supp_library(&api, device, &msl, src, &mut err);
                         if library.is_null() {
                             return Err(format!(
                                 "final-t3 shader compile failed: {}",
@@ -6638,17 +7188,10 @@ kernel void blake3_pow_scan(
                 };
                 let pso_final_leaf = if super::gpu_final_leaf_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(&final_leaf_msl_source())?;
+                        let msl = final_leaf_msl_source();
+                        let src = api.nsstring(&msl)?;
                         let mut err: Id = NIL;
-                        let library: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
-                        );
+                        let library: Id = supp_library(&api, device, &msl, src, &mut err);
                         if library.is_null() {
                             return Err(format!(
                                 "final-leaf shader compile failed: {}",
@@ -6706,16 +7249,17 @@ kernel void blake3_pow_scan(
                     api,
                     device,
                     queue,
-                    pso_ntt,
-                    pso_ntt4g4,
-                    pso_ntt4,
-                    pso_ntt3,
-                    pso_ntt4z,
-                    pso_ntt4zg4,
+                    lazy_lib,
+                    pso_ntt: LazyPso::new("ntt_fused", pso_ntt),
+                    pso_ntt4g4: LazyPso::new("ntt_fused_reg4g4", pso_ntt4g4),
+                    pso_ntt4: LazyPso::new("ntt_fused_reg4", pso_ntt4),
+                    pso_ntt3: LazyPso::new("ntt_fused_reg3", pso_ntt3),
+                    pso_ntt4z: LazyPso::new("ntt_fused_reg4_from_z", pso_ntt4z),
+                    pso_ntt4zg4: LazyPso::new("ntt_fused_reg4_from_zg4", pso_ntt4zg4),
                     pso_ntt4zg4_zero_root,
                     pso_export_from_z_zero_root_tabs,
-                    pso_ntt4h8,
-                    pso_ntt5mix,
+                    pso_ntt4h8: LazyPso::new("ntt_fused_reg4h8", pso_ntt4h8),
+                    pso_ntt5mix: LazyPso::new("ntt_pass5_mixed", pso_ntt5mix),
                     pso_leaf,
                     pso_parent,
                     pso_parent3,
@@ -6740,6 +7284,50 @@ kernel void blake3_pow_scan(
     // -----------------------------------------------------------------------
 
     impl Gpu {
+        /// The pipeline in `slot`, compiling it from the retained main library
+        /// on first use. Same function, same device: the same pipeline the
+        /// eager init would have built.
+        pub(crate) unsafe fn lazy_pso(&self, slot: &LazyPso) -> Id {
+            *slot.cell.get_or_init(|| unsafe {
+                let pool = (self.api.pool_push)();
+                let built = (|| -> Result<Id, String> {
+                    if self.lazy_lib.is_null() {
+                        return Err("no library retained".into());
+                    }
+                    let ns = self.api.nsstring(slot.name)?;
+                    let f: Id = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        self.lazy_lib,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err("kernel not found".into());
+                    }
+                    let mut err: Id = NIL;
+                    let p: Id = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        self.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut err
+                    );
+                    send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                    if p.is_null() {
+                        return Err(self.api.error_string(err));
+                    }
+                    Ok(p)
+                })();
+                (self.api.pool_pop)(pool);
+                match built {
+                    Ok(p) => p as usize,
+                    Err(e) => panic!("lazy pipeline {}: {e}", slot.name),
+                }
+            }) as Id
+        }
+
         pub(crate) unsafe fn pool_push(&self) -> *mut c_void {
             unsafe { (self.api.pool_push)() }
         }
@@ -7370,9 +7958,9 @@ kernel void blake3_pow_scan(
                     debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
                     gpu.pso_ntt4zg4_zero_root
                 } else if self.grouped {
-                    gpu.pso_ntt4zg4
+                    gpu.lazy_pso(&gpu.pso_ntt4zg4)
                 } else {
-                    gpu.pso_ntt4z
+                    gpu.lazy_pso(&gpu.pso_ntt4z)
                 };
                 gpu.set_pipeline(enc, pso);
                 gpu.set_buffer(enc, staging, byte_offset, 0);
@@ -7493,13 +8081,13 @@ kernel void blake3_pow_scan(
                         (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
-                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
+                        (gpu.lazy_pso(&gpu.pso_ntt4g4), 64u64, 1u64 << (log_d - f - share_log))
                     }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
                         let pso = if gpu.pso_ntt5t3.is_null() {
-                            gpu.pso_ntt5mix
+                            gpu.lazy_pso(&gpu.pso_ntt5mix)
                         } else {
                             gpu.pso_ntt5t3
                         };
@@ -7509,10 +8097,10 @@ kernel void blake3_pow_scan(
                     // share, so spend the same occupancy currency the other
                     // way — halve the per-tile table footprint (byte-Horner
                     // 32-entry tables) so twice the tiles fit a core.
-                    4 if super::pass_tune_enabled() => (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f)),
-                    4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
-                    3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
-                    _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
+                    4 if super::pass_tune_enabled() => (gpu.lazy_pso(&gpu.pso_ntt4h8), 64u64, 1u64 << (log_d - f)),
+                    4 => (gpu.lazy_pso(&gpu.pso_ntt4), 64u64, 1u64 << (log_d - f)),
+                    3 => (gpu.lazy_pso(&gpu.pso_ntt3), 64u64, 1u64 << (log_d - f)),
+                    _ => (gpu.lazy_pso(&gpu.pso_ntt), 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
                 gpu.set_pipeline(enc, pso);
                 let p = NttParams {
@@ -7562,13 +8150,13 @@ kernel void blake3_pow_scan(
                         (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
-                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
+                        (gpu.lazy_pso(&gpu.pso_ntt4g4), 64u64, 1u64 << (log_d - f - share_log))
                     }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
                         let pso = if gpu.pso_ntt5t3.is_null() {
-                            gpu.pso_ntt5mix
+                            gpu.lazy_pso(&gpu.pso_ntt5mix)
                         } else {
                             gpu.pso_ntt5t3
                         };
@@ -7578,10 +8166,10 @@ kernel void blake3_pow_scan(
                     // share, so spend the same occupancy currency the other
                     // way — halve the per-tile table footprint (byte-Horner
                     // 32-entry tables) so twice the tiles fit a core.
-                    4 if super::pass_tune_enabled() => (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f)),
-                    4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
-                    3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
-                    _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
+                    4 if super::pass_tune_enabled() => (gpu.lazy_pso(&gpu.pso_ntt4h8), 64u64, 1u64 << (log_d - f)),
+                    4 => (gpu.lazy_pso(&gpu.pso_ntt4), 64u64, 1u64 << (log_d - f)),
+                    3 => (gpu.lazy_pso(&gpu.pso_ntt3), 64u64, 1u64 << (log_d - f)),
+                    _ => (gpu.lazy_pso(&gpu.pso_ntt), 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
                 gpu.set_pipeline(enc, pso);
                 let p = NttParams {
@@ -7638,22 +8226,22 @@ kernel void blake3_pow_scan(
                         (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
-                        (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
+                        (gpu.lazy_pso(&gpu.pso_ntt4g4), 64u64, 1u64 << (log_d - f - share_log))
                     }
                     4 if super::pass_tune_enabled()
                         && super::gpu_mixed_final_selected(log_d, l, f) =>
                     {
                         let pso = if gpu.pso_ntt5t3.is_null() {
-                            gpu.pso_ntt5mix
+                            gpu.lazy_pso(&gpu.pso_ntt5mix)
                         } else {
                             gpu.pso_ntt5t3
                         };
                         (pso, 64u64, 1u64 << (log_d - f))
                     }
-                    4 if super::pass_tune_enabled() => (gpu.pso_ntt4h8, 64u64, 1u64 << (log_d - f)),
-                    4 => (gpu.pso_ntt4, 64u64, 1u64 << (log_d - f)),
-                    3 => (gpu.pso_ntt3, 64u64, 1u64 << (log_d - f)),
-                    _ => (gpu.pso_ntt, 1u64 << (f + 5), 1u64 << (log_d - f)),
+                    4 if super::pass_tune_enabled() => (gpu.lazy_pso(&gpu.pso_ntt4h8), 64u64, 1u64 << (log_d - f)),
+                    4 => (gpu.lazy_pso(&gpu.pso_ntt4), 64u64, 1u64 << (log_d - f)),
+                    3 => (gpu.lazy_pso(&gpu.pso_ntt3), 64u64, 1u64 << (log_d - f)),
+                    _ => (gpu.lazy_pso(&gpu.pso_ntt), 1u64 << (f + 5), 1u64 << (log_d - f)),
                 };
                 gpu.set_pipeline(enc, pso);
                 let p = NttParams {
@@ -11007,6 +11595,16 @@ kernel void blake3_pow_scan(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
         ), lead, extend, phi);
+        let key = if super::gpu_t3_bytetab2_enabled() {
+            key ^ fnv1a64(T3_BYTETAB2).rotate_left(10) ^ 0x5433_4259_5445_3242
+        } else {
+            key
+        };
+        let key = if super::gpu_t3_bytetab_enabled() {
+            key ^ fnv1a64(T3_BYTETAB3_MUL).rotate_left(8) ^ 0x5433_4259_5445_5442
+        } else {
+            key
+        };
         let key = if super::gpu_g4x2_enabled() {
             key ^ fnv1a64(g4x2_msl_source()).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
         } else {
@@ -12602,15 +13200,8 @@ kernel void lc_fold_stripes_factored_b4(
             let built = (|| -> Result<(Id, Id), String> {
                 let src = gpu.api.nsstring(ZC_FOLD_MSL_SOURCE)?;
                 let mut err: Id = NIL;
-                let library: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newLibraryWithSource:options:error:",
-                    src,
-                    NIL,
-                    &mut err
-                );
+                let library: Id =
+                    supp_library(&gpu.api, gpu.device, ZC_FOLD_MSL_SOURCE, src, &mut err);
                 if library.is_null() {
                     return Err(format!(
                         "zerocheck fold shader compile failed: {}",
@@ -12681,15 +13272,8 @@ kernel void lc_fold_stripes_factored_b4(
                 let built_lc = (|| -> Result<Id, String> {
                     let src = gpu.api.nsstring(LC_FOLD_MSL_SOURCE)?;
                     let mut err: Id = NIL;
-                    let library: Id = send!(
-                        gpu.api,
-                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                        gpu.device,
-                        c"newLibraryWithSource:options:error:",
-                        src,
-                        NIL,
-                        &mut err
-                    );
+                    let library: Id =
+                        supp_library(&gpu.api, gpu.device, LC_FOLD_MSL_SOURCE, src, &mut err);
                     if library.is_null() {
                         return Err(format!(
                             "lincheck fold shader compile failed: {}",
@@ -14775,15 +15359,8 @@ kernel void lc_fold_stripes_factored_b4(
         unsafe {
             let src = gpu.api.nsstring(source)?;
             let mut err: Id = NIL;
-            let library: Id = send!(
-                gpu.api,
-                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                gpu.device,
-                c"newLibraryWithSource:options:error:",
-                src,
-                NIL,
-                &mut err
-            );
+            let library: Id =
+                supp_library(&gpu.api, gpu.device, source, src, &mut err);
             if library.is_null() {
                 return Err(format!(
                     "supplemental shader compile failed: {}",
@@ -16278,15 +16855,7 @@ kernel void zc_r2_horner_oracle(
                 let source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled());
                 let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
-                let library: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newLibraryWithSource:options:error:",
-                    src,
-                    NIL,
-                    &mut err
-                );
+                let library: Id = supp_library(&gpu.api, gpu.device, &source, src, &mut err);
                 if library.is_null() {
                     return Err(format!(
                         "zc-r2 shader compile failed: {}",
@@ -16376,6 +16945,27 @@ kernel void zc_r2_horner_oracle(
                 wraps: Vec::new(),
                 prefetch_cb: NIL,
             })
+        }
+    }
+
+    /// Init-only: bring up the GPU and build the round-two products
+    /// pipelines now (see `super::prewarm_gpu_background`).
+    pub(crate) fn prewarm_gpu_and_zc_r2() {
+        let Ok(gpu) = gpu() else { return };
+        if super::gpu_zc_r2_enabled() {
+            let _ = zc_r2_state();
+        }
+        // The two other on-demand pipeline sets the ranked prove builds:
+        // the recursive-commit Merkle kernels and the open's z-fold. Same
+        // init functions, same state slots; an existing slot is left alone.
+        if super::gpu_recursive_merkle_enabled() {
+            let mut g = REC_MERKLE.lock().unwrap_or_else(|e| e.into_inner());
+            if g.is_none() {
+                *g = Some(rec_merkle_init(gpu));
+            }
+        }
+        if std::env::var_os("FLOCK_NO_GPU_ZFOLD").is_none() {
+            zfold::prewarm(gpu);
         }
     }
 
@@ -17285,15 +17875,8 @@ kernel void zc_t3_products(
             let built = (|| -> Result<Id, String> {
                 let src = gpu.api.nsstring(ZC_T3_MSL_SOURCE)?;
                 let mut err: Id = NIL;
-                let library: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newLibraryWithSource:options:error:",
-                    src,
-                    NIL,
-                    &mut err
-                );
+                let library: Id =
+                    supp_library(&gpu.api, gpu.device, ZC_T3_MSL_SOURCE, src, &mut err);
                 if library.is_null() {
                     return Err(format!(
                         "zc-t3 shader compile failed: {}",
@@ -17971,15 +18554,8 @@ kernel void zc_loop_products(
             let built = (|| -> Result<Id, String> {
                 let src = gpu.api.nsstring(ZC_LOOP_MSL_SOURCE)?;
                 let mut err: Id = NIL;
-                let library: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newLibraryWithSource:options:error:",
-                    src,
-                    NIL,
-                    &mut err
-                );
+                let library: Id =
+                    supp_library(&gpu.api, gpu.device, ZC_LOOP_MSL_SOURCE, src, &mut err);
                 if library.is_null() {
                     return Err(format!(
                         "zc-loop shader compile failed: {}",
@@ -18853,6 +19429,14 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
         unsafe impl Send for ZfState {}
 
         static ZF: Mutex<Option<Result<ZfState, String>>> = Mutex::new(None);
+
+        /// Init-only (see `prewarm_gpu_and_zc_r2`): fill `ZF` now if empty.
+        pub(crate) fn prewarm(gpu: &'static Gpu) {
+            let mut guard = ZF.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = Some(zf_init(gpu));
+            }
+        }
 
         fn zf_init(gpu: &'static Gpu) -> Result<ZfState, String> {
             unsafe {
@@ -20186,7 +20770,7 @@ mod tests {
             // Untouched incumbent g4 first pass.
             let cb = gpu.command_buffer().unwrap();
             let enc = gpu.compute_encoder(cb).unwrap();
-            gpu.set_pipeline(enc, gpu.pso_ntt4zg4);
+            gpu.set_pipeline(enc, gpu.lazy_pso(&gpu.pso_ntt4zg4));
             gpu.set_buffer(enc, incumbent, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
             let p = imp::NttParams {
@@ -20825,9 +21409,9 @@ mod tests {
                 }
                 best
             };
-            let base = time_pass(gpu.pso_ntt4, 16, 0);
-            let h8 = time_pass(gpu.pso_ntt4h8, 16, 0);
-            let mid_g4 = time_pass(gpu.pso_ntt4g4, 8, 2);
+            let base = time_pass(gpu.lazy_pso(&gpu.pso_ntt4), 16, 0);
+            let h8 = time_pass(gpu.lazy_pso(&gpu.pso_ntt4h8), 16, 0);
+            let mid_g4 = time_pass(gpu.lazy_pso(&gpu.pso_ntt4g4), 8, 2);
             eprintln!(
                 "final-pass probe l=16 s=0: reg4 {base:.2} ms, h8 {h8:.2} ms \
                  (mid-pass g4 reference l=8: {mid_g4:.2} ms)"
@@ -21086,8 +21670,8 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 ("t15_p15k (30.8 KiB)", "probe_g4_t15_p15k"),
                 ("t8_p0 (8.7 KiB, fake math)", "probe_g4_t8_p0"),
             ];
-            let incumbent8 = time_pass(gpu.pso_ntt4g4, 8);
-            let incumbent12 = time_pass(gpu.pso_ntt4g4, 12);
+            let incumbent8 = time_pass(gpu.lazy_pso(&gpu.pso_ntt4g4), 8);
+            let incumbent12 = time_pass(gpu.lazy_pso(&gpu.pso_ntt4g4), 12);
             eprintln!("incumbent pso_ntt4g4: l=8 {incumbent8:.2} ms, l=12 {incumbent12:.2} ms");
             for (label, name) in variants {
                 let pso = imp::compile_supplemental_pipeline(gpu, PROBE_MSL, name).unwrap();
@@ -22838,7 +23422,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
                 gpu.set_bytes(enc, bytes, 2);
             };
             let generic = |enc: imp::Id, l: usize, f: usize| {
-                gpu.set_pipeline(enc, gpu.pso_ntt);
+                gpu.set_pipeline(enc, gpu.lazy_pso(&gpu.pso_ntt));
                 gpu.set_buffer(enc, data_buf, 0, 0);
                 gpu.set_buffer(enc, tw_buf, 0, 1);
                 params(enc, l, f);
