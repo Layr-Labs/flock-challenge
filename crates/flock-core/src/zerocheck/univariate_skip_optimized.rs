@@ -1859,7 +1859,14 @@ fn ab_window_rows_plan() -> AbWindowRows {
             rows::<0, false>
         }
     } else if k::ab_hz_helper_enabled() && k::ab_horner2_enabled() {
-        rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>
+        // The helper instance takes the one-check-per-window entry too
+        // (`FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` restores one check per row).
+        // The plain instance otherwise, like every other kill-switch arm.
+        if k::ab_row_setup_hoist_enabled() {
+            rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, true>
+        } else {
+            rows::<0, false>
+        }
     } else {
         rows::<0, false>
     }
@@ -1923,8 +1930,8 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
     const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
     if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
         Some(unit::<MAIN, true>)
-    } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, false> as AbWindowRows) {
-        Some(unit::<HELPER, false>)
+    } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, true> as AbWindowRows) {
+        Some(unit::<HELPER, true>)
     } else {
         None
     }
@@ -5861,7 +5868,7 @@ mod tests {
 
         const V0: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
         let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 }, true>;
-        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>;
+        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, true>;
         assert!(!core::ptr::fn_addr_eq(main, plain));
         let switches = [
             "FLOCK_NO_ZC_AB_KARA",
@@ -6620,7 +6627,7 @@ mod tests {
             ab_window_unit_plan(r).is_some_and(|got| core::ptr::fn_addr_eq(got, u))
         };
         assert!(maps(rows::<MAIN, true>, unit::<MAIN, true>));
-        assert!(maps(rows::<HELPER, false>, unit::<HELPER, false>));
+        assert!(maps(rows::<HELPER, true>, unit::<HELPER, true>));
         assert!(ab_window_unit_plan(rows::<V0, true>).is_none());
         assert!(ab_window_unit_plan(rows::<{ k::AB_ROWS_VARIANT }, false>).is_none());
         let switches = [
