@@ -856,3 +856,63 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u16, const HOIST: bool>(
         rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
     }
 }
+
+/// The window rows of consecutive chunks in one call: chunk `i` of
+/// `out_unit` (1 KiB each) is chunk `x_outer + i` of window
+/// `(x_outer + i) & window_mask`, reads its rows at
+/// `chunk_byte_base + i * 1 KiB` with `partials[w]` and gets the rows, the
+/// checks and the stores of one [`bstatic_horner_window_rows_impl`] call
+/// with those arguments. The table pointer is fetched once per call.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) fn bstatic_horner_window_unit_impl<const V: u16, const HOIST: bool>(
+    x_outer: usize,
+    window_mask: usize,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    partials: [&'static [[u8; 64]; 248]; 2],
+    out_unit: &mut [u8],
+    nt_store: bool,
+) {
+    let kara = if V & ABV_KARA != 0 {
+        ab_kara_tables(inv_table)
+    } else if V & ABV_HZ != 0 {
+        ab_hz_tables(inv_table)
+    } else {
+        core::ptr::null()
+    };
+    for (i, out_outer) in out_unit.chunks_exact_mut(16 * 64).enumerate() {
+        let w = (x_outer + i) & window_mask;
+        let chunk_byte_base = chunk_byte_base + i * 16 * 64;
+        assert!(w <= 1);
+        let partials = partials[w];
+        if HOIST {
+            let end = chunk_byte_base + BSTATIC_HORNER_WINDOW_ROWS[w].1 * N_CHUNKS * 8;
+            assert!(end <= a_packed.len() && end <= b_packed.len());
+        }
+        let out = out_outer.as_mut_ptr();
+        macro_rules! rows {
+            ($($blk:literal),*) => {{
+                $(
+                    // SAFETY: `$blk % 16 < 16` and `out_outer` holds 16 rows of 64 bytes.
+                    let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
+                    if V & ABV_INLINE_WINDOW != 0 {
+                        bstatic_horner_blk_body::<$blk, V, HOIST>(
+                            a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store,
+                        );
+                    } else {
+                        bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store);
+                    }
+                )*
+            }};
+        }
+        if w == 0 {
+            rows!(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        } else {
+            rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+        }
+    }
+}
