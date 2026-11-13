@@ -8814,96 +8814,12 @@ fn query_set_presized_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_QUERY_SET_PRESIZE").is_none())
 }
 
-/// Kill switch for the probe set of query sampling: `FLOCK_NO_QUERY_PROBE_SET`
-/// (any value) restores the SipHash `HashSet`. Read once per process.
-fn query_probe_set_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_QUERY_PROBE_SET").is_none())
-}
-
-/// Fixed 1024-slot open-addressing membership set for query dedupe (port of
-/// the x86 track's `Gl2QSet`, e-man07 fd1b67de item 6). Thread-local and
-/// reused: one 4 KiB array, cleared after each use, no SipHash and no
-/// allocation. Only answers membership, so the kept positions and their
-/// first-occurrence order are exactly the `HashSet` path's.
-struct QueryProbeSet {
-    slots: [u32; 1024],
-}
-
-impl QueryProbeSet {
-    const EMPTY: u32 = u32::MAX;
-
-    /// Insert `q`; true when it was not present. Needs `q < u32::MAX` and at
-    /// most 256 members (load factor <= 1/4).
-    #[inline]
-    fn insert(&mut self, q: usize) -> bool {
-        let key = q as u32;
-        let mut i = (key.wrapping_mul(0x9E37_79B1) >> 22) as usize;
-        loop {
-            let s = self.slots[i];
-            if s == key {
-                return false;
-            }
-            if s == Self::EMPTY {
-                self.slots[i] = key;
-                return true;
-            }
-            i = (i + 1) & 1023;
-        }
-    }
-
-    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        thread_local! {
-            static SET: std::cell::RefCell<Box<QueryProbeSet>> =
-                std::cell::RefCell::new(Box::new(QueryProbeSet { slots: [QueryProbeSet::EMPTY; 1024] }));
-        }
-        SET.with(|c| {
-            let mut set = c.borrow_mut();
-            let r = f(&mut set);
-            set.slots.fill(Self::EMPTY);
-            r
-        })
-    }
-}
-
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
     count: usize,
 ) -> Vec<usize> {
-    if query_probe_set_enabled() {
-        return sample_distinct_queries_probe(challenger, block_len, count);
-    }
     sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled())
-}
-
-/// [`sample_distinct_queries_with`] with the probe set for the ranked shapes
-/// (`count <= 256`, `block_len < 2^32`); other shapes take the `HashSet`.
-/// Same draws, same first-occurrence dedupe, same sort.
-fn sample_distinct_queries_probe<Ch: Challenger>(
-    challenger: &mut Ch,
-    block_len: usize,
-    count: usize,
-) -> Vec<usize> {
-    if count > 256 || block_len >= u32::MAX as usize {
-        return sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled());
-    }
-    assert!(
-        count <= block_len,
-        "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
-    );
-    let mut out = Vec::with_capacity(count);
-    QueryProbeSet::with(|seen| {
-        while out.len() < count {
-            let v = challenger.sample_f128();
-            let q = (v.lo as usize) % block_len;
-            if seen.insert(q) {
-                out.push(q);
-            }
-        }
-    });
-    out.sort_unstable();
-    out
 }
 
 fn sample_distinct_queries_with<Ch: Challenger>(
@@ -15832,30 +15748,6 @@ mod tests {
             let presized = sample_distinct_queries_with(&mut c1, block_len, count, true);
             assert_eq!(presized, grown, "log_len={log_len} count={count}");
             assert_eq!(presized.len(), count);
-        }
-    }
-
-    #[test]
-    fn probe_query_set_samples_the_same_queries() {
-        use crate::challenger::Challenger;
-        // Ranked shapes plus dense small domains (many duplicate draws), the
-        // 256 boundary and the HashSet fallback above it; each set is used
-        // twice in a row on the same thread to check the clear-after-use.
-        for &(log_len, count) in &[
-            (20usize, 218usize), (17, 106), (15, 71), (12, 53), (8, 43), (6, 36), (4, 16),
-            (8, 256), (8, 255), (9, 256), (10, 257), (2, 4), (0, 1), (12, 0),
-        ] {
-            for rep in 0..2u64 {
-                let seed = 0x9B0E_0000 ^ (log_len * 1000 + count) as u64 ^ (rep << 40);
-                let mut c0 = crate::challenger::RandomChallenger::new(seed);
-                let mut c1 = crate::challenger::RandomChallenger::new(seed);
-                let block_len = 1usize << log_len;
-                let reference = sample_distinct_queries_with(&mut c0, block_len, count, true);
-                let probe = sample_distinct_queries_probe(&mut c1, block_len, count);
-                assert_eq!(probe, reference, "log_len={log_len} count={count} rep={rep}");
-                // Both consumed the same number of challenger draws.
-                assert_eq!(c0.sample_f128(), c1.sample_f128());
-            }
         }
     }
 

@@ -476,6 +476,33 @@ pub(crate) fn zc_factored_b4_enabled() -> bool {
 /// fallback to the incumbent kernel, never a reason to disable GPU lincheck.
 pub const ENV_NO_LINCHECK_FACTORED_B4: &str = "FLOCK_NO_LINCHECK_FACTORED_B4";
 
+/// Exact same-binary rollback for the eight-column form of the factored
+/// byte-table B4 fold (`lc_fold_stripes_factored_b4_c8`): each thread folds
+/// eight adjacent columns (one 8-byte stripe load) instead of four, so one
+/// threadgroup covers 2048 columns and every per-block table build (eq
+/// staging, 6+2-bit builder, three barriers) serves twice the lookups; the
+/// threadgroup count halves. Same tables, same XOR multiset per column, so
+/// the partials are bit-identical. Used by both fold arms (zerocheck C fold
+/// and lincheck) whenever they select the factored B4 pipeline.
+/// `FLOCK_NO_LC_FOLD_C8=1` (exact) restores the four-column kernel.
+pub const ENV_NO_LC_FOLD_C8: &str = "FLOCK_NO_LC_FOLD_C8";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn lc_fold_c8_enabled() -> bool {
+    // lineage prototype: this lincheck GPU piece of 4bc0e9e9 is NOT part of
+    // the open prototype (extra GPU work on the post-root spine is a refuted
+    // class), so it is opt-in here: `FLOCK_LC_FOLD_C8=1` enables it and
+    // `FLOCK_NO_LC_FOLD_C8=1` still forces it off.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_LC_FOLD_C8).as_deref() != Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("FLOCK_LC_FOLD_C8").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 fn lincheck_factored_b4_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -1134,6 +1161,53 @@ pub fn gpu_recursive_merkle_blake3(
 /// timed proof may use it.
 pub const ENV_NO_GPU_GRIND: &str = "FLOCK_NO_GPU_GRIND";
 
+/// Grid-stride grind kernel (`blake3_pow_scan_loop`): a fixed 2^16-thread
+/// grid walks the scan block and drains within one stride of the first
+/// hit, instead of launching one thread per nonce of the (4x expected-work
+/// wide) block. Same smallest-offset result. `FLOCK_NO_GRIND_LOOP=1` kills.
+pub const ENV_NO_GRIND_LOOP: &str = "FLOCK_NO_GRIND_LOOP";
+
+pub(crate) fn grind_loop_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(ENV_NO_GRIND_LOOP).map_or(true, |v| v != "1"))
+}
+
+/// When the CPU wins the grind race, retire the abandoned GPU scan early
+/// (see `imp::gpu_pow_abort`) so the next grind's dispatch is not queued
+/// behind it. `FLOCK_NO_GRIND_ABORT=1` kills.
+pub const ENV_NO_GRIND_ABORT: &str = "FLOCK_NO_GRIND_ABORT";
+
+pub(crate) fn grind_abort_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(ENV_NO_GRIND_ABORT).map_or(true, |v| v != "1"))
+}
+
+/// L1 recursive-commit Merkle: hash the internal levels behind the final
+/// leaf batch with a fused kernel (nine levels per dispatch, threadgroup
+/// barriers between levels) instead of one dispatch per level (18 serial
+/// dispatches at the 2^18-leaf shape -> 2). Same tree bytes.
+/// `FLOCK_NO_L1_PARENT_FUSE=1` kills.
+pub const ENV_NO_L1_PARENT_FUSE: &str = "FLOCK_NO_L1_PARENT_FUSE";
+
+pub(crate) fn l1_parent_fuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(ENV_NO_L1_PARENT_FUSE).map_or(true, |v| v != "1"))
+}
+
+/// Build the grid-stride grind pipeline now (untimed warmup calibration).
+pub(crate) fn gpu_pow_prepare() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Ok(gpu) = imp::gpu() {
+        let _ = imp::pow_loop_pso(gpu);
+    }
+}
+
+/// See [`grind_abort_enabled`]; no-op off macOS/aarch64.
+pub(crate) fn gpu_pow_abort() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::gpu_pow_abort();
+}
+
 pub(crate) fn gpu_grind_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| match std::env::var(ENV_NO_GPU_GRIND) {
@@ -1423,6 +1497,16 @@ pub(crate) fn gpu_final_t3_enabled() -> bool {
 pub(crate) fn gpu_final_leaf_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
+}
+
+pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB2").is_none())
+}
+
+pub(crate) fn gpu_t3_bytetab_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB").is_none())
 }
 
 /// Hybrid-split GPU prefix uses the fused final NTT pass + Merkle leaf kernel
@@ -1770,6 +1854,16 @@ impl FromZFirstPassStream {
     #[doc(hidden)]
     pub fn submit_ready_range(&mut self, r_start: usize, r_count: usize) {
         self.inner.submit_ready_range(r_start, r_count);
+    }
+
+    /// [`Self::submit_ready_range`] without the in-order contract: any
+    /// multiple-of-four range disjoint from every range already published.
+    /// Each first-pass tile is independent (disjoint z reads and staging
+    /// writes), so the order of publication changes only when the GPU runs
+    /// a tile, never what it writes.
+    #[doc(hidden)]
+    pub fn submit_ready_range_unordered(&mut self, r_start: usize, r_count: usize) {
+        self.inner.submit_ready_range_unordered(r_start, r_count);
     }
 }
 
@@ -4305,6 +4399,484 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     /// order and its exact field product are unchanged, so the output is
     /// bit-identical. Its own library: a compile failure keeps
     /// `ntt_pass5_mixed`.
+    const T3_BYTETAB3_BUILD: &str = "    threadgroup uint* tab3 = (threadgroup uint*)tabB;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    const uint cc = lid >> 3;
+    const uint base = (lid & 7u) * 32u;
+    const uint tw3 = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cc].x;
+    uint hb = 0u;
+    for (uint k = 5u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= tw3 << k; } }
+    for (uint i = 0u; i < 32u; i++) {
+        uint v = hb;
+        for (uint k = 0u; k < 5u; k++) { if ((i >> k) & 1u) { v ^= tw3 << k; } }
+        tab3[cc * 256u + base + i] = v;
+    }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    constexpr uint j = 3u;
+";
+    const T3_BYTETAB3_MUL: &str = "            const uint cb = c * 256u;
+        const uint4 V = elems[ev];
+        uint q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u, q4 = 0u;
+        #define T3B(W, LO, HI) { \\
+            const uint t0 = tab3[cb + ((W) & 255u)]; LO ^= t0; \\
+            const uint t1 = tab3[cb + extract_bits((W), 8, 8)]; LO ^= t1 << 8; HI ^= t1 >> 24; \\
+            const uint t2 = tab3[cb + extract_bits((W), 16, 8)]; LO ^= t2 << 16; HI ^= t2 >> 16; \\
+            const uint t4 = tab3[cb + ((W) >> 24)]; LO ^= t4 << 24; HI ^= t4 >> 8; }
+        T3B(V.x, q0, q1) T3B(V.y, q1, q2) T3B(V.z, q2, q3) T3B(V.w, q3, q4)
+        #undef T3B
+        q0 ^= q4 ^ (q4 << 1) ^ (q4 << 2) ^ (q4 << 7);
+        uint4 acc = uint4(q0, q1, q2, q3);
+";
+
+    const T3_SUB3_HORNER: &str = "            threadgroup const uint* nb = &nibB[c * NNIB];
+            uint4 V0 = elems[ev];
+            uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+            uint4 acc = uint4(0u);
+            for (int q = (int)NNIB - 1; q >= 0; q--) {
+                acc = gf_shl4(acc);
+                uint n = nb[q];
+                if (n & 1u) acc ^= V0;
+                if (n & 2u) acc ^= V1;
+                if (n & 4u) acc ^= V2;
+                if (n & 8u) acc ^= V3;
+            }
+";
+
+    // The published 2633d97f anchors below were written as a literal
+    // backslash-n and never matched, so the ranked leaf-fused final pass kept
+    // the nibble Horner for sub-layer 3; real newlines let the splice apply.
+    fn with_fused_bytetab3(src: &str) -> Option<String> {
+        let indent = |t: &str| t.lines().map(|l| if l.is_empty() { String::new() } else { format!("    {l}") }).collect::<Vec<_>>().join("\n") + "\n";
+        let pre = "        {\n            constexpr uint j = 3u;\n";
+        let sub3 = indent(T3_SUB3_HORNER);
+        if src.matches(pre).count() != 1 || src.matches(sub3.as_str()).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(sub3.as_str(), T3_BYTETAB3_MUL, 1))
+    }
+
+    fn with_t3_bytetab3(src: &str) -> Option<String> {
+        let pre = "    {\n        constexpr uint j = 3u;\n";
+        if src.matches(pre).count() != 1 || src.matches(T3_SUB3_HORNER).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(T3_SUB3_HORNER, T3_BYTETAB3_MUL, 1))
+    }
+
+    const T3_BYTETAB2: &str = "    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        threadgroup ulong* tab64 = (threadgroup ulong*)tabB;
+        const uint cc = lid >> 4;
+        const uint base = (lid & 15u) * 16u;
+        const uint4 tw4 = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2) + cc];
+        const ulong t = ulong(tw4.x) | (ulong(tw4.y) << 32);
+        ulong hb = 0ul;
+        for (uint k = 4u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= t << k; } }
+        for (uint i = 0u; i < 16u; i++) {
+            ulong v = hb;
+            for (uint k = 0u; k < 4u; k++) { if ((i >> k) & 1u) { v ^= t << k; } }
+            tab64[cc * 256u + base + i] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        threadgroup const ulong* tab64 = (threadgroup const ulong*)tabB;
+        for (uint b = 0; b < 8u; b++) {
+            const uint eu = ((b >> 1) << 2) | (b & 1u);
+            const uint ev = eu | 2u;
+            threadgroup const ulong* T = tab64 + (b >> 1) * 256u;
+            const uint4 V = elems[ev];
+            ulong a0 = 0ul, a1 = 0ul, a2 = 0ul;
+            #define BT2(W, SH, LO, HI) { \\
+                const ulong e = T[extract_bits((W), (SH) & 31u, 8)]; \\
+                LO ^= e << (SH); if ((SH) != 0u) { HI ^= e >> (64u - (SH)); } }
+            BT2(V.x, 0u, a0, a1) BT2(V.x, 8u, a0, a1) BT2(V.x, 16u, a0, a1) BT2(V.x, 24u, a0, a1)
+            BT2(V.y, 32u, a0, a1) BT2(V.y, 40u, a0, a1) BT2(V.y, 48u, a0, a1) BT2(V.y, 56u, a0, a1)
+            BT2(V.z, 0u, a1, a2) BT2(V.z, 8u, a1, a2) BT2(V.z, 16u, a1, a2) BT2(V.z, 24u, a1, a2)
+            BT2(V.w, 32u, a1, a2) BT2(V.w, 40u, a1, a2) BT2(V.w, 48u, a1, a2) BT2(V.w, 56u, a1, a2)
+            #undef BT2
+            a0 ^= a2 ^ (a2 << 1) ^ (a2 << 2) ^ (a2 << 7);
+            const uint4 pr = uint4(uint(a0), uint(a0 >> 32), uint(a1), uint(a1 >> 32));
+            const uint4 nu = elems[eu] ^ pr;
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+";
+
+    fn with_t3_bytetab2(src: &str) -> Option<String> {
+        let old = "    NTT_T3_SHORT_PAIR(2u, 0u)\n    NTT_T3_SHORT_PAIR(2u, 2u)\n";
+        if src.matches(old).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(old, T3_BYTETAB2, 1))
+    }
+
+    fn final_t3_msl_source() -> std::borrow::Cow<'static, str> {
+        let mut s = std::borrow::Cow::Borrowed(NTT_FINAL_T3_MSL_SOURCE);
+        if super::gpu_t3_bytetab_enabled() {
+            if let Some(x) = with_t3_bytetab3(&s) {
+                s = std::borrow::Cow::Owned(x);
+            }
+        }
+        if super::gpu_t3_bytetab2_enabled() {
+            if let Some(x) = with_t3_bytetab2(&s) {
+                s = std::borrow::Cow::Owned(x);
+            }
+        }
+        s
+    }
+
+    #[cfg(test)]
+    mod t3_bytetab2_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab2_splice_applies_alone_and_after_sub3() {
+            let a = with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).expect("sub-layer 2 not found");
+            assert!(a.contains("tab64[cc * 256u + base + i] = v;") && !a.contains("NTT_T3_SHORT_PAIR(2u, 0u)"));
+            let b = with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).expect("not after sub-layer 3");
+            assert!(b.contains("tab64[cc * 256u + base + i] = v;") && b.contains("tab3[cc * 256u + base + i] = v;"));
+        }
+
+        #[test]
+        fn t3_bytetab2_twiddle_bound_holds() {
+            assert!(super::super::max_twiddle_bits(20, 18) <= 40);
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab2_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let groups = 256usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = groups * 16 * 64 * 16;
+                let input: Vec<u8> = {
+                    let mut x = 0x0123_4567_89AB_CDEFu64;
+                    (0..len / 8)
+                        .flat_map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            x.to_le_bytes()
+                        })
+                        .collect()
+                };
+                let data = gpu.new_buffer(len).unwrap();
+                let run = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, groups as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                };
+                let inc = run(NTT_FINAL_T3_MSL_SOURCE);
+                let two = run(&with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                let both = run(&with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).unwrap());
+                assert!(inc != input, "the pass did not run");
+                assert!(inc == two, "byte-table sub-layer 2 changed the final pass's output");
+                assert!(inc == both, "both byte-table sub-layers changed the final pass's output");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod t3_bytetab_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab_splice_applies() {
+            let out = with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).expect("incumbent sub-layer 3 not found");
+            assert!(out.contains("tab3[cc * 256u + base + i] = v;"));
+            assert!(!out.contains("acc = gf_shl4(acc);"));
+            assert!(out.contains("kernel void ntt_final_t3("));
+        }
+
+        #[test]
+        fn t3_bytetab_twiddle_bound_holds() {
+            assert!(super::super::pass5_mixed_ok(20, 16, 4));
+            assert!(super::super::max_twiddle_bits(20, 19) <= 20);
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let groups = 256usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = groups * 16 * 64 * 16;
+                let input: Vec<u8> = {
+                    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+                    (0..len / 8)
+                        .flat_map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            x.to_le_bytes()
+                        })
+                        .collect()
+                };
+                let data = gpu.new_buffer(len).unwrap();
+                let run = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, groups as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                };
+                let inc = run(NTT_FINAL_T3_MSL_SOURCE);
+                let new = run(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                assert!(inc != input, "the pass did not run");
+                assert!(inc == new, "byte-table sub-layer 3 changed the final pass's output");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    /// Re-add of 2633d97f (fkiene, carrying kshitij-hash f34681d2/eee7f9de)
+    /// onto e60174c: pins which ranked final-pass kernels receive the splices,
+    /// so the re-add cannot silently drift.
+    #[cfg(test)]
+    mod t3_bytetab_readd_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab_splices_reach_ranked_final_sources() {
+            if !(super::super::gpu_t3_bytetab_enabled() && super::super::gpu_t3_bytetab2_enabled()) {
+                return;
+            }
+            let plain = final_t3_msl_source();
+            assert!(plain.contains("tab3[cc * 256u + base + i] = v;"), "plain sub-layer 3");
+            assert!(plain.contains("tab64[cc * 256u + base + i] = v;"), "plain sub-layer 2");
+            let leaf = final_leaf_msl_source();
+            assert_eq!(leaf.matches("tab64[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 2");
+            // With real newlines in `with_fused_bytetab3`'s anchors the fused
+            // leaf kernel gets sub-layer 3 as well.
+            assert_eq!(leaf.matches("tab3[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 3");
+            assert!(with_fused_bytetab3(NTT_FINAL_LEAF_EXTRA_MSL).is_some());
+        }
+
+        /// The ranked leaf-fused final pass with both byte-table sub-layers
+        /// writes the incumbent's codeword AND the incumbent's leaf + three
+        /// parent-level hashes (16 MiB position prefix).
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab_fused_leaf_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let n_leaves = 1usize << log_d;
+            let prefix = 1usize << 14;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = prefix * 64 * 16;
+                let mut x = 0xB17E_7AB3_u64;
+                let input: Vec<u8> = (0..len / 8)
+                    .flat_map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x.to_le_bytes()
+                    })
+                    .collect();
+                let data = gpu.new_buffer(len).unwrap();
+                let tree_len = 2 * n_leaves * 32;
+                let tree = gpu.new_buffer(tree_len).unwrap();
+                let run = |src: &str| -> (Vec<u8>, Vec<u8>) {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3_leaf").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    std::ptr::write_bytes(gpu.buffer_contents(tree), 0, tree_len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    let w1 = n_leaves;
+                    let w2 = w1 + n_leaves / 2;
+                    let w3 = w2 + n_leaves / 4;
+                    gpu.set_buffer(enc, tree, 0, 3);
+                    gpu.set_buffer(enc, tree, w1 * 32, 4);
+                    gpu.set_buffer(enc, tree, w2 * 32, 5);
+                    gpu.set_buffer(enc, tree, w3 * 32, 6);
+                    gpu.dispatch(enc, (prefix / 64) as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    (
+                        std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec(),
+                        std::slice::from_raw_parts(gpu.buffer_contents(tree), tree_len).to_vec(),
+                    )
+                };
+                let (d0, t0) = run(&format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}"));
+                let (d1, t1) = run(&final_leaf_msl_source());
+                assert!(d0 != input, "the pass did not run");
+                assert!(t0.iter().any(|&b| b != 0), "no hashes written");
+                assert!(d0 == d1, "byte tables changed the fused final pass's codeword");
+                assert!(t0 == t1, "byte tables changed the fused final pass's leaf/parent hashes");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.release(tree);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod t3_form_probe {
+        use super::*;
+
+        fn variant(name: &str) -> String {
+            match name {
+                "incumbent" => NTT_FINAL_T3_MSL_SOURCE.to_owned(),
+                "bytetab3" => with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap(),
+                "bytetab2" => with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).unwrap(),
+                "both" => with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).unwrap(),
+                _ => panic!("unknown variant {name}"),
+            }
+        }
+
+        #[test]
+        #[ignore]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_form_probe() {
+            let names: Vec<String> = std::env::var("T3_PROBE_VARIANTS")
+                .unwrap_or_else(|_| "incumbent,bytetab3,bytetab2,both".into())
+                .split(',')
+                .map(|s| s.to_owned())
+                .collect();
+            let rounds: usize = std::env::var("T3_PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let gpu = gpu().expect("gpu");
+            let log_d = 20usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let mut psos = Vec::new();
+                for n in &names {
+                    let pso = compile_supplemental_pipeline(gpu, &variant(n), "ntt_final_t3")
+                        .unwrap_or_else(|e| panic!("{n}: {e}"));
+                    let (tg, w, maxt) = gpu.pipeline_resources(pso);
+                    println!("variant {n}: threadgroup mem {tg} B, simd {w}, max threads {maxt}");
+                    psos.push(pso);
+                }
+                let data_len = (1usize << log_d) * 64 * 16;
+                let input = gpu.new_buffer(data_len).unwrap();
+                let data = gpu.new_buffer(data_len).unwrap();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let w = gpu.buffer_contents(input).cast::<u64>();
+                let mut x = 0x2545_F491_4F6C_DD1Du64;
+                for i in 0..data_len / 8 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *w.add(i) = x;
+                }
+                let run = |pso: Id| -> (f64, u64) {
+                    std::ptr::copy_nonoverlapping(gpu.buffer_contents(input), gpu.buffer_contents(data), data_len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let (s, e) = cb_gpu_interval(gpu, cb);
+                    let words = std::slice::from_raw_parts(gpu.buffer_contents(data).cast::<u64>(), data_len / 8);
+                    let mut h = 0xcbf2_9ce4_8422_2325u64;
+                    for &w in words.iter().step_by(7) {
+                        h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                    }
+                    ((e - s) * 1e3, h)
+                };
+                let (_, h_ref) = run(psos[0]);
+                let mut times: Vec<Vec<f64>> = vec![Vec::new(); psos.len()];
+                for r in 0..rounds {
+                    let k = psos.len();
+                    for j in 0..k {
+                        let i = (r + j) % k;
+                        let (ms, h) = run(psos[i]);
+                        if !names[i].starts_with("x_") {
+                            assert_eq!(h, h_ref, "variant {} output differs", names[i]);
+                        }
+                        times[i].push(ms);
+                    }
+                }
+                for (i, n) in names.iter().enumerate() {
+                    let mut t = times[i].clone();
+                    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let mut d: Vec<f64> = times[i].iter().zip(&times[0]).map(|(a, b)| a - b).collect();
+                    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let lower = times[i].iter().zip(&times[0]).filter(|(a, b)| a < b).count();
+                    println!(
+                        "summary {n}: median {:.2} ms, min {:.2} ms, paired median vs incumbent {:+.2} ms, lower in {lower} of {}",
+                        t[t.len() / 2], t[0], d[d.len() / 2], t.len()
+                    );
+                }
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
     const NTT_FINAL_T3_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -4913,7 +5485,19 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
 "#;
 
     pub(crate) fn final_leaf_msl_source() -> String {
-        format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}")
+        let extra: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(NTT_FINAL_LEAF_EXTRA_MSL);
+        let extra = if super::gpu_t3_bytetab_enabled() {
+            with_fused_bytetab3(&extra).unwrap_or(extra.into_owned()).into()
+        } else {
+            extra
+        };
+        let extra: std::borrow::Cow<'static, str> = if super::gpu_t3_bytetab2_enabled() {
+            let old = "        NTT_T3_SHORT_PAIR(2u, 0u)\n        NTT_T3_SHORT_PAIR(2u, 2u)\n";
+            if extra.matches(old).count() == 1 { extra.replacen(old, T3_BYTETAB2, 1).into() } else { extra }
+        } else {
+            extra
+        };
+        format!("{}{extra}", final_t3_msl_source())
     }
 
     pub(crate) fn final_leaf_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
@@ -5829,6 +6413,35 @@ kernel void blake3_pow_scan(
         atomic_fetch_min_explicit(best, id, memory_order_relaxed);
     }
 }
+
+// Grid-stride form (see `ENV_NO_GRIND_LOOP`): a fixed grid of threads
+// walks the block, thread t taking offsets t, t+T, t+2T, ... in ascending
+// order. A thread stops at its first match (its later offsets are larger)
+// or once its next offset is >= the current best (best only ever holds
+// matching offsets, all >= the true minimum, so the owner of the minimum
+// never skips it). The final `best` is therefore the smallest matching
+// offset for every schedule, exactly as in the one-thread-per-nonce form,
+// but the grid drains within one stride of the hit instead of launching
+// every remaining nonce's thread.
+kernel void blake3_pow_scan_loop(
+    constant uint* state_words [[buffer(0)]],
+    device atomic_uint* best   [[buffer(1)]],
+    constant PowParams& params [[buffer(2)]],
+    uint id [[thread_position_in_grid]],
+    uint nthreads [[threads_per_grid]])
+{
+    for (uint i = id; i < params.len; i += nthreads) {
+        if (i >= atomic_load_explicit(best, memory_order_relaxed)) return;
+        uint nonce_lo = params.start_lo + i;
+        uint carry = nonce_lo < params.start_lo ? 1u : 0u;
+        uint nonce_hi = params.start_hi + carry;
+        uint cv0 = pow_compress0(state_words, nonce_lo, nonce_hi);
+        if (pow_has_leading_zero_bits(cv0, params.bits)) {
+            atomic_fetch_min_explicit(best, i, memory_order_relaxed);
+            return;
+        }
+    }
+}
 "#;
 
     // -----------------------------------------------------------------------
@@ -6562,7 +7175,7 @@ kernel void blake3_pow_scan(
                 // leaves NIL and the encoders keep `ntt_pass5_mixed`.
                 let pso_ntt5t3 = if super::gpu_final_t3_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(NTT_FINAL_T3_MSL_SOURCE)?;
+                        let src = api.nsstring(&final_t3_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -8075,6 +8688,9 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         next_r: usize,
+        /// Ranges published through `submit_ready_range_unordered` (overlap
+        /// check); `next_r` then counts published tiles.
+        unordered: Vec<(usize, usize)>,
         /// Committed bands with their completion signals
         /// (`ENV_NO_GPU_DONE_EVENT`).
         pending: Vec<(Id, Option<DoneSig>)>,
@@ -8111,6 +8727,7 @@ kernel void blake3_pow_scan(
             }
             let total_r = 1usize << (self.log_d - 4);
             if r_start != self.next_r
+                || !self.unordered.is_empty()
                 || r_count == 0
                 || r_start + r_count > total_r
                 || !r_start.is_multiple_of(4)
@@ -8122,6 +8739,42 @@ kernel void blake3_pow_scan(
                 ));
                 return;
             }
+            self.submit_validated_range(r_start, r_count);
+        }
+
+        pub(crate) fn submit_ready_range_unordered(&mut self, r_start: usize, r_count: usize) {
+            if self.failed.is_some() {
+                return;
+            }
+            let total_r = 1usize << (self.log_d - 4);
+            let overlaps = self
+                .unordered
+                .iter()
+                .any(|&(s, c)| r_start < s + c && s < r_start + r_count);
+            if overlaps
+                || (self.next_r != 0 && self.unordered.is_empty())
+                || r_count == 0
+                || r_start + r_count > total_r
+                || !r_start.is_multiple_of(4)
+                || !r_count.is_multiple_of(4)
+            {
+                self.failed = Some(format!(
+                    "invalid unordered streamed range start={r_start} count={r_count} published={} total={total_r}",
+                    self.next_r
+                ));
+                return;
+            }
+            self.unordered.push((r_start, r_count));
+            self.submit_validated_range(r_start, r_count);
+        }
+
+        /// Encode and commit one validated first-pass range; `next_r` advances
+        /// by `r_count` (the published-tile count: the next start for the
+        /// ordered entry, a coverage count for the disjoint unordered one).
+        /// Once every tile is published the early prefix/graph is committed
+        /// behind the final range, exactly as before.
+        fn submit_validated_range(&mut self, r_start: usize, r_count: usize) {
+            let total_r = 1usize << (self.log_d - 4);
 
             // A position contains 64 F128 lanes = 1 KiB. Offsetting both the
             // z and staging bindings makes local kernel r map to global
@@ -8415,6 +9068,7 @@ kernel void blake3_pow_scan(
             log_d: params.k_code(),
             n_leaves: params.n_leaves(),
             next_r: 0,
+            unordered: Vec::new(),
             pending: Vec::with_capacity(8),
             failed: None,
             owns_lease: true,
@@ -10956,6 +11610,16 @@ kernel void blake3_pow_scan(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
         ), lead, extend, phi);
+        let key = if super::gpu_t3_bytetab2_enabled() {
+            key ^ fnv1a64(T3_BYTETAB2).rotate_left(10) ^ 0x5433_4259_5445_3242
+        } else {
+            key
+        };
+        let key = if super::gpu_t3_bytetab_enabled() {
+            key ^ fnv1a64(T3_BYTETAB3_MUL).rotate_left(8) ^ 0x5433_4259_5445_5442
+        } else {
+            key
+        };
         let key = if super::gpu_g4x2_enabled() {
             key ^ fnv1a64(g4x2_msl_source()).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
         } else {
@@ -11960,12 +12624,88 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// Grid-stride grind pipeline (`ENV_NO_GRIND_LOOP`), compiled on first
+    /// use (the untimed warmup prove's first grind); `NIL` when disabled or
+    /// on any compile failure (the one-thread-per-nonce kernel then runs).
+    pub(crate) fn pow_loop_pso(gpu: &Gpu) -> Id {
+        static PSO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *PSO.get_or_init(|| {
+            if !super::grind_loop_enabled() {
+                return 0;
+            }
+            unsafe {
+                let pool = gpu.pool_push();
+                let r = compile_supplemental_pipeline(gpu, POW_MSL_SOURCE, "blake3_pow_scan_loop");
+                gpu.pool_pop(pool);
+                r.map(|p| p as usize).unwrap_or(0)
+            }
+        }) as Id
+    }
+
+    /// Grid size of the grid-stride grind kernel (`FLOCK_GRIND_LOOP_THREADS`
+    /// probe override; power of two, multiple of 32).
+    fn pow_loop_threads() -> u32 {
+        static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *T.get_or_init(|| {
+            std::env::var("FLOCK_GRIND_LOOP_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|t| t.is_power_of_two() && *t >= 32)
+                .unwrap_or(1 << 16)
+        })
+    }
+
+    /// The CPU side of the grind race returned a definitive nonce: the
+    /// in-flight GPU scan's result will be discarded, so publish offset 0 as
+    /// its best — every remaining lane (and, in the grid-stride kernel,
+    /// every loop iteration) then exits at its next `best` check and the
+    /// dispatch worker is free for the next grind sooner. Only the
+    /// abandoned scan can observe the word: the next scan re-initializes it
+    /// on the dispatch worker after this call happened-before its job send.
+    pub(crate) fn gpu_pow_abort() {
+        if !super::grind_abort_enabled() {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        if gpu.pow_out.is_null() {
+            return;
+        }
+        unsafe {
+            let out = gpu.buffer_contents(gpu.pow_out).cast::<u32>();
+            (*out.cast::<std::sync::atomic::AtomicU32>())
+                .store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     pub(crate) fn gpu_blake3_pow_scan(
         state_digest: &[u8; 32],
         start: u64,
         len: u32,
         bits: u32,
     ) -> Result<Option<u64>, String> {
+        pow_scan_inner(state_digest, start, len, bits, None).map(|(r, _)| r)
+    }
+
+    /// Test hook: force the kernel form (`true` = grid-stride) and return
+    /// the command buffer's GPU wall in ms.
+    #[cfg(test)]
+    pub(crate) fn gpu_blake3_pow_scan_forced(
+        state_digest: &[u8; 32],
+        start: u64,
+        len: u32,
+        bits: u32,
+        use_loop: bool,
+    ) -> Result<(Option<u64>, f64), String> {
+        pow_scan_inner(state_digest, start, len, bits, Some(use_loop))
+    }
+
+    fn pow_scan_inner(
+        state_digest: &[u8; 32],
+        start: u64,
+        len: u32,
+        bits: u32,
+        force_loop: Option<bool>,
+    ) -> Result<(Option<u64>, f64), String> {
         if len == 0 || !(1..=32).contains(&bits) {
             return Err(format!("invalid GPU grind block len={len} bits={bits}"));
         }
@@ -11984,7 +12724,7 @@ kernel void blake3_pow_scan(
         });
         unsafe {
             let pool = gpu.pool_push();
-            let result = (|| -> Result<Option<u64>, String> {
+            let result = (|| -> Result<(Option<u64>, f64), String> {
                 let out = gpu.buffer_contents(gpu.pow_out).cast::<u32>();
                 out.write_volatile(u32::MAX);
                 let params = [start as u32, (start >> 32) as u32, len, bits];
@@ -11992,9 +12732,15 @@ kernel void blake3_pow_scan(
                     params.as_ptr().cast::<u8>(),
                     core::mem::size_of_val(&params),
                 );
+                let loop_pso = pow_loop_pso(gpu);
+                let loop_threads = pow_loop_threads();
+                let use_loop = match force_loop {
+                    Some(f) => f && !loop_pso.is_null(),
+                    None => !loop_pso.is_null() && len > loop_threads,
+                };
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, gpu.pso_pow);
+                gpu.set_pipeline(enc, if use_loop { loop_pso } else { gpu.pso_pow });
                 gpu.set_bytes(enc, state_digest, 0);
                 gpu.set_buffer(enc, gpu.pow_out, 0, 1);
                 gpu.set_bytes(enc, params_bytes, 2);
@@ -12005,7 +12751,8 @@ kernel void blake3_pow_scan(
                 // scheduler keep more threadgroups resident per wave on the
                 // small serial scans this kernel performs.
                 const THREADS: u64 = 32;
-                gpu.dispatch(enc, u64::from(len).div_ceil(THREADS), THREADS);
+                let grid = if use_loop { loop_threads } else { len };
+                gpu.dispatch(enc, u64::from(grid).div_ceil(THREADS), THREADS);
                 gpu.end_encoding(enc);
                 // The grind sits on the transcript's serial spine: nothing
                 // else can run until the nonce is known, so the calling
@@ -12016,7 +12763,14 @@ kernel void blake3_pow_scan(
                 // it the path degrades to the exact blocking wait.
                 gpu.commit_and_spin(cb, 4.0)?;
                 let offset = out.read_volatile();
-                Ok((offset != u32::MAX).then(|| start + u64::from(offset)))
+                let ms = if force_loop.is_some() {
+                    gpu.wait_cb(cb)?;
+                    let (s0, e0) = cb_gpu_interval(gpu, cb);
+                    (e0 - s0) * 1e3
+                } else {
+                    0.0
+                };
+                Ok(((offset != u32::MAX).then(|| start + u64::from(offset)), ms))
             })();
             gpu.pool_pop(pool);
             result
@@ -12457,6 +13211,131 @@ kernel void lc_fold_stripes_factored_b4(
 }
 "#;
 
+    /// Eight-column form of `lc_fold_stripes_factored_b4` (see
+    /// `ENV_NO_LC_FOLD_C8`): identical eq staging, identical 6+2-bit table
+    /// builder and barrier structure per four-stripe block; each thread then
+    /// looks up eight stripe bytes (one aligned 8-byte load) per stripe, so a
+    /// group covers 2048 columns and the per-block build is amortized over
+    /// twice the lookups.
+    const LC_FOLD_C8_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct LcFactoredB4Params {
+    uint k;
+    uint useful;
+    uint stripe_hi;
+    uint stripes_per_chunk;
+    uint i_groups;
+};
+
+#define LC_C8_STEP(TT, W) {                     \
+    a0 ^= (TT)[(W).x & 255u];                   \
+    a1 ^= (TT)[((W).x >> 8) & 255u];            \
+    a2 ^= (TT)[((W).x >> 16) & 255u];           \
+    a3 ^= (TT)[(W).x >> 24];                    \
+    a4 ^= (TT)[(W).y & 255u];                   \
+    a5 ^= (TT)[((W).y >> 8) & 255u];            \
+    a6 ^= (TT)[((W).y >> 16) & 255u];           \
+    a7 ^= (TT)[(W).y >> 24];                    \
+}
+
+kernel void lc_fold_stripes_factored_b4_c8(
+    device const uint2*              z64      [[buffer(0)]],
+    device const uint4*              eq       [[buffer(1)]],
+    device uint4*                    partials [[buffer(2)]],
+    constant LcFactoredB4Params&     p        [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]])
+{
+    constexpr uint B = 4u;
+    threadgroup uint4 tg_eq[B * 8u];
+    threadgroup uint4 tab[B * 256u];
+
+    uint chunk  = tgid / p.i_groups;
+    uint ig     = tgid - chunk * p.i_groups;
+    uint i_base = ig * 2048u;
+    uint s_lo = chunk * p.stripes_per_chunk;
+    uint s_hi = min(s_lo + p.stripes_per_chunk, p.stripe_hi);
+
+    uint4 a0 = uint4(0u), a1 = uint4(0u), a2 = uint4(0u), a3 = uint4(0u);
+    uint4 a4 = uint4(0u), a5 = uint4(0u), a6 = uint4(0u), a7 = uint4(0u);
+    // This thread owns columns [c0, c0+8). `useful` is a multiple of 8, so
+    // all eight are useful or none are.
+    uint c0 = i_base + 8u * lid;
+    bool live = c0 < p.useful;
+    uint kd = p.k >> 3;
+
+    for (uint sb = s_lo; sb < s_hi; sb += B) {
+        uint ns = min(B, s_hi - sb);
+        uint2 w[B];
+        for (uint t = 0u; t < B; ++t) { w[t] = uint2(0u); }
+        if (live && ns == B) {
+            uint q = (sb * p.k + c0) >> 3;
+            for (uint t = 0u; t < B; ++t) { w[t] = z64[q + t * kd]; }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < ns * 8u) {
+            tg_eq[lid] = eq[sb * 8u + lid];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lid < ns * 64u) {
+            uint s = lid >> 6;
+            uint h = lid & 63u;
+            uint eq_base = s * 8u;
+            uint4 l6 = uint4(0u);
+            uint hm = h;
+            while (hm != 0u) {
+                l6 ^= tg_eq[eq_base + ctz(hm)];
+                hm &= hm - 1u;
+            }
+            uint4 e6 = tg_eq[eq_base + 6u];
+            uint4 e7 = tg_eq[eq_base + 7u];
+            uint4 l6e6 = l6 ^ e6;
+            uint4 l6e7 = l6 ^ e7;
+            uint tab_base = s * 256u + h;
+            tab[tab_base]        = l6;
+            tab[tab_base + 64u]  = l6e6;
+            tab[tab_base + 128u] = l6e7;
+            tab[tab_base + 192u] = l6e6 ^ e7;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (live) {
+            if (ns == B) {
+                for (uint t = 0u; t < B; ++t) {
+                    LC_C8_STEP(&tab[t * 256u], w[t]);
+                }
+            } else {
+                for (uint t = 0u; t < ns; ++t) {
+                    uint2 wt = z64[((sb + t) * p.k + c0) >> 3];
+                    LC_C8_STEP(&tab[t * 256u], wt);
+                }
+            }
+        }
+    }
+
+    device uint4* out = partials + chunk * p.k + c0;
+    out[0u] = a0;
+    out[1u] = a1;
+    out[2u] = a2;
+    out[3u] = a3;
+    out[4u] = a4;
+    out[5u] = a5;
+    out[6u] = a6;
+    out[7u] = a7;
+}
+"#;
+
+    /// Eight-column kernel shape: (function, threads per group, columns
+    /// per thread). Probe shapes (16 columns x 256 threads, 8 x 512) were
+    /// measured slower on the ranked plan (+17..28% and -2..6% vs -10..20%).
+    fn lc_wide_shape() -> (&'static str, usize, usize) {
+        ("lc_fold_stripes_factored_b4_c8", 256, 8)
+    }
+
     /// Output partials produced by the GPU fold. Fixed so the buffer set and
     /// the reduce dispatch are size-stable across proves.
     const ZC_FOLD_CHUNKS: usize = 64;
@@ -12487,6 +13366,13 @@ kernel void lc_fold_stripes_factored_b4(
         /// isolated source/library and `NIL` on exact rollback or any init
         /// failure; lincheck then keeps `pso_lc_fold` unchanged.
         pso_lc_factored_b4: Id,
+        /// Eight-column form of the factored B4 kernel (`ENV_NO_LC_FOLD_C8`);
+        /// `NIL` on rollback, on any init failure, or without the factored
+        /// pipeline — callers then keep the four-column kernel.
+        pso_lc_c8: Id,
+        /// Shape of `pso_lc_c8`: (threads per group, columns per group).
+        lc_wide_tg: usize,
+        lc_wide_cols: usize,
         /// eq_outer upload (n_outer x 16 B).
         eq_buf: Id,
         eq_cap: usize,
@@ -12721,12 +13607,37 @@ kernel void lc_fold_stripes_factored_b4(
             } else {
                 NIL
             };
+            // Eight-column form (`ENV_NO_LC_FOLD_C8`): only meaningful on top
+            // of the factored pipeline; any failure keeps the four-column one.
+            let pso_lc_c8 = if !pso_lc_factored_b4.is_null() && super::lc_fold_c8_enabled() {
+                let pool = gpu.pool_push();
+                let built = compile_supplemental_pipeline(
+                    gpu,
+                    LC_FOLD_C8_MSL_SOURCE,
+                    lc_wide_shape().0,
+                );
+                gpu.pool_pop(pool);
+                match built {
+                    Ok(pso) => pso,
+                    Err(e) => {
+                        if super::gpu_lincheck_debug() {
+                            eprintln!("[gpu-lincheck] eight-column B4 unavailable: {e}");
+                        }
+                        NIL
+                    }
+                }
+            } else {
+                NIL
+            };
             Ok(ZcFold {
                 gpu,
                 pso_fold,
                 pso_reduce,
                 pso_lc_fold,
                 pso_lc_factored_b4,
+                pso_lc_c8,
+                lc_wide_tg: lc_wide_shape().1,
+                lc_wide_cols: lc_wide_shape().1 * lc_wide_shape().2,
                 eq_buf: NIL,
                 eq_cap: 0,
                 part_buf: NIL,
@@ -13666,6 +14577,8 @@ kernel void lc_fold_stripes_factored_b4(
         stripe_hi: usize,
         stripes_per_chunk: usize,
         i_groups: usize,
+        /// Threads per group of the fold dispatch.
+        fold_tg: usize,
     }
 
     unsafe fn zc_fold_submit(gpu: &Gpu, state: &ZcFold, plan: &ZcFoldPlan) -> Result<Id, String> {
@@ -13707,7 +14620,7 @@ kernel void lc_fold_stripes_factored_b4(
             gpu.dispatch(
                 enc,
                 (ZC_FOLD_CHUNKS * plan.i_groups) as u64,
-                ZC_FOLD_TG as u64,
+                plan.fold_tg as u64,
             );
             gpu.set_pipeline(enc, state.pso_reduce);
             gpu.set_buffer(enc, state.part_buf, 0, 0);
@@ -13745,6 +14658,36 @@ kernel void lc_fold_stripes_factored_b4(
         stripe_hi: usize,
         stripes_per_chunk: usize,
         candidate_first: bool,
+    ) -> Result<LincheckB4PsoPair, String> {
+        run_lincheck_fold_psos_for_test(
+            z_packed,
+            m,
+            k_log,
+            useful_bits,
+            eq_outer,
+            stripe_hi,
+            stripes_per_chunk,
+            candidate_first,
+            false,
+        )
+    }
+
+    /// [`run_lincheck_b4_psos_for_test`] with the candidate chosen by
+    /// `candidate_c8`: the eight-column kernel (2048-column groups) against
+    /// the four-column factored B4 kernel as control, else the factored B4
+    /// kernel against the incumbent byte-table B4 kernel.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_lincheck_fold_psos_for_test(
+        z_packed: &[u8],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        eq_outer: &[F128],
+        stripe_hi: usize,
+        stripes_per_chunk: usize,
+        candidate_first: bool,
+        candidate_c8: bool,
     ) -> Result<LincheckB4PsoPair, String> {
         let k = 1usize << k_log;
         let n_outer = 1usize << (m - k_log);
@@ -13789,6 +14732,9 @@ kernel void lc_fold_stripes_factored_b4(
         if state.pso_lc_factored_b4.is_null() {
             return Err("direct B4 oracle candidate PSO is NIL".to_string());
         }
+        if candidate_c8 && (state.pso_lc_c8.is_null() || !k.is_multiple_of(state.lc_wide_cols)) {
+            return Err("direct C8 oracle PSO is NIL or k is not a 2048 multiple".to_string());
+        }
 
         unsafe {
             let pool = gpu.pool_push();
@@ -13818,6 +14764,11 @@ kernel void lc_fold_stripes_factored_b4(
 
                 let useful = (useful_bits.div_ceil(8) * 8).min(k);
                 let run = |pso: Id, factored_b4: bool| -> Result<(Vec<F128>, f64), String> {
+                    let (cols, fold_tg) = if pso == state.pso_lc_c8 {
+                        (state.lc_wide_cols, state.lc_wide_tg)
+                    } else {
+                        (ZC_FOLD_COLS_PER_TG, ZC_FOLD_TG)
+                    };
                     let plan = ZcFoldPlan {
                         z_buf,
                         pso_fold: pso,
@@ -13827,7 +14778,8 @@ kernel void lc_fold_stripes_factored_b4(
                         useful,
                         stripe_hi,
                         stripes_per_chunk,
-                        i_groups: k / ZC_FOLD_COLS_PER_TG,
+                        i_groups: k / cols,
+                        fold_tg,
                     };
                     let cb = zc_fold_submit(gpu, state, &plan)?;
                     let waited = gpu.wait_cb(cb);
@@ -13846,15 +14798,17 @@ kernel void lc_fold_stripes_factored_b4(
                     Ok((out, gpu_ms))
                 };
 
+                let (cand_pso, ctrl_pso, ctrl_factored) = if candidate_c8 {
+                    (state.pso_lc_c8, state.pso_lc_factored_b4, true)
+                } else {
+                    (state.pso_lc_factored_b4, state.pso_lc_fold, false)
+                };
                 let ((candidate, candidate_gpu_ms), (incumbent, incumbent_gpu_ms)) =
                     if candidate_first {
-                        (
-                            run(state.pso_lc_factored_b4, true)?,
-                            run(state.pso_lc_fold, false)?,
-                        )
+                        (run(cand_pso, true)?, run(ctrl_pso, ctrl_factored)?)
                     } else {
-                        let incumbent = run(state.pso_lc_fold, false)?;
-                        let candidate = run(state.pso_lc_factored_b4, true)?;
+                        let incumbent = run(ctrl_pso, ctrl_factored)?;
+                        let candidate = run(cand_pso, true)?;
                         (candidate, incumbent)
                     };
                 Ok(LincheckB4PsoPair {
@@ -14207,6 +15161,18 @@ kernel void lc_fold_stripes_factored_b4(
                             n_outer * 16,
                         );
                     }
+                    // Eight-column form of the factored kernel (same partials).
+                    let c8 = factored_b4
+                        && !state.pso_lc_c8.is_null()
+                        && k.is_multiple_of(state.lc_wide_cols);
+                    let (pso_fold, cols_per_tg, fold_tg) = if c8 {
+                        (state.pso_lc_c8, state.lc_wide_cols, state.lc_wide_tg)
+                    } else {
+                        (pso_fold, ZC_FOLD_COLS_PER_TG, ZC_FOLD_TG)
+                    };
+                    if c8 && arm.debug() {
+                        eprintln!("{} eight-column kernel", arm.tag());
+                    }
                     let plan = ZcFoldPlan {
                         z_buf,
                         pso_fold,
@@ -14225,7 +15191,8 @@ kernel void lc_fold_stripes_factored_b4(
                         // dead groups. Partial/output columns past the last
                         // dispatched group are then never written; the only
                         // such caller's `expand` reads columns < n_roots only.
-                        i_groups: useful.div_ceil(ZC_FOLD_COLS_PER_TG).max(1),
+                        i_groups: useful.div_ceil(cols_per_tg).max(1),
+                        fold_tg,
                     };
                     // Lincheck only: the zerocheck arm's job may be parked
                     // (commit-tail fill) and adopted, which keeps the plain
@@ -14872,6 +15839,48 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     b3_compress(cv, block, 64u, B3_PARENT);
     for (int i = 0; i < 8; i++) parents[id * 8u + i] = cv[i];
 }
+
+// Fused parent levels (see `ENV_NO_L1_PARENT_FUSE`): one threadgroup owns
+// 2^p.w consecutive nodes of the level starting at flat node p.x (length
+// p.y) and hashes p.w levels of its subtree, writing every level to the flat
+// tree exactly where the per-level `rec_parent_hash` chain writes it. Levels
+// are separated by threadgroup barriers instead of dispatch boundaries; the
+// current level lives in threadgroup memory. Same BLAKE3 parent compression,
+// same children, same slots: bit-identical tree.
+kernel void rec_parent_subtree(device uint* tree        [[buffer(0)]],
+                               constant uint4& p        [[buffer(1)]],
+                               uint tg  [[threadgroup_position_in_grid]],
+                               uint lid [[thread_position_in_threadgroup]])
+{
+    threadgroup uint cur[256u * 8u];
+    uint rs = p.x;
+    uint n = p.y;
+    for (uint lev = 0u; lev < p.w; ++lev) {
+        uint ws = rs + n;
+        uint cnt = (1u << (p.w - 1u)) >> lev;
+        uint cv[8];
+        if (lid < cnt) {
+            uint block[16];
+            if (lev == 0u) {
+                device const uint* ch = tree + (rs + (tg << p.w) + 2u * lid) * 8u;
+                for (uint i = 0u; i < 16u; i++) block[i] = ch[i];
+            } else {
+                for (uint i = 0u; i < 16u; i++) block[i] = cur[2u * lid * 8u + i];
+            }
+            for (int i = 0; i < 8; i++) cv[i] = B3_IV[i];
+            b3_compress(cv, block, 64u, B3_PARENT);
+            device uint* o = tree + (ws + tg * cnt + lid) * 8u;
+            for (int i = 0; i < 8; i++) o[i] = cv[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < cnt) {
+            for (int i = 0; i < 8; i++) cur[lid * 8u + i] = cv[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        rs = ws;
+        n >>= 1;
+    }
+}
 "#;
 
     /// The exact recursive shapes worth offloading. L1 (2^18 leaves) wins
@@ -14884,6 +15893,9 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     struct RecMerkle {
         pso_leaf128: Id,
         pso_parent: Id,
+        /// Fused parent-level kernel (`ENV_NO_L1_PARENT_FUSE`); `NIL` when
+        /// disabled or on compile failure.
+        pso_parent_fused: Id,
         /// Persistent flat-tree output buffers, one per supported shape
         /// (`2 * n - 1` nodes each); allocated once, untimed.
         tree_bufs: [(usize, Id); REC_MERKLE_SHAPES.len()],
@@ -14947,9 +15959,16 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         }
                     }
                 }
+                let pso_parent_fused = if super::l1_parent_fuse_enabled() {
+                    compile_supplemental_pipeline(gpu, REC_MERKLE_MSL_SOURCE, "rec_parent_subtree")
+                        .unwrap_or(NIL)
+                } else {
+                    NIL
+                };
                 let mut state = RecMerkle {
                     pso_leaf128,
                     pso_parent,
+                    pso_parent_fused,
                     tree_bufs,
                     wraps: Vec::new(),
                     hits: 0,
@@ -15194,6 +16213,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         gpu: &'static Gpu,
         pso_leaf128: Id,
         pso_parent: Id,
+        pso_parent_fused: Id,
         data_buf: Id,
         tree_buf: Id,
         num_leaves: usize,
@@ -15280,7 +16300,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         if guard.is_none() {
             *guard = Some(rec_merkle_init(gpu));
         }
-        let (pso_leaf128, pso_parent, data_buf, tree_buf) = match guard.as_mut() {
+        let (pso_leaf128, pso_parent, pso_parent_fused, data_buf, tree_buf) = match guard.as_mut() {
             Some(Ok(state)) => {
                 let data_addr = data_ptr as usize;
                 let cached = state
@@ -15314,7 +16334,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     .iter()
                     .find(|(n, _)| *n == num_leaves)
                     .expect("shape checked above");
-                (state.pso_leaf128, state.pso_parent, data_buf, tree_buf)
+                (state.pso_leaf128, state.pso_parent, state.pso_parent_fused, data_buf, tree_buf)
             }
             Some(Err(e)) => {
                 if super::gpu_zc_r2_debug() {
@@ -15329,6 +16349,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             gpu,
             pso_leaf128,
             pso_parent,
+            pso_parent_fused,
             data_buf,
             tree_buf,
             num_leaves,
@@ -15482,6 +16503,31 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         for _ in 0..local_levels {
                             read_start += read_len;
                             read_len >>= 1;
+                        }
+                        // Fused levels: up to nine per dispatch (512 nodes
+                        // per group) while the level is a power of two.
+                        if !self.pso_parent_fused.is_null() && read_len.is_power_of_two() {
+                            self.gpu.set_pipeline(enc, self.pso_parent_fused);
+                            while read_len > 1 {
+                                let w = (read_len.trailing_zeros() as usize).min(9);
+                                let params: [u32; 4] =
+                                    [read_start as u32, read_len as u32, 0, w as u32];
+                                self.gpu.set_buffer(enc, self.tree_buf, 0, 0);
+                                self.gpu.set_bytes(
+                                    enc,
+                                    std::slice::from_raw_parts(params.as_ptr().cast::<u8>(), 16),
+                                    1,
+                                );
+                                self.gpu.dispatch(
+                                    enc,
+                                    (read_len >> w) as u64,
+                                    (1u64 << (w - 1)).max(1),
+                                );
+                                for _ in 0..w {
+                                    read_start += read_len;
+                                    read_len >>= 1;
+                                }
+                            }
                         }
                         while read_len > 1 {
                             let write_start = read_start + read_len;
@@ -19109,6 +20155,8 @@ mod imp {
 
     impl FromZFirstPassStream {
         pub(crate) fn submit_ready_range(&mut self, _r_start: usize, _r_count: usize) {}
+
+        pub(crate) fn submit_ready_range_unordered(&mut self, _r_start: usize, _r_count: usize) {}
     }
 
     /// L1 NTT/Merkle-leaf overlap (non-Metal stub): never engages.
@@ -21396,6 +22444,153 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert!(incumbent_ms.iter().all(|ms| *ms > 0.0));
         let useful = useful_bits.div_ceil(8) * 8;
         assert!(want[useful..].iter().all(|v| *v == F128::ZERO));
+    }
+
+    /// Grid-stride grind kernel (`ENV_NO_GRIND_LOOP`) returns exactly the
+    /// one-thread-per-nonce kernel's smallest offset (hits, misses, nonzero
+    /// starts, lengths below/above the grid), with GPU walls printed.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_grind_loop_kernel_matches_per_nonce_kernel() {
+        let Ok(gpu) = imp::gpu() else { return };
+        if gpu.pso_pow.is_null() || imp::pow_loop_pso(gpu).is_null() {
+            eprintln!("grind pipelines unavailable; skipping");
+            return;
+        }
+        let mut rng = Rng::new(0x9A1D_100F);
+        let mut sums = std::collections::BTreeMap::<u32, (f64, f64, usize)>::new();
+        for trial in 0..48usize {
+            let mut digest = [0u8; 32];
+            for b in digest.iter_mut() {
+                *b = rng.next_u64() as u8;
+            }
+            let bits = [12u32, 14, 16, 17, 18, 19][trial % 6];
+            let len = if trial % 7 == 3 { 1u32 << 14 } else { 1u32 << (bits + 2).min(24) };
+            let start = if trial % 5 == 4 { rng.next_u64() >> 20 } else { 0 };
+            // A short block can miss; both kernels must agree on that too.
+            let len = if trial % 11 == 5 { 1u32 << (bits - 3) } else { len };
+            let (a, ta) = imp::gpu_blake3_pow_scan_forced(&digest, start, len, bits, false).unwrap();
+            let (b, tb) = imp::gpu_blake3_pow_scan_forced(&digest, start, len, bits, true).unwrap();
+            assert_eq!(a, b, "trial {trial} bits {bits} len {len} start {start}");
+            if let Some(n) = a {
+                // Cross-check against the CPU predicate scan over the same window.
+                let cpu = crate::challenger::cpu_pow_window_for_test(&digest, start, (n - start + 1) as u32, bits);
+                assert_eq!(cpu, Some(n), "trial {trial} cpu oracle");
+            }
+            let e = sums.entry(bits).or_insert((0.0, 0.0, 0));
+            e.0 += ta;
+            e.1 += tb;
+            e.2 += 1;
+        }
+        for (bits, (ta, tb, n)) in sums {
+            eprintln!(
+                "[grind-loop] bits={bits} per-nonce {:.4} ms loop {:.4} ms (n={n})",
+                ta / n as f64,
+                tb / n as f64
+            );
+        }
+    }
+
+    /// Eight-column fold kernel (`ENV_NO_LC_FOLD_C8`) against the scalar
+    /// oracle and the four-column factored kernel on short final blocks
+    /// (ns = 1..3), a full block, and padded columns.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_lincheck_c8_direct_tail_blocks_match_cpu() {
+        // C8 is opt-in (FLOCK_LC_FOLD_C8=1); the ranked path never builds its PSO otherwise.
+        if !super::lc_fold_c8_enabled() {
+            return;
+        }
+        let (m, k_log, useful_bits) = (26usize, 11usize, 1997usize);
+        let k = 1usize << k_log;
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let z = leak_page_aligned((1usize << m) / 8);
+        fill_stripe(z, 0xC8FA_C701_2345_6789);
+        let mut rng = Rng::new(0x5EED_00C8);
+        let eq = rng.vec(1usize << (m - k_log));
+        for (i, stripe_hi) in [1usize, 2, 3, 4, 7].into_iter().enumerate() {
+            let pair = imp::run_lincheck_fold_psos_for_test(
+                z,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+                stripe_hi,
+                4,
+                i % 2 == 0,
+                true,
+            )
+            .expect("C8 and B4 PSOs must compile and run");
+            let want = lincheck_stripe_prefix_oracle(z, k, useful_bits, &eq, stripe_hi);
+            assert_eq!(pair.candidate, want, "c8 ns={stripe_hi}");
+            assert_eq!(pair.incumbent, want, "b4 ns={stripe_hi}");
+            let useful = useful_bits.div_ceil(8) * 8;
+            assert!(pair.candidate[useful..].iter().all(|v| *v == F128::ZERO));
+        }
+    }
+
+    /// Ranked-shape eight-column screen (g = 40 claims, root-compacted
+    /// useful width): bit-identical to the CPU range fold and to the
+    /// four-column kernel, with balanced-order GPU walls printed.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn gpu_lincheck_c8_direct_ranked_matches_cpu() {
+        // C8 is opt-in (FLOCK_LC_FOLD_C8=1); the ranked path never builds its PSO otherwise.
+        if !super::lc_fold_c8_enabled() {
+            return;
+        }
+        let (m, k_log) = (32usize, 14usize);
+        if gpu_or_skip(imp::gpu()).is_none() {
+            return;
+        }
+        let z = leak_page_aligned((1usize << m) / 8);
+        fill_stripe(z, 0xC8FA_C740_1234_5678);
+        let mut rng = Rng::new(0x5EED_40C8);
+        let eq = rng.vec(1usize << (m - k_log));
+        for useful_bits in [15_409usize, 11_313] {
+            let claims = 40usize;
+            let stripe_hi = crate::lincheck::oblock_claim_stripe_base(claims);
+            let stripes_per_chunk = stripe_hi.div_ceil(64).next_multiple_of(4);
+            let want = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_range(
+                z,
+                m,
+                k_log,
+                useful_bits,
+                &eq,
+                0,
+                claims,
+            );
+            let mut c_ms = Vec::new();
+            let mut r_ms = Vec::new();
+            for (sample, candidate_first) in [true, false, false, true, true, false].into_iter().enumerate() {
+                let pair = imp::run_lincheck_fold_psos_for_test(
+                    z,
+                    m,
+                    k_log,
+                    useful_bits,
+                    &eq,
+                    stripe_hi,
+                    stripes_per_chunk,
+                    candidate_first,
+                    true,
+                )
+                .expect("ranked C8 pair must run both PSOs");
+                assert_eq!(pair.candidate, want, "c8 sample {sample} useful {useful_bits}");
+                assert_eq!(pair.incumbent, want, "b4 sample {sample} useful {useful_bits}");
+                if sample > 0 {
+                    c_ms.push(pair.candidate_gpu_ms);
+                    r_ms.push(pair.incumbent_gpu_ms);
+                }
+            }
+            let c = c_ms.iter().sum::<f64>() / c_ms.len() as f64;
+            let r = r_ms.iter().sum::<f64>() / r_ms.len() as f64;
+            eprintln!(
+                "[lc-c8-direct] useful={useful_bits} c8={c:.4}ms b4={r:.4}ms improvement={:.2}% (c8 {c_ms:.4?} b4 {r_ms:.4?})",
+                100.0 * (r - c) / r
+            );
+        }
     }
 
     /// The GPU prefix equals the CPU fold over exactly the claims it owns,
