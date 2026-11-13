@@ -3041,11 +3041,47 @@ fn transpose_forward_ntt_fused_3layer(
 ) {
     use rayon::prelude::*;
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    type Twiddle = crate::field::gf2_128::aarch64::ConstPrep;
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+    type Twiddle = F128;
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
     #[inline(always)]
-    fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: F128) {
+    fn butterfly(values: &mut [F128; 8], a: usize, b: usize, twiddle: Twiddle) {
         let sum = values[a] + values[b];
         values[a] = sum;
         values[b] = twiddle * sum + values[b];
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    #[inline(always)]
+    fn butterfly_pair(
+        values: &mut [F128; 8],
+        a: [usize; 2],
+        b: [usize; 2],
+        tw: [Twiddle; 2],
+    ) {
+        use core::arch::aarch64::uint64x2_t;
+        use crate::field::gf2_128::aarch64::mul_const_pair_prep;
+
+        let bottom = [values[b[0]], values[b[1]]];
+        let sums = [values[a[0]] + bottom[0], values[a[1]] + bottom[1]];
+        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
+        // layout maps lo/hi to vector lanes 0/1 without padding.
+        let products = unsafe {
+            let products = mul_const_pair_prep(
+                tw[0],
+                core::mem::transmute::<F128, uint64x2_t>(sums[0]),
+                tw[1],
+                core::mem::transmute::<F128, uint64x2_t>(sums[1]),
+            );
+            products.map(|p| core::mem::transmute::<uint64x2_t, F128>(p))
+        };
+        values[a[0]] = sums[0];
+        values[a[1]] = sums[1];
+        values[b[0]] = products[0] + bottom[0];
+        values[b[1]] = products[1] + bottom[1];
     }
 
     let num_blocks = 1usize << layer;
@@ -3053,7 +3089,7 @@ fn transpose_forward_ntt_fused_3layer(
     let eighth = block_size >> 3;
     let eighth_log = log_d - layer - 3;
     let row_mask = eighth - 1;
-    let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+    let twiddles: Vec<[Twiddle; 7]> = (0..num_blocks)
         .map(|block| {
             let mut tw = [F128::ZERO; 7];
             tw[0] = ntt.twiddle(layer, block);
@@ -3063,7 +3099,18 @@ fn transpose_forward_ntt_fused_3layer(
             for s in 0..4 {
                 tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
             }
-            tw
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            {
+                use core::arch::aarch64::uint64x2_t;
+                use crate::field::gf2_128::aarch64::const_prep;
+                // Prepare each shared multiplier once per block, outside the rows.
+                // SAFETY: the same AES and limb-layout conditions apply above.
+                unsafe { tw.map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t))) }
+            }
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+            {
+                tw
+            }
         })
         .collect();
 
@@ -3089,15 +3136,45 @@ fn transpose_forward_ntt_fused_3layer(
                 *value = *ptr.add(base + i * eighth);
             }
             let tw = &twiddles[block];
-            for pair in 0..4 {
-                butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            {
+                for half in 0..2 {
+                    butterfly_pair(
+                        &mut values,
+                        [4 * half, 4 * half + 2],
+                        [4 * half + 1, 4 * half + 3],
+                        [tw[3 + 2 * half], tw[4 + 2 * half]],
+                    );
+                }
+                for half in 0..2 {
+                    butterfly_pair(
+                        &mut values,
+                        [4 * half, 4 * half + 1],
+                        [4 * half + 2, 4 * half + 3],
+                        [tw[1 + half]; 2],
+                    );
+                }
+                for pair in 0..2 {
+                    butterfly_pair(
+                        &mut values,
+                        [2 * pair, 2 * pair + 1],
+                        [2 * pair + 4, 2 * pair + 5],
+                        [tw[0]; 2],
+                    );
+                }
             }
-            for half in 0..2 {
-                butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
-                butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
-            }
-            for i in 0..4 {
-                butterfly(&mut values, i, i + 4, tw[0]);
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+            {
+                for pair in 0..4 {
+                    butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
+                }
+                for half in 0..2 {
+                    butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
+                    butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+                }
+                for i in 0..4 {
+                    butterfly(&mut values, i, i + 4, tw[0]);
+                }
             }
             for (i, &value) in values.iter().enumerate() {
                 *ptr.add(base + i * eighth) = value;

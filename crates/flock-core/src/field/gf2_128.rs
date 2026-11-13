@@ -505,6 +505,57 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    #[test]
+    fn prepared_pairs_match_software() {
+        use core::arch::aarch64::uint64x2_t;
+
+        let check = |constants: [F128; 2], inputs: [F128; 2]| {
+            // SAFETY: AES and the little-endian F128 lane layout are required.
+            let actual = unsafe {
+                let p0 = aarch64::const_prep(core::mem::transmute::<F128, uint64x2_t>(constants[0]));
+                let p1 = aarch64::const_prep(core::mem::transmute::<F128, uint64x2_t>(constants[1]));
+                aarch64::mul_const_pair_prep(
+                    p0,
+                    core::mem::transmute::<F128, uint64x2_t>(inputs[0]),
+                    p1,
+                    core::mem::transmute::<F128, uint64x2_t>(inputs[1]),
+                ).map(|v| core::mem::transmute::<uint64x2_t, F128>(v))
+            };
+            for lane in 0..2 {
+                assert_eq!(actual[lane], software::ghash_mul(constants[lane], inputs[lane]));
+            }
+        };
+        let constants = [
+            F128::ZERO,
+            F128::ONE,
+            F128::new(1 << 63, 0),
+            F128::new(0, 1),
+            F128::new(0, 1 << 63),
+            F128::new(u64::MAX, u64::MAX),
+            F128::new(0x0123456789abcdef, 0xfedcba9876543210),
+        ];
+        let basis = |bit: usize| {
+            if bit < 64 { F128::new(1 << bit, 0) } else { F128::new(0, 1 << (bit - 64)) }
+        };
+        for (i, &c) in constants.iter().enumerate() {
+            let different = [c, constants[(i + 3) % constants.len()]];
+            for bit in 0..128 {
+                let inputs = [basis(bit), basis(127 - bit)];
+                check(different, inputs);
+                check([c; 2], inputs);
+            }
+            check(different, [F128::new(u64::MAX, u64::MAX), F128::ONE]);
+        }
+        let mut rng = Rng::new(0x5041_4952);
+        for _ in 0..64 {
+            let c = [rng.next_f128(), rng.next_f128()];
+            let x = [rng.next_f128(), rng.next_f128()];
+            check(c, x);
+            check([c[1], c[0]], [x[1], x[0]]);
+        }
+    }
+
     /// Local timing probe (not a correctness test): the shared-constant pair
     /// in a slice loop, Karatsuba against prepared. Run with
     /// `cargo test --profile challenge -p flock-core --lib const_vec2_timing -- --ignored --nocapture`.
