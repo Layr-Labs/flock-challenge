@@ -1398,7 +1398,9 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// `fold_two_and_msg` / `fold_two_and_msg_in_place` exist only on aarch64 with
+// AES; without this gate the crate's unit tests do not compile on other hosts.
+#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
 #[test]
 fn kara2_in_place_matches_separate() {
     let mut state=0x91e10da5c79e7b1du64;
