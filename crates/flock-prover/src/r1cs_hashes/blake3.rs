@@ -241,6 +241,10 @@ pub(crate) struct DeferredAb<'a> {
     /// the whole kernel (default); `FLOCK_NO_WITGEN_AB_INPUT_MEM=1` restores
     /// the register form.  Copy-drain forms only.
     input_mem: bool,
+    /// Regenerate a word-major quad in place (`gen_quad_soa_into`, default)
+    /// instead of by value; `FLOCK_NO_AB_SEED_INPUT_REUSE` restores the
+    /// latter.
+    seed_in_place: bool,
 }
 
 // SAFETY: `fill_quad` writes only the four blocks of its own quad; distinct
@@ -311,6 +315,12 @@ impl DeferredAb<'_> {
             };
             // Same input selection as the driver's `process_group`.
             match self.spec_init {
+                Some(init) if self.gen_ilp && self.seed_in_place => {
+                    let mut slot = std::mem::MaybeUninit::uninit();
+                    emit(QuadInput::Seeded(crate::seed_pipe::gen_quad_soa_into(
+                        init, first, &mut slot,
+                    )));
+                }
                 Some(init) if self.gen_ilp => {
                     let seeded = crate::seed_pipe::gen_quad_soa(init, first);
                     emit(QuadInput::Seeded(&seeded));
@@ -3754,6 +3764,9 @@ pub(crate) mod witgen_simd {
         // Item C: resolve the gen_block ILP/scalar choice once per witgen
         // (the quad synth below calls it per block).
         let gen_ilp = !crate::seed_pipe::gen_block_ilp_killed();
+        // Word-major quads are written in place (`gen_quad_soa_into`) unless
+        // `FLOCK_NO_AB_SEED_INPUT_REUSE` is set; same bytes either way.
+        let seed_in_place = crate::seed_pipe::seed_input_reuse_enabled();
         assert!(
             n_total >= 8 && n_total.is_multiple_of(8),
             "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
@@ -3910,6 +3923,18 @@ pub(crate) mod witgen_simd {
                 // The scalar generator kill switch and every partial/padded
                 // shape retain the incumbent AoS path as an exact fallback.
                 if let Some(init) = spec_init {
+                    if seed_in_place && gen_ilp && first + 4 <= n_blocks {
+                        let mut slot = std::mem::MaybeUninit::uninit();
+                        emit_quad(
+                            QuadInput::Seeded(crate::seed_pipe::gen_quad_soa_into(
+                                init, first, &mut slot,
+                            )),
+                            z_grp[base..].as_mut_ptr() as *mut u32,
+                            a_grp[base..].as_mut_ptr() as *mut u32,
+                            b_grp[base..].as_mut_ptr() as *mut u32,
+                        );
+                        continue;
+                    }
                     if gen_ilp && first + 4 <= n_blocks {
                         let seeded = crate::seed_pipe::gen_quad_soa(init, first);
                         // Each quad fully owns its four block slots in every
@@ -4010,8 +4035,6 @@ pub(crate) mod witgen_simd {
             // the whole downstream GPU chain earlier by the difference. The
             // uniform 8-band control remains selectable for exact same-binary
             // A/B (`FLOCK_NO_STREAM_TAPER=1`).
-            // Tail band of 64 gps keeps 8 hetero slabs (WITGEN_HETERO_SLAB =
-            // 64 jobs) so its drain still parallelizes across the pool.
             const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
             const TAPERED_SCHEDULE: &[usize] =
                 &[64, 448, 512, 512, 512, 512, 512, 512, 448, 64];
@@ -4041,7 +4064,7 @@ pub(crate) mod witgen_simd {
             let cont_queue = !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE").is_ok_and(|v| v == "1");
             if cont_queue {
                 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-                const SLAB: usize = super::super::common::WITGEN_HETERO_SLAB;
+                const SLAB: usize = 32;
                 let n_bands = schedule.len();
                 let band_offset: Vec<usize> = schedule
                     .iter()
@@ -4054,7 +4077,6 @@ pub(crate) mod witgen_simd {
                 // Slab table in band-major order (band, then segment, then
                 // local) — the incumbent's claim order, minus its joins. A
                 // slab never straddles a segment or a band: every schedule
-                // entry is a multiple of the 64-group slab.
                 let mut slab_band: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
                 let mut slab_g0: Vec<u32> = Vec::with_capacity(n_groups / SLAB);
                 for (i, &gps) in schedule.iter().enumerate() {
@@ -4244,6 +4266,7 @@ pub(crate) mod witgen_simd {
             primed_scratch: ab_primed_scratch_enabled(),
             copy_drain: ab_copy_drain_enabled(),
             input_mem: ab_input_mem_enabled(),
+            seed_in_place,
         });
         (z, a, b, z_lincheck, stream, deferred)
     }
@@ -6530,6 +6553,7 @@ mod tests {
                 primed_scratch: true,
                 copy_drain: true,
                 input_mem,
+                seed_in_place: true,
             };
             for q in 0..n_quads {
                 let sa = scratch.as_mut_ptr().cast::<u8>();
@@ -6544,6 +6568,62 @@ mod tests {
             let off = fill_all(false, spec_init);
             assert!(on == off, "input-mem switch changed bytes (spec_init {spec_init:?})");
             assert!(on.0.iter().any(|&w| w != 0x1111_1111));
+        }
+    }
+
+    /// `DeferredAb::fill_quad` on the lazy input with the word-major quad
+    /// regenerated in place and by value (`FLOCK_NO_AB_SEED_INPUT_REUSE`):
+    /// same a, b and scratch bytes for every quad, both a/b kernel input
+    /// forms, without scratch, cold and primed scratch, several inits.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn deferred_ab_fill_quad_seed_in_place_is_byte_neutral() {
+        const U32S: usize = 4 * (K / 32);
+        // Never read on the lazy input; only its length sets the quad count.
+        let blocks: Vec<Compression> = vec![([0; 8], [0; 16], 0, 0, 0); 64];
+        let n_quads = blocks.len() / 4;
+        let fill_all = |in_place: bool, input_mem: bool, init: u64, scratch_mode: u8| {
+            let mut a = vec![0x1111_1111u32; n_quads * U32S];
+            let mut b = vec![0x2222_2222u32; n_quads * U32S];
+            let mut scratch = vec![0x3333_3333u32; 2 * U32S];
+            let mut scratches = Vec::new();
+            let handle = super::DeferredAb {
+                blocks: &blocks,
+                spec_init: Some(init),
+                gen_ilp: true,
+                a: a.as_mut_ptr(),
+                b: b.as_mut_ptr(),
+                n_quads,
+                primed_scratch: true,
+                copy_drain: true,
+                input_mem,
+                seed_in_place: in_place,
+            };
+            for q in 0..n_quads {
+                if scratch_mode == 0 {
+                    handle.fill_quad(q, std::ptr::null_mut(), std::ptr::null_mut(), false);
+                    continue;
+                }
+                let sa = scratch.as_mut_ptr().cast::<u8>();
+                let sb = unsafe { scratch.as_mut_ptr().add(U32S) }.cast::<u8>();
+                handle.fill_quad(q, sa, sb, scratch_mode == 2 && q > 0);
+                scratches.push(scratch.clone());
+            }
+            (a, b, scratches)
+        };
+        for init in [0u64, u64::MAX, 0x0123_4567_89ab_cdef, 0x9e37_79b9_7f4a_7c15] {
+            for input_mem in [true, false] {
+                for scratch_mode in 0..3u8 {
+                    let new = fill_all(true, input_mem, init, scratch_mode);
+                    let old = fill_all(false, input_mem, init, scratch_mode);
+                    assert!(
+                        new == old,
+                        "in-place quad changed bytes (init {init:#x} mem {input_mem} mode {scratch_mode})"
+                    );
+                    assert!(new.0.iter().any(|&w| w != 0x1111_1111));
+                    assert!(new.1.iter().any(|&w| w != 0x2222_2222));
+                }
+            }
         }
     }
 

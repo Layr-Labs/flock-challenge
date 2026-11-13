@@ -340,6 +340,63 @@ pub(crate) fn gen_quad_soa(init: u64, first_block: usize) -> CompressionQuadSoa 
     }
 }
 
+/// [`gen_quad_soa`] written in place: the chaining, message and counter rows
+/// are drawn straight into their fields of `out` and the three constant rows
+/// are stored as values, so there is no out-of-line row helper, no
+/// whole-struct copy and no pattern fill call. Same states, same draw order,
+/// same 448 bytes.
+#[inline(always)]
+pub(crate) fn gen_quad_soa_into(
+    init: u64,
+    first_block: usize,
+    out: &mut std::mem::MaybeUninit<CompressionQuadSoa>,
+) -> &CompressionQuadSoa {
+    let first_state =
+        init.wrapping_add(((DRAWS_PER_BLOCK * first_block) as u64).wrapping_mul(GOLDEN));
+    let block_stride = (DRAWS_PER_BLOCK as u64).wrapping_mul(GOLDEN);
+    let mut s0 = first_state;
+    let mut s1 = first_state.wrapping_add(block_stride);
+    let mut s2 = first_state.wrapping_add(block_stride.wrapping_mul(2));
+    let mut s3 = first_state.wrapping_add(block_stride.wrapping_mul(3));
+    let mut draw_row = || {
+        s0 = s0.wrapping_add(GOLDEN);
+        s1 = s1.wrapping_add(GOLDEN);
+        s2 = s2.wrapping_add(GOLDEN);
+        s3 = s3.wrapping_add(GOLDEN);
+        [mix(s0), mix(s1), mix(s2), mix(s3)]
+    };
+    let p = out.as_mut_ptr();
+    // The count is 8; read through `black_box` so the loop stays rolled like
+    // the message loop (fully unrolled, its state steps turn into one 64-bit
+    // constant per draw).
+    let cv_rows = std::hint::black_box(8usize);
+    debug_assert_eq!(cv_rows, 8);
+    // SAFETY: `black_box` returns its argument, so the first loop writes the
+    // 8 rows of `cv`; the other fields are written by name, so all 448 bytes
+    // are written before the shared reference is formed.
+    unsafe {
+        let cv = std::ptr::addr_of_mut!((*p).cv).cast::<[u32; 4]>();
+        for w in 0..cv_rows {
+            cv.add(w).write(draw_row());
+        }
+        for w in 0..16 {
+            std::ptr::addr_of_mut!((*p).message[w]).write(draw_row());
+        }
+        std::ptr::addr_of_mut!((*p).counter_lo).write(draw_row());
+        std::ptr::addr_of_mut!((*p).counter_hi).write([0, 0, 0, 0]);
+        std::ptr::addr_of_mut!((*p).block_len).write([64, 64, 64, 64]);
+        std::ptr::addr_of_mut!((*p).flags).write([11, 11, 11, 11]);
+        out.assume_init_ref()
+    }
+}
+
+/// `FLOCK_NO_AB_SEED_INPUT_REUSE` (any value) keeps both witness passes on
+/// [`gen_quad_soa`]; otherwise they use [`gen_quad_soa_into`]. Read once.
+pub(crate) fn seed_input_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_AB_SEED_INPUT_REUSE").is_none())
+}
+
 /// Full fail-closed oracle for the ranked word-major generator. This is called
 /// only during the protected worker's untimed warm-up, after `blocks` has
 /// already been byte-matched to the protected generator.
@@ -1717,6 +1774,47 @@ mod tests {
         protected[77].1[5] ^= 1;
         assert!(!generated_quads_match_blocks(init, &protected));
         assert!(!generated_quads_match_blocks(init, &protected[..255]));
+    }
+
+    /// The in-place word-major generator against the by-value one: every quad
+    /// of the ranked 2^18-block input for several inits, plus quads whose
+    /// state offset wraps. The destination is filled with a stale pattern
+    /// first, so a field the in-place form failed to write would show.
+    #[test]
+    fn gen_quad_soa_into_matches_gen_quad_soa() {
+        let check = |init: u64, first: usize| {
+            let want = gen_quad_soa(init, first);
+            let mut slot = std::mem::MaybeUninit::<CompressionQuadSoa>::uninit();
+            // SAFETY: plain u32 rows, every byte pattern is a valid value.
+            unsafe { std::ptr::write_bytes(slot.as_mut_ptr(), 0xA5, 1) };
+            let got = gen_quad_soa_into(init, first, &mut slot);
+            assert!(
+                got.cv == want.cv
+                    && got.message == want.message
+                    && got.counter_lo == want.counter_lo
+                    && got.counter_hi == want.counter_hi
+                    && got.block_len == want.block_len
+                    && got.flags == want.flags,
+                "init={init:#x} first={first}"
+            );
+        };
+        for &(log2, seed) in &[
+            (18u32, 0u64),
+            (18, u64::MAX),
+            (18, 0x0123_4567_89AB_CDEF),
+            (32, 0x9E37_79B9_7F4A_7C15),
+        ] {
+            let init = generator_init(log2, seed);
+            for quad in 0..(1usize << 16) {
+                check(init, 4 * quad);
+            }
+        }
+        let top = (usize::MAX / DRAWS_PER_BLOCK) & !3;
+        for init in [0u64, 1, u64::MAX, GOLDEN.wrapping_neg()] {
+            for first in [0usize, 4, 1 << 18, (1 << 18) - 4, top - 4, top] {
+                check(init, first);
+            }
+        }
     }
 
     /// Slices that are not the live lazy buffer must take the ordinary read
