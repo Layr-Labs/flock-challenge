@@ -291,7 +291,9 @@ unsafe fn fused_pmull_hi_acc(
 }
 
 /// `acc ^ (a_sw.lo * b.lo) ^ (a_sw.hi * b.hi)` as two chained fused µops
-/// (the cross term of `a * b` when `a_sw = swap_halves_q(a)`).
+/// (the cross term of `a * b` when `a_sw = swap_halves_q(a)`). The second
+/// product is written into the accumulator's own register once its old value
+/// is folded in, so an accumulator carried by a loop stays where it is.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(always)]
 unsafe fn fused_cross_acc(
@@ -299,19 +301,19 @@ unsafe fn fused_cross_acc(
     a_sw: core::arch::aarch64::uint64x2_t,
     b: core::arch::aarch64::uint64x2_t,
 ) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    // SAFETY: register-only; `p` and `o` are early clobbers.
+    let mut out = acc;
+    // SAFETY: register-only; `p` is an early clobber and `o` (the
+    // accumulator) is overwritten only after its value is folded into `p`.
     unsafe {
         core::arch::asm!(
             "pmull {p:v}.1q, {t:v}.1d, {b:v}.1d",
-            "eor {p:v}.16b, {p:v}.16b, {c:v}.16b",
+            "eor {p:v}.16b, {p:v}.16b, {o:v}.16b",
             "pmull2 {o:v}.1q, {t:v}.2d, {b:v}.2d",
             "eor {o:v}.16b, {o:v}.16b, {p:v}.16b",
             t = in(vreg) a_sw,
             b = in(vreg) b,
-            c = in(vreg) acc,
             p = out(vreg) _,
-            o = out(vreg) out,
+            o = inout(vreg) out,
             options(pure, nomem, nostack, preserves_flags),
         );
     }
@@ -5786,6 +5788,48 @@ mod tests {
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^ (z >> 31)
+    }
+
+    /// A run of `tri_acc_q` and `tri_acc_sw` updates on one accumulator, as a
+    /// loop carries it: the cross accumulator, updated in its own register by
+    /// `fused_cross_acc`, ends up as the XOR of its start value and every
+    /// product's cross term, and `ll` / `hh` as the XOR of the low and high
+    /// products (the terms `clmul_products_q` forms).
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn tri_acc_cross_in_place_matches_clmul_products() {
+        let mut state = 0x5452_4941_4343_524f;
+        let mut q = || -> uint64x2_t {
+            let v = [splitmix64(&mut state), splitmix64(&mut state)];
+            unsafe { core::mem::transmute::<[u64; 2], uint64x2_t>(v) }
+        };
+        let bits = |v: uint64x2_t| -> [u64; 2] { unsafe { core::mem::transmute(v) } };
+        for sw_form in [false, true] {
+            let start = [q(), q(), q()];
+            let mut acc = TriNeon {
+                ll: start[0],
+                cross: start[1],
+                hh: start[2],
+            };
+            let mut want = start.map(bits);
+            for _ in 0..97 {
+                let (a, b) = (q(), q());
+                unsafe {
+                    if sw_form {
+                        tri_acc_sw(&mut acc, a, swap_halves_q(a), b);
+                    } else {
+                        tri_acc_q(&mut acc, a, b);
+                    }
+                    let (ll, cross, hh) = clmul_products_q(a, b);
+                    for (w, t) in want.iter_mut().zip([ll, cross, hh]) {
+                        let t = bits(t);
+                        w[0] ^= t[0];
+                        w[1] ^= t[1];
+                    }
+                }
+            }
+            assert_eq!([bits(acc.ll), bits(acc.cross), bits(acc.hh)], want, "sw_form {sw_form}");
+        }
     }
 
     /// Every byte lane and every byte value: the selected load form returns
