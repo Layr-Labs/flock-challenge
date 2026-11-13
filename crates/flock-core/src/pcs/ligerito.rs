@@ -3092,12 +3092,52 @@ fn transpose_forward_ntt_fused_3layer(
             for pair in 0..4 {
                 butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
             }
-            for half in 0..2 {
-                butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
-                butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            {
+                use core::arch::aarch64::{uint64x2_t, veorq_u64, vzip1q_u64, vzip2q_u64};
+                use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon_vectors as mul_pair;
+
+                let pack = |x: F128, y: F128| {
+                    let x = core::mem::transmute::<F128, uint64x2_t>(x);
+                    let y = core::mem::transmute::<F128, uint64x2_t>(y);
+                    [vzip1q_u64(x, y), vzip2q_u64(x, y)]
+                };
+                let xor = |x: [uint64x2_t; 2], y: [uint64x2_t; 2]| {
+                    [veorq_u64(x[0], y[0]), veorq_u64(x[1], y[1])]
+                };
+                let unpack = |pair: [uint64x2_t; 2]| {
+                    (
+                        core::mem::transmute::<uint64x2_t, F128>(vzip1q_u64(pair[0], pair[1])),
+                        core::mem::transmute::<uint64x2_t, F128>(vzip2q_u64(pair[0], pair[1])),
+                    )
+                };
+
+                let a = pack(values[0], values[1]);
+                let b = pack(values[2], values[3]);
+                let c = pack(values[4], values[5]);
+                let d = pack(values[6], values[7]);
+                let s = xor(a, b);
+                let t = xor(c, d);
+                let b = xor(b, mul_pair(tw[1], s[0], s[1]));
+                let d = xor(d, mul_pair(tw[2], t[0], t[1]));
+                let u = xor(s, t);
+                let v = xor(b, d);
+                let c = xor(t, mul_pair(tw[0], u[0], u[1]));
+                let d = xor(d, mul_pair(tw[0], v[0], v[1]));
+                (values[0], values[1]) = unpack(u);
+                (values[2], values[3]) = unpack(v);
+                (values[4], values[5]) = unpack(c);
+                (values[6], values[7]) = unpack(d);
             }
-            for i in 0..4 {
-                butterfly(&mut values, i, i + 4, tw[0]);
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+            {
+                for half in 0..2 {
+                    butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
+                    butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+                }
+                for i in 0..4 {
+                    butterfly(&mut values, i, i + 4, tw[0]);
+                }
             }
             for (i, &value) in values.iter().enumerate() {
                 *ptr.add(base + i * eighth) = value;
@@ -10037,6 +10077,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
 
     for i in 0..r {
+        if i + 2 == r || r == 1 {
+            crate::spawn_publish_warm_hook();
+        }
         let k_i = config.recursive_ks[i];
         let mut level_rs = Vec::with_capacity(k_i);
         let _t = std::time::Instant::now();

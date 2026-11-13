@@ -53,6 +53,17 @@ pub mod zerocheck;
 /// purely for screening/rollback — mirrors `FLOCK_NO_AB_COMPACT_STORE`.
 pub const ENV_NO_MICRO_STACK: &str = "FLOCK_NO_MICRO_STACK";
 
+pub static PUBLISH_WARM_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+pub(crate) fn spawn_publish_warm_hook() {
+    if let Some(&hook) = PUBLISH_WARM_HOOK.get() {
+        match crate::epool::helper_pool() {
+            Some(pool) => pool.spawn(hook),
+            None => rayon::spawn(hook),
+        }
+    }
+}
+
 /// Unlike `ab_compact_store_enabled` this does **not** latch the first read
 /// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
 /// per-call `var_os` read is noise, and re-reading keeps same-process A/B

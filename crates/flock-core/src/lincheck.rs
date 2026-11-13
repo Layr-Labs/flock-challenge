@@ -623,6 +623,7 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
     }
     out[0] = F128::ONE;
     const PAR_THRESHOLD: usize = 1 << 12;
+    const PAR_CHUNK: usize = 1 << 8;
     for j in 0..d {
         let r_j = point[j];
         let len = 1usize << j;
@@ -632,21 +633,14 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
         //   hi[i] = v * r_j              ← new bit_j = 1
         //   lo[i] = v * (1 + r_j)
         //         = v + hi[i]             ← new bit_j = 0
-        // The distributive identity saves one field multiplication per pair.
-        let build_pair = |lo_i: &mut F128, hi_i: &mut F128| {
-            let v = *lo_i;
-            let vr = v * r_j;
-            *hi_i = vr;
-            *lo_i = v + vr;
-        };
         if len < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+            crate::field::f128_slice::expand_eq_table_level(lo, hi, r_j);
         } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+            lo.par_chunks_mut(PAR_CHUNK)
+                .zip(hi.par_chunks_mut(PAR_CHUNK))
+                .for_each(|(lo_chunk, hi_chunk)| {
+                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_j);
+                });
         }
     }
 }
@@ -2099,6 +2093,26 @@ mod tests {
         }
         fn bits(&mut self, n: usize) -> Vec<bool> {
             (0..n).map(|_| self.next_u64() & 1 == 1).collect()
+        }
+    }
+
+    #[test]
+    fn x1_quirky_eq_table_matches_outer_product() {
+        let mut rng = Rng::new(0x0E0_51DE);
+        for (k_skip, rest) in [(6usize, 8usize), (6, 0), (6, 1), (3, 5), (1, 9), (0, 4), (6, 11)] {
+            let z_skip = rng.f128();
+            let x_inner_rest = rng.f128_vec(rest);
+            let lambda = lagrange_weights_naive(k_skip, z_skip);
+            let eq_rest = build_eq_table(&x_inner_rest);
+            let mut want = Vec::with_capacity(lambda.len() * eq_rest.len());
+            for &er in &eq_rest {
+                for &ls in &lambda {
+                    want.push(ls * er);
+                }
+            }
+            let got = build_quirky_eq_table(z_skip, &x_inner_rest, k_skip);
+            assert_eq!(got.len(), want.len(), "k_skip={k_skip} rest={rest}");
+            assert!(got == want, "k_skip={k_skip} rest={rest}");
         }
     }
 

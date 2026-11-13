@@ -805,6 +805,49 @@ fn ranked_proof_path() -> Option<PathBuf> {
 
 /// Sibling temporary name: distinct from the wrapper's `{proof}.tmp`, and on
 /// the same filesystem as the destination so the final rename is atomic.
+fn publish_rename_warm_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_PUBLISH_RN_WARM").as_deref() != Some(OsStr::new("1"))
+    })
+}
+
+static PUBLISH_RN_WARM_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+fn publish_sibling(proof_path: &Path, suffix: &str) -> PathBuf {
+    let mut name = proof_path.as_os_str().to_os_string();
+    name.push(suffix);
+    name.into()
+}
+
+fn arm_publish_rename_warm(proof_path: &Path) {
+    if !publish_rename_warm_enabled() {
+        return;
+    }
+    if std::fs::write(publish_sibling(proof_path, ".rnw"), b"w").is_ok() {
+        let _ = PUBLISH_RN_WARM_PATH.set(proof_path.to_path_buf());
+        let _ = flock_core::PUBLISH_WARM_HOOK.set(publish_rename_warm_hook);
+    }
+}
+
+fn publish_rename_warm_hook() {
+    if let Some(path) = PUBLISH_RN_WARM_PATH.get() {
+        publish_rename_warm_at(path);
+    }
+}
+
+fn publish_rename_warm_at(path: &Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::metadata(dir);
+    }
+    let _ = std::fs::symlink_metadata(path);
+    let a = publish_sibling(path, ".rnw");
+    let b = publish_sibling(path, ".rnx");
+    if std::fs::rename(&a, &b).is_ok() {
+        let _ = std::fs::rename(&b, &a);
+    }
+}
+
 fn speculative_temporary_path(proof_path: &Path) -> PathBuf {
     let mut temporary = proof_path.as_os_str().to_os_string();
     temporary.push(".spec.tmp");
@@ -1355,7 +1398,13 @@ fn speculative_main(
     let preopened = speculative_publish_enabled()
         .then(ranked_proof_path)
         .flatten()
-        .and_then(|proof_path| preopen_publish_file(&proof_path));
+        .and_then(|proof_path| {
+            let pre = preopen_publish_file(&proof_path);
+            if pre.is_some() {
+                arm_publish_rename_warm(&proof_path);
+            }
+            pre
+        });
 
     // Everything before the stdin poll is done: release `arm`.
     let _ = parked.send(());
@@ -1614,6 +1663,30 @@ mod tests {
         ));
         std::fs::create_dir(&path).expect("create publication test directory");
         path
+    }
+
+    #[test]
+    fn publish_rename_warm_round_trips_the_dummy_only() {
+        let dir = publication_test_dir("rn-warm");
+        let proof = dir.join("run-0.proof");
+        let dummy = publish_sibling(&proof, ".rnw");
+        let scratch = publish_sibling(&proof, ".rnx");
+        publish_rename_warm_at(&proof);
+        assert!(!dummy.exists() && !scratch.exists() && !proof.exists());
+        std::fs::write(&dummy, b"w").expect("write dummy");
+        for _ in 0..3 {
+            publish_rename_warm_at(&proof);
+            assert_eq!(std::fs::read(&dummy).expect("dummy kept"), b"w");
+            assert!(!scratch.exists(), "scratch name must not survive");
+            assert!(!proof.exists(), "warm-up must never create the proof path");
+        }
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![std::ffi::OsString::from("run-0.proof.rnw")]);
+        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
     struct SpecIdentityReset;
