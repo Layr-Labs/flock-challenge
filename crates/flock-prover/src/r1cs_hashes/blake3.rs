@@ -3303,15 +3303,27 @@ pub(crate) mod witgen_simd {
             } else {
                 nt1
             };
+            // The copy loop is one asm block whose loop head is pinned to a
+            // 64-byte boundary (`.p2align 6` before the label; the padding
+            // runs once per block, never inside the loop), so its placement
+            // does not depend on the size of code elsewhere in the binary.
+            // Same loads and stores, in the same ascending order.
+            let n = end.saturating_sub(nt0);
             for j in 0..4usize {
                 let src = scratch.add(j * U32_PER_BLOCK);
                 let out = dst.add(j * U32_PER_BLOCK);
-                for g in nt0..end {
+                if n != 0 {
                     core::arch::asm!(
-                        "ldp {a:q}, {b:q}, [{s}]",
+                        ".p2align 6",
+                        "2:",
+                        "ldp {a:q}, {b:q}, [{s}], #32",
                         "stnp {a:q}, {b:q}, [{d}]",
-                        s = in(reg) src.add(8 * g),
-                        d = in(reg) out.add(8 * g),
+                        "add {d}, {d}, #32",
+                        "subs {n}, {n}, #1",
+                        "b.ne 2b",
+                        s = inout(reg) src.add(8 * nt0) => _,
+                        d = inout(reg) out.add(8 * nt0) => _,
+                        n = inout(reg) n => _,
                         a = out(vreg) _,
                         b = out(vreg) _,
                         options(nostack)
