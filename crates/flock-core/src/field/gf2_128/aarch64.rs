@@ -422,40 +422,6 @@ pub(crate) unsafe fn mul_const_prep(p: ConstPrep, x: uint64x2_t) -> uint64x2_t {
     unsafe { fold_lm(pmull_pair_sum(x, p.0), pmull_pair_sum(x, p.1)) }
 }
 
-/// Two independent prepared products, with their final folds in paired lanes.
-#[inline(always)]
-pub(crate) unsafe fn mul_const_pair_prep(
-    p0: ConstPrep,
-    x0: uint64x2_t,
-    p1: ConstPrep,
-    x1: uint64x2_t,
-) -> [uint64x2_t; 2] {
-    unsafe {
-        let l0 = pmull_pair_sum(x0, p0.0);
-        let m0 = pmull_pair_sum(x0, p0.1);
-        let l1 = pmull_pair_sum(x1, p1.0);
-        let m1 = pmull_pair_sum(x1, p1.1);
-        let l_lo = vzip1q_u64(l0, l1);
-        let l_hi = vzip2q_u64(l0, l1);
-        let m_lo = vzip1q_u64(m0, m1);
-        let m_hi = vzip2q_u64(m0, m1);
-
-        // Each M is an XOR of 64x64 products, so degree(M) <= 126.
-        // Thus M.hi bit 63 is zero and the high fold needs no >>63 term.
-        let lo = xor3_u64(
-            xor3_u64(l_lo, m_hi, vshlq_n_u64::<1>(m_hi)),
-            vshlq_n_u64::<2>(m_hi),
-            vshlq_n_u64::<7>(m_hi),
-        );
-        let hi = xor3_u64(
-            l_hi,
-            m_lo,
-            veorq_u64(vshrq_n_u64::<62>(m_hi), vshrq_n_u64::<57>(m_hi)),
-        );
-        [vzip1q_u64(lo, hi), vzip2q_u64(lo, hi)]
-    }
-}
-
 /// `x * c + y * d` for two prepared constants, with one shared fold.
 #[inline(always)]
 pub(crate) unsafe fn mul_two_const_sum_prep(

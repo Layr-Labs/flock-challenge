@@ -1423,16 +1423,6 @@ unsafe fn emit_root_rows_ab_s256(a: *const u8, b: *const u8, dst: *mut u8, ops: 
 /// decode or output cursor. A segment runs its Split, then its Pair or Full
 /// at 16 bytes further in the lanes and 64 bytes further in the output.
 ///
-/// The Pair and Split ops are single asm blocks with their registers chosen
-/// by hand (`pair_op`, `split_op`): the bit transpose of
-/// [`flock_core::bits::transpose_8_row_pairs_to_regs`] needs its four `TBL`
-/// table registers consecutive and its `BSL`/`SLI` destinations free, which
-/// the compiled form met with vector moves. A Pair op also keeps each lane's
-/// two words in one register (word `w` low, `w + 1` high), so for both of its
-/// rows at once all three exchange stages run between registers; the rows
-/// are split into their gather registers by `ZIP1`/`ZIP2` right in front of
-/// the `TBL`s. Same exchanges, same gather, same bytes.
-///
 /// # Safety
 /// As [`emit_root_rows_ab_s256`] for the row program `prog` was built from.
 #[cfg(target_arch = "aarch64")]
@@ -1440,27 +1430,11 @@ unsafe fn emit_root_rows_ab_s256(a: *const u8, b: *const u8, dst: *mut u8, ops: 
 unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut u8, prog: &StripeSegmentProgram) {
     use core::arch::aarch64::*;
     const LANE: usize = AB_STRIPE_WORDS * 8;
-    // The gather indices, the distance-1 keep mask and the distance-1 shifts
-    // (`-1` as `0xff`) of `transpose_8_row_pairs_to_regs`.
-    const IDX: [[u8; 16]; 4] = [
-        [0, 8, 16, 24, 32, 40, 48, 56, 1, 9, 17, 25, 33, 41, 49, 57],
-        [2, 10, 18, 26, 34, 42, 50, 58, 3, 11, 19, 27, 35, 43, 51, 59],
-        [4, 12, 20, 28, 36, 44, 52, 60, 5, 13, 21, 29, 37, 45, 53, 61],
-        [6, 14, 22, 30, 38, 46, 54, 62, 7, 15, 23, 31, 39, 47, 55, 63],
-    ];
-    const KEEP1: [u8; 16] = [0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa];
-    const SHIFT1: [u8; 16] = [1, 1, 1, 1, 1, 1, 1, 1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
 
-    /// The transpose's constants, held in registers across the program.
-    #[derive(Clone, Copy)]
-    struct Consts {
-        m33: uint8x16_t,
-        m55: uint8x16_t,
-        keep1: uint8x16_t,
-        shift1: uint8x16_t,
-        idx: [uint8x16_t; 4],
+    #[inline(always)]
+    unsafe fn q(a: *const u8, b: *const u8, l: usize) -> uint64x2_t {
+        unsafe { vandq_u64(vld1q_u64(a.add(l * LANE).cast()), vld1q_u64(b.add(l * LANE).cast())) }
     }
-
     #[inline(always)]
     unsafe fn pair(a: *const u8, b: *const u8, l: usize) -> uint64x2_t {
         unsafe {
@@ -1469,6 +1443,10 @@ unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut 
                 vcombine_u64(vld1_u64(b.add(l * LANE).cast()), vld1_u64(b.add((l + 1) * LANE).cast())),
             )
         }
+    }
+    #[inline(always)]
+    unsafe fn sel(m: uint8x16_t, x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+        unsafe { vreinterpretq_u64_u8(vbslq_u8(m, vreinterpretq_u8_u64(x), vreinterpretq_u8_u64(y))) }
     }
     #[inline(always)]
     unsafe fn put(dst: *mut u8, r: [uint64x2_t; 4]) {
@@ -1491,272 +1469,24 @@ unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut 
             );
         }
     }
-    /// The Pair op on the two words at `pa + OFF` / `pb + OFF` of the eight
-    /// lanes, writing its two 64-byte rows at `out + OUT`. Lane `l`'s
-    /// `a AND b` sits in `v16 + l`; the distance-4, 2 and 1 exchanges pair
-    /// lanes `l`/`l + 4`, `l`/`l + 2` and `l`/`l + 1` (`SLI`+`SRI` on a copy,
-    /// then `SHL`+`BIT` and `USHR`+`BIF` against `0x33` / `0x55`); `ZIP1`
-    /// (first word) and `ZIP2` (second word) of lanes `2k`/`2k + 1` fill the
-    /// table registers `v28..v31`. 88 instructions.
+    /// The two words at `pa` / `pb` of the eight lanes: (first words, second words).
     #[inline(always)]
-    unsafe fn pair_op<const OFF: usize, const OUT: usize>(pa: *const u8, pb: *const u8, out: *mut u8, k: &Consts) {
-        // SAFETY: the caller guarantees the 16-byte reads of the eight lanes
-        // and the 128-byte write; v16..v31 are declared clobbered.
+    unsafe fn rows(pa: *const u8, pb: *const u8) -> ([uint64x2_t; 4], [uint64x2_t; 4]) {
         unsafe {
-            core::arch::asm!(
-                "ldr q16, [{pa}, #{o0}]",
-                "ldr q24, [{pb}, #{o0}]",
-                "ldr q17, [{pa}, #{o1}]",
-                "ldr q25, [{pb}, #{o1}]",
-                "ldr q18, [{pa}, #{o2}]",
-                "ldr q26, [{pb}, #{o2}]",
-                "ldr q19, [{pa}, #{o3}]",
-                "ldr q27, [{pb}, #{o3}]",
-                "ldr q20, [{pa}, #{o4}]",
-                "ldr q28, [{pb}, #{o4}]",
-                "ldr q21, [{pa}, #{o5}]",
-                "ldr q29, [{pb}, #{o5}]",
-                "ldr q22, [{pa}, #{o6}]",
-                "ldr q30, [{pb}, #{o6}]",
-                "ldr q23, [{pa}, #{o7}]",
-                "ldr q31, [{pb}, #{o7}]",
-                "and v16.16b, v16.16b, v24.16b",
-                "and v17.16b, v17.16b, v25.16b",
-                "and v18.16b, v18.16b, v26.16b",
-                "and v19.16b, v19.16b, v27.16b",
-                "and v20.16b, v20.16b, v28.16b",
-                "and v21.16b, v21.16b, v29.16b",
-                "and v22.16b, v22.16b, v30.16b",
-                "and v23.16b, v23.16b, v31.16b",
-                "mov v24.16b, v16.16b",
-                "sli v24.16b, v20.16b, #4",
-                "sri v20.16b, v16.16b, #4",
-                "mov v25.16b, v17.16b",
-                "sli v25.16b, v21.16b, #4",
-                "sri v21.16b, v17.16b, #4",
-                "mov v26.16b, v18.16b",
-                "sli v26.16b, v22.16b, #4",
-                "sri v22.16b, v18.16b, #4",
-                "mov v27.16b, v19.16b",
-                "sli v27.16b, v23.16b, #4",
-                "sri v23.16b, v19.16b, #4",
-                "shl v16.16b, v26.16b, #2",
-                "bit v16.16b, v24.16b, {m33:v}.16b",
-                "ushr v24.16b, v24.16b, #2",
-                "bif v24.16b, v26.16b, {m33:v}.16b",
-                "shl v17.16b, v27.16b, #2",
-                "bit v17.16b, v25.16b, {m33:v}.16b",
-                "ushr v25.16b, v25.16b, #2",
-                "bif v25.16b, v27.16b, {m33:v}.16b",
-                "shl v18.16b, v22.16b, #2",
-                "bit v18.16b, v20.16b, {m33:v}.16b",
-                "ushr v20.16b, v20.16b, #2",
-                "bif v20.16b, v22.16b, {m33:v}.16b",
-                "shl v19.16b, v23.16b, #2",
-                "bit v19.16b, v21.16b, {m33:v}.16b",
-                "ushr v21.16b, v21.16b, #2",
-                "bif v21.16b, v23.16b, {m33:v}.16b",
-                "shl v26.16b, v17.16b, #1",
-                "bit v26.16b, v16.16b, {m55:v}.16b",
-                "ushr v16.16b, v16.16b, #1",
-                "bif v16.16b, v17.16b, {m55:v}.16b",
-                "shl v27.16b, v25.16b, #1",
-                "bit v27.16b, v24.16b, {m55:v}.16b",
-                "ushr v24.16b, v24.16b, #1",
-                "bif v24.16b, v25.16b, {m55:v}.16b",
-                "shl v22.16b, v19.16b, #1",
-                "bit v22.16b, v18.16b, {m55:v}.16b",
-                "ushr v18.16b, v18.16b, #1",
-                "bif v18.16b, v19.16b, {m55:v}.16b",
-                "shl v23.16b, v21.16b, #1",
-                "bit v23.16b, v20.16b, {m55:v}.16b",
-                "ushr v20.16b, v20.16b, #1",
-                "bif v20.16b, v21.16b, {m55:v}.16b",
-                "zip1 v28.2d, v26.2d, v16.2d",
-                "zip1 v29.2d, v27.2d, v24.2d",
-                "zip1 v30.2d, v22.2d, v18.2d",
-                "zip1 v31.2d, v23.2d, v20.2d",
-                "tbl v17.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i0:v}.16b",
-                "tbl v25.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i1:v}.16b",
-                "tbl v19.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i2:v}.16b",
-                "tbl v21.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i3:v}.16b",
-                "stnp q17, q25, [{out}, #{s0}]",
-                "stnp q19, q21, [{out}, #{s1}]",
-                "zip2 v28.2d, v26.2d, v16.2d",
-                "zip2 v29.2d, v27.2d, v24.2d",
-                "zip2 v30.2d, v22.2d, v18.2d",
-                "zip2 v31.2d, v23.2d, v20.2d",
-                "tbl v17.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i0:v}.16b",
-                "tbl v25.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i1:v}.16b",
-                "tbl v19.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i2:v}.16b",
-                "tbl v21.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i3:v}.16b",
-                "stnp q17, q25, [{out}, #{s2}]",
-                "stnp q19, q21, [{out}, #{s3}]",
-                pa = in(reg) pa,
-                pb = in(reg) pb,
-                out = in(reg) out,
-                o0 = const OFF + 0 * LANE,
-                o1 = const OFF + 1 * LANE,
-                o2 = const OFF + 2 * LANE,
-                o3 = const OFF + 3 * LANE,
-                o4 = const OFF + 4 * LANE,
-                o5 = const OFF + 5 * LANE,
-                o6 = const OFF + 6 * LANE,
-                o7 = const OFF + 7 * LANE,
-                s0 = const OUT,
-                s1 = const OUT + 32,
-                s2 = const OUT + 64,
-                s3 = const OUT + 96,
-                m33 = in(vreg) k.m33,
-                m55 = in(vreg) k.m55,
-                i0 = in(vreg) k.idx[0],
-                i1 = in(vreg) k.idx[1],
-                i2 = in(vreg) k.idx[2],
-                i3 = in(vreg) k.idx[3],
-                out("v16") _,
-                out("v17") _,
-                out("v18") _,
-                out("v19") _,
-                out("v20") _,
-                out("v21") _,
-                out("v22") _,
-                out("v23") _,
-                out("v24") _,
-                out("v25") _,
-                out("v26") _,
-                out("v27") _,
-                out("v28") _,
-                out("v29") _,
-                out("v30") _,
-                out("v31") _,
-                options(nostack, preserves_flags),
-            );
+            let (z0, z1, z2, z3) = (q(pa, pb, 0), q(pa, pb, 1), q(pa, pb, 2), q(pa, pb, 3));
+            let (z4, z5, z6, z7) = (q(pa, pb, 4), q(pa, pb, 5), q(pa, pb, 6), q(pa, pb, 7));
+            (
+                [vtrn1q_u64(z0, z1), vtrn1q_u64(z2, z3), vtrn1q_u64(z4, z5), vtrn1q_u64(z6, z7)],
+                [vtrn2q_u64(z0, z1), vtrn2q_u64(z2, z3), vtrn2q_u64(z4, z5), vtrn2q_u64(z6, z7)],
+            )
         }
     }
-    /// The Split op on the two words at `pa + OFF` / `pb + OFF` (the first
-    /// where `msk` is set, else the second), writing its 64-byte row at
-    /// `out + OUT`: each register pair of lanes is `ZIP1` then `BIF` with the
-    /// `ZIP2`, the distance-4 and 2 exchanges run between registers and the
-    /// distance-1 one in register, straight into the table registers
-    /// `v20..v23`. 68 instructions.
     #[inline(always)]
-    unsafe fn split_op<const OFF: usize, const OUT: usize>(
-        pa: *const u8,
-        pb: *const u8,
-        out: *mut u8,
-        msk: uint8x16_t,
-        k: &Consts,
-    ) {
-        // SAFETY: as `pair_op`, with a 64-byte write.
+    unsafe fn pair_op(pa: *const u8, pb: *const u8, out: *mut u8) {
         unsafe {
-            core::arch::asm!(
-                "ldr q16, [{pa}, #{o0}]",
-                "ldr q24, [{pb}, #{o0}]",
-                "ldr q17, [{pa}, #{o1}]",
-                "ldr q25, [{pb}, #{o1}]",
-                "ldr q18, [{pa}, #{o2}]",
-                "ldr q26, [{pb}, #{o2}]",
-                "ldr q19, [{pa}, #{o3}]",
-                "ldr q27, [{pb}, #{o3}]",
-                "ldr q20, [{pa}, #{o4}]",
-                "ldr q28, [{pb}, #{o4}]",
-                "ldr q21, [{pa}, #{o5}]",
-                "ldr q29, [{pb}, #{o5}]",
-                "ldr q22, [{pa}, #{o6}]",
-                "ldr q30, [{pb}, #{o6}]",
-                "ldr q23, [{pa}, #{o7}]",
-                "ldr q31, [{pb}, #{o7}]",
-                "and v16.16b, v16.16b, v24.16b",
-                "and v17.16b, v17.16b, v25.16b",
-                "and v18.16b, v18.16b, v26.16b",
-                "and v19.16b, v19.16b, v27.16b",
-                "and v20.16b, v20.16b, v28.16b",
-                "and v21.16b, v21.16b, v29.16b",
-                "and v22.16b, v22.16b, v30.16b",
-                "and v23.16b, v23.16b, v31.16b",
-                "zip1 v24.2d, v16.2d, v17.2d",
-                "zip2 v25.2d, v16.2d, v17.2d",
-                "bif v24.16b, v25.16b, {msk:v}.16b",
-                "zip1 v26.2d, v18.2d, v19.2d",
-                "zip2 v27.2d, v18.2d, v19.2d",
-                "bif v26.16b, v27.16b, {msk:v}.16b",
-                "zip1 v28.2d, v20.2d, v21.2d",
-                "zip2 v29.2d, v20.2d, v21.2d",
-                "bif v28.16b, v29.16b, {msk:v}.16b",
-                "zip1 v30.2d, v22.2d, v23.2d",
-                "zip2 v31.2d, v22.2d, v23.2d",
-                "bif v30.16b, v31.16b, {msk:v}.16b",
-                "mov v16.16b, v24.16b",
-                "sli v16.16b, v28.16b, #4",
-                "sri v28.16b, v24.16b, #4",
-                "mov v17.16b, v26.16b",
-                "sli v17.16b, v30.16b, #4",
-                "sri v30.16b, v26.16b, #4",
-                "shl v18.16b, v17.16b, #2",
-                "bit v18.16b, v16.16b, {m33:v}.16b",
-                "ushr v16.16b, v16.16b, #2",
-                "bif v16.16b, v17.16b, {m33:v}.16b",
-                "shl v19.16b, v30.16b, #2",
-                "bit v19.16b, v28.16b, {m33:v}.16b",
-                "ushr v28.16b, v28.16b, #2",
-                "bif v28.16b, v30.16b, {m33:v}.16b",
-                "ext v20.16b, v18.16b, v18.16b, #8",
-                "ushl v20.16b, v20.16b, {shift1:v}.16b",
-                "bit v20.16b, v18.16b, {keep1:v}.16b",
-                "ext v21.16b, v16.16b, v16.16b, #8",
-                "ushl v21.16b, v21.16b, {shift1:v}.16b",
-                "bit v21.16b, v16.16b, {keep1:v}.16b",
-                "ext v22.16b, v19.16b, v19.16b, #8",
-                "ushl v22.16b, v22.16b, {shift1:v}.16b",
-                "bit v22.16b, v19.16b, {keep1:v}.16b",
-                "ext v23.16b, v28.16b, v28.16b, #8",
-                "ushl v23.16b, v23.16b, {shift1:v}.16b",
-                "bit v23.16b, v28.16b, {keep1:v}.16b",
-                "tbl v24.16b, {{v20.16b, v21.16b, v22.16b, v23.16b}}, {i0:v}.16b",
-                "tbl v25.16b, {{v20.16b, v21.16b, v22.16b, v23.16b}}, {i1:v}.16b",
-                "tbl v26.16b, {{v20.16b, v21.16b, v22.16b, v23.16b}}, {i2:v}.16b",
-                "tbl v27.16b, {{v20.16b, v21.16b, v22.16b, v23.16b}}, {i3:v}.16b",
-                "stnp q24, q25, [{out}, #{s0}]",
-                "stnp q26, q27, [{out}, #{s1}]",
-                pa = in(reg) pa,
-                pb = in(reg) pb,
-                out = in(reg) out,
-                o0 = const OFF + 0 * LANE,
-                o1 = const OFF + 1 * LANE,
-                o2 = const OFF + 2 * LANE,
-                o3 = const OFF + 3 * LANE,
-                o4 = const OFF + 4 * LANE,
-                o5 = const OFF + 5 * LANE,
-                o6 = const OFF + 6 * LANE,
-                o7 = const OFF + 7 * LANE,
-                s0 = const OUT,
-                s1 = const OUT + 32,
-                msk = in(vreg) msk,
-                m33 = in(vreg) k.m33,
-                keep1 = in(vreg) k.keep1,
-                shift1 = in(vreg) k.shift1,
-                i0 = in(vreg) k.idx[0],
-                i1 = in(vreg) k.idx[1],
-                i2 = in(vreg) k.idx[2],
-                i3 = in(vreg) k.idx[3],
-                out("v16") _,
-                out("v17") _,
-                out("v18") _,
-                out("v19") _,
-                out("v20") _,
-                out("v21") _,
-                out("v22") _,
-                out("v23") _,
-                out("v24") _,
-                out("v25") _,
-                out("v26") _,
-                out("v27") _,
-                out("v28") _,
-                out("v29") _,
-                out("v30") _,
-                out("v31") _,
-                options(nostack, preserves_flags),
-            );
+            let (lo, hi) = rows(pa, pb);
+            put(out, lo);
+            put(out.add(64), hi);
         }
     }
     #[inline(always)]
@@ -1765,29 +1495,19 @@ unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut 
     }
 
     unsafe {
-        let k = Consts {
-            m33: vdupq_n_u8(0x33),
-            m55: vdupq_n_u8(0x55),
-            keep1: vld1q_u8(KEEP1.as_ptr()),
-            shift1: vld1q_u8(SHIFT1.as_ptr()),
-            idx: [
-                vld1q_u8(IDX[0].as_ptr()),
-                vld1q_u8(IDX[1].as_ptr()),
-                vld1q_u8(IDX[2].as_ptr()),
-                vld1q_u8(IDX[3].as_ptr()),
-            ],
-        };
         for &(off, out) in prog.pairs.iter() {
-            pair_op::<0, 0>(a.add(off as usize), b.add(off as usize), dst.add(out as usize), &k);
+            pair_op(a.add(off as usize), b.add(off as usize), dst.add(out as usize));
         }
         for &(off, out) in prog.fulls.iter() {
             full_op(a.add(off as usize), b.add(off as usize), dst.add(out as usize));
         }
         for seg in prog.segments.iter() {
             let (pa, pb, out) = (a.add(seg.off as usize), b.add(seg.off as usize), dst.add(seg.out as usize));
-            split_op::<0, 0>(pa, pb, out, vreinterpretq_u8_u64(vdupq_n_u64(seg.mask)), &k);
+            let (lo, hi) = rows(pa, pb);
+            let m = vreinterpretq_u8_u64(vdupq_n_u64(seg.mask));
+            put(out, [sel(m, lo[0], hi[0]), sel(m, lo[1], hi[1]), sel(m, lo[2], hi[2]), sel(m, lo[3], hi[3])]);
             if seg.pair {
-                pair_op::<16, 64>(pa, pb, out, &k);
+                pair_op(pa.add(16), pb.add(16), out.add(64));
             } else {
                 full_op(pa.add(16), pb.add(16), out.add(64));
             }

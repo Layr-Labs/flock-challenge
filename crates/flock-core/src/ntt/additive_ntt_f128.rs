@@ -3499,8 +3499,10 @@ mod tests {
     }
 
     /// Exhaust the exact production tables used by layers 18 and 19. This is
-    /// the invariant that makes the ranked narrow dispatch sound.
+    /// the invariant that makes the ranked narrow dispatch sound. The
+    /// dispatch is macOS-gated, so the assertion runs only on Apple hosts.
     #[test]
+    #[cfg(target_os = "macos")]
     fn standard_dim20_final_pair_twiddles_have_zero_high_limbs() {
         let ntt = AdditiveNttF128::standard(20);
         for layer in 18..20 {
