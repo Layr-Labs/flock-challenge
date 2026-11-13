@@ -1957,6 +1957,15 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
     let mut la_partials: Vec<[F128; 6]> = crate::alloc_uninit_vec(hi_size);
+    // The full-sweep group weights `eq_lo[2u + 1]` in prepared form, shared
+    // by every chunk's ranked loop (passed as an address; null without SHA3,
+    // which keeps the full sweep on its parent loop).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let eq_prep = kernels::aarch64::round2_eq_prep(eq_lo);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let eq_prep_addr = eq_prep.as_ptr() as usize;
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let eq_prep_addr = 0usize;
     let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
     let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -1992,6 +2001,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         anchors,
                         deltas,
                         eq_lo.as_ptr(),
+                        eq_prep_addr as *const F128,
                         lo_size,
                         pair_idx_base,
                         pair_in_block_mask,
@@ -2071,6 +2081,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         anchors,
                         deltas,
                         eq_lo.as_ptr(),
+                        core::ptr::null(),
                         lo_size,
                         pair_idx_base,
                         pair_in_block_mask,
@@ -2088,6 +2099,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         anchors,
                         deltas,
                         eq_lo.as_ptr(),
+                        core::ptr::null(),
                         lo_size,
                         pair_idx_base,
                         pair_in_block_mask,
@@ -2194,6 +2206,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             scr_anchors.as_mut_ptr(),
                             scr_deltas.as_mut_ptr(),
                             eq_lo.as_ptr(),
+                            eq_prep_addr as *const F128,
                             lo_size,
                             pair_idx_base,
                             pair_in_block_mask,
@@ -2643,6 +2656,10 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
         let _ = pack;
         false
     };
+    // The one-table kernel reads its group weights `eq_lo[2t + 1]` in
+    // prepared form, one table shared by every chunk.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them. Packed: each of a
@@ -2664,21 +2681,23 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
                 table_l3.as_ptr().cast::<u8>(),
             );
             let eq_ptr = eq_lo.as_ptr();
+            #[cfg(target_feature = "sha3")]
+            let prep_ptr = eq_prep.as_ptr();
             let out_ptr = outv.as_mut_ptr();
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
                     fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
-                        t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
                     )
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
-                    t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                    t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
                 ),
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
-                    t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                    t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
                 ),
                 #[cfg(target_feature = "sha3")]
                 (true, true) => fold2_compact_and_round45_chunk_neon_8_fused::<true>(
