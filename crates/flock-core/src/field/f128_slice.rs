@@ -262,6 +262,37 @@ pub(crate) fn fold_bank_major_128x64_rows2(
     }
 }
 
+#[inline]
+pub(crate) fn fold_bank_major_64x128_rows2(
+    weight: &[F128; 64],
+    input: &[F128],
+    output: &mut [F128; 128],
+) {
+    assert_eq!(
+        input.len(),
+        64 * 128,
+        "bank-major collapse requires exactly 64 banks by 128 lanes"
+    );
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies PMULL through `aes`; the exact input and
+    // output shapes are established by the types and assertion above.
+    unsafe {
+        aarch64::fold_bank_major_64x128_rows2(weight, input, output)
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        for lane in 0..128 {
+            let mut value = F128::ZERO;
+            for bank in 0..64 {
+                value += weight[bank] * input[bank * 128 + lane];
+            }
+            output[lane] = value;
+        }
+    }
+}
+
 /// Fold adjacent pairs from `src` into `dst`, starting at pair `base`.
 ///
 /// Computes `dst[t] = src[2j] * (1 + r) + src[2j + 1] * r`, where

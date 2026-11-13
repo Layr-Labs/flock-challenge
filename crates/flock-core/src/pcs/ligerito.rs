@@ -5052,6 +5052,14 @@ fn transpose_forward_ntt_sparse_impl(
     (data, intro_msg)
 }
 
+/// Exact rollback for the retained C2 transpose's fused first dense group:
+/// `FLOCK_NO_C2_FUSED_DENSIFY` (any value) restores the separate densify
+/// pass followed by the first three-layer group. Same bytes either way.
+fn c2_retained_fused_densify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_FUSED_DENSIFY").is_none())
+}
+
 pub(super) fn c2_retained_transpose_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_C2_RETAINED_TRANSPOSE").is_none())
@@ -5079,6 +5087,7 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
     if log_d - k < drop_log {
         return None;
     }
+    let mut remaining = log_d - k;
     let mut data: Vec<F128> = if k == 0 {
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
@@ -5089,9 +5098,25 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
         let groups = group_sorted_positions(positions, k);
         let mut arena = scatter_active_windows(&groups, positions, values, k);
         transform_active_windows(ntt, &mut arena, &groups, positions, values, k, log_d);
-        densify_active_windows(&arena, &groups, log_d, k)
+        // The first dense three-layer group below always runs at layer
+        // `log_d - k - 3` (both suffix branches start from `remaining = log_d
+        // - k` and step down by three) whenever the suffix has room for it.
+        // Gathering that group straight from the arena is byte-identical to
+        // densifying and then running it (see
+        // `densify_active_windows_fused_first_3layer`); it deletes the
+        // full-domain densify store and the group's matching reload.
+        let first_group_runs = if drop_log == 1 && remaining >= 3 && remaining.is_multiple_of(3) {
+            remaining > 3
+        } else {
+            remaining >= drop_log + 3
+        };
+        if first_group_runs && c2_retained_fused_densify_enabled() {
+            remaining -= 3;
+            densify_active_windows_fused_first_3layer(ntt, &arena, &groups, log_d, k)
+        } else {
+            densify_active_windows(&arena, &groups, log_d, k)
+        }
     };
-    let mut remaining = log_d - k;
     if drop_log == 1 && remaining >= 3 && remaining.is_multiple_of(3) {
         while remaining > 3 {
             remaining -= 3;
@@ -9703,6 +9728,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     &queries_0,
                     &alpha_0,
                     l0_row,
+                    Some(l0_codeword),
                 )
             },
             open_l0,
@@ -10049,6 +10075,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         &queries_i,
                         &alpha_i,
                         |q| wtns_prev.row(q),
+                        Some(&wtns_prev.mat[..]),
                     )
                 },
                 open_i,
