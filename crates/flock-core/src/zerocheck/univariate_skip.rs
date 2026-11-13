@@ -29,6 +29,23 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 /// `table[x] = ∏_i ((1 + r_i) · (1 ⊕ bit_i(x)) + r_i · bit_i(x))` for `x ∈ {0,1}^n`,
 /// where `n = r.len()`. Standard in-place power-of-two doubling.
 pub fn build_eq(r: &[F128]) -> Vec<F128> {
+    // Port of the x86 track's X1 piece (scalar `build_eq` delegated to the
+    // SIMD eq builder): on Apple the two-lane PMULL level kernel of
+    // `lincheck::build_eq_table_optimized` (the builder fba014ca already
+    // routes the zerocheck fold window to). Every entry is the same
+    // `v + v·r` / `v·r` of the same `v` (and, at d >= 14, the exact tensor
+    // split), so the table is value-identical. Serves the per-level
+    // `SplitEqGhash` halves of the zerocheck tail and the round-one split
+    // factors. `FLOCK_NO_X1_EQ_OPT=1` restores the scalar/rayon doubling.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if r.len() >= 3
+            && !*OFF.get_or_init(|| std::env::var_os("FLOCK_NO_X1_EQ_OPT").is_some())
+        {
+            return crate::lincheck::build_eq_table_optimized(r);
+        }
+    }
     build_eq_scaled(r, F128::ONE)
 }
 
@@ -699,6 +716,20 @@ mod tests {
         }
         fn f128_vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
+        }
+    }
+
+    #[test]
+    fn x1_build_eq_matches_optimized_builder_and_scalar_doubling() {
+        // `build_eq` may delegate to `lincheck::build_eq_table_optimized`
+        // (aarch64); both must equal the scalar doubling at every size,
+        // including the d >= 14 tensor split of the optimized builder.
+        let mut rng = Rng::new(0x51DE_E900);
+        for d in 0..=16usize {
+            let r = rng.f128_vec(d);
+            let scalar = build_eq_scaled(&r, F128::ONE);
+            assert_eq!(build_eq(&r), scalar, "build_eq d={d}");
+            assert_eq!(crate::lincheck::build_eq_table_optimized(&r), scalar, "optimized d={d}");
         }
     }
 
