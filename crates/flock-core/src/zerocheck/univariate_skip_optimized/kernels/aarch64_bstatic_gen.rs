@@ -341,6 +341,7 @@ fn bstatic_partials(inv_table: &InvNttTableByteSingleGf8) -> &'static [[u8; 64];
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 static BSTATIC_ARM_LIVE: [bool; 31] = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
 
 /// Guarded static-b variant of [`shift_reduce_inner_ab_fused_neon`].
@@ -348,7 +349,7 @@ static BSTATIC_ARM_LIVE: [bool; 31] = [true, true, true, true, true, true, true,
 /// which case the caller must run the generic kernel.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_lines)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), allow(dead_code))] // test-only since kill-switch fallbacks use the generic apply
 pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
     a_packed: &[u8],
     b_packed: &[u8],

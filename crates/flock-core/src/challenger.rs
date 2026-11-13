@@ -807,7 +807,9 @@ fn cpu_blake3_pow_window_inner(
     const CHUNK: u64 = 960;
     const NO_MATCH: u64 = u64::MAX;
     let n_chunks = usize::try_from(u64::from(len).div_ceil(CHUNK)).expect("chunk count");
-    let results: Vec<AtomicU64> = (0..n_chunks).map(|_| AtomicU64::new(NO_MATCH)).collect();
+    // Joined workers publish only matches; one minimum replaces the per-chunk
+    // allocation, sentinel initialization, and post-join vector reduction.
+    let best = AtomicU64::new(NO_MATCH);
     let next = AtomicUsize::new(0);
     let worker = || loop {
         if stop.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -822,7 +824,7 @@ fn cpu_blake3_pow_window_inner(
         if let Some(nonce) =
             blake3_pow_scan(state_digest, start.saturating_add(offset), chunk_len, bits)
         {
-            results[chunk].store(nonce, Ordering::Release);
+            best.fetch_min(nonce, Ordering::Relaxed);
         }
     };
     let main_threads = rayon::current_num_threads();
@@ -839,11 +841,8 @@ fn cpu_blake3_pow_window_inner(
         }),
         None => drain_main(),
     }
-    results
-        .iter()
-        .map(|result| result.load(Ordering::Acquire))
-        .filter(|&nonce| nonce != NO_MATCH)
-        .min()
+    let best = best.load(Ordering::Relaxed);
+    (best != NO_MATCH).then_some(best)
 }
 
 fn cpu_gpu_grind_calibration(state_digest: &[u8; 32]) -> Vec<Option<u64>> {
@@ -2220,6 +2219,29 @@ mod tests {
                     "{kind} bits={bits}: returned nonce {nonce} does not satisfy the PoW"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn nm_cpu_window_min_matches_scalar() {
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| {
+                for digest in [[0u8; 32], [0x5a; 32]] {
+                    for start in [0u64, 37] {
+                        for len in [0u32, 1, 959, 960, 961, 15_361] {
+                            for bits in [0u32, 8, 16] {
+                                let want = (start..start + u64::from(len)).find(|&n|
+                                    pow_has_leading_zero_bits(&digest, n, bits, HashKind::Blake3));
+                                assert_eq!(cpu_blake3_pow_window(&digest, start, len, bits), want,
+                                    "threads={threads} start={start} len={len} bits={bits}");
+                            }
+                        }
+                    }
+                    let stop = std::sync::atomic::AtomicBool::new(true);
+                    assert_eq!(cpu_blake3_pow_window_inner(&digest, 0, 15_361, 0, Some(&stop)), None);
+                }
+            });
         }
     }
 
