@@ -122,6 +122,15 @@ fn ranked_identity_prefix_omission_contract(
     r1cs.round1_pinned_one_prefix_statement()
 }
 
+/// `FLOCK_NO_OPEN_C_CANONICAL_REUSE=1` makes the open re-collapse C's
+/// sixty-four-bank statistic instead of reusing zerocheck's `s_hat_v_c`.
+fn open_c_canonical_reuse_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_NO_OPEN_C_CANONICAL_REUSE").map_or(true, |v| v != "1")
+    });
+    *ON
+}
+
 fn precompute_ab_s_hat_v(
     r1cs: &BlockR1cs,
     z_vec: &[F128],
@@ -535,6 +544,19 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
+    // Zerocheck round 1 already collapsed C's sixty-four-bank statistic to the
+    // canonical `s_hat_v_c` (it needs it for its own round message). On the
+    // DirectFold8 route the open is handed only the wide form and collapsed it
+    // a second time; give it the finished vector instead
+    // (`FLOCK_NO_OPEN_C_CANONICAL_REUSE=1` kills).
+    let c_canonical_staged = open_c_canonical_reuse_enabled()
+        && match (s_hat_v_c.fold8.as_deref(), pre_c) {
+            (Some(fold8), Some(pre)) if std::ptr::eq(fold8.as_ptr(), pre.as_ptr()) => {
+                pcs::ring_switch::stash_collapsed_s_hat_v_fold8(fold8, &s_hat_v_c.s_hat_v_c);
+                true
+            }
+            _ => false,
+        };
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     flock_core::tmark::mark("open start");
     let cpu_open0 = phase_timing.then(process_cpu_ms);
@@ -592,6 +614,9 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         }),
     };
     let [ab, c] = claims;
+    if c_canonical_staged {
+        pcs::ring_switch::clear_collapsed_s_hat_v_fold8();
+    }
     flock_core::epool::set_linger_phase(false);
     flock_core::tmark::mark("open returned");
     if phase_timing {
