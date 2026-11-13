@@ -98,21 +98,16 @@ pub(crate) fn help_guest_until(
         if done() {
             return 0;
         }
-        // Empty-slot polling needs no hazard registration. This relaxed
-        // peek is only a hint: never dereference it. Register and re-read
-        // with the original SeqCst protocol before borrowing the closure.
-        if !GUEST.load(Ordering::Relaxed).is_null() {
-            GUESTS.fetch_add(1, Ordering::SeqCst);
-            let p = GUEST.load(Ordering::SeqCst);
-            if !p.is_null() {
-                // SAFETY: the publisher cannot return while GUESTS > 0 and it
-                // unpublishes (SeqCst) before checking GUESTS.
-                let ran = unsafe { (**p)(done) };
-                GUESTS.fetch_sub(1, Ordering::SeqCst);
-                return ran;
-            }
+        GUESTS.fetch_add(1, Ordering::SeqCst);
+        let p = GUEST.load(Ordering::SeqCst);
+        if !p.is_null() {
+            // SAFETY: the publisher cannot return while GUESTS > 0 and it
+            // unpublishes (SeqCst) before checking GUESTS.
+            let ran = unsafe { (**p)(done) };
             GUESTS.fetch_sub(1, Ordering::SeqCst);
+            return ran;
         }
+        GUESTS.fetch_sub(1, Ordering::SeqCst);
         if started.elapsed() >= wait_for_queue {
             return 0;
         }
@@ -656,8 +651,7 @@ pub(crate) fn drain_hetero<H>(
 /// workers publish their running average, each helper keeps its own, and a
 /// helper declines to claim when its own chunk time exceeds the time the main
 /// pool needs to drain what is left (`remaining · t_main / main_threads`).
-/// Before both estimates exist it claims as before. When no helper can join
-/// this drain, no admission decision consumes these samples, so skip timing.
+/// Before both estimates exist it claims as before.
 ///
 /// Scheduling only: every chunk index is still claimed exactly once from the
 /// same atomic cursor (the main workers drain to the end), and `f(i)` does not
@@ -678,9 +672,9 @@ fn tail_guard_enabled() -> bool {
 }
 
 impl TailGuard {
-    fn new(main_threads: usize, has_helper: bool) -> Self {
+    fn new(main_threads: usize) -> Self {
         Self {
-            on: has_helper && tail_guard_enabled(),
+            on: tail_guard_enabled(),
             main_threads: main_threads as u64,
             main_ns: AtomicU64::new(0),
             main_cnt: AtomicU64::new(0),
@@ -1125,7 +1119,7 @@ fn run_chunks_with_helper_arm_after<F, A>(
         return;
     }
     let next = AtomicUsize::new(0);
-    let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
+    let guard = TailGuard::new(main_threads);
     let worker = || {
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
@@ -1243,7 +1237,7 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
         return;
     }
     let next = AtomicUsize::new(0);
-    let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
+    let guard = TailGuard::new(main_threads);
     let worker = || {
         let mut state = init();
         loop {
@@ -1512,22 +1506,6 @@ mod tests {
             let seen = seen.into_inner().unwrap();
             assert_eq!(seen, (0..100).collect::<Vec<_>>());
         });
-    }
-
-    #[test]
-    fn tail_guard_samples_only_when_a_helper_can_join() {
-        let absent = TailGuard::new(4, false);
-        let present = TailGuard::new(4, true);
-        let calls = AtomicUsize::new(0);
-        for _ in 0..64 {
-            absent.main_run(|| { calls.fetch_add(1, Ordering::Relaxed); });
-            present.main_run(|| { calls.fetch_add(1, Ordering::Relaxed); });
-        }
-        assert_eq!(calls.load(Ordering::Relaxed), 128);
-        assert_eq!(absent.main_cnt.load(Ordering::Relaxed), 0);
-        assert_eq!(absent.main_ns.load(Ordering::Relaxed), 0);
-        assert_eq!(present.main_cnt.load(Ordering::Relaxed), if tail_guard_enabled() { 64 } else { 0 });
-        assert!(absent.helper_may_claim(u64::MAX, 0, 1));
     }
 
     /// Zero chunks is a no-op.
