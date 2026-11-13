@@ -526,7 +526,6 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded<const U: bool>(
         }
     }
 }
-
 /// Row `B` of a fourteen-row span, 16 bytes at the pass's lane offset, as two
 /// words from one paired load (`ldp`). `mid` points at row 7 of the span plus
 /// the lane offset, so every row offset (`-448..=384`) fits the paired load's
@@ -655,6 +654,124 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
         }
     }
 }
+
+/// Kill switch for the four-row drain step of
+/// [`accumulate_convert_ab_nomul_seeded_quad`]: any value of
+/// `FLOCK_NO_ZC_AB_DRAIN_QUAD` keeps the two-row step. Read once per process.
+pub(crate) fn ab_drain_quad_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_DRAIN_QUAD").is_none())
+}
+
+/// [`accumulate_convert_ab_nomul_seeded`] (`U = true`) stepping four
+/// `b_med` rows per iteration instead of two: per four rows one row-pointer
+/// and one table-pointer increment and one loop branch instead of two each,
+/// and the four lookups of a lane fold with two `eor3`. The XOR of the same
+/// table entries into the same lanes (XOR is associative and commutative),
+/// so the bank bytes are identical.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_quad(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    n_b_med: usize,
+    convert: &[F128],
+    bank: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    // SAFETY: as in `accumulate_convert_ab_nomul_seeded`: every row read is
+    // one of the 16 rows of `chunk_ab_bytes` and every table read one of the
+    // `n_b_med <= 16` 4 KiB tables of `convert`.
+    unsafe {
+        let convert_ptr = convert.as_ptr() as *const u8;
+        let rows = chunk_ab_bytes.as_ptr() as *const u8;
+        let n_rows = n_b_med - first_b_med;
+        let n_quads = n_rows / 4;
+        let pair_tail = n_rows & 2 != 0;
+        let odd_tail = n_rows & 1 == 1;
+        const T: usize = 256 * 16;
+        for lane in (0..64).step_by(8) {
+            let slot = bank.as_mut_ptr().add(lane) as *mut u8;
+            let mut ab0 = vld1q_u8(slot);
+            let mut ab1 = vld1q_u8(slot.add(16));
+            let mut ab2 = vld1q_u8(slot.add(32));
+            let mut ab3 = vld1q_u8(slot.add(48));
+            let mut ab4 = vld1q_u8(slot.add(64));
+            let mut ab5 = vld1q_u8(slot.add(80));
+            let mut ab6 = vld1q_u8(slot.add(96));
+            let mut ab7 = vld1q_u8(slot.add(112));
+
+            let mut t0 = convert_ptr.add(first_b_med * T);
+            let mut row = rows.add(first_b_med * 64 + lane);
+            for _ in 0..n_quads {
+                let (t1, t2, t3) = (t0.add(T), t0.add(2 * T), t0.add(3 * T));
+                let w0 = (row as *const u64).read_unaligned() as usize;
+                let w1 = (row.add(64) as *const u64).read_unaligned() as usize;
+                let w2 = (row.add(128) as *const u64).read_unaligned() as usize;
+                let w3 = (row.add(192) as *const u64).read_unaligned() as usize;
+                macro_rules! lane4 {
+                    ($ab:ident, $s:literal) => {
+                        $ab = xor3_u8(
+                            xor3_u8($ab, ab_ld::<true, $s>(t0, w0), ab_ld::<true, $s>(t1, w1)),
+                            ab_ld::<true, $s>(t2, w2),
+                            ab_ld::<true, $s>(t3, w3),
+                        );
+                    };
+                }
+                lane4!(ab0, 0);
+                lane4!(ab1, 8);
+                lane4!(ab2, 16);
+                lane4!(ab3, 24);
+                lane4!(ab4, 32);
+                lane4!(ab5, 40);
+                lane4!(ab6, 48);
+                lane4!(ab7, 56);
+                t0 = t0.add(4 * T);
+                row = row.add(256);
+            }
+            if pair_tail {
+                let t1 = t0.add(T);
+                let we = (row as *const u64).read_unaligned() as usize;
+                let wo = (row.add(64) as *const u64).read_unaligned() as usize;
+                ab0 = xor3_u8(ab0, ab_ld::<true, 0>(t0, we), ab_ld::<true, 0>(t1, wo));
+                ab1 = xor3_u8(ab1, ab_ld::<true, 8>(t0, we), ab_ld::<true, 8>(t1, wo));
+                ab2 = xor3_u8(ab2, ab_ld::<true, 16>(t0, we), ab_ld::<true, 16>(t1, wo));
+                ab3 = xor3_u8(ab3, ab_ld::<true, 24>(t0, we), ab_ld::<true, 24>(t1, wo));
+                ab4 = xor3_u8(ab4, ab_ld::<true, 32>(t0, we), ab_ld::<true, 32>(t1, wo));
+                ab5 = xor3_u8(ab5, ab_ld::<true, 40>(t0, we), ab_ld::<true, 40>(t1, wo));
+                ab6 = xor3_u8(ab6, ab_ld::<true, 48>(t0, we), ab_ld::<true, 48>(t1, wo));
+                ab7 = xor3_u8(ab7, ab_ld::<true, 56>(t0, we), ab_ld::<true, 56>(t1, wo));
+            }
+            if odd_tail {
+                let b_med = n_b_med - 1;
+                let table = convert_ptr.add(b_med * T);
+                let wa = (rows.add(b_med * 64 + lane) as *const u64).read_unaligned() as usize;
+                ab0 = veorq_u8(ab0, ab_ld::<true, 0>(table, wa));
+                ab1 = veorq_u8(ab1, ab_ld::<true, 8>(table, wa));
+                ab2 = veorq_u8(ab2, ab_ld::<true, 16>(table, wa));
+                ab3 = veorq_u8(ab3, ab_ld::<true, 24>(table, wa));
+                ab4 = veorq_u8(ab4, ab_ld::<true, 32>(table, wa));
+                ab5 = veorq_u8(ab5, ab_ld::<true, 40>(table, wa));
+                ab6 = veorq_u8(ab6, ab_ld::<true, 48>(table, wa));
+                ab7 = veorq_u8(ab7, ab_ld::<true, 56>(table, wa));
+            }
+
+            vst1q_u8(slot, ab0);
+            vst1q_u8(slot.add(16), ab1);
+            vst1q_u8(slot.add(32), ab2);
+            vst1q_u8(slot.add(48), ab3);
+            vst1q_u8(slot.add(64), ab4);
+            vst1q_u8(slot.add(80), ab5);
+            vst1q_u8(slot.add(96), ab6);
+            vst1q_u8(slot.add(112), ab7);
+        }
+    }
+}
+
 
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
 ///
@@ -4213,19 +4330,24 @@ const AB_Z_ALL: usize = 40960; // 256 x 16: [g|g]
 /// Bytes of one image of the z-basis tables (the `T = {}` table is the
 /// image itself and is not copied).
 #[cfg(target_arch = "aarch64")]
-pub(crate) const AB_Z_IMAGE_BYTES: usize = 51200 + 3 * 32768 + 16384;
+pub(crate) const AB_Z_IMAGE_BYTES: usize = AB_Z_REC + 3 * 32768 + 16384;
 #[cfg(target_arch = "aarch64")]
-const AB_Z_REC3: usize = 51200 + 2 * 32768; // 256 x 128: [M0 M2 | N0 N1 | e0e0 e2e2 | f0f0 f1f1]
+const AB_Z_REC3: usize = AB_Z_REC + 2 * 32768; // 256 x 128: [M0 M2 | N0 N1 | e0e0 e2e2 | f0f0 f1f1]
 #[cfg(target_arch = "aarch64")]
-const AB_Z_DDUP: usize = 51200 + 3 * 32768; // 256 x 64: d0d0 d1d1 d2d2 d3d3
+const AB_Z_DDUP: usize = AB_Z_REC + 3 * 32768; // 256 x 64: d0d0 d1d1 d2d2 d3d3
 /// Row-body variant bit: the `x^4` Karatsuba image also takes the
 /// unscaled-index loads (for forms where the plain image is in z form).
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_KARA_SCALED_UNSCALED: u16 = 32;
 #[cfg(target_arch = "aarch64")]
-const AB_Z_REC2: usize = 51200 + 32768; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0 e2 | g | 0]
+const AB_Z_REC2: usize = AB_Z_REC + 32768; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0 e2 | g | 0]
 #[cfg(target_arch = "aarch64")]
-const AB_Z_REC: usize = 51200; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0e0 e2e2]
+// 4 KiB-aligned (2 KiB of padding after `AB_Z_ALLP`, never read): the record
+// base `z + AB_Z_REC` is then one `add #imm, lsl #12` from the image base
+// instead of two adds. Layout only; same table bytes.
+const AB_Z_REC: usize = 53248; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0e0 e2e2]
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(AB_Z_REC % 4096 == 0 && AB_Z_ALLP + 256 * 8 <= AB_Z_REC && (2 * AB_KARA_IMAGE_BYTES) % 4096 == 0);
 /// Row-body variant bit (with [`ABV_Z`]): the four two-load z tables
 /// interleaved in one 128-byte record per byte value, one base register.
 #[cfg(target_arch = "aarch64")]
@@ -4496,6 +4618,134 @@ unsafe fn apply_word_z_mt(
     }
 }
 
+/// Row-body variant bit (with [`ABV_Z`] and [`ABV_Z_REC`]): the z apply's
+/// eight lookup bytes from four index words formed in five integer
+/// instructions, depth four (masked first layer, then unmasked layers that
+/// keep the previous word for the bytes they would corrupt), instead of the
+/// seven partial XOR-shift words. Same lookups, same bytes. See
+/// [`ab_superset_words_m1`].
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_Z_M1: u16 = 32768;
+
+/// Kill switch for [`ABV_Z_M1`]: any value of `FLOCK_NO_ZC_AB_Z_M1` keeps
+/// the seven-word index form. Read once per process. Same bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_z_m1_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_Z_M1").is_none())
+}
+
+/// The superset bytes `z[T]` (XOR of the bytes `b ⊇ T` of `w`) spread over
+/// four words, in five instructions:
+/// - `y1 = w ^ ((w & 0xff00..ff00) >> 8)`: the complete first layer
+///   (`and` with a logical immediate + `eor` with a shifted register);
+/// - `y2 = y1 ^ (y1 >> 16)`: second layer, exact at bytes 0, 1, 4, 5 (at
+///   bytes 2, 3, 6, 7 the second layer is `y1` itself);
+/// - `y3 = y2 ^ (y2 >> 32)`: exact at bytes 0, 1;
+/// - `y3b = y1 ^ (y1 >> 32)`: exact at bytes 2, 3.
+/// So `z0 = y3[0]`, `z1 = y3[1]`, `z2 = y3b[2]`, `z3 = y3b[3]`, `z4 = y2[4]`,
+/// `z5 = y2[5]`, `z6 = y1[6]`, `z7 = w[7]`. Returns `(y1, y2, y3, y3b)`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn ab_superset_words_m1(w: u64) -> (u64, u64, u64, u64) {
+    // `(w & M) >> 8` with the mask applied before the shift, so it stays a
+    // logical immediate (LLVM otherwise emits `lsr` + `and` + `eor`).
+    let y1: u64;
+    // SAFETY: register arithmetic only.
+    unsafe {
+        core::arch::asm!(
+            "and {t}, {w}, #0xff00ff00ff00ff00",
+            "eor {y}, {w}, {t}, lsr #8",
+            w = in(reg) w,
+            t = out(reg) _,
+            y = lateout(reg) y1,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    let y2 = y1 ^ (y1 >> 16);
+    let y3 = y2 ^ (y2 >> 32);
+    let y3b = y1 ^ (y1 >> 32);
+    (y1, y2, y3, y3b)
+}
+
+/// [`apply_word_z`] (`REC`, not `PACK`) with the lookup bytes taken from
+/// [`ab_superset_words_m1`]: exactly the bytes `apply_word_z` extracts from
+/// its seven partial words, so the same lookups.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z_m1(
+    t0: *const u8,
+    z: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let (y1, y2, y3, y3b) = ab_superset_words_m1(w);
+        let ld = |base: *const u8, idx: usize| vld1q_u8(base.add(idx));
+        let r0 = t0.add(ab_z_idx::<0, 6>(y3));
+        let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
+        let rec = |i: usize| -> *const u8 {
+            let a: usize;
+            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) z.add(AB_Z_REC), i = in(reg) i,
+                options(pure, nomem, nostack, preserves_flags));
+            a as *const u8
+        };
+        let a = rec(ab_z_idx::<2, 7>(y3b));
+        let (m0, m2) = (ld(a, 0), ld(a, 16));
+        let a = rec(ab_z_idx::<4, 7>(y2));
+        let (n0, n1) = (ld(a, 32), ld(a, 48));
+        let a = rec(ab_z_idx::<1, 7>(y3));
+        let (d01, d23) = (ld(a, 64), ld(a, 80));
+        let a = rec(ab_z_idx::<3, 7>(y3b));
+        let (e0, e2) = (ld(a, 96), ld(a, 112));
+        let g = ld(z.add(AB_Z_ALL), ab_z_idx::<7, 4>(w));
+        let k = ld(z.add(AB_Z_L12), ab_z_idx::<6, 4>(y1));
+        let f = ld(z.add(AB_Z_SL2), ab_z_idx::<5, 4>(y2));
+        let fg = veorq_u8(f, g);
+        let p = vreinterpretq_u64_u8(xor3_u8(d01, e0, fg));
+        let q = vreinterpretq_u64_u8(xor3_u8(d23, e2, fg));
+        let mk0 = veorq_u8(m0, k);
+        let mk2 = veorq_u8(m2, k);
+        let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
+        let b1 = vreinterpretq_u8_u64(vzip2q_u64(p, p));
+        let b2 = vreinterpretq_u8_u64(vzip1q_u64(q, q));
+        let b3 = vreinterpretq_u8_u64(vzip2q_u64(q, q));
+        (
+            veorq_u8(xor3_u8(l0, mk0, n0), b0),
+            veorq_u8(xor3_u8(l1, mk0, n1), b1),
+            veorq_u8(xor3_u8(l2, mk2, n0), b2),
+            veorq_u8(xor3_u8(l3, mk2, n1), b3),
+        )
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_superset_words_m1_match_superset_bytes() {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for i in 0..20000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let w = match i {
+            0 => 0,
+            1 => u64::MAX,
+            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
+            _ => x,
+        };
+        let z = ab_superset_bytes(w).to_le_bytes();
+        let (y1, y2, y3, y3b) = ab_superset_words_m1(w);
+        let b = |v: u64, j: usize| v.to_le_bytes()[j];
+        let got = [b(y3, 0), b(y3, 1), b(y3b, 2), b(y3b, 3), b(y2, 4), b(y2, 5), b(y1, 6), b(w, 7)];
+        assert_eq!(got, z, "w={w:016x}");
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 #[test]
 fn ab_superset_bytes_matches_definition() {
@@ -4751,6 +5001,8 @@ unsafe fn apply_word_into_4_regs_v<const V: u16, const SCALED: bool>(
                 apply_word_z::<true, true>(table_base, z, word)
             } else if V & ABV_Z_REC != 0 && V & ABV_Z_MT != 0 {
                 apply_word_z_mt(table_base, z, word)
+            } else if V & ABV_Z_REC != 0 && V & ABV_Z_M1 != 0 {
+                apply_word_z_m1(table_base, z, word)
             } else if V & ABV_Z_REC != 0 {
                 apply_word_z::<false, true>(table_base, z, word)
             } else if V & ABV_Z_PACK != 0 {
@@ -5356,118 +5608,6 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
             nt_store,
         );
     }
-}
-
-/// Kill switch for [`ab_mixed_row_direct`]: any value of
-/// `FLOCK_NO_ZC_AB_MIXED_ROW_DIRECT` sends the two mixed const-one rows of a
-/// chunk through [`shift_reduce_inner_ab_fused_neon_checked_with_fast_policy`]
-/// again. Read once per process. The rows written are byte-identical.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_mixed_row_direct_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_MIXED_ROW_DIRECT").is_none())
-}
-
-/// Whether the process-wide switches make the dispatcher's mixed const-one
-/// arms pick the kernels of [`ab_mixed_row_guarded`] on a thread with the
-/// Karatsuba apply: the fast form on (asked of both fast policies), the
-/// unscaled Karatsuba z form with the twelve-XOR recombination, and not both
-/// of `ABV_KARA_SLOT` and `ABV_Z_MT`. Resolved once per process.
-#[cfg(target_arch = "aarch64")]
-fn ab_mixed_row_direct_route() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        ab_mixed_row_direct_enabled()
-            && fast_shift_reduce_enabled()
-            && ab_kara_unscaled_enabled()
-            && ab_z_enabled()
-            && ab_kara_xor16_enabled()
-            && !(ab_kara_slot_enabled() && ab_z_mt_enabled())
-    })
-}
-
-/// One of the two mixed const-one rows of the BLAKE3 static layout (`w0`:
-/// window 0, `b_med` 2, mask `0x03`; otherwise window 1, `b_med`
-/// `n_b_med - 2`, mask `0xf0`) through the kernel the dispatcher picks for
-/// it, without the dispatcher. Returns `false` with `out` untouched whenever
-/// the dispatcher would pick another kernel (a thread that keeps the plain
-/// apply, checked first; the switch or another process-wide form; a failed
-/// guard); the caller then runs the dispatcher. As for the dispatcher, the
-/// row's 64 bytes must be in bounds of both packed slices.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ab_mixed_row_direct(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    b_med: usize,
-    w0: bool,
-    out: &mut [u8; 64],
-    nt_store: bool,
-) -> bool {
-    ab_kara_enabled()
-        && ab_mixed_row_direct_route()
-        && ab_mixed_row_guarded(a_packed, b_packed, inv_table, chunk_byte_base, b_med, w0, out, nt_store)
-}
-
-/// The guards and the kernel call of [`ab_mixed_row_direct`]: the
-/// dispatcher's guards for the row's mask (B K0 and K1 all ones and the top
-/// three bytes of A K0 and K1 zero for `0x03`; B K4..K7 all ones for `0xf0`),
-/// then the `AB_Z_VARIANT | ABV_KARA_XOR16` kernel its mask arm calls. Returns
-/// `false` with `out` untouched when a guard fails.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ab_mixed_row_guarded(
-    a_packed: &[u8],
-    b_packed: &[u8],
-    inv_table: &InvNttTableByteSingleGf8,
-    chunk_byte_base: usize,
-    b_med: usize,
-    w0: bool,
-    out: &mut [u8; 64],
-    nt_store: bool,
-) -> bool {
-    const V: u16 = AB_Z_VARIANT | ABV_KARA_XOR16;
-    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
-    debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
-    let word = |packed: &[u8], k: usize| -> u64 {
-        // SAFETY: the caller keeps the row in bounds (the dispatcher reads
-        // the same words).
-        u64::from_le(unsafe { core::ptr::read_unaligned(packed.as_ptr().add(byte_base_b + k * 8).cast::<u64>()) })
-    };
-    if w0 {
-        if word(b_packed, 0) & word(b_packed, 1) != u64::MAX
-            || (word(a_packed, 0) | word(a_packed, 1)) & 0xffff_ff00_0000_0000 != 0
-        {
-            return false;
-        }
-        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V>(
-            a_packed,
-            b_packed,
-            inv_table,
-            byte_base_b,
-            None,
-            out,
-            nt_store,
-        );
-    } else {
-        if word(b_packed, 4) & word(b_packed, 5) & word(b_packed, 6) & word(b_packed, 7) != u64::MAX {
-            return false;
-        }
-        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V>(
-            a_packed,
-            b_packed,
-            inv_table,
-            byte_base_b,
-            None,
-            out,
-            nt_store,
-        );
-    }
-    true
 }
 
 /// `acc ^ pmull(a, b)` on 8-bit polynomial lanes (`HI` selects the high

@@ -37,6 +37,63 @@ fn dot2(local: &[F128], weights: &[F128], half: usize) -> [F128; 2] {
     }
 }
 
+/// Exact rollback for the four-row query-window dots of
+/// [`Dual::new_sync`]: `FLOCK_NO_C2_QUAD_ROWS` (any value) restores one
+/// [`dot`] per row. Same bytes either way.
+fn quad_rows_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_QUAD_ROWS").is_none())
+}
+
+/// `cache[j] = dot(row(base + j), weights)` for `j < cache_len`. When the
+/// caller hands the flat row-major matrix behind `row` (`row(q)` is
+/// `flat[q·W..(q+1)·W]` with `W = weights.len()`), each aligned group of
+/// four adjacent rows is folded by one four-slot banked kernel that loads
+/// every weight once for the four rows. Each output is the same exact field
+/// sum `Σ_b w_b·x_b`, so every cache value is bit-identical to [`dot`].
+#[inline]
+fn window_dots<'a>(
+    row: &impl Fn(usize) -> &'a [F128],
+    flat: Option<&'a [F128]>,
+    base: usize,
+    cache_len: usize,
+    weights: &[F128],
+    cache: &mut [F128; 16],
+) {
+    let w = weights.len();
+    if let Some(flat) = flat
+        && cache_len.is_multiple_of(4)
+        && (w == 64 || w == 8)
+        && (base + cache_len) * w <= flat.len()
+        && core::ptr::eq(row(base).as_ptr(), flat[base * w..].as_ptr())
+        && quad_rows_enabled()
+    {
+        let rows = &flat[base * w..(base + cache_len) * w];
+        for (j, quad) in rows.chunks_exact(4 * w).enumerate() {
+            let out = &mut cache[4 * j..4 * j + 4];
+            if w == 64 {
+                crate::field::f128_slice::fold_banked_slots4_whole_into::<64>(
+                    weights.try_into().unwrap(),
+                    quad,
+                    out,
+                    64,
+                );
+            } else {
+                crate::field::f128_slice::fold_banked_slots4_whole_into::<8>(
+                    weights.try_into().unwrap(),
+                    quad,
+                    out,
+                    8,
+                );
+            }
+        }
+        return;
+    }
+    for j in 0..cache_len {
+        cache[j] = dot(row(base + j), weights);
+    }
+}
+
 #[inline]
 fn one_plus_scale(ntt: &AdditiveNttF128, log_d: usize, s: usize, query: usize) -> F128 {
     let mut val = ntt.twiddle(log_d - 1 - s, query >> (s + 1));
@@ -177,6 +234,7 @@ impl Dual {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new_sync<'a>(
         depth: usize,
         log_d: usize,
@@ -185,6 +243,7 @@ impl Dual {
         queries: &[usize],
         alpha: &[F128],
         row: impl Fn(usize) -> &'a [F128] + Sync,
+        flat: Option<&'a [F128]>,
     ) -> (Self, F128) {
         assert!((2..=3).contains(&depth));
         assert!(log_inv_rate + depth < log_d);
@@ -226,9 +285,7 @@ impl Dual {
                     let base = q & !mask;
                     let qoff = q - base;
                     let mut cache = [F128::ZERO; 16];
-                    for j in 0..cache_len {
-                        cache[j] = dot(row(base + j), &lane_weights);
-                    }
+                    window_dots(&row, flat, base, cache_len, &lane_weights, &mut cache);
                     let enf = w.mul_unreduced(cache[qoff]);
                     *stage_out = invert_local_staged(
                         &ntt,
@@ -267,9 +324,7 @@ impl Dual {
                 let base = q & !mask;
                 let qoff = q - base;
                 let mut cache = [F128::ZERO; 16];
-                for j in 0..cache_len {
-                    cache[j] = dot(row(base + j), &lane_weights);
-                }
+                window_dots(&row, flat, base, cache_len, &lane_weights, &mut cache);
                 enf_sum ^= w.mul_unreduced(cache[qoff]);
                 *stage_out = invert_local_staged(
                     &ntt,
