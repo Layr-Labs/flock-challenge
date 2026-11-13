@@ -2058,6 +2058,24 @@ pub(crate) fn compose_fold_byte_table_into(e_hi: F128, base: &[F128], out: &mut 
 fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128], x_ladder: bool) {
     debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
     debug_assert_eq!(out.len(), FOLD_TABLE_LEN);
+    let g = compose_fold_generators(e_hi, base, x_ladder);
+    // Per byte position: subset-sum doubling over that byte's 8 generators.
+    // Every entry is written exactly once (t[0] = 0, then each doubling round
+    // writes the upper half from the lower).
+    for k in 0..FOLD_N_BYTES {
+        let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
+        t[0] = F128::ZERO;
+        for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
+            let half = 1usize << bit;
+            for v in 0..half {
+                t[v + half] = t[v] + gv;
+            }
+        }
+    }
+}
+
+#[inline]
+fn compose_fold_generators(e_hi: F128, base: &[F128], x_ladder: bool) -> [F128; 128] {
     let mut g = [F128::ZERO; 128];
     if x_ladder {
         // Generators g_b = L(x^b · e_hi) over the single-bit basis elements
@@ -2083,19 +2101,53 @@ fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128]
             *gb = fold_one_slot(e_b * e_hi, base);
         }
     }
-    // Per byte position: subset-sum doubling over that byte's 8 generators.
-    // Every entry is written exactly once (t[0] = 0, then each doubling round
-    // writes the upper half from the lower).
-    for k in 0..FOLD_N_BYTES {
-        let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
+    g
+}
+
+pub(crate) const FOLD_NIB_LEN: usize = 2 * FOLD_N_BYTES * 16;
+
+pub(crate) fn compact_compose_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_DIRECT_FOLD8_BYTE_TABLES").is_none())
+}
+
+pub(crate) fn compose_fold_nibble_table_into(e_hi: F128, base: &[F128], out: &mut [F128]) {
+    debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
+    assert!(out.len() >= FOLD_NIB_LEN);
+    let g = compose_fold_generators(e_hi, base, compose_x_ladder_enabled());
+    for k in 0..2 * FOLD_N_BYTES {
+        let t = &mut out[k * 16..(k + 1) * 16];
         t[0] = F128::ZERO;
-        for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
+        for (bit, &gv) in g[k * 4..k * 4 + 4].iter().enumerate() {
             let half = 1usize << bit;
             for v in 0..half {
                 t[v + half] = t[v] + gv;
             }
         }
     }
+}
+
+#[inline(always)]
+pub(crate) fn fold_one_slot_nib(elem: F128, tables: &[F128]) -> F128 {
+    debug_assert!(tables.len() >= FOLD_NIB_LEN);
+    let lo_bytes = elem.lo.to_le_bytes();
+    let hi_bytes = elem.hi.to_le_bytes();
+    let t = tables.as_ptr();
+    let byte = |j: usize, b: u8| unsafe {
+        *t.add(32 * j + (b & 15) as usize) + *t.add(32 * j + 16 + (b >> 4) as usize)
+    };
+    let p0 = byte(0, lo_bytes[0]) + byte(1, lo_bytes[1]);
+    let p1 = byte(2, lo_bytes[2]) + byte(3, lo_bytes[3]);
+    let p2 = byte(4, lo_bytes[4]) + byte(5, lo_bytes[5]);
+    let p3 = byte(6, lo_bytes[6]) + byte(7, lo_bytes[7]);
+    let p4 = byte(8, hi_bytes[0]) + byte(9, hi_bytes[1]);
+    let p5 = byte(10, hi_bytes[2]) + byte(11, hi_bytes[3]);
+    let p6 = byte(12, hi_bytes[4]) + byte(13, hi_bytes[5]);
+    let p7 = byte(14, hi_bytes[6]) + byte(15, hi_bytes[7]);
+    let q0 = xor3_f128(p0, p1, p2);
+    let q1 = xor3_f128(p3, p4, p5);
+    let q2 = p6 + p7;
+    xor3_f128(q0, q1, q2)
 }
 /// Encode `x ↦ Σ_d fold_weight[d] · Φ(low_eq[d]·x)` as a byte table,
 /// where `base` encodes the γ-baked linear map `Φ`.
