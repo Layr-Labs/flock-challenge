@@ -213,6 +213,77 @@ fn use_ranked_deep_pair_fusion(
         && n_top == 10
 }
 
+/// L1-resident deep groups: the layer at which the fused deep pairs of one
+/// sub-transform stop sweeping the whole sub-transform layer by layer and
+/// instead finish one small block at a time.
+///
+/// The deep pairs ran layer-major: every pair swept the whole sub-transform
+/// (1 MiB at the ranked shapes) through L1 from L2, five to seven times. But
+/// below layer `log_d - 2j` the transform never leaves a block of `2^(2j)`
+/// positions, so once the sweeps above that layer are done, each such block
+/// can run all of its remaining `j` pairs back to back while it sits in L1.
+/// The butterflies, twiddles (absolute block indices), kernels and per-block
+/// kernel choices are unchanged; within a block the pairs keep their order,
+/// and blocks of one layer are independent, so the result is bit-identical.
+///
+/// Returns the pair-aligned group layer (`>= first_pair_layer`), or `log_d`
+/// when grouping is off or no group of at least two pairs fits the budget:
+/// `FLOCK_NO_MF_DEEP_L1_GROUPS=1` kills it, `FLOCK_MF_DEEP_GROUP_KIB`
+/// (default 64) is the group size bound. At 64 lanes that is `2^6` positions
+/// (64 KiB, the last three pairs); at 8 lanes `2^8` positions (32 KiB, the
+/// last four pairs).
+fn deep_l1_group_layer(log_d: usize, num_ntts: usize, first_pair_layer: usize) -> usize {
+    static BUDGET_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var("FLOCK_NO_MF_DEEP_L1_GROUPS").is_ok_and(|v| v == "1") {
+            return 0;
+        }
+        std::env::var("FLOCK_MF_DEEP_GROUP_KIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|kib| (1..=4096).contains(kib))
+            .unwrap_or(64)
+            << 10
+    });
+    #[cfg(test)]
+    if let Some(budget) = DEEP_GROUP_BUDGET_OVERRIDE.with(|b| b.get()) {
+        return deep_l1_group_layer_for(log_d, num_ntts, first_pair_layer, budget);
+    }
+    deep_l1_group_layer_for(log_d, num_ntts, first_pair_layer, *BUDGET_BYTES)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread budget override so one test can run the grouped and the
+    /// layer-major order of a serial sub-transform side by side.
+    static DEEP_GROUP_BUDGET_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[inline]
+fn deep_l1_group_layer_for(
+    log_d: usize,
+    num_ntts: usize,
+    first_pair_layer: usize,
+    budget_bytes: usize,
+) -> usize {
+    if first_pair_layer >= log_d || !(log_d - first_pair_layer).is_multiple_of(2) {
+        return log_d;
+    }
+    let pairs = (log_d - first_pair_layer) / 2;
+    let position_bytes = num_ntts * core::mem::size_of::<F128>();
+    // Largest j <= pairs with 2^(2j) positions inside the budget.
+    let mut j = 0usize;
+    while j < pairs && (position_bytes << (2 * (j + 1))) <= budget_bytes {
+        j += 1;
+    }
+    // One pair per group is the layer-major order already; all pairs in one
+    // group likewise.
+    if j < 2 || j == pairs {
+        return log_d;
+    }
+    log_d - 2 * j
+}
+
 /// Fused-pair deep tail for every non-ranked-L0 deep subtree (recursive
 /// commits L1..L5 and CPU fallbacks); `FLOCK_NO_DEEP_SUBTREE_PAIRS=1` restores
 /// the single-layer sweep. Same butterflies and twiddles either way.
@@ -2115,13 +2186,15 @@ impl AdditiveNttF128 {
             }
             layer += 1;
         }
-        while layer + 1 < log_d {
+        // One fused pair (`layer`, `layer + 1`) over the sub-transform's
+        // blocks `block_lo..block_hi` of that layer.
+        let pair_blocks = |sub_data: &mut [F128], layer: usize, block_lo: usize, block_hi: usize| {
             let layer_in_sub = layer - n_top;
             let num_blocks_in_sub = 1usize << layer_in_sub;
             let block_size = 1usize << (log_d - layer);
             let quarter = block_size >> 2;
             let block_bytes = block_size * num_ntts;
-            for block_in_sub in 0..num_blocks_in_sub {
+            for block_in_sub in block_lo..block_hi {
                 let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
                 let t_outer = self.twiddle(layer, global_block);
                 let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
@@ -2148,7 +2221,26 @@ impl AdditiveNttF128 {
                     );
                 }
             }
+        };
+        // Layer-major sweeps down to the group layer, then every L1-sized
+        // block finishes its remaining pairs in one visit
+        // (`deep_l1_group_layer`; `log_d` = grouping off).
+        let group_layer = deep_l1_group_layer(log_d, num_ntts, layer);
+        while layer + 1 < log_d && layer < group_layer {
+            pair_blocks(sub_data, layer, 0, 1usize << (layer - n_top));
             layer += 2;
+        }
+        if layer + 1 < log_d {
+            debug_assert_eq!(layer, group_layer);
+            for group in 0..1usize << (group_layer - n_top) {
+                let mut l = group_layer;
+                while l + 1 < log_d {
+                    let per_group = 1usize << (l - group_layer);
+                    pair_blocks(sub_data, l, group * per_group, (group + 1) * per_group);
+                    l += 2;
+                }
+            }
+            layer = log_d;
         }
         debug_assert_eq!(layer, log_d.max(n_top.max(start_layer)));
     }
@@ -2238,14 +2330,20 @@ impl AdditiveNttF128 {
 
         let range_start = sub_start * sub_elems;
         let range_end = sub_end * sub_elems;
+        let group_layer = deep_l1_group_layer(log_d, num_ntts, n_top);
 
         data[range_start..range_end]
             .par_chunks_mut(sub_elems)
             .enumerate()
             .for_each(|(local_sub_idx, sub_data)| {
                 let sub_idx = sub_start + local_sub_idx;
-                let mut layer = n_top;
-                while layer + 1 < log_d {
+                // One fused pair (`layer`, `layer + 1`) over this sub's blocks
+                // `block_lo..block_hi` of that layer (a power-of-two count
+                // starting at a multiple of itself).
+                let pair_blocks = |sub_data: &mut [F128],
+                                   layer: usize,
+                                   block_lo: usize,
+                                   block_hi: usize| {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
                     let block_size_positions = 1usize << (log_d - layer);
@@ -2253,24 +2351,27 @@ impl AdditiveNttF128 {
                     let block_elems = block_size_positions * num_ntts;
 
                     // Final pair: rows b and d (odd positions) still hold
-                    // the zero tail, so one call per sub runs those lanes
-                    // in reduced form.
-                    if final_pair_tail > 0
-                        && layer + 2 == log_d
-                        && self.try_final_pair_low_twiddles_zero_tail(
-                            sub_data,
-                            sub_idx,
+                    // the zero tail, so one call per block range runs those
+                    // lanes in reduced form. The range is addressed as the
+                    // virtual sub `sub_idx·(num_blocks_in_sub / n) +
+                    // block_lo / n` of `n = block_hi - block_lo` blocks, whose
+                    // first absolute block is this range's.
+                    if final_pair_tail > 0 && layer + 2 == log_d {
+                        let n = block_hi - block_lo;
+                        debug_assert!(n.is_power_of_two() && block_lo.is_multiple_of(n));
+                        if self.try_final_pair_low_twiddles_zero_tail(
+                            &mut sub_data[block_lo * block_elems..block_hi * block_elems],
+                            sub_idx * (num_blocks_in_sub / n) + block_lo / n,
                             layer,
-                            num_blocks_in_sub,
+                            n,
                             num_ntts,
                             final_pair_tail,
-                        )
-                    {
-                        layer += 2;
-                        continue;
+                        ) {
+                            return;
+                        }
                     }
 
-                    for block_in_sub in 0..num_blocks_in_sub {
+                    for block_in_sub in block_lo..block_hi {
                         let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
                         let t_outer = self.twiddle(layer, global_block);
                         let t_inner_a = self.twiddle(layer + 1, 2 * global_block);
@@ -2310,7 +2411,28 @@ impl AdditiveNttF128 {
                             );
                         }
                     }
+                };
+
+                // Layer-major sweeps down to the group layer, then every
+                // L1-sized block finishes its remaining pairs in one visit
+                // (`deep_l1_group_layer`; `log_d` = grouping off, which is
+                // also what an odd layer count gets: its lone layer is last).
+                let mut layer = n_top;
+                while layer + 1 < log_d && layer < group_layer {
+                    pair_blocks(sub_data, layer, 0, 1usize << (layer - n_top));
                     layer += 2;
+                }
+                if layer + 1 < log_d {
+                    debug_assert_eq!(layer, group_layer);
+                    for group in 0..1usize << (group_layer - n_top) {
+                        let mut l = group_layer;
+                        while l + 1 < log_d {
+                            let per_group = 1usize << (l - group_layer);
+                            pair_blocks(sub_data, l, group * per_group, (group + 1) * per_group);
+                            l += 2;
+                        }
+                    }
+                    layer = log_d;
                 }
 
                 // The ranked path has ten deep layers and therefore no tail.
@@ -4739,6 +4861,213 @@ mod block_range_equivalence {
             got_offsets, expected_offsets,
             "callback coverage/offsets diverge"
         );
+    }
+}
+
+/// Bit-exactness oracle for the L1-resident deep groups.
+#[cfg(test)]
+mod mf_deep_l1_groups {
+    use super::*;
+
+    const KIB64: usize = 64 << 10;
+
+    fn rng_vec(seed: u64, n: usize) -> Vec<F128> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        (0..n).map(|_| F128::new(next(), next())).collect()
+    }
+
+    fn killed() -> bool {
+        std::env::var("FLOCK_NO_MF_DEEP_L1_GROUPS").is_ok_and(|v| v == "1")
+            || std::env::var_os("FLOCK_MF_DEEP_GROUP_KIB").is_some()
+    }
+
+    /// The policy at the three ranked shapes and its off conditions.
+    #[test]
+    fn group_layer_policy() {
+        // L0 hybrid suffix / full CPU: 64 lanes, ten deep layers from 10.
+        assert_eq!(deep_l1_group_layer_for(20, 64, 10, KIB64), 14);
+        // Recursive L1: 8 lanes, lone layer 5 then six pairs from 6; the
+        // tail-split halves start their pairs at 6 as well.
+        assert_eq!(deep_l1_group_layer_for(18, 8, 6, KIB64), 10);
+        // Recursive L2: 8 lanes, five pairs from 6.
+        assert_eq!(deep_l1_group_layer_for(16, 8, 6, KIB64), 8);
+        // Killed (zero budget), odd layer count, nothing to do, whole
+        // sub-transform inside the budget, and a budget of one pair.
+        assert_eq!(deep_l1_group_layer_for(20, 64, 10, 0), 20);
+        assert_eq!(deep_l1_group_layer_for(20, 64, 11, KIB64), 20);
+        assert_eq!(deep_l1_group_layer_for(20, 64, 20, KIB64), 20);
+        assert_eq!(deep_l1_group_layer_for(12, 4, 8, KIB64), 12);
+        assert_eq!(deep_l1_group_layer_for(20, 64, 10, 4 << 10), 20);
+        // A 16 KiB budget keeps two pairs per group at 64 lanes.
+        assert_eq!(deep_l1_group_layer_for(20, 64, 10, 16 << 10), 16);
+    }
+
+    /// Ranked deep-pair range driver (64 lanes, zero tail and dense) with
+    /// grouping active equals the plain all-layer range driver.
+    #[test]
+    fn grouped_deep_pairs_range_matches_plain_range() {
+        let (log_d, num_ntts, n_top) = (12usize, 64usize, 4usize);
+        if !killed() {
+            assert_eq!(deep_l1_group_layer(log_d, num_ntts, n_top), 6, "grouping must be active");
+        }
+        let ntt = AdditiveNttF128::standard(log_d);
+        for (tail, sub_start, sub_end) in [(7usize, 0usize, 16usize), (0, 3, 11), (7, 9, 16)] {
+            let mut src = rng_vec(0xa409_3822_299f_31d0 ^ tail as u64, (1usize << log_d) * num_ntts);
+            if tail != 0 {
+                for (pos, row) in src.chunks_exact_mut(num_ntts).enumerate() {
+                    if pos & 1 == 1 {
+                        for v in &mut row[num_ntts - tail..] {
+                            *v = F128::ZERO;
+                        }
+                    }
+                }
+            }
+            let mut plain = src.clone();
+            ntt.forward_transform_interleaved_block_range(
+                &mut plain, num_ntts, n_top, log_d, sub_start, sub_end, tail,
+            );
+            let mut grouped = src.clone();
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                &mut grouped,
+                num_ntts,
+                n_top,
+                log_d,
+                sub_start,
+                sub_end,
+                tail,
+                &|_elem_offset: usize, _chunk: &[F128]| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+            );
+            assert!(grouped == plain, "grouped deep pairs diverge (tail {tail})");
+            assert!(plain != src);
+            assert_eq!(calls.into_inner(), sub_end - sub_start);
+        }
+    }
+
+    /// Grouped and layer-major orders of the serial deep subtree agree
+    /// directly (same thread, budget override), at every budget class.
+    #[test]
+    fn grouped_deep_subtree_matches_layer_major() {
+        let num_ntts = 8usize;
+        for (log_d, start_layer, n_top) in [(15usize, 2usize, 2usize), (14, 3, 3), (14, 4, 3)] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            let src = rng_vec(0x4528_21e6_38d0_1377 ^ log_d as u64, (1usize << log_d) * num_ntts);
+            let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
+            let run = |budget: usize| {
+                DEEP_GROUP_BUDGET_OVERRIDE.with(|b| b.set(Some(budget)));
+                let mut data = src.clone();
+                for (sub_idx, sub_data) in data.chunks_exact_mut(sub_elems).enumerate() {
+                    ntt.forward_transform_interleaved_deep_subtree(
+                        sub_data, num_ntts, start_layer, n_top, log_d, sub_idx,
+                    );
+                }
+                DEEP_GROUP_BUDGET_OVERRIDE.with(|b| b.set(None));
+                data
+            };
+            let layer_major = run(0);
+            assert!(layer_major != src);
+            for budget_kib in [1usize, 2, 8, 32, 64, 128, 512] {
+                assert!(
+                    run(budget_kib << 10) == layer_major,
+                    "grouped order diverges (log_d {log_d}, start {start_layer}, {budget_kib} KiB)"
+                );
+            }
+        }
+    }
+
+    /// Timing probe (ignored): the recursive L1 deep shape (8 lanes, 1 MiB
+    /// sub-transforms, lone layer then six pairs), one thread, layer-major
+    /// against grouped, alternated. Run in release with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn deep_l1_groups_speed_probe() {
+        let (log_d, num_ntts, start_layer, n_top) = (18usize, 8usize, 5usize, 5usize);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let src = rng_vec(0x1234_5678_9abc_def1, (1usize << log_d) * num_ntts);
+        let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
+        let budgets: Vec<usize> = std::env::var("MF_PROBE_KIB")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_else(|| vec![0, 8, 32, 64, 128]);
+        let rounds = 15usize;
+        let mut best = vec![f64::INFINITY; budgets.len()];
+        let mut sum = vec![0.0f64; budgets.len()];
+        let mut reference: Option<Vec<F128>> = None;
+        for _ in 0..rounds {
+            for (i, &kib) in budgets.iter().enumerate() {
+                DEEP_GROUP_BUDGET_OVERRIDE.with(|b| b.set(Some(kib << 10)));
+                let mut data = src.clone();
+                let t = std::time::Instant::now();
+                for (sub_idx, sub_data) in data.chunks_exact_mut(sub_elems).enumerate() {
+                    ntt.forward_transform_interleaved_deep_subtree(
+                        sub_data, num_ntts, start_layer, n_top, log_d, sub_idx,
+                    );
+                }
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                best[i] = best[i].min(ms);
+                sum[i] += ms;
+                match &reference {
+                    None => reference = Some(data),
+                    Some(r) => assert!(*r == data),
+                }
+            }
+        }
+        DEEP_GROUP_BUDGET_OVERRIDE.with(|b| b.set(None));
+        for (i, &kib) in budgets.iter().enumerate() {
+            eprintln!(
+                "[mf-probe] budget {kib:4} KiB: best {:.3} ms, mean {:.3} ms (32 MiB, 13 layers, 1 thread)",
+                best[i],
+                sum[i] / rounds as f64
+            );
+        }
+    }
+
+    /// Recursive-commit deep subtree (8 lanes) with grouping active equals the
+    /// scalar reference: the L1 shape (lone first layer, then pairs), the L1
+    /// tail-split halves, and the L2 shape (pairs start below the sub layer).
+    #[test]
+    fn grouped_deep_subtree_matches_scalar() {
+        let num_ntts = 8usize;
+        // (log_d, start_layer, n_top): scaled L1, its halves, scaled L2.
+        for (log_d, start_layer, n_top) in [(16usize, 3usize, 3usize), (16, 4, 4), (15, 5, 4)] {
+            let first_pair = if (log_d - start_layer) % 2 == 1 {
+                start_layer + 1
+            } else {
+                start_layer
+            };
+            if !killed() {
+                assert_eq!(
+                    deep_l1_group_layer(log_d, num_ntts, first_pair),
+                    log_d - 8,
+                    "grouping must be active"
+                );
+                assert!(log_d - 8 > first_pair);
+            }
+            let ntt = AdditiveNttF128::standard(log_d);
+            let src = rng_vec(0x082e_fa98_ec4e_6c89 ^ log_d as u64, (1usize << log_d) * num_ntts);
+            let mut scalar = src.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut scalar, num_ntts, start_layer);
+            let mut grouped = src.clone();
+            let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
+            for (sub_idx, sub_data) in grouped.chunks_exact_mut(sub_elems).enumerate() {
+                ntt.forward_transform_interleaved_deep_subtree(
+                    sub_data, num_ntts, start_layer, n_top, log_d, sub_idx,
+                );
+            }
+            assert!(
+                grouped == scalar,
+                "grouped deep subtree diverges (log_d {log_d}, start {start_layer}, n_top {n_top})"
+            );
+            assert!(scalar != src);
+        }
     }
 }
 
