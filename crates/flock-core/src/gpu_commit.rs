@@ -1771,6 +1771,16 @@ impl FromZFirstPassStream {
     pub fn submit_ready_range(&mut self, r_start: usize, r_count: usize) {
         self.inner.submit_ready_range(r_start, r_count);
     }
+
+    /// [`Self::submit_ready_range`] without the in-order contract: any
+    /// multiple-of-four range disjoint from every range already published.
+    /// Each first-pass tile is independent (disjoint z reads and staging
+    /// writes), so the order of publication changes only when the GPU runs
+    /// a tile, never what it writes.
+    #[doc(hidden)]
+    pub fn submit_ready_range_unordered(&mut self, r_start: usize, r_count: usize) {
+        self.inner.submit_ready_range_unordered(r_start, r_count);
+    }
 }
 
 /// Finish a streamed first pass, run the remaining commitment graph, and
@@ -8075,6 +8085,9 @@ kernel void blake3_pow_scan(
         log_d: usize,
         n_leaves: usize,
         next_r: usize,
+        /// Ranges published through `submit_ready_range_unordered` (overlap
+        /// check); `next_r` then counts published tiles.
+        unordered: Vec<(usize, usize)>,
         /// Committed bands with their completion signals
         /// (`ENV_NO_GPU_DONE_EVENT`).
         pending: Vec<(Id, Option<DoneSig>)>,
@@ -8111,6 +8124,7 @@ kernel void blake3_pow_scan(
             }
             let total_r = 1usize << (self.log_d - 4);
             if r_start != self.next_r
+                || !self.unordered.is_empty()
                 || r_count == 0
                 || r_start + r_count > total_r
                 || !r_start.is_multiple_of(4)
@@ -8122,6 +8136,42 @@ kernel void blake3_pow_scan(
                 ));
                 return;
             }
+            self.submit_validated_range(r_start, r_count);
+        }
+
+        pub(crate) fn submit_ready_range_unordered(&mut self, r_start: usize, r_count: usize) {
+            if self.failed.is_some() {
+                return;
+            }
+            let total_r = 1usize << (self.log_d - 4);
+            let overlaps = self
+                .unordered
+                .iter()
+                .any(|&(s, c)| r_start < s + c && s < r_start + r_count);
+            if overlaps
+                || (self.next_r != 0 && self.unordered.is_empty())
+                || r_count == 0
+                || r_start + r_count > total_r
+                || !r_start.is_multiple_of(4)
+                || !r_count.is_multiple_of(4)
+            {
+                self.failed = Some(format!(
+                    "invalid unordered streamed range start={r_start} count={r_count} published={} total={total_r}",
+                    self.next_r
+                ));
+                return;
+            }
+            self.unordered.push((r_start, r_count));
+            self.submit_validated_range(r_start, r_count);
+        }
+
+        /// Encode and commit one validated first-pass range; `next_r` advances
+        /// by `r_count` (the published-tile count: the next start for the
+        /// ordered entry, a coverage count for the disjoint unordered one).
+        /// Once every tile is published the early prefix/graph is committed
+        /// behind the final range, exactly as before.
+        fn submit_validated_range(&mut self, r_start: usize, r_count: usize) {
+            let total_r = 1usize << (self.log_d - 4);
 
             // A position contains 64 F128 lanes = 1 KiB. Offsetting both the
             // z and staging bindings makes local kernel r map to global
@@ -8415,6 +8465,7 @@ kernel void blake3_pow_scan(
             log_d: params.k_code(),
             n_leaves: params.n_leaves(),
             next_r: 0,
+            unordered: Vec::new(),
             pending: Vec::with_capacity(8),
             failed: None,
             owns_lease: true,
@@ -19109,6 +19160,8 @@ mod imp {
 
     impl FromZFirstPassStream {
         pub(crate) fn submit_ready_range(&mut self, _r_start: usize, _r_count: usize) {}
+
+        pub(crate) fn submit_ready_range_unordered(&mut self, _r_start: usize, _r_count: usize) {}
     }
 
     /// L1 NTT/Merkle-leaf overlap (non-Metal stub): never engages.
