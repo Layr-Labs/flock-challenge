@@ -422,6 +422,40 @@ pub(crate) unsafe fn mul_const_prep(p: ConstPrep, x: uint64x2_t) -> uint64x2_t {
     unsafe { fold_lm(pmull_pair_sum(x, p.0), pmull_pair_sum(x, p.1)) }
 }
 
+/// Two independent prepared products, with their final folds in paired lanes.
+#[inline(always)]
+pub(crate) unsafe fn mul_const_pair_prep(
+    p0: ConstPrep,
+    x0: uint64x2_t,
+    p1: ConstPrep,
+    x1: uint64x2_t,
+) -> [uint64x2_t; 2] {
+    unsafe {
+        let l0 = pmull_pair_sum(x0, p0.0);
+        let m0 = pmull_pair_sum(x0, p0.1);
+        let l1 = pmull_pair_sum(x1, p1.0);
+        let m1 = pmull_pair_sum(x1, p1.1);
+        let l_lo = vzip1q_u64(l0, l1);
+        let l_hi = vzip2q_u64(l0, l1);
+        let m_lo = vzip1q_u64(m0, m1);
+        let m_hi = vzip2q_u64(m0, m1);
+
+        // Each M is an XOR of 64x64 products, so degree(M) <= 126.
+        // Thus M.hi bit 63 is zero and the high fold needs no >>63 term.
+        let lo = xor3_u64(
+            xor3_u64(l_lo, m_hi, vshlq_n_u64::<1>(m_hi)),
+            vshlq_n_u64::<2>(m_hi),
+            vshlq_n_u64::<7>(m_hi),
+        );
+        let hi = xor3_u64(
+            l_hi,
+            m_lo,
+            veorq_u64(vshrq_n_u64::<62>(m_hi), vshrq_n_u64::<57>(m_hi)),
+        );
+        [vzip1q_u64(lo, hi), vzip2q_u64(lo, hi)]
+    }
+}
+
 /// `x * c + y * d` for two prepared constants, with one shared fold.
 #[inline(always)]
 pub(crate) unsafe fn mul_two_const_sum_prep(
@@ -562,108 +596,6 @@ unsafe fn ghash_mul_const_vec2_karatsuba(c: F128, b: [F128; 2]) -> [F128; 2] {
                 hi: vgetq_lane_u64::<1>(final_hi),
             },
         ]
-    }
-}
-
-/// The same two products with limb pairs kept in vector lanes.
-/// `b_lo[i]` and `b_hi[i]` are the limbs of input `i`; results use the same map.
-///
-/// # Safety
-/// Requires the `aes` target feature.
-#[inline]
-#[target_feature(enable = "aes")]
-pub(crate) unsafe fn ghash_mul_const_vec2_neon_vectors(
-    c: F128,
-    b_lo: uint64x2_t,
-    b_hi: uint64x2_t,
-) -> [uint64x2_t; 2] {
-    // SAFETY: function carries the aes target feature; pmull requires it.
-    unsafe {
-        // Karatsuba per product: ll, hh, and (b_lo ^ b_hi)·(c_lo ^ c_hi);
-        // cross = mm ^ ll ^ hh (char 2).
-        let c_mid = c.lo ^ c.hi;
-        let b_mid = veorq_u64(b_lo, b_hi);
-        let p0_ll = pmull(vgetq_lane_u64::<0>(b_lo), c.lo);
-        let p0_hh = pmull(vgetq_lane_u64::<0>(b_hi), c.hi);
-        let p0_mm = pmull(vgetq_lane_u64::<0>(b_mid), c_mid);
-        let p1_ll = pmull(vgetq_lane_u64::<1>(b_lo), c.lo);
-        let p1_hh = pmull(vgetq_lane_u64::<1>(b_hi), c.hi);
-        let p1_mm = pmull(vgetq_lane_u64::<1>(b_mid), c_mid);
-
-        let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
-        let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
-
-        // Lane-paired (mul0, mul1) layout for each word position, identical
-        // to `ghash_mul_vec2_neon`:
-        //   r0 = ll_lo
-        //   r1 = ll_hi ^ cross_lo
-        //   r2 = hh_lo ^ cross_hi
-        //   r3 = hh_hi
-        let r0 = vzip1q_u64(p0_ll, p1_ll);
-        let ll_hi = vzip2q_u64(p0_ll, p1_ll);
-        let c_lo = vzip1q_u64(c0, c1);
-        let r1 = veorq_u64(ll_hi, c_lo);
-        let hh_lo = vzip1q_u64(p0_hh, p1_hh);
-        let c_hi = vzip2q_u64(c0, c1);
-        let r2 = veorq_u64(hh_lo, c_hi);
-        let r3 = vzip2q_u64(p0_hh, p1_hh);
-
-        let r2 = veorq_u64(
-            r2,
-            xor3_u64(
-                vshrq_n_u64::<63>(r3),
-                vshrq_n_u64::<62>(r3),
-                vshrq_n_u64::<57>(r3),
-            ),
-        );
-        let s1_lo = vshlq_n_u64::<1>(r2);
-        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
-        let s2_lo = vshlq_n_u64::<2>(r2);
-        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
-        let s7_lo = vshlq_n_u64::<7>(r2);
-        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
-
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-
-        let final_lo = veorq_u64(r0, t_lo);
-        let final_hi = veorq_u64(r1, t_hi);
-
-        [final_lo, final_hi]
-    }
-}
-
-#[cfg(all(test, target_feature = "aes", target_endian = "little"))]
-#[test]
-fn const_vec2_vector_lanes_match_software() {
-    let constants = [
-        F128::ZERO,
-        F128::ONE,
-        F128::new(2, 0),
-        F128::new(u64::MAX, 0),
-        F128::new(0, u64::MAX),
-        F128::new(u64::MAX, u64::MAX),
-        F128::new(0x0123456789abcdef, 0xfedcba9876543210),
-    ];
-    let basis = |bit: usize| {
-        if bit < 64 { F128::new(1 << bit, 0) } else { F128::new(0, 1 << (bit - 64)) }
-    };
-    for c in constants {
-        for bit in 0..128 {
-            let b = [basis(bit), basis(127 - bit)];
-            // SAFETY: the test requires AES; input/output lane maps are explicit.
-            let actual = unsafe {
-                let lo = vsetq_lane_u64::<1>(b[1].lo, vdupq_n_u64(b[0].lo));
-                let hi = vsetq_lane_u64::<1>(b[1].hi, vdupq_n_u64(b[0].hi));
-                let [lo, hi] = ghash_mul_const_vec2_neon_vectors(c, lo, hi);
-                [
-                    F128::new(vgetq_lane_u64::<0>(lo), vgetq_lane_u64::<0>(hi)),
-                    F128::new(vgetq_lane_u64::<1>(lo), vgetq_lane_u64::<1>(hi)),
-                ]
-            };
-            assert_eq!(actual[0], super::software::ghash_mul(c, b[0]));
-            assert_eq!(actual[1], super::software::ghash_mul(c, b[1]));
-        }
     }
 }
 
