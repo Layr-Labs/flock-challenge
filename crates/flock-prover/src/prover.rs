@@ -122,6 +122,50 @@ fn ranked_identity_prefix_omission_contract(
     r1cs.round1_pinned_one_prefix_statement()
 }
 
+/// Capture the already-folded lincheck intermediate used by the AB opening.
+/// The top-bit binding order matches the reverse order of `inner_rest_tail`;
+/// keep the low zero/two/four/six coordinates required by the selected route.
+fn prove_lincheck_with_ab_s_hat_v<Ch: Challenger>(
+    z_packed: &[u8],
+    r1cs: &BlockR1cs,
+    circuit: &dyn lincheck::LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (lincheck::LincheckProof, lincheck::LincheckClaim, Option<Vec<F128>>) {
+    let capture_folds = if r1cs.k_skip + 1 == pcs::LOG_PACKING
+        && r1cs.k_log >= pcs::LOG_PACKING
+    {
+        let retained = if ranked_direct_fold8_precompute_enabled(r1cs) {
+            6
+        } else if ranked_direct_fold4_precompute_enabled(r1cs) {
+            4
+        } else if ranked_direct_ab_precompute_enabled(r1cs) {
+            2
+        } else {
+            0
+        };
+        (r1cs.k_log - pcs::LOG_PACKING).checked_sub(retained)
+    } else {
+        None
+    };
+    if let Some(folds) = capture_folds {
+        let (proof, claim, captured) = lincheck::prove_padded_capture_z_vec_after_top_folds(
+            z_packed, r1cs.m, r1cs.k_log, r1cs.k_skip, r1cs.useful_bits,
+            circuit, x_ab, folds, challenger,
+        );
+        (proof, claim, Some(captured))
+    } else {
+        // Preserve the original route for unusual packing/skip geometries.
+        let (proof, claim, captured) = lincheck::prove_padded_capture_z_vec(
+            z_packed, r1cs.m, r1cs.k_log, r1cs.k_skip, r1cs.useful_bits,
+            circuit, x_ab, challenger,
+        );
+        let s_hat_v = precompute_ab_s_hat_v(r1cs, &captured, &claim.r_inner_rest[1..]);
+        flock_core::scratch::give_lincheck_eq(captured);
+        (proof, claim, s_hat_v)
+    }
+}
+
 fn precompute_ab_s_hat_v(
     r1cs: &BlockR1cs,
     z_vec: &[F128],
@@ -206,12 +250,22 @@ pub(crate) fn open_claims_with_precomputed_ligerito<Ch: Challenger>(
         .iter()
         .map(|c| quirky_x_outer_full(&c.point))
         .collect();
-    let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
+    // AB and C are the usual pair: their borrowed views fit on the stack.
+    // Keep the general claim-count path for callers with extra openings.
+    let pair;
+    let general;
+    let x_refs: &[&[F128]] = if let [a, b] = x_fulls.as_slice() {
+        pair = [a.as_slice(), b.as_slice()];
+        &pair
+    } else {
+        general = x_fulls.iter().map(|v| v.as_slice()).collect::<Vec<_>>();
+        &general
+    };
     let out = pcs::open_batch_mixed_ligerito_with_precomputed_s_hat_v(
         z_packed,
         prover_data,
         commitment,
-        &x_refs,
+        x_refs,
         precomputed_s_hat_v,
         &[],
         padding,
@@ -283,12 +337,9 @@ pub fn prove_ligerito<Ch: Challenger>(
 
     let lc_circuit =
         lincheck::SparseMatrixCircuit::new(&r1cs.a_0, &r1cs.b_0).with_const_pin(r1cs.const_pin);
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+    let (lc_proof, lc_claim, s_hat_v_ab) = prove_lincheck_with_ab_s_hat_v(
         &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
+        r1cs,
         &lc_circuit,
         &x_ab,
         challenger,
@@ -303,9 +354,6 @@ pub fn prove_ligerito<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-    flock_core::scratch::give_f128(z_vec_pre);
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
     let pcs_open = open_claims_with_precomputed_ligerito(
@@ -2887,19 +2935,16 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let t_lc = std::time::Instant::now();
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
 
-    // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
-    // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
+    // Capture the AB sufficient statistic after its required lincheck folds,
+    // avoiding a full-vector capture and a redundant PCS fold.
     // Lincheck runs on a main-pool worker (`flock_core::in_pool`), as above.
     flock_core::tmark::mark("lc call");
     flock_core::epool::set_linger_phase(true);
-    let (lc_proof, lc_claim, z_vec_pre) = flock_core::in_pool(|| {
+    let (lc_proof, lc_claim, s_hat_v_ab) = flock_core::in_pool(|| {
         flock_core::tmark::mark("lc body start");
-        lincheck::prove_padded_capture_z_vec(
+        prove_lincheck_with_ab_s_hat_v(
             &z_packed_lincheck,
-            r1cs.m,
-            r1cs.k_log,
-            r1cs.k_skip,
-            r1cs.useful_bits,
+            r1cs,
             lincheck_circuit,
             &x_ab,
             challenger,
@@ -2921,13 +2966,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         value: zc_claim.c_eval,
     };
 
-    // Strided fold of z_vec_pre against the AB-claim suffix's inner-rest tail
-    // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
-    // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
-    // (only test setups; real R1CS has k_log >= 16).
-    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-    flock_core::scratch::give_lincheck_eq(z_vec_pre);
     if phase_timing {
         let wall = t_lc.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_lc0.unwrap_or(0.0);
@@ -3129,12 +3167,9 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
 
     // --- lincheck + base-claim / s_hat_v setup ---
     let t0 = Instant::now();
-    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+    let (lc_proof, lc_claim, s_hat_v_ab) = prove_lincheck_with_ab_s_hat_v(
         &z_packed_lincheck,
-        r1cs.m,
-        r1cs.k_log,
-        r1cs.k_skip,
-        r1cs.useful_bits,
+        r1cs,
         lincheck_circuit,
         &x_ab,
         challenger,
@@ -3148,9 +3183,6 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
         value: zc_claim.c_eval,
     };
-    let s_hat_v_ab = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
-    // z_vec_pre only fed s_hat_v_ab; recycle before PCS open residency.
-    flock_core::scratch::give_f128(z_vec_pre);
     t.lincheck_s = t0.elapsed().as_secs_f64();
 
     // --- Ligerito recursive PCS open ---

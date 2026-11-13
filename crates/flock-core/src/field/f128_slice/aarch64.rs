@@ -630,6 +630,28 @@ unsafe fn tri_acc_two_banks(
     }
 }
 
+/// Add one live bank without evaluating the adjacent promised-zero bank.
+#[inline(always)]
+unsafe fn tri_acc_one_bank(
+    ll: &mut uint64x2_t,
+    cross: &mut uint64x2_t,
+    hh: &mut uint64x2_t,
+    x: uint64x2_t,
+    w: uint64x2_t,
+    w_sw: uint64x2_t,
+) {
+    unsafe {
+        let xp = vreinterpretq_p64_u64(x);
+        let lo = |a: uint64x2_t, b: uint64x2_t| pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b));
+        let hi = |a: poly64x2_t, b: uint64x2_t| {
+            transmute::<u128, uint64x2_t>(vmull_high_p64(a, vreinterpretq_p64_u64(b)))
+        };
+        *ll = veorq_u64(*ll, lo(x, w));
+        *hh = veorq_u64(*hh, hi(xp, w));
+        *cross = xor3_u64(*cross, lo(x, w_sw), hi(xp, w_sw));
+    }
+}
+
 /// [`fold_banked_slots4`] for an even bank count: schoolbook products with
 /// one swapped copy per weight shared by the four slots, two banks per step
 /// so each accumulator update is one EOR3 of two products. The four outputs
@@ -707,8 +729,10 @@ unsafe fn load_whole(p: *const F128) -> uint64x2_t {
 ///
 /// `odd_live` is the number of leading banks that can be nonzero in the
 /// second and fourth slot (`BANKS` when nothing is known). Banks at and above
-/// it, rounded up to a bank pair, are neither loaded nor multiplied for those
-/// two slots: the caller promises they are zero, and a zero input adds
+/// it are neither loaded nor multiplied for those two slots. An odd live
+/// count uses one single-bank update in the boundary pair; the even slots
+/// still consume both banks. The caller promises the skipped inputs are zero,
+/// and a zero input adds
 /// nothing to any of the three product sums.
 ///
 /// Same products (less the promised-zero ones), same accumulators and the
@@ -737,7 +761,8 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
 
         let w = weight.as_ptr();
         let x = input.as_ptr();
-        let split = if odd_live >= BANKS { BANKS } else { (odd_live + 1) & !1 };
+        let live = odd_live.min(BANKS);
+        let split = live & !1;
         let mut bank = 0usize;
         while bank < split {
             let w0 = vld1q_u64(w.add(bank).cast::<u64>());
@@ -758,6 +783,40 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
                     x1,
                     w1,
                     w1_sw,
+                );
+            }
+            bank += 2;
+        }
+        // The boundary pair has two live even-slot banks, but only its
+        // first bank is live in the odd slots. Share the same loaded weights.
+        if bank < live {
+            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
+            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
+            let w0_sw = swap_halves(w0);
+            let w1_sw = swap_halves(w1);
+            for slot in [0usize, 2] {
+                let row = x.add(slot * BANKS + bank);
+                tri_acc_two_banks(
+                    &mut ll[slot],
+                    &mut cross[slot],
+                    &mut hh[slot],
+                    load_whole(row),
+                    w0,
+                    w0_sw,
+                    load_whole(row.add(1)),
+                    w1,
+                    w1_sw,
+                );
+            }
+            for slot in [1usize, 3] {
+                let row = x.add(slot * BANKS + bank);
+                tri_acc_one_bank(
+                    &mut ll[slot],
+                    &mut cross[slot],
+                    &mut hh[slot],
+                    load_whole(row),
+                    w0,
+                    w0_sw,
                 );
             }
             bank += 2;
@@ -1942,6 +2001,49 @@ pub(super) unsafe fn scale_slice_prepared(out: &mut [F128], src: &[F128], s: F12
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nm_odd_bank_boundaries_match_scalar() {
+        assert!(std::arch::is_aarch64_feature_detected!("aes"));
+        fn check<const BANKS: usize>() {
+            let mut state = 0x4f44_445f_4241_4e4bu64;
+            let rand = |s: &mut u64| F128::new(test_xorshift(s), test_xorshift(s));
+            let weight: [F128; BANKS] = std::array::from_fn(|_| rand(&mut state));
+            for live in (0..=BANKS + 2).chain(std::iter::once(usize::MAX)) {
+                for pattern in 0..4 {
+                    let mut input: Vec<F128> = (0..4 * BANKS).map(|_| {
+                        match pattern {
+                            0 => rand(&mut state),
+                            1 => F128::new(u64::MAX, u64::MAX),
+                            2 => F128::new(rand(&mut state).lo, 0),
+                            _ => F128::new(0, rand(&mut state).hi),
+                        }
+                    }).collect();
+                    for slot in [1usize, 3] {
+                        input[slot * BANKS + live.min(BANKS)..(slot + 1) * BANKS]
+                            .fill(F128::ZERO);
+                    }
+                    let sentinel = F128::new(0xdead_beef, 0x1234_5678);
+                    let mut actual = [sentinel; 6];
+                    let mut expected = actual;
+                    for slot in 0..4 {
+                        expected[slot + 1] = (0..BANKS).fold(F128::ZERO, |acc, bank| {
+                            acc + weight[bank] * input[slot * BANKS + bank]
+                        });
+                    }
+                    unsafe {
+                        fold_banked_slots4_whole_into(&weight, &input, &mut actual[1..5], live);
+                    }
+                    assert_eq!(actual, expected, "BANKS={BANKS} live={live} pattern={pattern}");
+                }
+            }
+        }
+        check::<0>();
+        check::<2>();
+        check::<4>();
+        check::<16>();
+        check::<64>();
+    }
 
     /// The prepared row scale equals the generic field multiply, entry by
     /// entry, for edge multipliers and odd lengths.
