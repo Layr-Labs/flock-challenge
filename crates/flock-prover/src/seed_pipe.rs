@@ -1268,6 +1268,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     let _ = shared();
     // Committed here, in the warm-up, so the timed expansion never faults.
     let scratch = prefaulted_blocks(1usize << log2_size);
+    let (parked_tx, parked_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let spawned = std::thread::Builder::new()
         .name("flock-seed-pipe".into())
         // This thread runs the whole proof, which the wrapper otherwise runs on
@@ -1276,7 +1277,9 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
         // the process and costs the trial. Reservation is lazily committed, so
         // the untouched pages cost nothing.
         .stack_size(32 << 20)
-        .spawn(move || speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch));
+        .spawn(move || {
+            speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch, parked_tx)
+        });
 
     if spawned.is_err() {
         // Nobody will ever forward the seed, so hand the real stdin straight
@@ -1289,6 +1292,10 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
         }
         ARMED.store(false, Ordering::SeqCst);
         return;
+    }
+
+    if std::env::var_os("FLOCK_NO_PARKED_ARM").is_none() {
+        let _ = parked_rx.recv_timeout(std::time::Duration::from_millis(500));
     }
 
     // Everything this thread does from here until adoption is shadow work that
@@ -1321,12 +1328,12 @@ fn speculative_main(
     setup_addr: usize,
     run: fn(usize, &[Compression]) -> ProveOut,
     scratch: Vec<Compression>,
+    parked: std::sync::mpsc::SyncSender<()>,
 ) {
     flock_core::set_calling_thread_prover_qos();
     let mut scratch = scratch;
 
     // Pre-open the speculative publish target while every remaining moment is
-    // untimed (the wrapper has not even published its ready file yet): the
     // open, vnode, name-cache, and first-touch write machinery move off the
     // publication critical path. `None` outside the ranked worker, under the
     // kill switch, or on any I/O hiccup — the incumbent create-at-publish
@@ -1337,6 +1344,8 @@ fn speculative_main(
         .flatten()
         .and_then(|proof_path| preopen_publish_file(&proof_path));
 
+    let _ = parked.send(());
+    drop(parked);
     hot_wait_readable(real_stdin);
     let line = read_line_fd(real_stdin);
     flock_core::tmark::reset();

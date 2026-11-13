@@ -479,6 +479,8 @@ fn zero_lane_skip_disabled() -> bool {
     *OFF
 }
 
+const RANKED_TOP_TILE_ROWS: usize = 8;
+
 /// Trailing lanes the ranked commit transform may skip on odd rows, or 0.
 ///
 /// The ambient publication is honored ONLY at the exact ranked production
@@ -1228,6 +1230,109 @@ impl AdditiveNttF128 {
         }
     }
 
+    ///
+    ///
+    fn forward_transform_interleaved_ranked_top_tiled(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        b_start: usize,
+        b_end: usize,
+        odd_tail: usize,
+    ) -> bool {
+        use rayon::prelude::*;
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HYBRID_TOP_TILE").is_none());
+        const LOG_D: usize = 20;
+        const NUM_NTTS: usize = 64;
+        const BLOCK4_POS: usize = 1 << (LOG_D - 4);
+        const EIGHTH4: usize = BLOCK4_POS >> 3;
+        const EIGHTH7: usize = EIGHTH4 >> 3;
+        const ROWS: usize = RANKED_TOP_TILE_ROWS;
+        if !*ON
+            || num_ntts != NUM_NTTS
+            || data.len() != NUM_NTTS << LOG_D
+            || self.log_domain_size() < LOG_D
+            || !(b_start < b_end && b_end <= 16)
+        {
+            return false;
+        }
+        let tw4: Vec<[F128; 7]> = (b_start..b_end)
+            .map(|abs| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                tw[0] = self.twiddle(4, abs);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(5, 2 * abs + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(6, 4 * abs + s);
+                }
+                tw
+            })
+            .collect();
+        let tw7: Vec<[F128; 7]> = (8 * b_start..8 * b_end)
+            .map(|abs| {
+                let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+                tw[0] = self.twiddle(7, abs);
+                for s in 0..2 {
+                    tw[1 + s] = self.twiddle(8, 2 * abs + s);
+                }
+                for s in 0..4 {
+                    tw[3 + s] = self.twiddle(9, 4 * abs + s);
+                }
+                tw
+            })
+            .collect();
+        let use_neon = kernels::vector_resident_rows();
+        let odd_lanes = NUM_NTTS - odd_tail.min(NUM_NTTS);
+        let tiles_per_block = EIGHTH7 / ROWS;
+        let base = data.as_mut_ptr() as usize;
+        let job = |job: usize| {
+            let local = job / tiles_per_block;
+            let r0 = (job % tiles_per_block) * ROWS;
+            let abs_b = b_start + local;
+            unsafe {
+                let block_base = (base as *mut F128).add(abs_b * BLOCK4_POS * NUM_NTTS);
+                for a in 0..8usize {
+                    for r in r0..r0 + ROWS {
+                        let row = a * EIGHTH7 + r;
+                        let lanes = if row & 1 == 1 { odd_lanes } else { NUM_NTTS };
+                        if abs_b == 0 {
+                            kernels::butterfly_fused_3layer_zero_root_row_with_policy(
+                                block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local], use_neon,
+                            );
+                        } else {
+                            kernels::butterfly_fused_3layer_row_with_policy(
+                                block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local], use_neon,
+                            );
+                        }
+                    }
+                }
+                for b in 0..8usize {
+                    let abs_c = 8 * abs_b + b;
+                    let sub_base = block_base.add(b * EIGHTH4 * NUM_NTTS);
+                    let tw = &tw7[8 * local + b];
+                    for r in r0..r0 + ROWS {
+                        let lanes = if r & 1 == 1 { odd_lanes } else { NUM_NTTS };
+                        if abs_c == 0 {
+                            kernels::butterfly_fused_3layer_zero_root_row_with_policy(
+                                sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
+                            );
+                        } else {
+                            kernels::butterfly_fused_3layer_row_with_policy(
+                                sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        (0..(b_end - b_start) * tiles_per_block)
+            .into_par_iter()
+            .for_each(job);
+        true
+    }
+
     /// Complete a ranked hybrid suffix with the same cache-local schedule as
     /// the tuned full-CPU transform, then publish each finalized 1 MiB chunk.
     ///
@@ -1267,17 +1372,18 @@ impl AdditiveNttF128 {
         // explicit tail.
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
 
-        // Two fused radix-8 passes.  Unlike the old all-layer range driver,
-        // this is the last streaming traversal of the complete suffix.
-        self.forward_transform_interleaved_block_range(
-            data,
-            num_ntts,
-            start_layer,
-            DEEP_LAYER,
-            b_start,
-            b_end,
-            odd_tail,
-        );
+        if !self.forward_transform_interleaved_ranked_top_tiled(data, num_ntts, b_start, b_end, odd_tail)
+        {
+            self.forward_transform_interleaved_block_range(
+                data,
+                num_ntts,
+                start_layer,
+                DEEP_LAYER,
+                b_start,
+                b_end,
+                odd_tail,
+            );
+        }
 
         // Every layer-4 block contains 2^(10-4) independent layer-10
         // sub-NTTs.  Preserve their absolute indices so all deeper twiddles
@@ -1321,9 +1427,11 @@ impl AdditiveNttF128 {
         assert_eq!(num_ntts, 64, "ranked fine split requires 64 lanes");
         assert!((1..16).contains(&b_start) && (1..16).contains(&fine_m));
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
-        self.forward_transform_interleaved_block_range(
-            data, num_ntts, 4, DEEP_LAYER, b_start, 16, odd_tail,
-        );
+        if !self.forward_transform_interleaved_ranked_top_tiled(data, num_ntts, b_start, 16, odd_tail) {
+            self.forward_transform_interleaved_block_range(
+                data, num_ntts, 4, DEEP_LAYER, b_start, 16, odd_tail,
+            );
+        }
         let sb_end = b_start << 4;
         let sb_start = sb_end - fine_m;
         wait_boundary()?;

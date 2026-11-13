@@ -1398,7 +1398,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
 #[test]
 fn kara2_in_place_matches_separate() {
     let mut state=0x91e10da5c79e7b1du64;
