@@ -5057,6 +5057,15 @@ pub(super) fn c2_retained_transpose_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_C2_RETAINED_TRANSPOSE").is_none())
 }
 
+/// Kill switch for building the retained C2 transpose's dense data through
+/// its first three-layer pass (`densify_active_windows_fused_first_3layer`):
+/// `FLOCK_NO_C2_FUSED_DENSIFY` (any value) densifies first and runs that pass
+/// separately, as before. Both give the same data. Read once per process.
+fn c2_retained_fused_densify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_FUSED_DENSIFY").is_none())
+}
+
 ///
 ///
 ///
@@ -5066,6 +5075,35 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
     values: &[F128],
     log_d: usize,
     drop_log: usize,
+) -> Option<Vec<F128>> {
+    transpose_forward_ntt_sparse_retained_impl(
+        ntt,
+        positions,
+        values,
+        log_d,
+        drop_log,
+        c2_retained_fused_densify_enabled().then_some(C2_FUSED_DENSIFY_MIN_FIRST_LAYER),
+    )
+}
+
+/// The fused first pass runs one job per block of eight windows, `2^layer`
+/// jobs at first layer `layer`; it is used only from 32 blocks up, where
+/// every worker of the pool gets several blocks (the ranked L0 geometry,
+/// 64 blocks; the L1 geometry has 16 and keeps the two-step form).
+const C2_FUSED_DENSIFY_MIN_FIRST_LAYER: usize = 5;
+
+/// [`transpose_forward_ntt_sparse_retained`]. With `fused_first =
+/// Some(min_layer)`, when the first step after densification would be the
+/// fused three-layer pass at layer `log_d - k - 3 >= min_layer`, the dense
+/// data is built through that pass directly (no full-domain densify write
+/// and no separate read of it by the pass).
+fn transpose_forward_ntt_sparse_retained_impl(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    drop_log: usize,
+    fused_first: Option<usize>,
 ) -> Option<Vec<F128>> {
     if drop_log == 0
         || drop_log >= log_d
@@ -5079,6 +5117,18 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
     if log_d - k < drop_log {
         return None;
     }
+    // The step after densification is the fused three-layer pass at layer
+    // `log_d - k - 3` exactly when one of the two loops below runs at least
+    // once: the low-half path while `remaining > 3`, the general path while
+    // `remaining >= drop_log + 3`.
+    let dense = log_d - k;
+    let fused_first = fused_first.is_some_and(|min_layer| dense >= 3 + min_layer)
+        && k != 0
+        && if drop_log == 1 && dense >= 3 && dense.is_multiple_of(3) {
+            dense > 3
+        } else {
+            dense >= drop_log + 3
+        };
     let mut data: Vec<F128> = if k == 0 {
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
@@ -5089,9 +5139,13 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
         let groups = group_sorted_positions(positions, k);
         let mut arena = scatter_active_windows(&groups, positions, values, k);
         transform_active_windows(ntt, &mut arena, &groups, positions, values, k, log_d);
-        densify_active_windows(&arena, &groups, log_d, k)
+        if fused_first {
+            densify_active_windows_fused_first_3layer(ntt, &arena, &groups, log_d, k)
+        } else {
+            densify_active_windows(&arena, &groups, log_d, k)
+        }
     };
-    let mut remaining = log_d - k;
+    let mut remaining = if fused_first { dense - 3 } else { dense };
     if drop_log == 1 && remaining >= 3 && remaining.is_multiple_of(3) {
         while remaining > 3 {
             remaining -= 3;
@@ -15752,6 +15806,13 @@ mod tests {
                 transpose_forward_ntt_sparse_retained(&ntt, &positions, &values, log_d, drop_log)
                     .expect("supported retained geometry");
             assert_eq!(actual, expected, "log_d={log_d} drop={drop_log} nq={nq}");
+            for fused_first in [None, Some(0), Some(C2_FUSED_DENSIFY_MIN_FIRST_LAYER)] {
+                let got = transpose_forward_ntt_sparse_retained_impl(
+                    &ntt, &positions, &values, log_d, drop_log, fused_first,
+                )
+                .expect("supported retained geometry");
+                assert_eq!(got, expected, "log_d={log_d} drop={drop_log} nq={nq} fused_first={fused_first:?}");
+            }
         }
     }
 
