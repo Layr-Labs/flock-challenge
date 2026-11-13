@@ -153,6 +153,12 @@ fn is_ranked_worker_process() -> bool {
 fn ranked_start_pause() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        // Ranked worker only: compile the zerocheck round-two pipelines on an
+        // efficiency core during this pause instead of at first use
+        // (`FLOCK_NO_GPU_EARLY_ZC_R2=1` kills; see `spawn_early_zc_r2_compile`).
+        if is_ranked_worker_process() {
+            let _ = gpu_commit::spawn_early_zc_r2_compile();
+        }
         let kill = std::env::var_os(ENV_NO_READY_PAUSE);
         if let Some(pause) = ranked_start_pause_for(is_ranked_worker_process(), kill.as_deref()) {
             std::thread::sleep(pause);
