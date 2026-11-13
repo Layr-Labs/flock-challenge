@@ -1854,7 +1854,17 @@ fn ab_window_rows_plan() -> AbWindowRows {
             && !k::ab_z_mt_enabled()
             && k::ab_horner2_enabled()
         {
-            rows::<MAIN, true>
+            // `ABV_Z_M1` (`FLOCK_NO_ZC_AB_Z_M1` kills): the z apply's index
+            // words in five integer instructions instead of seven; `ABV_ZK`
+            // (`FLOCK_NO_ZC_AB_ZK` kills): every z lookup enters its outputs
+            // through `eor3` only. Same lookups, same bytes.
+            if k::ab_z_m1_enabled() && k::ab_zk_enabled() {
+                rows::<{ MAIN | k::ABV_Z_M1 | k::ABV_ZK }, true>
+            } else if k::ab_z_m1_enabled() {
+                rows::<{ MAIN | k::ABV_Z_M1 }, true>
+            } else {
+                rows::<MAIN, true>
+            }
         } else {
             rows::<0, false>
         }
@@ -1921,7 +1931,13 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
         | k::ABV_KARA_SLOT
         | k::ABV_HORNER2;
     const HELPER: u16 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
-    if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
+    const MAIN_M1: u16 = MAIN | k::ABV_Z_M1;
+    const MAIN_ZK: u16 = MAIN | k::ABV_Z_M1 | k::ABV_ZK;
+    if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN_ZK, true> as AbWindowRows) {
+        Some(unit::<MAIN_ZK, true>)
+    } else if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN_M1, true> as AbWindowRows) {
+        Some(unit::<MAIN_M1, true>)
+    } else if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
         Some(unit::<MAIN, true>)
     } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, false> as AbWindowRows) {
         Some(unit::<HELPER, false>)
@@ -5860,7 +5876,7 @@ mod tests {
         let _serial = AB_KARA_FORCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         const V0: u16 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
-        let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 }, true>;
+        let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 | k::ABV_Z_M1 | k::ABV_ZK }, true>;
         let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>;
         assert!(!core::ptr::fn_addr_eq(main, plain));
         let switches = [
@@ -5873,6 +5889,8 @@ mod tests {
             "FLOCK_NO_ZC_AB_KARA_SLOT",
             "FLOCK_ZC_AB_Z_MT",
             "FLOCK_NO_ZC_AB_HORNER2",
+            "FLOCK_NO_ZC_AB_Z_M1",
+            "FLOCK_NO_ZC_AB_ZK",
             "FLOCK_NO_ZC_AB_HZ",
             "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN",
         ];
@@ -7830,11 +7848,12 @@ mod tests {
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW | ABV_INLINE_WINDOW);
                         check!(kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z | kernels::aarch64::ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 | kernels::aarch64::ABV_Z_M1 | kernels::aarch64::ABV_ZK);
                     }
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 27);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 28);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
@@ -8067,6 +8086,8 @@ mod tests {
             ("+ KARA_SLOT + Z_MT", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT }, true>),
             ("+ HORNER2", imp::<{ V0 | kernels::aarch64::ABV_HORNER2 }, true>),
             ("+ KARA_SLOT + Z_MT + HORNER2", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT | kernels::aarch64::ABV_HORNER2 }, true>),
+            ("+ KARA_SLOT + HORNER2 (record)", imp::<{ V0 | ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 }, true>),
+            ("+ KARA_SLOT + HORNER2 + Z_M1", imp::<{ V0 | ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 | kernels::aarch64::ABV_Z_M1 }, true>),
             ("E-core HZ", imp::<{ kernels::aarch64::AB_HZ_VARIANT }, false>),
             ("E-core HZ + HORNER2", imp::<{ kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2 }, false>),
         ];
