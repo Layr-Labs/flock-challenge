@@ -1488,7 +1488,7 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let (z0, z1) = z_vec.split_at(half);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            let mut out = vec![F128::ZERO; half];
+            let mut out = crate::alloc_uninit_f128_vec(half);
             let mut i = 0;
             while i < half {
                 let x0 = z0[i] + z1[i];
@@ -1996,6 +1996,24 @@ pub(crate) fn compose_fold_byte_table_into(e_hi: F128, base: &[F128], out: &mut 
 fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128], x_ladder: bool) {
     debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
     debug_assert_eq!(out.len(), FOLD_TABLE_LEN);
+    let g = compose_fold_generators(e_hi, base, x_ladder);
+    // Per byte position: subset-sum doubling over that byte's 8 generators.
+    // Every entry is written exactly once (t[0] = 0, then each doubling round
+    // writes the upper half from the lower).
+    for k in 0..FOLD_N_BYTES {
+        let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
+        t[0] = F128::ZERO;
+        for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
+            let half = 1usize << bit;
+            for v in 0..half {
+                t[v + half] = t[v] + gv;
+            }
+        }
+    }
+}
+
+#[inline]
+fn compose_fold_generators(e_hi: F128, base: &[F128], x_ladder: bool) -> [F128; 128] {
     let mut g = [F128::ZERO; 128];
     if x_ladder {
         // Generators g_b = L(x^b · e_hi) over the single-bit basis elements
@@ -2021,19 +2039,53 @@ fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128]
             *gb = fold_one_slot(e_b * e_hi, base);
         }
     }
-    // Per byte position: subset-sum doubling over that byte's 8 generators.
-    // Every entry is written exactly once (t[0] = 0, then each doubling round
-    // writes the upper half from the lower).
-    for k in 0..FOLD_N_BYTES {
-        let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
+    g
+}
+
+pub(crate) const FOLD_NIB_LEN: usize = 2 * FOLD_N_BYTES * 16;
+
+pub(crate) fn compact_compose_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_DIRECT_FOLD8_BYTE_TABLES").is_none())
+}
+
+pub(crate) fn compose_fold_nibble_table_into(e_hi: F128, base: &[F128], out: &mut [F128]) {
+    debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
+    assert!(out.len() >= FOLD_NIB_LEN);
+    let g = compose_fold_generators(e_hi, base, compose_x_ladder_enabled());
+    for k in 0..2 * FOLD_N_BYTES {
+        let t = &mut out[k * 16..(k + 1) * 16];
         t[0] = F128::ZERO;
-        for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
+        for (bit, &gv) in g[k * 4..k * 4 + 4].iter().enumerate() {
             let half = 1usize << bit;
             for v in 0..half {
                 t[v + half] = t[v] + gv;
             }
         }
     }
+}
+
+#[inline(always)]
+pub(crate) fn fold_one_slot_nib(elem: F128, tables: &[F128]) -> F128 {
+    debug_assert!(tables.len() >= FOLD_NIB_LEN);
+    let lo_bytes = elem.lo.to_le_bytes();
+    let hi_bytes = elem.hi.to_le_bytes();
+    let t = tables.as_ptr();
+    let byte = |j: usize, b: u8| unsafe {
+        *t.add(32 * j + (b & 15) as usize) + *t.add(32 * j + 16 + (b >> 4) as usize)
+    };
+    let p0 = byte(0, lo_bytes[0]) + byte(1, lo_bytes[1]);
+    let p1 = byte(2, lo_bytes[2]) + byte(3, lo_bytes[3]);
+    let p2 = byte(4, lo_bytes[4]) + byte(5, lo_bytes[5]);
+    let p3 = byte(6, lo_bytes[6]) + byte(7, lo_bytes[7]);
+    let p4 = byte(8, hi_bytes[0]) + byte(9, hi_bytes[1]);
+    let p5 = byte(10, hi_bytes[2]) + byte(11, hi_bytes[3]);
+    let p6 = byte(12, hi_bytes[4]) + byte(13, hi_bytes[5]);
+    let p7 = byte(14, hi_bytes[6]) + byte(15, hi_bytes[7]);
+    let q0 = xor3_f128(p0, p1, p2);
+    let q1 = xor3_f128(p3, p4, p5);
+    let q2 = p6 + p7;
+    xor3_f128(q0, q1, q2)
 }
 /// Encode `x ↦ Σ_d fold_weight[d] · Φ(low_eq[d]·x)` as a byte table,
 /// where `base` encodes the γ-baked linear map `Φ`.
@@ -2770,24 +2822,24 @@ pub fn prove<Ch: Challenger>(
 
     // Suffix is x_outer[1..] (length m-7); first coord becomes the 7th-bit factor.
     let suffix = &x_outer[1..];
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let suffix_tensor = build_eq_parallel(suffix);
     if trace {
         eprintln!(
             "    [rs::prove] build_eq(suffix L={}): {:6.2} ms",
             suffix.len(),
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
     debug_assert_eq!(suffix_tensor.len(), l);
 
     // Compute and send s_hat_v.
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let s_hat_v = fold_1b_rows_naive(packed_witness, &suffix_tensor);
     if trace {
         eprintln!(
             "    [rs::prove] fold_1b_rows:          {:6.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
     challenger.observe_f128_slice(&s_hat_v);
@@ -2801,12 +2853,12 @@ pub fn prove<Ch: Challenger>(
     let sumcheck_claim = inner_product(&s_hat_u, &eq_r_dprime);
 
     // Compute transparent multilinear rs_eq_ind.
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let rs_eq_ind = fold_b128_elems(&suffix_tensor, &eq_r_dprime);
     if trace {
         eprintln!(
             "    [rs::prove] fold_b128_elems:       {:6.2} ms",
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
@@ -3002,7 +3054,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         && sparse_needs_fold.is_empty()
         && crate::pcs::ranked_direct_fold8_enabled()
         && rs_elide_dead_basis_enabled();
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
             .iter()
@@ -3034,7 +3086,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             dense_suffixes.len(),
             if use_split { "split" } else { "full" },
             sparse_supports.len(),
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
@@ -3046,7 +3098,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //    supplied by the caller. dense_s_hat_v/sparse_s_hat_v are still
     //    indexed by classify-time index `d` / `s`; we splice precomputed
     //    values in at those slots and run the kernel only on the others.
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
     // Fill precomputed slots first.
@@ -3144,7 +3196,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
             "    [rs::prove_batched] fold_1b_rows dense(k={})+sparse(k={}): {:6.2} ms",
             dense_s_hat_v.len(),
             sparse_s_hat_v.len(),
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 
@@ -3154,7 +3206,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     //    (b) Sample γ_rs after all observations (Schwartz-Zippel-sound).
     //    (c) Per claim: bake γ_k into eq_r_dprime, fold. Output rs_eq_ind
     //        already has γ_k baked in — pcs combine just adds.
-    let t = std::time::Instant::now();
+    let t = trace.then(std::time::Instant::now);
 
     struct ClaimWork<'a> {
         s_hat_v: Vec<F128>,
@@ -3481,7 +3533,7 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
         eprintln!(
             "    [rs::prove_batched] per-opening tail ×{}: {:6.2} ms",
             n,
-            t.elapsed().as_secs_f64() * 1e3
+            t.as_ref().unwrap().elapsed().as_secs_f64() * 1e3
         );
     }
 

@@ -1244,14 +1244,14 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
     let ell_skip = 1usize << k_skip;
     let ell_rest = 1usize << x_inner_rest.len();
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
-    let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
     let mut out = crate::scratch::take_lincheck_eq(total);
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
-    for (row, &er) in out.chunks_exact_mut(ell_skip).zip(eq_rest.iter()) {
-        for (dst, &ls) in row.iter_mut().zip(lambda_skip.iter()) {
-            *dst = ls * er;
-        }
+    out[..ell_skip].copy_from_slice(&lambda_skip);
+    for (j, &r_j) in x_inner_rest.iter().enumerate() {
+        let len = ell_skip << j;
+        let (lo, rest) = out.split_at_mut(len);
+        crate::field::f128_slice::expand_eq_table_level(lo, &mut rest[..len], r_j);
     }
     debug_assert_eq!(out.len(), total);
     out
@@ -1634,7 +1634,7 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        None,
         challenger,
     );
     (proof, claim)
@@ -1667,7 +1667,7 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        Some(0),
         challenger,
     );
     (
@@ -1675,6 +1675,29 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         claim,
         captured.expect("capture=true must produce z_vec"),
     )
+}
+
+/// Capture the lincheck vector after exactly `capture_after_top_folds` top-bit
+/// bindings. Downstream PCS can reuse this intermediate instead of re-folding
+/// a full-size pre-sumcheck copy. Zero preserves the legacy capture behavior.
+/// Panics if the requested count exceeds `k_log - k_skip`.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_z_vec_after_top_folds<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture_after_top_folds: usize,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, Vec<F128>) {
+    let (proof, claim, captured) = prove_padded_inner(
+        z_packed, m, k_log, k_skip, useful_bits, circuit, x_ab,
+        Some(capture_after_top_folds), challenger,
+    );
+    (proof, claim, captured.expect("requested z_vec capture must be produced"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1686,7 +1709,7 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture_after_top_folds: Option<usize>,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     let k = 1usize << k_log;
@@ -1695,6 +1718,9 @@ fn prove_padded_inner<Ch: Challenger>(
     assert!(k_skip <= k_log, "k_skip must be ≤ k_log");
     assert!(useful_bits <= k, "useful_bits ({useful_bits}) > k ({k})");
     let inner_rest_len = k_log - k_skip;
+    if let Some(folds) = capture_after_top_folds {
+        assert!(folds <= inner_rest_len, "capture fold count exceeds lincheck rounds");
+    }
     assert_eq!(circuit.n_cols(), k);
     assert_eq!(x_ab.x_inner_rest.len(), inner_rest_len);
     assert_eq!(x_ab.x_outer.len(), n_log);
@@ -1787,7 +1813,7 @@ fn prove_padded_inner<Ch: Challenger>(
         };
     let mut z_bind_dst: Option<Vec<F128>> = None;
     let mut captured_z_vec: Option<Vec<F128>> =
-        if capture_z_vec && eq_inner.len() == z_vec.len() {
+        if capture_after_top_folds == Some(0) && eq_inner.len() == z_vec.len() {
             if inner_rest_len >= 2 && lc_sumcheck_par_min(k) == usize::MAX {
                 z_bind_dst = Some(eq_inner);
                 None
@@ -1798,7 +1824,7 @@ fn prove_padded_inner<Ch: Challenger>(
             }
         } else {
             crate::scratch::give_lincheck_eq(eq_inner);
-            if capture_z_vec {
+            if capture_after_top_folds == Some(0) {
                 Some(z_vec.clone())
             } else {
                 None
@@ -1848,6 +1874,10 @@ fn prove_padded_inner<Ch: Challenger>(
             } else {
                 // Final round: just fold z_vec to z_partial (comb_vec is dead).
                 sumcheck_bind_top_in_place_par(&mut z_vec, r, par_min);
+            }
+            if capture_after_top_folds == Some(t + 1) {
+                debug_assert!(captured_z_vec.is_none());
+                captured_z_vec = Some(z_vec.clone());
             }
         }
     }
@@ -2635,6 +2665,63 @@ mod tests {
             point.extend_from_slice(&x_outer);
             let z_eval = mle_eval_bool(&z, &point);
             assert_eq!(z_partial[i_inner], z_eval, "i_inner={i_inner}");
+        }
+    }
+
+    #[test]
+    fn nm_folded_capture_matches_scalar_and_pcs() {
+        for &(m, k_log, k_skip) in &[(10usize, 4, 0), (10, 4, 4), (12, 8, 6), (17, 14, 6)] {
+            let k = 1usize << k_log;
+            let mut rng = Rng::new(51_044 + k_log as u64);
+            let a = random_sparse_matrix(k, k * 2, &mut rng);
+            let b = random_sparse_matrix(k, k * 2, &mut rng);
+            let circuit = SparseMatrixCircuit::new(&a, &b);
+            let z = rng.bits(1 << m);
+            let packed = pack_z_lincheck(&z, m, k_log);
+            let point = random_quirky_point(m, k_log, k_skip, &mut rng);
+            let mut legacy_ch = FsChallenger::new(b"nm-folded-capture");
+            let (legacy_proof, legacy_claim, original) = prove_padded_capture_z_vec(
+                &packed, m, k_log, k_skip, k, &circuit, &point, &mut legacy_ch,
+            );
+            let next = legacy_ch.sample_f128();
+            let eq = build_eq_table(&point.x_outer);
+            assert_eq!(original, partial_fold_packed_z(&packed, m, k_log, &eq));
+            let mut expected = original.clone();
+            for folds in 0..=k_log - k_skip {
+                let mut ch = FsChallenger::new(b"nm-folded-capture");
+                let (proof, claim, captured) = prove_padded_capture_z_vec_after_top_folds(
+                    &packed, m, k_log, k_skip, k, &circuit, &point, folds, &mut ch,
+                );
+                assert_eq!(captured, expected, "k_log={k_log}, folds={folds}");
+                assert_eq!(proof.rounds, legacy_proof.rounds);
+                assert_eq!(proof.z_partial, legacy_proof.z_partial);
+                assert_eq!(claim, legacy_claim);
+                assert_eq!(ch.sample_f128(), next);
+                if k_skip + 1 == crate::pcs::LOG_PACKING && folds < k_log - k_skip {
+                    let tail = &claim.r_inner_rest[1..];
+                    let retained = k_log - k_skip - 1 - folds;
+                    let pcs = match retained {
+                        0 => Some(crate::pcs::ring_switch::s_hat_v_from_z_vec(&original, tail)),
+                        2 => Some(crate::pcs::ring_switch::s_hat_v_quad_from_z_vec(&original, tail)),
+                        4 => Some(crate::pcs::ring_switch::s_hat_v_fold4_from_z_vec(&original, tail)),
+                        6 => Some(crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&original, tail)),
+                        _ => None,
+                    };
+                    if let Some(pcs) = pcs {
+                        assert_eq!(captured, pcs, "retained={retained}");
+                    }
+                }
+                if folds < k_log - k_skip {
+                    let r = legacy_claim.r_inner_rest[k_log - k_skip - 1 - folds];
+                    let half = expected.len() / 2;
+                    for i in 0..half {
+                        let lo = expected[i];
+                        let hi = expected[half + i];
+                        expected[i] = lo + r * (lo + hi);
+                    }
+                    expected.truncate(half);
+                }
+            }
         }
     }
 
