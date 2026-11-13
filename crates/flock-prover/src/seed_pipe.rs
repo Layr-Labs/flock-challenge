@@ -286,7 +286,7 @@ pub(crate) fn gen_block_ilp(init: u64, block: usize) -> Compression {
 /// ranked NEON witness builder consumes. Every field is initialized normally;
 /// this small value carries generated inputs rather than the lazy backing
 /// vector's valid sentinel values.
-#[repr(align(16))]
+#[repr(C, align(16))]
 pub(crate) struct CompressionQuadSoa {
     pub(crate) cv: [[u32; 4]; 8],
     pub(crate) message: [[u32; 4]; 16],
@@ -337,6 +337,95 @@ pub(crate) fn gen_quad_soa(init: u64, first_block: usize) -> CompressionQuadSoa 
         counter_hi: [0; 4],
         block_len: [64; 4],
         flags: [11; 4],
+    }
+}
+
+/// [`gen_quad_soa`] in 6.5 instructions per draw (lane wg): the four lane
+/// states stay in registers and step by a register-held `GOLDEN` (the
+/// compiled form re-materializes a 4-instruction `k·GOLDEN` constant per
+/// row), the final `z ^ (z >> 31)` is one shifted-operand `eor` (the
+/// compiled form narrows it to `lsr` + 32-bit `eor`), and each row's four
+/// words are stored straight into the result with two `stp`. Same values:
+/// identical ring arithmetic, pinned by `gen_quad_soa_asm_matches_plain`.
+/// `FLOCK_NO_WITGEN_GEN_ASM=1` selects [`gen_quad_soa`] at the callers.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn gen_quad_soa_asm(init: u64, first_block: usize) -> CompressionQuadSoa {
+    const {
+        assert!(std::mem::offset_of!(CompressionQuadSoa, cv) == 0);
+        assert!(std::mem::offset_of!(CompressionQuadSoa, message) == 128);
+        assert!(std::mem::offset_of!(CompressionQuadSoa, counter_lo) == 384);
+    }
+    let first_state =
+        init.wrapping_add(((DRAWS_PER_BLOCK * first_block) as u64).wrapping_mul(GOLDEN));
+    let block_stride = (DRAWS_PER_BLOCK as u64).wrapping_mul(GOLDEN);
+    let mut s0 = first_state;
+    let mut s1 = first_state.wrapping_add(block_stride);
+    let mut s2 = first_state.wrapping_add(block_stride.wrapping_mul(2));
+    let mut s3 = first_state.wrapping_add(block_stride.wrapping_mul(3));
+    let mut out = std::mem::MaybeUninit::<CompressionQuadSoa>::uninit();
+    // Rows 0..25 are contiguous 16-byte rows (cv, message, counter_lo);
+    // `base` = row 16 so every row offset fits the `stp w` imm7×4 range.
+    let base = unsafe { out.as_mut_ptr().cast::<u8>().add(256) };
+    macro_rules! row {
+        ($r:literal) => {
+            unsafe {
+                core::arch::asm!(
+                    "add {s0}, {s0}, {g}",
+                    "add {s1}, {s1}, {g}",
+                    "add {s2}, {s2}, {g}",
+                    "add {s3}, {s3}, {g}",
+                    "eor {t0}, {s0}, {s0}, lsr #30",
+                    "eor {t1}, {s1}, {s1}, lsr #30",
+                    "eor {t2}, {s2}, {s2}, lsr #30",
+                    "eor {t3}, {s3}, {s3}, lsr #30",
+                    "mul {t0}, {t0}, {m1}",
+                    "mul {t1}, {t1}, {m1}",
+                    "mul {t2}, {t2}, {m1}",
+                    "mul {t3}, {t3}, {m1}",
+                    "eor {t0}, {t0}, {t0}, lsr #27",
+                    "eor {t1}, {t1}, {t1}, lsr #27",
+                    "eor {t2}, {t2}, {t2}, lsr #27",
+                    "eor {t3}, {t3}, {t3}, lsr #27",
+                    "mul {t0}, {t0}, {m2}",
+                    "mul {t1}, {t1}, {m2}",
+                    "mul {t2}, {t2}, {m2}",
+                    "mul {t3}, {t3}, {m2}",
+                    "eor {t0}, {t0}, {t0}, lsr #31",
+                    "eor {t1}, {t1}, {t1}, lsr #31",
+                    "eor {t2}, {t2}, {t2}, lsr #31",
+                    "eor {t3}, {t3}, {t3}, lsr #31",
+                    "stp {t0:w}, {t1:w}, [{p}, #{o0}]",
+                    "stp {t2:w}, {t3:w}, [{p}, #{o1}]",
+                    s0 = inout(reg) s0,
+                    s1 = inout(reg) s1,
+                    s2 = inout(reg) s2,
+                    s3 = inout(reg) s3,
+                    g = in(reg) GOLDEN,
+                    m1 = in(reg) 0xBF58_476D_1CE4_E5B9u64,
+                    m2 = in(reg) 0x94D0_49BB_1331_11EBu64,
+                    p = in(reg) base,
+                    o0 = const 16 * $r - 256,
+                    o1 = const 16 * $r - 248,
+                    t0 = out(reg) _,
+                    t1 = out(reg) _,
+                    t2 = out(reg) _,
+                    t3 = out(reg) _,
+                    options(nostack, preserves_flags)
+                );
+            }
+        };
+    }
+    row!(0); row!(1); row!(2); row!(3); row!(4); row!(5); row!(6); row!(7); row!(8);
+    row!(9); row!(10); row!(11); row!(12); row!(13); row!(14); row!(15); row!(16);
+    row!(17); row!(18); row!(19); row!(20); row!(21); row!(22); row!(23); row!(24);
+    let _ = (s0, s1, s2, s3);
+    unsafe {
+        let p = out.as_mut_ptr();
+        (*p).counter_hi = [0; 4];
+        (*p).block_len = [64; 4];
+        (*p).flags = [11; 4];
+        out.assume_init()
     }
 }
 
@@ -1669,6 +1758,35 @@ mod tests {
                     gen_block_ilp(init, i),
                     "scalar/ilp divergence lg={lg} sd={sd:#x} block {i}"
                 );
+            }
+        }
+    }
+
+    /// Lane wg: the asm word-major generator equals [`gen_quad_soa`]
+    /// field for field over many (init, first) pairs, incl. wrap-around
+    /// states.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn gen_quad_soa_asm_matches_plain() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut inits = vec![0u64, u64::MAX, 1 << 63, generator_init(18, 1)];
+        inits.extend((0..60).map(|_| next()));
+        for (i, &init) in inits.iter().enumerate() {
+            for first in [0usize, 4, 4092, 1 << 17, (1 << 18) - 4, 4 * (next() as usize % 65_536)] {
+                let a = gen_quad_soa(init, first);
+                let b = gen_quad_soa_asm(init, first);
+                assert_eq!(a.cv, b.cv, "cv init#{i} first={first}");
+                assert_eq!(a.message, b.message, "message init#{i} first={first}");
+                assert_eq!(a.counter_lo, b.counter_lo);
+                assert_eq!(a.counter_hi, b.counter_hi);
+                assert_eq!(a.block_len, b.block_len);
+                assert_eq!(a.flags, b.flags);
             }
         }
     }
