@@ -53,6 +53,29 @@ pub mod zerocheck;
 /// purely for screening/rollback — mirrors `FLOCK_NO_AB_COMPACT_STORE`.
 pub const ENV_NO_MICRO_STACK: &str = "FLOCK_NO_MICRO_STACK";
 
+/// Publish-path warm-up hook (port of the x86 track's rename warm-up, e-man07
+/// fd1b67de item 20). The ranked worker's publisher installs it during the
+/// untimed gap; the PCS open fires it once, two recursive levels before the
+/// end, on an idle helper thread ([`spawn_publish_warm_hook`]), so the
+/// publication rename does not find every kernel cache for the proof
+/// directory cold. It must be cheap, never block the caller, and never touch
+/// proof state: it only stats the proof directory and renames a private dummy
+/// file next to the proof path back and forth.
+pub static PUBLISH_WARM_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Fire [`PUBLISH_WARM_HOOK`] (if installed) without waiting for it: on the
+/// efficiency-core helper pool when present, else on the main Rayon pool.
+/// The caller continues immediately; nothing in the proof depends on whether
+/// or when the hook runs.
+pub(crate) fn spawn_publish_warm_hook() {
+    if let Some(&hook) = PUBLISH_WARM_HOOK.get() {
+        match crate::epool::helper_pool() {
+            Some(pool) => pool.spawn(hook),
+            None => rayon::spawn(hook),
+        }
+    }
+}
+
 /// Unlike `ab_compact_store_enabled` this does **not** latch the first read
 /// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
 /// per-call `var_os` read is noise, and re-reading keeps same-process A/B
