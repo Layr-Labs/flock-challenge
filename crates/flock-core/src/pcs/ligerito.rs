@@ -5057,134 +5057,6 @@ pub(super) fn c2_retained_transpose_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_C2_RETAINED_TRANSPOSE").is_none())
 }
 
-/// Lean sparse-window stage of the C2 retained transpose (default on).
-/// `FLOCK_NO_C2_LEAN_WINDOWS` (any value) restores the incumbent zero-filled
-/// arena, read-modify-write singleton expansion and separate densify pass.
-/// Read once per process.
-fn c2_lean_windows_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_LEAN_WINDOWS").is_none())
-}
-
-/// Process-persistent storage for the C2 window arena. Its contents are
-/// stale between uses: [`transform_active_windows_lean`] writes every element
-/// of every window before anything reads it.
-static C2_WINDOW_ARENA: std::sync::Mutex<Option<Vec<F128>>> = std::sync::Mutex::new(None);
-
-/// An arena of `len` elements with unspecified contents, reusing the parked
-/// buffer when it is large enough.
-fn take_c2_window_arena(len: usize) -> Vec<F128> {
-    if let Ok(mut guard) = C2_WINDOW_ARENA.lock()
-        && let Some(mut arena) = guard.take()
-    {
-        if arena.capacity() >= len {
-            // SAFETY: capacity checked; F128 is Copy (no Drop) and every
-            // element is written before it is read (see the caller).
-            unsafe { arena.set_len(len) };
-            return arena;
-        }
-        *guard = Some(arena);
-    }
-    crate::alloc_uninit_f128_vec(len)
-}
-
-/// Park `arena` for the next C2 transpose, keeping the larger buffer.
-fn give_c2_window_arena(mut arena: Vec<F128>) {
-    arena.clear();
-    if let Ok(mut guard) = C2_WINDOW_ARENA.lock()
-        && guard
-            .as_ref()
-            .is_none_or(|parked| arena.capacity() > parked.capacity())
-    {
-        *guard = Some(arena);
-    }
-}
-
-/// [`expand_singleton_window`] without the zero-filled window: at layer `s`
-/// the seed's `2^(s+1)` block holds the previous layer's values in the half
-/// that contains the seed and (logically) zeros in the other half, so each
-/// butterfly has one zero input. With a zero bottom, `top + 0 = top` and
-/// `twiddle * top + 0 = twiddle * top`; with a zero top, `0 + bottom = bottom`
-/// and the bottom output is `twiddle * bottom + bottom`. Writing exactly
-/// those values produces the incumbent window bit for bit, reads only
-/// elements written earlier in this call, and writes every element of the
-/// window by the last layer (whose block is the whole window).
-fn expand_singleton_window_lean(
-    ntt: &AdditiveNttF128,
-    window: &mut [F128],
-    window_index: usize,
-    prefix_k: usize,
-    log_d: usize,
-    local_pos: usize,
-    value: F128,
-) {
-    window[local_pos] = value;
-    for s in 0..prefix_k {
-        let layer = log_d - 1 - s;
-        let half = 1usize << s;
-        let block_size = half << 1;
-        let block = local_pos / block_size;
-        let twiddle = ntt.twiddle(layer, (window_index << (prefix_k - s - 1)) + block);
-        let base = block * block_size;
-        let (top, bottom) = window[base..base + block_size].split_at_mut(half);
-        if local_pos & half == 0 {
-            for (t, b) in top.iter().zip(bottom.iter_mut()) {
-                *b = twiddle * *t;
-            }
-        } else {
-            for (t, b) in top.iter_mut().zip(bottom.iter_mut()) {
-                let v = *b;
-                *t = v;
-                *b = twiddle * v + v;
-            }
-        }
-    }
-}
-
-/// [`scatter_active_windows`] + [`transform_active_windows`] on an arena with
-/// unspecified contents: a multi-input window is zeroed and scattered (same
-/// inputs, same order) inside its own parallel job before the dense window
-/// transform, and a singleton window is written by
-/// [`expand_singleton_window_lean`]. Every window ends bit-identical to the
-/// incumbent pair of passes, which zero-filled the whole arena first.
-fn transform_active_windows_lean(
-    ntt: &AdditiveNttF128,
-    arena: &mut [F128],
-    groups: &[ActiveWindow],
-    positions: &[usize],
-    values: &[F128],
-    prefix_k: usize,
-    log_d: usize,
-) {
-    use rayon::prelude::*;
-    let window_len = 1usize << prefix_k;
-    let window_mask = window_len - 1;
-    debug_assert_eq!(arena.len(), groups.len() * window_len);
-    arena
-        .par_chunks_mut(window_len)
-        .zip(groups.par_iter())
-        .for_each(|(window, group)| {
-            if group.input_end - group.input_start == 1 {
-                let input = group.input_start;
-                expand_singleton_window_lean(
-                    ntt,
-                    window,
-                    group.window_index,
-                    prefix_k,
-                    log_d,
-                    positions[input] & window_mask,
-                    values[input],
-                );
-            } else {
-                window.fill(F128::ZERO);
-                for input_index in group.input_start..group.input_end {
-                    window[positions[input_index] & window_mask] += values[input_index];
-                }
-                transform_active_window(ntt, window, group.window_index, prefix_k, log_d);
-            }
-        });
-}
-
 ///
 ///
 ///
@@ -5194,34 +5066,6 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
     values: &[F128],
     log_d: usize,
     drop_log: usize,
-) -> Option<Vec<F128>> {
-    transpose_forward_ntt_sparse_retained_with(
-        ntt,
-        positions,
-        values,
-        log_d,
-        drop_log,
-        c2_lean_windows_enabled(),
-    )
-}
-
-/// [`transpose_forward_ntt_sparse_retained`] with the lean window stage
-/// chosen by the caller. Lean mode builds the windows in a reused arena (see
-/// [`transform_active_windows_lean`]) and, when the dense suffix runs at
-/// least one three-layer group, gathers the arena straight through that
-/// first group. Both suffix schedules below open with the group at layer
-/// `log_d - k - 3`, whose eight inputs per row are exactly eight adjacent
-/// `2^k` windows, so [`densify_active_windows_fused_first_3layer`] (zero for
-/// an inactive window, same butterflies and twiddles) equals the densify pass
-/// followed by that group bit for bit; the suffix then resumes three layers
-/// lower with the identical remaining schedule.
-fn transpose_forward_ntt_sparse_retained_with(
-    ntt: &AdditiveNttF128,
-    positions: &[usize],
-    values: &[F128],
-    log_d: usize,
-    drop_log: usize,
-    lean: bool,
 ) -> Option<Vec<F128>> {
     if drop_log == 0
         || drop_log >= log_d
@@ -5235,31 +5079,11 @@ fn transpose_forward_ntt_sparse_retained_with(
     if log_d - k < drop_log {
         return None;
     }
-    let mut remaining = log_d - k;
-    let low_half_final = drop_log == 1 && remaining >= 3 && remaining.is_multiple_of(3);
-    let fuse_first = lean
-        && k > 0
-        && if low_half_final {
-            remaining > 3
-        } else {
-            remaining >= drop_log + 3
-        };
     let mut data: Vec<F128> = if k == 0 {
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
             data[p] += v;
         }
-        data
-    } else if lean {
-        let groups = group_sorted_positions(positions, k);
-        let mut arena = take_c2_window_arena(groups.len() << k);
-        transform_active_windows_lean(ntt, &mut arena, &groups, positions, values, k, log_d);
-        let data = if fuse_first {
-            densify_active_windows_fused_first_3layer(ntt, &arena, &groups, log_d, k)
-        } else {
-            densify_active_windows(&arena, &groups, log_d, k)
-        };
-        give_c2_window_arena(arena);
         data
     } else {
         let groups = group_sorted_positions(positions, k);
@@ -5267,10 +5091,8 @@ fn transpose_forward_ntt_sparse_retained_with(
         transform_active_windows(ntt, &mut arena, &groups, positions, values, k, log_d);
         densify_active_windows(&arena, &groups, log_d, k)
     };
-    if fuse_first {
-        remaining -= 3;
-    }
-    if low_half_final {
+    let mut remaining = log_d - k;
+    if drop_log == 1 && remaining >= 3 && remaining.is_multiple_of(3) {
         while remaining > 3 {
             remaining -= 3;
             transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, remaining);
@@ -8992,96 +8814,12 @@ fn query_set_presized_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_QUERY_SET_PRESIZE").is_none())
 }
 
-/// Kill switch for the probe set of query sampling: `FLOCK_NO_QUERY_PROBE_SET`
-/// (any value) restores the SipHash `HashSet`. Read once per process.
-fn query_probe_set_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_QUERY_PROBE_SET").is_none())
-}
-
-/// Fixed 1024-slot open-addressing membership set for query dedupe (port of
-/// the x86 track's `Gl2QSet`, e-man07 fd1b67de item 6). Thread-local and
-/// reused: one 4 KiB array, cleared after each use, no SipHash and no
-/// allocation. Only answers membership, so the kept positions and their
-/// first-occurrence order are exactly the `HashSet` path's.
-struct QueryProbeSet {
-    slots: [u32; 1024],
-}
-
-impl QueryProbeSet {
-    const EMPTY: u32 = u32::MAX;
-
-    /// Insert `q`; true when it was not present. Needs `q < u32::MAX` and at
-    /// most 256 members (load factor <= 1/4).
-    #[inline]
-    fn insert(&mut self, q: usize) -> bool {
-        let key = q as u32;
-        let mut i = (key.wrapping_mul(0x9E37_79B1) >> 22) as usize;
-        loop {
-            let s = self.slots[i];
-            if s == key {
-                return false;
-            }
-            if s == Self::EMPTY {
-                self.slots[i] = key;
-                return true;
-            }
-            i = (i + 1) & 1023;
-        }
-    }
-
-    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        thread_local! {
-            static SET: std::cell::RefCell<Box<QueryProbeSet>> =
-                std::cell::RefCell::new(Box::new(QueryProbeSet { slots: [QueryProbeSet::EMPTY; 1024] }));
-        }
-        SET.with(|c| {
-            let mut set = c.borrow_mut();
-            let r = f(&mut set);
-            set.slots.fill(Self::EMPTY);
-            r
-        })
-    }
-}
-
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
     count: usize,
 ) -> Vec<usize> {
-    if query_probe_set_enabled() {
-        return sample_distinct_queries_probe(challenger, block_len, count);
-    }
     sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled())
-}
-
-/// [`sample_distinct_queries_with`] with the probe set for the ranked shapes
-/// (`count <= 256`, `block_len < 2^32`); other shapes take the `HashSet`.
-/// Same draws, same first-occurrence dedupe, same sort.
-fn sample_distinct_queries_probe<Ch: Challenger>(
-    challenger: &mut Ch,
-    block_len: usize,
-    count: usize,
-) -> Vec<usize> {
-    if count > 256 || block_len >= u32::MAX as usize {
-        return sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled());
-    }
-    assert!(
-        count <= block_len,
-        "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
-    );
-    let mut out = Vec::with_capacity(count);
-    QueryProbeSet::with(|seen| {
-        while out.len() < count {
-            let v = challenger.sample_f128();
-            let q = (v.lo as usize) % block_len;
-            if seen.insert(q) {
-                out.push(q);
-            }
-        }
-    });
-    out.sort_unstable();
-    out
 }
 
 fn sample_distinct_queries_with<Ch: Challenger>(
@@ -16014,30 +15752,6 @@ mod tests {
     }
 
     #[test]
-    fn probe_query_set_samples_the_same_queries() {
-        use crate::challenger::Challenger;
-        // Ranked shapes plus dense small domains (many duplicate draws), the
-        // 256 boundary and the HashSet fallback above it; each set is used
-        // twice in a row on the same thread to check the clear-after-use.
-        for &(log_len, count) in &[
-            (20usize, 218usize), (17, 106), (15, 71), (12, 53), (8, 43), (6, 36), (4, 16),
-            (8, 256), (8, 255), (9, 256), (10, 257), (2, 4), (0, 1), (12, 0),
-        ] {
-            for rep in 0..2u64 {
-                let seed = 0x9B0E_0000 ^ (log_len * 1000 + count) as u64 ^ (rep << 40);
-                let mut c0 = crate::challenger::RandomChallenger::new(seed);
-                let mut c1 = crate::challenger::RandomChallenger::new(seed);
-                let block_len = 1usize << log_len;
-                let reference = sample_distinct_queries_with(&mut c0, block_len, count, true);
-                let probe = sample_distinct_queries_probe(&mut c1, block_len, count);
-                assert_eq!(probe, reference, "log_len={log_len} count={count} rep={rep}");
-                // Both consumed the same number of challenger draws.
-                assert_eq!(c0.sample_f128(), c1.sample_f128());
-            }
-        }
-    }
-
-    #[test]
     fn c2_retained_transpose_matches_full_then_truncate() {
         use crate::challenger::Challenger;
         for &(log_d, drop_log, nq) in &[
@@ -16074,100 +15788,6 @@ mod tests {
                 transpose_forward_ntt_sparse_retained(&ntt, &positions, &values, log_d, drop_log)
                     .expect("supported retained geometry");
             assert_eq!(actual, expected, "log_d={log_d} drop={drop_log} nq={nq}");
-        }
-    }
-
-    #[test]
-    fn c2_lean_windows_retained_transpose_matches_kill_and_full() {
-        use crate::challenger::Challenger;
-        // Ranked C2 shapes (L0 17/1/218, deep 15/2/106 and 13/3/71), both
-        // suffix schedules with and without a fusable first group, one- and
-        // multi-group suffixes, clustered positions (multi-input windows)
-        // and sparse ones (singleton windows, inactive eight-window blocks).
-        // The lean arm runs on a poisoned parked arena, so any element read
-        // before it is written would change the result.
-        for &(log_d, drop_log, nq, clustered) in &[
-            (17usize, 1usize, 218usize, false),
-            (15, 2, 106, false),
-            (13, 3, 71, false),
-            (12, 1, 40, false),
-            (14, 4, 64, false),
-            (14, 1, 30, false),
-            (15, 1, 5, false),
-            (16, 2, 300, true),
-            (18, 1, 218, false),
-            (17, 2, 3, false),
-            (20, 2, 218, true),
-            (11, 4, 53, false),
-        ] {
-            let mut ch = crate::challenger::RandomChallenger::new(
-                0xC2_F05E_D000u64 ^ ((log_d * 977 + drop_log * 31 + nq) as u64),
-            );
-            let full_log = log_d + 3;
-            let ntt = AdditiveNttF128::standard(full_log);
-            let mut queries: Vec<usize> = Vec::new();
-            while queries.len() < nq {
-                let raw = ch.sample_f128().lo as usize;
-                let q = if clustered {
-                    // Pack draws into a few low windows so groups hold
-                    // several inputs and most windows stay inactive.
-                    (raw % (1usize << 13)) << 1
-                } else {
-                    raw % (1usize << full_log)
-                };
-                if !queries.contains(&q) {
-                    queries.push(q);
-                }
-            }
-            queries.sort_unstable();
-            let positions: Vec<usize> = queries.iter().map(|&q| q >> 3).collect();
-            let values: Vec<F128> = (0..nq).map(|_| ch.sample_f128()).collect();
-
-            let (mut expected, _) = transpose_forward_ntt_sparse_impl(
-                &ntt, &positions, &values, log_d, false, None, false,
-            );
-            expected.truncate(1usize << (log_d - drop_log));
-            let kill = transpose_forward_ntt_sparse_retained_with(
-                &ntt, &positions, &values, log_d, drop_log, false,
-            )
-            .expect("supported retained geometry");
-            assert_eq!(kill, expected, "kill log_d={log_d} drop={drop_log} nq={nq}");
-            for rep in 0..2u64 {
-                let poison = F128::new(0xA5A5_5A5A_DEAD_BEEF ^ rep, !rep);
-                *C2_WINDOW_ARENA.lock().unwrap() = Some(vec![poison; (nq + 1) << 8]);
-                let lean = transpose_forward_ntt_sparse_retained_with(
-                    &ntt, &positions, &values, log_d, drop_log, true,
-                )
-                .expect("supported retained geometry");
-                assert_eq!(lean, expected, "lean log_d={log_d} drop={drop_log} nq={nq} rep={rep}");
-            }
-        }
-    }
-
-    #[test]
-    fn c2_lean_singleton_expansion_matches_zeroed_expansion() {
-        use crate::challenger::Challenger;
-        let mut ch = crate::challenger::RandomChallenger::new(0xC2_51_6E_7E);
-        for &(log_d, prefix_k) in &[(17usize, 8usize), (15, 8), (13, 8), (12, 3), (9, 1)] {
-            let ntt = AdditiveNttF128::standard(log_d + 3);
-            let window_len = 1usize << prefix_k;
-            for window_index in [0usize, 1, (1usize << (log_d - prefix_k)) - 1] {
-                for local_pos in [0usize, 1, window_len / 2, window_len - 1] {
-                    let value = ch.sample_f128();
-                    let mut expected = vec![F128::ZERO; window_len];
-                    expand_singleton_window(
-                        &ntt, &mut expected, window_index, prefix_k, log_d, local_pos, value,
-                    );
-                    let mut lean = vec![F128::new(u64::MAX, 0x5A5A); window_len];
-                    expand_singleton_window_lean(
-                        &ntt, &mut lean, window_index, prefix_k, log_d, local_pos, value,
-                    );
-                    assert_eq!(
-                        lean, expected,
-                        "log_d={log_d} k={prefix_k} window={window_index} pos={local_pos}"
-                    );
-                }
-            }
         }
     }
 

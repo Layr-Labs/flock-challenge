@@ -1838,7 +1838,7 @@ fn ab_window_rows_plan() -> AbWindowRows {
     use kernels::aarch64::bstatic_horner_window_rows_impl as rows;
     // The default instances: the main-pool Karatsuba rows and the helper
     // rows. Every kill switch takes the plain instance (the same bytes).
-    const MAIN: u32 = k::AB_Z_VARIANT
+    const MAIN: u16 = k::AB_Z_VARIANT
         | k::ABV_INLINE_WINDOW
         | k::ABV_KARA_XOR16
         | k::ABV_BSTATIC_Z
@@ -1914,13 +1914,13 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
     use kernels::aarch64::{
         self as k, bstatic_horner_window_rows_impl as per_chunk, bstatic_horner_window_unit_impl as unit,
     };
-    const MAIN: u32 = k::AB_Z_VARIANT
+    const MAIN: u16 = k::AB_Z_VARIANT
         | k::ABV_INLINE_WINDOW
         | k::ABV_KARA_XOR16
         | k::ABV_BSTATIC_Z
         | k::ABV_KARA_SLOT
         | k::ABV_HORNER2;
-    const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
+    const HELPER: u16 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
     if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
         Some(unit::<MAIN, true>)
     } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, false> as AbWindowRows) {
@@ -5859,7 +5859,7 @@ mod tests {
         const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
         let _serial = AB_KARA_FORCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        const V0: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
+        const V0: u16 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
         let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 }, true>;
         let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>;
         assert!(!core::ptr::fn_addr_eq(main, plain));
@@ -6613,9 +6613,9 @@ mod tests {
         const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
         let _serial = AB_KARA_FORCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        const V0: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
-        const MAIN: u32 = V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2;
-        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
+        const V0: u16 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
+        const MAIN: u16 = V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2;
+        const HELPER: u16 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
         let maps = |r: AbWindowRows, u: AbWindowUnit| {
             ab_window_unit_plan(r).is_some_and(|got| core::ptr::fn_addr_eq(got, u))
         };
@@ -8028,9 +8028,7 @@ mod tests {
             bstatic_horner_window_rows_impl as imp, AB_Z_VARIANT, ABV_BSTATIC_Z, ABV_INLINE_WINDOW,
             ABV_KARA_SCALED_UNSCALED, ABV_KARA_SLOT, ABV_KARA_XOR16, ABV_Z_MT,
         };
-        const V0: u32 = AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 | ABV_BSTATIC_Z;
-        // The production main-pool unit instance: `AB_UNIT_MAIN | ABV_Z_OUT3`.
-        const PROD: u32 = V0 | ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 | kernels::aarch64::ABV_Z_OUT3;
+        const V0: u16 = AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 | ABV_BSTATIC_Z;
         let table = make_inv_table();
         let mut rng = Rng::new(0xB57A_71C0_7131_0005);
         let context =
@@ -8071,9 +8069,6 @@ mod tests {
             ("+ KARA_SLOT + Z_MT + HORNER2", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT | kernels::aarch64::ABV_HORNER2 }, true>),
             ("E-core HZ", imp::<{ kernels::aarch64::AB_HZ_VARIANT }, false>),
             ("E-core HZ + HORNER2", imp::<{ kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2 }, false>),
-            ("prod (OUT3)", imp::<{ PROD }, true>),
-            ("prod + FUSE", imp::<{ PROD | kernels::aarch64::ABV_FUSE }, true>),
-            ("E HZ+H2 + FUSE", imp::<{ kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2 | kernels::aarch64::ABV_FUSE }, false>),
         ];
         let pick: Vec<usize> = std::env::var("FLOCK_PROBE_FORMS")
             .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())

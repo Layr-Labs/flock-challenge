@@ -2135,7 +2135,7 @@ unsafe fn horner_absorb_first(
 /// four plus four; every lane stays congruent mod p to the incumbent's, so
 /// `gf8_reduce_vec16` writes the same bytes.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_HORNER2: u32 = 2048;
+pub(crate) const ABV_HORNER2: u16 = 2048;
 
 /// Kill switch for [`ABV_HORNER2`]: any value of `FLOCK_NO_ZC_AB_HORNER2`
 /// keeps the per-step carry fold. Read once per process. Same bytes.
@@ -2159,7 +2159,7 @@ pub(crate) const HORNER2_FOLD: [u8; 16] = {
 /// `x^2·T + x·P1`, which [`horner_absorb_k0`] completes).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn horner_absorb_k1<const V: u32>(
+unsafe fn horner_absorb_k1<const V: u16>(
     acc: &mut [core::arch::aarch64::uint16x8_t; 8],
     lo: &[core::arch::aarch64::uint16x8_t; 8],
     hi: &[core::arch::aarch64::uint16x8_t; 8],
@@ -2186,7 +2186,7 @@ unsafe fn horner_absorb_k1<const V: u32>(
 /// [`horner_absorb`] or, under [`ABV_HORNER2`], `acc ^= lo ^ hi`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn horner_absorb_k0<const V: u32>(
+unsafe fn horner_absorb_k0<const V: u16>(
     acc: &mut [core::arch::aarch64::uint16x8_t; 8],
     lo: &[core::arch::aarch64::uint16x8_t; 8],
     hi: &[core::arch::aarch64::uint16x8_t; 8],
@@ -2205,145 +2205,6 @@ unsafe fn horner_absorb_k0<const V: u32>(
                 vreinterpretq_u8_u16(hi[i]),
             ));
         }
-    }
-}
-
-/// Row-body variant bit (with [`ABV_HORNER2`]): the static-B Horner rows
-/// accumulate every 8-bit product as an adjacent `pmull`/`eor` pair into the
-/// running sum (see [`fused_pmull8_acc`]), which Apple P-cores issue as one
-/// SIMD µop, instead of forming each product in its own register and
-/// combining them with `eor`/`eor3`. The seed is `P3 ^ P7'`, the first
-/// absorb `(acc << 1) ^ P2 ^ P6'`, the K1 step folds `P1 ^ P5'` (summed the
-/// same way) as before and the K0 step adds `P0 ^ P4'`: the same XOR of the
-/// same products in every lane, so `gf8_reduce_vec16` writes the same bytes.
-#[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_FUSE: u32 = 1 << 16;
-
-
-/// Kill switch for [`ABV_FUSE`] in the main-pool (P-core) window rows: any
-/// value of `FLOCK_NO_ZC_AB_FUSE` keeps the separate products. Read once per
-/// process. The rows written are byte-identical.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_fuse_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_FUSE").is_none())
-}
-
-/// Kill switch for [`ABV_FUSE`] in the helper-thread (half-pair z) window
-/// rows: any value of `FLOCK_NO_ZC_AB_FUSE_E` keeps the separate products
-/// there. Read once per process. The rows written are byte-identical.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_fuse_e_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_FUSE_E").is_none())
-}
-
-/// The operands of one K row in the h4 layout: the four A image registers
-/// and the four B image registers.
-#[cfg(target_arch = "aarch64")]
-type AbKOperands = ([core::arch::aarch64::uint8x16_t; 4], [core::arch::aarch64::uint8x16_t; 4]);
-
-/// The eight raw products of one K row (lane order of `prods!`).
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fuse_products(o: &AbKOperands) -> [core::arch::aarch64::uint16x8_t; 8] {
-    unsafe {
-        let (a, b) = o;
-        [
-            pmull_lo_u16(a[0], b[0]),
-            pmull_hi_u16(a[0], b[0]),
-            pmull_lo_u16(a[1], b[1]),
-            pmull_hi_u16(a[1], b[1]),
-            pmull_lo_u16(a[2], b[2]),
-            pmull_hi_u16(a[2], b[2]),
-            pmull_lo_u16(a[3], b[3]),
-            pmull_hi_u16(a[3], b[3]),
-        ]
-    }
-}
-
-/// `acc[i] ^ product[i]` for the eight products of one K row, each as one
-/// fused `pmull`/`eor` pair.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fuse_acc(
-    acc: &[core::arch::aarch64::uint16x8_t; 8],
-    o: &AbKOperands,
-) -> [core::arch::aarch64::uint16x8_t; 8] {
-    unsafe {
-        let (a, b) = o;
-        [
-            fused_pmull8_acc::<false>(acc[0], a[0], b[0]),
-            fused_pmull8_acc::<true>(acc[1], a[0], b[0]),
-            fused_pmull8_acc::<false>(acc[2], a[1], b[1]),
-            fused_pmull8_acc::<true>(acc[3], a[1], b[1]),
-            fused_pmull8_acc::<false>(acc[4], a[2], b[2]),
-            fused_pmull8_acc::<true>(acc[5], a[2], b[2]),
-            fused_pmull8_acc::<false>(acc[6], a[3], b[3]),
-            fused_pmull8_acc::<true>(acc[7], a[3], b[3]),
-        ]
-    }
-}
-
-/// [`ABV_FUSE`] seed: `P3 ^ P7'`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fuse_seed(lo: &AbKOperands, hi: &AbKOperands) -> [core::arch::aarch64::uint16x8_t; 8] {
-    unsafe { fuse_acc(&fuse_products(lo), hi) }
-}
-
-/// [`ABV_FUSE`] form of [`horner_absorb_first`]: `(acc << 1) ^ P2 ^ P6'`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fuse_absorb_first(
-    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
-    lo: &AbKOperands,
-    hi: &AbKOperands,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let mut s = *acc;
-        for v in s.iter_mut() {
-            debug_assert_eq!(vmaxvq_u16(vshrq_n_u16::<15>(*v)), 0);
-            *v = vshlq_n_u16::<1>(*v);
-        }
-        *acc = fuse_acc(&fuse_acc(&s, lo), hi);
-    }
-}
-
-/// [`ABV_FUSE`] form of the [`ABV_HORNER2`] K1 step:
-/// `acc = (acc << 2) ^ fold(acc >> 14) ^ ((P1 ^ P5') << 1)`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fuse_absorb_k1(
-    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
-    lo: &AbKOperands,
-    hi: &AbKOperands,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let p = fuse_acc(&fuse_products(lo), hi);
-        let fold = vld1q_u8(HORNER2_FOLD.as_ptr());
-        for i in 0..8 {
-            let t = acc[i];
-            let s2 = vreinterpretq_u8_u16(vshlq_n_u16::<2>(t));
-            let f = vqtbl1q_u8(fold, vreinterpretq_u8_u16(vshrq_n_u16::<14>(t)));
-            let p1 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(p[i]));
-            acc[i] = vreinterpretq_u16_u8(xor3_u8(s2, f, p1));
-        }
-    }
-}
-
-/// [`ABV_FUSE`] form of the [`ABV_HORNER2`] K0 step: `acc ^ P0 ^ P4'`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fuse_absorb_k0(
-    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
-    lo: &AbKOperands,
-    hi: &AbKOperands,
-) {
-    unsafe {
-        *acc = fuse_acc(&fuse_acc(acc, lo), hi);
     }
 }
 
@@ -2368,7 +2229,7 @@ pub(crate) fn fast_shift_reduce_enabled() -> bool {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-pub(crate) fn shift_reduce_inner_ab_fused_neon_h4<const V: u32>(
+pub(crate) fn shift_reduce_inner_ab_fused_neon_h4<const V: u16>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -2488,7 +2349,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
     const ONE_MASK: u8,
     const STATIC_A: bool,
     const A_LOW5_K: u8,
-    const V: u32,
+    const V: u16,
 >(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -2642,11 +2503,10 @@ fn shift_reduce_inner_mixed_const_b_h4<
             horner_absorb_first(&mut acc, &lo2, &hi2);
             let lo1 = products!(plain, plain_sw, kplain, 1);
             let hi1 = products!(scaled, scaled_sw, kscaled, 5);
-            // `horner_absorb` itself unless `V` has `ABV_HORNER2`.
-            horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
+            horner_absorb(&mut acc, &lo1, &hi1, carry_not);
             let lo0 = products!(plain, plain_sw, kplain, 0);
             let hi0 = products!(scaled, scaled_sw, kscaled, 4);
-            horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
+            horner_absorb(&mut acc, &lo0, &hi0, carry_not);
         }
 
         let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
@@ -3252,7 +3112,7 @@ unsafe fn xor_vary_single<const J: u32>(
 /// Row-body variant bit: the static-B partial path swaps the halves of odd
 /// bytes in registers instead of reading the half-swapped image.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_NOSW: u32 = 64;
+pub(crate) const ABV_NOSW: u16 = 64;
 
 /// [`xor_vary_pair`] (or single with `J1 == 8`) out of the plain image only.
 #[cfg(target_arch = "aarch64")]
@@ -3617,14 +3477,14 @@ unsafe fn fused_apply_one_k_with_b_fast<const R: i32, const MUL_X2: bool>(
 
 /// Row-body variant bit: apply the table in the Karatsuba form.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_KARA: u32 = 1;
+pub(crate) const ABV_KARA: u16 = 1;
 /// Row-body variant bit: the static-B Horner rows of a window run as one
 /// function body (no per-row call, saved registers or constant reloads).
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_INLINE_WINDOW: u32 = 2;
+pub(crate) const ABV_INLINE_WINDOW: u16 = 2;
 /// Row-body variant bit: form Karatsuba byte offsets before unscaled loads.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_KARA_UNSCALED: u32 = 4;
+pub(crate) const ABV_KARA_UNSCALED: u16 = 4;
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn ab_kara_unscaled_enabled() -> bool {
@@ -3636,7 +3496,7 @@ pub(crate) fn ab_kara_unscaled_enabled() -> bool {
 /// The form of the static-B Horner rows when [`ab_kara_enabled`].
 #[cfg(target_arch = "aarch64")]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const AB_ROWS_VARIANT: u32 = ABV_KARA | ABV_INLINE_WINDOW;
+pub(crate) const AB_ROWS_VARIANT: u16 = ABV_KARA | ABV_INLINE_WINDOW;
 
 /// Kill switch for the Karatsuba table apply in the round-one AB rows:
 /// exactly `FLOCK_NO_ZC_AB_KARA=1` restores the plain eight-row apply.
@@ -3768,7 +3628,7 @@ pub(crate) fn ab_kara_tables(inv_table: &InvNttTableByteSingleGf8) -> *const u8 
 /// One slot of a Karatsuba table, with the byte offset formed in one instruction.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn ab_kara_ld<const V: u32, const J: u32, const SLOT: usize>(
+unsafe fn ab_kara_ld<const V: u16, const J: u32, const SLOT: usize>(
     kara: *const u8,
     word: u64,
 ) -> core::arch::aarch64::uint8x16_t {
@@ -3860,7 +3720,7 @@ fn ab_kara_unscaled_addresses_match() {
 /// no extra live base registers (the eight fixed slot bases of
 /// [`ABV_KARA_SCALED_UNSCALED`] spill).
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_KARA_SLOT: u32 = 8192;
+pub(crate) const ABV_KARA_SLOT: u16 = 8192;
 
 /// Kill switch for [`ABV_KARA_SLOT`]: any value of `FLOCK_NO_ZC_AB_KARA_SLOT`
 /// keeps the incumbent address formation. Read once per process. The rows
@@ -4046,7 +3906,7 @@ unsafe fn ab_kara_ninth_pair(
 /// (`kara` points at the image's first entry).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_kara<const V: u32, const SCALED: bool>(
+unsafe fn apply_word_kara<const V: u16, const SCALED: bool>(
     kara: *const u8,
     word: u64,
 ) -> (
@@ -4186,7 +4046,7 @@ unsafe fn apply_word_kara<const V: u32, const SCALED: bool>(
 /// image. Measured on an M5 Pro P-core (synthetic static-B rows, 25
 /// alternated rounds): 27.36 against 29.87 ns per row at the lower quartile.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const AB_Z_VARIANT: u32 = ABV_KARA | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_REC | ABV_NOSW;
+pub(crate) const AB_Z_VARIANT: u16 = ABV_KARA | ABV_KARA_UNSCALED | ABV_Z | ABV_Z_REC | ABV_NOSW;
 
 /// Kill switch: exactly `FLOCK_NO_ZC_AB_Z=1` keeps the record's Karatsuba
 /// form for the plain image. Same bytes either way.
@@ -4200,13 +4060,13 @@ pub(crate) fn ab_z_enabled() -> bool {
 
 /// Row-body variant bit: the plain image uses the z-basis apply.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_Z: u32 = 8;
+pub(crate) const ABV_Z: u16 = 8;
 /// Row-body variant bit: a word that keeps the Karatsuba apply (the `x^4`
 /// image under [`ABV_Z`]) recombines its eighteen lookups with twelve XORs
 /// and four `ext` instead of fifteen XORs and four `ext` (see
 /// [`apply_word_kara`]). Same lookups, same output bytes.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_KARA_XOR16: u32 = 512;
+pub(crate) const ABV_KARA_XOR16: u16 = 512;
 
 /// Kill switch for [`ABV_KARA_XOR16`]: any value of
 /// `FLOCK_NO_ZC_AB_KARA_XOR16` restores the incumbent recombination in the
@@ -4222,7 +4082,7 @@ pub(crate) fn ab_kara_xor16_enabled() -> bool {
 /// its partial image plus [`apply_word_z_low`] of the varying bytes instead
 /// of the per-byte rows or the whole-word apply. Same output bytes.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_BSTATIC_Z: u32 = 4096;
+pub(crate) const ABV_BSTATIC_Z: u16 = 4096;
 
 /// Kill switch for [`ABV_BSTATIC_Z`]: any value of
 /// `FLOCK_NO_ZC_AB_BSTATIC_Z` keeps the incumbent static-B word forms. Read
@@ -4335,7 +4195,7 @@ pub(crate) fn ab_bstatic_z_low_forms<const NB: u32>(
 
 /// Row-body variant bit (with [`ABV_Z`]): the `x^4` image uses it too.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_Z_SCALED: u32 = 16;
+pub(crate) const ABV_Z_SCALED: u16 = 16;
 
 #[cfg(target_arch = "aarch64")]
 const AB_Z_L1: usize = 0; // 256 x 32: lanes M0, M2 of R^{l1}
@@ -4362,7 +4222,7 @@ const AB_Z_DDUP: usize = 51200 + 3 * 32768; // 256 x 64: d0d0 d1d1 d2d2 d3d3
 /// Row-body variant bit: the `x^4` Karatsuba image also takes the
 /// unscaled-index loads (for forms where the plain image is in z form).
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_KARA_SCALED_UNSCALED: u32 = 32;
+pub(crate) const ABV_KARA_SCALED_UNSCALED: u16 = 32;
 #[cfg(target_arch = "aarch64")]
 const AB_Z_REC2: usize = 51200 + 32768; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0 e2 | g | 0]
 #[cfg(target_arch = "aarch64")]
@@ -4370,7 +4230,7 @@ const AB_Z_REC: usize = 51200; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0e0 e2e
 /// Row-body variant bit (with [`ABV_Z`]): the four two-load z tables
 /// interleaved in one 128-byte record per byte value, one base register.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_Z_REC: u32 = 128;
+pub(crate) const ABV_Z_REC: u16 = 128;
 #[cfg(target_arch = "aarch64")]
 const AB_Z_SL1P: usize = 45056; // 256 x 16: [e0|e2]
 #[cfg(target_arch = "aarch64")]
@@ -4378,7 +4238,7 @@ const AB_Z_ALLP: usize = 49152; // 256 x 8: g
 /// Row-body variant bit (with [`ABV_Z`]): packed `s l1` and `s l1 l2`
 /// tables (two more zips, one 8-byte replicating load; 38 KiB per image).
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_Z_PACK: u32 = 0; // retired: slower in every measured form
+pub(crate) const ABV_Z_PACK: u16 = 0; // retired: slower in every measured form
 
 #[cfg(target_arch = "aarch64")]
 fn ab_z_fill_entry(row: &[u8], x: usize, dst: &mut [u8]) {
@@ -4556,7 +4416,7 @@ unsafe fn apply_word_z<const PACK: bool, const REC: bool, const OUT3: bool>(
 /// three-way and a two-way XOR: eight XOR instructions per word instead of
 /// ten. Every output is the XOR of the same terms, so the bytes are the same.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_Z_OUT3: u32 = 16384;
+pub(crate) const ABV_Z_OUT3: u16 = 16384;
 
 /// Kill switch for [`ABV_Z_OUT3`]: any value of `FLOCK_NO_ZC_AB_Z_EOR3`
 /// keeps the shared `m ^ k` form. Read once per process. The rows written
@@ -4620,7 +4480,7 @@ fn ab_z_out3_apply_matches_shared_form() {
 /// butterfly steps (five integer instructions, no live mask registers)
 /// instead of the seven partial XOR-shift words. Same lookups, same bytes.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_Z_MT: u32 = 1024;
+pub(crate) const ABV_Z_MT: u16 = 1024;
 
 /// Opt-in for [`ABV_Z_MT`]: off by default (it measured ~1.7% slower on a
 /// single M5 Pro core); `FLOCK_ZC_AB_Z_MT=1` enables it. Read once per
@@ -4757,7 +4617,7 @@ fn ab_superset_bytes_matches_definition() {
 /// Row-body variant bit: the table apply in the half-pair z form (both
 /// images), out of [`ab_hz_tables`]. Exclusive with [`ABV_KARA`].
 #[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_HZ: u32 = 256;
+pub(crate) const ABV_HZ: u16 = 256;
 
 /// The static-B window rows' form on the efficiency-core helper threads
 /// (which keep the plain apply instead of the Karatsuba / z forms, see
@@ -4767,7 +4627,7 @@ pub(crate) const ABV_HZ: u32 = 256;
 /// 84.9 against 116.3 ns on a 64 KiB-L1D core (background QoS), 32.8 against
 /// 41.3 ns on a P-core.
 #[cfg(target_arch = "aarch64")]
-pub(crate) const AB_HZ_VARIANT: u32 = ABV_HZ | ABV_NOSW | ABV_INLINE_WINDOW;
+pub(crate) const AB_HZ_VARIANT: u16 = ABV_HZ | ABV_NOSW | ABV_INLINE_WINDOW;
 
 /// Kill switch: exactly `FLOCK_NO_ZC_AB_HZ=1` keeps the plain apply on the
 /// helper threads. Same bytes either way.
@@ -4838,8 +4698,8 @@ pub(crate) fn ab_mixed_row_incumbent_and_slot_mt(
     byte_base_b: usize,
     w0: bool,
 ) -> ([u8; 64], [u8; 64]) {
-    const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16;
-    const V: u32 = V0 | ABV_KARA_SLOT | ABV_Z_MT;
+    const V0: u16 = AB_Z_VARIANT | ABV_KARA_XOR16;
+    const V: u16 = V0 | ABV_KARA_SLOT | ABV_Z_MT;
     let mut out = ([0u8; 64], [0u8; 64]);
     if w0 {
         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V0>(a_packed, b_packed, inv_table, byte_base_b, None, &mut out.0, false);
@@ -4949,7 +4809,7 @@ unsafe fn apply_word_hz(
 /// [`apply_word_into_4_regs`] in the form selected by `V`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_into_4_regs_v<const V: u32, const SCALED: bool>(
+unsafe fn apply_word_into_4_regs_v<const V: u16, const SCALED: bool>(
     table_base: *const u8,
     half_swapped_table_base: *const u8,
     kara: *const u8,
@@ -5000,7 +4860,7 @@ unsafe fn apply_word_into_4_regs_v<const V: u32, const SCALED: bool>(
 /// Test access: one word through the plain apply and through the Karatsuba
 /// apply of the plain (`scaled = false`) or `x^4`-scaled image.
 #[cfg(all(test, target_arch = "aarch64"))]
-pub(crate) fn ab_apply_word_forms<const V: u32>(
+pub(crate) fn ab_apply_word_forms<const V: u16>(
     inv_table: &InvNttTableByteSingleGf8,
     scaled: bool,
     word: u64,
@@ -5644,9 +5504,7 @@ pub(crate) fn ab_mixed_row_guarded(
     out: &mut [u8; 64],
     nt_store: bool,
 ) -> bool {
-    const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16;
-    const V2: u32 = AB_MIXED_H2_VARIANT;
-    let h2 = ab_mixed_h2_enabled();
+    const V: u16 = AB_Z_VARIANT | ABV_KARA_XOR16;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
     let word = |packed: &[u8], k: usize| -> u64 {
@@ -5660,112 +5518,30 @@ pub(crate) fn ab_mixed_row_guarded(
         {
             return false;
         }
-        if h2 {
-            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V2>(
-                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
-            );
-        } else {
-            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V0>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                None,
-                out,
-                nt_store,
-            );
-        }
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V>(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base_b,
+            None,
+            out,
+            nt_store,
+        );
     } else {
         if word(b_packed, 4) & word(b_packed, 5) & word(b_packed, 6) & word(b_packed, 7) != u64::MAX {
             return false;
         }
-        if h2 {
-            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V2>(
-                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
-            );
-        } else {
-            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V0>(
-                a_packed,
-                b_packed,
-                inv_table,
-                byte_base_b,
-                None,
-                out,
-                nt_store,
-            );
-        }
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V>(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base_b,
+            None,
+            out,
+            nt_store,
+        );
     }
     true
-}
-
-/// The mixed const-one rows' form on a thread with the Karatsuba apply
-/// unless `FLOCK_NO_ZC_AB_MIXED_H2` is set: the window rows' production
-/// applies and Horner steps ([`ABV_HORNER2`] K1/K0 steps, [`ABV_Z_OUT3`]
-/// z-basis outputs, [`ABV_KARA_SLOT`] `x^4` addresses) on top of the
-/// incumbent `AB_Z_VARIANT | ABV_KARA_XOR16`. Same lookups, same terms in
-/// every lane, same bytes.
-#[cfg(target_arch = "aarch64")]
-pub(crate) const AB_MIXED_H2_VARIANT: u32 =
-    AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_HORNER2 | ABV_Z_OUT3 | ABV_KARA_SLOT;
-
-/// Kill switch for [`AB_MIXED_H2_VARIANT`]: any value of
-/// `FLOCK_NO_ZC_AB_MIXED_H2` keeps the incumbent mixed-row form. Read once
-/// per process. The rows written are byte-identical.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_mixed_h2_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_MIXED_H2").is_none())
-}
-
-/// The [`AB_MIXED_H2_VARIANT`] mixed rows write the incumbent form's bytes
-/// for both rows (window 0 `b_med` 2, window 1 `b_med` 13), random A and B
-/// rows with the guard words forced, zero and all-ones A.
-#[cfg(all(test, target_arch = "aarch64"))]
-#[test]
-fn ab_mixed_h2_matches_incumbent() {
-    use crate::ntt::AdditiveNttGf8;
-    const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16;
-    let table =
-        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
-    let mut state = 0x31CE_D00D_2468_ACE1u64;
-    let mut next = move || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    };
-    for case in 0..600usize {
-        let mut a: Vec<u8> = (0..64).map(|_| next() as u8).collect();
-        let mut b: Vec<u8> = (0..64).map(|_| next() as u8).collect();
-        if case % 5 == 3 {
-            a.fill(0);
-        }
-        if case % 5 == 4 {
-            a.fill(0xff);
-        }
-        let w0 = case % 2 == 0;
-        if w0 {
-            b[..16].fill(0xff);
-            for k in 0..2 {
-                a[k * 8 + 5..k * 8 + 8].fill(0);
-            }
-        } else {
-            b[32..].fill(0xff);
-        }
-        for nt in [false, true] {
-            let mut want = [0u8; 64];
-            let mut got = [0u8; 64];
-            if w0 {
-                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V0>(&a, &b, &table, 0, None, &mut want, nt);
-                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, AB_MIXED_H2_VARIANT>(&a, &b, &table, 0, None, &mut got, nt);
-            } else {
-                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V0>(&a, &b, &table, 0, None, &mut want, nt);
-                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, AB_MIXED_H2_VARIANT>(&a, &b, &table, 0, None, &mut got, nt);
-            }
-            assert_eq!(got, want, "case {case} w0={w0} nt={nt}");
-        }
-    }
 }
 
 /// `acc ^ pmull(a, b)` on 8-bit polynomial lanes (`HI` selects the high

@@ -1268,9 +1268,6 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     let _ = shared();
     // Committed here, in the warm-up, so the timed expansion never faults.
     let scratch = prefaulted_blocks(1usize << log2_size);
-    // The seed-pipe thread reports once it has pre-opened the publication
-    // target and is about to poll stdin; `arm` waits for that report below.
-    let (parked_tx, parked_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let spawned = std::thread::Builder::new()
         .name("flock-seed-pipe".into())
         // This thread runs the whole proof, which the wrapper otherwise runs on
@@ -1279,9 +1276,7 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
         // the process and costs the trial. Reservation is lazily committed, so
         // the untouched pages cost nothing.
         .stack_size(32 << 20)
-        .spawn(move || {
-            speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch, parked_tx)
-        });
+        .spawn(move || speculative_main(real_stdin, writer, log2_size, setup_addr, run, scratch));
 
     if spawned.is_err() {
         // Nobody will ever forward the seed, so hand the real stdin straight
@@ -1294,20 +1289,6 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
         }
         ARMED.store(false, Ordering::SeqCst);
         return;
-    }
-
-    // Return (and so let the worker publish its ready file) only once the
-    // seed-pipe thread has pre-opened the publication target and reached its
-    // stdin poll. The harness writes the seed about 0.1 ms after the ready
-    // file appears; the pre-open (create, 448 KiB warm write, map) used to
-    // race that write and delayed the seed read inside the timed window
-    // (seed read 0.30 ms median with the race, 0.04 ms parked; 16 local
-    // interleaved trials).
-    // Untimed: this is still the warm-up. A thread that dies before
-    // reporting drops the sender and `recv` returns at once; the timeout only
-    // bounds a pathological stall. `FLOCK_NO_PARKED_ARM=1` returns at once.
-    if std::env::var_os("FLOCK_NO_PARKED_ARM").is_none() {
-        let _ = parked_rx.recv_timeout(std::time::Duration::from_millis(500));
     }
 
     // Everything this thread does from here until adoption is shadow work that
@@ -1340,13 +1321,12 @@ fn speculative_main(
     setup_addr: usize,
     run: fn(usize, &[Compression]) -> ProveOut,
     scratch: Vec<Compression>,
-    parked: std::sync::mpsc::SyncSender<()>,
 ) {
     flock_core::set_calling_thread_prover_qos();
     let mut scratch = scratch;
 
     // Pre-open the speculative publish target while every remaining moment is
-    // untimed (`arm` holds the wrapper's ready file until this is done): the
+    // untimed (the wrapper has not even published its ready file yet): the
     // open, vnode, name-cache, and first-touch write machinery move off the
     // publication critical path. `None` outside the ranked worker, under the
     // kill switch, or on any I/O hiccup — the incumbent create-at-publish
@@ -1357,9 +1337,6 @@ fn speculative_main(
         .flatten()
         .and_then(|proof_path| preopen_publish_file(&proof_path));
 
-    // Everything before the stdin poll is done: release `arm`.
-    let _ = parked.send(());
-    drop(parked);
     hot_wait_readable(real_stdin);
     let line = read_line_fd(real_stdin);
     flock_core::tmark::reset();
