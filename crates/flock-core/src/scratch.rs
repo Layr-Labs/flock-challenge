@@ -82,7 +82,10 @@ pub fn take_lincheck_acc(len: usize) -> Vec<F128> {
     if let Ok(mut guard) = LINCHECK_ACC_SCRATCH.lock() {
         if let Some(mut v) = guard.take() {
             if v.capacity() >= len {
-                unsafe { v.set_len(len) };
+                unsafe {
+                    v.set_len(len);
+                    core::ptr::write_bytes(v.as_mut_ptr(), 0, len);
+                }
                 return v;
             }
         }
@@ -90,15 +93,14 @@ pub fn take_lincheck_acc(len: usize) -> Vec<F128> {
     vec![F128::ZERO; len]
 }
 
-/// Return the folded `comb_vec` buffer to `LINCHECK_ACC_SCRATCH`, zeroing
-/// its `[0..full_len)` prefix so the next `take_lincheck_acc(full_len)` is O(1).
+/// Return the folded `comb_vec` buffer to `LINCHECK_ACC_SCRATCH`; the next
+/// `take_lincheck_acc` zeroes the prefix it hands out, off the serial spine.
 pub fn give_lincheck_acc(mut v: Vec<F128>, full_len: usize) {
     if v.capacity() < full_len {
         return;
     }
     unsafe {
         v.set_len(full_len);
-        core::ptr::write_bytes(v.as_mut_ptr(), 0, full_len);
     }
     if let Ok(mut guard) = LINCHECK_ACC_SCRATCH.lock() {
         *guard = Some(v);
