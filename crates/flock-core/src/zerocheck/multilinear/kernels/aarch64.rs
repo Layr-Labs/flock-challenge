@@ -3431,6 +3431,81 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     degen: bool,
     out: *mut F128,
 ) {
+    unsafe {
+        fold2_compact_and_round45_chunk_neon_8_fused_r1_impl::<DEAD_TAIL, PACK, false>(
+            table_r1, rho2, anchors, deltas, a_out, b_out, eq_lo, out_pairs, degen, out,
+        )
+    }
+}
+
+/// Kill switch for [`fold2_compact_and_round45_chunk_neon_8_fused_r1_horner`]:
+/// `FLOCK_NO_ZC_K_HORNER` (any value) keeps the K pass on the per-group full
+/// weight products. Same outputs either way; read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) fn zc_k_horner_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_HORNER").is_none())
+}
+
+/// [`fold2_compact_and_round45_chunk_neon_8_fused_r1`] with the group weight
+/// split as `lambda * x^(2s)`.
+///
+/// The K pass weights group `t` by `eq_lo[2t+1]`, where `eq_lo` runs over
+/// `r[k_skip+3..]`. Its first four coordinates are the medium protocol
+/// constants `β_i = γ^{2^{i-1}} / (1 + γ^{2^{i-1}})` (`γ = x`), for which
+/// `eq(bit=1) / eq(bit=0) = x^{2^{i-1}}`. Bit 0 of `2t+1` is fixed, and bits
+/// 0..3 of `t` carry `β_2..β_4`, so for an 8-group-aligned `t0` and `s < 8`,
+/// `eq_lo[2(t0+s)+1] = eq_lo[2 t0 + 1] * x^(2s)`. The four rows are scaled by
+/// `x^(2s)` with [`mul_xb_q`] instead of by the full weight, the eight
+/// products accumulate unreduced per 8-group window, and each window sum is
+/// reduced and multiplied by `lambda = eq_lo[2 t0 + 1]` once. Same field
+/// elements in every slot, same stores. The caller checks that the medium
+/// coordinates are the protocol constants and that `out_pairs` is a multiple
+/// of 16.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_horner<
+    const DEAD_TAIL: bool,
+    const PACK: bool,
+>(
+    table_r1: *const u8,
+    rho2: F128,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    out_pairs: usize,
+    degen: bool,
+    out: *mut F128,
+) {
+    unsafe {
+        fold2_compact_and_round45_chunk_neon_8_fused_r1_impl::<DEAD_TAIL, PACK, true>(
+            table_r1, rho2, anchors, deltas, a_out, b_out, eq_lo, out_pairs, degen, out,
+        )
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_impl<
+    const DEAD_TAIL: bool,
+    const PACK: bool,
+    const HORNER: bool,
+>(
+    table_r1: *const u8,
+    rho2: F128,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_lo: *const F128,
+    out_pairs: usize,
+    degen: bool,
+    out: *mut F128,
+) {
     const { assert!(DEAD_TAIL || !PACK) };
     use core::arch::aarch64::*;
 
@@ -3456,9 +3531,34 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
         // Slots: p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5'.
         let mut acc = LookaheadTriAcc::zero();
+        let tri_zero = TriNeon {
+            ll: zero,
+            cross: zero,
+            hh: zero,
+        };
+        // HORNER: chunk sums of the `lambda`-weighted window sums, unreduced.
+        let mut sums = [tri_zero; 8];
 
         debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
+        debug_assert!(!HORNER || out_pairs.is_multiple_of(16));
         let n5 = out_pairs / 2;
+
+        // HORNER: close the 8-group window that ends with group `$t`.
+        macro_rules! flush_window {
+            ($t:expr) => {{
+                if HORNER {
+                    let lambda = vld1q_u64(eq_lo.add(2 * ($t & !7usize) + 1).cast::<u64>());
+                    for (sum, a) in sums.iter_mut().zip(acc.0.iter_mut()) {
+                        tri_acc_q_crossfused(
+                            sum,
+                            lambda,
+                            reduce_tri_binius_xor_q(a.ll, a.cross, a.hh, zero),
+                        );
+                        *a = tri_zero;
+                    }
+                }
+            }};
+        }
 
         macro_rules! fold_lane {
             ($g:expr, $b_flat:ident) => {{
@@ -3510,8 +3610,36 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 let (a3, b3) = fold_lane!(4 * t + 3, b_flat);
                 store_pair_nt_off::<32>(ao, a2, a3);
                 store_pair_nt_off::<32>(bo, b2, b3);
-                let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
                 let acc = &mut acc.0;
+                if HORNER {
+                    let xb = vdupq_n_u64(1u64 << (2 * (t & 7)));
+                    if b_flat
+                        && is_zero_q(vorrq_u64(
+                            vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
+                            vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
+                        ))
+                    {
+                        acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb, k87));
+                        acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb, k87));
+                        acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb, k87));
+                    } else {
+                        let a0w = mul_xb_q(a0, xb, k87);
+                        let a1w = mul_xb_q(a1, xb, k87);
+                        let a2w = mul_xb_q(a2, xb, k87);
+                        let a3w = mul_xb_q(a3, xb, k87);
+                        tri_acc_q_crossfused(&mut acc[0], a1w, b1);
+                        tri_acc_q_crossfused(&mut acc[1], veorq_u64(a0w, a1w), veorq_u64(b0, b1));
+                        tri_acc_q_crossfused(&mut acc[2], a3w, b3);
+                        tri_acc_q_crossfused(&mut acc[3], veorq_u64(a2w, a3w), veorq_u64(b2, b3));
+                        tri_acc_q_crossfused(&mut acc[4], a2w, b2);
+                        let (e_aw, e_b) = (veorq_u64(a0w, a2w), veorq_u64(b0, b2));
+                        let (o_aw, o_b) = (veorq_u64(a1w, a3w), veorq_u64(b1, b3));
+                        tri_acc_q_crossfused(&mut acc[5], e_aw, e_b);
+                        tri_acc_q_crossfused(&mut acc[6], o_aw, o_b);
+                        tri_acc_q_crossfused(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                    }
+                } else {
+                let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
                 if b_flat
                     && is_zero_q(vorrq_u64(
                         vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
@@ -3538,6 +3666,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     tri_acc_q_crossfused(&mut acc[6], o_aw, o_b);
                     tri_acc_q_crossfused(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
                 }
+                }
             }};
         }
 
@@ -3559,6 +3688,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 };
                 for t in t0..t0 + 15 {
                     k_group!(t, o0 + 4 * (t - t0));
+                    if t & 7 == 7 {
+                        flush_window!(t);
+                    }
                 }
                 let t = t0 + 15;
                 let g = 4 * t;
@@ -3592,8 +3724,12 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     store_pair_nt_off::<0>(bo, bv0, zero);
                     store_pair_nt_off::<32>(bo, zero, zero);
                 }
-                let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
-                let a0w = mul_sw_fused_q(w, swap_halves_q(w), av0, k87);
+                let a0w = if HORNER {
+                    mul_xb_q(av0, vdupq_n_u64(1u64 << (2 * (t & 7))), k87)
+                } else {
+                    let w = vld1q_u64(eq_lo.add(2 * t + 1).cast::<u64>());
+                    mul_sw_fused_q(w, swap_halves_q(w), av0, k87)
+                };
                 let (ll, cross, hh) = clmul_products_q(a0w, bv0);
                 for slot in [1usize, 5, 7] {
                     let t = &mut acc.0[slot];
@@ -3601,16 +3737,26 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     t.cross = veorq_u64(t.cross, cross);
                     t.hh = veorq_u64(t.hh, hh);
                 }
+                flush_window!(t);
             }
         } else {
             for t in 0..n5 {
                 k_group!(t, 4 * t);
+                if t & 7 == 7 {
+                    flush_window!(t);
+                }
             }
         }
 
-        let sums = acc.reduce();
-        for (k, v) in sums.into_iter().enumerate() {
-            *out.add(k) = v;
+        if HORNER {
+            for (k, sum) in sums.into_iter().enumerate() {
+                *out.add(k) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum));
+            }
+        } else {
+            let sums = acc.reduce();
+            for (k, v) in sums.into_iter().enumerate() {
+                *out.add(k) = v;
+            }
         }
     }
 }
@@ -7327,6 +7473,207 @@ mod tests {
                 assert!(bp[packed_len..].iter().all(|&v| v == poison));
             }
         }
+    }
+
+    /// The `lambda * x^(2s)` K pass equals the per-group-weight K pass when
+    /// the first four eq coordinates are the medium protocol constants: same
+    /// outputs (all three layouts), same eight slots.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn k_horner_matches_weighted() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        use crate::zerocheck::univariate_skip::build_eq;
+        use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
+        let mut state = 0x4b48_4f52_4e45_5231;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, rho(&mut state));
+        for case in 0..12 {
+            let out_pairs: usize = if case % 2 == 0 { 2 * 16 * 8 } else { 2 * 16 * 4 };
+            let n_out = 2 * out_pairs;
+            let (rho1, rho2) = match case / 2 {
+                0 => (F128::ONE, F128::ONE),
+                1 => (rho(&mut state), F128::ZERO),
+                _ => (rho(&mut state), rho(&mut state)),
+            };
+            let r1 = table.scaled_linear(rho1);
+            let mut anchors: Vec<F128> = (0..8 * out_pairs).map(|_| rho(&mut state)).collect();
+            let mut deltas: Vec<u8> =
+                (0..64 * out_pairs).map(|_| splitmix64(&mut state) as u8).collect();
+            let mut r: Vec<F128> =
+                (0..out_pairs.trailing_zeros()).map(|_| rho(&mut state)).collect();
+            r[..4].copy_from_slice(&medium_challenges_ghash());
+            if case == 5 {
+                r[4] = F128::ZERO;
+            }
+            let eq = build_eq(&r);
+            assert_eq!(eq.len(), out_pairs);
+            for g in 0..4 * out_pairs / 2 {
+                let class = if (g / 4) % 7 == 3 { 1 } else { splitmix64(&mut state) % 5 };
+                match class {
+                    0 => {
+                        anchors[4 * g + 3] = anchors[4 * g + 1];
+                        deltas[32 * g + 8..32 * g + 16].fill(0);
+                        deltas[32 * g + 24..32 * g + 32].fill(0);
+                    }
+                    1 => {
+                        anchors[4 * g + 1] = F128::ONE;
+                        anchors[4 * g + 3] = F128::ONE;
+                        deltas[32 * g + 8..32 * g + 16].fill(0);
+                        deltas[32 * g + 24..32 * g + 32].fill(0);
+                    }
+                    2 => {
+                        deltas[32 * g + 8..32 * g + 16].fill(0);
+                        deltas[32 * g + 24..32 * g + 32].fill(0);
+                    }
+                    _ => {}
+                }
+            }
+            for degen in [false, true] {
+                for layout in 0..3 {
+                    let run = |horner: bool| {
+                        let poison = F128::new(0xdead, 0xbeef);
+                        let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
+                        let mut o = [F128::ZERO; 8];
+                        let args = (
+                            r1.as_ptr().cast::<u8>(),
+                            anchors.as_ptr(),
+                            deltas.as_ptr(),
+                            a.as_mut_ptr(),
+                            b.as_mut_ptr(),
+                            eq.as_ptr(),
+                            o.as_mut_ptr(),
+                        );
+                        unsafe {
+                            macro_rules! call {
+                                ($f:ident, $d:literal, $p:literal) => {
+                                    $f::<$d, $p>(
+                                        args.0, rho2, args.1, args.2, args.3, args.4, args.5,
+                                        out_pairs, degen, args.6,
+                                    )
+                                };
+                            }
+                            match (horner, layout) {
+                                (false, 0) => call!(fold2_compact_and_round45_chunk_neon_8_fused_r1, false, false),
+                                (false, 1) => call!(fold2_compact_and_round45_chunk_neon_8_fused_r1, true, false),
+                                (false, _) => call!(fold2_compact_and_round45_chunk_neon_8_fused_r1, true, true),
+                                (true, 0) => call!(fold2_compact_and_round45_chunk_neon_8_fused_r1_horner, false, false),
+                                (true, 1) => call!(fold2_compact_and_round45_chunk_neon_8_fused_r1_horner, true, false),
+                                (true, _) => call!(fold2_compact_and_round45_chunk_neon_8_fused_r1_horner, true, true),
+                            }
+                        }
+                        (a, b, o)
+                    };
+                    let want = run(false);
+                    let got = run(true);
+                    let at = format!("case {case} degen {degen} layout {layout}");
+                    assert_eq!(got.0, want.0, "a outputs, {at}");
+                    assert_eq!(got.1, want.1, "b outputs, {at}");
+                    assert_eq!(got.2, want.2, "slots, {at}");
+                }
+            }
+        }
+    }
+
+    /// Single-thread A/B of the K pass kernel (packed dead-tail layout, the
+    /// ranked route): per-group weights vs `lambda * x^(2s)`.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    #[ignore = "timing probe"]
+    fn k_horner_timing() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        use crate::zerocheck::univariate_skip::build_eq;
+        use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
+        crate::set_calling_thread_prover_qos();
+        let mut state = 0x4b48_5449_4d45_0001;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, rho(&mut state));
+        const OUT_PAIRS: usize = 1 << 12;
+        const CHUNKS: usize = 4;
+        const PASSES: usize = 6;
+        let r1 = table.scaled_linear(rho(&mut state));
+        let rho2 = rho(&mut state);
+        let n_pairs = 2 * OUT_PAIRS * CHUNKS * 2;
+        let mut anchors: Vec<F128> = (0..2 * n_pairs).map(|_| rho(&mut state)).collect();
+        let mut deltas: Vec<u8> = (0..16 * n_pairs).map(|_| splitmix64(&mut state) as u8).collect();
+        // Dead pairs 121..128 of every 128-pair block: zero state.
+        for p in 0..n_pairs {
+            if p & 127 >= 121 {
+                anchors[2 * p] = F128::ZERO;
+                anchors[2 * p + 1] = F128::ZERO;
+                deltas[16 * p..16 * p + 16].fill(0);
+            }
+        }
+        let mut r: Vec<F128> = (0..OUT_PAIRS.trailing_zeros()).map(|_| rho(&mut state)).collect();
+        r[..4].copy_from_slice(&medium_challenges_ghash());
+        let eq = build_eq(&r);
+        let n_out = 2 * OUT_PAIRS;
+        let mut a = vec![F128::ZERO; n_out * CHUNKS];
+        let mut b = vec![F128::ZERO; n_out * CHUNKS];
+        let mut pass = |horner: bool| -> (f64, [F128; 8]) {
+            let mut last = [F128::ZERO; 8];
+            let t = std::time::Instant::now();
+            for _ in 0..PASSES {
+                for c in 0..CHUNKS {
+                    let mut o = [F128::ZERO; 8];
+                    let pair_base = 2 * c * n_out;
+                    unsafe {
+                        let args = (
+                            r1.as_ptr().cast::<u8>(),
+                            anchors.as_ptr().add(2 * pair_base),
+                            deltas.as_ptr().add(16 * pair_base),
+                            a.as_mut_ptr().add(c * n_out),
+                            b.as_mut_ptr().add(c * n_out),
+                        );
+                        if horner {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1_horner::<true, true>(
+                                args.0, rho2, args.1, args.2, args.3, args.4, eq.as_ptr(),
+                                OUT_PAIRS, true, o.as_mut_ptr(),
+                            );
+                        } else {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                                args.0, rho2, args.1, args.2, args.3, args.4, eq.as_ptr(),
+                                OUT_PAIRS, true, o.as_mut_ptr(),
+                            );
+                        }
+                    }
+                    if c == CHUNKS - 1 {
+                        last = o;
+                    }
+                }
+            }
+            (t.elapsed().as_nanos() as f64 / (PASSES * CHUNKS * n_out) as f64, last)
+        };
+        assert_eq!(pass(false).1, pass(true).1);
+        let samples: usize = std::env::var("ZC_PROBE_SAMPLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(41);
+        let (mut old_ns, mut new_ns, mut ratio) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..samples {
+            let (o, n) = if i % 2 == 0 {
+                let o = pass(false).0;
+                (o, pass(true).0)
+            } else {
+                let n = pass(true).0;
+                (pass(false).0, n)
+            };
+            old_ns.push(o);
+            new_ns.push(n);
+            ratio.push(n / o);
+        }
+        for v in [&mut old_ns, &mut new_ns, &mut ratio] {
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        }
+        println!(
+            "KHORNER ns_per_output old min {:.4} med {:.4} | new min {:.4} med {:.4} | paired new/old q1 {:.4} med {:.4} q3 {:.4}",
+            old_ns[0],
+            old_ns[samples / 2],
+            new_ns[0],
+            new_ns[samples / 2],
+            ratio[samples / 4],
+            ratio[samples / 2],
+            ratio[3 * samples / 4],
+        );
     }
 
     /// The tri pass over a dead-tail-packed input equals the tri pass over
