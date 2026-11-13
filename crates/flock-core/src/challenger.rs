@@ -304,6 +304,7 @@ impl FsChallenger {
         self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
     }
 
+    #[cfg(not(target_endian = "little"))]
     #[inline]
     fn absorb_f128(&mut self, v: F128) {
         self.absorb(&v.lo.to_le_bytes());
@@ -370,13 +371,20 @@ impl Challenger for FsChallenger {
     }
 
     fn observe_f128(&mut self, value: F128) {
-        self.absorb(&[OP_OBSERVE, KIND_SCALAR]);
-        self.absorb_f128(value);
+        let mut buf = [0u8; 18];
+        buf[0] = OP_OBSERVE;
+        buf[1] = KIND_SCALAR;
+        buf[2..10].copy_from_slice(&value.lo.to_le_bytes());
+        buf[10..].copy_from_slice(&value.hi.to_le_bytes());
+        self.absorb(&buf);
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
-        self.absorb(&[OP_OBSERVE, KIND_SLICE]);
-        self.absorb(&(values.len() as u64).to_le_bytes());
+        let mut header = [0u8; 10];
+        header[0] = OP_OBSERVE;
+        header[1] = KIND_SLICE;
+        header[2..].copy_from_slice(&(values.len() as u64).to_le_bytes());
+        self.absorb(&header);
 
         #[cfg(target_endian = "little")]
         self.absorb(f128s_as_bytes(values));
@@ -409,8 +417,11 @@ impl Challenger for FsChallenger {
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         #[cfg(feature = "hash-count")]
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
-        self.absorb(&(n as u64).to_le_bytes());
+        let mut header = [0u8; 10];
+        header[0] = OP_SQUEEZE;
+        header[1] = KIND_SLICE;
+        header[2..].copy_from_slice(&(n as u64).to_le_bytes());
+        self.absorb(&header);
 
         #[cfg(target_endian = "little")]
         {
@@ -620,9 +631,33 @@ impl Challenger for FsChallenger {
                     let gpu_2_started = std::time::Instant::now();
                     let gpu_2 = gpu_grind_calibration(&state_digest);
                     let gpu_2_time = gpu_2_started.elapsed();
-                    let cpu_2_started = std::time::Instant::now();
-                    let cpu_2 = cpu_gpu_grind_calibration(&state_digest);
-                    let cpu_2_time = cpu_2_started.elapsed();
+                    // Second CPU draw only when it could change the decision
+                    // (`FLOCK_NO_GRIND_CAL_SKIP`, any value, always takes it).
+                    // Under the min estimator a second draw can only LOWER the
+                    // CPU estimate, so it matters only when the projected GPU
+                    // cost is within a wide safety factor of the first draw.
+                    // Exactness is unaffected: `cpu_1` is still the full CPU
+                    // oracle every GPU window is compared against, and the
+                    // nonce of every later grind is the lowest match on either
+                    // device. Skipping saves one full 2^20-nonce CPU scan in
+                    // every fresh worker's untimed warm-up.
+                    let skip_cpu_2 = grind_cal_skip_enabled()
+                        && grind_latch_min_enabled()
+                        && matches!((&gpu_1, &gpu_2), (Ok(a), Ok(b)) if *a == cpu_1 && *b == cpu_1)
+                        && {
+                            let gpu_est = gpu_1_time.min(gpu_2_time);
+                            gpu_est
+                                .mul_f64(GPU_GRIND_CAL_SKIP_SAFETY)
+                                .saturating_add(GPU_GRIND_MIN_TWO_SAMPLE_GAIN)
+                                < cpu_1_time
+                        };
+                    let (cpu_2, cpu_2_time) = if skip_cpu_2 {
+                        (cpu_1.clone(), cpu_1_time)
+                    } else {
+                        let cpu_2_started = std::time::Instant::now();
+                        let cpu_2 = cpu_gpu_grind_calibration(&state_digest);
+                        (cpu_2, cpu_2_started.elapsed())
+                    };
 
                     let exact = matches!((&gpu_1, &gpu_2), (Ok(a), Ok(b)) if *a == cpu_1 && *b == cpu_1)
                         && cpu_2 == cpu_1;
@@ -1333,6 +1368,19 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
 fn grind_latch_min_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_LATCH_MIN").is_none())
+}
+
+/// Safety factor for skipping the second CPU calibration draw: skip only when
+/// even a second draw `GPU_GRIND_CAL_SKIP_SAFETY` times closer to the GPU
+/// projection than the first could not flip the latch decision.
+const GPU_GRIND_CAL_SKIP_SAFETY: f64 = 8.0;
+
+/// `FLOCK_NO_GRIND_CAL_SKIP` (any value) always takes the second CPU
+/// calibration draw, as before. Same latch inputs either way when the
+/// decision is not close; same nonces always.
+fn grind_cal_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GRIND_CAL_SKIP").is_none())
 }
 
 /// Route the engaged CPU-grind drain's helper broadcast through the epool's

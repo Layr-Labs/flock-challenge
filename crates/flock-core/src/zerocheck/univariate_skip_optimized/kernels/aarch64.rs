@@ -527,131 +527,119 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     }
 }
 
-/// Row `B` of a fourteen-row span, 16 bytes at the pass's lane offset, as two
-/// words from one paired load (`ldp`). `mid` points at row 7 of the span plus
-/// the lane offset, so every row offset (`-448..=384`) fits the paired load's
-/// immediate.
-#[inline(always)]
-unsafe fn ab_row_pair<const B: usize>(mid: *const u8) -> (usize, usize) {
-    const { assert!(B < 14) };
-    let (lo, hi): (usize, usize);
-    // SAFETY: `mid` is row 7 of fourteen in-bounds 64-byte rows plus a lane
-    // offset of at most 48, so the 16 bytes read lie inside row `B`; the asm
-    // only reads that memory.
-    unsafe {
-        core::arch::asm!(
-            "ldp {lo}, {hi}, [{p}, #{off}]",
-            off = const (B as isize - 7) * 64,
-            p = in(reg) mid,
-            lo = lateout(reg) lo,
-            hi = lateout(reg) hi,
-            options(pure, readonly, nostack, preserves_flags),
-        );
-    }
-    (lo, hi)
+/// Kill switch for the four-row drain step of
+/// [`accumulate_convert_ab_nomul_seeded_quad`]: any value of
+/// `FLOCK_NO_ZC_AB_DRAIN_QUAD` keeps the two-row step. Read once per process.
+pub(crate) fn ab_drain_quad_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_DRAIN_QUAD").is_none())
 }
 
-/// [`accumulate_convert_ab_nomul_seeded`] for a span of exactly fourteen rows
-/// (`first_b_med..first_b_med + 14`: seven pairs, no odd row).
-///
-/// Sixteen lanes per pass instead of eight: sixteen accumulators, and each
-/// row's 16 bytes for the pass come from one paired load, so a call issues
-/// 4 x 14 row loads instead of 8 x 14. The seven pairs are unrolled and the
-/// fourteen table bases are formed once per call, so no pair counter, pointer
-/// bump or odd-row test remains.
-///
-/// Bit-exactness: every lane XORs the same `ab_ld` entries (same table, same
-/// row byte) into the same bank slot, grouped in the same row pairs.
+/// [`accumulate_convert_ab_nomul_seeded`] (`U = true`) stepping four
+/// `b_med` rows per iteration instead of two: per four rows one row-pointer
+/// and one table-pointer increment and one loop branch instead of two each,
+/// and the four lookups of a lane fold with two `eor3`. The XOR of the same
+/// table entries into the same lanes (XOR is associative and commutative),
+/// so the bank bytes are identical.
 #[inline(always)]
-pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
+pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_quad(
     chunk_ab_bytes: &[[u8; 64]; 16],
     first_b_med: usize,
+    n_b_med: usize,
     convert: &[F128],
     bank: &mut [F128; 64],
 ) {
     use core::arch::aarch64::*;
 
-    debug_assert!(first_b_med + 14 <= 16);
+    debug_assert!(first_b_med <= n_b_med && n_b_med <= 16);
+    debug_assert_eq!(first_b_med & 1, 0, "paired AB drain requires an even start");
     debug_assert_eq!(convert.len(), 16 * 256);
 
-    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
-    // Rows `first_b_med..first_b_med + 14` and their 4 KiB tables are in
-    // bounds; each pass reads 16 bytes per row at lane offset 0, 16, 32 or 48
-    // and writes sixteen 16-byte bank slots.
+    // SAFETY: as in `accumulate_convert_ab_nomul_seeded`: every row read is
+    // one of the 16 rows of `chunk_ab_bytes` and every table read one of the
+    // `n_b_med <= 16` 4 KiB tables of `convert`.
     unsafe {
-        let t0 = (convert.as_ptr() as *const u8).add(first_b_med * 256 * 16);
-        let t: [*const u8; 14] = core::array::from_fn(|b| t0.add(b * 256 * 16));
-        let mut mid = (chunk_ab_bytes.as_ptr() as *const u8).add((first_b_med + 7) * 64);
-        let mut slot = bank.as_mut_ptr() as *mut u8;
-        for _ in 0..4 {
-            let mut a0 = vld1q_u8(slot);
-            let mut a1 = vld1q_u8(slot.add(16));
-            let mut a2 = vld1q_u8(slot.add(32));
-            let mut a3 = vld1q_u8(slot.add(48));
-            let mut a4 = vld1q_u8(slot.add(64));
-            let mut a5 = vld1q_u8(slot.add(80));
-            let mut a6 = vld1q_u8(slot.add(96));
-            let mut a7 = vld1q_u8(slot.add(112));
-            let mut a8 = vld1q_u8(slot.add(128));
-            let mut a9 = vld1q_u8(slot.add(144));
-            let mut a10 = vld1q_u8(slot.add(160));
-            let mut a11 = vld1q_u8(slot.add(176));
-            let mut a12 = vld1q_u8(slot.add(192));
-            let mut a13 = vld1q_u8(slot.add(208));
-            let mut a14 = vld1q_u8(slot.add(224));
-            let mut a15 = vld1q_u8(slot.add(240));
+        let convert_ptr = convert.as_ptr() as *const u8;
+        let rows = chunk_ab_bytes.as_ptr() as *const u8;
+        let n_rows = n_b_med - first_b_med;
+        let n_quads = n_rows / 4;
+        let pair_tail = n_rows & 2 != 0;
+        let odd_tail = n_rows & 1 == 1;
+        const T: usize = 256 * 16;
+        for lane in (0..64).step_by(8) {
+            let slot = bank.as_mut_ptr().add(lane) as *mut u8;
+            let mut ab0 = vld1q_u8(slot);
+            let mut ab1 = vld1q_u8(slot.add(16));
+            let mut ab2 = vld1q_u8(slot.add(32));
+            let mut ab3 = vld1q_u8(slot.add(48));
+            let mut ab4 = vld1q_u8(slot.add(64));
+            let mut ab5 = vld1q_u8(slot.add(80));
+            let mut ab6 = vld1q_u8(slot.add(96));
+            let mut ab7 = vld1q_u8(slot.add(112));
 
-            // One word of an (even, odd) row pair into eight accumulators.
-            macro_rules! fold8 {
-                ($te:expr, $to:expr, $we:expr, $wo:expr,
-                 $x0:ident, $x1:ident, $x2:ident, $x3:ident,
-                 $x4:ident, $x5:ident, $x6:ident, $x7:ident) => {
-                    $x0 = xor3_u8($x0, ab_ld::<U, 0>($te, $we), ab_ld::<U, 0>($to, $wo));
-                    $x1 = xor3_u8($x1, ab_ld::<U, 8>($te, $we), ab_ld::<U, 8>($to, $wo));
-                    $x2 = xor3_u8($x2, ab_ld::<U, 16>($te, $we), ab_ld::<U, 16>($to, $wo));
-                    $x3 = xor3_u8($x3, ab_ld::<U, 24>($te, $we), ab_ld::<U, 24>($to, $wo));
-                    $x4 = xor3_u8($x4, ab_ld::<U, 32>($te, $we), ab_ld::<U, 32>($to, $wo));
-                    $x5 = xor3_u8($x5, ab_ld::<U, 40>($te, $we), ab_ld::<U, 40>($to, $wo));
-                    $x6 = xor3_u8($x6, ab_ld::<U, 48>($te, $we), ab_ld::<U, 48>($to, $wo));
-                    $x7 = xor3_u8($x7, ab_ld::<U, 56>($te, $we), ab_ld::<U, 56>($to, $wo));
-                };
+            let mut t0 = convert_ptr.add(first_b_med * T);
+            let mut row = rows.add(first_b_med * 64 + lane);
+            for _ in 0..n_quads {
+                let (t1, t2, t3) = (t0.add(T), t0.add(2 * T), t0.add(3 * T));
+                let w0 = (row as *const u64).read_unaligned() as usize;
+                let w1 = (row.add(64) as *const u64).read_unaligned() as usize;
+                let w2 = (row.add(128) as *const u64).read_unaligned() as usize;
+                let w3 = (row.add(192) as *const u64).read_unaligned() as usize;
+                macro_rules! lane4 {
+                    ($ab:ident, $s:literal) => {
+                        $ab = xor3_u8(
+                            xor3_u8($ab, ab_ld::<true, $s>(t0, w0), ab_ld::<true, $s>(t1, w1)),
+                            ab_ld::<true, $s>(t2, w2),
+                            ab_ld::<true, $s>(t3, w3),
+                        );
+                    };
+                }
+                lane4!(ab0, 0);
+                lane4!(ab1, 8);
+                lane4!(ab2, 16);
+                lane4!(ab3, 24);
+                lane4!(ab4, 32);
+                lane4!(ab5, 40);
+                lane4!(ab6, 48);
+                lane4!(ab7, 56);
+                t0 = t0.add(4 * T);
+                row = row.add(256);
             }
-            // Rows `$e` and `$o` of the span: low word to lanes 0..8 of the
-            // pass, high word to lanes 8..16.
-            macro_rules! pair {
-                ($e:literal, $o:literal) => {{
-                    let (e0, e1) = ab_row_pair::<$e>(mid);
-                    let (o0, o1) = ab_row_pair::<$o>(mid);
-                    fold8!(t[$e], t[$o], e0, o0, a0, a1, a2, a3, a4, a5, a6, a7);
-                    fold8!(t[$e], t[$o], e1, o1, a8, a9, a10, a11, a12, a13, a14, a15);
-                }};
+            if pair_tail {
+                let t1 = t0.add(T);
+                let we = (row as *const u64).read_unaligned() as usize;
+                let wo = (row.add(64) as *const u64).read_unaligned() as usize;
+                ab0 = xor3_u8(ab0, ab_ld::<true, 0>(t0, we), ab_ld::<true, 0>(t1, wo));
+                ab1 = xor3_u8(ab1, ab_ld::<true, 8>(t0, we), ab_ld::<true, 8>(t1, wo));
+                ab2 = xor3_u8(ab2, ab_ld::<true, 16>(t0, we), ab_ld::<true, 16>(t1, wo));
+                ab3 = xor3_u8(ab3, ab_ld::<true, 24>(t0, we), ab_ld::<true, 24>(t1, wo));
+                ab4 = xor3_u8(ab4, ab_ld::<true, 32>(t0, we), ab_ld::<true, 32>(t1, wo));
+                ab5 = xor3_u8(ab5, ab_ld::<true, 40>(t0, we), ab_ld::<true, 40>(t1, wo));
+                ab6 = xor3_u8(ab6, ab_ld::<true, 48>(t0, we), ab_ld::<true, 48>(t1, wo));
+                ab7 = xor3_u8(ab7, ab_ld::<true, 56>(t0, we), ab_ld::<true, 56>(t1, wo));
             }
-            pair!(0, 1);
-            pair!(2, 3);
-            pair!(4, 5);
-            pair!(6, 7);
-            pair!(8, 9);
-            pair!(10, 11);
-            pair!(12, 13);
+            if odd_tail {
+                let b_med = n_b_med - 1;
+                let table = convert_ptr.add(b_med * T);
+                let wa = (rows.add(b_med * 64 + lane) as *const u64).read_unaligned() as usize;
+                ab0 = veorq_u8(ab0, ab_ld::<true, 0>(table, wa));
+                ab1 = veorq_u8(ab1, ab_ld::<true, 8>(table, wa));
+                ab2 = veorq_u8(ab2, ab_ld::<true, 16>(table, wa));
+                ab3 = veorq_u8(ab3, ab_ld::<true, 24>(table, wa));
+                ab4 = veorq_u8(ab4, ab_ld::<true, 32>(table, wa));
+                ab5 = veorq_u8(ab5, ab_ld::<true, 40>(table, wa));
+                ab6 = veorq_u8(ab6, ab_ld::<true, 48>(table, wa));
+                ab7 = veorq_u8(ab7, ab_ld::<true, 56>(table, wa));
+            }
 
-            vst1q_u8(slot, a0);
-            vst1q_u8(slot.add(16), a1);
-            vst1q_u8(slot.add(32), a2);
-            vst1q_u8(slot.add(48), a3);
-            vst1q_u8(slot.add(64), a4);
-            vst1q_u8(slot.add(80), a5);
-            vst1q_u8(slot.add(96), a6);
-            vst1q_u8(slot.add(112), a7);
-            vst1q_u8(slot.add(128), a8);
-            vst1q_u8(slot.add(144), a9);
-            vst1q_u8(slot.add(160), a10);
-            vst1q_u8(slot.add(176), a11);
-            vst1q_u8(slot.add(192), a12);
-            vst1q_u8(slot.add(208), a13);
-            vst1q_u8(slot.add(224), a14);
-            vst1q_u8(slot.add(240), a15);
-            mid = mid.add(16);
-            slot = slot.add(256);
+            vst1q_u8(slot, ab0);
+            vst1q_u8(slot.add(16), ab1);
+            vst1q_u8(slot.add(32), ab2);
+            vst1q_u8(slot.add(48), ab3);
+            vst1q_u8(slot.add(64), ab4);
+            vst1q_u8(slot.add(80), ab5);
+            vst1q_u8(slot.add(96), ab6);
+            vst1q_u8(slot.add(112), ab7);
         }
     }
 }
@@ -4213,19 +4201,24 @@ const AB_Z_ALL: usize = 40960; // 256 x 16: [g|g]
 /// Bytes of one image of the z-basis tables (the `T = {}` table is the
 /// image itself and is not copied).
 #[cfg(target_arch = "aarch64")]
-pub(crate) const AB_Z_IMAGE_BYTES: usize = 51200 + 3 * 32768 + 16384;
+pub(crate) const AB_Z_IMAGE_BYTES: usize = AB_Z_REC + 3 * 32768 + 16384;
 #[cfg(target_arch = "aarch64")]
-const AB_Z_REC3: usize = 51200 + 2 * 32768; // 256 x 128: [M0 M2 | N0 N1 | e0e0 e2e2 | f0f0 f1f1]
+const AB_Z_REC3: usize = AB_Z_REC + 2 * 32768; // 256 x 128: [M0 M2 | N0 N1 | e0e0 e2e2 | f0f0 f1f1]
 #[cfg(target_arch = "aarch64")]
-const AB_Z_DDUP: usize = 51200 + 3 * 32768; // 256 x 64: d0d0 d1d1 d2d2 d3d3
+const AB_Z_DDUP: usize = AB_Z_REC + 3 * 32768; // 256 x 64: d0d0 d1d1 d2d2 d3d3
 /// Row-body variant bit: the `x^4` Karatsuba image also takes the
 /// unscaled-index loads (for forms where the plain image is in z form).
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_KARA_SCALED_UNSCALED: u16 = 32;
 #[cfg(target_arch = "aarch64")]
-const AB_Z_REC2: usize = 51200 + 32768; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0 e2 | g | 0]
+const AB_Z_REC2: usize = AB_Z_REC + 32768; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0 e2 | g | 0]
 #[cfg(target_arch = "aarch64")]
-const AB_Z_REC: usize = 51200; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0e0 e2e2]
+// 4 KiB-aligned (2 KiB of padding after `AB_Z_ALLP`, never read): the record
+// base `z + AB_Z_REC` is then one `add #imm, lsl #12` from the image base
+// instead of two adds. Layout only; same table bytes.
+const AB_Z_REC: usize = 53248; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0e0 e2e2]
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(AB_Z_REC % 4096 == 0 && AB_Z_ALLP + 256 * 8 <= AB_Z_REC && (2 * AB_KARA_IMAGE_BYTES) % 4096 == 0);
 /// Row-body variant bit (with [`ABV_Z`]): the four two-load z tables
 /// interleaved in one 128-byte record per byte value, one base register.
 #[cfg(target_arch = "aarch64")]
@@ -4496,6 +4489,134 @@ unsafe fn apply_word_z_mt(
     }
 }
 
+/// Row-body variant bit (with [`ABV_Z`] and [`ABV_Z_REC`]): the z apply's
+/// eight lookup bytes from four index words formed in five integer
+/// instructions, depth four (masked first layer, then unmasked layers that
+/// keep the previous word for the bytes they would corrupt), instead of the
+/// seven partial XOR-shift words. Same lookups, same bytes. See
+/// [`ab_superset_words_m1`].
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_Z_M1: u16 = 32768;
+
+/// Kill switch for [`ABV_Z_M1`]: any value of `FLOCK_NO_ZC_AB_Z_M1` keeps
+/// the seven-word index form. Read once per process. Same bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_z_m1_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_Z_M1").is_none())
+}
+
+/// The superset bytes `z[T]` (XOR of the bytes `b ⊇ T` of `w`) spread over
+/// four words, in five instructions:
+/// - `y1 = w ^ ((w & 0xff00..ff00) >> 8)`: the complete first layer
+///   (`and` with a logical immediate + `eor` with a shifted register);
+/// - `y2 = y1 ^ (y1 >> 16)`: second layer, exact at bytes 0, 1, 4, 5 (at
+///   bytes 2, 3, 6, 7 the second layer is `y1` itself);
+/// - `y3 = y2 ^ (y2 >> 32)`: exact at bytes 0, 1;
+/// - `y3b = y1 ^ (y1 >> 32)`: exact at bytes 2, 3.
+/// So `z0 = y3[0]`, `z1 = y3[1]`, `z2 = y3b[2]`, `z3 = y3b[3]`, `z4 = y2[4]`,
+/// `z5 = y2[5]`, `z6 = y1[6]`, `z7 = w[7]`. Returns `(y1, y2, y3, y3b)`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn ab_superset_words_m1(w: u64) -> (u64, u64, u64, u64) {
+    // `(w & M) >> 8` with the mask applied before the shift, so it stays a
+    // logical immediate (LLVM otherwise emits `lsr` + `and` + `eor`).
+    let y1: u64;
+    // SAFETY: register arithmetic only.
+    unsafe {
+        core::arch::asm!(
+            "and {t}, {w}, #0xff00ff00ff00ff00",
+            "eor {y}, {w}, {t}, lsr #8",
+            w = in(reg) w,
+            t = out(reg) _,
+            y = lateout(reg) y1,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    let y2 = y1 ^ (y1 >> 16);
+    let y3 = y2 ^ (y2 >> 32);
+    let y3b = y1 ^ (y1 >> 32);
+    (y1, y2, y3, y3b)
+}
+
+/// [`apply_word_z`] (`REC`, not `PACK`) with the lookup bytes taken from
+/// [`ab_superset_words_m1`]: exactly the bytes `apply_word_z` extracts from
+/// its seven partial words, so the same lookups.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z_m1(
+    t0: *const u8,
+    z: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let (y1, y2, y3, y3b) = ab_superset_words_m1(w);
+        let ld = |base: *const u8, idx: usize| vld1q_u8(base.add(idx));
+        let r0 = t0.add(ab_z_idx::<0, 6>(y3));
+        let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
+        let rec = |i: usize| -> *const u8 {
+            let a: usize;
+            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) z.add(AB_Z_REC), i = in(reg) i,
+                options(pure, nomem, nostack, preserves_flags));
+            a as *const u8
+        };
+        let a = rec(ab_z_idx::<2, 7>(y3b));
+        let (m0, m2) = (ld(a, 0), ld(a, 16));
+        let a = rec(ab_z_idx::<4, 7>(y2));
+        let (n0, n1) = (ld(a, 32), ld(a, 48));
+        let a = rec(ab_z_idx::<1, 7>(y3));
+        let (d01, d23) = (ld(a, 64), ld(a, 80));
+        let a = rec(ab_z_idx::<3, 7>(y3b));
+        let (e0, e2) = (ld(a, 96), ld(a, 112));
+        let g = ld(z.add(AB_Z_ALL), ab_z_idx::<7, 4>(w));
+        let k = ld(z.add(AB_Z_L12), ab_z_idx::<6, 4>(y1));
+        let f = ld(z.add(AB_Z_SL2), ab_z_idx::<5, 4>(y2));
+        let fg = veorq_u8(f, g);
+        let p = vreinterpretq_u64_u8(xor3_u8(d01, e0, fg));
+        let q = vreinterpretq_u64_u8(xor3_u8(d23, e2, fg));
+        let mk0 = veorq_u8(m0, k);
+        let mk2 = veorq_u8(m2, k);
+        let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
+        let b1 = vreinterpretq_u8_u64(vzip2q_u64(p, p));
+        let b2 = vreinterpretq_u8_u64(vzip1q_u64(q, q));
+        let b3 = vreinterpretq_u8_u64(vzip2q_u64(q, q));
+        (
+            veorq_u8(xor3_u8(l0, mk0, n0), b0),
+            veorq_u8(xor3_u8(l1, mk0, n1), b1),
+            veorq_u8(xor3_u8(l2, mk2, n0), b2),
+            veorq_u8(xor3_u8(l3, mk2, n1), b3),
+        )
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_superset_words_m1_match_superset_bytes() {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for i in 0..20000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let w = match i {
+            0 => 0,
+            1 => u64::MAX,
+            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
+            _ => x,
+        };
+        let z = ab_superset_bytes(w).to_le_bytes();
+        let (y1, y2, y3, y3b) = ab_superset_words_m1(w);
+        let b = |v: u64, j: usize| v.to_le_bytes()[j];
+        let got = [b(y3, 0), b(y3, 1), b(y3b, 2), b(y3b, 3), b(y2, 4), b(y2, 5), b(y1, 6), b(w, 7)];
+        assert_eq!(got, z, "w={w:016x}");
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 #[test]
 fn ab_superset_bytes_matches_definition() {
@@ -4751,6 +4872,8 @@ unsafe fn apply_word_into_4_regs_v<const V: u16, const SCALED: bool>(
                 apply_word_z::<true, true>(table_base, z, word)
             } else if V & ABV_Z_REC != 0 && V & ABV_Z_MT != 0 {
                 apply_word_z_mt(table_base, z, word)
+            } else if V & ABV_Z_REC != 0 && V & ABV_Z_M1 != 0 {
+                apply_word_z_m1(table_base, z, word)
             } else if V & ABV_Z_REC != 0 {
                 apply_word_z::<false, true>(table_base, z, word)
             } else if V & ABV_Z_PACK != 0 {
@@ -5509,4 +5632,134 @@ unsafe fn fused_pmull8_acc<const HI: bool>(
         }
     }
     out
+}
+
+// ---- terrapinelf 749a64e1 (crown): pair16 completion route, kept verbatim ----
+/// Row `B` of a fourteen-row span, 16 bytes at the pass's lane offset, as two
+/// words from one paired load (`ldp`). `mid` points at row 7 of the span plus
+/// the lane offset, so every row offset (`-448..=384`) fits the paired load's
+/// immediate.
+#[inline(always)]
+unsafe fn ab_row_pair<const B: usize>(mid: *const u8) -> (usize, usize) {
+    const { assert!(B < 14) };
+    let (lo, hi): (usize, usize);
+    // SAFETY: `mid` is row 7 of fourteen in-bounds 64-byte rows plus a lane
+    // offset of at most 48, so the 16 bytes read lie inside row `B`; the asm
+    // only reads that memory.
+    unsafe {
+        core::arch::asm!(
+            "ldp {lo}, {hi}, [{p}, #{off}]",
+            off = const (B as isize - 7) * 64,
+            p = in(reg) mid,
+            lo = lateout(reg) lo,
+            hi = lateout(reg) hi,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    (lo, hi)
+}
+
+/// [`accumulate_convert_ab_nomul_seeded`] for a span of exactly fourteen rows
+/// (`first_b_med..first_b_med + 14`: seven pairs, no odd row).
+///
+/// Sixteen lanes per pass instead of eight: sixteen accumulators, and each
+/// row's 16 bytes for the pass come from one paired load, so a call issues
+/// 4 x 14 row loads instead of 8 x 14. The seven pairs are unrolled and the
+/// fourteen table bases are formed once per call, so no pair counter, pointer
+/// bump or odd-row test remains.
+///
+/// Bit-exactness: every lane XORs the same `ab_ld` entries (same table, same
+/// row byte) into the same bank slot, grouped in the same row pairs.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    convert: &[F128],
+    bank: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(first_b_med + 14 <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
+    // Rows `first_b_med..first_b_med + 14` and their 4 KiB tables are in
+    // bounds; each pass reads 16 bytes per row at lane offset 0, 16, 32 or 48
+    // and writes sixteen 16-byte bank slots.
+    unsafe {
+        let t0 = (convert.as_ptr() as *const u8).add(first_b_med * 256 * 16);
+        let t: [*const u8; 14] = core::array::from_fn(|b| t0.add(b * 256 * 16));
+        let mut mid = (chunk_ab_bytes.as_ptr() as *const u8).add((first_b_med + 7) * 64);
+        let mut slot = bank.as_mut_ptr() as *mut u8;
+        for _ in 0..4 {
+            let mut a0 = vld1q_u8(slot);
+            let mut a1 = vld1q_u8(slot.add(16));
+            let mut a2 = vld1q_u8(slot.add(32));
+            let mut a3 = vld1q_u8(slot.add(48));
+            let mut a4 = vld1q_u8(slot.add(64));
+            let mut a5 = vld1q_u8(slot.add(80));
+            let mut a6 = vld1q_u8(slot.add(96));
+            let mut a7 = vld1q_u8(slot.add(112));
+            let mut a8 = vld1q_u8(slot.add(128));
+            let mut a9 = vld1q_u8(slot.add(144));
+            let mut a10 = vld1q_u8(slot.add(160));
+            let mut a11 = vld1q_u8(slot.add(176));
+            let mut a12 = vld1q_u8(slot.add(192));
+            let mut a13 = vld1q_u8(slot.add(208));
+            let mut a14 = vld1q_u8(slot.add(224));
+            let mut a15 = vld1q_u8(slot.add(240));
+
+            // One word of an (even, odd) row pair into eight accumulators.
+            macro_rules! fold8 {
+                ($te:expr, $to:expr, $we:expr, $wo:expr,
+                 $x0:ident, $x1:ident, $x2:ident, $x3:ident,
+                 $x4:ident, $x5:ident, $x6:ident, $x7:ident) => {
+                    $x0 = xor3_u8($x0, ab_ld::<U, 0>($te, $we), ab_ld::<U, 0>($to, $wo));
+                    $x1 = xor3_u8($x1, ab_ld::<U, 8>($te, $we), ab_ld::<U, 8>($to, $wo));
+                    $x2 = xor3_u8($x2, ab_ld::<U, 16>($te, $we), ab_ld::<U, 16>($to, $wo));
+                    $x3 = xor3_u8($x3, ab_ld::<U, 24>($te, $we), ab_ld::<U, 24>($to, $wo));
+                    $x4 = xor3_u8($x4, ab_ld::<U, 32>($te, $we), ab_ld::<U, 32>($to, $wo));
+                    $x5 = xor3_u8($x5, ab_ld::<U, 40>($te, $we), ab_ld::<U, 40>($to, $wo));
+                    $x6 = xor3_u8($x6, ab_ld::<U, 48>($te, $we), ab_ld::<U, 48>($to, $wo));
+                    $x7 = xor3_u8($x7, ab_ld::<U, 56>($te, $we), ab_ld::<U, 56>($to, $wo));
+                };
+            }
+            // Rows `$e` and `$o` of the span: low word to lanes 0..8 of the
+            // pass, high word to lanes 8..16.
+            macro_rules! pair {
+                ($e:literal, $o:literal) => {{
+                    let (e0, e1) = ab_row_pair::<$e>(mid);
+                    let (o0, o1) = ab_row_pair::<$o>(mid);
+                    fold8!(t[$e], t[$o], e0, o0, a0, a1, a2, a3, a4, a5, a6, a7);
+                    fold8!(t[$e], t[$o], e1, o1, a8, a9, a10, a11, a12, a13, a14, a15);
+                }};
+            }
+            pair!(0, 1);
+            pair!(2, 3);
+            pair!(4, 5);
+            pair!(6, 7);
+            pair!(8, 9);
+            pair!(10, 11);
+            pair!(12, 13);
+
+            vst1q_u8(slot, a0);
+            vst1q_u8(slot.add(16), a1);
+            vst1q_u8(slot.add(32), a2);
+            vst1q_u8(slot.add(48), a3);
+            vst1q_u8(slot.add(64), a4);
+            vst1q_u8(slot.add(80), a5);
+            vst1q_u8(slot.add(96), a6);
+            vst1q_u8(slot.add(112), a7);
+            vst1q_u8(slot.add(128), a8);
+            vst1q_u8(slot.add(144), a9);
+            vst1q_u8(slot.add(160), a10);
+            vst1q_u8(slot.add(176), a11);
+            vst1q_u8(slot.add(192), a12);
+            vst1q_u8(slot.add(208), a13);
+            vst1q_u8(slot.add(224), a14);
+            vst1q_u8(slot.add(240), a15);
+            mid = mid.add(16);
+            slot = slot.add(256);
+        }
+    }
 }
