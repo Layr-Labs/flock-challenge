@@ -348,6 +348,7 @@ static BSTATIC_ARM_LIVE: [bool; 31] = [true, true, true, true, true, true, true,
 /// which case the caller must run the generic kernel.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn shift_reduce_inner_ab_bstatic<const FAST: bool>(
     a_packed: &[u8],
     b_packed: &[u8],

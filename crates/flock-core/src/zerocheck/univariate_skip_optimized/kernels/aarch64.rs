@@ -3495,6 +3495,7 @@ pub(crate) fn ab_kara_unscaled_enabled() -> bool {
 }
 /// The form of the static-B Horner rows when [`ab_kara_enabled`].
 #[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const AB_ROWS_VARIANT: u16 = ABV_KARA | ABV_INLINE_WINDOW;
 
 /// Kill switch for the Karatsuba table apply in the round-one AB rows:
@@ -4303,10 +4304,11 @@ fn ab_z_idx<const J: u32, const LOG: u32>(word: u64) -> usize {
 }
 
 /// [`apply_word_into_4_regs`] in the z-basis form. `t0` is the table image
-/// (64-byte rows), `z` its [`AB_Z_IMAGE_BYTES`] of z-basis tables.
+/// (64-byte rows), `z` its [`AB_Z_IMAGE_BYTES`] of z-basis tables. `OUT3`:
+/// the outputs in the [`ABV_Z_OUT3`] form.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_z<const PACK: bool, const REC: bool>(
+unsafe fn apply_word_z<const PACK: bool, const REC: bool, const OUT3: bool>(
     t0: *const u8,
     z: *const u8,
     w: u64,
@@ -4379,6 +4381,19 @@ unsafe fn apply_word_z<const PACK: bool, const REC: bool>(
         let fg = veorq_u8(f, g);
         let p = vreinterpretq_u64_u8(xor3_u8(d01, e0, fg));
         let q = vreinterpretq_u64_u8(xor3_u8(d23, e2, fg));
+        if OUT3 {
+            // The five terms of each output below, as two three-way XORs.
+            let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
+            let b1 = vreinterpretq_u8_u64(vzip2q_u64(p, p));
+            let b2 = vreinterpretq_u8_u64(vzip1q_u64(q, q));
+            let b3 = vreinterpretq_u8_u64(vzip2q_u64(q, q));
+            return (
+                xor3_u8(xor3_u8(m0, k, n0), l0, b0),
+                xor3_u8(xor3_u8(m0, k, n1), l1, b1),
+                xor3_u8(xor3_u8(m2, k, n0), l2, b2),
+                xor3_u8(xor3_u8(m2, k, n1), l3, b3),
+            );
+        }
         let mk0 = veorq_u8(m0, k);
         let mk2 = veorq_u8(m2, k);
         let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
@@ -4391,6 +4406,71 @@ unsafe fn apply_word_z<const PACK: bool, const REC: bool>(
             veorq_u8(xor3_u8(l2, mk2, n0), b2),
             veorq_u8(xor3_u8(l3, mk2, n1), b3),
         )
+    }
+}
+
+/// Row-body variant bit (with [`ABV_Z`] and [`ABV_Z_REC`]): the z-basis
+/// apply forms each of its four outputs as two three-way XORs of its five
+/// terms (`m`, `k`, `n`, the plain row lane and the spread `b`) instead of
+/// XORing `m ^ k` once for two outputs and finishing each output with a
+/// three-way and a two-way XOR: eight XOR instructions per word instead of
+/// ten. Every output is the XOR of the same terms, so the bytes are the same.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_Z_OUT3: u16 = 16384;
+
+/// Kill switch for [`ABV_Z_OUT3`]: any value of `FLOCK_NO_ZC_AB_Z_EOR3`
+/// keeps the shared `m ^ k` form. Read once per process. The rows written
+/// are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_z_out3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_Z_EOR3").is_none())
+}
+
+/// The [`ABV_Z_OUT3`] z-basis apply writes the shared `m ^ k` form's bytes
+/// and the plain apply's, for the zero and all-ones words, every one-byte
+/// word (each value at each byte) and random words.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_z_out3_apply_matches_shared_form() {
+    use crate::ntt::AdditiveNttGf8;
+    use core::arch::aarch64::*;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let kara = ab_kara_tables(&table);
+    let (t, sw) = (table.data_ptr(), table.half_swapped_data_ptr());
+    let bytes = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| {
+        let mut out = [0u8; 64];
+        // SAFETY: four 16-byte stores into a 64-byte array.
+        unsafe {
+            vst1q_u8(out.as_mut_ptr(), v.0);
+            vst1q_u8(out.as_mut_ptr().add(16), v.1);
+            vst1q_u8(out.as_mut_ptr().add(32), v.2);
+            vst1q_u8(out.as_mut_ptr().add(48), v.3);
+        }
+        out
+    };
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for i in 0..20000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let w = match i {
+            0 => 0,
+            1 => u64::MAX,
+            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
+            _ => x,
+        };
+        // SAFETY: the applies read inside the table images only.
+        let (new, old, plain) = unsafe {
+            (
+                bytes(apply_word_into_4_regs_v::<{ AB_Z_VARIANT | ABV_Z_OUT3 }, false>(t, sw, kara, w)),
+                bytes(apply_word_into_4_regs_v::<AB_Z_VARIANT, false>(t, sw, kara, w)),
+                bytes(apply_word_into_4_regs(t, sw, w)),
+            )
+        };
+        assert_eq!(new, old, "w={w:016x}");
+        assert_eq!(new, plain, "w={w:016x}");
     }
 }
 
@@ -4748,15 +4828,17 @@ unsafe fn apply_word_into_4_regs_v<const V: u16, const SCALED: bool>(
                 kara.add(2 * AB_KARA_IMAGE_BYTES)
             };
             if V & ABV_Z_REC != 0 && V & ABV_Z_PACK != 0 {
-                apply_word_z::<true, true>(table_base, z, word)
+                apply_word_z::<true, true, false>(table_base, z, word)
             } else if V & ABV_Z_REC != 0 && V & ABV_Z_MT != 0 {
                 apply_word_z_mt(table_base, z, word)
+            } else if V & ABV_Z_REC != 0 && V & ABV_Z_OUT3 != 0 {
+                apply_word_z::<false, true, true>(table_base, z, word)
             } else if V & ABV_Z_REC != 0 {
-                apply_word_z::<false, true>(table_base, z, word)
+                apply_word_z::<false, true, false>(table_base, z, word)
             } else if V & ABV_Z_PACK != 0 {
-                apply_word_z::<true, false>(table_base, z, word)
+                apply_word_z::<true, false, false>(table_base, z, word)
             } else {
-                apply_word_z::<false, false>(table_base, z, word)
+                apply_word_z::<false, false, false>(table_base, z, word)
             }
         } else if V & ABV_KARA != 0 {
             apply_word_kara::<V, SCALED>(kara, word)
@@ -5307,17 +5389,9 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     nt_store,
                 )
             } else {
-                shift_reduce_inner_ab_bstatic::<false>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    chunk_byte_base,
-                    b_med,
-                    bstatic_w,
-                    context,
-                    out,
-                    nt_store,
-                )
+                // `FLOCK_NO_FAST_SHIFT_REDUCE`: every row takes h4 (the same
+                // bytes).
+                false
             };
         if handled {
             return;
