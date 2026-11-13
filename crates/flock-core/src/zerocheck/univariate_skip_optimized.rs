@@ -1949,32 +1949,37 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 out_outer,
                 direct,
             );
-        } else if kernels::aarch64::ab_hz_helper_enabled() && kernels::aarch64::ab_horner2_enabled() {
-            // The efficiency-core form with the two-degree Horner carry fold
-            // (`FLOCK_NO_ZC_AB_HORNER2` kills; same bytes).
-            kernels::aarch64::bstatic_horner_window_rows::<{
-                kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2
-            }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
         } else if kernels::aarch64::ab_hz_helper_enabled() {
-            kernels::aarch64::bstatic_horner_window_rows::<{ kernels::aarch64::AB_HZ_VARIANT }>(
-                within_hash_outer,
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                partials,
-                out_outer,
-                direct,
-            );
+            // The efficiency-core form, optionally with the two-degree Horner
+            // carry fold (`FLOCK_NO_ZC_AB_HORNER2` kills; same bytes). Its
+            // inlined window body takes the same one-per-window bounds check
+            // as the P-core arm (`FLOCK_NO_ZC_AB_ROW_SETUP_HOIST`, any value,
+            // restores one check per row; same bytes).
+            macro_rules! hz_rows {
+                ($entry:ident, $v:expr) => {
+                    kernels::aarch64::$entry::<{ $v }>(
+                        within_hash_outer,
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        partials,
+                        out_outer,
+                        direct,
+                    )
+                };
+            }
+            const HZ: u16 = kernels::aarch64::AB_HZ_VARIANT;
+            const HZ2: u16 = kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2;
+            match (
+                kernels::aarch64::ab_horner2_enabled(),
+                kernels::aarch64::ab_row_setup_hoist_enabled(),
+            ) {
+                (true, true) => hz_rows!(bstatic_horner_window_rows_hoisted, HZ2),
+                (true, false) => hz_rows!(bstatic_horner_window_rows, HZ2),
+                (false, true) => hz_rows!(bstatic_horner_window_rows_hoisted, HZ),
+                (false, false) => hz_rows!(bstatic_horner_window_rows, HZ),
+            }
         } else {
             kernels::aarch64::bstatic_horner_window_rows::<0>(
                 within_hash_outer,
@@ -3059,8 +3064,8 @@ fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
     let n_lo = n_lo_and_inner - N_INNER;
     let n_banks = 1usize << bank_bits;
     let bank_mask = n_banks - 1;
-    let range_start = lo_range.start;
-    let store_first = lo_range.len() >= n_banks;
+    // First-touch stores need the range to open with every bank exactly once.
+    let store_first = lo_range.start == 0 && lo_range.end >= n_banks;
     let unscaled = zc_ab_unscaled_enabled();
     let seeded = zc_ab_seeded_enabled();
     if !store_first {
@@ -3071,7 +3076,7 @@ fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
-        let first_touch = store_first && x_outer_lo - range_start < n_banks;
+        let first_touch = store_first && x_outer_lo < n_banks;
         let w = x_outer_lo >> bank_bits;
         let u = x_outer_lo & bank_mask;
         let bank: &mut [F128; ELL] = (&mut banks[u * ELL..(u + 1) * ELL])
