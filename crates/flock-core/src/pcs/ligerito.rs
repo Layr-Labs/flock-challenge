@@ -9859,6 +9859,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
 
     for i in 0..r {
+        if i + 2 == r || r == 1 {
+            // Publish-path warm-up (x86 fd1b67de item 20): fire the
+            // publisher's hook on an idle helper during the last two (small)
+            // levels so it is done well before the publication rename.
+            // Proof-neutral; no-op unless the ranked publisher installed it.
+            crate::spawn_publish_warm_hook();
+        }
         let k_i = config.recursive_ks[i];
         let mut level_rs = Vec::with_capacity(k_i);
         let _t = std::time::Instant::now();
