@@ -395,8 +395,10 @@ fn csc_from_rows(m: &SparseBinaryMatrix) -> (Vec<u32>, CscRowIndices) {
     }
     let mut next = col_ptr.clone();
     let nnz = *col_ptr.last().unwrap() as usize;
-    let compact =
-        m.num_rows <= (u16::MAX as usize + 1) && std::env::var_os("FLOCK_CSC_U32").is_none();
+    // Read once per process: the ranked worker's env is fixed at spawn.
+    static CSC_U32_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let csc_u32_off = *CSC_U32_OFF.get_or_init(|| std::env::var_os("FLOCK_CSC_U32").is_some());
+    let compact = m.num_rows <= (u16::MAX as usize + 1) && !csc_u32_off;
     let rows_flat = if compact {
         let mut rows_flat = vec![0u16; nnz];
         for (r, row) in m.rows.iter().enumerate() {
@@ -997,6 +999,30 @@ fn ranked_lincheck_fold_gpu_shape(m: usize, k_log: usize) -> bool {
     (cfg!(test) || (m == 32 && k_log == 14))
         && m >= k_log + 6
         && !FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Ranked lincheck join latch, read once per process. The ranked worker's
+/// environment is fixed at spawn, so `FLOCK_NO_LINCHECK_JOIN` cannot change
+/// mid-prove; caching it removes the timed-path env lookup without changing
+/// any scheduling decision.
+#[inline]
+fn lincheck_join_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_none())
+}
+
+/// `LINCHECK_TRACE` latch, read once per process (diagnostics only).
+#[inline]
+fn lincheck_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LINCHECK_TRACE").is_ok())
+}
+
+/// `VERIFY_TRACE` latch, read once per process (diagnostics only).
+#[inline]
+fn verify_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VERIFY_TRACE").is_ok())
 }
 
 /// Build eq(x_outer, ·) for the witness-stripe fold. The exact ranked shape
@@ -1700,7 +1726,7 @@ fn prove_padded_inner<Ch: Challenger>(
     assert_eq!(x_ab.x_outer.len(), n_log);
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = lincheck_trace_enabled();
 
     // 1. Sample α (matches verifier's order). Used to batch the two scalar
     //    consistency checks v_a, v_b into a single sumcheck.
@@ -1779,12 +1805,11 @@ fn prove_padded_inner<Ch: Challenger>(
         }
         z_vec
     };
-    let ((mut comb_vec, eq_inner), mut z_vec) =
-        if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
-            (comb_branch(), z_branch())
-        } else {
-            rayon::join(comb_branch, z_branch)
-        };
+    let ((mut comb_vec, eq_inner), mut z_vec) = if lincheck_join_enabled() {
+        rayon::join(comb_branch, z_branch)
+    } else {
+        (comb_branch(), z_branch())
+    };
     let mut z_bind_dst: Option<Vec<F128>> = None;
     let mut captured_z_vec: Option<Vec<F128>> =
         if capture_z_vec && eq_inner.len() == z_vec.len() {
@@ -1954,7 +1979,7 @@ pub fn verify<Ch: Challenger>(
 
     challenger.observe_label(b"flock-lincheck-v0");
 
-    let trace = std::env::var("VERIFY_TRACE").is_ok();
+    let trace = verify_trace_enabled();
     let fmt = |s: f64| -> String {
         let ms = s * 1000.0;
         if ms < 1.0 {

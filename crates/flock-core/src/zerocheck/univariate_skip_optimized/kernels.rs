@@ -606,8 +606,15 @@ pub(super) fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     assert_eq!(convert.len(), 16 * 256);
     #[cfg(target_arch = "aarch64")]
     unsafe {
+        // Composition of two exact drains. The fourteen-row span takes the
+        // sixteen-lane paired form; every other even-start span takes the
+        // four-row drain step. The two routes are disjoint in span width, and
+        // both XOR the same table entries into the same lanes, so the bank
+        // bytes are identical to the incumbent kernel.
         if seeded_pair16_route::<U>(first_b_med, n_b_med) && ab_completion_pair16_enabled() {
             aarch64::accumulate_convert_ab_nomul_seeded_pair16::<U>(chunk_ab_bytes, first_b_med, convert, bank);
+        } else if U && first_b_med & 1 == 0 && aarch64::ab_drain_quad_enabled() {
+            aarch64::accumulate_convert_ab_nomul_seeded_quad(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
         } else {
             aarch64::accumulate_convert_ab_nomul_seeded::<U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
         }

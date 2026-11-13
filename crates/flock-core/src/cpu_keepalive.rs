@@ -87,6 +87,36 @@ pub fn pool_spin_release() {
     imp::pool_spin_release();
 }
 
+/// GPU-tail pool bridge (`FLOCK_NO_CB3_POOL_SPIN=1` kills): from the moment
+/// the hybrid commit's CPU arm has nothing left but the GPU suffix Merkle
+/// (cb3) until zerocheck's first parallel regions are under way, keep the
+/// main pool's other workers in the same hot spin as [`keepalive_start`]'s
+/// pool form instead of letting them park through the GPU-only tail. They
+/// keep executing any pool job (`rayon::yield_now`), so the tail-fill's eq
+/// build and round one's AB completion start on running cores at an
+/// undecayed clock instead of waking parked workers one by one. The calling
+/// worker (the one waiting on cb3) is skipped. Scheduling only; released by
+/// [`pool_spin_release`], bounded by a short deadline.
+pub fn pool_spin_bridge_start() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::pool_spin_bridge_start();
+}
+
+/// Lincheck/open pool bridge (`FLOCK_NO_OPEN_POOL_SPIN=1` kills): from the
+/// lincheck call through the PCS open, hold all main-pool workers but one in
+/// the hot pool spin. The two phases are chains of short parallel regions
+/// separated by serial Fiat-Shamir steps (lincheck's serial sumcheck, the
+/// ring-switch transcript, the fold grinds, the L1 Merkle wait, the L0
+/// query opens); parked workers otherwise pay a wake per region and drop
+/// clock across each serial gap. Workers keep executing every pool job
+/// (`rayon::yield_now`), so the work and its bytes are unchanged; one worker
+/// is left free for the calling thread. Released by [`pool_spin_release`]
+/// after the open; bounded by a deadline.
+pub fn pool_spin_open_start() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::pool_spin_open_start();
+}
+
 /// Stop the keep-alive: signal the spin threads and join them. Idempotent and
 /// safe to call from any thread. Called by the seed-pipe thread the instant its
 /// stdin `read()` returns (before forwarding the seed or starting the
@@ -217,6 +247,51 @@ mod imp {
             pool_spin_body(deadline);
         });
         true
+    }
+
+    /// See [`super::pool_spin_open_start`].
+    pub(super) fn pool_spin_open_start() {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_OPEN_POOL_SPIN").is_some()) {
+            return;
+        }
+        let n = rayon::current_num_threads();
+        if n <= 1 || POOL_SPIN.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Leave the caller's worker (when on the pool) or the last worker
+        // free, so the serial steps between parallel regions keep a core.
+        let skip = rayon::current_thread_index().unwrap_or(n - 1);
+        const OPEN_MAX: Duration = Duration::from_millis(40);
+        let deadline = Instant::now() + OPEN_MAX;
+        rayon::spawn_broadcast(move |ctx| {
+            if ctx.index() == skip {
+                return;
+            }
+            pool_spin_body(deadline);
+        });
+    }
+
+    /// See [`super::pool_spin_bridge_start`].
+    pub(super) fn pool_spin_bridge_start() {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_CB3_POOL_SPIN").is_some()) {
+            return;
+        }
+        let Some(caller) = rayon::current_thread_index() else {
+            return;
+        };
+        if rayon::current_num_threads() <= 1 || POOL_SPIN.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        const BRIDGE_MAX: Duration = Duration::from_millis(12);
+        let deadline = Instant::now() + BRIDGE_MAX;
+        rayon::spawn_broadcast(move |ctx| {
+            if ctx.index() == caller {
+                return;
+            }
+            pool_spin_body(deadline);
+        });
     }
 
     fn pool_spin_body(deadline: Instant) {

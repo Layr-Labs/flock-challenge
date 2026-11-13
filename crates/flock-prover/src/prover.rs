@@ -42,13 +42,37 @@ pub const ENV_NO_ZC_AB_IDENTITY_PREFIX_OMIT: &str = "FLOCK_NO_ZC_AB_IDENTITY_PRE
 /// Literal `1` retains C1 while computing window 30 normally.
 pub const ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT: &str = "FLOCK_NO_ZC_AB_OUTPUT_WINDOW_OMIT";
 
+/// Process-wide latches for the direct-AB/direct-C entry predicates. The
+/// ranked worker's environment is fixed at spawn, so each value is constant
+/// per process; caching it in `OnceLock` (the codebase's own convention)
+/// removes the timed-path env lookup without changing any decision.
+#[inline]
+fn direct_ab_env_latches() -> (bool, bool) {
+    static L: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        (
+            std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none(),
+            std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none(),
+        )
+    })
+}
+
+/// `FLOCK_PHASE_TIMING` latch, read once per process (the ranked worker's
+/// environment is fixed at spawn). Kept off the timed spine.
+#[inline]
+fn phase_timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_PHASE_TIMING").is_some())
+}
+
 #[inline]
 fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
+    let (open_direct_ab, lig_fold2) = direct_ab_env_latches();
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
-        && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+        && open_direct_ab
+        && lig_fold2
 }
 
 /// Whether the c-claim ships its four-bank sufficient statistic instead of the
@@ -535,7 +559,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = phase_timing_enabled();
     flock_core::tmark::mark("open start");
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
@@ -593,6 +617,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     };
     let [ab, c] = claims;
     flock_core::epool::set_linger_phase(false);
+    flock_core::cpu_keepalive::pool_spin_release();
     flock_core::tmark::mark("open returned");
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
@@ -2400,7 +2425,7 @@ fn commit_with_round1_ab_precompute(
             // store is one relaxed atomic per prove).
             flock_core::tmark::mark("ab arm end");
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
-            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            if phase_timing_enabled() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
@@ -2506,7 +2531,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = phase_timing_enabled();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
                       stripe_help: Option<&(dyn Fn() + Sync)>,
                       producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
@@ -2881,6 +2906,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
+    // Safety release of the commit-tail pool bridge (zerocheck ends it
+    // after round one; idempotent).
+    flock_core::cpu_keepalive::pool_spin_release();
     flock_core::gpu_commit::lc_gpu_wake_arm(false);
     flock_core::tmark::mark("zc end");
     let cpu_lc0 = phase_timing.then(process_cpu_ms);
@@ -2891,6 +2919,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
     // Lincheck runs on a main-pool worker (`flock_core::in_pool`), as above.
     flock_core::tmark::mark("lc call");
+    // Hold the main pool hot through lincheck and the open (see
+    // `cpu_keepalive::pool_spin_open_start`); released after the open.
+    flock_core::cpu_keepalive::pool_spin_open_start();
     flock_core::epool::set_linger_phase(true);
     let (lc_proof, lc_claim, z_vec_pre) = flock_core::in_pool(|| {
         flock_core::tmark::mark("lc body start");
