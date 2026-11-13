@@ -2317,6 +2317,99 @@ unsafe fn fold_two_codes_paired_q(
     }
 }
 
+/// Byte `j` of the even b code of pair `p` of a 128-pair block (bit `j` of
+/// entry `p`) is 0xff in every block of the ranked BLAKE3 layout: the b rows
+/// of the identity prefix, of the two lin-id rows of every G block and of
+/// the output words are all ones. Pairs 121.. are padding (no entry). The
+/// kernel checks every pair's bytes before using an entry.
+pub(crate) const R2_STATIC_B_EVEN_ONES: [u8; 128] = [
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x80, 0x00, 0xc0, 0x00,
+    0xc0, 0x00, 0xe0, 0x00, 0xf0, 0x00, 0xf8, 0x00, 0xf8, 0x00, 0xfc, 0x00, 0xfe, 0x00, 0x7f, 0x00,
+    0x7f, 0x00, 0x3f, 0x00, 0x1f, 0x00, 0x0f, 0x00, 0x0f, 0x00, 0x07, 0x00, 0x03, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x80, 0x00, 0xc0, 0x00, 0xe0, 0x00, 0xf0, 0x00, 0xf0,
+    0x00, 0xf8, 0x00, 0xfc, 0x00, 0xfe, 0x00, 0xfe, 0x00, 0x7f, 0x00, 0x3f, 0x00, 0x1f, 0x00, 0x1f,
+    0x00, 0x0f, 0x00, 0x07, 0x00, 0x03, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x80, 0x00, 0xc0, 0x00, 0xe0, 0x00, 0xe0, 0x00, 0xf0, 0x00, 0xf8, 0x00, 0xfc, 0x00, 0xfc, 0x00,
+    0xfe, 0x00, 0x7f, 0x00, 0x3f, 0x00, 0xff, 0xff, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Kill switch for the static-ones b lookups of the round-two pre-scaled
+/// kernel: any value of `FLOCK_NO_R2_STATIC_B_ONES` makes every pair look up
+/// all eight b bytes. Read once per process. Same entries, same values.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn r2_static_b_ones_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_STATIC_B_ONES").is_none())
+}
+
+/// Byte mask of the bytes set in `m` (bit `j` gives byte `j` = 0xff).
+const fn byte_mask64(m: u8) -> u64 {
+    let mut out = 0u64;
+    let mut j = 0;
+    while j < 8 {
+        if m & (1 << j) != 0 {
+            out |= 0xff << (8 * j);
+        }
+        j += 1;
+    }
+    out
+}
+
+/// [`fold_two_row_codes_q`] whose second row has its bytes in `M` equal to
+/// 0xff: those entries are not looked up; `ones[P]` (the XOR of entry 255 of
+/// the banks in `M`) takes their place, one load at an immediate offset
+/// from `ones` for all of them. If the
+/// row's bytes in `M` are not all 0xff, or `M` has fewer than two bytes, it
+/// is [`fold_two_row_codes_q`]. The table is a XOR of per-bank entries, so
+/// the value is the same either way.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_two_row_codes_static_q<const M: u8, const P: usize>(
+    table_data: *const u8,
+    row0: u64,
+    row1: u64,
+    ones: *const core::arch::aarch64::uint64x2_t,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        if M.count_ones() < 2 || row1 & byte_mask64(M) != byte_mask64(M) {
+            return fold_two_row_codes_q(table_data, row0, row1);
+        }
+        const STRIDE: usize = 256 * 16;
+        let acc0 = fold_row_code_q(table_data, row0);
+        let mut acc1: uint64x2_t;
+        core::arch::asm!(
+            "ldr {v:q}, [{base}, #{off}]",
+            base = in(reg) ones,
+            off = const 16 * P,
+            v = lateout(vreg) acc1,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+        macro_rules! var {
+            ($chunk:literal) => {
+                if M & (1 << $chunk) == 0 {
+                    acc1 = veorq_u64(
+                        acc1,
+                        bank_load_q::<{ 8 * $chunk }>(table_data.add($chunk * STRIDE), row1),
+                    );
+                }
+            };
+        }
+        var!(0);
+        var!(1);
+        var!(2);
+        var!(3);
+        var!(4);
+        var!(5);
+        var!(6);
+        var!(7);
+        (acc0, acc1)
+    }
+}
+
 ///
 ///
 ///
@@ -2340,7 +2433,24 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
 ) {
     unsafe {
         match (r2_gpr_delta_enabled(), r2_fixed_pads_enabled()) {
-            (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true>(
+            (true, true) if r2_static_b_ones_enabled() => {
+                fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true>(
+                    table_data,
+                    a_packed,
+                    b_packed,
+                    anchors,
+                    deltas,
+                    eq_lo,
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    degen,
+                    skip_dead,
+                    out,
+                )
+            }
+            (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2355,7 +2465,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (true, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false>(
+            (true, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2370,7 +2480,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (false, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true>(
+            (false, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2385,7 +2495,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (false, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false>(
+            (false, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2410,6 +2520,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
 unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
     const GPR_DELTA: bool,
     const FIXED_PADS: bool,
+    const STATIC_B: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -2467,6 +2578,28 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
             && (pair_idx_base & 127) == 0
             && lo_size.is_multiple_of(128);
         let fixed_pads = FIXED_PADS && aligned_padding;
+        // `STATIC_B`: entry `p` is the XOR of entry 255 of every bank whose
+        // byte is static in pair `p`'s even b code (`R2_STATIC_B_EVEN_ONES`).
+        let static_ones: Vec<uint64x2_t> = if STATIC_B && fixed_pads {
+            R2_STATIC_B_EVEN_ONES
+                .iter()
+                .map(|&m| {
+                    let mut v = zero;
+                    for j in 0..8 {
+                        if m & (1 << j) != 0 {
+                            v = veorq_u64(
+                                v,
+                                vld1q_u64(table_data.add(j * 256 * 16 + 255 * 16).cast::<u64>()),
+                            );
+                        }
+                    }
+                    v
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ones_ptr = static_ones.as_ptr();
         for first in (0..lo_size / 2).step_by(32) {
             for t in 0..2 {
                 let mut w0 = tri_zero;
@@ -2488,20 +2621,16 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                     }
                 }
                 let mut xb = vdupq_n_u64(1u64 << (b_end - 1));
-                macro_rules! group {
-                    ($pos:expr, $pads:expr) => {
-                        'group: {
-                            let u = first + 2 * $pos + t;
-                            let x_lo0 = 2 * u;
-                            let x_lo1 = x_lo0 + 1;
-                            let (pad0, pad1): (bool, bool) = ($pads)(x_lo0, x_lo1);
-                            let pair = |x_lo: usize, pad: bool| {
+                // One pair of a group: `$m` its static-ones mask, `$p` its
+                // index in the block.
+                macro_rules! pair { ($x_lo:expr, $pad:expr, $m:expr, $p:expr) => {'pair: {
+                            let (x_lo, pad): (usize, bool) = ($x_lo, $pad);
                                 if pad {
                                     if !skip_dead {
                                         store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
                                         vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
                                     }
-                                    return (zero, zero, 0u64, 0u64, false);
+                                    break 'pair (zero, zero, 0u64, 0u64, false);
                                 }
                                 let a_row = a_packed.add(2 * x_lo * 8).cast::<u64>();
                                 let b_row = b_packed.add(2 * x_lo * 8).cast::<u64>();
@@ -2521,7 +2650,12 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 let (a, b) = if deg {
                                     (fold_row_code_q(table_data, a_even), b_ones)
                                 } else {
-                                    fold_two_row_codes_q(table_data, a_even, b_even)
+                                    fold_two_row_codes_static_q::<{ $m }, { $p }>(
+                                        table_data,
+                                        a_even,
+                                        b_even,
+                                        ones_ptr,
+                                    )
                                 };
                                 store_anchor_pair_nt(anchors.add(2 * x_lo), a, b);
                                 if GPR_DELTA {
@@ -2540,9 +2674,24 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                     vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
                                 }
                                 (a, b, a_odd, b_odd, deg)
-                            };
-                            let (a0, b0, a1c, b1c, deg0) = pair(x_lo0, pad0);
-                            let (a2, b2, a3c, b3c, deg1) = pair(x_lo1, pad1);
+                            }}}
+                // `$m0`, `$m1`: the static-ones masks of the group's two pairs
+                // and `$p0` the first pair's index in its block (all zero
+                // outside the `STATIC_B` sequences).
+                macro_rules! group {
+                    ($pos:expr, $pads:expr, $m0:expr, $m1:expr, $p0:expr) => {
+                        'group: {
+                            let u = first + 2 * $pos + t;
+                            let mut x_lo0 = 2 * u;
+                            if STATIC_B {
+                                // The spelled-out positions form their pair
+                                // addresses per group, not all up front.
+                                core::arch::asm!("/* {0} */", inout(reg) x_lo0, options(pure, nomem, nostack, preserves_flags));
+                            }
+                            let x_lo1 = x_lo0 + 1;
+                            let (pad0, pad1): (bool, bool) = ($pads)(x_lo0, x_lo1);
+                            let (a0, b0, a1c, b1c, deg0) = pair!(x_lo0, pad0, $m0, $p0);
+                            let (a2, b2, a3c, b3c, deg1) = pair!(x_lo1, pad1, $m1, $p0 + 1);
                             if pad0 & pad1 {
                                 break 'group;
                             }
@@ -2576,15 +2725,91 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                         ((pair_idx_base + x1) & pair_in_block_mask) >= useful_pairs_inclusive,
                     )
                 };
-                if fixed_pads {
+                if STATIC_B && fixed_pads {
+                    // The fixed-padding sequence below with every position
+                    // spelled out, so each pair's static-ones mask is a
+                    // constant: block half `(first & 63) / 32`, pair `p0` of
+                    // position `pos` is `64 * half + 4 * pos + 2 * t`.
+                    match ((first & 63) == 32, t) {
+                        (false, 0) => {
+                            group!(15, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[60], R2_STATIC_B_EVEN_ONES[61], 60);
+                            group!(14, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[56], R2_STATIC_B_EVEN_ONES[57], 56);
+                            group!(13, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[52], R2_STATIC_B_EVEN_ONES[53], 52);
+                            group!(12, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[48], R2_STATIC_B_EVEN_ONES[49], 48);
+                            group!(11, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[44], R2_STATIC_B_EVEN_ONES[45], 44);
+                            group!(10, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[40], R2_STATIC_B_EVEN_ONES[41], 40);
+                            group!(9, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[36], R2_STATIC_B_EVEN_ONES[37], 36);
+                            group!(8, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[32], R2_STATIC_B_EVEN_ONES[33], 32);
+                            group!(7, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[28], R2_STATIC_B_EVEN_ONES[29], 28);
+                            group!(6, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[24], R2_STATIC_B_EVEN_ONES[25], 24);
+                            group!(5, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[20], R2_STATIC_B_EVEN_ONES[21], 20);
+                            group!(4, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[16], R2_STATIC_B_EVEN_ONES[17], 16);
+                            group!(3, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[12], R2_STATIC_B_EVEN_ONES[13], 12);
+                            group!(2, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[8], R2_STATIC_B_EVEN_ONES[9], 8);
+                            group!(1, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[4], R2_STATIC_B_EVEN_ONES[5], 4);
+                            group!(0, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[0], R2_STATIC_B_EVEN_ONES[1], 0);
+                        }
+                        (false, _) => {
+                            group!(15, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[62], R2_STATIC_B_EVEN_ONES[63], 62);
+                            group!(14, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[58], R2_STATIC_B_EVEN_ONES[59], 58);
+                            group!(13, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[54], R2_STATIC_B_EVEN_ONES[55], 54);
+                            group!(12, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[50], R2_STATIC_B_EVEN_ONES[51], 50);
+                            group!(11, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[46], R2_STATIC_B_EVEN_ONES[47], 46);
+                            group!(10, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[42], R2_STATIC_B_EVEN_ONES[43], 42);
+                            group!(9, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[38], R2_STATIC_B_EVEN_ONES[39], 38);
+                            group!(8, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[34], R2_STATIC_B_EVEN_ONES[35], 34);
+                            group!(7, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[30], R2_STATIC_B_EVEN_ONES[31], 30);
+                            group!(6, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[26], R2_STATIC_B_EVEN_ONES[27], 26);
+                            group!(5, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[22], R2_STATIC_B_EVEN_ONES[23], 22);
+                            group!(4, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[18], R2_STATIC_B_EVEN_ONES[19], 18);
+                            group!(3, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[14], R2_STATIC_B_EVEN_ONES[15], 14);
+                            group!(2, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[10], R2_STATIC_B_EVEN_ONES[11], 10);
+                            group!(1, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[6], R2_STATIC_B_EVEN_ONES[7], 6);
+                            group!(0, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[2], R2_STATIC_B_EVEN_ONES[3], 2);
+                        }
+                        (true, 0) => {
+                            group!(14, |_: usize, _: usize| (false, true), R2_STATIC_B_EVEN_ONES[120], R2_STATIC_B_EVEN_ONES[121], 120);
+                            group!(13, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[116], R2_STATIC_B_EVEN_ONES[117], 116);
+                            group!(12, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[112], R2_STATIC_B_EVEN_ONES[113], 112);
+                            group!(11, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[108], R2_STATIC_B_EVEN_ONES[109], 108);
+                            group!(10, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[104], R2_STATIC_B_EVEN_ONES[105], 104);
+                            group!(9, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[100], R2_STATIC_B_EVEN_ONES[101], 100);
+                            group!(8, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[96], R2_STATIC_B_EVEN_ONES[97], 96);
+                            group!(7, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[92], R2_STATIC_B_EVEN_ONES[93], 92);
+                            group!(6, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[88], R2_STATIC_B_EVEN_ONES[89], 88);
+                            group!(5, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[84], R2_STATIC_B_EVEN_ONES[85], 84);
+                            group!(4, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[80], R2_STATIC_B_EVEN_ONES[81], 80);
+                            group!(3, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[76], R2_STATIC_B_EVEN_ONES[77], 76);
+                            group!(2, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[72], R2_STATIC_B_EVEN_ONES[73], 72);
+                            group!(1, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[68], R2_STATIC_B_EVEN_ONES[69], 68);
+                            group!(0, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[64], R2_STATIC_B_EVEN_ONES[65], 64);
+                        }
+                        (true, _) => {
+                            group!(13, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[118], R2_STATIC_B_EVEN_ONES[119], 118);
+                            group!(12, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[114], R2_STATIC_B_EVEN_ONES[115], 114);
+                            group!(11, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[110], R2_STATIC_B_EVEN_ONES[111], 110);
+                            group!(10, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[106], R2_STATIC_B_EVEN_ONES[107], 106);
+                            group!(9, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[102], R2_STATIC_B_EVEN_ONES[103], 102);
+                            group!(8, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[98], R2_STATIC_B_EVEN_ONES[99], 98);
+                            group!(7, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[94], R2_STATIC_B_EVEN_ONES[95], 94);
+                            group!(6, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[90], R2_STATIC_B_EVEN_ONES[91], 90);
+                            group!(5, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[86], R2_STATIC_B_EVEN_ONES[87], 86);
+                            group!(4, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[82], R2_STATIC_B_EVEN_ONES[83], 82);
+                            group!(3, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[78], R2_STATIC_B_EVEN_ONES[79], 78);
+                            group!(2, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[74], R2_STATIC_B_EVEN_ONES[75], 74);
+                            group!(1, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[70], R2_STATIC_B_EVEN_ONES[71], 70);
+                            group!(0, |_: usize, _: usize| (false, false), R2_STATIC_B_EVEN_ONES[66], R2_STATIC_B_EVEN_ONES[67], 66);
+                        }
+                    }
+                } else if fixed_pads {
                     let boundary = b_end == 15;
-                    group!(b_end - 1, |_: usize, _: usize| (false, boundary));
+                    group!(b_end - 1, |_: usize, _: usize| (false, boundary), 0, 0, 0);
                     for pos in (0..b_end - 1).rev() {
-                        group!(pos, |_: usize, _: usize| (false, false));
+                        group!(pos, |_: usize, _: usize| (false, false), 0, 0, 0);
                     }
                 } else {
                     for pos in (0..b_end).rev() {
-                        group!(pos, generic_pads);
+                        group!(pos, generic_pads, 0, 0, 0);
                     }
                 }
                 let lambda = vld1q_u64(eq_lo.add(2 * (first + t) + 1).cast::<u64>());
@@ -6078,10 +6303,10 @@ mod tests {
                                 unsafe {
                                     let kernel = match variant {
                                         0 => fold_round2_compact_chunk_neon_horner_8_impl::<true, false>,
-                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false>,
-                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false>,
-                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true>,
-                                        _ => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true>,
+                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false>,
+                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false>,
+                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false>,
+                                        _ => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false>,
                                     };
                                     kernel(
                                         table.data.as_ptr().cast::<u8>(),
@@ -6110,6 +6335,94 @@ mod tests {
                                 assert_eq!(prescaled.2, horner.2, "slots: {at}");
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pre-scaled kernel with the static-ones b lookups (`STATIC_B`)
+    /// against the same kernel without them: b rows whose static bytes
+    /// (`R2_STATIC_B_EVEN_ONES`) are 0xff as in the ranked layout, rows where
+    /// some of those bytes are not 0xff (the guard must fall back), and fully
+    /// random rows; aligned and unaligned chunks, all degen/skip flavours.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn round2_static_b_ones_matches_incumbent() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        use crate::zerocheck::univariate_skip::build_eq;
+        use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
+
+        const LO_SIZE: usize = 512;
+        let mut state = 0x5354_4154_4943_4231;
+        for b_case in 0..3 {
+            let mut a_packed = vec![0u8; 16 * LO_SIZE];
+            let mut b_packed = vec![0u8; 16 * LO_SIZE];
+            for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+                *byte = splitmix64(&mut state) as u8;
+            }
+            if b_case < 2 {
+                for pair in 0..LO_SIZE {
+                    let m = R2_STATIC_B_EVEN_ONES[pair & 127];
+                    for j in 0..8 {
+                        if m & (1 << j) != 0 {
+                            b_packed[16 * pair + j] = 0xff;
+                        }
+                    }
+                    // Case 1: every fifth pair breaks one of its static bytes.
+                    if b_case == 1 && pair % 5 == 2 && m != 0 {
+                        let j = m.trailing_zeros() as usize;
+                        b_packed[16 * pair + j] = 0x7f;
+                    }
+                }
+                // Whole-ones pairs (the degenerate branch) as in the layout.
+                for pair in (0..LO_SIZE).filter(|p| p % 128 < 9) {
+                    b_packed[16 * pair..16 * pair + 16].fill(0xff);
+                }
+            }
+            let table = UniSkipFoldTable::new(6, F128::new(splitmix64(&mut state), splitmix64(&mut state)));
+            let mut r: Vec<F128> = (0..9)
+                .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+                .collect();
+            r[2..6].copy_from_slice(&medium_challenges_ghash());
+            let eq_lo = build_eq(&r);
+            for (mask, useful) in [(127, 121), (usize::MAX, usize::MAX)] {
+                for (degen, skip_dead) in [(false, false), (true, false), (false, true), (true, true)] {
+                    for base in [0usize, 64, 3 * LO_SIZE] {
+                        let run = |static_b: bool| {
+                            let poison = F128::new(u64::MAX, u64::MAX);
+                            let mut anchors = vec![poison; 2 * LO_SIZE];
+                            let mut deltas = vec![0xa5u8; 16 * LO_SIZE];
+                            let mut out = [poison; 8];
+                            unsafe {
+                                let kernel = if static_b {
+                                    fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true>
+                                } else {
+                                    fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false>
+                                };
+                                kernel(
+                                    table.data.as_ptr().cast::<u8>(),
+                                    a_packed.as_ptr(),
+                                    b_packed.as_ptr(),
+                                    anchors.as_mut_ptr(),
+                                    deltas.as_mut_ptr(),
+                                    eq_lo.as_ptr(),
+                                    LO_SIZE,
+                                    base,
+                                    mask,
+                                    useful,
+                                    degen,
+                                    skip_dead,
+                                    out.as_mut_ptr(),
+                                );
+                            }
+                            (anchors, deltas, out)
+                        };
+                        let (want, got) = (run(false), run(true));
+                        let at = format!("b {b_case} mask {mask} base {base} degen {degen} skip {skip_dead}");
+                        assert_eq!(got.0, want.0, "anchors: {at}");
+                        assert_eq!(got.1, want.1, "deltas: {at}");
+                        assert_eq!(got.2, want.2, "slots: {at}");
                     }
                 }
             }
