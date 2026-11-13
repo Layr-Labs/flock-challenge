@@ -44,6 +44,7 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use crate::field::F128;
@@ -151,9 +152,9 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
 /// NTT objects are constructed repeatedly by the recursive PCS, and rebuilding
 /// these rows otherwise repeats field inversions and multiplications even when
 /// the large twiddle table is already resident from the untimed warm proof.
-/// Clone into the original nested-`Vec` representation so transform object
-/// layout and hot-loop dereferencing remain unchanged.
-fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
+/// Borrow the immutable cached rows; custom-basis transforms retain owned rows.
+/// Unlike an Arc around the triangle, this needs no additional reference count.
+fn cached_standard_evals(dim: usize) -> &'static [Vec<F128>] {
     static TABLES: OnceLock<[OnceLock<Vec<Vec<F128>>>; 65]> = OnceLock::new();
     let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     tables[dim]
@@ -161,7 +162,7 @@ fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
             let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
             generate_evals_from_subspace(&basis)
         })
-        .clone()
+        .as_slice()
 }
 
 /// Complete the last radix-8 group for the ranked Apple-silicon L0 commit.
@@ -556,7 +557,7 @@ const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    evals: Cow<'static, [Vec<F128>]>,
     /// Breadth-first table: layer `l` starts at `2^l - 1`.
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
@@ -567,7 +568,7 @@ impl AdditiveNttF128 {
         let evals = generate_evals_from_subspace(basis);
         let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
-            evals,
+            evals: Cow::Owned(evals),
             precomputed_twiddles,
         }
     }
@@ -576,7 +577,7 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let evals = cached_standard_evals(dim);
+        let evals = Cow::Borrowed(cached_standard_evals(dim));
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
@@ -878,19 +879,30 @@ impl AdditiveNttF128 {
         let block_elems = block_positions * num_ntts;
         let eighth = block_positions >> 3;
         assert_eq!(msg.len(), block_elems);
-        let twiddles: Vec<[F128; 7]> = (0..num_blocks)
-            .map(|block| {
-                let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                tw[0] = self.twiddle(start_layer, block);
-                for s in 0..2 {
-                    tw[1 + s] = self.twiddle(start_layer + 1, 2 * block + s);
-                }
-                for s in 0..4 {
-                    tw[3 + s] = self.twiddle(start_layer + 2, 4 * block + s);
-                }
-                tw
-            })
-            .collect();
+        let load_twiddles = |block| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = self.twiddle(start_layer, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(start_layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(start_layer + 2, 4 * block + s);
+            }
+            tw
+        };
+        // Keep small reused tables on the stack; larger replica counts retain
+        // the same gathered heap layout. Both buffers outlive all top jobs.
+        let mut local_twiddles = [[F128::ZERO; 7]; 8];
+        let heap_twiddles;
+        let twiddles: &[[F128; 7]] = if num_blocks <= local_twiddles.len() {
+            for (block, tw) in local_twiddles[..num_blocks].iter_mut().enumerate() {
+                *tw = load_twiddles(block);
+            }
+            &local_twiddles[..num_blocks]
+        } else {
+            heap_twiddles = (0..num_blocks).map(load_twiddles).collect::<Vec<_>>();
+            &heap_twiddles
+        };
         debug_assert_eq!(twiddles[0][0], F128::ZERO);
         debug_assert_eq!(twiddles[0][1], F128::ZERO);
         debug_assert_eq!(twiddles[0][3], F128::ZERO);
@@ -1755,9 +1767,9 @@ impl AdditiveNttF128 {
         if n_split > 0 {
             let n_whole = num_subs - n_split;
             let half_bytes = sub_bytes / 2;
-            let first_done: Vec<std::sync::atomic::AtomicBool> = (0..n_split)
-                .map(|_| std::sync::atomic::AtomicBool::new(false))
-                .collect();
+            // At most one flag per subtree; the joined queue cannot outlive
+            // this bounded storage. Keep the existing Release/Acquire protocol.
+            let first_done = [const { std::sync::atomic::AtomicBool::new(false) }; 1 << N_TOP];
             let run_job = |job: usize| {
                 if job < n_whole {
                     // SAFETY: as in `run_sub` below — one disjoint subtree.
@@ -3741,7 +3753,7 @@ mod tests {
     fn recursive_from_message_fused3_matches_replicated_transform() {
         const NUM_NTTS: usize = 8;
         let mut rng = Rng::new(0x5241_5445_384D_5347);
-        for (log_d, start_layer) in [(12usize, 2usize), (12, 3)] {
+        for (log_d, start_layer) in [(12usize, 0usize), (12, 1), (12, 2), (12, 3), (12, 4)] {
             let ntt = AdditiveNttF128::standard(log_d);
             let msg_len = (1usize << (log_d - start_layer)) * NUM_NTTS;
             let msg = rand_vec(&mut rng, msg_len);
@@ -4197,6 +4209,44 @@ mod tests {
         // twiddle(0, 0) = 0 (no bits set in block index 0).
         let ntt = AdditiveNttF128::standard(4);
         assert_eq!(ntt.twiddle(0, 0), F128::ZERO);
+    }
+
+    #[test]
+    fn standard_evals_borrow_cached_rows_and_clone_without_copying() {
+        for dim in [1usize, 8, MAX_PRECOMPUTED_TWIDDLE_LOG + 1, 64] {
+            let first = AdditiveNttF128::standard(dim);
+            let second = AdditiveNttF128::standard(dim);
+            let cloned = first.clone();
+            assert!(matches!(&first.evals, Cow::Borrowed(_)));
+            assert_eq!(first.evals.as_ptr(), second.evals.as_ptr());
+            assert_eq!(first.evals.as_ptr(), cloned.evals.as_ptr());
+            let basis: Vec<_> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+            assert_eq!(first.evals.as_ref(), generate_evals_from_subspace(&basis));
+            drop(first);
+            assert_eq!(cloned.log_domain_size(), dim);
+            if dim > 0 {
+                let layer = dim - 1;
+                let block = (1usize << layer) - 1;
+                assert_eq!(cloned.twiddle(layer, block), second.twiddle(layer, block));
+            }
+        }
+    }
+
+    #[test]
+    fn custom_basis_evals_remain_owned_after_clone() {
+        let basis: Vec<_> = (0..6).map(|i| F128::new(1 << i, 1 << (i + 10))).collect();
+        let original = AdditiveNttF128::new(&basis);
+        let cloned = original.clone();
+        assert!(matches!(&original.evals, Cow::Owned(_)));
+        assert!(matches!(&cloned.evals, Cow::Owned(_)));
+        assert_ne!(original.evals.as_ptr(), cloned.evals.as_ptr());
+        assert_eq!(original.evals, cloned.evals);
+        drop(original);
+        let input: Vec<_> = (0..64).map(|i| F128::new(i, i * 13)).collect();
+        let mut data = input.clone();
+        cloned.forward_transform(&mut data);
+        cloned.inverse_transform(&mut data);
+        assert_eq!(data, input);
     }
 
     #[test]
