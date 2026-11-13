@@ -165,7 +165,13 @@ pub struct ChainProofBundleLigerito {
 
 impl R1csProofBundleLigerito {
     pub fn to_bytes(&self) -> Vec<u8> {
-        r1cs_parts_to_bytes(&self.commitment, &self.proof)
+        let bytes = r1cs_parts_to_bytes(&self.commitment, &self.proof);
+        debug_assert!(
+            bytes.len() <= 500_000,
+            "proof bundle {} bytes exceeds the harness's 500,000-byte limit",
+            bytes.len()
+        );
+        bytes
     }
     /// Single-pass publish: stream the stashed prefix (header ‖ commitment ‖
     /// zerocheck ‖ lincheck, pre-encoded on the efficiency-core helper while

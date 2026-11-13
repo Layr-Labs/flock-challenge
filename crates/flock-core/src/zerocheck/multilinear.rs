@@ -6418,10 +6418,16 @@ mod tests {
         }
 
         fn qos() {
+            // QoS classes are a macOS pthread extension; the benchmark's QoS hint
+            // has no equivalent to set on other hosts, so this is a no-op there.
+            #[cfg(target_os = "macos")]
             unsafe extern "C" {
                 fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
             }
-            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+            #[cfg(target_os = "macos")]
+            unsafe {
+                pthread_set_qos_class_self_np(0x21, 0);
+            }
         }
 
         fn lq(v: &mut [f64]) -> (f64, f64) {
