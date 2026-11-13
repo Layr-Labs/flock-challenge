@@ -1893,7 +1893,7 @@ fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
-    let mut tables = vec![F128::ZERO; FOLD_N_BYTES * FOLD_TABLE_SIZE];
+    let mut tables = crate::alloc_uninit_f128_vec(FOLD_N_BYTES * FOLD_TABLE_SIZE);
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         let table = &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE];
@@ -2119,7 +2119,7 @@ pub(crate) fn build_direct_fold8_table_from_w_prime(
 pub(crate) fn build_direct_fold8_table_from_generators(generators: &[F128]) -> Vec<F128> {
     assert_eq!(generators.len(), 1 << LOG_PACKING);
 
-    let mut out = vec![F128::ZERO; FOLD_TABLE_LEN];
+    let mut out = crate::alloc_uninit_f128_vec(FOLD_TABLE_LEN);
     for byte in 0..FOLD_N_BYTES {
         let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
         table[0] = F128::ZERO;
