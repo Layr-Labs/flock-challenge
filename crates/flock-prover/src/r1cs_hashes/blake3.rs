@@ -4850,6 +4850,11 @@ impl Blake3Setup {
             r1cs,
             pcs_params,
         };
+        // Ranked shape: overlap the GPU bring-up and its Metal compiles with
+        // the CPU setup below and the warm-up's witness generation.
+        if setup.use_ranked_reverse_lincheck() {
+            flock_core::gpu_commit::prewarm_gpu_background();
+        }
         // Non-ranked shapes retain the eager CSC build, keeping its one-time
         // transpose outside the first proof.  The ranked shape never allocates
         // or walks the ~21M-entry CSC unless its runtime control requests it.
