@@ -44,6 +44,7 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use crate::field::F128;
@@ -151,9 +152,9 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
 /// NTT objects are constructed repeatedly by the recursive PCS, and rebuilding
 /// these rows otherwise repeats field inversions and multiplications even when
 /// the large twiddle table is already resident from the untimed warm proof.
-/// Clone into the original nested-`Vec` representation so transform object
-/// layout and hot-loop dereferencing remain unchanged.
-fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
+/// Borrow the immutable cached rows; custom-basis transforms retain owned rows.
+/// Unlike an Arc around the triangle, this needs no additional reference count.
+fn cached_standard_evals(dim: usize) -> &'static [Vec<F128>] {
     static TABLES: OnceLock<[OnceLock<Vec<Vec<F128>>>; 65]> = OnceLock::new();
     let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     tables[dim]
@@ -161,7 +162,7 @@ fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
             let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
             generate_evals_from_subspace(&basis)
         })
-        .clone()
+        .as_slice()
 }
 
 /// Complete the last radix-8 group for the ranked Apple-silicon L0 commit.
@@ -556,7 +557,7 @@ const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    evals: Cow<'static, [Vec<F128>]>,
     /// Breadth-first table: layer `l` starts at `2^l - 1`.
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
@@ -567,7 +568,7 @@ impl AdditiveNttF128 {
         let evals = generate_evals_from_subspace(basis);
         let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
-            evals,
+            evals: Cow::Owned(evals),
             precomputed_twiddles,
         }
     }
@@ -576,7 +577,7 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let evals = cached_standard_evals(dim);
+        let evals = Cow::Borrowed(cached_standard_evals(dim));
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
@@ -4197,6 +4198,44 @@ mod tests {
         // twiddle(0, 0) = 0 (no bits set in block index 0).
         let ntt = AdditiveNttF128::standard(4);
         assert_eq!(ntt.twiddle(0, 0), F128::ZERO);
+    }
+
+    #[test]
+    fn standard_evals_borrow_cached_rows_and_clone_without_copying() {
+        for dim in [1usize, 8, MAX_PRECOMPUTED_TWIDDLE_LOG + 1, 64] {
+            let first = AdditiveNttF128::standard(dim);
+            let second = AdditiveNttF128::standard(dim);
+            let cloned = first.clone();
+            assert!(matches!(&first.evals, Cow::Borrowed(_)));
+            assert_eq!(first.evals.as_ptr(), second.evals.as_ptr());
+            assert_eq!(first.evals.as_ptr(), cloned.evals.as_ptr());
+            let basis: Vec<_> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+            assert_eq!(first.evals.as_ref(), generate_evals_from_subspace(&basis));
+            drop(first);
+            assert_eq!(cloned.log_domain_size(), dim);
+            if dim > 0 {
+                let layer = dim - 1;
+                let block = (1usize << layer) - 1;
+                assert_eq!(cloned.twiddle(layer, block), second.twiddle(layer, block));
+            }
+        }
+    }
+
+    #[test]
+    fn custom_basis_evals_remain_owned_after_clone() {
+        let basis: Vec<_> = (0..6).map(|i| F128::new(1 << i, 1 << (i + 10))).collect();
+        let original = AdditiveNttF128::new(&basis);
+        let cloned = original.clone();
+        assert!(matches!(&original.evals, Cow::Owned(_)));
+        assert!(matches!(&cloned.evals, Cow::Owned(_)));
+        assert_ne!(original.evals.as_ptr(), cloned.evals.as_ptr());
+        assert_eq!(original.evals, cloned.evals);
+        drop(original);
+        let input: Vec<_> = (0..64).map(|i| F128::new(i, i * 13)).collect();
+        let mut data = input.clone();
+        cloned.forward_transform(&mut data);
+        cloned.inverse_transform(&mut data);
+        assert_eq!(data, input);
     }
 
     #[test]

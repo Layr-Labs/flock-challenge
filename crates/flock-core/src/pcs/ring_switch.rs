@@ -1488,7 +1488,7 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let (z0, z1) = z_vec.split_at(half);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            let mut out = vec![F128::ZERO; half];
+            let mut out = crate::alloc_uninit_f128_vec(half);
             let mut i = 0;
             while i < half {
                 let x0 = z0[i] + z1[i];
@@ -1566,75 +1566,13 @@ fn s_hat_v_fold8_from_z_vec_generic(
 pub(crate) fn collapse_s_hat_v_fold8(s_hat_v_fold8: &[F128], low_point: &[F128]) -> Vec<F128> {
     debug_assert_eq!(s_hat_v_fold8.len(), 64 * (1usize << LOG_PACKING));
     debug_assert_eq!(low_point.len(), 6);
-    let n_packed = 1usize << LOG_PACKING;
     let low_eq = build_eq(low_point);
-    let mut out = crate::alloc_uninit_f128_vec(n_packed);
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        let w0 = low_eq[0];
-        let mut i = 0;
-        while i < n_packed {
-            let prod0 = unsafe {
-                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
-                    w0,
-                    [s_hat_v_fold8[i], s_hat_v_fold8[i + 1]],
-                )
-            };
-            let prod1 = unsafe {
-                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
-                    w0,
-                    [s_hat_v_fold8[i + 2], s_hat_v_fold8[i + 3]],
-                )
-            };
-            out[i] = prod0[0];
-            out[i + 1] = prod0[1];
-            out[i + 2] = prod1[0];
-            out[i + 3] = prod1[1];
-            i += 4;
-        }
-        for bank in 1..64 {
-            let w = low_eq[bank];
-            let bank_src = &s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed];
-            let mut i = 0;
-            while i < n_packed {
-                let prod0 = unsafe {
-                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
-                        w,
-                        [bank_src[i], bank_src[i + 1]],
-                    )
-                };
-                let prod1 = unsafe {
-                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(
-                        w,
-                        [bank_src[i + 2], bank_src[i + 3]],
-                    )
-                };
-                out[i] += prod0[0];
-                out[i + 1] += prod0[1];
-                out[i + 2] += prod1[0];
-                out[i + 3] += prod1[1];
-                i += 4;
-            }
-        }
-        return out;
-    }
-    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    {
-        let w0 = low_eq[0];
-        for (dst, &src) in out.iter_mut().zip(&s_hat_v_fold8[..n_packed]) {
-            *dst = w0 * src;
-        }
-        for bank in 1..64 {
-            let w = low_eq[bank];
-            for (dst, &src) in out
-                .iter_mut()
-                .zip(&s_hat_v_fold8[bank * n_packed..(bank + 1) * n_packed])
-            {
-                *dst += w * src;
-            }
-        }
-        out
-    }
+    let weights: &[F128; 64] = low_eq[..64]
+        .try_into()
+        .expect("fold8 collapse needs exactly 64 low-eq weights");
+    let mut out = [F128::ZERO; 1usize << LOG_PACKING];
+    crate::field::f128_slice::fold_bank_major_64x128_rows2(weights, s_hat_v_fold8, &mut out);
+    out.to_vec()
 }
 
 /// Compute the slice-MLE vector `s_hat_v` (length 128) from a packed witness
