@@ -7666,6 +7666,61 @@ kernel void blake3_pow_scan(
     /// Encode leaves + all parent levels of ONE aligned subtree
     /// (`subtree_leaves` a power of two, `leaf_start` aligned to it), writing
     /// into the subtree's slots of the GLOBAL flat tree layout.
+    /// Single-level parent ladder from flat-tree level `from_level` up to the
+    /// root of the aligned subtree `[leaf_start, leaf_start + subtree_leaves)`.
+    /// Same `pso_parent` kernel and flat-tree slots as the tail of
+    /// [`encode_merkle_subtree_impl`]; it only assumes the level-`from_level`
+    /// nodes of that subtree are already (or will be, queue order) written.
+    pub(crate) unsafe fn encode_merkle_parents_above(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        n_leaves_total: usize,
+        leaf_start: usize,
+        subtree_leaves: usize,
+        from_level: usize,
+    ) {
+        debug_assert!(subtree_leaves.is_power_of_two() && subtree_leaves >> from_level >= 1);
+        debug_assert_eq!(leaf_start % subtree_leaves, 0);
+        unsafe {
+            let mut level_start = 2 * n_leaves_total - ((2 * n_leaves_total) >> from_level);
+            let mut level_len = n_leaves_total >> from_level;
+            let mut local_start = leaf_start >> from_level;
+            let mut local_len = subtree_leaves >> from_level;
+            gpu.set_pipeline(enc, gpu.pso_parent);
+            while local_len > 1 {
+                let write_level_start = level_start + level_len;
+                let n_out = local_len / 2;
+                gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
+                gpu.set_buffer(enc, tree_buf, (write_level_start + local_start / 2) * 32, 1);
+                let tpg = 256u64.min(n_out as u64);
+                gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                level_start = write_level_start;
+                level_len /= 2;
+                local_start /= 2;
+                local_len = n_out;
+            }
+        }
+    }
+
+    /// Early suffix-subtree hash: `FLOCK_NO_EARLY_SUFFIX_HASH=1` restores the
+    /// single post-NTT cb3. `FLOCK_EARLY_SUFFIX_SEG_LOG` (12..=18) sets the
+    /// segment size in leaves (diagnostic).
+    fn hybrid_early_suffix_seg_log() -> usize {
+        use std::sync::OnceLock;
+        static V: OnceLock<usize> = OnceLock::new();
+        *V.get_or_init(|| {
+            if std::env::var_os("FLOCK_NO_EARLY_SUFFIX_HASH").is_some() {
+                return 0;
+            }
+            std::env::var("FLOCK_EARLY_SUFFIX_SEG_LOG")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| (12..=18).contains(v))
+                .unwrap_or(16)
+        })
+    }
+
     pub(crate) unsafe fn encode_merkle_subtree(
         gpu: &Gpu,
         enc: Id,
@@ -9115,6 +9170,64 @@ kernel void blake3_pow_scan(
                 // the suffix's aligned subtrees. Same leaf bytes, same BLAKE3
                 // tree, same flat-tree slots, so the root is unchanged.
                 if hybrid_gpu_suffix_hash_enabled() {
+                    // E1: the suffix's deep pass finalizes 1 MiB chunks
+                    // progressively. Whole aligned segments of 2^seg_log
+                    // leaves are hashed (leaves + parents to the segment
+                    // root, the same `encode_merkle_subtree` kernels and
+                    // flat-tree slots) as soon as their last chunk is final,
+                    // instead of all after the NTT; cb3 then only hashes the
+                    // unaligned head and the few levels above the segments.
+                    // The tuner's sweep keeps the single-cb3 shape it prices.
+                    let seg_log = if hybrid_arm_recording() { 0 } else { hybrid_early_suffix_seg_log() };
+                    let seg = 1usize << seg_log;
+                    let seg0 = if seg_log == 0 { n_leaves } else { suffix_leaf_start.div_ceil(seg) };
+                    let nseg = if seg_log == 0 { 0 } else { (n_leaves >> seg_log) - seg0 };
+                    let seg_done: Vec<std::sync::atomic::AtomicU32> =
+                        (0..nseg).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+                    let early_cbs: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+                    let early_failed = std::sync::atomic::AtomicBool::new(false);
+                    let (staging_u, tree_buf_u) = (staging as usize, tree_buf as usize);
+                    let early_chunk = |elem_offset: usize, chunk: &[F128]| {
+                        if nseg == 0 {
+                            return;
+                        }
+                        let leaf = elem_offset / 64;
+                        let nl = (chunk.len() / 64) as u32;
+                        if leaf < seg0 << seg_log || (nl as usize) > seg {
+                            if (nl as usize) > seg {
+                                early_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            return;
+                        }
+                        let s = (leaf >> seg_log) - seg0;
+                        let prev = seg_done[s].fetch_add(nl, std::sync::atomic::Ordering::AcqRel);
+                        if (prev + nl) as usize != seg {
+                            return;
+                        }
+                        let pool = gpu.pool_push();
+                        let ok = (|| -> Result<(), String> {
+                            let cb = gpu.command_buffer()?;
+                            let enc = gpu.compute_encoder(cb)?;
+                            encode_merkle_subtree(
+                                gpu,
+                                enc,
+                                staging_u as Id,
+                                tree_buf_u as Id,
+                                n_leaves,
+                                (seg0 + s) << seg_log,
+                                seg,
+                            );
+                            gpu.end_encoding(enc);
+                            gpu.retain(cb);
+                            gpu.commit_async(cb);
+                            early_cbs.lock().unwrap_or_else(|e| e.into_inner()).push(cb as usize);
+                            Ok(())
+                        })();
+                        if ok.is_err() {
+                            early_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        gpu.pool_pop(pool);
+                    };
                     let t_cpu_ntt = std::time::Instant::now();
                     if fine_m == 0 {
                         ntt.forward_transform_interleaved_ranked_block_range_and_then(
@@ -9124,7 +9237,7 @@ kernel void blake3_pow_scan(
                             log_d,
                             16 - k_cpu16,
                             16,
-                            |_elem_offset: usize, _chunk: &[F128]| {},
+                            &early_chunk,
                         );
                     } else {
                         // The boundary sixteenth's layers 4..8 are the GPU's
@@ -9152,7 +9265,7 @@ kernel void blake3_pow_scan(
                                 }
                                 Ok(())
                             },
-                            |_elem_offset: usize, _chunk: &[F128]| {},
+                            &early_chunk,
                         )?;
                     }
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
@@ -9162,12 +9275,25 @@ kernel void blake3_pow_scan(
                     let cb3 = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb3)?;
                     let mut sstart = suffix_leaf_start;
+                    // Every segment must have been queued by its last chunk;
+                    // otherwise (or on an early encode failure) cb3 hashes
+                    // the whole suffix as before (same bytes, same slots).
+                    let early_ok = nseg > 0
+                        && !early_failed.load(std::sync::atomic::Ordering::Relaxed)
+                        && seg_done
+                            .iter()
+                            .all(|c| c.load(std::sync::atomic::Ordering::Acquire) as usize == seg);
                     while sstart < n_leaves {
                         let mut size = 1usize << (n_leaves - sstart).ilog2();
                         while sstart % size != 0 {
                             size >>= 1;
                         }
-                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
+                        if early_ok && sstart >= seg0 << seg_log {
+                            debug_assert!(size >= seg);
+                            encode_merkle_parents_above(gpu, enc, tree_buf, n_leaves, sstart, size, seg_log);
+                        } else {
+                            encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
+                        }
                         sstart += size;
                     }
                     gpu.end_encoding(enc);
@@ -9194,6 +9320,19 @@ kernel void blake3_pow_scan(
                     } else {
                         gpu.wait_cb(cb2)?;
                         gpu.wait_cb(cb3)?;
+                    }
+                    // Same queue, committed before cb3: already complete.
+                    // Check each status, then drop the retains.
+                    let early_list = core::mem::take(&mut *early_cbs.lock().unwrap_or_else(|e| e.into_inner()));
+                    let mut early_err: Option<String> = None;
+                    for cb in early_list {
+                        if let Err(e) = gpu.wait_cb(cb as Id) {
+                            early_err.get_or_insert(e);
+                        }
+                        gpu.release(cb as Id);
+                    }
+                    if let Some(e) = early_err {
+                        return Err(e);
                     }
                     // Arms for the sweep's split selection. cb3 queues behind
                     // both cb2 and the CPU NTT, so this split's window is
