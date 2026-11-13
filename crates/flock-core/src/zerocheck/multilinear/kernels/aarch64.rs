@@ -633,13 +633,16 @@ unsafe fn fold4_expanded_tri_one_q(
         let delta_a = veorq_u64(v0, v1);
         let delta_b = veorq_u64(v0, v2);
         let delta_ab = xor3_u64(v0, v1, veorq_u64(v2, v3));
-        let (ll_a, ca0, ca1, hh_a) = clmul_products_sw_q(rho.a, rho.a_sw, delta_a);
-        let (ll_b, cb0, cb1, hh_b) = clmul_products_sw_q(rho.b, rho.b_sw, delta_b);
-        let (ll_ab, cab0, cab1, hh_ab) = clmul_products_sw_q(rho.ab, rho.ab_sw, delta_ab);
-        let ll = xor3_u64(ll_a, ll_b, ll_ab);
-        let hh = xor3_u64(hh_a, hh_b, hh_ab);
-        let cross = veorq_u64(xor3_u64(xor3_u64(ca0, ca1, cb0), cb1, cab0), cab1);
-        reduce_tri_binius_xor_q(ll, cross, hh, v0)
+        // Accumulate the three constant products in tri form through the
+        // fused PMULL+EOR helpers instead of materializing twelve partial
+        // products and combining them with five extra XORs: same twelve
+        // PMULLs and the same tri words, five fewer issue slots per output.
+        let zero = vdupq_n_u64(0);
+        let mut acc = TriNeon { ll: zero, cross: zero, hh: zero };
+        tri_acc_sw(&mut acc, rho.a, rho.a_sw, delta_a);
+        tri_acc_sw(&mut acc, rho.b, rho.b_sw, delta_b);
+        tri_acc_sw(&mut acc, rho.ab, rho.ab_sw, delta_ab);
+        reduce_tri_binius_xor_q(acc.ll, acc.cross, acc.hh, v0)
     }
 }
 
