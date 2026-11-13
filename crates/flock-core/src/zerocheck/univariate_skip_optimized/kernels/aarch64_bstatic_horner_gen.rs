@@ -1340,8 +1340,10 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                         )
                     } else {
-                        bstatic_horner_window_unit_nt::<BASE, true, true>(
-                            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                        // `FLOCK_NO_ZC_AB_FUSE`: the per-chunk rows of the
+                        // default instance (the same bytes, no extra copy).
+                        bstatic_horner_window_unit_per_chunk::<V, HOIST>(
+                            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, true,
                         )
                     }
                 } else {
@@ -1357,8 +1359,10 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                         x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                     )
                 } else {
-                    bstatic_horner_window_unit_nt::<V, HOIST, true>(
-                        x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                    // `FLOCK_NO_ZC_AB_FUSE_E`: the per-chunk rows of the
+                    // default instance (the same bytes, no extra copy).
+                    bstatic_horner_window_unit_per_chunk::<V, HOIST>(
+                        x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, true,
                     )
                 }
             } else {

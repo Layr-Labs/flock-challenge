@@ -2126,6 +2126,14 @@ unsafe fn load_code_pair_gpr(p: *const u64) -> (u64, u64) {
     (lo, hi)
 }
 
+/// One pair's compact deltas `[a0 ^ a1, b0 ^ b1]`, 16 bytes at `dst`.
+///
+/// The store is the X-register `stnp`: the delta stream is written once, in
+/// address order, and next read by the K pass after a transcript boundary,
+/// like the anchor stream beside it, which has always used the Q-register
+/// `stnp`. A plain `stp` first brings each destination line into the cache
+/// and leaves it there dirty; the hint stores the same 16 bytes at the same
+/// address without that. The three helpers below use the same form.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn store_delta_pair_gpr(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64) {
@@ -2133,7 +2141,7 @@ unsafe fn store_delta_pair_gpr(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64)
         core::arch::asm!(
             "eor {ta}, {a0}, {a1}",
             "eor {tb}, {b0}, {b1}",
-            "stp {ta}, {tb}, [{dst}]",
+            "stnp {ta}, {tb}, [{dst}]",
             dst = in(reg) dst,
             a0 = in(reg) a0,
             a1 = in(reg) a1,
@@ -2152,7 +2160,7 @@ unsafe fn store_delta_a_only_gpr(dst: *mut u8, a0: u64, a1: u64) {
     unsafe {
         core::arch::asm!(
             "eor {ta}, {a0}, {a1}",
-            "stp {ta}, xzr, [{dst}]",
+            "stnp {ta}, xzr, [{dst}]",
             dst = in(reg) dst,
             a0 = in(reg) a0,
             a1 = in(reg) a1,
@@ -2204,7 +2212,7 @@ unsafe fn store_delta_pair_gpr_off<const OFF: usize>(
         core::arch::asm!(
             "eor {ta}, {a0}, {a1}",
             "eor {tb}, {b0}, {b1}",
-            "stp {ta}, {tb}, [{dst}, #{off}]",
+            "stnp {ta}, {tb}, [{dst}, #{off}]",
             dst = in(reg) dst,
             off = const OFF,
             a0 = in(reg) a0,
@@ -2225,7 +2233,7 @@ unsafe fn store_delta_a_only_gpr_off<const OFF: usize>(dst: *mut u8, a0: u64, a1
     unsafe {
         core::arch::asm!(
             "eor {ta}, {a0}, {a1}",
-            "stp {ta}, xzr, [{dst}, #{off}]",
+            "stnp {ta}, xzr, [{dst}, #{off}]",
             dst = in(reg) dst,
             off = const OFF,
             a0 = in(reg) a0,
@@ -6088,6 +6096,50 @@ mod tests {
                 }
             }
             assert_eq!([bits(acc.ll), bits(acc.cross), bits(acc.hh)], want, "sw_form {sw_form}");
+        }
+    }
+
+    /// The four delta store helpers write exactly their pair's 16 bytes
+    /// (`[a0 ^ a1, b0 ^ b1]`, or `[a0 ^ a1, 0]`) at `dst` / `dst + OFF` and
+    /// leave every neighbouring byte alone, at every 8-byte alignment.
+    #[test]
+    fn delta_store_helpers_write_exactly_their_pair() {
+        let mut state = 0x5eed_de17_a5u64;
+        for shift in [0usize, 8, 16, 24, 40, 56] {
+            for _ in 0..64 {
+                let (a0, a1, b0, b1) = (
+                    splitmix64(&mut state),
+                    splitmix64(&mut state),
+                    splitmix64(&mut state),
+                    splitmix64(&mut state),
+                );
+                let fill = splitmix64(&mut state) | 1;
+                let check = |store: &dyn Fn(*mut u8), at: usize, want: [u64; 2]| {
+                    let mut buf = [fill; 24];
+                    store(unsafe { buf.as_mut_ptr().cast::<u8>().add(shift) });
+                    let i = (shift + at) / 8;
+                    for (k, &v) in buf.iter().enumerate() {
+                        let exp = if k == i {
+                            want[0].to_le()
+                        } else if k == i + 1 {
+                            want[1].to_le()
+                        } else {
+                            fill
+                        };
+                        assert_eq!(v, exp, "shift {shift} at {at} word {k}");
+                    }
+                };
+                let pair = [a0 ^ a1, b0 ^ b1];
+                let a_only = [a0 ^ a1, 0];
+                unsafe {
+                    check(&|d| store_delta_pair_gpr(d, a0, a1, b0, b1), 0, pair);
+                    check(&|d| store_delta_a_only_gpr(d, a0, a1), 0, a_only);
+                    check(&|d| store_delta_pair_gpr_off::<0>(d, a0, a1, b0, b1), 0, pair);
+                    check(&|d| store_delta_pair_gpr_off::<16>(d, a0, a1, b0, b1), 16, pair);
+                    check(&|d| store_delta_a_only_gpr_off::<0>(d, a0, a1), 0, a_only);
+                    check(&|d| store_delta_a_only_gpr_off::<16>(d, a0, a1), 16, a_only);
+                }
+            }
         }
     }
 
