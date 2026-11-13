@@ -574,6 +574,26 @@ pub(super) fn accumulate_convert_ab_nomul<const STORE: bool, const U: bool>(
     portable::accumulate_convert_ab_nomul(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
 }
 
+/// Kill switch for the fourteen-row form of the seeded AB completion drain
+/// ([`aarch64::accumulate_convert_ab_nomul_seeded_pair16`]): any value of
+/// `FLOCK_NO_ZC_AB_COMPLETION_PAIR16` keeps every seeded call on the general
+/// kernel. Read once per process; the bank values are identical either way.
+#[cfg(target_arch = "aarch64")]
+pub(super) fn ab_completion_pair16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_COMPLETION_PAIR16").is_none())
+}
+
+/// The seeded calls the fourteen-row form serves: spans of exactly seven row
+/// pairs with the unscaled table loads. The scaled-load form keeps the
+/// general kernel: with plain scaled loads the sixteen accumulators and the
+/// table loads in flight do not fit the vector registers.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(super) fn seeded_pair16_route<const U: bool>(first_b_med: usize, n_b_med: usize) -> bool {
+    U && n_b_med - first_b_med == 14
+}
+
 #[inline]
 pub(super) fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
@@ -586,7 +606,11 @@ pub(super) fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     assert_eq!(convert.len(), 16 * 256);
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        aarch64::accumulate_convert_ab_nomul_seeded::<U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        if seeded_pair16_route::<U>(first_b_med, n_b_med) && ab_completion_pair16_enabled() {
+            aarch64::accumulate_convert_ab_nomul_seeded_pair16::<U>(chunk_ab_bytes, first_b_med, convert, bank);
+        } else {
+            aarch64::accumulate_convert_ab_nomul_seeded::<U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     accumulate_convert_ab_nomul::<false, U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);

@@ -3052,6 +3052,49 @@ fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
     banks: &mut [F128],
     partial_ab: &mut [F128; ELL],
 ) {
+    process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded_with(
+        x_hi,
+        lo_range,
+        big_lo_size,
+        n_lo_and_inner,
+        within_outer_mask,
+        b_med_counts,
+        ab_inner,
+        representation,
+        eq_bot,
+        eq_hi_val,
+        tables,
+        bank_bits,
+        bank_deferred,
+        banks,
+        partial_ab,
+        zc_ab_head_hoist_enabled(),
+    );
+}
+
+/// [`process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded`] with the
+/// sweep form chosen by the caller: `head_hoist` sends the seeded indices
+/// (every index past the first-touch prefix) through
+/// [`seeded_sweep_hoisted`]; otherwise every index takes the per-index setup.
+#[allow(clippy::too_many_arguments)]
+fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded_with(
+    x_hi: usize,
+    lo_range: std::ops::Range<usize>,
+    big_lo_size: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    representation: Round1AbRepresentation,
+    eq_bot: &[F128],
+    eq_hi_val: F128,
+    tables: &[F128],
+    bank_bits: usize,
+    bank_deferred: bool,
+    banks: &mut [F128],
+    partial_ab: &mut [F128; ELL],
+    head_hoist: bool,
+) {
     debug_assert_eq!(banks.len(), eq_bot.len() * ELL);
     debug_assert_eq!(eq_bot.len(), 1usize << bank_bits);
     debug_assert!(lo_range.end <= big_lo_size);
@@ -3067,7 +3110,29 @@ fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
         banks.fill(F128::ZERO);
     }
 
-    for x_outer_lo in lo_range {
+    let range_end = lo_range.end;
+    let hoist = head_hoist
+        && seeded
+        && seeded_sweep_hoist_applies(
+            range_start..range_end,
+            x_hi,
+            n_lo_and_inner,
+            within_outer_mask,
+            b_med_counts,
+            ab_inner,
+            tables,
+            bank_bits,
+            banks.len(),
+        );
+    // With `hoist`, the per-index loop below keeps only the first-touch
+    // prefix; every later index is seeded and goes to the hoisted sweep.
+    let split = match (hoist, store_first) {
+        (false, _) => range_end,
+        (true, true) => range_end.min(range_start + n_banks),
+        (true, false) => range_start,
+    };
+
+    for x_outer_lo in range_start..split {
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
@@ -3110,7 +3175,157 @@ fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
         }
     }
 
+    if split < range_end {
+        if unscaled {
+            seeded_sweep_hoisted::<true>(
+                split..range_end,
+                x_hi,
+                n_lo_and_inner,
+                within_outer_mask,
+                b_med_counts,
+                ab_inner,
+                representation,
+                tables,
+                bank_bits,
+                banks,
+            );
+        } else {
+            seeded_sweep_hoisted::<false>(
+                split..range_end,
+                x_hi,
+                n_lo_and_inner,
+                within_outer_mask,
+                b_med_counts,
+                ab_inner,
+                representation,
+                tables,
+                bank_bits,
+                banks,
+            );
+        }
+    }
+
     finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
+}
+
+/// Kill switch: `FLOCK_NO_ZC_AB_HEAD_HOIST` (any value) gives every
+/// `x_outer_lo` index of the folded round-one AB completion the per-index
+/// setup (bounds-checked row, table and bank slices, the window's span through
+/// the representation, the arm selection), as in the parent.
+fn zc_ab_head_hoist_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_HEAD_HOIST").is_none())
+}
+
+/// Largest `within_outer_mask` the hoisted sweep tabulates.
+const HOIST_MAX_WINDOWS: usize = 16;
+
+/// Whether [`seeded_sweep_hoisted`] covers `range`: every index's row block,
+/// table and bank lie inside their buffers (checked once, at the range's last
+/// index; all three offsets grow with the index), and the window spans fit
+/// the sweep's table. Otherwise the per-index loop runs the whole range.
+#[allow(clippy::too_many_arguments)]
+fn seeded_sweep_hoist_applies(
+    range: std::ops::Range<usize>,
+    x_hi: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    tables: &[F128],
+    bank_bits: usize,
+    banks_len: usize,
+) -> bool {
+    if range.is_empty() {
+        return true;
+    }
+    let last = range.end - 1;
+    let Some(hi_bits) = x_hi.checked_shl(n_lo_and_inner as u32) else {
+        return false;
+    };
+    // The index bits sit below the `x_hi` bits, so the OR of the row offset
+    // is a sum and grows with the index.
+    within_outer_mask < HOIST_MAX_WINDOWS
+        && b_med_counts.len() > within_outer_mask
+        && bank_bits < usize::BITS as usize
+        && N_INNER < n_lo_and_inner
+        && (last >> (n_lo_and_inner - N_INNER)) == 0
+        && hi_bits & ((1usize << n_lo_and_inner) - 1) == 0
+        && ((last << N_INNER) | hi_bits)
+            .checked_mul(N_CHUNKS)
+            .and_then(|base| base.checked_add((1 << N_MEDIUM) * 64))
+            .is_some_and(|end| end <= ab_inner.len())
+        && ((last >> bank_bits) + 1)
+            .checked_mul(CONVERT_TABLE_SIZE)
+            .is_some_and(|end| end <= tables.len())
+        && (1usize << bank_bits)
+            .checked_mul(ELL)
+            .is_some_and(|n| n <= banks_len)
+}
+
+/// The seeded indices of the folded round-one AB completion with the
+/// per-index setup hoisted: each window position's span (`first..end` of the
+/// materialized `b_med` rows, or none) is tabulated once per call, the buffer
+/// bounds were checked once by [`seeded_sweep_hoist_applies`], and the row
+/// block, table and bank of an index are formed by pointer arithmetic. Each
+/// index makes the same `accumulate_convert_ab_nomul_seeded::<U>` call with
+/// the same rows, span, table and bank as the per-index loop.
+#[allow(clippy::too_many_arguments)]
+fn seeded_sweep_hoisted<const U: bool>(
+    range: std::ops::Range<usize>,
+    x_hi: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    ab_inner: &[u8],
+    representation: Round1AbRepresentation,
+    tables: &[F128],
+    bank_bits: usize,
+    banks: &mut [F128],
+) {
+    let n_lo = n_lo_and_inner - N_INNER;
+    let bank_mask = (1usize << bank_bits) - 1;
+    let x_hi_outer = x_hi << n_lo;
+    let x_hi_inner = x_hi << n_lo_and_inner;
+    let mut spans = [(0usize, 0usize, false); HOIST_MAX_WINDOWS];
+    for (within_hash_outer, span) in spans.iter_mut().enumerate().take(within_outer_mask + 1) {
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        if n_b_med != 0 {
+            *span = (
+                representation.first_materialized_b_med(within_hash_outer),
+                representation.materialized_b_med_end(within_hash_outer, n_b_med),
+                true,
+            );
+        }
+    }
+    let ab = ab_inner.as_ptr();
+    let tp = tables.as_ptr();
+    let bp = banks.as_mut_ptr();
+    for x_outer_lo in range {
+        let within_hash_outer = (x_outer_lo | x_hi_outer) & within_outer_mask;
+        // SAFETY: `within_hash_outer <= within_outer_mask < HOIST_MAX_WINDOWS`.
+        let (first_b_med, end_b_med, live) = unsafe { *spans.get_unchecked(within_hash_outer) };
+        if !live {
+            continue;
+        }
+        let chunk_byte_base = ((x_outer_lo << N_INNER) | x_hi_inner) * N_CHUNKS;
+        // SAFETY: `seeded_sweep_hoist_applies` checked the last index of the
+        // range; the row block start, the table index and the bank index grow
+        // with `x_outer_lo` (the bank index stays below `1 << bank_bits`), so
+        // every index's 1 KiB row block, 4,096-entry table and 64-lane bank are
+        // inside their buffers, and distinct banks never alias.
+        let (rows, table, bank) = unsafe {
+            (
+                &*ab.add(chunk_byte_base).cast::<[[u8; 64]; 1 << N_MEDIUM]>(),
+                core::slice::from_raw_parts(
+                    tp.add((x_outer_lo >> bank_bits) * CONVERT_TABLE_SIZE),
+                    CONVERT_TABLE_SIZE,
+                ),
+                &mut *bp.add((x_outer_lo & bank_mask) * ELL).cast::<[F128; ELL]>(),
+            )
+        };
+        kernels::accumulate_convert_ab_nomul_seeded::<U>(rows, first_b_med, end_b_med, table, bank);
+    }
 }
 
 /// Kill switch for the unscaled-index table loads of the round-one AB
@@ -7973,6 +8188,88 @@ mod tests {
     }
 
     #[test]
+    fn ab_completion_head_hoist_matches_per_index_sweep() {
+        let mut rng = Rng::new(0x4E4D_4801);
+        let n_lo = 7usize;
+        let n_lo_and_inner = n_lo + N_INNER;
+        let big_lo_size = 1usize << n_lo;
+        let reps = [
+            (Round1AbRepresentation::Complete, [16u8, 15]),
+            (Round1AbRepresentation::Complete, [16u8, 0]),
+            (Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true }, [16u8, 15]),
+            (Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false }, [16u8, 15]),
+            (Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false }, [0u8, 16]),
+        ];
+        let mut hoisted_calls = 0usize;
+        for (rep_index, (representation, counts)) in reps.into_iter().enumerate() {
+            for x_hi in [0usize, 3] {
+                let ab_inner: Vec<u8> = (0..((x_hi + 1) << n_lo_and_inner) * N_CHUNKS)
+                    .map(|_| rng.next_u64() as u8)
+                    .collect();
+                for bank_bits in [0usize, 2, n_lo] {
+                    let n_banks = 1usize << bank_bits;
+                    let tables = rng.f128_vec((big_lo_size >> bank_bits) * CONVERT_TABLE_SIZE);
+                    let eq_bot = rng.f128_vec(n_banks);
+                    let eq_hi_val = rng.f128();
+                    let start_banks = rng.f128_vec(n_banks * ELL);
+                    for lo_range in [0..big_lo_size, 5..big_lo_size, 0..3, 7..7 + n_banks.min(9), 33..34] {
+                        // The deferred bank fold is the ranked 128-bank form.
+                        for bank_deferred in [false, bank_bits == 7] {
+                            let mut want_banks = start_banks.clone();
+                            let mut got_banks = start_banks.clone();
+                            let mut want: [F128; ELL] = core::array::from_fn(|_| F128::ZERO);
+                            let mut got = want;
+                            for (hoist, banks, partial) in
+                                [(false, &mut want_banks, &mut want), (true, &mut got_banks, &mut got)]
+                            {
+                                process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded_with(
+                                    x_hi,
+                                    lo_range.clone(),
+                                    big_lo_size,
+                                    n_lo_and_inner,
+                                    1,
+                                    &counts,
+                                    &ab_inner,
+                                    representation,
+                                    &eq_bot,
+                                    eq_hi_val,
+                                    &tables,
+                                    bank_bits,
+                                    bank_deferred,
+                                    banks,
+                                    partial,
+                                    hoist,
+                                );
+                            }
+                            let ctx = format!(
+                                "rep {rep_index}, x_hi {x_hi}, s {bank_bits}, range {lo_range:?}, deferred {bank_deferred}"
+                            );
+                            assert_eq!(got, want, "partial, {ctx}");
+                            assert_eq!(got_banks, want_banks, "banks, {ctx}");
+                            hoisted_calls += usize::from(seeded_sweep_hoist_applies(
+                                lo_range.clone(),
+                                x_hi,
+                                n_lo_and_inner,
+                                1,
+                                &counts,
+                                &ab_inner,
+                                &tables,
+                                bank_bits,
+                                start_banks.len(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(hoisted_calls > 0, "the hoisted sweep never applied");
+        // Buffers too short for the range's last index keep the per-index loop.
+        let ab_inner = vec![0u8; (1 << n_lo_and_inner) * N_CHUNKS - 1];
+        let tables = vec![F128::ZERO; big_lo_size * CONVERT_TABLE_SIZE];
+        assert!(!seeded_sweep_hoist_applies(0..big_lo_size, 0, n_lo_and_inner, 1, &[16, 15], &ab_inner, &tables, 0, ELL));
+    }
+
+    #[test]
     fn ab_completion_seeded_kernel_matches_incumbent() {
         let mut rng = Rng::new(0x5EED_AB01);
         let table = rng.f128_vec(CONVERT_TABLE_SIZE);
@@ -7999,6 +8296,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The fourteen-row seeded form (sixteen lanes per pass, seven unrolled
+    /// pairs) against the general seeded kernel on the same rows, table and
+    /// starting bank, at both spans the identity-prefix layout produces
+    /// (`2..16` and `0..14`) and both table-load forms, and against the
+    /// per-lane definition (also for the odd-start span `1..15`); rows
+    /// outside the span carry data that must not be read. Only spans of
+    /// exactly fourteen rows with the unscaled loads are routed to the new
+    /// form; the scaled-load arm never is.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_completion_seeded_pair16_form_matches_general_seeded_kernel() {
+        let mut rng = Rng::new(0x5EED_AB16);
+        for trial in 0..12 {
+            let table = rng.f128_vec(CONVERT_TABLE_SIZE);
+            let mut rows = [[0u8; 64]; 16];
+            for row in rows.iter_mut() {
+                for byte in row.iter_mut() {
+                    *byte = match trial {
+                        0 => 0xff,
+                        1 => 0,
+                        _ => rng.next_u64() as u8,
+                    };
+                }
+            }
+            let start: [F128; ELL] = if trial == 2 {
+                [F128::ZERO; ELL]
+            } else {
+                core::array::from_fn(|_| rng.f128())
+            };
+            for (first, end) in [(2usize, 16usize), (0, 14), (1, 15)] {
+                let mut defined = start;
+                for b in first..end {
+                    for lane in 0..ELL {
+                        defined[lane] += table[b * 256 + rows[b][lane] as usize];
+                    }
+                }
+                let mut got_unscaled = start;
+                let mut got_scaled = start;
+                // SAFETY: fixed-size rows, bank and a full 16 x 256 table;
+                // `first + 14 <= 16`.
+                unsafe {
+                    kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16::<true>(
+                        &rows, first, &table, &mut got_unscaled,
+                    );
+                    kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16::<false>(
+                        &rows, first, &table, &mut got_scaled,
+                    );
+                }
+                assert_eq!(got_unscaled, defined, "unscaled trial={trial} first={first}");
+                assert_eq!(got_scaled, defined, "scaled trial={trial} first={first}");
+                if first % 2 != 0 {
+                    // The general kernel requires an even start.
+                    continue;
+                }
+                let mut want_unscaled = start;
+                let mut want_scaled = start;
+                // SAFETY: as above.
+                unsafe {
+                    kernels::aarch64::accumulate_convert_ab_nomul_seeded::<true>(
+                        &rows, first, end, &table, &mut want_unscaled,
+                    );
+                    kernels::aarch64::accumulate_convert_ab_nomul_seeded::<false>(
+                        &rows, first, end, &table, &mut want_scaled,
+                    );
+                }
+                assert_eq!(got_unscaled, want_unscaled, "unscaled trial={trial} first={first}");
+                assert_eq!(got_scaled, want_scaled, "scaled trial={trial} first={first}");
+            }
+        }
+
+        let spans = || (0..=16).flat_map(|first| (first..=16).map(move |end| (first, end)));
+        let routed: Vec<(usize, usize)> = spans()
+            .filter(|&(first, end)| kernels::seeded_pair16_route::<true>(first, end))
+            .collect();
+        assert_eq!(routed, [(0, 14), (1, 15), (2, 16)]);
+        assert!(spans().all(|(first, end)| !kernels::seeded_pair16_route::<false>(first, end)));
     }
 
     /// The gather is an XOR chain over convert rows, so the pre-scaled table

@@ -982,6 +982,9 @@ struct AbStripeEmitter<'a> {
     direct: bool,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     program: Option<Box<[StripeRowOp]>>,
+    /// `program` regrouped into segments (`None`: run it op by op).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    segments: Option<StripeSegmentProgram>,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     checks: Box<[(usize, u64, u64)]>,
 }
@@ -1001,6 +1004,15 @@ impl<'a> AbStripeEmitter<'a> {
         assert!(rows.len() <= AB_STRIPE_MAX_ROWS && rows.len() * 64 <= group_bytes);
         assert!(rows.iter().all(|r| r.lo_word + usize::from(r.hi_mask != 0) < AB_STRIPE_WORDS));
         let n_groups = stripe_len / group_bytes;
+        let program = if cfg!(target_arch = "aarch64") && ab_stripe_row_program_enabled() {
+            build_stripe_row_program(rows)
+        } else {
+            None
+        };
+        let segments = program
+            .as_deref()
+            .filter(|_| ab_stripe_segments_enabled())
+            .and_then(build_stripe_segment_program);
         Self {
             stripe,
             group_bytes,
@@ -1019,11 +1031,8 @@ impl<'a> AbStripeEmitter<'a> {
                 .max()
                 .unwrap_or(0),
             direct: zerocheck::univariate_skip_optimized::zc_ab_pair_scratch_active(),
-            program: if cfg!(target_arch = "aarch64") && ab_stripe_row_program_enabled() {
-                build_stripe_row_program(rows)
-            } else {
-                None
-            },
+            program,
+            segments,
             checks: crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter().copied().collect(),
         }
     }
@@ -1132,7 +1141,10 @@ impl<'a> AbStripeEmitter<'a> {
         #[cfg(target_arch = "aarch64")]
         let programmed = if let Some(program) = self.program.as_deref() {
             unsafe {
-                emit_root_rows_ab_s256(a.cast(), b.cast(), dst.as_mut_ptr(), program);
+                match &self.segments {
+                    Some(segments) => emit_root_rows_ab_s256_segments(a.cast(), b.cast(), dst.as_mut_ptr(), segments),
+                    None => emit_root_rows_ab_s256(a.cast(), b.cast(), dst.as_mut_ptr(), program),
+                }
                 if self.fixed_inputs && !fixed_inputs_hold_ab_resolved(a, b, &self.checks) {
                     self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1184,6 +1196,13 @@ fn ab_stripe_row_program_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_AB_STRIPE_ROW_PROGRAM").is_none())
 }
 
+/// Whether the AB stripe row program runs in its segment form
+/// ([`StripeSegmentProgram`]); `FLOCK_NO_AB_STRIPE_SEGMENTS` keeps the per-op loop.
+fn ab_stripe_segments_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_AB_STRIPE_SEGMENTS").is_none())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 enum StripeRowKind {
@@ -1230,6 +1249,81 @@ fn build_stripe_row_program(
         j += 1;
     }
     Some(ops.into_boxed_slice())
+}
+
+/// A Split op of a row program and the Pair or Full op right after it,
+/// which starts two words (16 bytes) further in each lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+struct StripeSegment {
+    /// Lane byte offset of the Split.
+    off: u32,
+    /// Byte offset of the Split's 64 output bytes; the second op's output
+    /// follows them.
+    out: u32,
+    /// The Split's mask.
+    mask: u64,
+    /// The second op is a Pair (128 output bytes), else a Full (64).
+    pair: bool,
+}
+
+/// A row program regrouped as its leading Pair ops, the Full ops after
+/// them, a run of [`StripeSegment`]s and at most one trailing Masked op,
+/// each with its output offset precomputed. Same ops, same order.
+#[derive(Debug)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+struct StripeSegmentProgram {
+    /// `(off, out)` of each leading Pair op.
+    pairs: Box<[(u32, u32)]>,
+    /// `(off, out)` of each Full op that follows them.
+    fulls: Box<[(u32, u32)]>,
+    segments: Box<[StripeSegment]>,
+    /// `(off, out, mask)` of the trailing Masked op.
+    masked: Option<(u32, u32, u64)>,
+}
+
+/// Regroups a row program for [`emit_root_rows_ab_s256_segments`], or
+/// `None` when the program is not of the [`StripeSegmentProgram`] form.
+fn build_stripe_segment_program(ops: &[StripeRowOp]) -> Option<StripeSegmentProgram> {
+    let at = |off: usize, out: usize| Some((u32::try_from(off).ok()?, u32::try_from(out).ok()?));
+    let (mut i, mut out) = (0, 0usize);
+    let mut pairs = Vec::new();
+    while let Some(op) = ops.get(i).filter(|op| op.kind == StripeRowKind::Pair) {
+        pairs.push(at(op.off, out)?);
+        (i, out) = (i + 1, out + 128);
+    }
+    let mut fulls = Vec::new();
+    while let Some(op) = ops.get(i).filter(|op| op.kind == StripeRowKind::Full) {
+        fulls.push(at(op.off, out)?);
+        (i, out) = (i + 1, out + 64);
+    }
+    let mut segments = Vec::new();
+    while let [split, second, ..] = &ops[i..] {
+        let pair = second.kind == StripeRowKind::Pair;
+        if split.kind != StripeRowKind::Split
+            || !(pair || second.kind == StripeRowKind::Full)
+            || second.off != split.off + 16
+        {
+            break;
+        }
+        let (off, seg_out) = at(split.off, out)?;
+        segments.push(StripeSegment { off, out: seg_out, mask: split.mask, pair });
+        (i, out) = (i + 2, out + if pair { 192 } else { 128 });
+    }
+    let masked = match &ops[i..] {
+        [] => None,
+        [op] if op.kind == StripeRowKind::Masked => {
+            let (off, op_out) = at(op.off, out)?;
+            Some((off, op_out, op.mask))
+        }
+        _ => return None,
+    };
+    Some(StripeSegmentProgram {
+        pairs: pairs.into_boxed_slice(),
+        fulls: fulls.into_boxed_slice(),
+        segments: segments.into_boxed_slice(),
+        masked,
+    })
 }
 
 ///
@@ -1320,6 +1414,116 @@ unsafe fn emit_root_rows_ab_s256(a: *const u8, b: *const u8, dst: *mut u8, ops: 
                     out = out.add(64);
                 }
             }
+        }
+    }
+}
+
+/// [`emit_root_rows_ab_s256`] driven by the regrouped program: the same op
+/// bodies with the same offsets, outputs and order, without a per-op kind
+/// decode or output cursor. A segment runs its Split, then its Pair or Full
+/// at 16 bytes further in the lanes and 64 bytes further in the output.
+///
+/// # Safety
+/// As [`emit_root_rows_ab_s256`] for the row program `prog` was built from.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut u8, prog: &StripeSegmentProgram) {
+    use core::arch::aarch64::*;
+    const LANE: usize = AB_STRIPE_WORDS * 8;
+
+    #[inline(always)]
+    unsafe fn q(a: *const u8, b: *const u8, l: usize) -> uint64x2_t {
+        unsafe { vandq_u64(vld1q_u64(a.add(l * LANE).cast()), vld1q_u64(b.add(l * LANE).cast())) }
+    }
+    #[inline(always)]
+    unsafe fn pair(a: *const u8, b: *const u8, l: usize) -> uint64x2_t {
+        unsafe {
+            vandq_u64(
+                vcombine_u64(vld1_u64(a.add(l * LANE).cast()), vld1_u64(a.add((l + 1) * LANE).cast())),
+                vcombine_u64(vld1_u64(b.add(l * LANE).cast()), vld1_u64(b.add((l + 1) * LANE).cast())),
+            )
+        }
+    }
+    #[inline(always)]
+    unsafe fn sel(m: uint8x16_t, x: uint64x2_t, y: uint64x2_t) -> uint64x2_t {
+        unsafe { vreinterpretq_u64_u8(vbslq_u8(m, vreinterpretq_u8_u64(x), vreinterpretq_u8_u64(y))) }
+    }
+    #[inline(always)]
+    unsafe fn put(dst: *mut u8, r: [uint64x2_t; 4]) {
+        unsafe {
+            let [y0, y1, y2, y3] = flock_core::bits::transpose_8_row_pairs_to_regs(
+                vreinterpretq_u8_u64(r[0]),
+                vreinterpretq_u8_u64(r[1]),
+                vreinterpretq_u8_u64(r[2]),
+                vreinterpretq_u8_u64(r[3]),
+            );
+            core::arch::asm!(
+                "stnp {y0:q}, {y1:q}, [{dst}]",
+                "stnp {y2:q}, {y3:q}, [{dst}, #32]",
+                dst = in(reg) dst,
+                y0 = in(vreg) y0,
+                y1 = in(vreg) y1,
+                y2 = in(vreg) y2,
+                y3 = in(vreg) y3,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+    /// The two words at `pa` / `pb` of the eight lanes: (first words, second words).
+    #[inline(always)]
+    unsafe fn rows(pa: *const u8, pb: *const u8) -> ([uint64x2_t; 4], [uint64x2_t; 4]) {
+        unsafe {
+            let (z0, z1, z2, z3) = (q(pa, pb, 0), q(pa, pb, 1), q(pa, pb, 2), q(pa, pb, 3));
+            let (z4, z5, z6, z7) = (q(pa, pb, 4), q(pa, pb, 5), q(pa, pb, 6), q(pa, pb, 7));
+            (
+                [vtrn1q_u64(z0, z1), vtrn1q_u64(z2, z3), vtrn1q_u64(z4, z5), vtrn1q_u64(z6, z7)],
+                [vtrn2q_u64(z0, z1), vtrn2q_u64(z2, z3), vtrn2q_u64(z4, z5), vtrn2q_u64(z6, z7)],
+            )
+        }
+    }
+    #[inline(always)]
+    unsafe fn pair_op(pa: *const u8, pb: *const u8, out: *mut u8) {
+        unsafe {
+            let (lo, hi) = rows(pa, pb);
+            put(out, lo);
+            put(out.add(64), hi);
+        }
+    }
+    #[inline(always)]
+    unsafe fn full_op(pa: *const u8, pb: *const u8, out: *mut u8) {
+        unsafe { put(out, [pair(pa, pb, 0), pair(pa, pb, 2), pair(pa, pb, 4), pair(pa, pb, 6)]) }
+    }
+
+    unsafe {
+        for &(off, out) in prog.pairs.iter() {
+            pair_op(a.add(off as usize), b.add(off as usize), dst.add(out as usize));
+        }
+        for &(off, out) in prog.fulls.iter() {
+            full_op(a.add(off as usize), b.add(off as usize), dst.add(out as usize));
+        }
+        for seg in prog.segments.iter() {
+            let (pa, pb, out) = (a.add(seg.off as usize), b.add(seg.off as usize), dst.add(seg.out as usize));
+            let (lo, hi) = rows(pa, pb);
+            let m = vreinterpretq_u8_u64(vdupq_n_u64(seg.mask));
+            put(out, [sel(m, lo[0], hi[0]), sel(m, lo[1], hi[1]), sel(m, lo[2], hi[2]), sel(m, lo[3], hi[3])]);
+            if seg.pair {
+                pair_op(pa.add(16), pb.add(16), out.add(64));
+            } else {
+                full_op(pa.add(16), pb.add(16), out.add(64));
+            }
+        }
+        if let Some((off, out, mask)) = prog.masked {
+            let (pa, pb) = (a.add(off as usize), b.add(off as usize));
+            let m = vdupq_n_u64(mask);
+            put(
+                dst.add(out as usize),
+                [
+                    vandq_u64(pair(pa, pb, 0), m),
+                    vandq_u64(pair(pa, pb, 2), m),
+                    vandq_u64(pair(pa, pb, 4), m),
+                    vandq_u64(pair(pa, pb, 6), m),
+                ],
+            );
         }
     }
 }
@@ -1735,6 +1939,101 @@ mod deferred_stripe_tests {
                     assert!(got, "rows={} case={case}", rows.len());
                 }
             }
+        }
+    }
+
+    /// The segment form of the row program writes the bytes of the per-op
+    /// loop, and no others: the ranked 176 rows (6 Pair + 1 Full head, 56
+    /// segments, Masked tail) and the 177 rows (8 Pair head, 55 segments,
+    /// Masked tail) on zero, all-ones and random groups, then the program of
+    /// every prefix of both row sets; a prefix that ends inside a segment
+    /// (on a Split) is not regrouped, nor is any other program outside the
+    /// form (second op not 16 bytes on, ops left after the segments).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_stripe_segment_program_writes_the_row_program_bytes() {
+        use crate::r1cs_hashes::blake3 as b3;
+        let mut x = 0x7a3d_51c9_e08b_2f64u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let check = |ops: &[StripeRowOp], segs: &StripeSegmentProgram, a: &[u64], b: &[u64], what: &str| {
+            assert!(a.len() == 8 * AB_STRIPE_WORDS && b.len() == 8 * AB_STRIPE_WORDS);
+            let mut expected = vec![0xa5u8; 1 << 14];
+            let mut actual = vec![0xa5u8; 1 << 14];
+            // SAFETY: eight complete blocks each; the programs come from rows
+            // whose reads stay inside a block and whose output fits 16 KiB.
+            unsafe {
+                emit_root_rows_ab_s256(a.as_ptr().cast(), b.as_ptr().cast(), expected.as_mut_ptr(), ops);
+                emit_root_rows_ab_s256_segments(a.as_ptr().cast(), b.as_ptr().cast(), actual.as_mut_ptr(), segs);
+            }
+            let written: usize = ops.iter().map(|op| if op.kind == StripeRowKind::Pair { 128 } else { 64 }).sum();
+            assert!(expected[written..].iter().all(|&x| x == 0xa5), "{what}");
+            assert!(written == 0 || expected[..written].iter().any(|&x| x != 0xa5), "{what}");
+            assert_eq!(actual, expected, "{what}");
+        };
+        let count = |ops: &[StripeRowOp], kind| ops.iter().filter(|op| op.kind == kind).count();
+        let ranked = b3::fixed_input_root_stripe_rows().expect("fixed-input stripe on by default");
+        let full = b3::root_stripe_rows().expect("root stripe on by default");
+        // (rows, Pair / Split / Full / Masked ops, head Pairs, head Fulls, segments, Pair segments)
+        for (rows, kinds, head_pairs, head_fulls, n_segs, pair_segs) in
+            [(ranked, [56, 56, 7, 1], 6, 1, 56, 50), (full, [58, 55, 5, 1], 8, 0, 55, 50)]
+        {
+            let ops = build_stripe_row_program(rows).expect("ranked rows compile");
+            let segs = build_stripe_segment_program(&ops).expect("ranked program regroups");
+            let got_kinds = [StripeRowKind::Pair, StripeRowKind::Split, StripeRowKind::Full, StripeRowKind::Masked]
+                .map(|k| count(&ops, k));
+            assert_eq!(got_kinds, kinds, "rows={}", rows.len());
+            assert_eq!(
+                (segs.pairs.len(), segs.fulls.len(), segs.segments.len(), segs.masked.is_some()),
+                (head_pairs, head_fulls, n_segs, true),
+                "rows={}",
+                rows.len()
+            );
+            assert_eq!(segs.segments.iter().filter(|s| s.pair).count(), pair_segs, "rows={}", rows.len());
+            for case in 0..8 {
+                let mut word = |_: usize| match case {
+                    0 => 0,
+                    1 => u64::MAX,
+                    _ => next(),
+                };
+                let a: Vec<u64> = (0..8 * AB_STRIPE_WORDS).map(&mut word).collect();
+                let b: Vec<u64> = (0..8 * AB_STRIPE_WORDS).map(&mut word).collect();
+                check(&ops, &segs, &a, &b, &format!("rows={} case={case}", rows.len()));
+            }
+            let a: Vec<u64> = (0..8 * AB_STRIPE_WORDS).map(|_| next()).collect();
+            let b: Vec<u64> = (0..8 * AB_STRIPE_WORDS).map(|_| next()).collect();
+            let (mut regrouped, mut kept) = (0, 0);
+            for k in 0..=rows.len() {
+                let ops = build_stripe_row_program(&rows[..k]).expect("row prefixes compile");
+                match build_stripe_segment_program(&ops) {
+                    Some(segs) => {
+                        check(&ops, &segs, &a, &b, &format!("rows={} prefix={k}", rows.len()));
+                        regrouped += 1;
+                    }
+                    None => {
+                        assert_eq!(ops.last().map(|op| op.kind), Some(StripeRowKind::Split), "prefix={k}");
+                        kept += 1;
+                    }
+                }
+            }
+            assert!(regrouped > n_segs && kept > 0, "rows={} {regrouped} {kept}", rows.len());
+        }
+        // Programs outside the regrouped form keep the per-op loop.
+        let op = |off: usize, kind, mask: u64| StripeRowOp { off, kind, mask };
+        let (p, f, s, m) = (StripeRowKind::Pair, StripeRowKind::Full, StripeRowKind::Split, StripeRowKind::Masked);
+        for ops in [
+            vec![op(0, s, 1), op(24, p, 0)],
+            vec![op(0, s, 1), op(16, s, 1)],
+            vec![op(0, s, 1), op(16, p, 0), op(32, p, 0)],
+            vec![op(0, s, 1), op(16, f, 0), op(24, m, 3), op(32, m, 3)],
+            vec![op(0, f, 0), op(8, p, 0)],
+            vec![op(0, m, 3), op(8, f, 0)],
+        ] {
+            assert!(build_stripe_segment_program(&ops).is_none(), "{ops:?}");
         }
     }
 

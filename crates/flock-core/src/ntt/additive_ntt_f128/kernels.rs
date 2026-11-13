@@ -201,6 +201,53 @@ pub(super) fn butterfly_fused_2layer_low_twiddles(
     portable::butterfly_fused_2layer(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 }
 
+/// Whether [`try_butterfly_fused_2layer_low_twiddles_zero_tail_blocks`] runs
+/// the same lane body that [`butterfly_fused_2layer_low_twiddles`] selects.
+#[inline]
+pub(super) fn low_twiddles_zero_tail_blocks_selected() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        aarch64::low_lazy_blocks_selected()
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        false
+    }
+}
+
+/// Final low-twiddle fused pair (`quarter == 1`) over consecutive four-row
+/// blocks in one call; `twiddles(i)` gives block `i`'s three twiddles. Rows b
+/// and d must be zero in the trailing `zero_tail` lanes, which take a reduced
+/// body. Returns `false` when the caller's per-block path should be used.
+#[inline]
+pub(super) fn try_butterfly_fused_2layer_low_twiddles_zero_tail_blocks<F>(
+    blocks: &mut [F128],
+    num_ntts: usize,
+    zero_tail: usize,
+    twiddles: F,
+) -> bool
+where
+    F: Fn(usize) -> (F128, F128, F128),
+{
+    debug_assert!(num_ntts > 0 && zero_tail < num_ntts);
+    debug_assert!(blocks.len().is_multiple_of(4 * num_ntts));
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate guarantees PMULL through the aes feature.
+    unsafe {
+        aarch64::butterfly_fused_2layer_low_lazy_zero_tail_blocks(
+            blocks, num_ntts, zero_tail, twiddles,
+        );
+        true
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let _ = (blocks, num_ntts, zero_tail, twiddles);
+        false
+    }
+}
+
 /// Process one fused-four-layer row group across every interleaved NTT lane.
 ///
 /// # Safety

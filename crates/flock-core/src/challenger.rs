@@ -304,7 +304,6 @@ impl FsChallenger {
         self.n_absorbed = self.n_absorbed.wrapping_add(bytes.len() as u64);
     }
 
-    #[cfg(not(target_endian = "little"))]
     #[inline]
     fn absorb_f128(&mut self, v: F128) {
         self.absorb(&v.lo.to_le_bytes());
@@ -371,20 +370,13 @@ impl Challenger for FsChallenger {
     }
 
     fn observe_f128(&mut self, value: F128) {
-        let mut buf = [0u8; 18];
-        buf[0] = OP_OBSERVE;
-        buf[1] = KIND_SCALAR;
-        buf[2..10].copy_from_slice(&value.lo.to_le_bytes());
-        buf[10..].copy_from_slice(&value.hi.to_le_bytes());
-        self.absorb(&buf);
+        self.absorb(&[OP_OBSERVE, KIND_SCALAR]);
+        self.absorb_f128(value);
     }
 
     fn observe_f128_slice(&mut self, values: &[F128]) {
-        let mut header = [0u8; 10];
-        header[0] = OP_OBSERVE;
-        header[1] = KIND_SLICE;
-        header[2..].copy_from_slice(&(values.len() as u64).to_le_bytes());
-        self.absorb(&header);
+        self.absorb(&[OP_OBSERVE, KIND_SLICE]);
+        self.absorb(&(values.len() as u64).to_le_bytes());
 
         #[cfg(target_endian = "little")]
         self.absorb(f128s_as_bytes(values));
@@ -417,11 +409,8 @@ impl Challenger for FsChallenger {
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         #[cfg(feature = "hash-count")]
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut header = [0u8; 10];
-        header[0] = OP_SQUEEZE;
-        header[1] = KIND_SLICE;
-        header[2..].copy_from_slice(&(n as u64).to_le_bytes());
-        self.absorb(&header);
+        self.absorb(&[OP_SQUEEZE, KIND_SLICE]);
+        self.absorb(&(n as u64).to_le_bytes());
 
         #[cfg(target_endian = "little")]
         {

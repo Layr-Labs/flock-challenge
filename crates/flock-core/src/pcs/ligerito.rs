@@ -8806,16 +8806,39 @@ impl SumcheckProver {
 /// Sample `count` distinct positions in `[0, block_len)` via the challenger.
 /// Asserts `count <= block_len` — otherwise no number of samples could satisfy
 /// the distinctness requirement (would infinite-loop).
+/// Kill switch for the presized membership set of query sampling:
+/// `FLOCK_NO_QUERY_SET_PRESIZE` (any value) starts the set empty and lets it
+/// grow, as before. Same queries. Read once per process.
+fn query_set_presized_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_QUERY_SET_PRESIZE").is_none())
+}
+
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
     count: usize,
 ) -> Vec<usize> {
+    sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled())
+}
+
+fn sample_distinct_queries_with<Ch: Challenger>(
+    challenger: &mut Ch,
+    block_len: usize,
+    count: usize,
+    presized: bool,
+) -> Vec<usize> {
     assert!(
         count <= block_len,
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
-    let mut seen = std::collections::HashSet::new();
+    // Sized once for `count` entries; the set only answers membership, so
+    // its capacity cannot change which positions are kept or their order.
+    let mut seen = if presized {
+        std::collections::HashSet::with_capacity(count)
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut out = Vec::with_capacity(count);
     while out.len() < count {
         let v = challenger.sample_f128();
@@ -15712,6 +15735,19 @@ mod tests {
                 let sparse = transpose_forward_ntt_sparse(&ntt, &positions, &values, log_d, false);
                 assert_eq!(sparse, dense, "log_d={log_d}, nq={nq}");
             }
+        }
+    }
+
+    #[test]
+    fn presized_query_set_samples_the_same_queries() {
+        for &(log_len, count) in &[(20usize, 218usize), (17, 106), (15, 71), (12, 53), (8, 43), (6, 36), (4, 16)] {
+            let block_len = 1usize << log_len;
+            let mut c0 = crate::challenger::RandomChallenger::new(0x51A7_0000 ^ (log_len * 1000 + count) as u64);
+            let mut c1 = crate::challenger::RandomChallenger::new(0x51A7_0000 ^ (log_len * 1000 + count) as u64);
+            let grown = sample_distinct_queries_with(&mut c0, block_len, count, false);
+            let presized = sample_distinct_queries_with(&mut c1, block_len, count, true);
+            assert_eq!(presized, grown, "log_len={log_len} count={count}");
+            assert_eq!(presized.len(), count);
         }
     }
 

@@ -1327,6 +1327,80 @@ unsafe fn butterfly_fused_2layer_low_lazy(
     }
 }
 
+/// Whether [`butterfly_fused_2layer_low_twiddles`] runs its lazy form
+/// (`FLOCK_NO_NTT_LOW_PMULL` and `FLOCK_NO_NTT_LOW_LAZY` unset) with its
+/// per-block debug counter off (`FLOCK_NTT_LOW_PMULL_DEBUG` unset). Read once
+/// per process.
+pub(super) fn low_lazy_blocks_selected() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_NTT_LOW_PMULL").is_none()
+            && std::env::var_os("FLOCK_NO_NTT_LOW_LAZY").is_none()
+            && std::env::var_os("FLOCK_NTT_LOW_PMULL_DEBUG").is_none()
+    })
+}
+
+/// Final fused pair (`quarter == 1`) over consecutive four-row blocks
+/// `[a, b, c, d]` of `num_ntts` lanes each. `twiddles(i)` returns block `i`'s
+/// `(t_outer, t_inner_a, t_inner_b)`, all with a zero high limb.
+///
+/// Rows b and d must be zero in the trailing `zero_tail` lanes. There layer L
+/// gives `a1 = a + c·t_outer`, `c1 = c + a1` and leaves b and d at zero, so
+/// layer L+1 gives `a2 = b2 = a1` and `c2 = d2 = c1`: one fully reduced
+/// low-limb product per lane. The other lanes run the lazy lane body of
+/// [`butterfly_fused_2layer_low_lazy`].
+///
+/// # Safety
+/// Requires the `aes` target feature.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_2layer_low_lazy_zero_tail_blocks<F>(
+    blocks: &mut [F128],
+    num_ntts: usize,
+    zero_tail: usize,
+    twiddles: F,
+) where
+    F: Fn(usize) -> (F128, F128, F128),
+{
+    debug_assert!(zero_tail < num_ntts);
+    debug_assert!(blocks.len().is_multiple_of(4 * num_ntts));
+    let dense = num_ntts - zero_tail;
+    unsafe {
+        use core::arch::aarch64::*;
+        let zero = vdupq_n_u64(0);
+        for (i, block) in blocks.chunks_exact_mut(4 * num_ntts).enumerate() {
+            let (t_outer, t_inner_a, t_inner_b) = twiddles(i);
+            let (a, rest) = block.split_at_mut(num_ntts);
+            let (b, rest) = rest.split_at_mut(num_ntts);
+            let (c, d) = rest.split_at_mut(num_ntts);
+            let (a, a_tail) = a.split_at_mut(dense);
+            let (b, b_tail) = b.split_at_mut(dense);
+            let (c, c_tail) = c.split_at_mut(dense);
+            let (d, d_tail) = d.split_at_mut(dense);
+            butterfly_fused_2layer_low_lazy(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+
+            let to = vdupq_n_u64(t_outer.lo);
+            for (((a, b), c), d) in a_tail
+                .iter_mut()
+                .zip(b_tail.iter_mut())
+                .zip(c_tail.iter_mut())
+                .zip(d_tail.iter_mut())
+            {
+                debug_assert!(
+                    *b == F128::ZERO && *d == F128::ZERO,
+                    "zero-tail final pair needs zero b and d rows in the tail lanes"
+                );
+                let xa = vld1q_u64((&raw const *a).cast::<u64>());
+                let xc = vld1q_u64((&raw const *c).cast::<u64>());
+                let (fa, fc) = butterfly_low_fold_q(xa, xc, to, zero);
+                vst1q_u64((&raw mut *a).cast::<u64>(), fa);
+                vst1q_u64((&raw mut *b).cast::<u64>(), fa);
+                vst1q_u64((&raw mut *c).cast::<u64>(), fc);
+                vst1q_u64((&raw mut *d).cast::<u64>(), fc);
+            }
+        }
+    }
+}
+
 ///
 /// # Safety
 #[target_feature(enable = "aes")]

@@ -1262,7 +1262,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
         for x_lo in 0..lo_size {
             if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
                 store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                store_delta_pair_gpr(deltas.add(x_lo * 16), 0, 0, 0, 0);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
                 continue;
             }
 
@@ -1282,7 +1282,9 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
                 // b-table lookups; `b0 + b1 = 0` zeroes the G(∞) term.
                 let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
                 store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-                store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, 0, 0);
+                let delta_pair =
+                    core::mem::transmute::<[u64; 2], uint64x2_t>([a0_code ^ a1_code, 0]);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
 
                 let g1 = if ones_is_one { a1 } else { mul_q(a1, b_ones) };
                 let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
@@ -1294,7 +1296,10 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
                 fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
 
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-            store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+            let da = a0_code ^ a1_code;
+            let db = b0_code ^ b1_code;
+            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([da, db]);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
 
             let g1 = mul_q(a1, b1);
             let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
@@ -1351,7 +1356,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
         for x_lo in 0..lo_size {
             if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
                 store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                store_delta_pair_gpr(deltas.add(x_lo * 16), 0, 0, 0, 0);
+                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
                 continue;
             }
             let row0 = 2 * x_lo;
@@ -1370,7 +1375,11 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
             ));
             let (a0, b0) = fold_two_row_codes_q(table_data, a0_code, b0_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-            store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+            let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
+                a0_code ^ a1_code,
+                b0_code ^ b1_code,
+            ]);
+            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
         }
     }
 }
@@ -3747,13 +3756,11 @@ pub(crate) unsafe fn fold_round2_compact_stream_chunk_neon<const L: usize>(
 
                     if pass == 0 {
                         acc[i] = [va0, va1, vb0, vb1];
-                        store_delta_pair_gpr(
-                            deltas.add(x_lo * 16),
-                            a0_code,
-                            a1_code,
-                            b0_code,
-                            b1_code,
-                        );
+                        let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
+                            a0_code ^ a1_code,
+                            b0_code ^ b1_code,
+                        ]);
+                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
                     } else {
                         acc[i][0] = veorq_u64(acc[i][0], va0);
                         acc[i][1] = veorq_u64(acc[i][1], va1);
@@ -4860,9 +4867,24 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
     rho_c: F128,
     eq_lo: &[F128],
 ) -> [F128; TRI_SLOTS] {
-    fold_tri_and_message_impl::<DEPTH, NT, ABL, false>(
-        a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
-    )
+    if zc_tri_group_inline_enabled() {
+        fold_tri_and_message_impl::<DEPTH, NT, ABL, false, true>(
+            a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+        )
+    } else {
+        fold_tri_and_message_impl::<DEPTH, NT, ABL, false, false>(
+            a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+        )
+    }
+}
+
+/// Kill switch: `FLOCK_NO_ZC_TRI_GROUP_INLINE` (any value) folds each group
+/// of the tri pass through the parent's closure, which the compiler emits as
+/// an out-of-line call returning its eight vectors through memory.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+fn zc_tri_group_inline_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_TRI_GROUP_INLINE").is_none())
 }
 
 /// [`fold_tri_and_message_aarch64`] (depth two, no probes) over an input in
@@ -4882,15 +4904,27 @@ pub(crate) fn fold_tri_and_message_packed_aarch64<const NT: bool>(
     rho_b: F128,
     eq_lo: &[F128],
 ) -> [F128; TRI_SLOTS] {
-    fold_tri_and_message_impl::<2, NT, 0, true>(
-        a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo,
-    )
+    if zc_tri_group_inline_enabled() {
+        fold_tri_and_message_impl::<2, NT, 0, true, true>(
+            a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo,
+        )
+    } else {
+        fold_tri_and_message_impl::<2, NT, 0, true, false>(
+            a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo,
+        )
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn fold_tri_and_message_impl<const DEPTH: usize, const NT: bool, const ABL: u32, const PACK: bool>(
+fn fold_tri_and_message_impl<
+    const DEPTH: usize,
+    const NT: bool,
+    const ABL: u32,
+    const PACK: bool,
+    const INL: bool,
+>(
     a_in: &[F128],
     b_in: &[F128],
     a_out: &mut [F128],
@@ -5023,6 +5057,33 @@ fn fold_tri_and_message_impl<const DEPTH: usize, const NT: bool, const ABL: u32,
                 fold_eight::<DEPTH>(ip.add((8 * y) << DEPTH), &rho, rc, rc_sw)
             }
         };
+        // `INL`: the same group fold as `fold_group`, as an always-inlined
+        // function, so its eight vectors stay in registers at the call site
+        // (the closure is emitted out of line and returns them through
+        // memory, reloading the rho vectors and constants on every call).
+        #[inline(always)]
+        unsafe fn fold_group_inl<const DEPTH: usize, const PACK: bool>(
+            ip: *const F128,
+            y: usize,
+            rho: &Fold4RhoQ,
+            rc: uint64x2_t,
+            rc_sw: uint64x2_t,
+        ) -> [uint64x2_t; 8] {
+            unsafe {
+                if PACK {
+                    let (blk, w) = (y / 2, (y / 2) % PACK_BLOCKS);
+                    let sup = ip.add(PACK_SUPER * (blk / PACK_BLOCKS));
+                    let main = sup.add(60 * w);
+                    if y % 2 == 0 {
+                        fold_eight::<2>(main, rho, rc, rc_sw)
+                    } else {
+                        fold_eight_packed_tail(main.add(32), sup.add(60 * PACK_BLOCKS + w), rho)
+                    }
+                } else {
+                    fold_eight::<DEPTH>(ip.add((8 * y) << DEPTH), rho, rc, rc_sw)
+                }
+            }
+        }
 
         const TG: usize = 16;
         let ng = n_out / 8;
@@ -5033,8 +5094,14 @@ fn fold_tri_and_message_impl<const DEPTH: usize, const NT: bool, const ABL: u32,
             let gn = (ng - g0).min(TG);
             for t in 0..gn {
                 let y = g0 + t;
-                let a = fold_group(a_ip, y);
-                let b = fold_group(b_ip, y);
+                let (a, b) = if INL {
+                    (
+                        fold_group_inl::<DEPTH, PACK>(a_ip, y, &rho, rc, rc_sw),
+                        fold_group_inl::<DEPTH, PACK>(b_ip, y, &rho, rc, rc_sw),
+                    )
+                } else {
+                    (fold_group(a_ip, y), fold_group(b_ip, y))
+                };
                 if ABL & 2 == 0 {
                     for h in 0..4 {
                         store_pair::<NT>(a_op.add(8 * y + 2 * h), a[2 * h], a[2 * h + 1]);
@@ -7307,6 +7374,72 @@ mod tests {
                 assert_eq!(packed, full, "slots, case {case}, nt {nt}");
                 assert_eq!(ap, ao, "a outputs, case {case}, nt {nt}");
                 assert_eq!(bp, bo, "b outputs, case {case}, nt {nt}");
+            }
+        }
+    }
+
+    /// The tri pass with the always-inlined group fold (`INL`) equals the
+    /// closure form: every output and all 26 slots, full inputs at depth two
+    /// and three, dead-tail-packed inputs, both store flavours.
+    #[test]
+    fn tri_group_inline_matches_closure_form() {
+        type K = fn(&[F128], &[F128], &mut [F128], &mut [F128], F128, F128, F128, &[F128]) -> [F128; TRI_SLOTS];
+        let mut state = 0x7472_6967_696e_6c31;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let full: [(usize, K, K); 4] = [
+            (2, fold_tri_and_message_impl::<2, false, 0, false, true>, fold_tri_and_message_impl::<2, false, 0, false, false>),
+            (2, fold_tri_and_message_impl::<2, true, 0, false, true>, fold_tri_and_message_impl::<2, true, 0, false, false>),
+            (3, fold_tri_and_message_impl::<3, false, 0, false, true>, fold_tri_and_message_impl::<3, false, 0, false, false>),
+            (3, fold_tri_and_message_impl::<3, true, 0, false, true>, fold_tri_and_message_impl::<3, true, 0, false, false>),
+        ];
+        let packed: [(usize, K, K); 2] = [
+            (2, fold_tri_and_message_impl::<2, false, 0, true, true>, fold_tri_and_message_impl::<2, false, 0, true, false>),
+            (2, fold_tri_and_message_impl::<2, true, 0, true, true>, fold_tri_and_message_impl::<2, true, 0, true, false>),
+        ];
+        for case in 0..4 {
+            let n_out = 64 << case;
+            for (depth, k_inl, k_closure) in full {
+                let n_in = n_out << depth;
+                let a: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+                let b: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+                let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+                let (ra, rb) = (rho(&mut state), rho(&mut state));
+                let rc = if depth == 3 { rho(&mut state) } else { F128::ZERO };
+                let (mut ai, mut bi) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                let (mut ac, mut bc) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                let si = k_inl(&a, &b, &mut ai, &mut bi, ra, rb, rc, &eq);
+                let sc = k_closure(&a, &b, &mut ac, &mut bc, ra, rb, rc, &eq);
+                assert_eq!(si, sc, "slots, case {case}, depth {depth}");
+                assert_eq!(ai, ac, "a outputs, case {case}, depth {depth}");
+                assert_eq!(bi, bc, "b outputs, case {case}, depth {depth}");
+            }
+            let n_in = 4 * n_out;
+            let mut a: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+            let mut b: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+            for blk in 0..n_in / 64 {
+                a[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+                b[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+            }
+            let pack = |v: &[F128]| -> Vec<F128> {
+                let mut p = vec![F128::new(1, 2); n_in / 256 * PACK_SUPER];
+                for (i, &x) in v.iter().enumerate() {
+                    if let Some(k) = packed_index(i) {
+                        p[k] = x;
+                    }
+                }
+                p
+            };
+            let (ap_in, bp_in) = (pack(&a), pack(&b));
+            let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+            let (ra, rb) = (rho(&mut state), rho(&mut state));
+            for (_, k_inl, k_closure) in packed {
+                let (mut ai, mut bi) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                let (mut ac, mut bc) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                let si = k_inl(&ap_in, &bp_in, &mut ai, &mut bi, ra, rb, F128::ZERO, &eq);
+                let sc = k_closure(&ap_in, &bp_in, &mut ac, &mut bc, ra, rb, F128::ZERO, &eq);
+                assert_eq!(si, sc, "packed slots, case {case}");
+                assert_eq!(ai, ac, "packed a outputs, case {case}");
+                assert_eq!(bi, bc, "packed b outputs, case {case}");
             }
         }
     }

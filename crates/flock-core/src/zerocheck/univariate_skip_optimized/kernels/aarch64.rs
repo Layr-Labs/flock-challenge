@@ -527,6 +527,135 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     }
 }
 
+/// Row `B` of a fourteen-row span, 16 bytes at the pass's lane offset, as two
+/// words from one paired load (`ldp`). `mid` points at row 7 of the span plus
+/// the lane offset, so every row offset (`-448..=384`) fits the paired load's
+/// immediate.
+#[inline(always)]
+unsafe fn ab_row_pair<const B: usize>(mid: *const u8) -> (usize, usize) {
+    const { assert!(B < 14) };
+    let (lo, hi): (usize, usize);
+    // SAFETY: `mid` is row 7 of fourteen in-bounds 64-byte rows plus a lane
+    // offset of at most 48, so the 16 bytes read lie inside row `B`; the asm
+    // only reads that memory.
+    unsafe {
+        core::arch::asm!(
+            "ldp {lo}, {hi}, [{p}, #{off}]",
+            off = const (B as isize - 7) * 64,
+            p = in(reg) mid,
+            lo = lateout(reg) lo,
+            hi = lateout(reg) hi,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    (lo, hi)
+}
+
+/// [`accumulate_convert_ab_nomul_seeded`] for a span of exactly fourteen rows
+/// (`first_b_med..first_b_med + 14`: seven pairs, no odd row).
+///
+/// Sixteen lanes per pass instead of eight: sixteen accumulators, and each
+/// row's 16 bytes for the pass come from one paired load, so a call issues
+/// 4 x 14 row loads instead of 8 x 14. The seven pairs are unrolled and the
+/// fourteen table bases are formed once per call, so no pair counter, pointer
+/// bump or odd-row test remains.
+///
+/// Bit-exactness: every lane XORs the same `ab_ld` entries (same table, same
+/// row byte) into the same bank slot, grouped in the same row pairs.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    convert: &[F128],
+    bank: &mut [F128; 64],
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(first_b_med + 14 <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
+    // Rows `first_b_med..first_b_med + 14` and their 4 KiB tables are in
+    // bounds; each pass reads 16 bytes per row at lane offset 0, 16, 32 or 48
+    // and writes sixteen 16-byte bank slots.
+    unsafe {
+        let t0 = (convert.as_ptr() as *const u8).add(first_b_med * 256 * 16);
+        let t: [*const u8; 14] = core::array::from_fn(|b| t0.add(b * 256 * 16));
+        let mut mid = (chunk_ab_bytes.as_ptr() as *const u8).add((first_b_med + 7) * 64);
+        let mut slot = bank.as_mut_ptr() as *mut u8;
+        for _ in 0..4 {
+            let mut a0 = vld1q_u8(slot);
+            let mut a1 = vld1q_u8(slot.add(16));
+            let mut a2 = vld1q_u8(slot.add(32));
+            let mut a3 = vld1q_u8(slot.add(48));
+            let mut a4 = vld1q_u8(slot.add(64));
+            let mut a5 = vld1q_u8(slot.add(80));
+            let mut a6 = vld1q_u8(slot.add(96));
+            let mut a7 = vld1q_u8(slot.add(112));
+            let mut a8 = vld1q_u8(slot.add(128));
+            let mut a9 = vld1q_u8(slot.add(144));
+            let mut a10 = vld1q_u8(slot.add(160));
+            let mut a11 = vld1q_u8(slot.add(176));
+            let mut a12 = vld1q_u8(slot.add(192));
+            let mut a13 = vld1q_u8(slot.add(208));
+            let mut a14 = vld1q_u8(slot.add(224));
+            let mut a15 = vld1q_u8(slot.add(240));
+
+            // One word of an (even, odd) row pair into eight accumulators.
+            macro_rules! fold8 {
+                ($te:expr, $to:expr, $we:expr, $wo:expr,
+                 $x0:ident, $x1:ident, $x2:ident, $x3:ident,
+                 $x4:ident, $x5:ident, $x6:ident, $x7:ident) => {
+                    $x0 = xor3_u8($x0, ab_ld::<U, 0>($te, $we), ab_ld::<U, 0>($to, $wo));
+                    $x1 = xor3_u8($x1, ab_ld::<U, 8>($te, $we), ab_ld::<U, 8>($to, $wo));
+                    $x2 = xor3_u8($x2, ab_ld::<U, 16>($te, $we), ab_ld::<U, 16>($to, $wo));
+                    $x3 = xor3_u8($x3, ab_ld::<U, 24>($te, $we), ab_ld::<U, 24>($to, $wo));
+                    $x4 = xor3_u8($x4, ab_ld::<U, 32>($te, $we), ab_ld::<U, 32>($to, $wo));
+                    $x5 = xor3_u8($x5, ab_ld::<U, 40>($te, $we), ab_ld::<U, 40>($to, $wo));
+                    $x6 = xor3_u8($x6, ab_ld::<U, 48>($te, $we), ab_ld::<U, 48>($to, $wo));
+                    $x7 = xor3_u8($x7, ab_ld::<U, 56>($te, $we), ab_ld::<U, 56>($to, $wo));
+                };
+            }
+            // Rows `$e` and `$o` of the span: low word to lanes 0..8 of the
+            // pass, high word to lanes 8..16.
+            macro_rules! pair {
+                ($e:literal, $o:literal) => {{
+                    let (e0, e1) = ab_row_pair::<$e>(mid);
+                    let (o0, o1) = ab_row_pair::<$o>(mid);
+                    fold8!(t[$e], t[$o], e0, o0, a0, a1, a2, a3, a4, a5, a6, a7);
+                    fold8!(t[$e], t[$o], e1, o1, a8, a9, a10, a11, a12, a13, a14, a15);
+                }};
+            }
+            pair!(0, 1);
+            pair!(2, 3);
+            pair!(4, 5);
+            pair!(6, 7);
+            pair!(8, 9);
+            pair!(10, 11);
+            pair!(12, 13);
+
+            vst1q_u8(slot, a0);
+            vst1q_u8(slot.add(16), a1);
+            vst1q_u8(slot.add(32), a2);
+            vst1q_u8(slot.add(48), a3);
+            vst1q_u8(slot.add(64), a4);
+            vst1q_u8(slot.add(80), a5);
+            vst1q_u8(slot.add(96), a6);
+            vst1q_u8(slot.add(112), a7);
+            vst1q_u8(slot.add(128), a8);
+            vst1q_u8(slot.add(144), a9);
+            vst1q_u8(slot.add(160), a10);
+            vst1q_u8(slot.add(176), a11);
+            vst1q_u8(slot.add(192), a12);
+            vst1q_u8(slot.add(208), a13);
+            vst1q_u8(slot.add(224), a14);
+            vst1q_u8(slot.add(240), a15);
+            mid = mid.add(16);
+            slot = slot.add(256);
+        }
+    }
+}
+
 /// Eight α-free single-bit-`K` C banks, NEON — straight off the packed witness.
 ///
 /// Three phases, no multiplies, no convert-table gathers, and **no per-`b_med`

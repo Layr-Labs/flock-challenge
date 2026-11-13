@@ -251,6 +251,15 @@ fn use_ranked_low_twiddle_final_pair(log_d: usize, num_ntts: usize, n_top: usize
         && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none()
 }
 
+/// The ranked low-twiddle final pair runs each sub-transform's blocks in one
+/// kernel call, with the zero-tail lanes of its odd rows in reduced form.
+/// `FLOCK_NO_NTT_FINAL_PAIR_TAIL` (any value) keeps the dense per-block call.
+#[inline]
+fn final_pair_tail_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_NTT_FINAL_PAIR_TAIL").is_none())
+}
+
 /// The zero-root radix-8 kernel is currently scored only for the ranked L0
 /// transform. Keep recursive and diagnostic commits on their prior kernel so
 /// this candidate has one production scope and one transfer story.
@@ -2078,6 +2087,17 @@ impl AdditiveNttF128 {
         let sub_elems = sub_size_positions * num_ntts;
         let low_twiddle_final_pair = use_ranked_low_twiddle_final_pair(log_d, num_ntts, n_top);
         debug_assert!(zero_tail < num_ntts);
+        // Zero-tail lanes the final pair runs in reduced form; 0 keeps the
+        // dense per-block final pair.
+        let final_pair_tail = if low_twiddle_final_pair
+            && zero_tail > 0
+            && final_pair_tail_enabled()
+            && kernels::low_twiddles_zero_tail_blocks_selected()
+        {
+            zero_tail
+        } else {
+            0
+        };
 
         let range_start = sub_start * sub_elems;
         let range_end = sub_end * sub_elems;
@@ -2094,6 +2114,24 @@ impl AdditiveNttF128 {
                     let block_size_positions = 1usize << (log_d - layer);
                     let quarter = block_size_positions >> 2;
                     let block_elems = block_size_positions * num_ntts;
+
+                    // Final pair: rows b and d (odd positions) still hold
+                    // the zero tail, so one call per sub runs those lanes
+                    // in reduced form.
+                    if final_pair_tail > 0
+                        && layer + 2 == log_d
+                        && self.try_final_pair_low_twiddles_zero_tail(
+                            sub_data,
+                            sub_idx,
+                            layer,
+                            num_blocks_in_sub,
+                            num_ntts,
+                            final_pair_tail,
+                        )
+                    {
+                        layer += 2;
+                        continue;
+                    }
 
                     for block_in_sub in 0..num_blocks_in_sub {
                         let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
@@ -2117,7 +2155,8 @@ impl AdditiveNttF128 {
                             // `quarter` even ⇒ each row group stays inside
                             // one position parity and the static zero tail
                             // survives; the final pair (quarter == 1) mixes
-                            // parities and always runs dense.
+                            // parities and runs dense here (only its rows b
+                            // and d keep the tail; see the form above).
                             let odd_tail = if quarter.is_multiple_of(2) {
                                 zero_tail
                             } else {
@@ -2160,6 +2199,43 @@ impl AdditiveNttF128 {
                 }
                 finish_chunk(sub_idx * sub_elems, sub_data);
             });
+    }
+
+    /// Low-twiddle final pair (`layer`, `layer + 1`; `quarter == 1`) of one
+    /// sub-transform in one kernel call. Rows b and d of every block must be
+    /// zero in the trailing `zero_tail` lanes. The twiddles are the entries
+    /// [`Self::twiddle`] reads from the precomputed table; without a table
+    /// this returns `false` and the per-block loop runs.
+    #[inline]
+    fn try_final_pair_low_twiddles_zero_tail(
+        &self,
+        sub_data: &mut [F128],
+        sub_idx: usize,
+        layer: usize,
+        num_blocks_in_sub: usize,
+        num_ntts: usize,
+        zero_tail: usize,
+    ) -> bool {
+        debug_assert_eq!(sub_data.len(), num_blocks_in_sub * 4 * num_ntts);
+        let Some(table) = self.precomputed_twiddle_table() else {
+            return false;
+        };
+        // Layer `l` starts at `2^l - 1`; this sub's blocks are consecutive.
+        let first_block = sub_idx * num_blocks_in_sub;
+        let outer = &table[(1usize << layer) - 1 + first_block..][..num_blocks_in_sub];
+        let inner = &table[(1usize << (layer + 1)) - 1 + 2 * first_block..][..2 * num_blocks_in_sub];
+        kernels::try_butterfly_fused_2layer_low_twiddles_zero_tail_blocks(
+            sub_data,
+            num_ntts,
+            zero_tail,
+            |block_in_sub| {
+                let t_outer = outer[block_in_sub];
+                let t_inner_a = inner[2 * block_in_sub];
+                let t_inner_b = inner[2 * block_in_sub + 1];
+                debug_assert_eq!(t_outer.hi | t_inner_a.hi | t_inner_b.hi, 0);
+                (t_outer, t_inner_a, t_inner_b)
+            },
+        )
     }
 
     /// Scalar reference implementation. Used as the test oracle and on
@@ -3118,6 +3194,199 @@ mod tests {
         assert!(!use_ranked_low_twiddle_final_pair(19, 64, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 32, 10));
         assert!(!use_ranked_low_twiddle_final_pair(20, 64, 9));
+    }
+
+    /// Zero rows b and d (odd positions) of every four-row block in the
+    /// trailing `zero_tail` lanes: the final pair's input under the static
+    /// zero-lane pattern.
+    fn zero_odd_row_tails(data: &mut [F128], num_ntts: usize, zero_tail: usize) {
+        for (row, lanes) in data.chunks_exact_mut(num_ntts).enumerate() {
+            if row & 1 == 1 {
+                lanes[num_ntts - zero_tail..].fill(F128::ZERO);
+            }
+        }
+    }
+
+    /// Parent form of the low-twiddle final pair: one dense call per block.
+    fn final_pair_per_block_dense(
+        data: &mut [F128],
+        num_ntts: usize,
+        twiddles: &dyn Fn(usize) -> (F128, F128, F128),
+    ) {
+        for (i, block) in data.chunks_exact_mut(4 * num_ntts).enumerate() {
+            let (t_outer, t_inner_a, t_inner_b) = twiddles(i);
+            butterfly_interleaved_fused_2layer_low_twiddles_rows_seq(
+                block, t_outer, t_inner_a, t_inner_b, 1, num_ntts,
+            );
+        }
+    }
+
+    const HAS_ZERO_TAIL_BLOCKS: bool = cfg!(all(target_arch = "aarch64", target_feature = "aes"));
+
+    /// The one-call final pair with reduced zero-tail lanes equals the
+    /// per-block dense low-twiddle pair when rows b and d are zero in the
+    /// tail: the ranked geometry (64 lanes, seven-lane tail, 256 blocks) and
+    /// edges (no tail, a one-lane tail, short runs, eight lanes), with an
+    /// all-ones low-limb twiddle draw and random low-limb draws.
+    #[test]
+    fn final_pair_zero_tail_blocks_match_per_block_dense() {
+        let mut rng = Rng::new(0x7A11_F1A1_20A5_0001);
+        let mut cases = 0;
+        for (num_ntts, num_blocks) in [(64usize, 256usize), (64, 1), (64, 3), (8, 5)] {
+            for zero_tail in [0usize, 1, 7] {
+                for draw in 0..4 {
+                    let twiddles: Vec<(F128, F128, F128)> = (0..num_blocks)
+                        .map(|_| {
+                            if draw == 0 {
+                                let t = F128::new(u64::MAX, 0);
+                                (t, t, t)
+                            } else {
+                                (
+                                    F128::new(rng.next_u64(), 0),
+                                    F128::new(rng.next_u64(), 0),
+                                    F128::new(rng.next_u64(), 0),
+                                )
+                            }
+                        })
+                        .collect();
+                    let mut source = rand_vec(&mut rng, num_blocks * 4 * num_ntts);
+                    zero_odd_row_tails(&mut source, num_ntts, zero_tail);
+
+                    let mut want = source.clone();
+                    final_pair_per_block_dense(&mut want, num_ntts, &|i| twiddles[i]);
+
+                    let mut got = source;
+                    let ran = kernels::try_butterfly_fused_2layer_low_twiddles_zero_tail_blocks(
+                        &mut got,
+                        num_ntts,
+                        zero_tail,
+                        |i| twiddles[i],
+                    );
+                    assert_eq!(ran, HAS_ZERO_TAIL_BLOCKS);
+                    if !ran {
+                        final_pair_per_block_dense(&mut got, num_ntts, &|i| twiddles[i]);
+                    }
+                    assert_eq!(
+                        got, want,
+                        "zero-tail final pair mismatch at num_ntts={num_ntts} \
+                         blocks={num_blocks} zero_tail={zero_tail} draw={draw}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 48);
+    }
+
+    /// The scheduler's one-call final pair takes the twiddles of its
+    /// per-block loop: the standard dimension-20 tables at layers 18 and 19
+    /// over whole 1024-position, 64-lane sub-transforms with a seven-lane
+    /// tail. The per-block reference is also checked against two
+    /// single-layer sweeps.
+    #[test]
+    fn ranked_final_pair_zero_tail_sub_matches_per_block_dense() {
+        const LOG_D: usize = 20;
+        const N_TOP: usize = 10;
+        const NUM_NTTS: usize = 64;
+        const TAIL: usize = 7;
+
+        let ntt = AdditiveNttF128::standard(LOG_D);
+        let layer = LOG_D - 2;
+        let num_blocks_in_sub = 1usize << (layer - N_TOP);
+        let mut rng = Rng::new(0x7A11_F1A1_20A5_0002);
+        for sub_idx in [0usize, 1, 517, (1usize << N_TOP) - 1] {
+            let twiddles = |block_in_sub: usize| {
+                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                (
+                    ntt.twiddle(layer, global_block),
+                    ntt.twiddle(layer + 1, 2 * global_block),
+                    ntt.twiddle(layer + 1, 2 * global_block + 1),
+                )
+            };
+            let mut source = rand_vec(&mut rng, num_blocks_in_sub * 4 * NUM_NTTS);
+            zero_odd_row_tails(&mut source, NUM_NTTS, TAIL);
+
+            let mut want = source.clone();
+            final_pair_per_block_dense(&mut want, NUM_NTTS, &twiddles);
+
+            let mut sweeps = source.clone();
+            for (i, block) in sweeps.chunks_exact_mut(4 * NUM_NTTS).enumerate() {
+                let (t_outer, t_inner_a, t_inner_b) = twiddles(i);
+                butterfly_interleaved_block(block, t_outer, 2, NUM_NTTS);
+                let (top, bot) = block.split_at_mut(2 * NUM_NTTS);
+                butterfly_interleaved_block(top, t_inner_a, 1, NUM_NTTS);
+                butterfly_interleaved_block(bot, t_inner_b, 1, NUM_NTTS);
+            }
+            assert_eq!(want, sweeps, "per-block reference diverges at sub_idx={sub_idx}");
+
+            let mut got = source;
+            let ran = ntt.try_final_pair_low_twiddles_zero_tail(
+                &mut got,
+                sub_idx,
+                layer,
+                num_blocks_in_sub,
+                NUM_NTTS,
+                TAIL,
+            );
+            assert_eq!(ran, HAS_ZERO_TAIL_BLOCKS);
+            if ran {
+                assert_eq!(got, want, "ranked zero-tail final pair mismatch at sub_idx={sub_idx}");
+            }
+        }
+    }
+
+    /// Negative control: the reduced lanes assume zero b and d rows. With one
+    /// nonzero odd-row tail value the one-call form stops at its precondition
+    /// check in debug builds; otherwise exactly that lane's four outputs
+    /// differ from the dense pair, so the equalities above come from the
+    /// reduced lanes being active.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[test]
+    fn final_pair_zero_tail_blocks_need_zero_odd_rows() {
+        const NUM_NTTS: usize = 64;
+        const TAIL: usize = 7;
+        const BLOCKS: usize = 4;
+
+        let mut rng = Rng::new(0x7A11_F1A1_20A5_0003);
+        let twiddles: Vec<(F128, F128, F128)> = (0..BLOCKS)
+            .map(|_| {
+                (
+                    F128::new(rng.next_u64(), 0),
+                    F128::new(rng.next_u64(), 0),
+                    F128::new(rng.next_u64(), 0),
+                )
+            })
+            .collect();
+        let mut source = rand_vec(&mut rng, BLOCKS * 4 * NUM_NTTS);
+        zero_odd_row_tails(&mut source, NUM_NTTS, TAIL);
+        // Row b, last lane, of block 2.
+        source[(2 * 4 + 1) * NUM_NTTS + NUM_NTTS - 1] = F128::new(1, 0);
+
+        let mut want = source.clone();
+        final_pair_per_block_dense(&mut want, NUM_NTTS, &|i| twiddles[i]);
+
+        let mut got = source;
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            kernels::try_butterfly_fused_2layer_low_twiddles_zero_tail_blocks(
+                &mut got,
+                NUM_NTTS,
+                TAIL,
+                |i| twiddles[i],
+            )
+        }));
+        if cfg!(debug_assertions) {
+            assert!(run.is_err(), "debug builds must reject a nonzero b/d tail lane");
+            return;
+        }
+        assert_eq!(run.ok(), Some(true));
+        let differing: Vec<usize> = (0..got.len()).filter(|&i| got[i] != want[i]).collect();
+        let poisoned_lane: Vec<usize> = (0..4)
+            .map(|row| (2 * 4 + row) * NUM_NTTS + NUM_NTTS - 1)
+            .collect();
+        assert_eq!(
+            differing, poisoned_lane,
+            "the reduced form must differ exactly in the poisoned lane"
+        );
     }
 
     /// Exercise five fused deep pairs with the ranked 1024-position subtree
