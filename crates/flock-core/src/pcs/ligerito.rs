@@ -8815,7 +8815,7 @@ fn sample_distinct_queries<Ch: Challenger>(
         count <= block_len,
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::with_capacity(count);
     let mut out = Vec::with_capacity(count);
     while out.len() < count {
         let v = challenger.sample_f128();
