@@ -104,6 +104,8 @@ use kernels::aarch64::{
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_prescaled_8;
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+use kernels::aarch64::{fold2_compact_and_round45_chunk_neon_8_fused_r1_horner, zc_k_horner_enabled};
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
     fold2_and_message_lookahead_normal_expanded_aarch64,
@@ -2643,6 +2645,15 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
         let _ = pack;
         false
     };
+    // `lambda * x^(2s)` group weights: the first four eq coordinates are the
+    // medium protocol constants (`FLOCK_NO_ZC_K_HORNER` restores the
+    // per-group full weight products; same outputs).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let k_horner = one_table
+        && lo_size.is_multiple_of(16)
+        && r_next4.len() >= 5
+        && r_next4[1..5] == crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash()
+        && zc_k_horner_enabled();
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them. Packed: each of a
@@ -2666,6 +2677,24 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
             let eq_ptr = eq_lo.as_ptr();
             let out_ptr = outv.as_mut_ptr();
             match (fused_k, compact.dead_tail) {
+                #[cfg(target_feature = "sha3")]
+                (true, true) if one_table && pack && k_horner => {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1_horner::<true, true>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                    )
+                }
+                #[cfg(target_feature = "sha3")]
+                (true, true) if one_table && k_horner => {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1_horner::<true, false>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                    )
+                }
+                #[cfg(target_feature = "sha3")]
+                (true, false) if one_table && k_horner => {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1_horner::<false, false>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
+                    )
+                }
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
                     fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
