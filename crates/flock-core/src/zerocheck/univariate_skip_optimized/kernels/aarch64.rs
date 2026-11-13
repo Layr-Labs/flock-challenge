@@ -5358,6 +5358,118 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
     }
 }
 
+/// Kill switch for [`ab_mixed_row_direct`]: any value of
+/// `FLOCK_NO_ZC_AB_MIXED_ROW_DIRECT` sends the two mixed const-one rows of a
+/// chunk through [`shift_reduce_inner_ab_fused_neon_checked_with_fast_policy`]
+/// again. Read once per process. The rows written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_mixed_row_direct_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_MIXED_ROW_DIRECT").is_none())
+}
+
+/// Whether the process-wide switches make the dispatcher's mixed const-one
+/// arms pick the kernels of [`ab_mixed_row_guarded`] on a thread with the
+/// Karatsuba apply: the fast form on (asked of both fast policies), the
+/// unscaled Karatsuba z form with the twelve-XOR recombination, and not both
+/// of `ABV_KARA_SLOT` and `ABV_Z_MT`. Resolved once per process.
+#[cfg(target_arch = "aarch64")]
+fn ab_mixed_row_direct_route() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        ab_mixed_row_direct_enabled()
+            && fast_shift_reduce_enabled()
+            && ab_kara_unscaled_enabled()
+            && ab_z_enabled()
+            && ab_kara_xor16_enabled()
+            && !(ab_kara_slot_enabled() && ab_z_mt_enabled())
+    })
+}
+
+/// One of the two mixed const-one rows of the BLAKE3 static layout (`w0`:
+/// window 0, `b_med` 2, mask `0x03`; otherwise window 1, `b_med`
+/// `n_b_med - 2`, mask `0xf0`) through the kernel the dispatcher picks for
+/// it, without the dispatcher. Returns `false` with `out` untouched whenever
+/// the dispatcher would pick another kernel (a thread that keeps the plain
+/// apply, checked first; the switch or another process-wide form; a failed
+/// guard); the caller then runs the dispatcher. As for the dispatcher, the
+/// row's 64 bytes must be in bounds of both packed slices.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ab_mixed_row_direct(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    w0: bool,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) -> bool {
+    ab_kara_enabled()
+        && ab_mixed_row_direct_route()
+        && ab_mixed_row_guarded(a_packed, b_packed, inv_table, chunk_byte_base, b_med, w0, out, nt_store)
+}
+
+/// The guards and the kernel call of [`ab_mixed_row_direct`]: the
+/// dispatcher's guards for the row's mask (B K0 and K1 all ones and the top
+/// three bytes of A K0 and K1 zero for `0x03`; B K4..K7 all ones for `0xf0`),
+/// then the `AB_Z_VARIANT | ABV_KARA_XOR16` kernel its mask arm calls. Returns
+/// `false` with `out` untouched when a guard fails.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ab_mixed_row_guarded(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    w0: bool,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) -> bool {
+    const V: u16 = AB_Z_VARIANT | ABV_KARA_XOR16;
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
+    let word = |packed: &[u8], k: usize| -> u64 {
+        // SAFETY: the caller keeps the row in bounds (the dispatcher reads
+        // the same words).
+        u64::from_le(unsafe { core::ptr::read_unaligned(packed.as_ptr().add(byte_base_b + k * 8).cast::<u64>()) })
+    };
+    if w0 {
+        if word(b_packed, 0) & word(b_packed, 1) != u64::MAX
+            || (word(a_packed, 0) | word(a_packed, 1)) & 0xffff_ff00_0000_0000 != 0
+        {
+            return false;
+        }
+        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V>(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base_b,
+            None,
+            out,
+            nt_store,
+        );
+    } else {
+        if word(b_packed, 4) & word(b_packed, 5) & word(b_packed, 6) & word(b_packed, 7) != u64::MAX {
+            return false;
+        }
+        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V>(
+            a_packed,
+            b_packed,
+            inv_table,
+            byte_base_b,
+            None,
+            out,
+            nt_store,
+        );
+    }
+    true
+}
+
 /// `acc ^ pmull(a, b)` on 8-bit polynomial lanes (`HI` selects the high
 /// halves, i.e. `pmull2`), emitted as an adjacent `pmull`/`eor` pair that
 /// Apple P-cores issue in one SIMD issue slot. The 8-bit PMULL fuses like the 64-bit one

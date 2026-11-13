@@ -3513,8 +3513,31 @@ pub(crate) fn fold_cascade_t_into_packed(
     tri_finish(&s, r_next)
 }
 
+/// Kill switch for the shared inversion of the tri-cascade finish:
+/// `FLOCK_NO_ZC_TRI_BATCH_INV` (any value) inverts the two challenges
+/// separately, as before. Same inverses. Read once per process.
+fn zc_tri_batch_inv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_TRI_BATCH_INV").is_none())
+}
+
+/// `(a^-1, b^-1)` with `F128::inv`'s convention (zero maps to zero). With
+/// `batch` and both inputs nonzero it takes one inversion of `a * b` and two
+/// products: `a^-1 = b * (a b)^-1`, `b^-1 = a * (a b)^-1`; otherwise it
+/// inverts each input.
+fn tri_inverse_pair(a: F128, b: F128, batch: bool) -> (F128, F128) {
+    if batch {
+        let ab = a * b;
+        if ab != F128::ZERO {
+            let inv_ab = ab.inv();
+            return (b * inv_ab, a * inv_ab);
+        }
+    }
+    (a.inv(), b.inv())
+}
+
 fn tri_finish(s: &[F128; 26], r_next: &[F128]) -> (F128, F128, Round3Lookahead, Lookahead2) {
-    let (inv1, inv2) = (r_next[1].inv(), r_next[2].inv());
+    let (inv1, inv2) = tri_inverse_pair(r_next[1], r_next[2], zc_tri_batch_inv_enabled());
     let k1 = F128::ONE + inv1;
     let k2 = F128::ONE + inv2;
     let k12 = k1 * k2;
@@ -6285,6 +6308,24 @@ mod tests {
                     let s = tri_chunk_scalar(&a, &b, &mut sa, &mut sb, &rhos, &eq.lo);
                     assert_eq!(tri_finish(&s, &r_next), (m1, minf, la, la2));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn tri_inverse_pair_matches_separate_inversions() {
+        let mut rng = Rng::new(0x7121_1A57);
+        let mut cases: Vec<(F128, F128)> = (0..64).map(|_| (rng.f128(), rng.f128())).collect();
+        cases.push((F128::ZERO, rng.f128()));
+        cases.push((rng.f128(), F128::ZERO));
+        cases.push((F128::ZERO, F128::ZERO));
+        cases.push((F128::ONE, F128::ONE));
+        for (a, b) in cases {
+            let want = (a.inv(), b.inv());
+            assert_eq!(tri_inverse_pair(a, b, false), want);
+            assert_eq!(tri_inverse_pair(a, b, true), want, "a={a:?} b={b:?}");
+            if a != F128::ZERO {
+                assert_eq!(a * tri_inverse_pair(a, b, true).0, F128::ONE);
             }
         }
     }
