@@ -5052,6 +5052,14 @@ fn transpose_forward_ntt_sparse_impl(
     (data, intro_msg)
 }
 
+/// Exact rollback for the retained C2 transpose's fused first dense group:
+/// `FLOCK_NO_C2_FUSED_DENSIFY` (any value) restores the separate densify
+/// pass followed by the first three-layer group. Same bytes either way.
+fn c2_retained_fused_densify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_FUSED_DENSIFY").is_none())
+}
+
 pub(super) fn c2_retained_transpose_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_OFF_C2_RETAINED_TRANSPOSE").is_none())
@@ -5067,6 +5075,131 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
     log_d: usize,
     drop_log: usize,
 ) -> Option<Vec<F128>> {
+    let (mut data, tail) =
+        transpose_forward_ntt_sparse_retained_prefix(ntt, positions, values, log_d, drop_log)?;
+    match tail {
+        RetainedTail::LowHalf => {
+            transpose_forward_ntt_factored_final_3layer_low_half(ntt, &mut data, log_d);
+            data.truncate(1usize << (log_d - 1));
+            Some(data)
+        }
+        RetainedTail::Collapse(keep_log) => {
+            let retained = xor_collapse_cosets(&data, keep_log);
+            crate::scratch::give_sparse_ntt_data(data);
+            Some(retained)
+        }
+    }
+}
+
+/// The last stage of [`transpose_forward_ntt_sparse_retained`] still owed by
+/// a [`transpose_forward_ntt_sparse_retained_prefix`] result.
+pub(super) enum RetainedTail {
+    /// The factored final three layers, keeping the low half.
+    LowHalf,
+    /// The XOR collapse of all cosets onto the first `2^keep_log` slots.
+    Collapse(usize),
+}
+
+/// Exact rollback for adding the retained C2 basis inside its last transpose
+/// stage: `FLOCK_NO_C2_FUSED_ADD` (any value) materializes the basis first
+/// and adds it in a separate pass. Same bytes either way.
+pub(super) fn c2_fused_add_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_FUSED_ADD").is_none())
+}
+
+/// Finish a retained transpose prefix by adding its output straight into
+/// `dst` (`dst[i] += basis[i]`) instead of materializing the basis. Every
+/// output slot gets the same XOR terms as the separate stage plus add, so
+/// `dst` ends bit-identical. Recycles `data`.
+pub(super) fn transpose_forward_ntt_sparse_retained_finish_add(
+    ntt: &AdditiveNttF128,
+    data: Vec<F128>,
+    log_d: usize,
+    tail: RetainedTail,
+    dst: &mut [F128],
+) {
+    use rayon::prelude::*;
+    match tail {
+        RetainedTail::LowHalf => {
+            assert!(log_d >= 3);
+            assert_eq!(data.len(), 1usize << log_d);
+            assert_eq!(dst.len(), data.len() >> 1);
+            let eighth = data.len() >> 3;
+            let layer_1_twiddles = [ntt.twiddle(1, 0), ntt.twiddle(1, 1)];
+            let layer_2_twiddles: [F128; 4] = core::array::from_fn(|block| ntt.twiddle(2, block));
+            assert_eq!(layer_1_twiddles[0], F128::ZERO);
+            assert_eq!(layer_2_twiddles[0], F128::ZERO);
+            assert_eq!(
+                layer_2_twiddles[3],
+                layer_2_twiddles[1] + layer_2_twiddles[2]
+            );
+            let constants = L0FactoredFinal3Constants {
+                a: layer_2_twiddles[1],
+                d: layer_2_twiddles[2],
+                a_plus_d: layer_2_twiddles[3],
+                b: layer_1_twiddles[1],
+            };
+            let src = data.as_ptr() as usize;
+            let out = dst.as_mut_ptr() as usize;
+            (0..eighth)
+                .into_par_iter()
+                .with_min_len(small_ntt_min_jobs(8))
+                .for_each(|row| {
+                    // SAFETY: row `row` reads its own eight source slots and
+                    // updates its own four destination slots `row + i·eighth`
+                    // (i < 4, all below `dst.len() = 4·eighth`); rows are
+                    // disjoint.
+                    unsafe {
+                        let sp = src as *const F128;
+                        let dp = out as *mut F128;
+                        let retained = l0_factored_final3_retained_row(
+                            core::array::from_fn(|i| *sp.add(row + i * eighth)),
+                            constants,
+                        );
+                        for (i, value) in retained.into_iter().enumerate() {
+                            let d = dp.add(row + i * eighth);
+                            *d = *d + value;
+                        }
+                    }
+                });
+        }
+        RetainedTail::Collapse(keep_log) => {
+            let keep = 1usize << keep_log;
+            assert!(data.len().is_power_of_two() && data.len() >= keep);
+            assert_eq!(dst.len(), keep);
+            let cosets = data.len() >> keep_log;
+            let add_cosets = |base: usize, chunk: &mut [F128]| {
+                let len = chunk.len();
+                for coset in 0..cosets {
+                    let start = coset * keep + base;
+                    for (o, &s) in chunk.iter_mut().zip(&data[start..start + len]) {
+                        *o += s;
+                    }
+                }
+            };
+            if keep >= 2 * SMALL_NTT_MIN_ELEMS {
+                dst.par_chunks_mut(SMALL_NTT_MIN_ELEMS)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| add_cosets(ci * SMALL_NTT_MIN_ELEMS, chunk));
+            } else {
+                add_cosets(0, dst);
+            }
+        }
+    }
+    crate::scratch::give_sparse_ntt_data(data);
+}
+
+/// Everything of [`transpose_forward_ntt_sparse_retained`] but its last
+/// stage, which is returned as a [`RetainedTail`]. `None` exactly when the
+/// retained form does not apply.
+pub(super) fn transpose_forward_ntt_sparse_retained_prefix(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    drop_log: usize,
+) -> Option<(Vec<F128>, RetainedTail)> {
     if drop_log == 0
         || drop_log >= log_d
         || positions.len() != values.len()
@@ -5079,6 +5212,7 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
     if log_d - k < drop_log {
         return None;
     }
+    let mut remaining = log_d - k;
     let mut data: Vec<F128> = if k == 0 {
         let mut data = vec![F128::ZERO; n];
         for (&p, &v) in positions.iter().zip(values) {
@@ -5089,17 +5223,31 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
         let groups = group_sorted_positions(positions, k);
         let mut arena = scatter_active_windows(&groups, positions, values, k);
         transform_active_windows(ntt, &mut arena, &groups, positions, values, k, log_d);
-        densify_active_windows(&arena, &groups, log_d, k)
+        // The first dense three-layer group below always runs at layer
+        // `log_d - k - 3` (both suffix branches start from `remaining = log_d
+        // - k` and step down by three) whenever the suffix has room for it.
+        // Gathering that group straight from the arena is byte-identical to
+        // densifying and then running it (see
+        // `densify_active_windows_fused_first_3layer`); it deletes the
+        // full-domain densify store and the group's matching reload.
+        let first_group_runs = if drop_log == 1 && remaining >= 3 && remaining.is_multiple_of(3) {
+            remaining > 3
+        } else {
+            remaining >= drop_log + 3
+        };
+        if first_group_runs && c2_retained_fused_densify_enabled() {
+            remaining -= 3;
+            densify_active_windows_fused_first_3layer(ntt, &arena, &groups, log_d, k)
+        } else {
+            densify_active_windows(&arena, &groups, log_d, k)
+        }
     };
-    let mut remaining = log_d - k;
     if drop_log == 1 && remaining >= 3 && remaining.is_multiple_of(3) {
         while remaining > 3 {
             remaining -= 3;
             transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, remaining);
         }
-        transpose_forward_ntt_factored_final_3layer_low_half(ntt, &mut data, log_d);
-        data.truncate(n >> 1);
-        return Some(data);
+        return Some((data, RetainedTail::LowHalf));
     }
     while remaining >= drop_log + 3 {
         remaining -= 3;
@@ -5108,9 +5256,7 @@ pub(super) fn transpose_forward_ntt_sparse_retained(
     for layer in (drop_log..remaining).rev() {
         transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, layer);
     }
-    let retained = xor_collapse_cosets(&data, log_d - drop_log);
-    crate::scratch::give_sparse_ntt_data(data);
-    Some(retained)
+    Some((data, RetainedTail::Collapse(log_d - drop_log)))
 }
 
 fn transpose_forward_ntt_factored_final_3layer_low_half(
@@ -9650,14 +9796,46 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // Open L0; lane-fold weights = r_lane_fold.
     let num_queries_0 = config.queries[0];
-    let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
-    let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let use_c2 = c2::enabled(
         use_lazy_l1_ood,
         std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
     );
+    let l0_depth = if config.recursive_ks.first().copied() == Some(3) {
+        3
+    } else {
+        2
+    };
+    // C2 path: each query's alpha-independent dual setup (window row folds
+    // and local inverse stages) runs on the pool while the sampler draws the
+    // next queries; the transcript calls are unchanged.
+    let (queries_0, l0_prepared, l0_rows) = if use_c2 && c2::query_overlap_enabled() {
+        let (queries, prepared, rows) = c2::sample_and_prepare(
+            challenger,
+            l0_block_len,
+            num_queries_0,
+            l0_depth,
+            n1 + log_inv_rate_0,
+            log_inv_rate_0,
+            &r_lane_fold,
+            &l0_row,
+            Some(l0_codeword),
+            l0_tree,
+        );
+        (queries, Some(prepared), Some(rows))
+    } else {
+        (
+            sample_distinct_queries(challenger, l0_block_len, num_queries_0),
+            None,
+            None,
+        )
+    };
+    let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let open_l0 = || {
         use rayon::prelude::*;
+        // Rows already copied (in sorted query order) during the overlap.
+        if let Some(rows) = l0_rows {
+            return (merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0), rows);
+        }
         rayon::join(
             || merkle_multi_proof_for(l0_tree, l0_block_len, &queries_0),
             || queries_0.par_iter().map(|&q| l0_row(q).to_vec()).collect::<Vec<Vec<F128>>>(),
@@ -9665,13 +9843,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     };
     let _t = std::time::Instant::now();
     let ((merkle_proof_0, opened_rows_0), sparse_l0, full_l0) = if use_c2 {
-        let l0_depth = if config.recursive_ks.first().copied() == Some(3) {
-            3
-        } else {
-            2
-        };
         let (dual, opened) = rayon::join(
             || {
+                if let Some(prepared) = l0_prepared {
+                    return prepared.into_dual(&queries_0, &alpha_0);
+                }
                 c2::Dual::new_sync(
                     l0_depth,
                     n1 + log_inv_rate_0,
@@ -9680,6 +9856,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     &queries_0,
                     &alpha_0,
                     l0_row,
+                    Some(l0_codeword),
                 )
             },
             open_l0,
@@ -9991,13 +10168,40 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let nonce_i = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
         grinding_nonces.push(nonce_i);
         let num_queries_i = config.queries[i + 1];
-        let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
-        let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let use_deep_c2 = use_c2
             && config.recursive_ks.get(i + 1).copied() == Some(3)
             && n_next > 3;
+        let deep_row = |q: usize| wtns_prev.row(q);
+        let (queries_i, deep_prepared, deep_rows) = if use_deep_c2 && c2::deep_query_overlap_enabled() {
+            let (queries, prepared, rows) = c2::sample_and_prepare(
+                challenger,
+                wtns_prev.block_len,
+                num_queries_i,
+                3,
+                n_next + config.log_inv_rates[i + 1],
+                config.log_inv_rates[i + 1],
+                &level_rs,
+                &deep_row,
+                Some(&wtns_prev.mat[..]),
+                wtns_prev.nodes(),
+            );
+            (queries, Some(prepared), Some(rows))
+        } else {
+            (
+                sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i),
+                None,
+                None,
+            )
+        };
+        let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
         let open_i = || {
             use rayon::prelude::*;
+            if let Some(rows) = deep_rows {
+                return (
+                    merkle_multi_proof_for(wtns_prev.nodes(), wtns_prev.block_len, &queries_i),
+                    rows,
+                );
+            }
             if op_serial_opens_enabled() {
                 return (
                     merkle_multi_proof_for(wtns_prev.nodes(), wtns_prev.block_len, &queries_i),
@@ -10018,6 +10222,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let ((merkle_proof_i, opened_rows_i), sparse_deep_i) = if use_deep_c2 {
             let (dual, opened) = rayon::join(
                 || {
+                    if let Some(prepared) = deep_prepared {
+                        return prepared.into_dual(&queries_i, &alpha_i);
+                    }
                     c2::Dual::new_sync(
                         3,
                         n_next + config.log_inv_rates[i + 1],
@@ -10026,6 +10233,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                         &queries_i,
                         &alpha_i,
                         |q| wtns_prev.row(q),
+                        Some(&wtns_prev.mat[..]),
                     )
                 },
                 open_i,
