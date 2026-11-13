@@ -4213,19 +4213,24 @@ const AB_Z_ALL: usize = 40960; // 256 x 16: [g|g]
 /// Bytes of one image of the z-basis tables (the `T = {}` table is the
 /// image itself and is not copied).
 #[cfg(target_arch = "aarch64")]
-pub(crate) const AB_Z_IMAGE_BYTES: usize = 51200 + 3 * 32768 + 16384;
+pub(crate) const AB_Z_IMAGE_BYTES: usize = AB_Z_REC + 3 * 32768 + 16384;
 #[cfg(target_arch = "aarch64")]
-const AB_Z_REC3: usize = 51200 + 2 * 32768; // 256 x 128: [M0 M2 | N0 N1 | e0e0 e2e2 | f0f0 f1f1]
+const AB_Z_REC3: usize = AB_Z_REC + 2 * 32768; // 256 x 128: [M0 M2 | N0 N1 | e0e0 e2e2 | f0f0 f1f1]
 #[cfg(target_arch = "aarch64")]
-const AB_Z_DDUP: usize = 51200 + 3 * 32768; // 256 x 64: d0d0 d1d1 d2d2 d3d3
+const AB_Z_DDUP: usize = AB_Z_REC + 3 * 32768; // 256 x 64: d0d0 d1d1 d2d2 d3d3
 /// Row-body variant bit: the `x^4` Karatsuba image also takes the
 /// unscaled-index loads (for forms where the plain image is in z form).
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_KARA_SCALED_UNSCALED: u16 = 32;
 #[cfg(target_arch = "aarch64")]
-const AB_Z_REC2: usize = 51200 + 32768; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0 e2 | g | 0]
+const AB_Z_REC2: usize = AB_Z_REC + 32768; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0 e2 | g | 0]
 #[cfg(target_arch = "aarch64")]
-const AB_Z_REC: usize = 51200; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0e0 e2e2]
+// 4 KiB-aligned (2 KiB of padding after `AB_Z_ALLP`, never read): the record
+// base `z + AB_Z_REC` is then one `add #imm, lsl #12` from the image base
+// instead of two adds. Layout only; same table bytes.
+const AB_Z_REC: usize = 53248; // 256 x 128: [M0 M2 | N0 N1 | d01 d23 | e0e0 e2e2]
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(AB_Z_REC % 4096 == 0 && AB_Z_ALLP + 256 * 8 <= AB_Z_REC && (2 * AB_KARA_IMAGE_BYTES) % 4096 == 0);
 /// Row-body variant bit (with [`ABV_Z`]): the four two-load z tables
 /// interleaved in one 128-byte record per byte value, one base register.
 #[cfg(target_arch = "aarch64")]
@@ -4496,6 +4501,134 @@ unsafe fn apply_word_z_mt(
     }
 }
 
+/// Row-body variant bit (with [`ABV_Z`] and [`ABV_Z_REC`]): the z apply's
+/// eight lookup bytes from four index words formed in five integer
+/// instructions, depth four (masked first layer, then unmasked layers that
+/// keep the previous word for the bytes they would corrupt), instead of the
+/// seven partial XOR-shift words. Same lookups, same bytes. See
+/// [`ab_superset_words_m1`].
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_Z_M1: u16 = 32768;
+
+/// Kill switch for [`ABV_Z_M1`]: any value of `FLOCK_NO_ZC_AB_Z_M1` keeps
+/// the seven-word index form. Read once per process. Same bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_z_m1_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_Z_M1").is_none())
+}
+
+/// The superset bytes `z[T]` (XOR of the bytes `b ⊇ T` of `w`) spread over
+/// four words, in five instructions:
+/// - `y1 = w ^ ((w & 0xff00..ff00) >> 8)`: the complete first layer
+///   (`and` with a logical immediate + `eor` with a shifted register);
+/// - `y2 = y1 ^ (y1 >> 16)`: second layer, exact at bytes 0, 1, 4, 5 (at
+///   bytes 2, 3, 6, 7 the second layer is `y1` itself);
+/// - `y3 = y2 ^ (y2 >> 32)`: exact at bytes 0, 1;
+/// - `y3b = y1 ^ (y1 >> 32)`: exact at bytes 2, 3.
+/// So `z0 = y3[0]`, `z1 = y3[1]`, `z2 = y3b[2]`, `z3 = y3b[3]`, `z4 = y2[4]`,
+/// `z5 = y2[5]`, `z6 = y1[6]`, `z7 = w[7]`. Returns `(y1, y2, y3, y3b)`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn ab_superset_words_m1(w: u64) -> (u64, u64, u64, u64) {
+    // `(w & M) >> 8` with the mask applied before the shift, so it stays a
+    // logical immediate (LLVM otherwise emits `lsr` + `and` + `eor`).
+    let y1: u64;
+    // SAFETY: register arithmetic only.
+    unsafe {
+        core::arch::asm!(
+            "and {t}, {w}, #0xff00ff00ff00ff00",
+            "eor {y}, {w}, {t}, lsr #8",
+            w = in(reg) w,
+            t = out(reg) _,
+            y = lateout(reg) y1,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    let y2 = y1 ^ (y1 >> 16);
+    let y3 = y2 ^ (y2 >> 32);
+    let y3b = y1 ^ (y1 >> 32);
+    (y1, y2, y3, y3b)
+}
+
+/// [`apply_word_z`] (`REC`, not `PACK`) with the lookup bytes taken from
+/// [`ab_superset_words_m1`]: exactly the bytes `apply_word_z` extracts from
+/// its seven partial words, so the same lookups.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z_m1(
+    t0: *const u8,
+    z: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let (y1, y2, y3, y3b) = ab_superset_words_m1(w);
+        let ld = |base: *const u8, idx: usize| vld1q_u8(base.add(idx));
+        let r0 = t0.add(ab_z_idx::<0, 6>(y3));
+        let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
+        let rec = |i: usize| -> *const u8 {
+            let a: usize;
+            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) z.add(AB_Z_REC), i = in(reg) i,
+                options(pure, nomem, nostack, preserves_flags));
+            a as *const u8
+        };
+        let a = rec(ab_z_idx::<2, 7>(y3b));
+        let (m0, m2) = (ld(a, 0), ld(a, 16));
+        let a = rec(ab_z_idx::<4, 7>(y2));
+        let (n0, n1) = (ld(a, 32), ld(a, 48));
+        let a = rec(ab_z_idx::<1, 7>(y3));
+        let (d01, d23) = (ld(a, 64), ld(a, 80));
+        let a = rec(ab_z_idx::<3, 7>(y3b));
+        let (e0, e2) = (ld(a, 96), ld(a, 112));
+        let g = ld(z.add(AB_Z_ALL), ab_z_idx::<7, 4>(w));
+        let k = ld(z.add(AB_Z_L12), ab_z_idx::<6, 4>(y1));
+        let f = ld(z.add(AB_Z_SL2), ab_z_idx::<5, 4>(y2));
+        let fg = veorq_u8(f, g);
+        let p = vreinterpretq_u64_u8(xor3_u8(d01, e0, fg));
+        let q = vreinterpretq_u64_u8(xor3_u8(d23, e2, fg));
+        let mk0 = veorq_u8(m0, k);
+        let mk2 = veorq_u8(m2, k);
+        let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
+        let b1 = vreinterpretq_u8_u64(vzip2q_u64(p, p));
+        let b2 = vreinterpretq_u8_u64(vzip1q_u64(q, q));
+        let b3 = vreinterpretq_u8_u64(vzip2q_u64(q, q));
+        (
+            veorq_u8(xor3_u8(l0, mk0, n0), b0),
+            veorq_u8(xor3_u8(l1, mk0, n1), b1),
+            veorq_u8(xor3_u8(l2, mk2, n0), b2),
+            veorq_u8(xor3_u8(l3, mk2, n1), b3),
+        )
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_superset_words_m1_match_superset_bytes() {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for i in 0..20000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let w = match i {
+            0 => 0,
+            1 => u64::MAX,
+            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
+            _ => x,
+        };
+        let z = ab_superset_bytes(w).to_le_bytes();
+        let (y1, y2, y3, y3b) = ab_superset_words_m1(w);
+        let b = |v: u64, j: usize| v.to_le_bytes()[j];
+        let got = [b(y3, 0), b(y3, 1), b(y3b, 2), b(y3b, 3), b(y2, 4), b(y2, 5), b(y1, 6), b(w, 7)];
+        assert_eq!(got, z, "w={w:016x}");
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 #[test]
 fn ab_superset_bytes_matches_definition() {
@@ -4751,6 +4884,8 @@ unsafe fn apply_word_into_4_regs_v<const V: u16, const SCALED: bool>(
                 apply_word_z::<true, true>(table_base, z, word)
             } else if V & ABV_Z_REC != 0 && V & ABV_Z_MT != 0 {
                 apply_word_z_mt(table_base, z, word)
+            } else if V & ABV_Z_REC != 0 && V & ABV_Z_M1 != 0 {
+                apply_word_z_m1(table_base, z, word)
             } else if V & ABV_Z_REC != 0 {
                 apply_word_z::<false, true>(table_base, z, word)
             } else if V & ABV_Z_PACK != 0 {
