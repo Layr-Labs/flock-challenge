@@ -258,13 +258,32 @@ unsafe fn process_block_neon_single<const TILE_T: usize>(
     vst1q_u8(o.add(112), a7);
 }
 
-/// SHA3/EOR3 specialization that fuses two adjacent BLOCK_K=8 drains into one
-/// stripe/table traversal. The fixed register assignment avoids callee-saved
-/// vector registers and uses scaled table loads fed directly by UBFX.
+/// Fuse two adjacent BLOCK_K=8 drains into one stripe/table traversal.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_block16_neon_single_sha3(
+    row_ptr: *const u8,
+    row_stride: usize,
+    bs: usize,
+    tables_ptr: *const u8,
+    out_ptr: *mut F128,
+) {
+    static UNSCALED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_LC_UNSCALED").is_none_or(|v| v != *"1")
+    });
+    if *UNSCALED {
+        process_block16_neon_single_sha3_unscaled(row_ptr, row_stride, bs, tables_ptr, out_ptr);
+    } else {
+        process_block16_neon_single_sha3_scaled(row_ptr, row_stride, bs, tables_ptr, out_ptr);
+    }
+}
+
+// Keep the original asm as the rollback and equivalence-test reference.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(never)]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn process_block16_neon_single_sha3(
+unsafe fn process_block16_neon_single_sha3_scaled(
     row_ptr: *const u8,
     row_stride: usize,
     bs: usize,
@@ -435,6 +454,251 @@ unsafe fn process_block16_neon_single_sha3(
         out("v25") _,
         options(nostack),
     );
+}
+
+// Byte offsets avoid the extra scaled-load uop on Apple cores.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(never)]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn process_block16_neon_single_sha3_unscaled(
+    row_ptr: *const u8,
+    row_stride: usize,
+    bs: usize,
+    tables_ptr: *const u8,
+    out_ptr: *mut F128,
+) {
+    use std::arch::asm;
+
+    asm!(
+        "ldp q0, q1, [{dst}]",
+        "ldp q2, q3, [{dst}, #32]",
+        "ldp q4, q5, [{dst}, #64]",
+        "ldp q6, q7, [{dst}, #96]",
+        "ldp q16, q17, [{dst}, #128]",
+        "ldp q18, q19, [{dst}, #160]",
+        "ldp q20, q21, [{dst}, #192]",
+        "ldp q22, q23, [{dst}, #224]",
+        "add x8, {row}, {block_start}",
+        "lsl x9, {stride}, #1",
+        "mov x10, #4",
+        "2:",
+        "ldp x11, x12, [x8]",
+        "add x15, x8, {stride}",
+        "ldp x13, x14, [x15]",
+        "add x15, {table}, #4096",
+
+        "ubfiz x16, x11, #4, #8",
+        "ubfiz x17, x13, #4, #8",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v0, v0, v24, v25",
+
+        "and x16, {mask}, x11, lsr #4",
+        "and x17, {mask}, x13, lsr #4",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v1, v1, v24, v25",
+
+        "and x16, {mask}, x11, lsr #12",
+        "and x17, {mask}, x13, lsr #12",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v2, v2, v24, v25",
+
+        "and x16, {mask}, x11, lsr #20",
+        "and x17, {mask}, x13, lsr #20",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v3, v3, v24, v25",
+
+        "and x16, {mask}, x11, lsr #28",
+        "and x17, {mask}, x13, lsr #28",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v4, v4, v24, v25",
+
+        "and x16, {mask}, x11, lsr #36",
+        "and x17, {mask}, x13, lsr #36",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v5, v5, v24, v25",
+
+        "and x16, {mask}, x11, lsr #44",
+        "and x17, {mask}, x13, lsr #44",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v6, v6, v24, v25",
+
+        "and x16, {mask}, x11, lsr #52",
+        "and x17, {mask}, x13, lsr #52",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v7, v7, v24, v25",
+
+        "ubfiz x16, x12, #4, #8",
+        "ubfiz x17, x14, #4, #8",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v16, v16, v24, v25",
+
+        "and x16, {mask}, x12, lsr #4",
+        "and x17, {mask}, x14, lsr #4",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v17, v17, v24, v25",
+
+        "and x16, {mask}, x12, lsr #12",
+        "and x17, {mask}, x14, lsr #12",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v18, v18, v24, v25",
+
+        "and x16, {mask}, x12, lsr #20",
+        "and x17, {mask}, x14, lsr #20",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v19, v19, v24, v25",
+
+        "and x16, {mask}, x12, lsr #28",
+        "and x17, {mask}, x14, lsr #28",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v20, v20, v24, v25",
+
+        "and x16, {mask}, x12, lsr #36",
+        "and x17, {mask}, x14, lsr #36",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v21, v21, v24, v25",
+
+        "and x16, {mask}, x12, lsr #44",
+        "and x17, {mask}, x14, lsr #44",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v22, v22, v24, v25",
+
+        "and x16, {mask}, x12, lsr #52",
+        "and x17, {mask}, x14, lsr #52",
+        "ldr q24, [{table}, x16]",
+        "ldr q25, [x15, x17]",
+        "eor3.16b v23, v23, v24, v25",
+
+        "add x8, x8, x9",
+        "add {table}, {table}, #8192",
+        "subs x10, x10, #1",
+        "b.ne 2b",
+
+        "stp q0, q1, [{dst}]",
+        "stp q2, q3, [{dst}, #32]",
+        "stp q4, q5, [{dst}, #64]",
+        "stp q6, q7, [{dst}, #96]",
+        "stp q16, q17, [{dst}, #128]",
+        "stp q18, q19, [{dst}, #160]",
+        "stp q20, q21, [{dst}, #192]",
+        "stp q22, q23, [{dst}, #224]",
+        row = in(reg) row_ptr,
+        stride = in(reg) row_stride,
+        block_start = in(reg) bs,
+        table = inout(reg) tables_ptr => _,
+        dst = in(reg) out_ptr,
+        mask = in(reg) 0xff0u64,
+        out("x8") _,
+        out("x9") _,
+        out("x10") _,
+        out("x11") _,
+        out("x12") _,
+        out("x13") _,
+        out("x14") _,
+        out("x15") _,
+        out("x16") _,
+        out("x17") _,
+        out("v0") _,
+        out("v1") _,
+        out("v2") _,
+        out("v3") _,
+        out("v4") _,
+        out("v5") _,
+        out("v6") _,
+        out("v7") _,
+        out("v16") _,
+        out("v17") _,
+        out("v18") _,
+        out("v19") _,
+        out("v20") _,
+        out("v21") _,
+        out("v22") _,
+        out("v23") _,
+        out("v24") _,
+        out("v25") _,
+        options(nostack),
+    );
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_feature = "sha3"))]
+#[test]
+fn block16_unscaled_matches_scaled_all_byte_values() {
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let tables: Vec<F128> = (0..8 * 256)
+        .map(|_| F128 {
+            lo: next(),
+            hi: next(),
+        })
+        .collect();
+    const STRIDE: usize = 48;
+    const BS: usize = 5;
+    let mut rows = [0u8; 8 * STRIDE];
+    for byte in &mut rows {
+        *byte = next() as u8;
+    }
+    for position in 0..8 {
+        for value in 0..=255u8 {
+            for stripe in 0..8 {
+                rows[stripe * STRIDE + BS + position] = value;
+                rows[stripe * STRIDE + BS + 8 + position] = value;
+            }
+            let initial: Vec<F128> = (0..16)
+                .map(|_| F128 {
+                    lo: next(),
+                    hi: next(),
+                })
+                .collect();
+            let mut scaled = initial.clone();
+            let mut unscaled = initial.clone();
+            let mut expected = initial;
+            for stripe in 0..8 {
+                for i in 0..16 {
+                    expected[i] += tables[stripe * 256 + rows[stripe * STRIDE + BS + i] as usize];
+                }
+            }
+            unsafe {
+                process_block16_neon_single_sha3_scaled(
+                    rows.as_ptr(),
+                    STRIDE,
+                    BS,
+                    tables.as_ptr().cast(),
+                    scaled.as_mut_ptr(),
+                );
+                process_block16_neon_single_sha3_unscaled(
+                    rows.as_ptr(),
+                    STRIDE,
+                    BS,
+                    tables.as_ptr().cast(),
+                    unscaled.as_mut_ptr(),
+                );
+            }
+            assert_eq!(scaled, expected, "scaled: byte {position}, value {value}");
+            assert_eq!(
+                unscaled, expected,
+                "unscaled: byte {position}, value {value}"
+            );
+        }
+    }
 }
 
 /// **i_inner-partitioned** NEON partial fold. Same result as
