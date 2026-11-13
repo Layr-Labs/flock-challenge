@@ -1980,7 +1980,7 @@ unsafe fn store_delta_pair_gpr(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64)
         core::arch::asm!(
             "eor {ta}, {a0}, {a1}",
             "eor {tb}, {b0}, {b1}",
-            "stp {ta}, {tb}, [{dst}]",
+            "stnp {ta}, {tb}, [{dst}]",
             dst = in(reg) dst,
             a0 = in(reg) a0,
             a1 = in(reg) a1,
@@ -1999,7 +1999,7 @@ unsafe fn store_delta_a_only_gpr(dst: *mut u8, a0: u64, a1: u64) {
     unsafe {
         core::arch::asm!(
             "eor {ta}, {a0}, {a1}",
-            "stp {ta}, xzr, [{dst}]",
+            "stnp {ta}, xzr, [{dst}]",
             dst = in(reg) dst,
             a0 = in(reg) a0,
             a1 = in(reg) a1,
@@ -2051,7 +2051,7 @@ unsafe fn store_delta_pair_gpr_off<const OFF: usize>(
         core::arch::asm!(
             "eor {ta}, {a0}, {a1}",
             "eor {tb}, {b0}, {b1}",
-            "stp {ta}, {tb}, [{dst}, #{off}]",
+            "stnp {ta}, {tb}, [{dst}, #{off}]",
             dst = in(reg) dst,
             off = const OFF,
             a0 = in(reg) a0,
@@ -2072,7 +2072,7 @@ unsafe fn store_delta_a_only_gpr_off<const OFF: usize>(dst: *mut u8, a0: u64, a1
     unsafe {
         core::arch::asm!(
             "eor {ta}, {a0}, {a1}",
-            "stp {ta}, xzr, [{dst}, #{off}]",
+            "stnp {ta}, xzr, [{dst}, #{off}]",
             dst = in(reg) dst,
             off = const OFF,
             a0 = in(reg) a0,
