@@ -12545,9 +12545,47 @@ kernel void lc_fold_stripes_factored_b4(
 
     static ZC_FOLD: Mutex<Option<Result<ZcFold, String>>> = Mutex::new(None);
 
+    /// One pipeline of the zerocheck fold library (`ZC_FOLD_MSL_SOURCE`).
+    unsafe fn zc_fold_build_pso(gpu: &Gpu, library: Id, name: &str) -> Result<Id, String> {
+        unsafe {
+            let ns = gpu.api.nsstring(name)?;
+            let f: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                library,
+                c"newFunctionWithName:",
+                ns
+            );
+            if f.is_null() {
+                return Err(format!("zerocheck fold kernel {name} not found"));
+            }
+            let mut perr: Id = NIL;
+            let pso: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newComputePipelineStateWithFunction:error:",
+                f,
+                &mut perr
+            );
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+            if pso.is_null() {
+                Err(format!(
+                    "zerocheck fold pipeline {name}: {}",
+                    gpu.api.error_string(perr)
+                ))
+            } else {
+                Ok(pso)
+            }
+        }
+    }
+
     fn zc_fold_init(gpu: &'static Gpu) -> Result<ZcFold, String> {
         unsafe {
             let pool = gpu.pool_push();
+            // Returns the still-retained library with the reduce pipeline; the
+            // nibble fold pipeline is built from it below only when the launcher
+            // can select it (see `nibble_needed`).
             let built = (|| -> Result<(Id, Id), String> {
                 let src = gpu.api.nsstring(ZC_FOLD_MSL_SOURCE)?;
                 let mut err: Id = NIL;
@@ -12566,61 +12604,21 @@ kernel void lc_fold_stripes_factored_b4(
                         gpu.api.error_string(err)
                     ));
                 }
-                let build = |name: &str| -> Result<Id, String> {
-                    let ns = gpu.api.nsstring(name)?;
-                    let f: Id = send!(
-                        gpu.api,
-                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                        library,
-                        c"newFunctionWithName:",
-                        ns
-                    );
-                    if f.is_null() {
-                        return Err(format!("zerocheck fold kernel {name} not found"));
-                    }
-                    let mut perr: Id = NIL;
-                    let pso: Id = send!(
-                        gpu.api,
-                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                        gpu.device,
-                        c"newComputePipelineStateWithFunction:error:",
-                        f,
-                        &mut perr
-                    );
-                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                    if pso.is_null() {
-                        Err(format!(
-                            "zerocheck fold pipeline {name}: {}",
-                            gpu.api.error_string(perr)
-                        ))
-                    } else {
-                        Ok(pso)
-                    }
-                };
-                let fold = build("zc_fold_stripes")?;
-                let reduce = match build("zc_fold_reduce") {
-                    Ok(r) => r,
+                match zc_fold_build_pso(gpu, library, "zc_fold_reduce") {
+                    Ok(reduce) => Ok((library, reduce)),
                     Err(e) => {
-                        gpu.release(fold);
                         send!(
                             gpu.api,
                             unsafe extern "C" fn(Id, Sel) -> Id,
                             library,
                             c"release"
                         );
-                        return Err(e);
+                        Err(e)
                     }
-                };
-                send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel) -> Id,
-                    library,
-                    c"release"
-                );
-                Ok((fold, reduce))
+                }
             })();
             gpu.pool_pop(pool);
-            let (pso_fold, pso_reduce) = built?;
+            let (zc_library, pso_reduce) = built?;
             // The lincheck arm's byte-table kernels compile from their own
             // source; a failure here must NOT take down the shipped
             // zerocheck arm, so it degrades to NIL pipelines (the lincheck
@@ -12721,6 +12719,32 @@ kernel void lc_fold_stripes_factored_b4(
             } else {
                 NIL
             };
+            // `launch_fold_prefix` selects the nibble fold for `FoldArm::Zc`
+            // only when the byte fold is rolled back or neither byte pipeline
+            // exists (the gates are process-cached, so this matches every
+            // later launch). Otherwise the pipeline is never dispatched and
+            // its backend compile is skipped; `pso_fold` stays NIL.
+            let nibble_needed = !(super::zc_byte_fold_enabled()
+                && ((super::zc_factored_b4_enabled() && !pso_lc_factored_b4.is_null())
+                    || !pso_lc_fold.is_null()));
+            let pso_fold = if nibble_needed {
+                let pool = gpu.pool_push();
+                let fold = zc_fold_build_pso(gpu, zc_library, "zc_fold_stripes");
+                gpu.pool_pop(pool);
+                match fold {
+                    Ok(p) => p,
+                    Err(e) => {
+                        gpu.release(pso_reduce);
+                        gpu.release(pso_lc_fold);
+                        gpu.release(pso_lc_factored_b4);
+                        gpu.release(zc_library);
+                        return Err(e);
+                    }
+                }
+            } else {
+                NIL
+            };
+            gpu.release(zc_library);
             Ok(ZcFold {
                 gpu,
                 pso_fold,
