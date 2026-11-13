@@ -7713,7 +7713,7 @@ fn materialize_direct_fold8(
         let zf_setup_ms = zf_t0.elapsed().as_secs_f64() * 1e3;
         crate::epool::run_hetero_chunks_stateful(
             n_blocks,
-            || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+            || crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN),
             |scratch, block| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 if zf_want {
@@ -7845,7 +7845,7 @@ fn materialize_direct_fold8(
             .zip(folded_f.par_chunks_mut(block_len))
             .enumerate()
             .map_init(
-                || vec![F128::ZERO; super::ring_switch::FOLD_TABLE_LEN],
+                || crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN),
                 |scratch, (block, (b_out, f_out))| fold8_block(scratch, block, b_out, f_out),
             )
             .reduce(
