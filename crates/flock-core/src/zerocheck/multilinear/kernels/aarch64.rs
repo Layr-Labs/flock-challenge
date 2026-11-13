@@ -1530,6 +1530,67 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     skip_dead: bool,
     out: *mut F128,
 ) {
+    unsafe {
+        macro_rules! go {
+            ($cf:literal) => {
+                fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, $cf>(
+                    table_data,
+                    a_packed,
+                    b_packed,
+                    anchors,
+                    deltas,
+                    eq_lo,
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    degen,
+                    periodic_padding,
+                    skip_dead,
+                    out,
+                )
+            };
+        }
+        if FULL && r2_la_crossfused_enabled() { go!(true) } else { go!(false) }
+    }
+}
+
+/// Kill switch for the in-place accumulators of the full (CPU-only) round-two
+/// lookahead body (`FLOCK_NO_R2_LA_CROSSFUSED`, any value): with it set the
+/// full body keeps [`tri_acc_q`], whose fresh destinations cost a `MOV` per
+/// loop-carried accumulator where the degenerate branches rejoin; by default
+/// it uses [`tri_acc_q_crossfused`] (same XORs of the same products, so the
+/// same bytes) like the GPU-shared body.
+#[cfg(target_arch = "aarch64")]
+fn r2_la_crossfused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_LA_CROSSFUSED").is_none())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
+    const FULL: bool,
+    const ODD_ON_GPU: bool,
+    const CF: bool,
+>(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    periodic_padding: bool,
+    skip_dead: bool,
+    out: *mut F128,
+) {
     use core::arch::aarch64::*;
 
     #[inline(always)]
@@ -1640,7 +1701,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                             // accumulators and measures faster with them updated
                             // in place; the full body keeps the all-fused form.
                             #[cfg(target_feature = "sha3")]
-                            if FULL {
+                            if FULL && !CF {
                                 tri_acc_q(&mut $acc, $a, $b);
                             } else {
                                 tri_acc_q_crossfused(&mut $acc, $a, $b);
@@ -1863,6 +1924,127 @@ unsafe fn store_delta_a_only_gpr(dst: *mut u8, a0: u64, a1: u64) {
             options(nostack, preserves_flags),
         );
     }
+}
+
+/// Kill switch for the round-two pointer walk (`FLOCK_NO_R2_PTR_WALK`, any
+/// value): the prescaled kernel's aligned-padding group loop walks its four
+/// streams with pre-indexed `LDP`/`STP` (two of them) and one `SUB`, instead
+/// of re-deriving every address from a shared induction variable (ten
+/// `ADD`s and five pointer steps per group), and takes the degenerate-pair
+/// and `b_ones == 1` flags as constants. Same loads, same stores, same bytes.
+#[cfg(target_arch = "aarch64")]
+fn r2_ptr_walk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_PTR_WALK").is_none())
+}
+
+/// `ldp lo, hi, [p, #-64]!`: step `p` back one 64-byte group, then load the
+/// two codes it now points at.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn load_code_pair_pre_m64(p: &mut *const u64) -> (u64, u64) {
+    let (lo, hi): (u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "ldp {lo}, {hi}, [{p}, #-64]!",
+            p = inout(reg) *p,
+            lo = lateout(reg) lo,
+            hi = lateout(reg) hi,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+    (lo, hi)
+}
+
+/// `ldp lo, hi, [p, #16]`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn load_code_pair_off16(p: *const u64) -> (u64, u64) {
+    let (lo, hi): (u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "ldp {lo}, {hi}, [{p}, #16]",
+            p = in(reg) p,
+            lo = lateout(reg) lo,
+            hi = lateout(reg) hi,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    (lo, hi)
+}
+
+/// [`store_delta_pair_gpr`] at `dst - 64`, leaving `dst` there.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_pair_pre_m64(dst: &mut *mut u8, a0: u64, a1: u64, b0: u64, b1: u64) {
+    unsafe {
+        core::arch::asm!(
+            "eor {ta}, {a0}, {a1}",
+            "eor {tb}, {b0}, {b1}",
+            "stp {ta}, {tb}, [{dst}, #-64]!",
+            dst = inout(reg) *dst,
+            a0 = in(reg) a0,
+            a1 = in(reg) a1,
+            b0 = in(reg) b0,
+            b1 = in(reg) b1,
+            ta = out(reg) _,
+            tb = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// [`store_delta_pair_gpr`] at `dst + 16`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_pair_off16(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64) {
+    unsafe {
+        core::arch::asm!(
+            "eor {ta}, {a0}, {a1}",
+            "eor {tb}, {b0}, {b1}",
+            "stp {ta}, {tb}, [{dst}, #16]",
+            dst = in(reg) dst,
+            a0 = in(reg) a0,
+            a1 = in(reg) a1,
+            b0 = in(reg) b0,
+            b1 = in(reg) b1,
+            ta = out(reg) _,
+            tb = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// `stnp a, b, [dst, #OFF]`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_q_pair_nt_off<const OFF: usize>(
+    dst: *mut F128,
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stnp {a:q}, {b:q}, [{dst}, #{off}]",
+            dst = in(reg) dst,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            off = const OFF,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// The value of `v`, hidden from the optimiser so a constant stays in its
+/// register instead of being rematerialised (`ADRP`+`LDR`) inside a loop.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn opaque_q(v: core::arch::aarch64::uint64x2_t) -> core::arch::aarch64::uint64x2_t {
+    let mut v = v;
+    unsafe {
+        core::arch::asm!("/* {v:v} */", v = inout(vreg) v, options(pure, nomem, nostack, preserves_flags));
+    }
+    v
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2467,6 +2649,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
             && (pair_idx_base & 127) == 0
             && lo_size.is_multiple_of(128);
         let fixed_pads = FIXED_PADS && aligned_padding;
+        let ptr_walk = GPR_DELTA && r2_ptr_walk_enabled();
         for first in (0..lo_size / 2).step_by(32) {
             for t in 0..2 {
                 let mut w0 = tri_zero;
@@ -2579,8 +2762,87 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                 if fixed_pads {
                     let boundary = b_end == 15;
                     group!(b_end - 1, |_: usize, _: usize| (false, boundary));
-                    for pos in (0..b_end - 1).rev() {
-                        group!(pos, |_: usize, _: usize| (false, false));
+                    if ptr_walk {
+                        // Groups `b_end-2 ..= 0`, no padding. The a/b/delta
+                        // streams step back 64 bytes per group through the
+                        // pre-indexed loads/stores of pair 0; pair 1 reads
+                        // and writes at +16; the anchors step 128 bytes.
+                        macro_rules! walk_loop {
+                            ($deg:literal, $ones:literal) => {{
+                                let k87w = opaque_q(k87);
+                                let u_top = first + t + 2 * (b_end - 1);
+                                let mut pa = a_packed.add(32 * u_top).cast::<u64>();
+                                let mut pb = b_packed.add(32 * u_top).cast::<u64>();
+                                let mut pd = deltas.add(32 * u_top);
+                                let mut pn = anchors.add(4 * (u_top - 2));
+                                for _ in 0..b_end - 1 {
+                                    let (a_even0, a_odd0) = load_code_pair_pre_m64(&mut pa);
+                                    let (b_even0, b_odd0) = load_code_pair_pre_m64(&mut pb);
+                                    let deg0 = $deg && (b_even0 & b_odd0) == u64::MAX;
+                                    let (a0, b0) = if deg0 {
+                                        (fold_row_code_q(table_data, a_even0), b_ones)
+                                    } else {
+                                        fold_two_row_codes_q(table_data, a_even0, b_even0)
+                                    };
+                                    store_q_pair_nt_off::<0>(pn, a0, b0);
+                                    store_delta_pair_pre_m64(&mut pd, a_even0, a_odd0, b_even0, b_odd0);
+                                    let (a_even1, a_odd1) = load_code_pair_off16(pa);
+                                    let (b_even1, b_odd1) = load_code_pair_off16(pb);
+                                    let deg1 = $deg && (b_even1 & b_odd1) == u64::MAX;
+                                    // The full message step, shared by both
+                                    // pair-1 branches below.
+                                    macro_rules! full_step {
+                                        ($a2:expr, $b2:expr) => {{
+                                            let (a2, b2) = ($a2, $b2);
+                                            let e_a = veorq_u64(a0, a2);
+                                            let e_b = veorq_u64(b0, b2);
+                                            tri_acc_q_crossfused(&mut w0, mul_xb_q(a2, xb, k87w), b2);
+                                            let e_s = mul_xb_q(e_a, xb, k87w);
+                                            tri_acc_q_crossfused(&mut w3, e_s, e_b);
+                                            let (o_a, o_b) = fold_two_codes_paired_q(
+                                                table_data,
+                                                a_odd0 ^ a_odd1,
+                                                b_odd0 ^ b_odd1,
+                                            );
+                                            let o_s = mul_xb_q(o_a, xb, k87w);
+                                            tri_acc_q_crossfused(&mut w4, o_s, o_b);
+                                            tri_acc_q_crossfused(
+                                                &mut w5,
+                                                veorq_u64(e_s, o_s),
+                                                veorq_u64(e_b, o_b),
+                                            );
+                                        }};
+                                    }
+                                    if deg1 {
+                                        let a2 = fold_row_code_q(table_data, a_even1);
+                                        store_q_pair_nt_off::<32>(pn, a2, b_ones);
+                                        store_delta_pair_off16(pd, a_even1, a_odd1, b_even1, b_odd1);
+                                        pn = pn.wrapping_sub(8);
+                                        if $ones && deg0 {
+                                            w0.ll = veorq_u64(w0.ll, mul_xb_q(a2, xb, k87w));
+                                        } else {
+                                            full_step!(a2, b_ones);
+                                        }
+                                    } else {
+                                        let (a2, b2) = fold_two_row_codes_q(table_data, a_even1, b_even1);
+                                        store_q_pair_nt_off::<32>(pn, a2, b2);
+                                        store_delta_pair_off16(pd, a_even1, a_odd1, b_even1, b_odd1);
+                                        pn = pn.wrapping_sub(8);
+                                        full_step!(a2, b2);
+                                    }
+                                    xb = vshrq_n_u64::<1>(xb);
+                                }
+                            }};
+                        }
+                        match (degen, ones_is_one) {
+                            (true, true) => walk_loop!(true, true),
+                            (true, false) => walk_loop!(true, false),
+                            (false, _) => walk_loop!(false, false),
+                        }
+                    } else {
+                        for pos in (0..b_end - 1).rev() {
+                            group!(pos, |_: usize, _: usize| (false, false));
+                        }
                     }
                 } else {
                     for pos in (0..b_end).rev() {

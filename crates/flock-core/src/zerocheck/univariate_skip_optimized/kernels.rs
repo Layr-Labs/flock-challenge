@@ -586,7 +586,12 @@ pub(super) fn accumulate_convert_ab_nomul_seeded<const U: bool>(
     assert_eq!(convert.len(), 16 * 256);
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        aarch64::accumulate_convert_ab_nomul_seeded::<U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        // Four-row drain step (`FLOCK_NO_ZC_AB_DRAIN_QUAD` kills); same bytes.
+        if U && aarch64::ab_drain_quad_enabled() {
+            aarch64::accumulate_convert_ab_nomul_seeded_quad(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        } else {
+            aarch64::accumulate_convert_ab_nomul_seeded::<U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     accumulate_convert_ab_nomul::<false, U>(chunk_ab_bytes, first_b_med, n_b_med, convert, bank);

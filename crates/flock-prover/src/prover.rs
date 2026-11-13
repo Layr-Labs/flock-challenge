@@ -593,6 +593,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     };
     let [ab, c] = claims;
     flock_core::epool::set_linger_phase(false);
+    flock_core::cpu_keepalive::pool_spin_release();
     flock_core::tmark::mark("open returned");
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
@@ -2582,6 +2583,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 
+    // Safety release of the commit-tail pool bridge (zerocheck ends it
+    // after round one; idempotent).
+    flock_core::cpu_keepalive::pool_spin_release();
     flock_core::gpu_commit::lc_gpu_wake_arm(false);
     flock_core::tmark::mark("zc end");
     let cpu_lc0 = phase_timing.then(process_cpu_ms);
@@ -2592,6 +2596,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
     // Lincheck runs on a main-pool worker (`flock_core::in_pool`), as above.
     flock_core::tmark::mark("lc call");
+    // Hold the main pool hot through lincheck and the open (see
+    // `cpu_keepalive::pool_spin_open_start`); released after the open.
+    flock_core::cpu_keepalive::pool_spin_open_start();
     flock_core::epool::set_linger_phase(true);
     let (lc_proof, lc_claim, z_vec_pre) = flock_core::in_pool(|| {
         flock_core::tmark::mark("lc body start");
