@@ -607,10 +607,12 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
     assert_eq!(out.len(), 1usize << d);
     if d >= 14 {
         let a = d / 2;
-        let mut lo = vec![F128::ZERO; 1usize << a];
-        let mut hi = vec![F128::ZERO; 1usize << (d - a)];
-        build_eq_table_into(&point[..a], &mut lo);
-        build_eq_table_into(&point[a..], &mut hi);
+        let mut lo = crate::alloc_uninit_f128_vec(1usize << a);
+        let mut hi = crate::alloc_uninit_f128_vec(1usize << (d - a));
+        rayon::join(
+            || build_eq_table_into(&point[..a], &mut lo),
+            || build_eq_table_into(&point[a..], &mut hi),
+        );
         let lo = &lo;
         out.par_chunks_mut(1usize << a)
             .zip(hi.par_iter())
@@ -1242,14 +1244,14 @@ pub fn build_quirky_eq_table(z_skip: F128, x_inner_rest: &[F128], k_skip: usize)
     let ell_skip = 1usize << k_skip;
     let ell_rest = 1usize << x_inner_rest.len();
     let lambda_skip = lagrange_weights_naive(k_skip, z_skip);
-    let eq_rest = build_eq_table(x_inner_rest);
     let total = ell_skip * ell_rest;
     let mut out = crate::scratch::take_lincheck_eq(total);
     // Layout: index = i_skip + i_inner_rest · 2^k_skip  ⇒  i_skip is low bits.
-    for (row, &er) in out.chunks_exact_mut(ell_skip).zip(eq_rest.iter()) {
-        for (dst, &ls) in row.iter_mut().zip(lambda_skip.iter()) {
-            *dst = ls * er;
-        }
+    out[..ell_skip].copy_from_slice(&lambda_skip);
+    for (j, &r_j) in x_inner_rest.iter().enumerate() {
+        let len = ell_skip << j;
+        let (lo, rest) = out.split_at_mut(len);
+        crate::field::f128_slice::expand_eq_table_level(lo, &mut rest[..len], r_j);
     }
     debug_assert_eq!(out.len(), total);
     out
