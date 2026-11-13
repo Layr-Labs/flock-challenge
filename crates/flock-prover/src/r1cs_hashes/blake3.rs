@@ -2641,15 +2641,12 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR; shr/shl/or is
-    /// exact bitwise. M = 32 − N is spelled out at the call site (stable
-    /// Rust cannot derive const arguments from const parameters).
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
         unsafe {
             let v = veorq_u32(x, y);
-            vorrq_u32(vshrq_n_u32::<N>(v), vshlq_n_u32::<M>(v))
+            vsriq_n_u32(vshlq_n_u32::<M>(v), v, N)
         }
     }
 
