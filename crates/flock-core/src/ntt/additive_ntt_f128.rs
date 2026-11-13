@@ -1423,16 +1423,16 @@ impl AdditiveNttF128 {
     }
 
     /// Complete a ranked hybrid suffix with the same cache-local schedule as
-    /// the tuned full-CPU transform, then publish each finalized 1 MiB chunk.
+    /// the tuned full-CPU transform, then publish each 1 MiB chunk.
     ///
     /// The shared GPU pass has already completed layers 0..4.  This routine
     /// runs the two remaining top radix-8 groups (layers 4..10) over the
-    /// requested absolute layer-4 blocks, then finishes layers 10..20 as five
+    /// requested absolute layer-4 blocks, then runs layers 10..`stop_layer` as
     /// fused pairs inside independent layer-10 sub-NTTs.  `finish_chunk`
-    /// receives an absolute element offset, so a concurrent GPU prefix and
-    /// this CPU suffix can write disjoint Merkle leaf ranges without rebasing
-    /// indices.  It runs immediately after the last pair while the 1 MiB
-    /// codeword chunk is still cache-resident.
+    /// receives an absolute element offset at the requested stop layer.
+    /// Hash callbacks require `stop_layer == log_d`. The callback runs after
+    /// the last pair while the 1 MiB chunk is still cache-resident. Layer 16 leaves the
+    /// final four layers for the GPU before hashing.
     ///
     /// This deliberately has a narrow production contract.  Other shapes
     /// keep [`Self::forward_transform_interleaved_block_range`].
@@ -1453,7 +1453,7 @@ impl AdditiveNttF128 {
         assert_eq!(log_d, 20, "ranked hybrid suffix requires log_d=20");
         assert_eq!(num_ntts, 64, "ranked hybrid suffix requires 64 lanes");
         assert_eq!(start_layer, 4, "ranked hybrid suffix starts at layer 4");
-        assert_eq!(stop_layer, log_d, "ranked hybrid suffix completes the NTT");
+        assert!(matches!(stop_layer, 16 | 20), "ranked hybrid suffix stops at layer 16 or 20");
         assert!(b_start < b_end && b_end <= (1usize << start_layer));
 
         // Only this ranked entry point (and the ranked full-CPU driver) honor
@@ -1487,6 +1487,7 @@ impl AdditiveNttF128 {
             num_ntts,
             DEEP_LAYER,
             log_d,
+            stop_layer,
             sub_start,
             sub_end,
             odd_tail,
@@ -1506,6 +1507,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         b_start: usize,
         fine_m: usize,
+        stop_layer: usize,
         wait_boundary: W,
         finish_chunk: F,
     ) -> Result<(), String>
@@ -1517,6 +1519,7 @@ impl AdditiveNttF128 {
         let log_d = log2_pow2(data.len() / num_ntts);
         assert_eq!(log_d, 20, "ranked fine split requires log_d=20");
         assert_eq!(num_ntts, 64, "ranked fine split requires 64 lanes");
+        assert!(matches!(stop_layer, 16 | 20), "ranked fine split stops at layer 16 or 20");
         assert!((1..16).contains(&b_start) && (1..16).contains(&fine_m));
         let odd_tail = ranked_zero_odd_tail_lanes(log_d, num_ntts);
         if !self.forward_transform_interleaved_ranked_top_tiled(data, num_ntts, b_start, 16, odd_tail) {
@@ -1535,6 +1538,7 @@ impl AdditiveNttF128 {
             num_ntts,
             DEEP_LAYER,
             log_d,
+            stop_layer,
             sb_start << (DEEP_LAYER - 8),
             16 << (DEEP_LAYER - 4),
             odd_tail,
@@ -2254,6 +2258,7 @@ impl AdditiveNttF128 {
             num_ntts,
             n_top,
             log_d,
+            log_d,
             0,
             1usize << n_top,
             odd_tail,
@@ -2270,6 +2275,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         n_top: usize,
         log_d: usize,
+        stop_layer: usize,
         sub_start: usize,
         sub_end: usize,
         // Trailing lanes known zero at every odd position; 0 = dense.
@@ -2280,7 +2286,7 @@ impl AdditiveNttF128 {
     {
         use rayon::prelude::*;
 
-        debug_assert!(n_top <= log_d);
+        debug_assert!(n_top <= stop_layer && stop_layer <= log_d);
         debug_assert_eq!(data.len(), (1usize << log_d) * num_ntts);
         debug_assert!(sub_start < sub_end && sub_end <= (1usize << n_top));
         let sub_size_positions = 1usize << (log_d - n_top);
@@ -2308,7 +2314,7 @@ impl AdditiveNttF128 {
             .for_each(|(local_sub_idx, sub_data)| {
                 let sub_idx = sub_start + local_sub_idx;
                 let mut layer = n_top;
-                while layer + 1 < log_d {
+                while layer + 1 < stop_layer {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
                     let block_size_positions = 1usize << (log_d - layer);
@@ -2379,7 +2385,7 @@ impl AdditiveNttF128 {
                 // The ranked path has ten deep layers and therefore no tail.
                 // Retaining the scalar single-layer tail makes this helper a
                 // compact exact-test fixture for odd layer counts as well.
-                if layer < log_d {
+                if layer < stop_layer {
                     let layer_in_sub = layer - n_top;
                     let num_blocks_in_sub = 1usize << layer_in_sub;
                     let block_size_positions = 1usize << (log_d - layer);
@@ -4731,6 +4737,80 @@ mod block_range_equivalence {
     }
 
     #[test]
+    fn partial_deep_range_keeps_full_domain_geometry() {
+        let (log_d, num_ntts, n_top, stop_layer) = (14, 8, 6, 10);
+        let (sub_start, sub_end) = (43, 64);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let source: Vec<F128> = (0..(1usize << log_d) * num_ntts)
+            .map(|i| if (i / num_ntts) % 2 == 1 && i % num_ntts >= 5 {
+                F128::ZERO
+            } else {
+                F128::new((i as u64).wrapping_mul(0x9e3779b97f4a7c15), i as u64 ^ 0xd3)
+            })
+            .collect();
+        let first = sub_start * (1 << (log_d - n_top)) * num_ntts;
+        let mut expected = source.clone();
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut expected, num_ntts, n_top);
+        expected[..first].copy_from_slice(&source[..first]);
+        for zero_tail in [0, 3] {
+            let mut actual = source.clone();
+            ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                &mut actual, num_ntts, n_top, log_d, stop_layer,
+                sub_start, sub_end, zero_tail, &|_, _| {},
+            );
+            ntt.forward_transform_interleaved_block_range(
+                &mut actual, num_ntts, stop_layer, log_d,
+                sub_start << (stop_layer - n_top), sub_end << (stop_layer - n_top), 0,
+            );
+            assert_eq!(actual, expected, "partial deep range changed geometry or guards");
+        }
+    }
+
+    #[test]
+    fn partial_deep_range_matches_plain_and_guards() {
+        let (log_d, num_ntts, n_top) = (12usize, 64usize, 4usize);
+        let (sub_start, sub_end) = (3usize, 11usize);
+        let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut state = 0x5355_4646_5041_5254u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state
+        };
+        let source: Vec<F128> = (0..(1usize << log_d) * num_ntts)
+            .map(|_| F128::new(next(), next())).collect();
+        for tail in [0usize, 7] {
+            let mut input = source.clone();
+            for row in input.chunks_exact_mut(num_ntts).skip(1).step_by(2) {
+                row[num_ntts - tail..].fill(F128::ZERO);
+            }
+            for stop_layer in [6usize, 8, 9, 10, 12] {
+                let mut plain = input.clone();
+                ntt.forward_transform_interleaved_block_range(
+                    &mut plain, num_ntts, n_top, stop_layer, sub_start, sub_end, 0,
+                );
+                let mut actual = input.clone();
+                let offsets = std::sync::Mutex::new(Vec::new());
+                ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                    &mut actual, num_ntts, n_top, log_d, stop_layer,
+                    sub_start, sub_end, tail,
+                    &|offset, chunk| {
+                        assert_eq!(chunk.len(), sub_elems);
+                        offsets.lock().unwrap().push(offset);
+                    },
+                );
+                assert!(actual == plain, "partial range differs: stop={stop_layer}, tail={tail}");
+                assert!(plain != input, "reference did no work");
+                assert_eq!(&actual[..sub_start * sub_elems], &input[..sub_start * sub_elems]);
+                assert_eq!(&actual[sub_end * sub_elems..], &input[sub_end * sub_elems..]);
+                let mut offsets = offsets.into_inner().unwrap();
+                offsets.sort_unstable();
+                assert_eq!(offsets, (sub_start..sub_end).map(|i| i * sub_elems).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
     fn cache_local_block_range_matches_plain_with_absolute_callbacks() {
         // Compact analogue of ranked layers 4..10 streaming + cache-local
         // deep pairs: six top layers followed by two fused deep pairs.
@@ -4779,6 +4859,7 @@ mod block_range_equivalence {
             &mut cache_local,
             num_ntts,
             n_top,
+            log_d,
             log_d,
             sub_start,
             sub_end,
@@ -4880,6 +4961,7 @@ mod zero_lane_skip {
                 &mut data,
                 NUM_NTTS,
                 n_top,
+                log_d,
                 log_d,
                 0,
                 1 << n_top,
