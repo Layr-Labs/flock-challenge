@@ -44,6 +44,7 @@
 //! FRI fold processes layers in **reverse** (deepest first), at which level
 //! pairs are adjacent — matching the standard `fold_pair` formula in DP24.
 
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use crate::field::F128;
@@ -151,9 +152,9 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
 /// NTT objects are constructed repeatedly by the recursive PCS, and rebuilding
 /// these rows otherwise repeats field inversions and multiplications even when
 /// the large twiddle table is already resident from the untimed warm proof.
-/// Clone into the original nested-`Vec` representation so transform object
-/// layout and hot-loop dereferencing remain unchanged.
-fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
+/// Borrow the immutable cached rows; custom-basis transforms retain owned rows.
+/// Unlike an Arc around the triangle, this needs no additional reference count.
+fn cached_standard_evals(dim: usize) -> &'static [Vec<F128>] {
     static TABLES: OnceLock<[OnceLock<Vec<Vec<F128>>>; 65]> = OnceLock::new();
     let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     tables[dim]
@@ -161,7 +162,7 @@ fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
             let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
             generate_evals_from_subspace(&basis)
         })
-        .clone()
+        .as_slice()
 }
 
 /// Complete the last radix-8 group for the ranked Apple-silicon L0 commit.
@@ -556,7 +557,7 @@ const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    evals: Cow<'static, [Vec<F128>]>,
     /// Breadth-first table: layer `l` starts at `2^l - 1`.
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
@@ -567,7 +568,7 @@ impl AdditiveNttF128 {
         let evals = generate_evals_from_subspace(basis);
         let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
-            evals,
+            evals: Cow::Owned(evals),
             precomputed_twiddles,
         }
     }
@@ -576,7 +577,7 @@ impl AdditiveNttF128 {
     /// (the low 64 bits of F_{2^128} hold these basis vectors).
     pub fn standard(dim: usize) -> Self {
         assert!(dim <= 64, "standard NTT requires dim ≤ 64");
-        let evals = cached_standard_evals(dim);
+        let evals = Cow::Borrowed(cached_standard_evals(dim));
         let precomputed_twiddles = cached_standard_twiddles(dim, &evals);
         Self {
             evals,
@@ -593,6 +594,20 @@ impl AdditiveNttF128 {
     /// commit uploads this table once at init.
     pub(crate) fn precomputed_twiddle_table(&self) -> Option<&[F128]> {
         self.precomputed_twiddles.as_deref()
+    }
+
+    /// The seven twiddles of the radix-8 group rooted at `(layer, block)`, in
+    /// the order the fused three-layer kernels take them.
+    fn fused3_twiddles(&self, layer: usize, block: usize) -> [F128; 7] {
+        let mut tw = [F128 { lo: 0, hi: 0 }; 7];
+        tw[0] = self.twiddle(layer, block);
+        for s in 0..2 {
+            tw[1 + s] = self.twiddle(layer + 1, 2 * block + s);
+        }
+        for s in 0..4 {
+            tw[3 + s] = self.twiddle(layer + 2, 4 * block + s);
+        }
+        tw
     }
 
     /// Twiddle at `(layer, block)` for the forward NTT and FRI fold.
@@ -878,19 +893,30 @@ impl AdditiveNttF128 {
         let block_elems = block_positions * num_ntts;
         let eighth = block_positions >> 3;
         assert_eq!(msg.len(), block_elems);
-        let twiddles: Vec<[F128; 7]> = (0..num_blocks)
-            .map(|block| {
-                let mut tw = [F128 { lo: 0, hi: 0 }; 7];
-                tw[0] = self.twiddle(start_layer, block);
-                for s in 0..2 {
-                    tw[1 + s] = self.twiddle(start_layer + 1, 2 * block + s);
-                }
-                for s in 0..4 {
-                    tw[3 + s] = self.twiddle(start_layer + 2, 4 * block + s);
-                }
-                tw
-            })
-            .collect();
+        let load_twiddles = |block| {
+            let mut tw = [F128::ZERO; 7];
+            tw[0] = self.twiddle(start_layer, block);
+            for s in 0..2 {
+                tw[1 + s] = self.twiddle(start_layer + 1, 2 * block + s);
+            }
+            for s in 0..4 {
+                tw[3 + s] = self.twiddle(start_layer + 2, 4 * block + s);
+            }
+            tw
+        };
+        // Keep small reused tables on the stack; larger replica counts retain
+        // the same gathered heap layout. Both buffers outlive all top jobs.
+        let mut local_twiddles = [[F128::ZERO; 7]; 8];
+        let heap_twiddles;
+        let twiddles: &[[F128; 7]] = if num_blocks <= local_twiddles.len() {
+            for (block, tw) in local_twiddles[..num_blocks].iter_mut().enumerate() {
+                *tw = load_twiddles(block);
+            }
+            &local_twiddles[..num_blocks]
+        } else {
+            heap_twiddles = (0..num_blocks).map(load_twiddles).collect::<Vec<_>>();
+            &heap_twiddles
+        };
         debug_assert_eq!(twiddles[0][0], F128::ZERO);
         debug_assert_eq!(twiddles[0][1], F128::ZERO);
         debug_assert_eq!(twiddles[0][3], F128::ZERO);
@@ -1093,21 +1119,45 @@ impl AdditiveNttF128 {
                 t_l1.elapsed().as_secs_f64() * 1e3
             );
         }
-        // Layers 4 and 7: exact in-place ranked hetero passes.
-        for layer in [4usize, 7] {
-            let num_blocks = 1usize << layer;
-            let block_size = 1usize << (log_d - layer);
-            let eighth = block_size >> 3;
-            debug_assert!(is_ranked_top_hetero_fused3_pass(
-                log_d,
-                num_ntts,
-                start_layer,
-                n_top,
-                layer
-            ));
-            let twiddles: Vec<[F128; 7]> =
-                (0..num_blocks).map(|b| block_twiddles(layer, b)).collect();
-            butterfly_interleaved_fused_3layer_all_blocks_hetero(data, &twiddles, eighth, num_ntts);
+        let t_top = std::time::Instant::now();
+        // Layers 4..10: two radix-8 groups. With the strip schedule each job
+        // runs both groups over one cache-resident strip of row groups (see
+        // `butterfly_interleaved_fused_6layer_strips_hetero`), so the codeword
+        // streams through DRAM once for these six layers instead of twice.
+        let strip = ntt_strip_rows();
+        let eighth_lo = 1usize << (log_d - 7 - 3);
+        if strip != 0 && strip <= eighth_lo && eighth_lo.is_multiple_of(strip) {
+            let tw_hi: Vec<[F128; 7]> = (0..1usize << 4).map(|b| block_twiddles(4, b)).collect();
+            let tw_lo: Vec<[F128; 7]> = (0..1usize << 7).map(|b| block_twiddles(7, b)).collect();
+            butterfly_interleaved_fused_6layer_strips_hetero(
+                data, &tw_hi, &tw_lo, eighth_lo, num_ntts, strip,
+            );
+        } else {
+            // Layers 4 and 7: exact in-place ranked hetero passes.
+            for layer in [4usize, 7] {
+                let num_blocks = 1usize << layer;
+                let block_size = 1usize << (log_d - layer);
+                let eighth = block_size >> 3;
+                debug_assert!(is_ranked_top_hetero_fused3_pass(
+                    log_d,
+                    num_ntts,
+                    start_layer,
+                    n_top,
+                    layer
+                ));
+                let twiddles: Vec<[F128; 7]> =
+                    (0..num_blocks).map(|b| block_twiddles(layer, b)).collect();
+                butterfly_interleaved_fused_3layer_all_blocks_hetero(
+                    data, &twiddles, eighth, num_ntts,
+                );
+            }
+        }
+        if pass_timing {
+            eprintln!(
+                "[ntt-pass] layers4-10 (strip {}): {:.2} ms",
+                strip,
+                t_top.elapsed().as_secs_f64() * 1e3
+            );
         }
     }
 
@@ -1135,6 +1185,34 @@ impl AdditiveNttF128 {
         // ordinary dense transform.
         odd_tail: usize,
     ) {
+        self.forward_transform_interleaved_block_range_impl(
+            data,
+            num_ntts,
+            start_layer,
+            stop_layer,
+            b_start,
+            b_end,
+            odd_tail,
+            None,
+        );
+    }
+
+    /// [`Self::forward_transform_interleaved_block_range`] with an explicit
+    /// strip width for the six-layer strip schedule: `None` uses the process
+    /// policy (large blocks only), `Some(0)` disables it, `Some(s)` forces
+    /// strips of `s` row groups wherever two radix-8 groups are adjacent.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_transform_interleaved_block_range_impl(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        start_layer: usize,
+        stop_layer: usize,
+        b_start: usize,
+        b_end: usize,
+        odd_tail: usize,
+        strip_override: Option<usize>,
+    ) {
         let log_d = log2_pow2(data.len() / num_ntts);
         debug_assert!(stop_layer <= log_d);
         let range_blocks = b_end - b_start;
@@ -1151,6 +1229,38 @@ impl AdditiveNttF128 {
             let num_blocks = range_blocks << (layer - start_layer);
             let range_base_elem = base_pos * num_ntts;
 
+            // Two adjacent radix-8 groups (layers layer..layer+6) as one
+            // strip-scheduled traversal: same kernels, rows and twiddles as
+            // the two passes the next branch would take, in an order that
+            // keeps each strip cache-resident between them.
+            let eighth_lo = block_size >> 6;
+            let strip = match strip_override {
+                Some(s) => s,
+                None if eighth_lo >= 256 => ntt_strip_rows(),
+                None => 0,
+            };
+            if strip != 0
+                && layer + 5 < stop_layer
+                && stop_layer - layer != 4
+                && stop_layer - layer - 3 != 4
+                && block_size >= 64
+                && strip <= eighth_lo
+                && eighth_lo.is_multiple_of(strip)
+            {
+                let tw_hi: Vec<[F128; 7]> = (0..num_blocks)
+                    .map(|local| self.fused3_twiddles(layer, abs_first + local))
+                    .collect();
+                let tw_lo: Vec<[F128; 7]> = (0..num_blocks << 3)
+                    .map(|local| self.fused3_twiddles(layer + 3, (abs_first << 3) + local))
+                    .collect();
+                let range =
+                    &mut data[range_base_elem..range_base_elem + num_blocks * block_elems];
+                butterfly_interleaved_fused_6layer_strips_range(
+                    range, &tw_hi, &tw_lo, eighth_lo, num_ntts, odd_tail, abs_first, strip,
+                );
+                layer += 6;
+                continue;
+            }
             // Never leave a lone final layer (block_size 2 ⇒ 2^19 serial
             // kernel calls): when exactly 4 layers remain, take two fused-2
             // passes instead of fused-3 + single.
@@ -1755,9 +1865,9 @@ impl AdditiveNttF128 {
         if n_split > 0 {
             let n_whole = num_subs - n_split;
             let half_bytes = sub_bytes / 2;
-            let first_done: Vec<std::sync::atomic::AtomicBool> = (0..n_split)
-                .map(|_| std::sync::atomic::AtomicBool::new(false))
-                .collect();
+            // At most one flag per subtree; the joined queue cannot outlive
+            // this bounded storage. Keep the existing Release/Acquire protocol.
+            let first_done = [const { std::sync::atomic::AtomicBool::new(false) }; 1 << N_TOP];
             let run_job = |job: usize| {
                 if job < n_whole {
                     // SAFETY: as in `run_sub` below — one disjoint subtree.
@@ -2951,6 +3061,187 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
     });
 }
 
+/// Row groups per strip for the six-layer strip schedule, or 0 if disabled.
+///
+/// `FLOCK_NO_NTT_STRIP` (any value) restores the two whole-range radix-8
+/// passes; `FLOCK_NTT_STRIP_ROWS` (power of two) overrides the default 32.
+/// At the ranked shape a 32-row strip is 32 x 64 rows x 1 KiB = 2 MiB per job:
+/// L2-resident between its two sweeps, with 32 KiB sequential runs per stream.
+/// Scheduling only: every row sees the same kernel, twiddles and input in
+/// either order, so the codeword is bit-identical. Read once per process.
+pub(crate) fn ntt_strip_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        if std::env::var_os("FLOCK_NO_NTT_STRIP").is_some() {
+            return 0;
+        }
+        match std::env::var("FLOCK_NTT_STRIP_ROWS").ok().map(|v| v.parse::<usize>()) {
+            None => 32,
+            Some(Ok(s)) if s.is_power_of_two() => s,
+            Some(_) => 0,
+        }
+    })
+}
+
+/// Two adjacent radix-8 groups over whole layer-`L` blocks, strip by strip.
+///
+/// A layer-`L` block holds `64 * eighth_lo` rows. Its row group
+/// `{i * eighth_lo + r : i < 64}` is closed under layers `L..L+6`: the
+/// layer-`L` group (row stride `8 * eighth_lo`) touches rows
+/// `j * eighth_lo + r + {0..8} * 8 * eighth_lo`, and each layer-`L+3` sub-block
+/// `j` (row stride `eighth_lo`) touches rows `8 * j * eighth_lo + r + {0..8} *
+/// eighth_lo`. One job owns `strip` consecutive values of `r`: it runs the
+/// layer-`L` kernel on its rows, then the layer-`L+3` kernel on the same rows,
+/// while the `64 * strip` rows are still cache-resident. That is the same
+/// per-row arithmetic as two whole-range passes, but the codeword moves through
+/// DRAM once instead of twice. Each sweep keeps the incumbent eight row streams.
+/// `tw_hi[b]` holds layer-`L` block `b`'s twiddles and `tw_lo[8b + j]` its
+/// sub-block `j`'s. Block 0 uses the zero-root kernels exactly as the
+/// incumbent hetero passes do.
+fn butterfly_interleaved_fused_6layer_strips_hetero(
+    data: &mut [F128],
+    tw_hi: &[[F128; 7]],
+    tw_lo: &[[F128; 7]],
+    eighth_lo: usize,
+    num_ntts: usize,
+    strip: usize,
+) {
+    let num_blocks = tw_hi.len();
+    let block_elems = 64 * eighth_lo * num_ntts;
+    let sub_elems = 8 * eighth_lo * num_ntts;
+    assert_eq!(tw_lo.len(), 8 * num_blocks);
+    assert_eq!(data.len(), num_blocks * block_elems);
+    assert!(strip != 0 && eighth_lo.is_multiple_of(strip));
+    debug_assert_eq!(tw_hi[0][0], F128::ZERO);
+    debug_assert_eq!(tw_lo[0][0], F128::ZERO);
+    let strips_per_block = eighth_lo / strip;
+    let base = crate::epool::SyncPtr(data.as_mut_ptr());
+    crate::epool::run_hetero_chunks(num_blocks * strips_per_block, |job| {
+        let block = job / strips_per_block;
+        let r0 = (job % strips_per_block) * strip;
+        // SAFETY: job (block, r0) owns rows `{i * eighth_lo + r}` of block
+        // `block` for r in r0..r0 + strip; jobs are disjoint.
+        unsafe {
+            let hi = base.ptr().add(block * block_elems);
+            for j in 0..8 {
+                let (a, b) = (j * eighth_lo + r0, j * eighth_lo + r0 + strip);
+                if block == 0 {
+                    kernels::butterfly_fused_3layer_zero_root_rows(
+                        hi, 8 * eighth_lo, num_ntts, a, b, &tw_hi[block],
+                    );
+                } else {
+                    kernels::butterfly_fused_3layer_rows(
+                        hi, 8 * eighth_lo, num_ntts, a, b, &tw_hi[block],
+                    );
+                }
+            }
+            for j in 0..8 {
+                let sub = 8 * block + j;
+                let lo = hi.add(j * sub_elems);
+                if sub == 0 {
+                    kernels::butterfly_fused_3layer_zero_root_rows(
+                        lo, eighth_lo, num_ntts, r0, r0 + strip, &tw_lo[sub],
+                    );
+                } else {
+                    kernels::butterfly_fused_3layer_rows(
+                        lo, eighth_lo, num_ntts, r0, r0 + strip, &tw_lo[sub],
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Block-range sibling of [`butterfly_interleaved_fused_6layer_strips_hetero`]
+/// for [`AdditiveNttF128::forward_transform_interleaved_block_range`]: the
+/// same per-row kernels, odd-row lane counts and zero-root rule as two
+/// [`butterfly_interleaved_fused_3layer_range_par_rows`] passes, one indexed
+/// Rayon region of strip jobs.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn butterfly_interleaved_fused_6layer_strips_range(
+    data: &mut [F128],
+    tw_hi: &[[F128; 7]],
+    tw_lo: &[[F128; 7]],
+    eighth_lo: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    abs_first: usize,
+    strip: usize,
+) {
+    use rayon::prelude::*;
+    let num_blocks = tw_hi.len();
+    let block_elems = 64 * eighth_lo * num_ntts;
+    let sub_elems = 8 * eighth_lo * num_ntts;
+    assert_eq!(tw_lo.len(), 8 * num_blocks);
+    assert_eq!(data.len(), num_blocks * block_elems);
+    assert!(strip != 0 && eighth_lo.is_multiple_of(strip));
+    // As in the two-pass driver: a pass keeps the odd-row tail only when its
+    // eighth is even (the layer-L eighth, 8 * eighth_lo, always is).
+    let tail_lo = if eighth_lo.is_multiple_of(2) {
+        odd_tail
+    } else {
+        0
+    };
+    let lanes = |r: usize, tail: usize| {
+        if r & 1 == 1 {
+            num_ntts - tail
+        } else {
+            num_ntts
+        }
+    };
+    let zero_root = abs_first == 0;
+    let use_neon = kernels::vector_resident_rows();
+    let strips_per_block = eighth_lo / strip;
+    let n_jobs = num_blocks * strips_per_block;
+    let base = data.as_mut_ptr() as usize;
+    let job = move |job: usize| {
+        let block = job / strips_per_block;
+        let r0 = (job % strips_per_block) * strip;
+        // SAFETY: job (block, r0) owns rows `{i * eighth_lo + r}` of block
+        // `block` for r in r0..r0 + strip; jobs are disjoint.
+        unsafe {
+            let hi = (base as *mut F128).add(block * block_elems);
+            for j in 0..8 {
+                for r in j * eighth_lo + r0..j * eighth_lo + r0 + strip {
+                    if zero_root && block == 0 {
+                        kernels::butterfly_fused_3layer_zero_root_row_with_policy(
+                            hi, 8 * eighth_lo, num_ntts, lanes(r, odd_tail), r, &tw_hi[block],
+                            use_neon,
+                        );
+                    } else {
+                        kernels::butterfly_fused_3layer_row_with_policy(
+                            hi, 8 * eighth_lo, num_ntts, lanes(r, odd_tail), r, &tw_hi[block],
+                            use_neon,
+                        );
+                    }
+                }
+            }
+            for j in 0..8 {
+                let sub = 8 * block + j;
+                let lo = hi.add(j * sub_elems);
+                for r in r0..r0 + strip {
+                    if zero_root && sub == 0 {
+                        kernels::butterfly_fused_3layer_zero_root_row_with_policy(
+                            lo, eighth_lo, num_ntts, lanes(r, tail_lo), r, &tw_lo[sub], use_neon,
+                        );
+                    } else {
+                        kernels::butterfly_fused_3layer_row_with_policy(
+                            lo, eighth_lo, num_ntts, lanes(r, tail_lo), r, &tw_lo[sub], use_neon,
+                        );
+                    }
+                }
+            }
+        }
+    };
+    // Same serial cut-off as the two-pass driver, counted in row groups.
+    if n_jobs * strip < 256 {
+        (0..n_jobs).for_each(job);
+    } else {
+        (0..n_jobs).into_par_iter().for_each(job);
+    }
+}
+
 /// Ranked block/tile-queue sibling of
 /// [`butterfly_interleaved_fused_3layer_all_blocks_par_rows`]. Each queue
 /// claim owns a fixed row tile within one block and processes those rows
@@ -3741,7 +4032,7 @@ mod tests {
     fn recursive_from_message_fused3_matches_replicated_transform() {
         const NUM_NTTS: usize = 8;
         let mut rng = Rng::new(0x5241_5445_384D_5347);
-        for (log_d, start_layer) in [(12usize, 2usize), (12, 3)] {
+        for (log_d, start_layer) in [(12usize, 0usize), (12, 1), (12, 2), (12, 3), (12, 4)] {
             let ntt = AdditiveNttF128::standard(log_d);
             let msg_len = (1usize << (log_d - start_layer)) * NUM_NTTS;
             let msg = rand_vec(&mut rng, msg_len);
@@ -4200,6 +4491,44 @@ mod tests {
     }
 
     #[test]
+    fn standard_evals_borrow_cached_rows_and_clone_without_copying() {
+        for dim in [1usize, 8, MAX_PRECOMPUTED_TWIDDLE_LOG + 1, 64] {
+            let first = AdditiveNttF128::standard(dim);
+            let second = AdditiveNttF128::standard(dim);
+            let cloned = first.clone();
+            assert!(matches!(&first.evals, Cow::Borrowed(_)));
+            assert_eq!(first.evals.as_ptr(), second.evals.as_ptr());
+            assert_eq!(first.evals.as_ptr(), cloned.evals.as_ptr());
+            let basis: Vec<_> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+            assert_eq!(first.evals.as_ref(), generate_evals_from_subspace(&basis));
+            drop(first);
+            assert_eq!(cloned.log_domain_size(), dim);
+            if dim > 0 {
+                let layer = dim - 1;
+                let block = (1usize << layer) - 1;
+                assert_eq!(cloned.twiddle(layer, block), second.twiddle(layer, block));
+            }
+        }
+    }
+
+    #[test]
+    fn custom_basis_evals_remain_owned_after_clone() {
+        let basis: Vec<_> = (0..6).map(|i| F128::new(1 << i, 1 << (i + 10))).collect();
+        let original = AdditiveNttF128::new(&basis);
+        let cloned = original.clone();
+        assert!(matches!(&original.evals, Cow::Owned(_)));
+        assert!(matches!(&cloned.evals, Cow::Owned(_)));
+        assert_ne!(original.evals.as_ptr(), cloned.evals.as_ptr());
+        assert_eq!(original.evals, cloned.evals);
+        drop(original);
+        let input: Vec<_> = (0..64).map(|i| F128::new(i, i * 13)).collect();
+        let mut data = input.clone();
+        cloned.forward_transform(&mut data);
+        cloned.inverse_transform(&mut data);
+        assert_eq!(data, input);
+    }
+
+    #[test]
     fn precomputed_twiddles_match_span_reference_and_cap() {
         for log_d in [1usize, 2, 5, 8, 12] {
             let ntt = AdditiveNttF128::standard(log_d);
@@ -4432,6 +4761,315 @@ mod twiddle_structure_check {
 #[cfg(test)]
 mod block_range_equivalence {
     use super::*;
+
+    fn strip_src(log_d: usize, num_ntts: usize, odd_tail: usize) -> Vec<F128> {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut src: Vec<F128> = (0..(1usize << log_d) * num_ntts)
+            .map(|_| F128::new(next(), next()))
+            .collect();
+        for pos in (1..1usize << log_d).step_by(2) {
+            for lane in num_ntts - odd_tail..num_ntts {
+                src[pos * num_ntts + lane] = F128::ZERO;
+            }
+        }
+        src
+    }
+
+    #[test]
+    fn strip_schedule_block_range_matches_two_pass_and_scalar() {
+        // Layer-2 blocks of 2^10 rows: eighth_lo = 16, two adjacent radix-8
+        // groups at layers 2..8, then the remaining layers.
+        let (log_d, start_layer, num_ntts) = (12usize, 2usize, 4usize);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let block_elems = (1usize << (log_d - start_layer)) * num_ntts;
+        for odd_tail in [0usize, 1] {
+            let src = strip_src(log_d, num_ntts, odd_tail);
+            let mut full = src.clone();
+            ntt.forward_transform_interleaved_scalar_from_layer(&mut full, num_ntts, start_layer);
+            for (b_start, b_end) in [(0usize, 4usize), (1, 4), (1, 3), (3, 4)] {
+                for stop in [8usize, log_d] {
+                    let mut plain = src.clone();
+                    ntt.forward_transform_interleaved_block_range_impl(
+                        &mut plain, num_ntts, start_layer, stop, b_start, b_end, odd_tail,
+                        Some(0),
+                    );
+                    for strip in [1usize, 2, 16] {
+                        let mut got = src.clone();
+                        ntt.forward_transform_interleaved_block_range_impl(
+                            &mut got, num_ntts, start_layer, stop, b_start, b_end, odd_tail,
+                            Some(strip),
+                        );
+                        assert_eq!(
+                            got, plain,
+                            "strip {strip} tail {odd_tail} range {b_start}..{b_end} stop {stop}"
+                        );
+                    }
+                    if stop == log_d && odd_tail == 0 {
+                        let (a, b) = (b_start * block_elems, b_end * block_elems);
+                        assert_eq!(&plain[..a], &src[..a]);
+                        assert_eq!(&plain[a..b], &full[a..b]);
+                        assert_eq!(&plain[b..], &src[b..]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strip_schedule_hetero_matches_two_hetero_passes() {
+        let (log_d, num_ntts) = (12usize, 4usize);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let src = strip_src(log_d, num_ntts, 0);
+        // Layer 2: 4 blocks, eighth 128; layer 5: 32 blocks, eighth 16.
+        let tw_hi: Vec<[F128; 7]> = (0..4).map(|b| ntt.fused3_twiddles(2, b)).collect();
+        let tw_lo: Vec<[F128; 7]> = (0..32).map(|b| ntt.fused3_twiddles(5, b)).collect();
+        let mut two = src.clone();
+        butterfly_interleaved_fused_3layer_all_blocks_hetero(&mut two, &tw_hi, 128, num_ntts);
+        butterfly_interleaved_fused_3layer_all_blocks_hetero(&mut two, &tw_lo, 16, num_ntts);
+        // Independent oracle: the scalar transform's layers 2..8 equal the
+        // two passes; finish both with the scalar layers 8..12 and compare to
+        // the whole scalar transform.
+        let mut full = src.clone();
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut full, num_ntts, 2);
+        let mut two_done = two.clone();
+        ntt.forward_transform_interleaved_scalar_from_layer(&mut two_done, num_ntts, 8);
+        assert_eq!(two_done, full, "two hetero passes diverge from scalar layers 2..8");
+        for strip in [1usize, 4, 16] {
+            let mut got = src.clone();
+            butterfly_interleaved_fused_6layer_strips_hetero(
+                &mut got, &tw_hi, &tw_lo, 16, num_ntts, strip,
+            );
+            assert_eq!(got, two, "strip {strip}");
+        }
+    }
+
+    /// Exactness of the production suffix entry points at the ranked geometry
+    /// (1 GiB codeword, published odd tail): the strip-scheduled drivers
+    /// against the two-pass schedule followed by the same deep pairs. Needs
+    /// ~3 GiB; run explicitly with `--ignored`.
+    #[test]
+    #[ignore]
+    fn strip_schedule_ranked_suffix_matches_two_pass_at_scale() {
+        use rayon::prelude::*;
+        let (log_d, num_ntts, tail) = (20usize, 64usize, 7usize);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let _tail = ZeroOddTailLanes::scope(num_ntts, tail);
+        assert_eq!(ranked_zero_odd_tail_lanes(log_d, num_ntts), tail);
+        eprintln!("[strip-exact] process strip policy {}", ntt_strip_rows());
+        assert_ne!(ntt_strip_rows(), 0, "the strip schedule must be on in this test");
+        let mut src = vec![F128::ZERO; (1usize << log_d) * num_ntts];
+        src.par_chunks_mut(num_ntts).enumerate().for_each(|(pos, row)| {
+            for (lane, x) in row.iter_mut().enumerate() {
+                if pos & 1 == 1 && lane >= num_ntts - tail {
+                    continue;
+                }
+                let w = ((pos * num_ntts + lane) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                *x = F128::new(w ^ 0x243f_6a88, w.rotate_left(23));
+            }
+        });
+        let noop = |_: usize, _: &[F128]| {};
+        for k in [1usize, 6] {
+            let b_start = 16 - k;
+            let mut want = src.clone();
+            ntt.forward_transform_interleaved_block_range_impl(
+                &mut want, num_ntts, 4, 10, b_start, 16, tail, Some(0),
+            );
+            ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                &mut want,
+                num_ntts,
+                10,
+                log_d,
+                b_start << 6,
+                16 << 6,
+                tail,
+                &noop,
+            );
+            let mut got = src.clone();
+            ntt.forward_transform_interleaved_ranked_block_range_and_then(
+                &mut got, num_ntts, 4, log_d, b_start, 16, noop,
+            );
+            assert!(got == want, "ranked block range k={k} diverges");
+            eprintln!("[strip-exact] ranked_block_range_and_then k={k}: identical");
+        }
+        let (b_start, fine_m) = (10usize, 5usize);
+        let (sb_end, sb_start) = (b_start << 4, (b_start << 4) - fine_m);
+        let mut want = src.clone();
+        ntt.forward_transform_interleaved_block_range_impl(
+            &mut want, num_ntts, 4, 10, b_start, 16, tail, Some(0),
+        );
+        ntt.forward_transform_interleaved_block_range_impl(
+            &mut want, num_ntts, 8, 10, sb_start, sb_end, tail, Some(0),
+        );
+        ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+            &mut want,
+            num_ntts,
+            10,
+            log_d,
+            sb_start << 2,
+            16 << 6,
+            tail,
+            &noop,
+        );
+        let mut got = src.clone();
+        ntt.forward_transform_interleaved_ranked_fine_range_and_then(
+            &mut got,
+            num_ntts,
+            b_start,
+            fine_m,
+            || Ok(()),
+            noop,
+        )
+        .unwrap();
+        assert!(got == want, "ranked fine range diverges");
+        eprintln!("[strip-exact] ranked_fine_range_and_then b_start={b_start} m={fine_m}: identical");
+
+        // Full-CPU ranked top (macOS GPU-less path): the exact call made by
+        // `forward_transform_interleaved_ranked_top_from_message` for layers
+        // 4..10 against its two hetero passes.
+        drop(got);
+        let tw_hi: Vec<[F128; 7]> = (0..16).map(|b| ntt.fused3_twiddles(4, b)).collect();
+        let tw_lo: Vec<[F128; 7]> = (0..128).map(|b| ntt.fused3_twiddles(7, b)).collect();
+        want.copy_from_slice(&src);
+        butterfly_interleaved_fused_3layer_all_blocks_hetero(&mut want, &tw_hi, 1 << 13, num_ntts);
+        butterfly_interleaved_fused_3layer_all_blocks_hetero(&mut want, &tw_lo, 1 << 10, num_ntts);
+        let mut got = src;
+        butterfly_interleaved_fused_6layer_strips_hetero(
+            &mut got,
+            &tw_hi,
+            &tw_lo,
+            1 << 10,
+            num_ntts,
+            ntt_strip_rows(),
+        );
+        assert!(got == want, "full-CPU strip schedule diverges");
+        eprintln!("[strip-exact] full-CPU layers 4..10 strip {}: identical", ntt_strip_rows());
+    }
+
+    /// Timing probe for the strip schedule at the exact ranked hybrid-suffix
+    /// geometry (log_d 20, 64 lanes, layers 4..10 over the last k layer-4
+    /// blocks of a 1 GiB codeword). Not a correctness test; run explicitly
+    /// with `--ignored --nocapture`. Threads: FLOCK_STRIP_BENCH_THREADS (10).
+    #[test]
+    #[ignore]
+    fn strip_schedule_ranked_suffix_timing() {
+        use rayon::prelude::*;
+        let (log_d, num_ntts) = (20usize, 64usize);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let threads: usize = std::env::var("FLOCK_STRIP_BENCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let trials: usize = std::env::var("FLOCK_STRIP_BENCH_TRIALS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let mut data = vec![F128::ZERO; (1usize << log_d) * num_ntts];
+        // Optional DRAM contention (stand-in for the GPU prefix / AB arm
+        // streaming beside the CPU suffix): FLOCK_STRIP_BENCH_HOG threads each
+        // copy a private 128 MiB buffer back and forth until the probe ends.
+        let hogs: usize = std::env::var("FLOCK_STRIP_BENCH_HOG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hog_threads: Vec<_> = (0..hogs)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let n = 1usize << 23; // 8M u128 = 128 MiB per half
+                    let mut a = vec![1u128; n];
+                    let mut b = vec![2u128; n];
+                    let mut rounds = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        b.copy_from_slice(&a);
+                        std::mem::swap(&mut a, &mut b);
+                        rounds += 1;
+                    }
+                    std::hint::black_box((rounds, a[n - 1]));
+                })
+            })
+            .collect();
+        pool.install(|| {
+            data.par_chunks_mut(1 << 16).enumerate().for_each(|(c, ch)| {
+                for (i, x) in ch.iter_mut().enumerate() {
+                    let w = (((c << 16) | i) as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    *x = F128::new(w, w.rotate_left(17) ^ 0xd1b5_4a32_d192_ed03);
+                }
+            });
+            let strips = [0usize, 8, 16, 32];
+            for k in [6usize, 16] {
+                let mut t = vec![Vec::new(); strips.len()];
+                for trial in 0..trials {
+                    for idx in 0..strips.len() {
+                        let si = if trial % 2 == 0 { idx } else { strips.len() - 1 - idx };
+                        let t0 = std::time::Instant::now();
+                        ntt.forward_transform_interleaved_block_range_impl(
+                            &mut data,
+                            num_ntts,
+                            4,
+                            10,
+                            16 - k,
+                            16,
+                            0,
+                            Some(strips[si]),
+                        );
+                        t[si].push(t0.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+                let med = |v: &[f64]| {
+                    let mut s = v.to_vec();
+                    s.sort_by(f64::total_cmp);
+                    s[s.len() / 2]
+                };
+                for (si, &strip) in strips.iter().enumerate() {
+                    let diffs: Vec<f64> = t[si].iter().zip(&t[0]).map(|(a, b)| a - b).collect();
+                    let faster = diffs.iter().filter(|d| **d < 0.0).count();
+                    eprintln!(
+                        "[strip-bench] threads {threads} k {k:2} strip {strip:2}: layers4-10 med {:7.2} ms min {:7.2} | paired vs two-pass med {:+6.2} ms, faster {faster}/{}",
+                        med(&t[si]),
+                        t[si].iter().copied().fold(f64::MAX, f64::min),
+                        med(&diffs),
+                        diffs.len()
+                    );
+                }
+                // Context: the unchanged deep phase (layers 10..20) of the same
+                // suffix, so the top passes' share of the CPU arm is visible.
+                let mut deep = Vec::new();
+                for _ in 0..trials.min(6) {
+                    let t0 = std::time::Instant::now();
+                    ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                        &mut data,
+                        num_ntts,
+                        10,
+                        log_d,
+                        (16 - k) << 6,
+                        16 << 6,
+                        0,
+                        &|_: usize, _: &[F128]| {},
+                    );
+                    deep.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+                eprintln!(
+                    "[strip-bench] threads {threads} k {k:2} deep layers10-20 med {:7.2} ms",
+                    med(&deep)
+                );
+            }
+        });
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for h in hog_threads {
+            h.join().unwrap();
+        }
+    }
 
     #[test]
     fn block_range_matches_full_transform() {
