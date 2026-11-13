@@ -23431,5 +23431,3 @@ kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_
         }
     }
 }
-#[allow(dead_code)]
-const GAUNTLET_REDRAW_359349b9_20261111T014954Z: u8 = 0;

@@ -98,16 +98,21 @@ pub(crate) fn help_guest_until(
         if done() {
             return 0;
         }
-        GUESTS.fetch_add(1, Ordering::SeqCst);
-        let p = GUEST.load(Ordering::SeqCst);
-        if !p.is_null() {
-            // SAFETY: the publisher cannot return while GUESTS > 0 and it
-            // unpublishes (SeqCst) before checking GUESTS.
-            let ran = unsafe { (**p)(done) };
+        // Empty-slot polling needs no hazard registration. This relaxed
+        // peek is only a hint: never dereference it. Register and re-read
+        // with the original SeqCst protocol before borrowing the closure.
+        if !GUEST.load(Ordering::Relaxed).is_null() {
+            GUESTS.fetch_add(1, Ordering::SeqCst);
+            let p = GUEST.load(Ordering::SeqCst);
+            if !p.is_null() {
+                // SAFETY: the publisher cannot return while GUESTS > 0 and it
+                // unpublishes (SeqCst) before checking GUESTS.
+                let ran = unsafe { (**p)(done) };
+                GUESTS.fetch_sub(1, Ordering::SeqCst);
+                return ran;
+            }
             GUESTS.fetch_sub(1, Ordering::SeqCst);
-            return ran;
         }
-        GUESTS.fetch_sub(1, Ordering::SeqCst);
         if started.elapsed() >= wait_for_queue {
             return 0;
         }
