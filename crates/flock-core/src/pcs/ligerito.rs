@@ -7350,6 +7350,24 @@ fn direct_fold8_odd_slot_live_banks(padding: Option<(usize, usize)>) -> usize {
     }
 }
 
+#[inline(always)]
+fn direct_compose<const COMPACT: bool>(e_hi: F128, base: &[F128], scratch: &mut [F128]) {
+    if COMPACT {
+        super::ring_switch::compose_fold_nibble_table_into(e_hi, base, scratch);
+    } else {
+        super::ring_switch::compose_fold_byte_table_into(e_hi, base, scratch);
+    }
+}
+
+#[inline(always)]
+fn direct_slot<const COMPACT: bool>(elem: F128, tables: &[F128]) -> F128 {
+    if COMPACT {
+        super::ring_switch::fold_one_slot_nib(elem, tables)
+    } else {
+        super::ring_switch::fold_one_slot(elem, tables)
+    }
+}
+
 /// Exact same-binary rollback for fusing the last direct claim's basis
 /// update with the block's round-zero statistics: any value of
 /// `FLOCK_NO_ROUND0_BASIS_FUSION` keeps the separate update loop followed by
@@ -7365,13 +7383,11 @@ fn round0_basis_fusion_enabled() -> bool {
 }
 
 /// Add the remaining direct claims' slot folds into `b_out` and return the
-/// block's round-zero partial over `(f_out, b_out)`. On the deferred-reduction
-/// AArch64 path the last claim's update runs inside the round-zero streams
 /// (`f128_slice::round0_add_basis`), so the completed basis is not re-read;
 /// every other configuration runs the separate loops and
 /// [`super::round0_deferred`]. Both write the same `b_out` and partial.
 #[inline(always)]
-fn direct_fold8_rest_claims_round0(
+fn direct_fold8_rest_claims_round0<const COMPACT: bool>(
     rest_claims: &[super::ring_switch::DirectFold8Factors],
     rest_tables: &[Vec<F128>],
     block: usize,
@@ -7390,26 +7406,22 @@ fn direct_fold8_rest_claims_round0(
         && last_claim.eq_lo.len() == b_out.len()
     {
         for (claim, table) in init_claims.iter().zip(init_tables.iter()) {
-            super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
+            direct_compose::<COMPACT>(claim.eq_hi[block], table, scratch);
             for (slot, out) in b_out.iter_mut().enumerate() {
-                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+                *out += direct_slot::<COMPACT>(claim.eq_lo[slot], scratch);
             }
         }
-        super::ring_switch::compose_fold_byte_table_into(
-            last_claim.eq_hi[block],
-            last_table,
-            scratch,
-        );
+        direct_compose::<COMPACT>(last_claim.eq_hi[block], last_table, scratch);
         let tables: &[F128] = scratch;
         let eq_lo: &[F128] = &last_claim.eq_lo;
         return crate::field::f128_slice::round0_add_basis(f_out, b_out, |slot| {
-            super::ring_switch::fold_one_slot(eq_lo[slot], tables)
+            direct_slot::<COMPACT>(eq_lo[slot], tables)
         });
     }
     for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
-        super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
+        direct_compose::<COMPACT>(claim.eq_hi[block], table, scratch);
         for (slot, out) in b_out.iter_mut().enumerate() {
-            *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+            *out += direct_slot::<COMPACT>(claim.eq_lo[slot], scratch);
         }
     }
     super::round0_deferred(f_out, b_out)
@@ -7433,6 +7445,8 @@ fn materialize_direct_fold8(
     let has_ordinary = !ordinary_basis.is_empty();
     assert!(!has_ordinary || ordinary_basis.len() == packed_witness.len());
     assert!(packed_witness.len().is_multiple_of(64));
+    let compact =
+        !has_ordinary && claims.len() == 2 && super::ring_switch::compact_compose_enabled();
 
     let zf_t0 = std::time::Instant::now();
     // GPU share of the witness fold (ranked hetero shape only, no ordinary
@@ -7510,7 +7524,7 @@ fn materialize_direct_fold8(
     // closure, token for token, and each form is compiled without the
     // others' code and with its bank split as a constant.
     macro_rules! fold8_block_body {
-        ($whole:literal, $odd_live:literal) => {
+        ($whole:literal, $odd_live:literal, $compact:literal) => {
     |scratch: &mut Vec<F128>,
                        block: usize,
                        b_out: &mut [F128],
@@ -7540,7 +7554,7 @@ fn materialize_direct_fold8(
 
         let (first_claim, rest_claims) = claims.split_first().unwrap();
         let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-        super::ring_switch::compose_fold_byte_table_into(
+        direct_compose::<$compact>(
             first_claim.eq_hi[block],
             first_table,
             scratch,
@@ -7567,13 +7581,13 @@ fn materialize_direct_fold8(
                     f_out[slot + 3] = folded_f[3];
                 }
 
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct0 = direct_slot::<$compact>(first_claim.eq_lo[slot], scratch);
                 let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
+                    direct_slot::<$compact>(first_claim.eq_lo[slot + 1], scratch);
                 let direct2 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
+                    direct_slot::<$compact>(first_claim.eq_lo[slot + 2], scratch);
                 let direct3 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
+                    direct_slot::<$compact>(first_claim.eq_lo[slot + 3], scratch);
                 if has_ordinary {
                     let folded_b = crate::field::f128_slice::fold_banked_slots4::<64>(
                         &fold_weight,
@@ -7602,9 +7616,9 @@ fn materialize_direct_fold8(
                 f_out[slot] = folded_f[0];
                 f_out[slot + 1] = folded_f[1];
 
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct0 = direct_slot::<$compact>(first_claim.eq_lo[slot], scratch);
                 let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
+                    direct_slot::<$compact>(first_claim.eq_lo[slot + 1], scratch);
                 if has_ordinary {
                     let folded_b = crate::field::f128_slice::fold_banked_slots2::<64>(
                         &fold_weight,
@@ -7621,7 +7635,7 @@ fn materialize_direct_fold8(
         }
         while slot < block_len {
             f_out[slot] = fold64(f_in, slot);
-            let direct = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+            let direct = direct_slot::<$compact>(first_claim.eq_lo[slot], scratch);
             b_out[slot] = if has_ordinary {
                 direct + fold64(b_in, slot)
             } else {
@@ -7629,24 +7643,35 @@ fn materialize_direct_fold8(
             };
             slot += 1;
         }
-        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
+        direct_fold8_rest_claims_round0::<$compact>(
+            rest_claims,
+            rest_tables,
+            block,
+            scratch,
+            b_out,
+            f_out,
+        )
     }
         };
     }
-    let fold8_block_incumbent = fold8_block_body!(false, 64);
-    let fold8_block_whole = fold8_block_body!(true, 64);
-    let fold8_block_whole_tail = fold8_block_body!(true, 57);
+    let fold8_block_incumbent = fold8_block_body!(false, 64, false);
+    let fold8_block_whole = fold8_block_body!(true, 64, false);
+    let fold8_block_whole_tail = fold8_block_body!(true, 57, false);
+    let fold8_block_incumbent_c = fold8_block_body!(false, 64, true);
+    let fold8_block_whole_c = fold8_block_body!(true, 64, true);
+    let fold8_block_whole_tail_c = fold8_block_body!(true, 57, true);
     let fold8_block = |scratch: &mut Vec<F128>,
                        block: usize,
                        b_out: &mut [F128],
                        f_out: &mut [F128]|
      -> (F128, F128) {
-        if whole_fold64 && odd_slot_live == 57 {
-            fold8_block_whole_tail(scratch, block, b_out, f_out)
-        } else if whole_fold64 {
-            fold8_block_whole(scratch, block, b_out, f_out)
-        } else {
-            fold8_block_incumbent(scratch, block, b_out, f_out)
+        match (compact, whole_fold64, odd_slot_live == 57) {
+            (true, true, true) => fold8_block_whole_tail_c(scratch, block, b_out, f_out),
+            (true, true, false) => fold8_block_whole_c(scratch, block, b_out, f_out),
+            (true, false, _) => fold8_block_incumbent_c(scratch, block, b_out, f_out),
+            (false, true, true) => fold8_block_whole_tail(scratch, block, b_out, f_out),
+            (false, true, false) => fold8_block_whole(scratch, block, b_out, f_out),
+            (false, false, _) => fold8_block_incumbent(scratch, block, b_out, f_out),
         }
     };
     // The same block body when `f_out` already holds the GPU's witness fold
@@ -7662,15 +7687,23 @@ fn materialize_direct_fold8(
         debug_assert!(!has_ordinary);
         let (first_claim, rest_claims) = claims.split_first().unwrap();
         let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-        super::ring_switch::compose_fold_byte_table_into(
-            first_claim.eq_hi[block],
-            first_table,
-            scratch,
-        );
-        for (slot, out) in b_out.iter_mut().enumerate() {
-            *out = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+        macro_rules! b_only {
+            ($compact:literal) => {{
+                direct_compose::<$compact>(first_claim.eq_hi[block], first_table, scratch);
+                for (slot, out) in b_out.iter_mut().enumerate() {
+                    *out = direct_slot::<$compact>(first_claim.eq_lo[slot], scratch);
+                }
+                direct_fold8_rest_claims_round0::<$compact>(
+                    rest_claims,
+                    rest_tables,
+                    block,
+                    scratch,
+                    b_out,
+                    f_out,
+                )
+            }};
         }
-        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
+        if compact { b_only!(true) } else { b_only!(false) }
     };
 
     let mut folded_f = crate::scratch::take_f128(out_len);
@@ -8814,12 +8847,96 @@ fn query_set_presized_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_QUERY_SET_PRESIZE").is_none())
 }
 
+/// Kill switch for the probe set of query sampling: `FLOCK_NO_QUERY_PROBE_SET`
+/// (any value) restores the SipHash `HashSet`. Read once per process.
+fn query_probe_set_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_QUERY_PROBE_SET").is_none())
+}
+
+/// Fixed 1024-slot open-addressing membership set for query dedupe (port of
+/// the x86 track's `Gl2QSet`, e-man07 fd1b67de item 6). Thread-local and
+/// reused: one 4 KiB array, cleared after each use, no SipHash and no
+/// allocation. Only answers membership, so the kept positions and their
+/// first-occurrence order are exactly the `HashSet` path's.
+struct QueryProbeSet {
+    slots: [u32; 1024],
+}
+
+impl QueryProbeSet {
+    const EMPTY: u32 = u32::MAX;
+
+    /// Insert `q`; true when it was not present. Needs `q < u32::MAX` and at
+    /// most 256 members (load factor <= 1/4).
+    #[inline]
+    fn insert(&mut self, q: usize) -> bool {
+        let key = q as u32;
+        let mut i = (key.wrapping_mul(0x9E37_79B1) >> 22) as usize;
+        loop {
+            let s = self.slots[i];
+            if s == key {
+                return false;
+            }
+            if s == Self::EMPTY {
+                self.slots[i] = key;
+                return true;
+            }
+            i = (i + 1) & 1023;
+        }
+    }
+
+    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        thread_local! {
+            static SET: std::cell::RefCell<Box<QueryProbeSet>> =
+                std::cell::RefCell::new(Box::new(QueryProbeSet { slots: [QueryProbeSet::EMPTY; 1024] }));
+        }
+        SET.with(|c| {
+            let mut set = c.borrow_mut();
+            let r = f(&mut set);
+            set.slots.fill(Self::EMPTY);
+            r
+        })
+    }
+}
+
 fn sample_distinct_queries<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
     count: usize,
 ) -> Vec<usize> {
+    if query_probe_set_enabled() {
+        return sample_distinct_queries_probe(challenger, block_len, count);
+    }
     sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled())
+}
+
+/// [`sample_distinct_queries_with`] with the probe set for the ranked shapes
+/// (`count <= 256`, `block_len < 2^32`); other shapes take the `HashSet`.
+/// Same draws, same first-occurrence dedupe, same sort.
+fn sample_distinct_queries_probe<Ch: Challenger>(
+    challenger: &mut Ch,
+    block_len: usize,
+    count: usize,
+) -> Vec<usize> {
+    if count > 256 || block_len >= u32::MAX as usize {
+        return sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled());
+    }
+    assert!(
+        count <= block_len,
+        "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
+    );
+    let mut out = Vec::with_capacity(count);
+    QueryProbeSet::with(|seen| {
+        while out.len() < count {
+            let v = challenger.sample_f128();
+            let q = (v.lo as usize) % block_len;
+            if seen.insert(q) {
+                out.push(q);
+            }
+        }
+    });
+    out.sort_unstable();
+    out
 }
 
 fn sample_distinct_queries_with<Ch: Challenger>(
@@ -9775,6 +9892,13 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let mut recursive_proofs: Vec<RecursiveProof> = Vec::new();
 
     for i in 0..r {
+        if i + 2 == r || r == 1 {
+            // Publish-path warm-up (x86 fd1b67de item 20): fire the
+            // publisher's hook on an idle helper during the last two (small)
+            // levels so it is done well before the publication rename.
+            // Proof-neutral; no-op unless the ranked publisher installed it.
+            crate::spawn_publish_warm_hook();
+        }
         let k_i = config.recursive_ks[i];
         let mut level_rs = Vec::with_capacity(k_i);
         let _t = std::time::Instant::now();
@@ -15748,6 +15872,30 @@ mod tests {
             let presized = sample_distinct_queries_with(&mut c1, block_len, count, true);
             assert_eq!(presized, grown, "log_len={log_len} count={count}");
             assert_eq!(presized.len(), count);
+        }
+    }
+
+    #[test]
+    fn probe_query_set_samples_the_same_queries() {
+        use crate::challenger::Challenger;
+        // Ranked shapes plus dense small domains (many duplicate draws), the
+        // 256 boundary and the HashSet fallback above it; each set is used
+        // twice in a row on the same thread to check the clear-after-use.
+        for &(log_len, count) in &[
+            (20usize, 218usize), (17, 106), (15, 71), (12, 53), (8, 43), (6, 36), (4, 16),
+            (8, 256), (8, 255), (9, 256), (10, 257), (2, 4), (0, 1), (12, 0),
+        ] {
+            for rep in 0..2u64 {
+                let seed = 0x9B0E_0000 ^ (log_len * 1000 + count) as u64 ^ (rep << 40);
+                let mut c0 = crate::challenger::RandomChallenger::new(seed);
+                let mut c1 = crate::challenger::RandomChallenger::new(seed);
+                let block_len = 1usize << log_len;
+                let reference = sample_distinct_queries_with(&mut c0, block_len, count, true);
+                let probe = sample_distinct_queries_probe(&mut c1, block_len, count);
+                assert_eq!(probe, reference, "log_len={log_len} count={count} rep={rep}");
+                // Both consumed the same number of challenger draws.
+                assert_eq!(c0.sample_f128(), c1.sample_f128());
+            }
         }
     }
 
