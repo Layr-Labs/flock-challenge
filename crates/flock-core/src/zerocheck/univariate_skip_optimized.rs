@@ -1462,6 +1462,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     out_outer,
                     a_col,
                     b_col,
+                    None,
                 );
             },
         );
@@ -1598,9 +1599,11 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     [F8::ZERO; ELL],
                     [F8::ZERO; ELL],
                     AbUnitScratch::new(unit_bytes),
+                    ab_window_rows_worker_plan(),
                 )
             },
-            |(a_col, b_col, scratch), job| {
+            |(a_col, b_col, scratch, window_plan), job| {
+                let window_plan = *window_plan;
                 let unit_start = job * units_per_job;
                 let unit_end = (unit_start + units_per_job).min(n_units);
                 for unit in unit_start..unit_end {
@@ -1631,6 +1634,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                             out_outer,
                             a_col,
                             b_col,
+                            window_plan,
                         );
                     }
                 }
@@ -1645,9 +1649,10 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         || {
             #[cfg(target_arch = "aarch64")]
             kernels::aarch64::ab_kara_note_worker();
-            ([F8::ZERO; ELL], [F8::ZERO; ELL])
+            ([F8::ZERO; ELL], [F8::ZERO; ELL], ab_window_rows_worker_plan())
         },
-        |(a_col, b_col), job| {
+        |(a_col, b_col, window_plan), job| {
+            let window_plan = *window_plan;
             let chunk_start = job * chunks_per_job;
             let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
             let slab_len = chunk_end - chunk_start;
@@ -1699,6 +1704,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     out_outer,
                     a_col,
                     b_col,
+                    window_plan,
                 );
             }
         },
@@ -1792,6 +1798,79 @@ impl AbUnitScratch {
     }
 }
 
+/// Kill switch for the per-worker window-rows plan: any value of
+/// `FLOCK_NO_ZC_AB_WINDOW_PLAN` makes every chunk pick its static-B window
+/// rows through the switch chain in `precompute_ab_one_chunk` again. Read
+/// once per process. The same instance runs either way.
+pub const ENV_NO_ZC_AB_WINDOW_PLAN: &str = "FLOCK_NO_ZC_AB_WINDOW_PLAN";
+
+#[cfg(target_arch = "aarch64")]
+fn ab_window_plan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_WINDOW_PLAN).is_none())
+}
+
+/// One instance of the static-B window rows; every instance takes these
+/// arguments.
+type AbWindowRows =
+    fn(usize, &[u8], &[u8], &InvNttTableByteSingleGf8, usize, &'static [[u8; 64]; 248], &mut [u8], bool);
+
+/// The window-rows instance the switch chain in [`precompute_ab_one_chunk`]
+/// calls on this thread: the same checks in the same order. Every input is
+/// a per-process switch except the per-thread plain flag of
+/// `ab_kara_enabled`, which `ab_kara_note_worker` sets before a worker's
+/// first job, so a worker resolves this right after that call. The chain's
+/// `bstatic_horner_window_rows_hoisted::<V>` and
+/// `bstatic_horner_window_rows::<V>` call `rows::<V, true>` and
+/// `rows::<V, false>`.
+#[cfg(target_arch = "aarch64")]
+fn ab_window_rows_plan() -> AbWindowRows {
+    use kernels::aarch64 as k;
+    use kernels::aarch64::bstatic_horner_window_rows_impl as rows;
+    if k::ab_kara_enabled()
+        && k::ab_kara_unscaled_enabled()
+        && k::ab_z_enabled()
+        && k::ab_kara_xor16_enabled()
+        && k::ab_bstatic_z_enabled()
+        && k::ab_row_setup_hoist_enabled()
+    {
+        const V0: u16 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
+        use k::{ABV_HORNER2, ABV_KARA_SLOT, ABV_Z_M1, ABV_Z_MT};
+        let m1 = k::ab_z_m1_enabled();
+        match (k::ab_kara_slot_enabled(), k::ab_z_mt_enabled(), k::ab_horner2_enabled()) {
+            (true, false, true) if m1 => rows::<{ V0 | ABV_KARA_SLOT | ABV_HORNER2 | ABV_Z_M1 }, true>,
+            (true, true, true) => rows::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT | ABV_HORNER2 }, true>,
+            (false, true, true) => rows::<{ V0 | ABV_Z_MT | ABV_HORNER2 }, true>,
+            (true, false, true) => rows::<{ V0 | ABV_KARA_SLOT | ABV_HORNER2 }, true>,
+            (true, true, false) => rows::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT }, true>,
+            _ => rows::<V0, true>,
+        }
+    } else if k::ab_kara_enabled() && k::ab_kara_unscaled_enabled() && k::ab_z_enabled() {
+        rows::<{ k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW }, false>
+    } else if k::ab_kara_enabled() && k::ab_kara_unscaled_enabled() {
+        rows::<{ k::AB_ROWS_VARIANT | k::ABV_KARA_UNSCALED }, false>
+    } else if k::ab_kara_enabled() {
+        rows::<{ k::AB_ROWS_VARIANT }, false>
+    } else if k::ab_hz_helper_enabled() && k::ab_horner2_enabled() {
+        rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>
+    } else if k::ab_hz_helper_enabled() {
+        rows::<{ k::AB_HZ_VARIANT }, false>
+    } else {
+        rows::<0, false>
+    }
+}
+
+/// A worker's `window_plan` for [`precompute_ab_one_chunk`], resolved on the
+/// worker thread after `ab_kara_note_worker`; `None` (the per-chunk chain)
+/// with [`ENV_NO_ZC_AB_WINDOW_PLAN`] set.
+fn ab_window_rows_worker_plan() -> Option<AbWindowRows> {
+    #[cfg(target_arch = "aarch64")]
+    if ab_window_plan_enabled() {
+        return Some(ab_window_rows_plan());
+    }
+    None
+}
+
 /// One `x_outer`'s worth of the challenge-independent AB transform — the
 /// exact loop body both precompute drains share, factored out so the QS5
 /// hetero queue and the incumbent `par_chunks_mut` cannot diverge.
@@ -1813,6 +1892,9 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     out_outer: &mut [u8],
     a_col: &mut [F8; ELL],
     b_col: &mut [F8; ELL],
+    // The worker's window-rows instance (see `ab_window_rows_worker_plan`);
+    // `None` picks it per chunk through the switch chain below.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] window_plan: Option<AbWindowRows>,
 ) {
     // `chunk_byte_base` is where this chunk's 1 KiB of rows starts inside
     // `a_packed` / `b_packed`: `x_outer * OUTER_BYTES` for the complete
@@ -1867,7 +1949,20 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         // z form of static B words and one bounds check per window; any of
         // `FLOCK_NO_ZC_AB_KARA_XOR16`, `FLOCK_NO_ZC_AB_BSTATIC_Z` or
         // `FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` (any value) takes the arms below.
-        if kernels::aarch64::ab_kara_enabled()
+        if let Some(rows) = window_plan {
+            // The instance the chain below calls on this thread, picked once
+            // per worker (`FLOCK_NO_ZC_AB_WINDOW_PLAN` picks it per chunk).
+            rows(
+                within_hash_outer,
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                partials,
+                out_outer,
+                direct,
+            );
+        } else if kernels::aarch64::ab_kara_enabled()
             && kernels::aarch64::ab_kara_unscaled_enabled()
             && kernels::aarch64::ab_z_enabled()
             && kernels::aarch64::ab_kara_xor16_enabled()
@@ -1899,12 +1994,17 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             }
             // One kill switch drops its piece and keeps the other two; two or
             // more fall back to the incumbent form.
-            use kernels::aarch64::{ABV_HORNER2, ABV_KARA_SLOT, ABV_Z_MT};
+            use kernels::aarch64::{ABV_HORNER2, ABV_KARA_SLOT, ABV_Z_M1, ABV_Z_MT};
+            // `ABV_Z_M1` (`FLOCK_NO_ZC_AB_Z_M1` kills): the z apply's index
+            // words in five integer instructions instead of seven. Same
+            // lookups, same bytes.
+            let m1 = kernels::aarch64::ab_z_m1_enabled();
             match (
                 kernels::aarch64::ab_kara_slot_enabled(),
                 kernels::aarch64::ab_z_mt_enabled(),
                 kernels::aarch64::ab_horner2_enabled(),
             ) {
+                (true, false, true) if m1 => rows!(V0 | ABV_KARA_SLOT | ABV_HORNER2 | ABV_Z_M1),
                 (true, true, true) => rows!(V0 | ABV_KARA_SLOT | ABV_Z_MT | ABV_HORNER2),
                 (false, true, true) => rows!(V0 | ABV_Z_MT | ABV_HORNER2),
                 (true, false, true) => rows!(V0 | ABV_KARA_SLOT | ABV_HORNER2),
@@ -1996,32 +2096,53 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 .try_into()
                 .expect("one transformed b_med block")
         };
-        shift_reduce_inner_ab::<FAST_POLICY>(
-            a_packed,
-            b_packed,
-            inv_table,
-            chunk_byte_base,
-            b_med,
-            dst,
-            a_col,
-            b_col,
-            !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
-            !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
-            if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
-                0x03
-            } else if blake3_static_layout && within_hash_outer == 1 && b_med + 2 == n_b_med {
-                0xf0
-            } else {
-                0
-            },
-            if blake3_static_layout {
-                within_hash_outer
-            } else {
-                usize::MAX
-            },
-            static_b_context,
-            direct,
-        );
+        let const_one_mask = if blake3_static_layout && within_hash_outer == 0 && b_med == 2 {
+            0x03
+        } else if blake3_static_layout && within_hash_outer == 1 && b_med + 2 == n_b_med {
+            0xf0
+        } else {
+            0
+        };
+        // The two mixed const-one rows call the kernel the dispatcher picks
+        // for them directly when its guards hold (same kernel, same inputs);
+        // any other case, or `FLOCK_NO_ZC_AB_MIXED_ROW_DIRECT`, runs the
+        // dispatcher.
+        #[cfg(target_arch = "aarch64")]
+        let done = const_one_mask != 0
+            && kernels::aarch64::ab_mixed_row_direct(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                const_one_mask == 0x03,
+                dst,
+                direct,
+            );
+        #[cfg(not(target_arch = "aarch64"))]
+        let done = false;
+        if !done {
+            shift_reduce_inner_ab::<FAST_POLICY>(
+                a_packed,
+                b_packed,
+                inv_table,
+                chunk_byte_base,
+                b_med,
+                dst,
+                a_col,
+                b_col,
+                !blake3_static_layout || (within_hash_outer == 0 && b_med < 2),
+                !blake3_static_layout || (within_hash_outer == 1 && b_med + 1 == n_b_med),
+                const_one_mask,
+                if blake3_static_layout {
+                    within_hash_outer
+                } else {
+                    usize::MAX
+                },
+                static_b_context,
+                direct,
+            );
+        }
         if nt && !direct {
             // SAFETY: `b_med < n_b_med ≤ OUTER_BYTES / 64`, so the
             // 64 destination bytes are in-bounds of `out_outer`.
@@ -5538,6 +5659,7 @@ mod tests {
             &mut cached,
             &mut cached_a_col,
             &mut cached_b_col,
+            None,
         );
 
         let mut direct = [0u8; OUTER_BYTES];
@@ -5559,9 +5681,198 @@ mod tests {
             &mut direct,
             &mut direct_a_col,
             &mut direct_b_col,
+            None,
         );
 
         assert_eq!(direct, cached);
+    }
+
+    /// Serializes the tests that set the process-wide Karatsuba state with
+    /// `ab_kara_force`.
+    #[cfg(target_arch = "aarch64")]
+    static AB_KARA_FORCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_arch = "aarch64")]
+    thread_local! {
+        /// `(w, chunk_byte_base, nt_store)` of each `counted_window_rows`
+        /// call on this thread.
+        static WINDOW_ROWS_CALLS: core::cell::RefCell<Vec<(usize, usize, bool)>> =
+            const { core::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A window-rows plan that records its call, then runs the instance
+    /// `ab_window_rows_plan` resolves on this thread.
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    fn counted_window_rows(
+        w: usize,
+        a_packed: &[u8],
+        b_packed: &[u8],
+        inv_table: &InvNttTableByteSingleGf8,
+        chunk_byte_base: usize,
+        partials: &'static [[u8; 64]; 248],
+        out_outer: &mut [u8],
+        nt_store: bool,
+    ) {
+        WINDOW_ROWS_CALLS.with(|calls| calls.borrow_mut().push((w, chunk_byte_base, nt_store)));
+        ab_window_rows_plan()(w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store);
+    }
+
+    /// The per-worker window-rows plan (`FLOCK_NO_ZC_AB_WINDOW_PLAN`). With
+    /// the default switches the resolver returns the instance the per-chunk
+    /// chain calls: the hoisted z form with the slot and Horner pieces on a
+    /// thread with the Karatsuba apply, the half-pair form with the Horner
+    /// piece on a `flock-ecore-*` worker and with the Karatsuba apply off.
+    /// Whole chunks through `precompute_ab_one_chunk` with a plan write the
+    /// bytes of the chain at the ranked layout for both windows, every
+    /// representation, three drain instantiations and both Karatsuba states,
+    /// with B rows that satisfy the BLAKE3 static masks and B rows that do
+    /// not; the plan runs once per chunk with a static run and never without
+    /// the static layout.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_window_rows_plan_matches_chain() {
+        use kernels::aarch64::{self as k, bstatic_horner_window_rows_impl as rows};
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        let _serial = AB_KARA_FORCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        const V0: u16 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
+        let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 }, true>;
+        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>;
+        assert!(!core::ptr::fn_addr_eq(main, plain));
+        let switches = [
+            "FLOCK_NO_ZC_AB_KARA",
+            "FLOCK_NO_ZC_AB_KARA_UNSCALED",
+            "FLOCK_NO_ZC_AB_Z",
+            "FLOCK_NO_ZC_AB_KARA_XOR16",
+            "FLOCK_NO_ZC_AB_BSTATIC_Z",
+            "FLOCK_NO_ZC_AB_ROW_SETUP_HOIST",
+            "FLOCK_NO_ZC_AB_KARA_SLOT",
+            "FLOCK_ZC_AB_Z_MT",
+            "FLOCK_NO_ZC_AB_HORNER2",
+            "FLOCK_NO_ZC_AB_HZ",
+            "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN",
+        ];
+        // The chain's picks with every one of its switches unset.
+        let default_switches = switches.iter().all(|s| std::env::var_os(s).is_none());
+        if default_switches {
+            k::ab_kara_force(true);
+            k::ab_kara_note_worker();
+            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(), main));
+            let helper = std::thread::Builder::new()
+                .name("flock-ecore-x".into())
+                .spawn(|| {
+                    k::ab_kara_note_worker();
+                    ab_window_rows_plan()
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            assert!(core::ptr::fn_addr_eq(helper, plain));
+            k::ab_kara_force(false);
+            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(), plain));
+            k::ab_kara_force(true);
+        }
+        let worker_plan = ab_window_rows_worker_plan();
+        assert_eq!(worker_plan.is_some(), std::env::var_os(ENV_NO_ZC_AB_WINDOW_PLAN).is_none());
+        if let Some(plan) = worker_plan {
+            assert!(core::ptr::fn_addr_eq(plan, ab_window_rows_plan()));
+        }
+
+        let table = make_inv_table();
+        let padding = PaddingSpec {
+            k_log: 14,
+            useful_bits_per_block: 15_409,
+        };
+        let (within_outer_mask, b_med_counts) = build_b_med_counts(&padding);
+        let static_b_context = kernels::prepare_static_b_context(&table, true);
+        let process_direct = ab_pre_nt_direct_enabled();
+        let process_fast = k::fast_shift_reduce_enabled();
+        let mut rng = Rng::new(0xAB5A_71C0_F457_0007);
+        let mut a_col = [F8::ZERO; ELL];
+        let mut b_col = [F8::ZERO; ELL];
+        let (mut checked, mut planned) = (0usize, 0usize);
+        for case in 0..12usize {
+            // One compression: two windows of 1 KiB.
+            let mut a: Vec<u8> = (0..2 * OUTER_BYTES).map(|_| (rng.next_u64() >> 13 & 0xff) as u8).collect();
+            let mut b: Vec<u8> = (0..2 * OUTER_BYTES).map(|_| (rng.next_u64() >> 7 & 0xff) as u8).collect();
+            if case % 3 != 2 {
+                for row in 0..31usize {
+                    for kk in 0..N_CHUNKS {
+                        let off = row * 64 + kk * N_CHUNKS;
+                        let (mask, expected) = k::BSTATIC_MASKS[row][kk];
+                        let word = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                        b[off..off + 8].copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                    }
+                }
+                b[31 * 64..].fill(0);
+            }
+            if case % 3 == 0 {
+                for kk in 0..2 {
+                    a[2 * 64 + kk * 8 + 5..2 * 64 + kk * 8 + 8].fill(0);
+                }
+            }
+            if case % 6 == 1 {
+                a.fill(0);
+            }
+            for kara in [true, false] {
+                k::ab_kara_force(kara);
+                for representation in [
+                    Round1AbRepresentation::Complete,
+                    Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false },
+                    Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true },
+                ] {
+                    for window in 0..2usize {
+                        for flavor in 0..3usize {
+                            for static_layout in [true, false] {
+                                let context = if static_layout { static_b_context } else { None };
+                                let mut outs: Vec<Vec<u8>> = Vec::new();
+                                for plan in [None, Some(counted_window_rows as AbWindowRows)] {
+                                    let mut out = vec![0x3cu8; OUTER_BYTES];
+                                    macro_rules! go {
+                                        ($policy:expr, $direct:literal, $nt:expr) => {
+                                            precompute_ab_one_chunk::<{ $policy }, $direct>(
+                                                &a, &b, &table, within_outer_mask, &b_med_counts, static_layout,
+                                                context, $nt, false, representation, window,
+                                                window * OUTER_BYTES, &mut out, &mut a_col, &mut b_col, plan,
+                                            )
+                                        };
+                                    }
+                                    match flavor {
+                                        0 => go!(kernels::AB_FAST_POLICY_FORCE_FAST, true, true),
+                                        1 => go!(kernels::AB_FAST_POLICY_FORCE_FAST, false, false),
+                                        _ => go!(kernels::AB_FAST_POLICY_PROCESS, false, true),
+                                    }
+                                    outs.push(out);
+                                }
+                                let (runs, nt_store) = match flavor {
+                                    0 => (true, true),
+                                    1 => (true, false),
+                                    _ => (process_fast && process_direct, process_direct),
+                                };
+                                let want = if static_layout && runs {
+                                    vec![(window, window * OUTER_BYTES, nt_store)]
+                                } else {
+                                    Vec::new()
+                                };
+                                let calls = WINDOW_ROWS_CALLS.take();
+                                let at = format!(
+                                    "case={case}, kara={kara}, window={window}, flavor={flavor}, \
+                                     static_layout={static_layout}, {representation:?}"
+                                );
+                                assert_eq!(calls, want, "plan calls ({at})");
+                                assert_eq!(outs[0], outs[1], "chunk differs ({at})");
+                                planned += calls.len();
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        k::ab_kara_force(true);
+        assert_eq!(checked, 12 * 2 * 3 * 2 * 3 * 2);
+        assert!(planned >= 12 * 2 * 3 * 2 * 2);
     }
 
     #[test]
@@ -7179,11 +7490,12 @@ mod tests {
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW | ABV_INLINE_WINDOW);
                         check!(kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z | kernels::aarch64::ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 | kernels::aarch64::ABV_Z_M1);
                     }
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 27);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 28);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
@@ -7195,6 +7507,7 @@ mod tests {
     #[test]
     fn ab_kara_chunk_matches_plain() {
         const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+        let _serial = AB_KARA_FORCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let table = make_inv_table();
         let padding = PaddingSpec {
             k_log: 14,
@@ -7246,7 +7559,7 @@ mod tests {
                                     precompute_ab_one_chunk::<{ $policy }, $direct>(
                                         &a, &b, &table, within_outer_mask, &b_med_counts, true,
                                         static_b_context, $nt, false, representation, window,
-                                        window * OUTER_BYTES, &mut out, &mut a_col, &mut b_col,
+                                        window * OUTER_BYTES, &mut out, &mut a_col, &mut b_col, None,
                                     )
                                 };
                             }
@@ -7415,6 +7728,8 @@ mod tests {
             ("+ KARA_SLOT + Z_MT", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT }, true>),
             ("+ HORNER2", imp::<{ V0 | kernels::aarch64::ABV_HORNER2 }, true>),
             ("+ KARA_SLOT + Z_MT + HORNER2", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT | kernels::aarch64::ABV_HORNER2 }, true>),
+            ("+ KARA_SLOT + HORNER2 (record)", imp::<{ V0 | ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 }, true>),
+            ("+ KARA_SLOT + HORNER2 + Z_M1", imp::<{ V0 | ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 | kernels::aarch64::ABV_Z_M1 }, true>),
             ("E-core HZ", imp::<{ kernels::aarch64::AB_HZ_VARIANT }, false>),
             ("E-core HZ + HORNER2", imp::<{ kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2 }, false>),
         ];
@@ -7608,6 +7923,152 @@ mod tests {
                 "A_LOW5_K=0x03 h4 arm (trial {trial}) must be bit-identical"
             );
         }
+    }
+
+    /// The two mixed const-one rows through the direct call
+    /// (`FLOCK_NO_ZC_AB_MIXED_ROW_DIRECT`) against the per-row dispatcher with
+    /// the precompute loop's flags: rows of the ranked shape (every guard
+    /// holds), rows that fail one guard word, zero A and all-ones B, both
+    /// windows, four chunk bases, both store flavours and both fast policies.
+    /// A guard miss must write nothing. (Whole chunks with the direct call
+    /// against the dispatcher: `ab_kara_chunk_matches_plain`.)
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_mixed_row_direct_matches_dispatcher() {
+        const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+
+        /// The parent's per-row call with the loop's flags.
+        #[allow(clippy::too_many_arguments)]
+        fn dispatch(
+            a: &[u8],
+            b: &[u8],
+            table: &InvNttTableByteSingleGf8,
+            context: Option<kernels::StaticBContext>,
+            base: usize,
+            window: usize,
+            b_med: usize,
+            n_b_med: usize,
+            process: bool,
+            nt: bool,
+        ) -> [u8; 64] {
+            let mut a_col = [F8::ZERO; ELL];
+            let mut b_col = [F8::ZERO; ELL];
+            let mut out = [0x5au8; 64];
+            let mask = if window == 0 && b_med == 2 {
+                0x03
+            } else if window == 1 && b_med + 2 == n_b_med {
+                0xf0
+            } else {
+                0
+            };
+            macro_rules! go {
+                ($policy:expr) => {
+                    shift_reduce_inner_ab::<{ $policy }>(
+                        a,
+                        b,
+                        table,
+                        base,
+                        b_med,
+                        &mut out,
+                        &mut a_col,
+                        &mut b_col,
+                        window == 0 && b_med < 2,
+                        window == 1 && b_med + 1 == n_b_med,
+                        mask,
+                        window,
+                        context,
+                        nt,
+                    )
+                };
+            }
+            if process {
+                go!(kernels::AB_FAST_POLICY_PROCESS);
+            } else {
+                go!(kernels::AB_FAST_POLICY_FORCE_FAST);
+            }
+            out
+        }
+
+        let table = make_inv_table();
+        let context = kernels::prepare_static_b_context(&table, true);
+        let mut rng = Rng::new(0xAB31_D0EC_7303_F0F0);
+        let word = |v: &[u8], at: usize| u64::from_le_bytes(v[at..at + 8].try_into().unwrap());
+
+        let mut hits = [0usize; 2];
+        let mut misses = [0usize; 2];
+        for trial in 0..256usize {
+            let mut a: Vec<u8> = (0..3 * OUTER_BYTES).map(|_| rng.next_u64() as u8).collect();
+            let mut b: Vec<u8> = (0..3 * OUTER_BYTES).map(|_| rng.next_u64() as u8).collect();
+            match trial % 16 {
+                4 | 13 => a.fill(0),
+                8 | 11 => b.fill(0xff),
+                _ => {}
+            }
+            // 0: every guard holds; 1: one B guard word misses one bit;
+            // 2: one bit of the top three bytes of A K0 or K1 is set (window 0
+            // misses, window 1 has no A guard); 3: the drawn row.
+            let shape = trial % 4;
+            for w0 in [true, false] {
+                let (window, b_med, n_b_med) = if w0 { (0, 2, 16) } else { (1, 13, 15) };
+                let ones: &[usize] = if w0 { &[0, 1] } else { &[4, 5, 6, 7] };
+                for base in [0, 64, OUTER_BYTES, 2 * OUTER_BYTES] {
+                    let row = base + b_med * 64;
+                    if shape != 3 {
+                        for &k in ones {
+                            b[row + 8 * k..row + 8 * k + 8].fill(0xff);
+                        }
+                        for k in 0..2 {
+                            a[row + 8 * k + 5..row + 8 * k + 8].fill(0);
+                        }
+                    }
+                    if shape == 1 {
+                        let k = ones[rng.next_u64() as usize % ones.len()];
+                        let bit = rng.next_u64() as usize % 64;
+                        b[row + 8 * k + bit / 8] ^= 1 << (bit % 8);
+                    }
+                    if shape == 2 {
+                        let k = rng.next_u64() as usize % 2;
+                        let bit = 40 + rng.next_u64() as usize % 24;
+                        a[row + 8 * k + bit / 8] ^= 1 << (bit % 8);
+                    }
+                    let pass = if w0 {
+                        word(&b, row) & word(&b, row + 8) == u64::MAX
+                            && (word(&a, row) | word(&a, row + 8)) >> 40 == 0
+                    } else {
+                        (4..8).all(|k| word(&b, row + 8 * k) == u64::MAX)
+                    };
+                    match shape {
+                        0 => assert!(pass),
+                        1 => assert!(!pass),
+                        2 => assert_eq!(pass, !w0),
+                        _ => {}
+                    }
+                    for nt in [false, true] {
+                        let want = dispatch(&a, &b, &table, context, base, window, b_med, n_b_med, trial % 2 == 0, nt);
+                        let what = format!("trial={trial} w0={w0} base={base} nt={nt}");
+                        let mut got = [0xa5u8; 64];
+                        let done =
+                            kernels::aarch64::ab_mixed_row_guarded(&a, &b, &table, base, b_med, w0, &mut got, nt);
+                        assert_eq!(done, pass, "guards: {what}");
+                        assert_eq!(got, if done { want } else { [0xa5; 64] }, "row: {what}");
+                        let mut routed = [0xc3u8; 64];
+                        if kernels::aarch64::ab_mixed_row_direct(&a, &b, &table, base, b_med, w0, &mut routed, nt) {
+                            assert!(pass, "routed guards: {what}");
+                            assert_eq!(routed, want, "routed row: {what}");
+                        } else {
+                            assert_eq!(routed, [0xc3; 64], "routed miss writes nothing: {what}");
+                        }
+                        let i = usize::from(!w0);
+                        if done {
+                            hits[i] += 1;
+                        } else {
+                            misses[i] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(hits.iter().chain(&misses).all(|&n| n > 0), "hits={hits:?} misses={misses:?}");
     }
 
     /// The blk-30 static-B single-K0 fast path (precomputed partial instead

@@ -153,6 +153,12 @@ fn is_ranked_worker_process() -> bool {
 fn ranked_start_pause() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        // Ranked worker only: start the Metal pipeline compiles now, so they
+        // run during this pause instead of on the warm-up's critical path
+        // (`FLOCK_NO_GPU_EARLY_INIT=1` kills; see `spawn_early_gpu_init`).
+        if is_ranked_worker_process() {
+            let _ = gpu_commit::spawn_early_gpu_init();
+        }
         let kill = std::env::var_os(ENV_NO_READY_PAUSE);
         if let Some(pause) = ranked_start_pause_for(is_ranked_worker_process(), kill.as_deref()) {
             std::thread::sleep(pause);
