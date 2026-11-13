@@ -8903,6 +8903,8 @@ fn sample_distinct_queries_probe<Ch: Challenger>(
         }
     });
     out.sort_unstable();
+    debug_assert!(out.windows(2).all(|w| w[0] < w[1]) && out.last().map_or(true, |&q| q < block_len),
+        "sampled queries must be strictly increasing and in-domain");
     out
 }
 
@@ -8932,6 +8934,8 @@ fn sample_distinct_queries_with<Ch: Challenger>(
         }
     }
     out.sort_unstable();
+    debug_assert!(out.windows(2).all(|w| w[0] < w[1]) && out.last().map_or(true, |&q| q < block_len),
+        "sampled queries must be strictly increasing and in-domain");
     out
 }
 
