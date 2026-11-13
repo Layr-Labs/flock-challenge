@@ -1899,12 +1899,17 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             }
             // One kill switch drops its piece and keeps the other two; two or
             // more fall back to the incumbent form.
-            use kernels::aarch64::{ABV_HORNER2, ABV_KARA_SLOT, ABV_Z_MT};
+            use kernels::aarch64::{ABV_HORNER2, ABV_KARA_SLOT, ABV_Z_M1, ABV_Z_MT};
+            // `ABV_Z_M1` (`FLOCK_NO_ZC_AB_Z_M1` kills): the z apply's index
+            // words in five integer instructions instead of seven. Same
+            // lookups, same bytes.
+            let m1 = kernels::aarch64::ab_z_m1_enabled();
             match (
                 kernels::aarch64::ab_kara_slot_enabled(),
                 kernels::aarch64::ab_z_mt_enabled(),
                 kernels::aarch64::ab_horner2_enabled(),
             ) {
+                (true, false, true) if m1 => rows!(V0 | ABV_KARA_SLOT | ABV_HORNER2 | ABV_Z_M1),
                 (true, true, true) => rows!(V0 | ABV_KARA_SLOT | ABV_Z_MT | ABV_HORNER2),
                 (false, true, true) => rows!(V0 | ABV_Z_MT | ABV_HORNER2),
                 (true, false, true) => rows!(V0 | ABV_KARA_SLOT | ABV_HORNER2),
@@ -6964,11 +6969,12 @@ mod tests {
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW);
                         check!(kernels::aarch64::ABV_HZ | kernels::aarch64::ABV_NOSW | ABV_INLINE_WINDOW);
                         check!(kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2);
+                        check!(kernels::aarch64::AB_Z_VARIANT | ABV_INLINE_WINDOW | kernels::aarch64::ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z | kernels::aarch64::ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 | kernels::aarch64::ABV_Z_M1);
                     }
                 }
             }
         }
-        assert_eq!(cases, 96 * 2 * 2 * 2 * 27);
+        assert_eq!(cases, 96 * 2 * 2 * 2 * 28);
     }
 
     /// Whole chunks through `precompute_ab_one_chunk` with the Karatsuba
@@ -7200,6 +7206,8 @@ mod tests {
             ("+ KARA_SLOT + Z_MT", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT }, true>),
             ("+ HORNER2", imp::<{ V0 | kernels::aarch64::ABV_HORNER2 }, true>),
             ("+ KARA_SLOT + Z_MT + HORNER2", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT | kernels::aarch64::ABV_HORNER2 }, true>),
+            ("+ KARA_SLOT + HORNER2 (record)", imp::<{ V0 | ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 }, true>),
+            ("+ KARA_SLOT + HORNER2 + Z_M1", imp::<{ V0 | ABV_KARA_SLOT | kernels::aarch64::ABV_HORNER2 | kernels::aarch64::ABV_Z_M1 }, true>),
             ("E-core HZ", imp::<{ kernels::aarch64::AB_HZ_VARIANT }, false>),
             ("E-core HZ + HORNER2", imp::<{ kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2 }, false>),
         ];

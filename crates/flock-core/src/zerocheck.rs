@@ -794,6 +794,10 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
     }
 
+    // Round one's parallel regions are done: end the commit-tail pool
+    // bridge (`cpu_keepalive::pool_spin_bridge_start`), if it is running.
+    crate::cpu_keepalive::pool_spin_release();
+
     // ---- 4. Observe round-1 message, sample z (URM fold point) ----
     challenger.observe_f128_slice(&round1_ab);
     challenger.observe_f128_slice(&round1_c);
