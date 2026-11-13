@@ -2529,9 +2529,10 @@ fn shift_reduce_inner_mixed_const_b_h4<
         let a_base = a_packed.as_ptr().add(byte_base_b);
         let b_base = b_packed.as_ptr().add(byte_base_b);
 
-        macro_rules! products {
+        // The A image of K word `$k` (each form as described inline).
+        macro_rules! a_img {
             ($at:expr, $at_sw:expr, $kara:expr, $k:literal) => {{
-                let (da0, da1, da2, da3) = if STATIC_A && $k == 1 {
+                if STATIC_A && $k == 1 {
                     let p = a_k1_partial.unwrap_unchecked().as_ptr();
                     (
                         vld1q_u8(p),
@@ -2574,7 +2575,13 @@ fn shift_reduce_inner_mixed_const_b_h4<
                         a_base.add($k * N_CHUNKS).cast::<u64>(),
                     ));
                     apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw)
-                };
+                }
+            }};
+        }
+
+        macro_rules! products {
+            ($at:expr, $at_sw:expr, $kara:expr, $k:literal) => {{
+                let (da0, da1, da2, da3) = a_img!($at, $at_sw, $kara, $k);
                 if ONE_MASK & (1 << $k) != 0 {
                     [
                         widen_lo(da0),
@@ -2603,6 +2610,49 @@ fn shift_reduce_inner_mixed_const_b_h4<
                     ]
                 }
             }};
+        }
+
+        if V & ABV_FUSE != 0 {
+            // [`ABV_FUSE`]: the window rows' fused accumulation. A
+            // const-one K word's B image is the vector of ones bytes, and
+            // the carry-less product of a byte with 1 is that byte widened,
+            // so `pmull(A, 1)` is exactly the widened A image the other arm
+            // forms; every lane then receives the XOR of the same terms.
+            const { assert!(V & ABV_FUSE == 0 || (V & ABV_HORNER2 != 0 && V & ABV_HZ == 0)) };
+            let ones = vdupq_n_u8(1);
+            macro_rules! opnds {
+                ($at:expr, $at_sw:expr, $kara:expr, $k:literal) => {{
+                    let (da0, da1, da2, da3) = a_img!($at, $at_sw, $kara, $k);
+                    let db = if ONE_MASK & (1 << $k) != 0 {
+                        [ones; 4]
+                    } else {
+                        let bw = u64::from_le(core::ptr::read_unaligned(
+                            b_base.add($k * N_CHUNKS).cast::<u64>(),
+                        ));
+                        let (db0, db1, db2, db3) = apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw);
+                        [db0, db1, db2, db3]
+                    };
+                    ([da0, da1, da2, da3], db)
+                }};
+            }
+            let o3 = opnds!(plain, plain_sw, kplain, 3);
+            let o7 = opnds!(scaled, scaled_sw, kscaled, 7);
+            let mut acc = fuse_seed(&o3, &o7);
+            let o2 = opnds!(plain, plain_sw, kplain, 2);
+            let o6 = opnds!(scaled, scaled_sw, kscaled, 6);
+            fuse_absorb_first(&mut acc, &o2, &o6);
+            let o1 = opnds!(plain, plain_sw, kplain, 1);
+            let o5 = opnds!(scaled, scaled_sw, kscaled, 5);
+            fuse_absorb_k1(&mut acc, &o1, &o5);
+            let o0 = opnds!(plain, plain_sw, kplain, 0);
+            let o4 = opnds!(scaled, scaled_sw, kscaled, 4);
+            fuse_absorb_k0(&mut acc, &o0, &o4);
+            let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
+            let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
+            let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
+            let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
+            store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
+            return;
         }
 
         let lo3 = products!(plain, plain_sw, kplain, 3);
@@ -5645,8 +5695,12 @@ pub(crate) fn ab_mixed_row_guarded(
     nt_store: bool,
 ) -> bool {
     const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16;
-    const V2: u32 = AB_MIXED_H2_VARIANT;
-    let h2 = ab_mixed_h2_enabled();
+    // The production mixed rows: the H2 form with the fused products. Either
+    // kill switch (`FLOCK_NO_ZC_AB_MIXED_H2`, `FLOCK_NO_ZC_AB_MIXED_FUSE`)
+    // takes the incumbent form `V0`; the unfused H2 instance is kept for
+    // the tests only, so the binary carries no extra mixed-row instance.
+    const VF: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE;
+    let fuse = ab_mixed_h2_enabled() && ab_mixed_fuse_enabled();
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
     let word = |packed: &[u8], k: usize| -> u64 {
@@ -5660,8 +5714,8 @@ pub(crate) fn ab_mixed_row_guarded(
         {
             return false;
         }
-        if h2 {
-            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V2>(
+        if fuse {
+            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VF>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
         } else {
@@ -5679,8 +5733,8 @@ pub(crate) fn ab_mixed_row_guarded(
         if word(b_packed, 4) & word(b_packed, 5) & word(b_packed, 6) & word(b_packed, 7) != u64::MAX {
             return false;
         }
-        if h2 {
-            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V2>(
+        if fuse {
+            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VF>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
         } else {
@@ -5715,6 +5769,187 @@ pub(crate) const AB_MIXED_H2_VARIANT: u32 =
 pub(crate) fn ab_mixed_h2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_MIXED_H2").is_none())
+}
+
+/// Kill switch for [`ABV_FUSE`] in the two mixed const-one rows: any value
+/// of `FLOCK_NO_ZC_AB_MIXED_FUSE` runs the incumbent `AB_Z_VARIANT |
+/// ABV_KARA_XOR16` rows instead (separate products, widened A images for the
+/// const-one words; the binary keeps no unfused H2 instance). Read once per
+/// process. The rows written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_mixed_fuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_MIXED_FUSE").is_none())
+}
+
+/// Deterministic test words (splitmix64).
+#[cfg(all(test, target_arch = "aarch64"))]
+fn mixed_fuse_words(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+/// The fused mixed rows (`AB_MIXED_H2_VARIANT | ABV_FUSE`) write the
+/// [`AB_MIXED_H2_VARIANT`] rows' and the incumbent rows' bytes: both rows,
+/// both store flavours, random rows with the guard words forced, and zero
+/// and all-ones A and B words (all-ones A makes every widened lane maximal).
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_mixed_fuse_matches_h2_and_incumbent() {
+    use crate::ntt::AdditiveNttGf8;
+    const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16;
+    const VF: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let mut next = mixed_fuse_words(0x6d69_7865_6466_7573);
+    for case in 0..2000usize {
+        let mut a: Vec<u8> = (0..64).map(|_| next() as u8).collect();
+        let mut b: Vec<u8> = (0..64).map(|_| next() as u8).collect();
+        match case % 7 {
+            3 => a.fill(0),
+            4 => a.fill(0xff),
+            5 => b.fill(0),
+            6 => b.fill(0xff),
+            _ => {}
+        }
+        let w0 = case % 2 == 0;
+        if w0 {
+            b[..16].fill(0xff);
+            for k in 0..2 {
+                a[k * 8 + 5..k * 8 + 8].fill(0);
+            }
+        } else {
+            b[32..].fill(0xff);
+        }
+        for nt in [false, true] {
+            let mut inc = [0u8; 64];
+            let mut h2 = [0u8; 64];
+            let mut got = [0u8; 64];
+            if w0 {
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V0>(&a, &b, &table, 0, None, &mut inc, nt);
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, AB_MIXED_H2_VARIANT>(&a, &b, &table, 0, None, &mut h2, nt);
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VF>(&a, &b, &table, 0, None, &mut got, nt);
+            } else {
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V0>(&a, &b, &table, 0, None, &mut inc, nt);
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, AB_MIXED_H2_VARIANT>(&a, &b, &table, 0, None, &mut h2, nt);
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VF>(&a, &b, &table, 0, None, &mut got, nt);
+            }
+            assert_eq!(h2, inc, "h2 case {case} w0={w0} nt={nt}");
+            assert_eq!(got, h2, "fuse case {case} w0={w0} nt={nt}");
+        }
+    }
+}
+
+/// The production route of the mixed rows ([`ab_mixed_row_guarded`], guards
+/// included) against the H2 kernel at the ranked row positions of a chunk
+/// (window 0 `b_med` 2, window 1 `b_med` 13); the guarded call takes every
+/// row (returns `true`).
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_mixed_row_guarded_fuse_route_matches_h2() {
+    use crate::ntt::AdditiveNttGf8;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let mut next = mixed_fuse_words(0x7275_6f75_7465_6d78);
+    const ROW_BYTES: usize = N_CHUNKS * 8;
+    for case in 0..64usize {
+        let mut a: Vec<u8> = (0..16 * ROW_BYTES).map(|_| next() as u8).collect();
+        let mut b: Vec<u8> = (0..16 * ROW_BYTES).map(|_| next() as u8).collect();
+        let w0 = case % 2 == 0;
+        let b_med = if w0 { 2 } else { 13 };
+        let base = b_med * ROW_BYTES;
+        if w0 {
+            b[base..base + 16].fill(0xff);
+            for k in 0..2 {
+                a[base + k * 8 + 5..base + k * 8 + 8].fill(0);
+            }
+        } else {
+            b[base + 32..base + 64].fill(0xff);
+        }
+        for nt in [false, true] {
+            let mut want = [0u8; 64];
+            let mut got = [0u8; 64];
+            if w0 {
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, AB_MIXED_H2_VARIANT>(&a, &b, &table, base, None, &mut want, nt);
+            } else {
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, AB_MIXED_H2_VARIANT>(&a, &b, &table, base, None, &mut want, nt);
+            }
+            assert!(ab_mixed_row_guarded(&a, &b, &table, 0, b_med, w0, &mut got, nt));
+            assert_eq!(got, want, "case {case} w0={w0} nt={nt}");
+        }
+    }
+}
+
+/// Alternated single-thread timing of the two mixed rows, H2 against H2 +
+/// [`ABV_FUSE`] (`PROBE_ROUNDS` rounds; 64 rows resident in L1, as the
+/// producer unit's rows are).
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+#[ignore = "timing probe"]
+fn ab_mixed_fuse_timing() {
+    use crate::ntt::AdditiveNttGf8;
+    const VF: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE;
+    #[cfg(target_os = "macos")]
+    unsafe {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, priority: i32) -> i32;
+        }
+        pthread_set_qos_class_self_np(0x21, 0);
+    }
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let mut next = mixed_fuse_words(0x7469_6d69_6e67_6d78);
+    const ROWS: usize = 64;
+    let mut a: Vec<u8> = (0..ROWS * 64).map(|_| next() as u8).collect();
+    let mut b: Vec<u8> = (0..ROWS * 64).map(|_| next() as u8).collect();
+    for r in 0..ROWS {
+        let base = r * 64;
+        if r % 2 == 0 {
+            b[base..base + 16].fill(0xff);
+            for k in 0..2 {
+                a[base + k * 8 + 5..base + k * 8 + 8].fill(0);
+            }
+        } else {
+            b[base + 32..base + 64].fill(0xff);
+        }
+    }
+    let rounds: usize = std::env::var("PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(21);
+    const ITERS: usize = 4000;
+    let mut out = vec![[0u8; 64]; ROWS];
+    let mut times = [Vec::new(), Vec::new()];
+    for round in 0..rounds + 1 {
+        for k in 0..2usize {
+            let form = (k + round) % 2;
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                for r in (0..ROWS).step_by(2) {
+                    let (o0, o1) = out.split_at_mut(r + 1);
+                    let (o0, o1) = (&mut o0[r], &mut o1[0]);
+                    if form == 0 {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, AB_MIXED_H2_VARIANT>(&a, &b, &table, r * 64, None, o0, true);
+                        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, AB_MIXED_H2_VARIANT>(&a, &b, &table, (r + 1) * 64, None, o1, true);
+                    } else {
+                        shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VF>(&a, &b, &table, r * 64, None, o0, true);
+                        shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VF>(&a, &b, &table, (r + 1) * 64, None, o1, true);
+                    }
+                }
+            }
+            let ns = t0.elapsed().as_nanos() as f64 / (ITERS * ROWS) as f64;
+            if round > 0 {
+                times[form].push(ns);
+            }
+        }
+        std::hint::black_box(&mut out);
+    }
+    for i in 0..rounds {
+        println!("mixed-fuse round={i} h2={:.2} fuse={:.2}", times[0][i], times[1][i]);
+    }
 }
 
 /// The [`AB_MIXED_H2_VARIANT`] mixed rows write the incumbent form's bytes
