@@ -4103,9 +4103,18 @@ pub(crate) mod witgen_simd {
                 let submit_ns: Vec<AtomicU64> = (0..n_bands).map(|_| AtomicU64::new(0)).collect();
                 struct SubmitSeq<'a> {
                     next: usize,
+                    submitted: Vec<bool>,
                     stream: &'a mut flock_core::gpu_commit::FromZFirstPassStream,
                 }
-                let seq = std::sync::Mutex::new(SubmitSeq { next: 0, stream });
+                // Publish each band the moment its last slab lands instead of
+                // strictly in band order. `FLOCK_NO_BAND_ANY_ORDER=1` restores
+                // the in-order sequencer.
+                let any_order = std::env::var_os("FLOCK_NO_BAND_ANY_ORDER").is_none();
+                let seq = std::sync::Mutex::new(SubmitSeq {
+                    next: 0,
+                    submitted: vec![false; n_bands],
+                    stream,
+                });
                 let slab_fn = |s: usize| {
                     let g0 = slab_g0[s] as usize;
                     for g in g0..g0 + SLAB {
@@ -4125,7 +4134,24 @@ pub(crate) mod witgen_simd {
                         // so completion of the drain below is what guarantees
                         // every published band gets submitted.
                         let mut seq = seq.lock().unwrap();
-                        while seq.next < n_bands && done[seq.next].load(Ordering::Acquire) {
+                        if any_order {
+                            // Publish this band now, whatever its position:
+                            // first-pass tiles are independent, so a late
+                            // early band no longer holds back the GPU on
+                            // every band after it.
+                            std::sync::atomic::fence(Ordering::Release);
+                            seq.stream.submit_ready_range_unordered(
+                                band_offset[band] * 16,
+                                schedule[band] * 16,
+                            );
+                            seq.submitted[band] = true;
+                            seq.next += 1;
+                            if timing {
+                                submit_ns[band]
+                                    .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            }
+                        }
+                        while !any_order && seq.next < n_bands && done[seq.next].load(Ordering::Acquire) {
                             let b = seq.next;
                             // Same visibility boundary as the incumbent path:
                             // publish all CPU writes of band b before the
@@ -4149,6 +4175,19 @@ pub(crate) mod witgen_simd {
                 // be submitted safely — every write is already published.
                 let mut seq = seq.into_inner().unwrap();
                 debug_assert_eq!(seq.next, n_bands, "continuous-queue band left unsubmitted");
+                if any_order {
+                    for b in 0..n_bands {
+                        if !seq.submitted[b] {
+                            std::sync::atomic::fence(Ordering::Release);
+                            seq.stream.submit_ready_range_unordered(
+                                band_offset[b] * 16,
+                                schedule[b] * 16,
+                            );
+                            seq.submitted[b] = true;
+                            seq.next += 1;
+                        }
+                    }
+                }
                 while seq.next < n_bands {
                     let b = seq.next;
                     std::sync::atomic::fence(Ordering::Release);
