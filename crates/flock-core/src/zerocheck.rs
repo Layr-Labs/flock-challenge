@@ -2339,6 +2339,35 @@ mod tests {
         }
     }
 
+    /// Lookahead transcript identity at m = 24, where the cascade K pass
+    /// chunks hold 16 out-pairs and take the `lambda * x^(2s)` K kernel:
+    /// full proof and claim equal to the non-lookahead route, and the
+    /// verifier accepts.
+    #[test]
+    fn prove_transcript_identical_with_and_without_lookahead_k_horner_shape() {
+        use std::sync::atomic::Ordering;
+        let m = 24usize;
+        let mut rng = Rng::new(0x48_4F_52 ^ m as u64);
+        let a = rng.bits(1 << m);
+        let b = rng.bits(1 << m);
+        let c: Vec<bool> = a.iter().zip(&b).map(|(x, y)| *x & *y).collect();
+        let (a_p, b_p, c_p) = pack_abc(&a, &b, &c);
+
+        ZC_LOOKAHEAD_FORCED_OFF.store(false, Ordering::Relaxed);
+        let mut ch_on = FsChallenger::new(b"flock-test-v0");
+        let (proof_on, claim_on) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_on);
+
+        ZC_LOOKAHEAD_FORCED_OFF.store(true, Ordering::Relaxed);
+        let mut ch_off = FsChallenger::new(b"flock-test-v0");
+        let (proof_off, claim_off) = prove_packed(&a_p, &b_p, &c_p, m, &mut ch_off);
+        ZC_LOOKAHEAD_FORCED_OFF.store(false, Ordering::Relaxed);
+
+        assert_eq!(proof_on, proof_off);
+        assert_eq!(claim_on, claim_off);
+        let mut ch_v = FsChallenger::new(b"flock-test-v0");
+        assert!(verify(m, &proof_on, &mut ch_v).is_ok());
+    }
+
     /// C-T5 — transcript identity for the second-level cascade (rounds 5+6):
     /// prove twice from the same witness with the cascade engaged and
     /// disabled (the round-3 lookahead stays on in both — the cascade's

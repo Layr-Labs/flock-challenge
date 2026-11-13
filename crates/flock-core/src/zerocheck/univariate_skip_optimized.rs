@@ -3059,8 +3059,8 @@ fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
     let n_lo = n_lo_and_inner - N_INNER;
     let n_banks = 1usize << bank_bits;
     let bank_mask = n_banks - 1;
-    let range_start = lo_range.start;
-    let store_first = lo_range.len() >= n_banks;
+    // First-touch stores need the range to open with every bank exactly once.
+    let store_first = lo_range.start == 0 && lo_range.end >= n_banks;
     let unscaled = zc_ab_unscaled_enabled();
     let seeded = zc_ab_seeded_enabled();
     if !store_first {
@@ -3071,7 +3071,7 @@ fn process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
         let x_outer = x_outer_lo | (x_hi << n_lo);
         let within_hash_outer = x_outer & within_outer_mask;
         let n_b_med = b_med_counts[within_hash_outer] as usize;
-        let first_touch = store_first && x_outer_lo - range_start < n_banks;
+        let first_touch = store_first && x_outer_lo < n_banks;
         let w = x_outer_lo >> bank_bits;
         let u = x_outer_lo & bank_mask;
         let bank: &mut [F128; ELL] = (&mut banks[u * ELL..(u + 1) * ELL])
@@ -6707,16 +6707,32 @@ mod tests {
                         macro_rules! check {
                             ($v:expr) => {{
                                 let mut want = vec![0x5au8; 16 * 64];
-                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, false>(
+                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, false, { kernels::aarch64::NT_RUNTIME }>(
                                     w, &a, &bb, &table, 0, partials, &mut want, nt,
                                 );
                                 let mut got = vec![0x5au8; 16 * 64];
-                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, true>(
+                                kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, true, { kernels::aarch64::NT_RUNTIME }>(
                                     w, &a, &bb, &table, 0, partials, &mut got, nt,
                                 );
                                 assert_eq!(
                                     got, want,
                                     "hoisted variant {} differs (case={case}, w={w}, satisfied={satisfied}, nt={nt})",
+                                    $v
+                                );
+                                // Store flavour fixed at compile time.
+                                let mut got = vec![0x5au8; 16 * 64];
+                                if nt {
+                                    kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, true, { kernels::aarch64::NT_ON }>(
+                                        w, &a, &bb, &table, 0, partials, &mut got, nt,
+                                    );
+                                } else {
+                                    kernels::aarch64::bstatic_horner_window_rows_impl::<{ $v }, true, { kernels::aarch64::NT_OFF }>(
+                                        w, &a, &bb, &table, 0, partials, &mut got, nt,
+                                    );
+                                }
+                                assert_eq!(
+                                    got, want,
+                                    "compile-time store variant {} differs (case={case}, w={w}, satisfied={satisfied}, nt={nt})",
                                     $v
                                 );
                                 cases += 1;
@@ -6755,6 +6771,7 @@ mod tests {
         kernels::aarch64::bstatic_horner_window_rows_impl::<
             { AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 },
             true,
+            { kernels::aarch64::NT_ON },
         >(0, &a, &b, &table, 0, partials, &mut out, true);
     }
 
@@ -7193,15 +7210,15 @@ mod tests {
         const REPS: usize = 40;
         type RowsFn = fn(usize, &[u8], &[u8], &InvNttTableByteSingleGf8, usize, &'static [[u8; 64]; 248], &mut [u8], bool);
         let all: Vec<(&str, RowsFn)> = vec![
-            ("production (hoisted)", imp::<{ V0 }, true>),
-            ("+ x4 Kara unscaled", imp::<{ V0 | ABV_KARA_SCALED_UNSCALED }, true>),
-            ("+ KARA_SLOT", imp::<{ V0 | ABV_KARA_SLOT }, true>),
-            ("+ Z_MT", imp::<{ V0 | ABV_Z_MT }, true>),
-            ("+ KARA_SLOT + Z_MT", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT }, true>),
-            ("+ HORNER2", imp::<{ V0 | kernels::aarch64::ABV_HORNER2 }, true>),
-            ("+ KARA_SLOT + Z_MT + HORNER2", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT | kernels::aarch64::ABV_HORNER2 }, true>),
-            ("E-core HZ", imp::<{ kernels::aarch64::AB_HZ_VARIANT }, false>),
-            ("E-core HZ + HORNER2", imp::<{ kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2 }, false>),
+            ("production (hoisted)", imp::<{ V0 }, true, { kernels::aarch64::NT_RUNTIME }>),
+            ("+ x4 Kara unscaled", imp::<{ V0 | ABV_KARA_SCALED_UNSCALED }, true, { kernels::aarch64::NT_RUNTIME }>),
+            ("+ KARA_SLOT", imp::<{ V0 | ABV_KARA_SLOT }, true, { kernels::aarch64::NT_RUNTIME }>),
+            ("+ Z_MT", imp::<{ V0 | ABV_Z_MT }, true, { kernels::aarch64::NT_RUNTIME }>),
+            ("+ KARA_SLOT + Z_MT", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT }, true, { kernels::aarch64::NT_RUNTIME }>),
+            ("+ HORNER2", imp::<{ V0 | kernels::aarch64::ABV_HORNER2 }, true, { kernels::aarch64::NT_RUNTIME }>),
+            ("+ KARA_SLOT + Z_MT + HORNER2", imp::<{ V0 | ABV_KARA_SLOT | ABV_Z_MT | kernels::aarch64::ABV_HORNER2 }, true, { kernels::aarch64::NT_RUNTIME }>),
+            ("E-core HZ", imp::<{ kernels::aarch64::AB_HZ_VARIANT }, false, { kernels::aarch64::NT_RUNTIME }>),
+            ("E-core HZ + HORNER2", imp::<{ kernels::aarch64::AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2 }, false, { kernels::aarch64::NT_RUNTIME }>),
         ];
         let pick: Vec<usize> = std::env::var("FLOCK_PROBE_FORMS")
             .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())

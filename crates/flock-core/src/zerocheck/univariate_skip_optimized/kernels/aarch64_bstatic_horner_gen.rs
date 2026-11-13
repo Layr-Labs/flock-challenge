@@ -761,6 +761,27 @@ pub(crate) fn ab_row_setup_hoist_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_ROW_SETUP_HOIST").is_none())
 }
 
+/// Kill switch for the compile-time store flavour of the hoisted window rows:
+/// any value of `FLOCK_NO_ZC_AB_ROW_NT_CONST` makes every row test the
+/// `nt_store` argument again. Read once per process. The rows written are
+/// byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_row_nt_const_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_ROW_NT_CONST").is_none())
+}
+
+/// `NT` argument of [`bstatic_horner_window_rows_impl`]: every row tests
+/// the `nt_store` argument.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const NT_RUNTIME: u8 = 0;
+/// `NT` argument: plain stores; `nt_store` is ignored (the caller passed false).
+#[cfg(target_arch = "aarch64")]
+pub(crate) const NT_OFF: u8 = 1;
+/// `NT` argument: non-temporal stores; `nt_store` is ignored (the caller passed true).
+#[cfg(target_arch = "aarch64")]
+pub(crate) const NT_ON: u8 = 2;
+
 /// All static-B Horner rows of window `w` (see [`BSTATIC_HORNER_WINDOW_ROWS`])
 /// as one unrolled sequence of direct calls into the per-arm bodies, writing
 /// row `b_med` to `out_outer[b_med * 64..][..64]`. Each row checks its own
@@ -778,7 +799,7 @@ pub(crate) fn bstatic_horner_window_rows<const V: u16>(
     out_outer: &mut [u8],
     nt_store: bool,
 ) {
-    bstatic_horner_window_rows_impl::<V, false>(
+    bstatic_horner_window_rows_impl::<V, false, NT_RUNTIME>(
         w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
     );
 }
@@ -799,9 +820,19 @@ pub(crate) fn bstatic_horner_window_rows_hoisted<const V: u16>(
     nt_store: bool,
 ) {
     const { assert!(V & ABV_INLINE_WINDOW != 0) };
-    bstatic_horner_window_rows_impl::<V, true>(
-        w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
-    );
+    if !ab_row_nt_const_enabled() {
+        bstatic_horner_window_rows_impl::<V, true, NT_RUNTIME>(
+            w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
+        );
+    } else if nt_store {
+        bstatic_horner_window_rows_impl::<V, true, NT_ON>(
+            w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
+        );
+    } else {
+        bstatic_horner_window_rows_impl::<V, true, NT_OFF>(
+            w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store,
+        );
+    }
 }
 
 /// [`bstatic_horner_window_rows`] with the per-row bounds check hoisted to
@@ -809,7 +840,7 @@ pub(crate) fn bstatic_horner_window_rows_hoisted<const V: u16>(
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-pub(crate) fn bstatic_horner_window_rows_impl<const V: u16, const HOIST: bool>(
+pub(crate) fn bstatic_horner_window_rows_impl<const V: u16, const HOIST: bool, const NT: u8>(
     w: usize,
     a_packed: &[u8],
     b_packed: &[u8],
@@ -820,6 +851,12 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u16, const HOIST: bool>(
     nt_store: bool,
 ) {
     assert!(w <= 1 && out_outer.len() >= 16 * 64);
+    debug_assert!(NT == NT_RUNTIME || nt_store == (NT == NT_ON));
+    let nt_store = match NT {
+        NT_RUNTIME => nt_store,
+        NT_OFF => false,
+        _ => true,
+    };
     // Every row of window `w` has `b_med < hi` and reads bytes up to
     // `chunk_byte_base + (b_med + 1) * 8 * N_CHUNKS`; this one check is the
     // last row's own check, so it covers every row's and is never stricter.
