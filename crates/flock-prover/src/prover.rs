@@ -142,17 +142,6 @@ fn open_ab_canonical_reuse_enabled() -> bool {
     *ON
 }
 
-fn ab_round0_reuse_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    value != Some(std::ffi::OsStr::new("1"))
-}
-
-fn open_ab_round0_reuse_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        ab_round0_reuse_value_enabled(std::env::var_os("FLOCK_NO_OPEN_AB_ROUND0_REUSE").as_deref())
-    });
-    *ON
-}
-
 fn ab_canonical_capture_selected(
     layout: flock_core::r1cs::WitnessLayout,
     m: usize,
@@ -193,37 +182,6 @@ mod ab_canonical_tests {
             assert!(ab_canonical_reuse_value_enabled(Some(OsStr::new(value))));
         }
         assert!(!ab_canonical_reuse_value_enabled(Some(OsStr::new("1"))));
-    }
-
-    #[test]
-    fn round0_ab_opt_out_and_shape_are_independent_of_canonical() {
-        use std::ffi::OsStr;
-        assert!(ab_round0_reuse_value_enabled(None));
-        for value in ["", "0", "01", "true"] {
-            assert!(ab_round0_reuse_value_enabled(Some(OsStr::new(value))));
-        }
-        assert!(!ab_round0_reuse_value_enabled(Some(OsStr::new("1"))));
-        for s_off in [None, Some(OsStr::new("1"))] {
-            for r_off in [None, Some(OsStr::new("1"))] {
-                let s = ab_canonical_capture_selected(
-                    RowMajor, 32, 14, 6, true, ab_canonical_reuse_value_enabled(s_off),
-                );
-                let r = ab_canonical_capture_selected(
-                    RowMajor, 32, 14, 6, true, ab_round0_reuse_value_enabled(r_off),
-                );
-                assert_eq!(s, s_off.is_none());
-                assert_eq!(r, r_off.is_none());
-            }
-        }
-        for (layout, m, k_log, k_skip, first_bound) in [
-            (BatchMajor, 32, 14, 6, true), (RowMajor, 31, 14, 6, true),
-            (RowMajor, 32, 13, 6, true), (RowMajor, 32, 14, 7, true),
-            (RowMajor, 32, 14, 6, false),
-        ] {
-            assert!(!ab_canonical_capture_selected(
-                layout, m, k_log, k_skip, first_bound, ab_round0_reuse_value_enabled(None),
-            ));
-        }
     }
 }
 
@@ -325,37 +283,18 @@ fn open_claims_with_owned_canonical_fold8_ligerito<Ch: Challenger>(
     lig_config: &pcs::ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> pcs::BatchOpeningProofLigerito {
-    open_claims_with_fold8_round0_ligerito(
-        z_packed, prover_data, commitment, claims, precomputed_s_hat_v,
-        canonical_fold8, &mut [], padding, lig_config, challenger,
-    )
-}
-
-fn open_claims_with_fold8_round0_ligerito<Ch: Challenger>(
-    z_packed: Vec<F128>,
-    prover_data: &pcs::ProverData,
-    commitment: &Commitment,
-    claims: &[ZClaim],
-    precomputed_s_hat_v: &[Option<&[F128]>],
-    canonical_fold8: &mut [Option<Vec<F128>>],
-    round0_fold8: &mut [Option<Vec<F128>>],
-    padding: &zerocheck::PaddingSpec,
-    lig_config: &pcs::ligerito::ProverConfig,
-    challenger: &mut Ch,
-) -> pcs::BatchOpeningProofLigerito {
     let x_fulls: Vec<Vec<F128>> = claims
         .iter()
         .map(|c| quirky_x_outer_full(&c.point))
         .collect();
     let x_refs: Vec<&[F128]> = x_fulls.iter().map(|v| v.as_slice()).collect();
-    let out = pcs::open_batch_mixed_ligerito_with_fold8_round0(
+    let out = pcs::open_batch_mixed_ligerito_with_owned_canonical_fold8(
         z_packed,
         prover_data,
         commitment,
         &x_refs,
         precomputed_s_hat_v,
         canonical_fold8,
-        round0_fold8,
         &[],
         padding,
         lig_config,
@@ -661,7 +600,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         z_packed,
         s_hat_v_ab,
         s_hat_v_c,
-    }, recycle_bound, canonical_ab, round0_ab) = prove_fast_core_with_commit_codeword(
+    }, recycle_bound, canonical_ab) = prove_fast_core_with_commit_codeword(
         r1cs,
         pcs_params,
         z_packed,
@@ -677,7 +616,6 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     );
 
     let mut canonical_fold8 = [canonical_ab, None];
-    let mut round0_fold8 = [round0_ab, None];
     let padding = r1cs.padding_spec();
     let pre_ab: Option<&[F128]> = s_hat_v_ab.as_deref();
     let pre_c: Option<&[F128]> = pre_c_slot(r1cs, &s_hat_v_c);
@@ -725,14 +663,13 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             // and its spawned prefix encode are unchanged.
             flock_core::in_pool(|| {
                 flock_core::tmark::mark("open body start");
-                open_claims_with_fold8_round0_ligerito(
+                open_claims_with_owned_canonical_fold8_ligerito(
                     z_packed,
                     &prover_data,
                     &commitment,
                     &claims,
                     &[pre_ab, pre_c],
                     &mut canonical_fold8,
-                    &mut round0_fold8,
                     &padding,
                     &lig_config,
                     challenger,
@@ -740,14 +677,13 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             })
         }),
         None => flock_core::in_pool(|| {
-            open_claims_with_fold8_round0_ligerito(
+            open_claims_with_owned_canonical_fold8_ligerito(
                 z_packed,
                 &prover_data,
                 &commitment,
                 &claims,
                 &[pre_ab, pre_c],
                 &mut canonical_fold8,
-                &mut round0_fold8,
                 &padding,
                 &lig_config,
                 challenger,
@@ -2960,7 +2896,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
     reuse_first_bound: bool,
     challenger: &mut Ch,
-) -> (ProveCore, bool, Option<Vec<F128>>, Option<Vec<F128>>) {
+) -> (ProveCore, bool, Option<Vec<F128>>) {
     let padding = r1cs.padding_spec();
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
@@ -3351,18 +3287,14 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // Lincheck runs on a main-pool worker (`flock_core::in_pool`), as above.
     flock_core::tmark::mark("lc call");
     flock_core::epool::set_linger_phase(true);
-    let (lc_proof, lc_claim, z_capture, canonical_ab, round0_ab) = flock_core::in_pool(|| {
+    let (lc_proof, lc_claim, z_capture, canonical_ab) = flock_core::in_pool(|| {
         flock_core::tmark::mark("lc body start");
         if reuse_first_bound && ranked_direct_fold8_precompute_enabled(r1cs) {
             let capture_canonical = ab_canonical_capture_selected(
                 r1cs.layout, r1cs.m, r1cs.k_log, r1cs.k_skip, true,
                 open_ab_canonical_reuse_enabled(),
             );
-            let capture_round0 = ab_canonical_capture_selected(
-                r1cs.layout, r1cs.m, r1cs.k_log, r1cs.k_skip, true,
-                open_ab_round0_reuse_enabled(),
-            );
-            lincheck::prove_padded_capture_fold8_with_round0(
+            lincheck::prove_padded_capture_fold8_with_canonical(
                 &z_packed_lincheck,
                 r1cs.m,
                 r1cs.k_log,
@@ -3371,7 +3303,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 lincheck_circuit,
                 &x_ab,
                 capture_canonical,
-                capture_round0,
                 challenger,
             )
         } else {
@@ -3385,7 +3316,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 &x_ab,
                 challenger,
             );
-            (proof, claim, lincheck::CapturedZVec::PreSumcheck(z_vec), None, None)
+            (proof, claim, lincheck::CapturedZVec::PreSumcheck(z_vec), None)
         }
     });
     // The lincheck stripe copy of z is dead from here on; return it to the
@@ -3406,12 +3337,12 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
 
     // The first lincheck bind is already the ranked AB Fold8 statistic.
     // A pre-sumcheck capture keeps the existing fold and early pool return.
-    let (s_hat_v_ab, recycle_bound, canonical_ab, round0_ab) = match z_capture {
-        lincheck::CapturedZVec::Fold8(bound) => (Some(bound), true, canonical_ab, round0_ab),
+    let (s_hat_v_ab, recycle_bound, canonical_ab) = match z_capture {
+        lincheck::CapturedZVec::Fold8(bound) => (Some(bound), true, canonical_ab),
         lincheck::CapturedZVec::PreSumcheck(z_vec_pre) => {
             let out = precompute_ab_s_hat_v(r1cs, &z_vec_pre, &lc_claim.r_inner_rest[1..]);
             flock_core::scratch::give_lincheck_eq(z_vec_pre);
-            (out, false, None, None)
+            (out, false, None)
         }
     };
     if phase_timing {
@@ -3437,7 +3368,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
         },
         recycle_bound,
         canonical_ab,
-        round0_ab,
     )
 }
 

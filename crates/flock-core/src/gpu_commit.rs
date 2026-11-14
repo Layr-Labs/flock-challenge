@@ -2096,7 +2096,12 @@ pub const ENV_NO_STREAM_WARM: &str = "FLOCK_NO_STREAM_WARM";
 /// GPU shape, without a latched commit, while staging is leased, or killed.
 pub fn warm_streamed_first_pass(params: &crate::pcs::commit::PcsParams) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| !std::env::var(ENV_NO_STREAM_WARM).is_ok_and(|v| v == "1"));
+    // Off by default: the runner reads no gain for this warm (official medians), and its
+    // dispatch costs warm-up time against the job limit. `FLOCK_STREAM_WARM=1` turns it on.
+    let on = *ON.get_or_init(|| {
+        std::env::var("FLOCK_STREAM_WARM").is_ok_and(|v| v == "1")
+            && !std::env::var(ENV_NO_STREAM_WARM).is_ok_and(|v| v == "1")
+    });
     if !on
         || !gpu_commit_enabled()
         || !is_ranked_gpu_shape(params)
@@ -19002,6 +19007,12 @@ kernel void zc_ab_finish(
         }
     }
 
+    /// Build the arm's library and pipelines now (see
+    /// `zerocheck::univariate_skip_optimized::ab_completion_gpu_prewarm`).
+    pub(crate) fn zc_ab_prewarm(basis: &[F128; 128]) {
+        let _ = zc_ab_state(basis);
+    }
+
     fn zc_ab_state(basis: &[F128; 128]) -> Option<&'static std::sync::Mutex<ZcAb>> {
         ZC_AB_STATE
             .get_or_init(|| {
@@ -21428,7 +21439,7 @@ pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_wait};
+pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm, zc_ab_wait};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

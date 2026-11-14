@@ -1876,10 +1876,13 @@ fn ab_window_rows_plan() -> AbWindowRows {
             rows::<0, false>
         }
     } else if k::ab_hz_helper_enabled() && k::ab_horner2_enabled() {
+        // Lean (build budget): only the hoisted helper instance is compiled;
+        // its kill switches take the plain instance, which writes the same
+        // rows, as every other AB kill switch does.
         if k::ab_row_setup_hoist_enabled() && k::ab_hz_hoist_enabled() {
             rows::<HELPER, true>
         } else {
-            rows::<HELPER, false>
+            rows::<0, false>
         }
     } else {
         rows::<0, false>
@@ -1946,8 +1949,6 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
         Some(unit::<MAIN, true>)
     } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, true> as AbWindowRows) {
         Some(unit::<HELPER, true>)
-    } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, false> as AbWindowRows) {
-        Some(unit::<HELPER, false>)
     } else {
         None
     }
@@ -3824,6 +3825,29 @@ fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
             Some(basis)
         })
         .as_ref()
+}
+
+/// Untimed warm-up only: build the round-one AB completion GPU arm (its
+/// Metal library, compiled from source, and its pipelines) on a background
+/// thread, so the compile overlaps the warm-up proof instead of stalling its
+/// round one and lengthening every worker start. The arm's state is a
+/// process-wide `OnceLock`, so a launch that arrives first waits for (or
+/// does) the same build; nothing else changes. A no-op when the arm is off.
+/// `FLOCK_NO_ZC_AB_PREWARM=1` builds it lazily as before.
+pub fn ab_completion_gpu_prewarm() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() == Some(std::ffi::OsStr::new("1"))
+            || crate::gpu_commit::gpu_zc_ab_completion_share() == 0
+        {
+            return;
+        }
+        let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(|| {
+            if let Some(basis) = ab_completion_convert_basis() {
+                crate::gpu_commit::zc_ab_prewarm(basis);
+            }
+        });
+    }
 }
 
 /// Launch the GPU prefix of the folded completion, or `None` (CPU drains
@@ -6852,7 +6876,9 @@ mod tests {
         };
         assert!(maps(rows::<MAIN, true>, unit::<MAIN, true>));
         assert!(maps(rows::<HELPER, true>, unit::<HELPER, true>));
-        assert!(maps(rows::<HELPER, false>, unit::<HELPER, false>));
+        // Lean: the unhoisted helper instance has no unit form (its kill
+        // switches take the plain rows instead).
+        assert!(ab_window_unit_plan(rows::<HELPER, false>).is_none());
         assert!(ab_window_unit_plan(rows::<V0, true>).is_none());
         assert!(ab_window_unit_plan(rows::<{ k::AB_ROWS_VARIANT }, false>).is_none());
         let switches = [
