@@ -2728,7 +2728,7 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
         let eq_h = eq_hi[x_hi];
         // SAFETY: each queue job owns its partial slot exclusively.
         unsafe {
-            *partials_base.ptr().add(x_hi) = outv.map(|v| eq_h * v);
+            crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
     });
 
