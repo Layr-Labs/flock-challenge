@@ -1305,8 +1305,9 @@ static AB_ROWS_NT_CONST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// `chunk_byte_base + i * 1 KiB` with `partials[w]` and gets the rows, the
 /// checks and the stores of one [`bstatic_horner_window_rows_impl`] call
 /// with those arguments. The table pointer is fetched once per call.
-/// `nt_store` is the same for every row of the call: it picks the instance
-/// of [`bstatic_horner_window_unit_nt`] for that flavour once, or with
+/// `nt_store` is the same for every row of the call: with non-temporal
+/// stores it picks the instance of [`bstatic_horner_window_unit_nt`] once;
+/// cached stores (a kill switch only) take the per-chunk rows. With
 /// `FLOCK_NO_ZC_AB_ROWS_NT_CONST` set every row tests it
 /// ([`bstatic_horner_window_unit_flag`]).
 #[cfg(target_arch = "aarch64")]
@@ -1374,8 +1375,13 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                 )
             }
         }
-        Some(true) => bstatic_horner_window_unit_nt::<V, HOIST, false>(
-            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+        // Cached stores: kill switch only (build budget). Every AB precompute
+        // entry stores non-temporally unless `FLOCK_NO_ZC_AB_PRE_NT` is set, so
+        // the ranked prove never reaches this arm (counted at log2=18: zero
+        // calls in the warm-up and the timed proof). The per-chunk rows write
+        // the same bytes; no separate cached-store unit instance.
+        Some(true) => bstatic_horner_window_unit_per_chunk::<V, HOIST>(
+            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, false,
         ),
         Some(false) => bstatic_horner_window_unit_per_chunk::<V, HOIST>(
             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, nt_store,
