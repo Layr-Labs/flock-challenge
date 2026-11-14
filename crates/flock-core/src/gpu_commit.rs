@@ -1572,6 +1572,91 @@ pub(crate) fn gpu_zero_lane_pass(log_d: usize, s: usize) -> bool {
         && GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst) == GPU_ZERO_TAIL_LANES_RANKED
 }
 
+/// Exact-`1`, uncached rollback for first-pass zero-column compaction.
+/// All output stores remain: only known-zero input loads, products and table
+/// builds disappear. The ranked padding descriptor must also be published.
+pub const ENV_NO_GPU_FROM_Z_ZERO_COLUMNS: &str = "FLOCK_NO_GPU_FROM_Z_ZERO_COLUMNS";
+
+fn gpu_from_z_zero_columns_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_from_z_zero_columns_enabled() -> bool {
+    gpu_from_z_zero_columns_value_enabled(
+        std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_COLUMNS).as_deref(),
+    )
+}
+
+fn select_from_z_zero_columns(log_d: usize, zero_lanes: usize, enabled: bool) -> bool {
+    enabled && log_d == 20 && zero_lanes == GPU_ZERO_TAIL_LANES_RANKED
+}
+
+/// 256 columns/group and 121 live columns/pair require 512 rows/band.
+/// The byte offset is shared by the input and output and must start even.
+fn from_z_zero_columns_range(byte_offset: usize, r_count: usize) -> bool {
+    byte_offset.is_multiple_of(2 * 64 * 16) && r_count != 0 && r_count.is_multiple_of(512)
+}
+
+#[cfg(test)]
+mod from_z_zero_columns_gate_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_shape_and_band_gates() {
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(gpu_from_z_zero_columns_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(!gpu_from_z_zero_columns_value_enabled(Some(OsStr::new("1"))));
+        assert!(select_from_z_zero_columns(20, 7, true));
+        assert!(!select_from_z_zero_columns(19, 7, true));
+        assert!(!select_from_z_zero_columns(20, 0, true));
+        assert!(!select_from_z_zero_columns(20, 6, true));
+        assert!(!select_from_z_zero_columns(20, 7, false));
+        let mut start = 0;
+        // The unchanged ranked tapered witness schedule, in groups of 16 rows.
+        for groups in [64, 448, 512, 512, 512, 512, 512, 512, 448, 64] {
+            let rows = groups * 16;
+            assert!(from_z_zero_columns_range(start * 1024, rows));
+            start += rows;
+        }
+        assert_eq!(start, 1 << 16);
+        assert!(!from_z_zero_columns_range(1024, 512));
+        assert!(!from_z_zero_columns_range(16, 512));
+        assert!(!from_z_zero_columns_range(0, 256));
+        assert!(!from_z_zero_columns_range(0, 0));
+    }
+
+    #[test]
+    fn compact_column_partition_is_exact() {
+        for rows in [512, 1024, 7168, 8192] {
+            let live_groups = (rows / 512) * 121;
+            let mut seen = vec![false; rows * 64];
+            for group in 0..rows / 4 {
+                for rr in 0..4 {
+                    for lid in 0..64 {
+                        let (r, lane) = if group < live_groups {
+                            let col = (group * 4 + rr) * 64 + lid;
+                            let pair = col / 121;
+                            let m = col % 121;
+                            let odd = usize::from(m >= 64);
+                            (pair * 2 + odd, m - odd * 64)
+                        } else {
+                            let col = ((group - live_groups) * 4 + rr) * 64 + lid;
+                            (col / 7 * 2 + 1, 57 + col % 7)
+                        };
+                        assert!(r < rows && lane < 64);
+                        assert_eq!(r % 2 == 1 && lane >= 57, group >= live_groups);
+                        assert!(!seen[r * 64 + lane]);
+                        seen[r * 64 + lane] = true;
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&v| v));
+        }
+    }
+}
+
 /// Groups per block of the compacted grid: 121 live columns per (even, odd)
 /// tile pair, 256 columns per 64-thread group.
 #[inline]
@@ -3921,6 +4006,8 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
     device const uint4* twiddles   [[buffer(1)]],
     constant NttParams& P          [[buffer(2)]],
     device const uint4* z          [[buffer(3)]],
+    constant uint& compact        [[buffer(4)]],
+    uint grid [[threadgroups_per_grid]],
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_threadgroup]])
 {
@@ -3935,6 +4022,23 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
     // groups up to 13.5 KiB, five from 13.8 KiB at 25.2 ms, four from
     // 16.8 KiB at 25.5 ms, three at 21.6 KiB at 31.1 ms).
     threadgroup uint4 pad[256u];
+    // The host admits only even-start bands with a multiple of 512 rows.
+    // Compact 121 live columns per even/odd pair into complete groups. The
+    // other 7/128 groups initialize zero outputs without tables or products.
+    // The return is uniform across the group, before either table barrier.
+    const uint live_groups = (grid >> 7) * 121u;
+    if (compact && tgid >= live_groups) {
+        for (uint rr = 0u; rr < 4u; rr++) {
+            const uint col = (((tgid - live_groups) << 2) + rr) * 64u + lid;
+            const uint pair = col / 7u;
+            const uint lane = 57u + col - pair * 7u;
+            const uint r = pair * 2u + 1u;
+            for (uint e = 0u; e < NF; e++) {
+                data[((r + (e << P.s)) << 6) + lane] = uint4(0u);
+            }
+        }
+        return;
+    }
     build_zero_root_tabs(twiddles, bases, tabs, lid);
     if (P.log_d == 77u) {          // unreachable; keeps `pad` allocated
         pad[lid % 256u] = tabs[lid];
@@ -3942,10 +4046,14 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
         tabs[lid] ^= pad[(lid + 1u) % 256u];
     }
 
-    const uint lane = lid & 63u;
     const uint r_base = tgid << LOG_G;
     for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
-        const uint r = r_base + rr;
+        const uint col = ((r_base + rr) << 6) + lid;
+        const uint pair = col / 121u;
+        const uint m = col - pair * 121u;
+        const uint odd = uint(m >= 64u);
+        const uint r = compact ? pair * 2u + odd : r_base + rr;
+        const uint lane = compact ? m - odd * 64u : lid;
         uint4 elems[NF];
 
         // Layer zero has v=0: load the message half once and duplicate it.
@@ -8422,6 +8530,11 @@ kernel void blake3_pow_scan(
         pub(crate) s: u32,
     }
 
+    #[cfg(test)]
+    std::thread_local! {
+        pub(crate) static TEST_FROM_Z_ZERO_COLUMN_BINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     /// Immutable selection for one logical from-z first pass. Every full,
     /// streamed, and blocking/reprime dispatch goes through this helper, so
     /// the candidate and exact rollback cannot silently diverge by path.
@@ -8429,14 +8542,21 @@ kernel void blake3_pow_scan(
     pub(crate) struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
+        zero_columns: bool,
     }
 
     impl FromZFirstPassPlan {
         pub(crate) fn new(log_d: usize) -> Self {
             let grouped = super::pass_tune_enabled();
+            let zero_root = grouped && super::gpu_from_z_zero_root_selected(log_d);
             Self {
                 grouped,
-                zero_root: grouped && super::gpu_from_z_zero_root_selected(log_d),
+                zero_root,
+                zero_columns: zero_root && super::select_from_z_zero_columns(
+                    log_d,
+                    super::GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst),
+                    super::gpu_from_z_zero_columns_enabled(),
+                ),
             }
         }
 
@@ -8477,6 +8597,14 @@ kernel void blake3_pow_scan(
                 );
                 gpu.set_bytes(enc, bytes, 2);
                 gpu.set_buffer(enc, z_buf, byte_offset, 3);
+                if self.zero_root {
+                    let compact = u32::from(
+                        self.zero_columns && super::from_z_zero_columns_range(byte_offset, r_count),
+                    );
+                    gpu.set_bytes(enc, &compact.to_ne_bytes(), 4);
+                    #[cfg(test)]
+                    TEST_FROM_Z_ZERO_COLUMN_BINDS.with(|n| n.set(n.get() + compact as usize));
+                }
                 gpu.dispatch(
                     enc,
                     (r_count >> if self.grouped { 2 } else { 0 }) as u64,
@@ -8501,6 +8629,7 @@ kernel void blake3_pow_scan(
             FromZFirstPassPlan {
                 grouped: true,
                 zero_root: true,
+                zero_columns: false,
             }
             .encode_range(
                 gpu,
@@ -12322,6 +12451,13 @@ kernel void blake3_pow_scan(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
         ), lead, extend, phi);
+        // Same library, different first-pass work: keep the dense rollback's
+        // latch/tuned split separate from the compact-column execution.
+        let key = if super::gpu_from_z_zero_root_selected(20) && super::gpu_from_z_zero_columns_enabled() {
+            key ^ 0x5A43_4F4C_554D_4E31 // "ZCOLUMN1"
+        } else {
+            key
+        };
         let key = if super::gpu_t3_bytetab2_enabled() {
             key ^ fnv1a64(T3_BYTETAB2).rotate_left(10) ^ 0x5433_4259_5445_3242
         } else {
@@ -21718,6 +21854,97 @@ mod tests {
             gpu.release(tree_buf);
             gpu.pool_pop(pool);
         }
+    }
+
+    /// Use the actual ranked selector/encoder/PSO with a scaled address stride.
+    /// The descriptor, range checks and runtime rollback remain live. Reused
+    /// stale buffers and out-of-band sentinels catch missing zero stores.
+    #[test]
+    #[ignore = "real Metal oracle; run alone with two Rayon threads"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_from_z_zero_columns_match_cpu_scaled() {
+        let gpu = imp::gpu().expect("zero-column oracle requires real Metal");
+        assert!(gpu_from_z_zero_root_selected(20));
+        assert!(!gpu_from_z_zero_root_selected(14));
+        let log_d = 14usize;
+        let rows = 1usize << (log_d - 4);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let mut rng = Rng::new(0x5A43_4F4C_554D_4E31);
+        let mut z = rng.vec(64 << (log_d - 1));
+        let mut expect = vec![F128::ZERO; 64 << log_d];
+        let sentinel = F128::new(0xa5a5_a5a5_a5a5_a5a5, 0xa5a5_a5a5_a5a5_a5a5);
+        let mut cases = 0;
+        let mut binds = 0;
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = core::mem::size_of_val(expect.as_slice());
+            let z_bytes = core::mem::size_of_val(z.as_slice());
+            let out = gpu.new_buffer(data_bytes).unwrap();
+            let input = gpu.new_buffer(z_bytes).unwrap();
+            let tw = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(), gpu.buffer_contents(tw),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            assert_eq!(gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root).0, 16_064);
+            for repeat in 0..3 {
+                let padded = repeat != 2;
+                // Change live and zero columns at the same input addresses.
+                for (i, value) in z.iter_mut().enumerate() {
+                    *value = crate::field::mul_by_x(*value) + F128::new(i as u64 | 1, 0xf001);
+                }
+                if padded {
+                    for pos in (1..(1usize << (log_d - 1))).step_by(2) {
+                        z[pos * 64 + 57..pos * 64 + 64].fill(F128::ZERO);
+                    }
+                }
+                let _scope = GpuZeroTailLanes::scope(64, if padded { 7 } else { 0 });
+                crate::pcs::commit::replicate_message_fill(&mut expect, &z);
+                ntt.forward_transform_interleaved_block_range(&mut expect, 64, 1, 4, 0, 2, 0);
+                std::ptr::copy_nonoverlapping(z.as_ptr().cast::<u8>(), gpu.buffer_contents(input), z_bytes);
+                // The even unaligned start is supported; odd/short ranges fall
+                // back to dense. Production's ten bands are all admitted.
+                for (start, count) in [(0, 512), (512, 512), (2, 512), (1, 512), (0, 256), (0, rows)] {
+                    std::ptr::write_bytes(gpu.buffer_contents(out), 0xa5, data_bytes);
+                    imp::TEST_FROM_Z_ZERO_COLUMN_BINDS.with(|n| n.set(0));
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    imp::FromZFirstPassPlan::new(20).encode_range(
+                        gpu, enc, out, tw, input, log_d, start * 1024, count,
+                    );
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let expected_bind = usize::from(
+                        padded && gpu_from_z_zero_columns_enabled()
+                            && from_z_zero_columns_range(start * 1024, count),
+                    );
+                    let actual_bind = imp::TEST_FROM_Z_ZERO_COLUMN_BINDS.with(|n| n.get());
+                    assert_eq!(actual_bind, expected_bind, "production encoder engagement");
+                    binds += actual_bind;
+                    let got = core::slice::from_raw_parts(
+                        gpu.buffer_contents(out).cast::<F128>(), expect.len(),
+                    );
+                    for e in 0..16 {
+                        let block = &got[e * rows * 64..(e + 1) * rows * 64];
+                        assert!(block[..start * 64].iter().all(|&x| x == sentinel));
+                        assert!(block[(start + count) * 64..].iter().all(|&x| x == sentinel));
+                        let begin = (e * rows + start) * 64;
+                        assert_eq!(
+                            &block[start * 64..(start + count) * 64],
+                            &expect[begin..begin + count * 64],
+                            "first-pass output repeat={repeat} start={start} count={count} e={e}",
+                        );
+                    }
+                    cases += 1;
+                }
+            }
+            gpu.release(out);
+            gpu.release(input);
+            gpu.release(tw);
+            gpu.pool_pop(pool);
+        }
+        eprintln!("from-z-zero-columns log_d={log_d} cases={cases} compact_binds={binds} exact=true");
     }
 
     /// The hybrid commit sends only a high-block prefix through the GPU NTT

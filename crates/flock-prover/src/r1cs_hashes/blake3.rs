@@ -5111,6 +5111,40 @@ impl Blake3Setup {
         blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+        // Build-time only: the Fiat-Shamir challenger goes through one
+        // non-generic instance compiled here, so a downstream caller (the
+        // benchmark worker) does not re-instantiate the generic prover tree
+        // for `FsChallenger` (the seed pipe already instantiates it in this
+        // crate). `Ch::IS_FS` is a constant after monomorphization, so the
+        // other arm is never collected for `FsChallenger`. Same code, same
+        // bytes; see `Challenger::IS_FS`.
+        if Ch::IS_FS {
+            match challenger.as_fs_challenger() {
+                Some(fs) => self.prove_fast_fs(blocks, fs),
+                None => unreachable!("Challenger::IS_FS without as_fs_challenger"),
+            }
+        } else {
+            self.prove_fast_generic(blocks, challenger)
+        }
+    }
+
+    /// [`Self::prove_fast`] for the Fiat-Shamir challenger: the single
+    /// instance every crate links to.
+    #[inline(never)]
+    pub fn prove_fast_fs(
+        &self,
+        blocks: &[Compression],
+        challenger: &mut flock_core::challenger::FsChallenger,
+    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+        self.prove_fast_generic(blocks, challenger)
+    }
+
+    /// Body of [`Self::prove_fast`] (see its docs above).
+    fn prove_fast_generic<Ch: Challenger>(
+        &self,
+        blocks: &[Compression],
+        challenger: &mut Ch,
+    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         use std::sync::atomic::Ordering;
         let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
         // Seed pipelining: on the timed call the proof for these blocks may
