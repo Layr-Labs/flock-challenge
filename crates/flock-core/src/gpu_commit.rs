@@ -1725,6 +1725,15 @@ pub(crate) fn gpu_final_leaf_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
 }
 
+/// Initialization-only rollback for deriving the seven sibling byte tables.
+/// This changes neither dispatch geometry nor the calibrated CPU/GPU split.
+pub const ENV_NO_GPU_T3_SIBLING_TABLES: &str = "FLOCK_NO_GPU_T3_SIBLING_TABLES";
+
+pub(crate) fn gpu_t3_sibling_tables_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_T3_SIBLING_TABLES).as_deref() != Some(std::ffi::OsStr::new("1")))
+}
+
 pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB2").is_none())
@@ -4309,6 +4318,109 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
         }
     }
 
+    fn mid_four_tiles_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_MID_COMPACT_FOUR_TILES").is_none())
+    }
+
+    /// Reuse each table across four tiles only in the compact grid.
+    /// The compact s=8 tail has only two tiles: inactive registers stay zero
+    /// and never load/store, while all lanes still reach every table barrier.
+    fn with_mid_four_tiles(source: &str, compact: bool) -> Option<String> {
+        let mut out = source.to_string();
+        let round = "for (uint it = 0; it < 2u; it++)";
+        if out.matches(round).count() != 1 { return None; }
+        out = out.replacen(round, "for (uint it = 0; it < 1u; it++)", 1);
+        let start = out.find("        uint4 ea[NF];")?;
+        let end = out[start..].find("        NTT_G4X2_SUBLAYER(0u)")? + start;
+        let load = out[start..end].to_string();
+        let mut extra = load.replace("ea[", "ec[").replace("eb[", "ed[");
+        extra = extra.replace("uint4 ec[NF];", "uint4 ec[NF] = {};")
+            .replace("uint4 ed[NF];", "uint4 ed[NF] = {};");
+        if compact {
+            extra = extra.replace("(it << 7)", "((it + 1u) << 7)");
+            extra = extra.replace("        {\n", "        if (has_cd) {\n");
+        } else {
+            extra = extra.replace("(pa +", "(pa + 2u +")
+                .replace("(pb +", "(pb + 2u +");
+        }
+        let active = if compact {
+            "        const bool has_cd = (g << 8) + 128u < (121u << (P.s - 1u));\n"
+        } else { "" };
+        out.replace_range(start..end, &format!("{load}{active}{extra}"));
+
+        let anchor = "                eb[ev] ^= nb;";
+        if out.matches(anchor).count() != 1 { return None; }
+        let more = [
+            "                uint4 pc, pd;",
+            "                gf_mul_byte16_x2(ec[ev], ed[ev], &tabB[0], pc, pd);",
+            "                const uint4 nc = ec[eu] ^ pc, nd = ed[eu] ^ pd;",
+            "                ec[eu] = nc; ec[ev] ^= nc;",
+            "                ed[eu] = nd; ed[ev] ^= nd;",
+        ].join(" \\\n");
+        out = out.replacen(anchor, &format!("{anchor} \\\n{more}"), 1);
+
+        let first_store = out.find("            data[((pa + (e << P.s))")?;
+        let start = if compact {
+            out[..first_store].rfind("        {\n")?
+        } else {
+            out[..first_store].rfind("        for (uint e = 0; e < NF; e++)")?
+        };
+        let end = out[start..].find("\n    }\n}")? + start;
+        let store = out[start..end].to_string();
+        let mut extra = store.replace("ea[", "ec[").replace("eb[", "ed[");
+        if compact {
+            extra = extra.replace("(it << 7)", "((it + 1u) << 7)");
+            extra = extra.replacen("        {\n", "        if (has_cd) {\n", 1);
+        } else {
+            extra = extra.replace("(pa +", "(pa + 2u +")
+                .replace("(pb +", "(pb + 2u +");
+        }
+        out.replace_range(start..end, &format!("{store}\n{extra}"));
+        Some(out)
+    }
+
+    #[cfg(test)]
+    mod mid_four_tiles_tests {
+        use super::*;
+
+        #[test]
+        fn four_tiles_splice_and_partial_group_ownership() {
+            let dense = with_mid_four_tiles(NTT_G4X2_TWL_MSL_SOURCE, false).unwrap();
+            assert!(dense.contains("uint4 ec[NF] = {};"));
+            assert!(!dense.contains("it < 2u"));
+            assert_eq!(dense.matches("gf_build_byte16_twl(tabB").count(), 1);
+            assert_eq!(dense.matches("gf_mul_byte16_x2(ec[ev]").count(), 1);
+            assert!(dense.contains("threadgroup uint4 pad[252u]"));
+            let compact = g4x2_zero_lane_msl_source().unwrap();
+            assert!(!compact.contains("+ lane]"));
+            assert_eq!(compact.contains("uint4 ec[NF] = {};"), mid_four_tiles_enabled());
+            assert_eq!(compact.contains("if (has_cd)"), mid_four_tiles_enabled());
+            // Dense stays byte-identical to the crown: loaded dense l8
+            // regressed when table reuse was enabled for every middle pass.
+            assert_eq!(g4x2_msl_source(), if super::super::gpu_tw_prefetch_enabled() {
+                NTT_G4X2_TWL_MSL_SOURCE
+            } else { NTT_G4X2_MSL_SOURCE });
+            // Every legal compact block has whole 128-column halves. Model
+            // the four-register ownership including the s=8 partial group.
+            for s in [8usize, 12] {
+                let live = 121usize << (s - 1);
+                let groups = live.div_ceil(256);
+                let mut visits = vec![0u8; live];
+                for g in 0..groups {
+                    for tile in 0..4 {
+                        if tile >= 2 && g * 256 + 128 >= live { continue; }
+                        for lane in 0..64 {
+                            visits[g * 256 + tile * 64 + lane] += 1;
+                        }
+                    }
+                }
+                assert!(visits.iter().all(|&v| v == 1));
+            }
+        }
+    }
+
+
     /// `NTT_G4X2_TWL_MSL_SOURCE` with the zero-lane compacted grid
     /// (`ntt_fused_reg4g4x2_zl`). The butterflies, tables and twiddles are the
     /// incumbent's; only the (tile, lane) column each thread slot owns
@@ -4357,11 +4469,14 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
         if out.matches(round).count() != 1 {
             return None;
         }
-        Some(out.replacen(
+        let out = out.replacen(
             round,
             "    for (uint it = 0; it < 2u; it++) {\n        if ((g << 8) + (it << 7) >= (121u << (P.s - 1u))) { break; }\n",
             1,
-        ))
+        );
+        Some(if mid_four_tiles_enabled() {
+            with_mid_four_tiles(&out, true).unwrap_or(out)
+        } else { out })
     }
 
     const NTT_G4X2_MSL_SOURCE: &str = r#"
@@ -4806,6 +4921,43 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     {
     constexpr uint j = 3u;
 ";
+    // Standard-basis final roots satisfy t[8B+c] = t[8B] XOR (2*c).
+    // Build one byte polynomial, derive its seven siblings, and retain every
+    // table entry, barrier and lookup. pass5_mixed_ok bounds products to uint.
+    const T3_BYTETAB3_SIBLING_BUILD: &str = "    threadgroup uint* tab3 = (threadgroup uint*)tabB;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    // The eight final-layer roots are t[8B] XOR (2*c).
+    const uint base = lid * 4u;
+    const uint tw3 = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3)].x;
+    uint hb = 0u;
+    for (uint k = 2u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= tw3 << k; } }
+    for (uint i = 0u; i < 4u; i++) {
+        uint v = hb;
+        for (uint k = 0u; k < 2u; k++) { if ((i >> k) & 1u) { v ^= tw3 << k; } }
+        const uint d1 = (base + i) << 1, d2 = (base + i) << 2, d4 = (base + i) << 3;
+        tab3[base + i] = v;
+        tab3[256u + base + i] = v ^ d1;
+        tab3[512u + base + i] = v ^ d2;
+        tab3[768u + base + i] = v ^ d1 ^ d2;
+        tab3[1024u + base + i] = v ^ d4;
+        tab3[1280u + base + i] = v ^ d1 ^ d4;
+        tab3[1536u + base + i] = v ^ d2 ^ d4;
+        tab3[1792u + base + i] = v ^ d1 ^ d2 ^ d4;
+    }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    constexpr uint j = 3u;
+";
+    fn t3_bytetab3_build() -> &'static str {
+        if super::gpu_t3_sibling_tables_enabled() {
+            T3_BYTETAB3_SIBLING_BUILD
+        } else {
+            T3_BYTETAB3_BUILD
+        }
+    }
+
     const T3_BYTETAB3_MUL: &str = "            const uint cb = c * 256u;
         const uint4 V = elems[ev];
         uint q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u, q4 = 0u;
@@ -4844,7 +4996,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
         if src.matches(pre).count() != 1 || src.matches(sub3.as_str()).count() != 1 {
             return None;
         }
-        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(sub3.as_str(), T3_BYTETAB3_MUL, 1))
+        Some(src.replacen(pre, t3_bytetab3_build(), 1).replacen(sub3.as_str(), T3_BYTETAB3_MUL, 1))
     }
 
     fn with_t3_bytetab3(src: &str) -> Option<String> {
@@ -4852,7 +5004,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
         if src.matches(pre).count() != 1 || src.matches(T3_SUB3_HORNER).count() != 1 {
             return None;
         }
-        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(T3_SUB3_HORNER, T3_BYTETAB3_MUL, 1))
+        Some(src.replacen(pre, t3_bytetab3_build(), 1).replacen(T3_SUB3_HORNER, T3_BYTETAB3_MUL, 1))
     }
 
     const T3_BYTETAB2: &str = "    threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4928,7 +5080,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
             let a = with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).expect("sub-layer 2 not found");
             assert!(a.contains("tab64[cc * 256u + base + i] = v;") && !a.contains("NTT_T3_SHORT_PAIR(2u, 0u)"));
             let b = with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).expect("not after sub-layer 3");
-            assert!(b.contains("tab64[cc * 256u + base + i] = v;") && b.contains("tab3[cc * 256u + base + i] = v;"));
+            assert!(b.contains("tab64[cc * 256u + base + i] = v;") && b.contains(t3_bytetab3_build()));
         }
 
         #[test]
@@ -4995,13 +5147,141 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     }
 
     #[cfg(test)]
+    mod t3_sibling_tests {
+        use super::*;
+
+        #[test]
+        fn t3_sibling_standard_basis_and_sources() {
+            for log_d in [10, 16, 20] {
+                let ntt = AdditiveNttF128::standard(log_d);
+                for b in 0..1usize << (log_d - 1) {
+                    assert_eq!(ntt.twiddle(log_d - 1, b), F128::new((2 * b) as u64, 0));
+                }
+            }
+            let selected = t3_bytetab3_build();
+            assert!(final_t3_msl_source().contains(selected));
+            assert_eq!(final_leaf_msl_source().matches(selected).count(), 2);
+        }
+
+        /// Production PSOs and the production hybrid-prefix encoder, with a
+        /// small data slice but ranked twiddle indices and global tree offsets.
+        /// Poisoning only the seven derived roots proves which shader ran.
+        #[test]
+        #[ignore]
+        fn t3_sibling_native_production_oracle() {
+            let gpu = gpu().expect("Metal required for the engagement gate");
+            assert!(!gpu.pso_ntt5t3.is_null() && !gpu.pso_final_leaf.is_null());
+            let enabled = super::super::gpu_t3_sibling_tables_enabled();
+            assert!(super::super::gpu_t3_bytetab_enabled());
+            TEST_T3_SIBLING_PREFIX_DISPATCHES.with(|n| n.set(0));
+            let mut fused_runs = 0;
+            for log_d in [10usize, 16, 20] {
+                let n = 1usize << log_d;
+                let prefix = n.min(4096);
+                let ntt = AdditiveNttF128::standard(log_d);
+                let mut tws = super::super::flat_twiddle_table(&ntt, log_d);
+                // Parent3/fused dispatch is ranked-size-only. Smaller shapes
+                // exercise the same compiled PSOs directly, not this selector.
+                assert_eq!(hybrid_final_leaf_selected(gpu, log_d, n), log_d == 20);
+                for offset in [0, n - prefix].into_iter().take(if n == prefix { 1 } else { 2 }) {
+                    for l in log_d - 4..log_d {
+                        let half = 1usize << (log_d - l - 1);
+                        let start = (1usize << l) - 1;
+                        for b in 0..prefix / (2 * half) {
+                            tws[start + b] = ntt.twiddle(l, offset / (2 * half) + b);
+                        }
+                    }
+                    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+                    let mut word = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+                    let input: Vec<F128> = (0..prefix * 64).map(|_| F128::new(word(), word())).collect();
+                    let mut expected = input.clone();
+                    for l in log_d - 4..log_d {
+                        let half = 1usize << (log_d - l - 1);
+                        for b in 0..prefix / (2 * half) {
+                            let tw = ntt.twiddle(l, offset / (2 * half) + b);
+                            for j in 0..half * 64 {
+                                let a = b * 2 * half * 64 + j;
+                                let z = a + half * 64;
+                                let x = expected[a] + expected[z] * tw;
+                                expected[z] += x;
+                                expected[a] = x;
+                            }
+                        }
+                    }
+                    unsafe {
+                        let pool = gpu.pool_push();
+                        let len = input.len() * 16;
+                        let tree_len = 2 * n * 32;
+                        let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                        let data = gpu.new_buffer(len + 256).unwrap();
+                        let tree = gpu.new_buffer(tree_len + 256).unwrap();
+                        let input_bytes = std::slice::from_raw_parts(input.as_ptr().cast::<u8>(), len);
+                        let expected_bytes = std::slice::from_raw_parts(expected.as_ptr().cast::<u8>(), len);
+                        let cpu_tree = crate::merkle::merkle_tree(expected_bytes, prefix, crate::hash::HashKind::Blake3);
+                        for fused in [false, true] {
+                            for poison in [false, true] {
+                                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                                if poison {
+                                    let row = gpu.buffer_contents(tw).cast::<F128>().add((1usize << (log_d - 1)) - 1);
+                                    for b in 0..prefix / 2 {
+                                        if b % 8 != 0 { (*row.add(b)).lo ^= 0x15554; }
+                                    }
+                                }
+                                std::ptr::write_bytes(gpu.buffer_contents(data), 0xA5, len + 256);
+                                std::ptr::copy_nonoverlapping(input_bytes.as_ptr(), gpu.buffer_contents(data), len);
+                                std::ptr::write_bytes(gpu.buffer_contents(tree), 0xA5, tree_len + 256);
+                                let cb = gpu.command_buffer().unwrap();
+                                let enc = gpu.compute_encoder(cb).unwrap();
+                                if fused {
+                                    encode_final_leaf_prefix(gpu, enc, data, tw, tree, log_d, prefix);
+                                    fused_runs += 1;
+                                } else {
+                                    gpu.set_pipeline(enc, gpu.pso_ntt5t3);
+                                    gpu.set_buffer(enc, data, 0, 0);
+                                    gpu.set_buffer(enc, tw, 0, 1);
+                                    let p = NttParams { log_d: log_d as u32, l: (log_d - 4) as u32, f: 4, s: 0 };
+                                    gpu.set_bytes(enc, std::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), std::mem::size_of::<NttParams>()), 2);
+                                    gpu.dispatch(enc, (prefix / 16) as u64, 64);
+                                }
+                                gpu.end_encoding(enc);
+                                gpu.commit_and_wait(cb).unwrap();
+                                let out = std::slice::from_raw_parts(gpu.buffer_contents(data), len + 256);
+                                assert_eq!(out[..len] == *expected_bytes, !poison || enabled, "log_d={log_d} offset={offset} fused={fused} poison={poison}");
+                                assert!(out[len..].iter().all(|&b| b == 0xA5));
+                                let out_tree = std::slice::from_raw_parts(gpu.buffer_contents(tree), tree_len + 256);
+                                let (mut dst, mut cpu, mut width, mut count) = (0, 0, n, prefix);
+                                for _ in 0..4 {
+                                    if fused {
+                                        if !poison || enabled {
+                                            let want = std::slice::from_raw_parts(cpu_tree[cpu..cpu + count].as_ptr().cast::<u8>(), count * 32);
+                                            assert_eq!(&out_tree[dst * 32..(dst + count) * 32], want);
+                                        }
+                                        assert!(out_tree[(dst + count) * 32..(dst + width) * 32].iter().all(|&b| b == 0xA5));
+                                    }
+                                    dst += width; cpu += count; width /= 2; count /= 2;
+                                }
+                                assert!(out_tree[if fused { dst * 32 } else { 0 }..].iter().all(|&b| b == 0xA5));
+                            }
+                        }
+                        gpu.release(tw); gpu.release(data); gpu.release(tree);
+                        gpu.pool_pop(pool);
+                    }
+                }
+            }
+            let engaged = TEST_T3_SIBLING_PREFIX_DISPATCHES.with(|n| n.get());
+            assert_eq!(engaged, if enabled { fused_runs } else { 0 });
+            eprintln!("t3-sibling production: enabled={enabled} fused_runs={fused_runs} engaged={engaged} CPU_exact=true poison_engagement=true guards=true");
+        }
+    }
+
+    #[cfg(test)]
     mod t3_bytetab_tests {
         use super::*;
 
         #[test]
         fn t3_bytetab_splice_applies() {
             let out = with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).expect("incumbent sub-layer 3 not found");
-            assert!(out.contains("tab3[cc * 256u + base + i] = v;"));
+            assert!(out.contains(t3_bytetab3_build()));
             assert!(!out.contains("acc = gf_shl4(acc);"));
             assert!(out.contains("kernel void ntt_final_t3("));
         }
@@ -5298,13 +5578,13 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 return;
             }
             let plain = final_t3_msl_source();
-            assert!(plain.contains("tab3[cc * 256u + base + i] = v;"), "plain sub-layer 3");
+            assert!(plain.contains(t3_bytetab3_build()), "plain sub-layer 3");
             assert!(plain.contains("tab64[cc * 256u + base + i] = v;"), "plain sub-layer 2");
             let leaf = final_leaf_msl_source();
             assert_eq!(leaf.matches("tab64[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 2");
             // With real newlines in `with_fused_bytetab3`'s anchors the fused
             // leaf kernel gets sub-layer 3 as well.
-            assert_eq!(leaf.matches("tab3[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 3");
+            assert_eq!(leaf.matches(t3_bytetab3_build()).count(), 2, "leaf sub-layer 3");
             assert!(with_fused_bytetab3(NTT_FINAL_LEAF_EXTRA_MSL).is_some());
         }
 
@@ -6213,7 +6493,16 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             gpu.set_buffer(enc, tree_buf, w2 * 32, 5);
             gpu.set_buffer(enc, tree_buf, w3 * 32, 6);
             gpu.dispatch(enc, (prefix_leaves / 64) as u64, 64);
+            #[cfg(test)]
+            if super::gpu_t3_bytetab_enabled() && super::gpu_t3_sibling_tables_enabled() {
+                TEST_T3_SIBLING_PREFIX_DISPATCHES.with(|n| n.set(n.get() + 1));
+            }
         }
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        static TEST_T3_SIBLING_PREFIX_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// The parent levels of ONE aligned subtree above its level 3 (levels
@@ -12518,6 +12807,13 @@ kernel void blake3_pow_scan(
         };
         let key = if super::gpu_t3_bytetab_enabled() {
             key ^ fnv1a64(T3_BYTETAB3_MUL).rotate_left(8) ^ 0x5433_4259_5445_5442
+        } else {
+            key
+        };
+        // The plain final kernel can be used when fused leaves are disabled.
+        // Its sibling builder must also have a distinct tuning-cache key.
+        let key = if super::gpu_t3_bytetab_enabled() && super::gpu_t3_sibling_tables_enabled() {
+            key ^ fnv1a64(T3_BYTETAB3_SIBLING_BUILD).rotate_left(11)
         } else {
             key
         };
