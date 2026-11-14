@@ -1420,6 +1420,69 @@ pub(crate) fn gpu_g4x2_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_G4X2").is_none())
 }
 
+/// Kill switch for GPU zero-lane deletion (`ntt_fused_reg4g4x2_zl`):
+/// `FLOCK_NO_GPU_ZERO_LANE` (any value) keeps the dense `ntt_fused_reg4g4x2`
+/// grid. Both write the same bytes.
+pub(crate) fn gpu_zero_lane_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_ZERO_LANE").is_none())
+}
+
+/// Zero tail lanes the GPU commit passes may delete, published by the ranked
+/// BLAKE3 prover from its R1CS padding descriptor for the whole proof (the
+/// GPU graph is encoded during witness generation, before the CPU skip's own
+/// `ZeroOddTailLanes` publication at the commit join). 0 = no deletion.
+///
+/// The ranked padding rows force words 121..127 of every 128-word block to
+/// zero, i.e. lanes 57..63 of every odd codeword position. Every layer but
+/// the last pairs positions an even distance apart, so those columns stay
+/// zero through the mid passes (layers 4..15): a pass that never loads or
+/// stores them leaves the buffer byte-identical.
+static GPU_ZERO_TAIL_LANES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The only zero-tail geometry the compacted kernel implements.
+pub(crate) const GPU_ZERO_TAIL_LANES_RANKED: usize = 7;
+
+/// Scoped publication of [`GPU_ZERO_TAIL_LANES`]; restores the previous value
+/// on drop.
+#[must_use = "the deletion is active only while the guard is alive"]
+pub struct GpuZeroTailLanes(usize);
+
+impl GpuZeroTailLanes {
+    /// Publish `lanes` zero tail lanes for `num_ntts`-wide interleaving; any
+    /// geometry other than the ranked 64 lanes / 7 zero lanes publishes 0.
+    pub fn scope(num_ntts: usize, lanes: usize) -> Self {
+        let lanes = if num_ntts == 64 && lanes == GPU_ZERO_TAIL_LANES_RANKED { lanes } else { 0 };
+        Self(GPU_ZERO_TAIL_LANES.swap(lanes, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+impl Drop for GpuZeroTailLanes {
+    fn drop(&mut self) {
+        GPU_ZERO_TAIL_LANES.store(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// True when a mid pass at `(log_d, s)` may run the compacted grid: switch on,
+/// the ranked geometry published, and the s = 12 pass (layers 4..7), whose
+/// blocks hold 4,096 tiles = exactly 968 full compacted groups. (At s = 8 the
+/// last group of a block would be half empty and need per-slot validity
+/// flags; at s = 4 a block's 3.78 live groups still round up to 4.)
+#[inline]
+pub(crate) fn gpu_zero_lane_pass(log_d: usize, s: usize) -> bool {
+    log_d == 20
+        && s == 12
+        && gpu_zero_lane_enabled()
+        && GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst) == GPU_ZERO_TAIL_LANES_RANKED
+}
+
+/// Groups per block of the compacted grid: 121 live columns per (even, odd)
+/// tile pair, 256 columns per 64-thread group.
+#[inline]
+pub(crate) const fn zero_lane_groups_per_block(s: usize) -> u64 {
+    ((121u64 << s) + 511) >> 9
+}
+
 /// Kill switch for the tabled ranked final NTT pass (`ntt_final_t3`):
 /// `FLOCK_NO_GPU_FINAL_T3` (any value) keeps `ntt_pass5_mixed`. Both kernels
 /// write the same bytes.
@@ -1431,6 +1494,16 @@ pub(crate) fn gpu_final_t3_enabled() -> bool {
 pub(crate) fn gpu_final_leaf_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
+}
+
+pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB2").is_none())
+}
+
+pub(crate) fn gpu_t3_bytetab_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB").is_none())
 }
 
 /// Hybrid-split GPU prefix uses the fused final NTT pass + Merkle leaf kernel
@@ -3945,6 +4018,49 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
         }
     }
 
+    /// `NTT_G4X2_TWL_MSL_SOURCE` with the zero-lane compacted grid
+    /// (`ntt_fused_reg4g4x2_zl`). The butterflies, tables and twiddles are the
+    /// incumbent's; only the (tile, lane) column each thread slot owns
+    /// changes. A block's live columns are enumerated per (even r, odd r)
+    /// tile pair as 64 even-tile lanes then odd-tile lanes 0..56, so every
+    /// group still runs 2 x 128 columns of ONE block (uniform twiddles) and
+    /// the 7 zero columns of every odd tile are never loaded or stored.
+    /// `None` if an anchor drifted (the encoders then keep the dense grid).
+    pub(crate) fn g4x2_zero_lane_msl_source() -> Option<String> {
+        let base = NTT_G4X2_TWL_MSL_SOURCE;
+        // Column c of block B -> (position, lane): tile pair q = c / 121, the
+        // pair's first 64 columns are the even tile's lanes, the next 57 the
+        // odd tile's lanes 0..56. Recomputed at the stores (not held live
+        // across the register-resident butterflies).
+        let col = "#define ZL_COL(C, POS, LN) { const uint q_ = (C) / 121u; const uint m_ = (C) - q_ * 121u; \\\n    const uint o_ = m_ >= 64u ? 1u : 0u; POS = pblk + (q_ << 1) + o_; LN = m_ - (o_ << 6); }\n";
+        let reps: Vec<(&str, String)> = vec![
+            (
+                "kernel void ntt_fused_reg4g4x2(",
+                format!("{col}kernel void ntt_fused_reg4g4x2_zl("),
+            ),
+            (
+                "    const uint lane = lid;\n    const uint B = tgid >> (P.s - LOG_G);\n    const uint r_base = (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;\n",
+                "    // Zero-lane compaction (see g4x2_zero_lane_msl_source); s = 12 only,\n    // where a block's 121 << 11 live columns fill exactly 968 groups.\n    const uint gpb = ((121u << P.s) + 511u) >> 9;\n    const uint B = tgid / gpb;\n    const uint g = tgid - B * gpb;\n    const uint pblk = B << (P.log_d - P.l);\n".to_string(),
+            ),
+            (
+                "        const uint ra = r_base + (it << 1);\n        const uint rb = ra + 1u;\n        const uint pa = (B << (P.log_d - P.l)) + ra;\n        const uint pb = (B << (P.log_d - P.l)) + rb;\n        uint4 ea[NF];\n        uint4 eb[NF];\n        for (uint e = 0; e < NF; e++) {\n            ea[e] = data[((pa + (e << P.s)) << 6) + lane];\n            eb[e] = data[((pb + (e << P.s)) << 6) + lane];\n        }\n",
+                "        uint4 ea[NF];\n        uint4 eb[NF];\n        {\n            uint pa, la, pb, lb;\n            ZL_COL((g << 8) + (it << 7) + lid, pa, la)\n            ZL_COL((g << 8) + (it << 7) + 64u + lid, pb, lb)\n            for (uint e = 0; e < NF; e++) {\n                ea[e] = data[((pa + (e << P.s)) << 6) + la];\n                eb[e] = data[((pb + (e << P.s)) << 6) + lb];\n            }\n        }\n".to_string(),
+            ),
+            (
+                "        for (uint e = 0; e < NF; e++) {\n            data[((pa + (e << P.s)) << 6) + lane] = ea[e];\n            data[((pb + (e << P.s)) << 6) + lane] = eb[e];\n        }\n",
+                "        {\n            uint pa, la, pb, lb;\n            ZL_COL((g << 8) + (it << 7) + lid, pa, la)\n            ZL_COL((g << 8) + (it << 7) + 64u + lid, pb, lb)\n            for (uint e = 0; e < NF; e++) {\n                data[((pa + (e << P.s)) << 6) + la] = ea[e];\n                data[((pb + (e << P.s)) << 6) + lb] = eb[e];\n            }\n        }\n".to_string(),
+            ),
+        ];
+        let mut out = base.to_string();
+        for (a, b) in reps {
+            if out.matches(a).count() != 1 {
+                return None;
+            }
+            out = out.replacen(a, &b, 1);
+        }
+        Some(out)
+    }
+
     const NTT_G4X2_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -4369,6 +4485,698 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     /// order and its exact field product are unchanged, so the output is
     /// bit-identical. Its own library: a compile failure keeps
     /// `ntt_pass5_mixed`.
+    const T3_BYTETAB3_BUILD: &str = "    threadgroup uint* tab3 = (threadgroup uint*)tabB;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    const uint cc = lid >> 3;
+    const uint base = (lid & 7u) * 32u;
+    const uint tw3 = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cc].x;
+    uint hb = 0u;
+    for (uint k = 5u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= tw3 << k; } }
+    for (uint i = 0u; i < 32u; i++) {
+        uint v = hb;
+        for (uint k = 0u; k < 5u; k++) { if ((i >> k) & 1u) { v ^= tw3 << k; } }
+        tab3[cc * 256u + base + i] = v;
+    }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    constexpr uint j = 3u;
+";
+    const T3_BYTETAB3_MUL: &str = "            const uint cb = c * 256u;
+        const uint4 V = elems[ev];
+        uint q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u, q4 = 0u;
+        #define T3B(W, LO, HI) { \\
+            const uint t0 = tab3[cb + ((W) & 255u)]; LO ^= t0; \\
+            const uint t1 = tab3[cb + extract_bits((W), 8, 8)]; LO ^= t1 << 8; HI ^= t1 >> 24; \\
+            const uint t2 = tab3[cb + extract_bits((W), 16, 8)]; LO ^= t2 << 16; HI ^= t2 >> 16; \\
+            const uint t4 = tab3[cb + ((W) >> 24)]; LO ^= t4 << 24; HI ^= t4 >> 8; }
+        T3B(V.x, q0, q1) T3B(V.y, q1, q2) T3B(V.z, q2, q3) T3B(V.w, q3, q4)
+        #undef T3B
+        q0 ^= q4 ^ (q4 << 1) ^ (q4 << 2) ^ (q4 << 7);
+        uint4 acc = uint4(q0, q1, q2, q3);
+";
+
+    const T3_SUB3_HORNER: &str = "            threadgroup const uint* nb = &nibB[c * NNIB];
+            uint4 V0 = elems[ev];
+            uint4 V1 = gf_mulx(V0), V2 = gf_mulx(V1), V3 = gf_mulx(V2);
+            uint4 acc = uint4(0u);
+            for (int q = (int)NNIB - 1; q >= 0; q--) {
+                acc = gf_shl4(acc);
+                uint n = nb[q];
+                if (n & 1u) acc ^= V0;
+                if (n & 2u) acc ^= V1;
+                if (n & 4u) acc ^= V2;
+                if (n & 8u) acc ^= V3;
+            }
+";
+
+    // The published 2633d97f anchors below were written as a literal
+    // backslash-n and never matched, so the ranked leaf-fused final pass kept
+    // the nibble Horner for sub-layer 3; real newlines let the splice apply.
+    fn with_fused_bytetab3(src: &str) -> Option<String> {
+        let indent = |t: &str| t.lines().map(|l| if l.is_empty() { String::new() } else { format!("    {l}") }).collect::<Vec<_>>().join("\n") + "\n";
+        let pre = "        {\n            constexpr uint j = 3u;\n";
+        let sub3 = indent(T3_SUB3_HORNER);
+        if src.matches(pre).count() != 1 || src.matches(sub3.as_str()).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(sub3.as_str(), T3_BYTETAB3_MUL, 1))
+    }
+
+    fn with_t3_bytetab3(src: &str) -> Option<String> {
+        let pre = "    {\n        constexpr uint j = 3u;\n";
+        if src.matches(pre).count() != 1 || src.matches(T3_SUB3_HORNER).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(T3_SUB3_HORNER, T3_BYTETAB3_MUL, 1))
+    }
+
+    const T3_BYTETAB2: &str = "    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        threadgroup ulong* tab64 = (threadgroup ulong*)tabB;
+        const uint cc = lid >> 4;
+        const uint base = (lid & 15u) * 16u;
+        const uint4 tw4 = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2) + cc];
+        const ulong t = ulong(tw4.x) | (ulong(tw4.y) << 32);
+        ulong hb = 0ul;
+        for (uint k = 4u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= t << k; } }
+        for (uint i = 0u; i < 16u; i++) {
+            ulong v = hb;
+            for (uint k = 0u; k < 4u; k++) { if ((i >> k) & 1u) { v ^= t << k; } }
+            tab64[cc * 256u + base + i] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        threadgroup const ulong* tab64 = (threadgroup const ulong*)tabB;
+        for (uint b = 0; b < 8u; b++) {
+            const uint eu = ((b >> 1) << 2) | (b & 1u);
+            const uint ev = eu | 2u;
+            threadgroup const ulong* T = tab64 + (b >> 1) * 256u;
+            const uint4 V = elems[ev];
+            ulong a0 = 0ul, a1 = 0ul, a2 = 0ul;
+            #define BT2(W, SH, LO, HI) { \\
+                const ulong e = T[extract_bits((W), (SH) & 31u, 8)]; \\
+                LO ^= e << (SH); if ((SH) != 0u) { HI ^= e >> (64u - (SH)); } }
+            BT2(V.x, 0u, a0, a1) BT2(V.x, 8u, a0, a1) BT2(V.x, 16u, a0, a1) BT2(V.x, 24u, a0, a1)
+            BT2(V.y, 32u, a0, a1) BT2(V.y, 40u, a0, a1) BT2(V.y, 48u, a0, a1) BT2(V.y, 56u, a0, a1)
+            BT2(V.z, 0u, a1, a2) BT2(V.z, 8u, a1, a2) BT2(V.z, 16u, a1, a2) BT2(V.z, 24u, a1, a2)
+            BT2(V.w, 32u, a1, a2) BT2(V.w, 40u, a1, a2) BT2(V.w, 48u, a1, a2) BT2(V.w, 56u, a1, a2)
+            #undef BT2
+            a0 ^= a2 ^ (a2 << 1) ^ (a2 << 2) ^ (a2 << 7);
+            const uint4 pr = uint4(uint(a0), uint(a0 >> 32), uint(a1), uint(a1 >> 32));
+            const uint4 nu = elems[eu] ^ pr;
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }
+";
+
+    fn with_t3_bytetab2(src: &str) -> Option<String> {
+        let old = "    NTT_T3_SHORT_PAIR(2u, 0u)\n    NTT_T3_SHORT_PAIR(2u, 2u)\n";
+        if src.matches(old).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(old, T3_BYTETAB2, 1))
+    }
+
+    fn final_t3_msl_source() -> std::borrow::Cow<'static, str> {
+        let mut s = std::borrow::Cow::Borrowed(NTT_FINAL_T3_MSL_SOURCE);
+        if super::gpu_t3_bytetab_enabled() {
+            if let Some(x) = with_t3_bytetab3(&s) {
+                s = std::borrow::Cow::Owned(x);
+            }
+        }
+        if super::gpu_t3_bytetab2_enabled() {
+            if let Some(x) = with_t3_bytetab2(&s) {
+                s = std::borrow::Cow::Owned(x);
+            }
+        }
+        s
+    }
+
+    #[cfg(test)]
+    mod t3_bytetab2_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab2_splice_applies_alone_and_after_sub3() {
+            let a = with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).expect("sub-layer 2 not found");
+            assert!(a.contains("tab64[cc * 256u + base + i] = v;") && !a.contains("NTT_T3_SHORT_PAIR(2u, 0u)"));
+            let b = with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).expect("not after sub-layer 3");
+            assert!(b.contains("tab64[cc * 256u + base + i] = v;") && b.contains("tab3[cc * 256u + base + i] = v;"));
+        }
+
+        #[test]
+        fn t3_bytetab2_twiddle_bound_holds() {
+            assert!(super::super::max_twiddle_bits(20, 18) <= 40);
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab2_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let groups = 256usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = groups * 16 * 64 * 16;
+                let input: Vec<u8> = {
+                    let mut x = 0x0123_4567_89AB_CDEFu64;
+                    (0..len / 8)
+                        .flat_map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            x.to_le_bytes()
+                        })
+                        .collect()
+                };
+                let data = gpu.new_buffer(len).unwrap();
+                let run = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, groups as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                };
+                let inc = run(NTT_FINAL_T3_MSL_SOURCE);
+                let two = run(&with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                let both = run(&with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).unwrap());
+                assert!(inc != input, "the pass did not run");
+                assert!(inc == two, "byte-table sub-layer 2 changed the final pass's output");
+                assert!(inc == both, "both byte-table sub-layers changed the final pass's output");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod t3_bytetab_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab_splice_applies() {
+            let out = with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).expect("incumbent sub-layer 3 not found");
+            assert!(out.contains("tab3[cc * 256u + base + i] = v;"));
+            assert!(!out.contains("acc = gf_shl4(acc);"));
+            assert!(out.contains("kernel void ntt_final_t3("));
+        }
+
+        #[test]
+        fn t3_bytetab_twiddle_bound_holds() {
+            assert!(super::super::pass5_mixed_ok(20, 16, 4));
+            assert!(super::super::max_twiddle_bits(20, 19) <= 20);
+        }
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let groups = 256usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = groups * 16 * 64 * 16;
+                let input: Vec<u8> = {
+                    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+                    (0..len / 8)
+                        .flat_map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            x.to_le_bytes()
+                        })
+                        .collect()
+                };
+                let data = gpu.new_buffer(len).unwrap();
+                let run = |src: &str| -> Vec<u8> {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, groups as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                };
+                let inc = run(NTT_FINAL_T3_MSL_SOURCE);
+                let new = run(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                assert!(inc != input, "the pass did not run");
+                assert!(inc == new, "byte-table sub-layer 3 changed the final pass's output");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    /// ntt/gpubuild pane: GPU zero-lane deletion (`FLOCK_NO_GPU_ZERO_LANE`).
+    #[cfg(test)]
+    mod zero_lane_tests {
+        use super::*;
+
+        #[test]
+        fn zero_lane_splice_applies_and_grid_counts() {
+            let src = g4x2_zero_lane_msl_source().expect("zero-lane splice anchors drifted");
+            assert!(src.contains("kernel void ntt_fused_reg4g4x2_zl("));
+            assert!(!src.contains("+ lane]"), "a dense load/store survived");
+            assert_eq!(super::super::zero_lane_groups_per_block(12), 968);
+            assert_eq!(super::super::zero_lane_groups_per_block(8), 61);
+            // Groups-per-block shrink only from s = 8 up (dense: 2^(s-2)).
+            assert_eq!(super::super::zero_lane_groups_per_block(4), 4);
+            // s = 12: the compacted grid is exactly full (no partial group).
+            assert_eq!(super::super::zero_lane_groups_per_block(12) * 256, 121u64 << 11);
+        }
+
+        #[test]
+        fn zero_lane_publication_is_scoped_and_shape_gated() {
+            assert!(!super::super::gpu_zero_lane_pass(20, 12), "published outside a proof");
+            {
+                let _g = super::super::GpuZeroTailLanes::scope(64, 7);
+                if super::super::gpu_zero_lane_enabled() {
+                    assert!(super::super::gpu_zero_lane_pass(20, 12));
+                }
+                assert!(!super::super::gpu_zero_lane_pass(20, 8), "s = 8 would need validity flags");
+                assert!(!super::super::gpu_zero_lane_pass(20, 4));
+                assert!(!super::super::gpu_zero_lane_pass(18, 12));
+                let _h = super::super::GpuZeroTailLanes::scope(8, 7);
+                assert!(!super::super::gpu_zero_lane_pass(20, 12), "8-lane commit must not inherit");
+            }
+            assert!(!super::super::gpu_zero_lane_pass(20, 12), "guard did not restore");
+        }
+
+        unsafe fn zl_fixture(gpu: &Gpu) -> (Id, Id, Vec<u8>, usize) {
+            unsafe {
+                let log_d = 20usize;
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let positions = 1usize << 16; // 64 MiB prefix
+                let len = positions * 64 * 16;
+                let mut x = 0x2E0_1A5E_u64;
+                let mut input: Vec<u8> = (0..len / 8)
+                    .flat_map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x.to_le_bytes()
+                    })
+                    .collect();
+                for p in (1..positions).step_by(2) {
+                    for lane in 57..64 {
+                        let o = (p * 64 + lane) * 16;
+                        input[o..o + 16].fill(0);
+                    }
+                }
+                let data = gpu.new_buffer(len).unwrap();
+                (tw, data, input, len)
+            }
+        }
+
+        unsafe fn run_pass(gpu: &Gpu, pso: Id, data: Id, tw: Id, l: usize, groups: u64) -> (f64, ()) {
+            unsafe {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, data, 0, 0);
+                gpu.set_buffer(enc, tw, 0, 1);
+                let p = NttParams { log_d: 20, l: l as u32, f: 4, s: (16 - l) as u32 };
+                let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                gpu.set_bytes(enc, bytes, 2);
+                gpu.dispatch(enc, groups, 64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = cb_gpu_interval(gpu, cb);
+                ((e - s) * 1e3, ())
+            }
+        }
+
+        fn dense_groups(l: usize) -> u64 {
+            (1u64 << (20 - 4 - 2)) / 16 + 0 * l as u64
+        }
+        fn zl_groups(l: usize) -> u64 {
+            (1u64 << l) * super::super::zero_lane_groups_per_block(16 - l) / 16
+        }
+
+        /// Exactness on a 64 MiB prefix with the ranked zero columns: each of
+        /// the s = 12 and s = 8 passes alone, and the chained mid passes
+        /// (4, 8, 12) followed by the production final pass, compacted vs dense.
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn zero_lane_g4x2_matches_dense() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let (tw, data, input, len) = zl_fixture(gpu);
+                let dense = compile_supplemental_pipeline(gpu, NTT_G4X2_TWL_MSL_SOURCE, "ntt_fused_reg4g4x2").unwrap();
+                let zl = compile_supplemental_pipeline(gpu, &g4x2_zero_lane_msl_source().unwrap(), "ntt_fused_reg4g4x2_zl").unwrap();
+                let read = || std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec();
+                let load = || std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                for l in [4usize] {
+                    load();
+                    run_pass(gpu, dense, data, tw, l, dense_groups(l));
+                    let a = read();
+                    load();
+                    run_pass(gpu, zl, data, tw, l, zl_groups(l));
+                    let b = read();
+                    assert!(a != input, "dense pass did not run at l={l}");
+                    assert!(a == b, "zero-lane pass diverges from dense at l={l}");
+                }
+                // Chain: mid passes then the production final pass.
+                let fin = compile_supplemental_pipeline(gpu, &final_t3_msl_source(), "ntt_final_t3").unwrap();
+                let chain = |use_zl: bool| -> Vec<u8> {
+                    load();
+                    for l in [4usize, 8, 12] {
+                        if use_zl && l == 4 {
+                            run_pass(gpu, zl, data, tw, l, zl_groups(l));
+                        } else {
+                            run_pass(gpu, dense, data, tw, l, dense_groups(l));
+                        }
+                    }
+                    run_pass(gpu, fin, data, tw, 16, (1u64 << 16) / 16);
+                    read()
+                };
+                let a = chain(false);
+                let b = chain(true);
+                assert!(a == b, "chained cb2 NTT differs with zero-lane passes");
+                // The deleted columns are genuinely zero at every mid-pass
+                // boundary of the dense chain (the invariant the kernel uses).
+                load();
+                for l in [4usize, 8, 12] {
+                    run_pass(gpu, dense, data, tw, l, dense_groups(l));
+                    let v = read();
+                    for p in (1..(1usize << 16)).step_by(2) {
+                        let o = (p * 64 + 57) * 16;
+                        assert!(v[o..o + 7 * 16].iter().all(|&x| x == 0), "column not zero after l={l}");
+                    }
+                }
+                for p in [dense, zl, fin] {
+                    gpu.release(p);
+                }
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+
+        /// GPU-ms per 1 GiB pass, dense vs compacted, interleaved rounds.
+        #[test]
+        #[ignore = "timing probe"]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn ntt500_zero_lane_probe() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let (tw, data, input, len) = zl_fixture(gpu);
+                std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                let dense = compile_supplemental_pipeline(gpu, NTT_G4X2_TWL_MSL_SOURCE, "ntt_fused_reg4g4x2").unwrap();
+                let zl = compile_supplemental_pipeline(gpu, &g4x2_zero_lane_msl_source().unwrap(), "ntt_fused_reg4g4x2_zl").unwrap();
+                let warm = std::time::Instant::now();
+                while warm.elapsed().as_secs_f64() < 2.0 {
+                    run_pass(gpu, dense, data, tw, 8, dense_groups(8));
+                }
+                let rounds = 11usize;
+                let mut t = vec![vec![Vec::new(); 2]; 1]; // [l index][variant]
+                for r in 0..rounds {
+                    for (li, l) in [4usize].into_iter().enumerate() {
+                        for k in 0..2 {
+                            let v = (k + r) % 2;
+                            let (pso, g) = if v == 0 { (dense, dense_groups(l)) } else { (zl, zl_groups(l)) };
+                            let mut best = f64::MAX;
+                            for _ in 0..5 {
+                                best = best.min(run_pass(gpu, pso, data, tw, l, g).0 * 16.0);
+                            }
+                            t[li][v].push(best);
+                        }
+                    }
+                }
+                for (li, l) in [4usize].into_iter().enumerate() {
+                    let med = |v: &Vec<f64>| {
+                        let mut v = v.clone();
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        v[v.len() / 2]
+                    };
+                    let mut d: Vec<f64> = t[li][1].iter().zip(&t[li][0]).map(|(a, b)| a - b).collect();
+                    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let lower = t[li][1].iter().zip(&t[li][0]).filter(|(a, b)| a < b).count();
+                    eprintln!(
+                        "l={l} s={}: dense {:.2} ms/GiB, zero-lane {:.2} ms/GiB, paired {:+.2} ({:+.1}%), lower in {lower}/{rounds}",
+                        16 - l,
+                        med(&t[li][0]),
+                        med(&t[li][1]),
+                        d[d.len() / 2],
+                        100.0 * d[d.len() / 2] / med(&t[li][0])
+                    );
+                }
+                gpu.release(dense);
+                gpu.release(zl);
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    /// Re-add of 2633d97f (fkiene, carrying kshitij-hash f34681d2/eee7f9de)
+    /// onto e60174c: pins which ranked final-pass kernels receive the splices,
+    /// so the re-add cannot silently drift.
+    #[cfg(test)]
+    mod t3_bytetab_readd_tests {
+        use super::*;
+
+        #[test]
+        fn t3_bytetab_splices_reach_ranked_final_sources() {
+            if !(super::super::gpu_t3_bytetab_enabled() && super::super::gpu_t3_bytetab2_enabled()) {
+                return;
+            }
+            let plain = final_t3_msl_source();
+            assert!(plain.contains("tab3[cc * 256u + base + i] = v;"), "plain sub-layer 3");
+            assert!(plain.contains("tab64[cc * 256u + base + i] = v;"), "plain sub-layer 2");
+            let leaf = final_leaf_msl_source();
+            assert_eq!(leaf.matches("tab64[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 2");
+            // With real newlines in `with_fused_bytetab3`'s anchors the fused
+            // leaf kernel gets sub-layer 3 as well.
+            assert_eq!(leaf.matches("tab3[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 3");
+            assert!(with_fused_bytetab3(NTT_FINAL_LEAF_EXTRA_MSL).is_some());
+        }
+
+        /// The ranked leaf-fused final pass with both byte-table sub-layers
+        /// writes the incumbent's codeword AND the incumbent's leaf + three
+        /// parent-level hashes (16 MiB position prefix).
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_bytetab_fused_leaf_matches_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let log_d = 20usize;
+            let n_leaves = 1usize << log_d;
+            let prefix = 1usize << 14;
+            unsafe {
+                let pool = gpu.pool_push();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = prefix * 64 * 16;
+                let mut x = 0xB17E_7AB3_u64;
+                let input: Vec<u8> = (0..len / 8)
+                    .flat_map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x.to_le_bytes()
+                    })
+                    .collect();
+                let data = gpu.new_buffer(len).unwrap();
+                let tree_len = 2 * n_leaves * 32;
+                let tree = gpu.new_buffer(tree_len).unwrap();
+                let run = |src: &str| -> (Vec<u8>, Vec<u8>) {
+                    let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3_leaf").unwrap();
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    std::ptr::write_bytes(gpu.buffer_contents(tree), 0, tree_len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    let w1 = n_leaves;
+                    let w2 = w1 + n_leaves / 2;
+                    let w3 = w2 + n_leaves / 4;
+                    gpu.set_buffer(enc, tree, 0, 3);
+                    gpu.set_buffer(enc, tree, w1 * 32, 4);
+                    gpu.set_buffer(enc, tree, w2 * 32, 5);
+                    gpu.set_buffer(enc, tree, w3 * 32, 6);
+                    gpu.dispatch(enc, (prefix / 64) as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    gpu.release(pso);
+                    (
+                        std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec(),
+                        std::slice::from_raw_parts(gpu.buffer_contents(tree), tree_len).to_vec(),
+                    )
+                };
+                let (d0, t0) = run(&format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}"));
+                let (d1, t1) = run(&final_leaf_msl_source());
+                assert!(d0 != input, "the pass did not run");
+                assert!(t0.iter().any(|&b| b != 0), "no hashes written");
+                assert!(d0 == d1, "byte tables changed the fused final pass's codeword");
+                assert!(t0 == t1, "byte tables changed the fused final pass's leaf/parent hashes");
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.release(tree);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod t3_form_probe {
+        use super::*;
+
+        fn variant(name: &str) -> String {
+            match name {
+                "incumbent" => NTT_FINAL_T3_MSL_SOURCE.to_owned(),
+                "bytetab3" => with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap(),
+                "bytetab2" => with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).unwrap(),
+                "both" => with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).unwrap(),
+                _ => panic!("unknown variant {name}"),
+            }
+        }
+
+        #[test]
+        #[ignore]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn t3_form_probe() {
+            let names: Vec<String> = std::env::var("T3_PROBE_VARIANTS")
+                .unwrap_or_else(|_| "incumbent,bytetab3,bytetab2,both".into())
+                .split(',')
+                .map(|s| s.to_owned())
+                .collect();
+            let rounds: usize = std::env::var("T3_PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let gpu = gpu().expect("gpu");
+            let log_d = 20usize;
+            unsafe {
+                let pool = gpu.pool_push();
+                let mut psos = Vec::new();
+                for n in &names {
+                    let pso = compile_supplemental_pipeline(gpu, &variant(n), "ntt_final_t3")
+                        .unwrap_or_else(|e| panic!("{n}: {e}"));
+                    let (tg, w, maxt) = gpu.pipeline_resources(pso);
+                    println!("variant {n}: threadgroup mem {tg} B, simd {w}, max threads {maxt}");
+                    psos.push(pso);
+                }
+                let data_len = (1usize << log_d) * 64 * 16;
+                let input = gpu.new_buffer(data_len).unwrap();
+                let data = gpu.new_buffer(data_len).unwrap();
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let w = gpu.buffer_contents(input).cast::<u64>();
+                let mut x = 0x2545_F491_4F6C_DD1Du64;
+                for i in 0..data_len / 8 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *w.add(i) = x;
+                }
+                let run = |pso: Id| -> (f64, u64) {
+                    std::ptr::copy_nonoverlapping(gpu.buffer_contents(input), gpu.buffer_contents(data), data_len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 16, f: 4, s: 0 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, 1u64 << (log_d - 4), 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let (s, e) = cb_gpu_interval(gpu, cb);
+                    let words = std::slice::from_raw_parts(gpu.buffer_contents(data).cast::<u64>(), data_len / 8);
+                    let mut h = 0xcbf2_9ce4_8422_2325u64;
+                    for &w in words.iter().step_by(7) {
+                        h = (h ^ w).wrapping_mul(0x1000_0000_01b3);
+                    }
+                    ((e - s) * 1e3, h)
+                };
+                let (_, h_ref) = run(psos[0]);
+                let mut times: Vec<Vec<f64>> = vec![Vec::new(); psos.len()];
+                for r in 0..rounds {
+                    let k = psos.len();
+                    for j in 0..k {
+                        let i = (r + j) % k;
+                        let (ms, h) = run(psos[i]);
+                        if !names[i].starts_with("x_") {
+                            assert_eq!(h, h_ref, "variant {} output differs", names[i]);
+                        }
+                        times[i].push(ms);
+                    }
+                }
+                for (i, n) in names.iter().enumerate() {
+                    let mut t = times[i].clone();
+                    t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let mut d: Vec<f64> = times[i].iter().zip(&times[0]).map(|(a, b)| a - b).collect();
+                    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let lower = times[i].iter().zip(&times[0]).filter(|(a, b)| a < b).count();
+                    println!(
+                        "summary {n}: median {:.2} ms, min {:.2} ms, paired median vs incumbent {:+.2} ms, lower in {lower} of {}",
+                        t[t.len() / 2], t[0], d[d.len() / 2], t.len()
+                    );
+                }
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
     const NTT_FINAL_T3_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -4977,7 +5785,19 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
 "#;
 
     pub(crate) fn final_leaf_msl_source() -> String {
-        format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}")
+        let extra: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(NTT_FINAL_LEAF_EXTRA_MSL);
+        let extra = if super::gpu_t3_bytetab_enabled() {
+            with_fused_bytetab3(&extra).unwrap_or(extra.into_owned()).into()
+        } else {
+            extra
+        };
+        let extra: std::borrow::Cow<'static, str> = if super::gpu_t3_bytetab2_enabled() {
+            let old = "        NTT_T3_SHORT_PAIR(2u, 0u)\n        NTT_T3_SHORT_PAIR(2u, 2u)\n";
+            if extra.matches(old).count() == 1 { extra.replacen(old, T3_BYTETAB2, 1).into() } else { extra }
+        } else {
+            extra
+        };
+        format!("{}{extra}", final_t3_msl_source())
     }
 
     pub(crate) fn final_leaf_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
@@ -6044,6 +6864,8 @@ kernel void blake3_pow_scan(
         /// `FLOCK_NO_GPU_G4X2` is set; the NTT encoders then keep
         /// `pso_ntt4g4`, which writes the same bytes.
         pub(crate) pso_ntt4g4x2: Id,
+        /// Zero-lane compacted g4x2 (`ntt_fused_reg4g4x2_zl`), NIL when off.
+        pub(crate) pso_ntt4g4x2_zl: Id,
         /// Supplemental ranked final pass (`ntt_final_t3`). `NIL` when its
         /// compile failed, its pipeline cannot run 64-thread groups, or
         /// `FLOCK_NO_GPU_FINAL_T3` is set; the NTT encoders then keep
@@ -6621,12 +7443,71 @@ kernel void blake3_pow_scan(
                 } else {
                     NIL
                 };
+                // Zero-lane compacted g4x2: its own library; any failure
+                // leaves NIL and the encoders keep the dense g4x2 grid.
+                let pso_ntt4g4x2_zl = if !pso_ntt4g4x2.is_null()
+                    && super::gpu_zero_lane_enabled()
+                    && super::gpu_tw_prefetch_enabled()
+                {
+                    (|| -> Result<Id, String> {
+                        let text = g4x2_zero_lane_msl_source().ok_or("zero-lane splice anchor drifted")?;
+                        let src = api.nsstring(&text)?;
+                        let mut err: Id = NIL;
+                        let library: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                            device,
+                            c"newLibraryWithSource:options:error:",
+                            src,
+                            NIL,
+                            &mut err
+                        );
+                        if library.is_null() {
+                            return Err(format!("zero-lane g4x2 compile failed: {}", api.error_string(err)));
+                        }
+                        let ns = api.nsstring("ntt_fused_reg4g4x2_zl")?;
+                        let f: Id = send!(api, unsafe extern "C" fn(Id, Sel, Id) -> Id, library, c"newFunctionWithName:", ns);
+                        if f.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            return Err("zero-lane g4x2 kernel not found".into());
+                        }
+                        let mut pso_err: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            f,
+                            &mut pso_err
+                        );
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                        if pso.is_null() {
+                            return Err(format!("zero-lane g4x2 pipeline: {}", api.error_string(pso_err)));
+                        }
+                        let max_threads: u64 =
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup");
+                        if max_threads < 64 {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                            return Err(format!("zero-lane g4x2 pipeline allows {max_threads} threads"));
+                        }
+                        Ok(pso)
+                    })()
+                    .unwrap_or_else(|e| {
+                        if debug_enabled() {
+                            eprintln!("[gpu-commit] {e}; keeping the dense g4x2 grid");
+                        }
+                        NIL
+                    })
+                } else {
+                    NIL
+                };
                 // Supplemental ranked final pass, its own library. Any
                 // failure, or a pipeline that cannot run a 64-thread group,
                 // leaves NIL and the encoders keep `ntt_pass5_mixed`.
                 let pso_ntt5t3 = if super::gpu_final_t3_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(NTT_FINAL_T3_MSL_SOURCE)?;
+                        let src = api.nsstring(&final_t3_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -6777,6 +7658,7 @@ kernel void blake3_pow_scan(
                     pso_leaf_v4,
                     pso_parent3_v4,
                     pso_ntt4g4x2,
+                    pso_ntt4g4x2_zl,
                     pso_ntt5t3,
                     pso_final_leaf,
                     pso_pow,
@@ -7543,6 +8425,15 @@ kernel void blake3_pow_scan(
                 // loses badly because each lane keeps 16 F128s live.
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if share_log > 0
+                        && !gpu.pso_ntt4g4x2_zl.is_null()
+                        && super::gpu_zero_lane_pass(log_d, s) =>
+                    {
+                        if debug_enabled() {
+                            eprintln!("[gpu-commit] zero-lane g4x2 pass l={l} s={s}");
+                        }
+                        (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
+                    }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
                         (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
                     }
@@ -7612,6 +8503,15 @@ kernel void blake3_pow_scan(
                 debug_assert!(l >= 4, "prefix passes require layer >= 4 blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if share_log > 0
+                        && !gpu.pso_ntt4g4x2_zl.is_null()
+                        && super::gpu_zero_lane_pass(log_d, s) =>
+                    {
+                        if debug_enabled() {
+                            eprintln!("[gpu-commit] zero-lane g4x2 pass l={l} s={s}");
+                        }
+                        (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
+                    }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
                         (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
                     }
@@ -7688,6 +8588,15 @@ kernel void blake3_pow_scan(
                 debug_assert!(1u64 << l >= den, "fine prefix finer than the pass's blocks");
                 let s = log_d - l - f;
                 let (pso, tpg, groups) = match f {
+                    4 if share_log > 0
+                        && !gpu.pso_ntt4g4x2_zl.is_null()
+                        && super::gpu_zero_lane_pass(log_d, s) =>
+                    {
+                        if debug_enabled() {
+                            eprintln!("[gpu-commit] zero-lane g4x2 pass l={l} s={s}");
+                        }
+                        (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
+                    }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
                         (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
                     }
@@ -11061,8 +11970,26 @@ kernel void blake3_pow_scan(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
         ), lead, extend, phi);
+        let key = if super::gpu_t3_bytetab2_enabled() {
+            key ^ fnv1a64(T3_BYTETAB2).rotate_left(10) ^ 0x5433_4259_5445_3242
+        } else {
+            key
+        };
+        let key = if super::gpu_t3_bytetab_enabled() {
+            key ^ fnv1a64(T3_BYTETAB3_MUL).rotate_left(8) ^ 0x5433_4259_5445_5442
+        } else {
+            key
+        };
         let key = if super::gpu_g4x2_enabled() {
             key ^ fnv1a64(g4x2_msl_source()).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
+        } else {
+            key
+        };
+        // Zero-lane compaction changes the GPU prefix cost: never reuse a split
+        // tuned for the dense grid, nor the reverse.
+        let key = if super::gpu_zero_lane_enabled() && super::gpu_g4x2_enabled() {
+            key ^ fnv1a64(g4x2_zero_lane_msl_source().as_deref().unwrap_or("")).rotate_left(6)
+                ^ 0x5A45_524F_4C41_4E45 // "ZEROLANE"
         } else {
             key
         };

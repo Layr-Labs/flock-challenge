@@ -5167,6 +5167,22 @@ impl Blake3Setup {
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
         let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+        // The padding rows force the same zero columns the CPU suffix skips
+        // (`ZeroOddTailLanes`); the GPU commit graph is encoded during
+        // witness generation, so publish them for the whole proof.
+        // `FLOCK_NO_GPU_ZERO_LANE=1` keeps the dense GPU grid.
+        let _gpu_zero_lanes = {
+            let padding = self.r1cs.padding_spec();
+            let num_ntts = self.pcs_params.num_ntts();
+            flock_core::gpu_commit::GpuZeroTailLanes::scope(
+                num_ntts,
+                flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+                    num_ntts,
+                    padding.k_log,
+                    padding.useful_bits_per_block,
+                ),
+            )
+        };
         if self.use_ranked_rate2_hot_codeword() {
             // From-message commit: the layer-1 NTT pass synthesizes both
             // rate-1/2 replicas straight from z_packed, so the witness
