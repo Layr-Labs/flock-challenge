@@ -1189,6 +1189,17 @@ pub(crate) fn ab_row_setup_hoist_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_ROW_SETUP_HOIST").is_none())
 }
 
+/// Kill switch for the hoisted bounds check of the helper threads' static-B
+/// window rows ([`AB_HZ_VARIANT`] with [`ABV_HORNER2`]): any value of
+/// `FLOCK_NO_ZC_AB_HZ_HOIST` restores one bounds check per row there, as
+/// `FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` does. Read once per process. The rows
+/// written are byte-identical: only the bounds checks move.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_hz_hoist_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_HZ_HOIST").is_none())
+}
+
 /// All static-B Horner rows of window `w` (see [`BSTATIC_HORNER_WINDOW_ROWS`])
 /// as one unrolled sequence of direct calls into the per-arm bodies, writing
 /// row `b_med` to `out_outer[b_med * 64..][..64]`. Each row checks its own
@@ -1353,11 +1364,12 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                         x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, true,
                     )
                 }
-            } else if const { V == AB_UNIT_HELPER && !HOIST } {
+            } else if const { V == AB_UNIT_HELPER } {
                 // The helper threads' half-pair z rows with the fused
-                // products ([`ABV_FUSE`], `FLOCK_NO_ZC_AB_FUSE_E` kills).
+                // products ([`ABV_FUSE`], `FLOCK_NO_ZC_AB_FUSE_E` kills), with
+                // the same bounds checks (`HOIST`: one per window).
                 if ab_fuse_e_enabled() {
-                    bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM }, false, true>(
+                    bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM }, HOIST, true>(
                         x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                     )
                 } else {
@@ -1429,7 +1441,8 @@ const AB_UNIT_MAIN: u32 =
 
 /// The helper threads' instance of [`bstatic_horner_window_unit_impl`]
 /// (`ab_window_unit_plan`'s helper form). With non-temporal stores it runs
-/// with [`ABV_FUSE`] added unless `FLOCK_NO_ZC_AB_FUSE_E` is set.
+/// with [`ABV_FUSE`] added unless `FLOCK_NO_ZC_AB_FUSE_E` is set, with
+/// either bounds-check form (`HOIST`, see [`ab_hz_hoist_enabled`]).
 #[cfg(target_arch = "aarch64")]
 const AB_UNIT_HELPER: u32 = AB_HZ_VARIANT | ABV_HORNER2;
 
@@ -1667,7 +1680,7 @@ fn ab_window_unit_nt_matches_flag_form() {
 /// The main-pool unit rows with [`ABV_Z_OUT3`] write the parent instance's
 /// bytes for both store flavours, and [`bstatic_horner_window_unit_impl`]
 /// writes them too (main-pool instance) or the flag form's (helper
-/// instance): units of eight chunks from window 0, three from window 1 and
+/// instances): units of eight chunks from window 0, three from window 1 and
 /// one from either window, in a unit scratch and at a chunk offset in a
 /// whole buffer, with B rows that satisfy the static masks (every row on its
 /// plan), random B rows (every row through the fallback) and B rows where
@@ -1746,11 +1759,13 @@ fn ab_window_unit_z_out3_matches_parent() {
                     let via = run(&|o| bstatic_horner_window_unit_impl::<AB_UNIT_MAIN, true>(x0, 1, a_in, b_in, &table, base, p, o, nt));
                     let helper_want = run(&|o| bstatic_horner_window_unit_flag::<HELPER, false>(x0, 1, a_in, b_in, &table, base, p, o, nt));
                     let helper_got = run(&|o| bstatic_horner_window_unit_impl::<HELPER, false>(x0, 1, a_in, b_in, &table, base, p, o, nt));
+                    let helper_hoisted = run(&|o| bstatic_horner_window_unit_impl::<HELPER, true>(x0, 1, a_in, b_in, &table, base, p, o, nt));
                     let at = format!("x0={x0} n={n} case={case} scratch={in_scratch} nt={nt}");
                     assert!(want.iter().any(|&x| x != 0x3c), "{at}");
                     assert_eq!(got, want, "{at}");
                     assert_eq!(via, want, "{at}");
                     assert_eq!(helper_got, helper_want, "{at}");
+                    assert_eq!(helper_hoisted, helper_want, "hoisted {at}");
                     checked += 1;
                 }
             }
