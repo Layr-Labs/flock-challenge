@@ -415,10 +415,47 @@ fn lc_gpu_wake_at2() -> u32 {
     *AT2
 }
 
+pub const ENV_NO_LC_WAKE_POST: &str = "FLOCK_NO_LC_WAKE_POST";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static LC_WAKE_POSTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn lc_wake_poster() -> Option<&'static std::thread::Thread> {
+    static POSTER: std::sync::OnceLock<Option<std::thread::Thread>> = std::sync::OnceLock::new();
+    POSTER
+        .get_or_init(|| {
+            if std::env::var(ENV_NO_LC_WAKE_POST).is_ok_and(|v| v == "1") {
+                return None;
+            }
+            std::thread::Builder::new()
+                .name("flock-lc-wake".into())
+                .spawn(|| {
+                    crate::set_calling_thread_prover_qos();
+                    loop {
+                        let n = LC_WAKE_POSTED.swap(0, std::sync::atomic::Ordering::AcqRel);
+                        for _ in 0..n {
+                            imp::lc_gpu_wake();
+                        }
+                        if n == 0 {
+                            std::thread::park();
+                        }
+                    }
+                })
+                .ok()
+                .map(|handle| handle.thread().clone())
+        })
+        .as_ref()
+}
+
 /// Arm (or, with `false`, disarm) the lincheck GPU wake for this prove.
 pub fn lc_gpu_wake_arm(on: bool) {
     if !on {
         lc_gpu_wake_fire(100);
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if on && lc_gpu_wake_enabled() {
+        let _ = lc_wake_poster();
     }
     LC_GPU_WAKE_ARMED.store(on && lc_gpu_wake_enabled(), std::sync::atomic::Ordering::Relaxed);
     LC_GPU_WAKE_ARMED2.store(
@@ -443,7 +480,13 @@ pub(crate) fn lc_gpu_wake_fire(point: u32) {
     }
     crate::tmark::mark(if first { "lc wake fired" } else { "lc wake2 fired" });
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    imp::lc_gpu_wake();
+    match lc_wake_poster() {
+        Some(poster) => {
+            LC_WAKE_POSTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            poster.unpark();
+        }
+        None => imp::lc_gpu_wake(),
+    }
 }
 
 pub(crate) fn gpu_lincheck_enabled() -> bool {
@@ -1843,6 +1886,22 @@ pub unsafe fn begin_from_z_first_pass_stream(
 ) -> Option<FromZFirstPassStream> {
     unsafe { imp::begin_from_z_first_pass_stream(z_ptr, z_len, params) }
         .map(|inner| FromZFirstPassStream { inner })
+}
+
+pub const ENV_NO_STREAM_WARM: &str = "FLOCK_NO_STREAM_WARM";
+
+pub fn warm_streamed_first_pass(params: &crate::pcs::commit::PcsParams) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| !std::env::var(ENV_NO_STREAM_WARM).is_ok_and(|v| v == "1"));
+    if !on
+        || !gpu_commit_enabled()
+        || !is_ranked_gpu_shape(params)
+        || std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
+    {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::warm_streamed_first_pass(params.k_code());
 }
 
 impl FromZFirstPassStream {
@@ -9358,6 +9417,43 @@ kernel void blake3_pow_scan(
                 STAGING_IN_USE.store(false, std::sync::atomic::Ordering::Release);
             }
         }
+    }
+
+    pub(crate) fn warm_streamed_first_pass(log_d: usize) {
+        use std::sync::atomic::Ordering;
+        let Ok(gpu) = gpu() else { return };
+        let latch = latch_lock();
+        let LatchState::On(state) = &*latch else {
+            return;
+        };
+        let Some(&(_, _, z_buf)) = state.wraps.first() else {
+            return;
+        };
+        if STAGING_IN_USE.swap(true, Ordering::Acquire) {
+            return;
+        }
+        let total_r = 1usize << (log_d - 4);
+        unsafe {
+            let pool = gpu.pool_push();
+            let _ = (|| -> Result<(), String> {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                FromZFirstPassPlan::new(log_d).encode_range(
+                    gpu,
+                    enc,
+                    state.staging,
+                    state.tw_buf,
+                    z_buf,
+                    log_d,
+                    0,
+                    total_r,
+                );
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb)
+            })();
+            gpu.pool_pop(pool);
+        }
+        STAGING_IN_USE.store(false, Ordering::Release);
     }
 
     pub(crate) unsafe fn begin_from_z_first_pass_stream(

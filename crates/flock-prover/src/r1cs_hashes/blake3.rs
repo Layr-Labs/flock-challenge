@@ -5170,6 +5170,9 @@ impl Blake3Setup {
                     blocks,
                 );
             }
+            if crate::seed_pipe::is_ranked_worker() {
+                flock_core::gpu_commit::warm_streamed_first_pass(&self.pcs_params);
+            }
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
             // return and only then touches `io::stdin()`, so the splice lands
