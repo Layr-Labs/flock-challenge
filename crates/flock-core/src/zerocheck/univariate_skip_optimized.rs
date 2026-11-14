@@ -795,6 +795,13 @@ pub fn ab_compact_backing_token_counts() -> (usize, usize) {
 pub struct Round1AbInner {
     storage: Vec<F128>,
     representation: Round1AbRepresentation,
+    /// The storage came back through the scratch pool's provenance-token
+    /// path with a HIT: this exact allocation was parked through the tagged
+    /// release of an earlier prove's AB transform and never left pool custody
+    /// since. The round-one GPU completion arm reuses its cached no-copy view
+    /// of the allocation only on such a hit (allocation identity), and
+    /// re-wraps otherwise. Never read by any CPU computation.
+    provenance_hit: bool,
 }
 
 /// Representation carried with the large round-one AB transform backing.
@@ -1314,6 +1321,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
     // raw-zero the complete allocation before constructing any reference and
     // force the historical full-store arm for that warmup/fail-safe proof.
     let storage_len = total_bytes / core::mem::size_of::<F128>();
+    let from_backing = backing.is_some();
     let (mut storage, token_hit) = if let Some(mut b) = backing {
         // Fully initialized by construction (`ExactTuneBacking::zeroed`):
         // treat as a hit so the fill is skipped and the compact arm runs.
@@ -1324,6 +1332,9 @@ fn precompute_round1_ab_inner_packed_padded_body(
     } else {
         (crate::scratch::take_f128(storage_len), false)
     };
+    // Allocation identity only (see `Round1AbInner::provenance_hit`): a
+    // tuner-supplied backing reports `token_hit` without any provenance.
+    let provenance_hit = use_provenance && token_hit && !from_backing;
     if use_provenance && token_hit {
         AB_COMPACT_BACKING_TOKEN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else if use_provenance {
@@ -1433,6 +1444,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         return Round1AbInner {
             storage,
             representation,
+            provenance_hit,
         };
     }
 
@@ -1470,6 +1482,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
     Round1AbInner {
         storage,
         representation,
+        provenance_hit,
     }
 }
 
@@ -1837,13 +1850,17 @@ fn ab_window_rows_plan() -> AbWindowRows {
     use kernels::aarch64 as k;
     use kernels::aarch64::bstatic_horner_window_rows_impl as rows;
     // The default instances: the main-pool Karatsuba rows and the helper
-    // rows. Every kill switch takes the plain instance (the same bytes).
+    // rows, both with one bounds check per window. Every kill switch takes
+    // the plain instance (the same bytes), except that
+    // `FLOCK_NO_ZC_AB_HZ_HOIST` and `FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` keep the
+    // helper rows with one bounds check per row (the same bytes).
     const MAIN: u32 = k::AB_Z_VARIANT
         | k::ABV_INLINE_WINDOW
         | k::ABV_KARA_XOR16
         | k::ABV_BSTATIC_Z
         | k::ABV_KARA_SLOT
         | k::ABV_HORNER2;
+    const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
     if k::ab_kara_enabled() {
         if k::ab_kara_unscaled_enabled()
             && k::ab_z_enabled()
@@ -1859,7 +1876,11 @@ fn ab_window_rows_plan() -> AbWindowRows {
             rows::<0, false>
         }
     } else if k::ab_hz_helper_enabled() && k::ab_horner2_enabled() {
-        rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>
+        if k::ab_row_setup_hoist_enabled() && k::ab_hz_hoist_enabled() {
+            rows::<HELPER, true>
+        } else {
+            rows::<HELPER, false>
+        }
     } else {
         rows::<0, false>
     }
@@ -1907,8 +1928,8 @@ type AbWindowUnitRun = (AbWindowUnit, [&'static [[u8; 64]; 248]; 2]);
 
 /// The unit form of the window-rows instance `rows`, which runs the same
 /// rows with the same arguments for each chunk. The default instances of
-/// the main-pool workers and of the helper threads have one; `None` keeps
-/// one call per chunk.
+/// the main-pool workers and of the helper threads (either bounds-check form)
+/// have one; `None` keeps one call per chunk.
 #[cfg(target_arch = "aarch64")]
 fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
     use kernels::aarch64::{
@@ -1923,6 +1944,8 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
     const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
     if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
         Some(unit::<MAIN, true>)
+    } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, true> as AbWindowRows) {
+        Some(unit::<HELPER, true>)
     } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, false> as AbWindowRows) {
         Some(unit::<HELPER, false>)
     } else {
@@ -3716,6 +3739,168 @@ fn ab_tail_split_chunks(hi_size: usize, big_lo_size: usize, n_banks: usize) -> u
     (*N).min(hi_size)
 }
 
+/// Round-one AB completion GPU prefix arm in flight (see
+/// `gpu_commit::ENV_NO_GPU_ZC_AB_COMPLETION`). The GPU computes the per-chunk
+/// 64-lane partials of chunks `0..cpu_base()`; the CPU drains the rest with
+/// the incumbent kernel and folds both into the same XOR reduction.
+struct AbGpuPrefix {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    job: crate::gpu_commit::ZcAbJob,
+}
+
+impl AbGpuPrefix {
+    /// First chunk the CPU drains (0 during the warm-up oracle probe, when
+    /// the CPU computes every chunk itself).
+    fn cpu_base(&self) -> usize {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.job.cpu_base()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            0
+        }
+    }
+
+    /// Join the GPU. Admitted prove: writes the GPU's partials into
+    /// `partials[..cpu_base()]` and returns `true`. Oracle probe: compares
+    /// the GPU's partials with the CPU's complete `partials` (verdict kept for
+    /// the process) and returns `true`. `false` = the GPU failed after
+    /// admission: the caller must CPU-compute `partials[..cpu_base()]`.
+    fn finish(self, partials: &mut [[F128; ELL]]) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let hi_size = partials.len();
+            match crate::gpu_commit::zc_ab_wait(self.job, partials, hi_size) {
+                crate::gpu_commit::ZcAbResult::Prefix(gpu) => {
+                    partials[..gpu.len()].copy_from_slice(&gpu);
+                    true
+                }
+                crate::gpu_commit::ZcAbResult::Calibrated => true,
+                crate::gpu_commit::ZcAbResult::Failed => false,
+            }
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = partials;
+            true
+        }
+    }
+}
+
+/// The 128 F2-basis images `convert[b * 256 + (1 << k)]` (`[b][k]`) of the
+/// convert table, or `None` unless every entry is the XOR of the basis
+/// images of its set bits AND every row `b >= 1` is `x` times row `b - 1`
+/// (`convert[b][v] = mul_by_x(convert[b - 1][v])`) — the GPU arm expands its
+/// pre-scaled row 0 from the basis and derives rows 1..15 by multiplication
+/// by `x`, so it runs only when both identities reproduce the table.
+fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
+    static BASIS: OnceLock<Option<[F128; 128]>> = OnceLock::new();
+    BASIS
+        .get_or_init(|| {
+            let convert = convert_table();
+            let mut basis = [F128::ZERO; 128];
+            for b in 0..16 {
+                for k in 0..8 {
+                    basis[b * 8 + k] = convert[b * 256 + (1 << k)];
+                }
+            }
+            for b in 0..16 {
+                for v in 0..256usize {
+                    let mut expanded = F128::ZERO;
+                    for k in 0..8 {
+                        if (v >> k) & 1 == 1 {
+                            expanded += basis[b * 8 + k];
+                        }
+                    }
+                    if expanded != convert[b * 256 + v] {
+                        return None;
+                    }
+                    if b != 0 && convert[b * 256 + v] != mul_by_x(convert[(b - 1) * 256 + v]) {
+                        return None;
+                    }
+                }
+            }
+            Some(basis)
+        })
+        .as_ref()
+}
+
+/// Launch the GPU prefix of the folded completion, or `None` (CPU drains
+/// every chunk: kill switch / share 0, arm disabled, non-ranked geometry,
+/// no Metal). Challenge-derived inputs come from the same `r_outer` the CPU
+/// tables use, regrouped as `eq_bot' = eq(r_lo[..4])` and
+/// `e_top' = eq(r_lo[4..]) * D^-1` (their product is `eq_lo * D^-1` exactly).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn launch_ab_completion_gpu_prefix(
+    ab_inner: &Round1AbInner,
+    r_outer: &[F128],
+    n_lo: usize,
+    n_hi: usize,
+    padding: &PaddingSpec,
+) -> Option<AbGpuPrefix> {
+    let share = crate::gpu_commit::gpu_zc_ab_completion_share();
+    if share == 0 {
+        return None;
+    }
+    // Kernel geometry: 4096 `x_lo` rows (1 KiB each) per chunk, at most 128
+    // chunks, and windows selected by the low four `x_lo` bits only.
+    if n_lo != 12 || n_hi > 7 || r_outer.len() != n_lo + n_hi {
+        return None;
+    }
+    let hi_size = 1usize << n_hi;
+    if ab_inner.len_bytes() != hi_size << (n_lo + N_INNER + 3) {
+        return None;
+    }
+    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    if within_outer_mask >= 16 || b_med_counts.len() <= within_outer_mask {
+        return None;
+    }
+    let basis = ab_completion_convert_basis()?;
+    // Row (x_lo, b) is gathered iff the CPU sweep reads it: window
+    // `w = x_lo & within_outer_mask` (the x_hi bits sit above bit n_lo), span
+    // `[first_materialized_b_med(w), materialized_b_med_end(w, n_b_med))`.
+    let mut bmask = [0u32; 16];
+    for bot in 0..16usize {
+        let w = bot & within_outer_mask;
+        let n_b_med = b_med_counts[w] as usize;
+        if n_b_med == 0 {
+            continue;
+        }
+        let first = ab_inner.representation.first_materialized_b_med(w);
+        let end = ab_inner.representation.materialized_b_med_end(w, n_b_med);
+        for row in bmask.iter_mut().take(end.min(16)).skip(first) {
+            *row |= 1 << bot;
+        }
+    }
+    let r_lo = &r_outer[..n_lo];
+    let eq_bot = build_eq(&r_lo[..4]);
+    let e_top = build_eq_scaled(&r_lo[4..], d_inv());
+    let eq_hi = build_eq(&r_outer[n_lo..]);
+    let job = crate::gpu_commit::launch_zc_ab_completion(
+        ab_inner.as_bytes(),
+        ab_inner.provenance_hit,
+        share.min(hi_size),
+        &bmask,
+        basis,
+        &e_top,
+        &eq_bot,
+        &eq_hi,
+    )?;
+    Some(AbGpuPrefix { job })
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn launch_ab_completion_gpu_prefix(
+    _ab_inner: &Round1AbInner,
+    _r_outer: &[F128],
+    _n_lo: usize,
+    _n_hi: usize,
+    _padding: &PaddingSpec,
+) -> Option<AbGpuPrefix> {
+    None
+}
+
 /// Completion set-up: everything the chunk queue reads besides `ab_inner`.
 enum AbCompletionSetup {
     Plain {
@@ -3759,6 +3944,13 @@ where
     let n_hi = fold4_n_hi.min(r_outer.len());
     let n_lo = r_outer.len() - n_hi;
     let bank_bits = fold.bank_bits(n_lo);
+    // GPU prefix arm (`FLOCK_NO_GPU_ZC_AB_COMPLETION` kills): submitted first
+    // so the GPU starts while the CPU builds its tables. Folded drain only.
+    let gpu_prefix = if bank_bits.is_some() && n_hi > 0 {
+        launch_ab_completion_gpu_prefix(ab_inner, r_outer, n_lo, n_hi, padding)
+    } else {
+        None
+    };
     let setup = || {
         if let Some(bank_bits) = bank_bits {
             // The folded arm builds its low factors below and never reads eq.lo.
@@ -3849,50 +4041,60 @@ where
             bank_deferred,
         } => {
             let bank_len = eq_bot.len() * ELL;
+            // GPU prefix arm: in an admitted prove the GPU owns chunks
+            // `0..cpu_base` and the CPU queue starts at `cpu_base`; without the
+            // arm (or during its warm-up oracle probe) `cpu_base == 0` and the
+            // queue below is exactly the incumbent one.
+            let cpu_base = gpu_prefix.as_ref().map_or(0, AbGpuPrefix::cpu_base);
+            let cpu_chunks = hi_size - cpu_base;
             // Tail split (`FLOCK_NO_ZC_AB_TAIL_SPLIT=1` kills): the last
             // `split` chunks of the queue are claimed as two half-ranges of
             // `x_outer_lo` each, halving the queue's ragged-tail grain. The
             // two half partials XOR to the whole chunk's partial exactly.
-            let split = ab_tail_split_chunks(hi_size, big_lo_size, 1usize << bank_bits);
-            let whole = hi_size - split;
+            let split = ab_tail_split_chunks(cpu_chunks, big_lo_size, 1usize << bank_bits);
+            let whole = cpu_chunks - split;
             let half_lo = big_lo_size / 2;
             let mut half_partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(2 * split);
             let half_base = crate::epool::SyncPtr(half_partials.as_mut_ptr());
+            let fold_chunk = |x_hi: usize, range: std::ops::Range<usize>| -> [F128; ELL] {
+                let mut partial = [F128::ZERO; ELL];
+                AB_EQ_FOLD_BANKS.with(|cell| {
+                    let mut banks = cell.borrow_mut();
+                    if banks.len() != bank_len {
+                        banks.clear();
+                        banks.resize(bank_len, F128::ZERO);
+                    }
+                    process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
+                        x_hi,
+                        range,
+                        big_lo_size,
+                        n_lo_and_inner,
+                        within_outer_mask,
+                        &b_med_counts,
+                        ab_inner_bytes,
+                        ab_inner.representation,
+                        &eq_bot,
+                        eq.hi[x_hi],
+                        &tables,
+                        bank_bits,
+                        bank_deferred,
+                        &mut banks,
+                        &mut partial,
+                    );
+                });
+                partial
+            };
             let out = crate::epool::run_hetero_chunks_caller_tail(
                 whole + 2 * split,
                 |i| {
                     let (x_hi, range) = if i < whole {
-                        (i, 0..big_lo_size)
+                        (cpu_base + i, 0..big_lo_size)
                     } else {
                         let j = i - whole;
                         let h = j & 1;
-                        (whole + j / 2, h * half_lo..(h + 1) * half_lo)
+                        (cpu_base + whole + j / 2, h * half_lo..(h + 1) * half_lo)
                     };
-                    let mut partial = [F128::ZERO; ELL];
-                    AB_EQ_FOLD_BANKS.with(|cell| {
-                        let mut banks = cell.borrow_mut();
-                        if banks.len() != bank_len {
-                            banks.clear();
-                            banks.resize(bank_len, F128::ZERO);
-                        }
-                        process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
-                            x_hi,
-                            range,
-                            big_lo_size,
-                            n_lo_and_inner,
-                            within_outer_mask,
-                            &b_med_counts,
-                            ab_inner_bytes,
-                            ab_inner.representation,
-                            &eq_bot,
-                            eq.hi[x_hi],
-                            &tables,
-                            bank_bits,
-                            bank_deferred,
-                            &mut banks,
-                            &mut partial,
-                        );
-                    });
+                    let partial = fold_chunk(x_hi, range);
                     // SAFETY: each queue index owns one disjoint output slot
                     // (whole chunks in `partials`, halves in
                     // `half_partials`) and the synchronous queue join
@@ -3907,15 +4109,42 @@ where
                 },
                 tail,
             );
-            crate::scratch::give_f128(tables);
             // Reassemble each split chunk's partial (XOR is exact).
-            for k in 0..split {
-                let (a, b) = (half_partials[2 * k], half_partials[2 * k + 1]);
-                let mut p = a;
-                for lane in 0..ELL {
-                    p[lane] += b[lane];
+            let reassemble = |partials: &mut [[F128; ELL]]| {
+                for k in 0..split {
+                    let (a, b) = (half_partials[2 * k], half_partials[2 * k + 1]);
+                    let mut p = a;
+                    for lane in 0..ELL {
+                        p[lane] += b[lane];
+                    }
+                    partials[cpu_base + whole + k] = p;
                 }
-                partials[whole + k] = p;
+            };
+            match gpu_prefix {
+                None => {
+                    crate::scratch::give_f128(tables);
+                    reassemble(&mut partials);
+                }
+                Some(prefix) => {
+                    // The oracle probe compares against the CPU's complete
+                    // per-chunk partials, so reassemble before joining.
+                    reassemble(&mut partials);
+                    if !prefix.finish(&mut partials) {
+                        // GPU failed after admission: CPU computes its chunks
+                        // with the same kernel (the arm is now disabled).
+                        crate::epool::run_hetero_chunks_caller_tail(
+                            cpu_base,
+                            |x_hi| {
+                                let partial = fold_chunk(x_hi, 0..big_lo_size);
+                                // SAFETY: one disjoint slot per index; the
+                                // synchronous join publishes the writes.
+                                unsafe { *partials_base.ptr().add(x_hi) = partial };
+                            },
+                            || {},
+                        );
+                    }
+                    crate::scratch::give_f128(tables);
+                }
             }
             out
         }
@@ -5844,8 +6073,9 @@ mod tests {
     /// The per-worker window-rows plan (`FLOCK_NO_ZC_AB_WINDOW_PLAN`). With
     /// the default switches the resolver returns the instance the per-chunk
     /// chain calls: the hoisted z form with the slot and Horner pieces on a
-    /// thread with the Karatsuba apply, the half-pair form with the Horner
-    /// piece on a `flock-ecore-*` worker and with the Karatsuba apply off.
+    /// thread with the Karatsuba apply, the hoisted half-pair form with the
+    /// Horner piece on a `flock-ecore-*` worker and with the Karatsuba apply
+    /// off.
     /// Whole chunks through `precompute_ab_one_chunk` with a plan write the
     /// bytes of the chain at the ranked layout for both windows, every
     /// representation, three drain instantiations and both Karatsuba states,
@@ -5861,7 +6091,7 @@ mod tests {
 
         const V0: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
         let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 }, true>;
-        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>;
+        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, true>;
         assert!(!core::ptr::fn_addr_eq(main, plain));
         let switches = [
             "FLOCK_NO_ZC_AB_KARA",
@@ -5874,6 +6104,7 @@ mod tests {
             "FLOCK_ZC_AB_Z_MT",
             "FLOCK_NO_ZC_AB_HORNER2",
             "FLOCK_NO_ZC_AB_HZ",
+            "FLOCK_NO_ZC_AB_HZ_HOIST",
             "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN",
         ];
         // The chain's picks with every one of its switches unset.
@@ -6620,6 +6851,7 @@ mod tests {
             ab_window_unit_plan(r).is_some_and(|got| core::ptr::fn_addr_eq(got, u))
         };
         assert!(maps(rows::<MAIN, true>, unit::<MAIN, true>));
+        assert!(maps(rows::<HELPER, true>, unit::<HELPER, true>));
         assert!(maps(rows::<HELPER, false>, unit::<HELPER, false>));
         assert!(ab_window_unit_plan(rows::<V0, true>).is_none());
         assert!(ab_window_unit_plan(rows::<{ k::AB_ROWS_VARIANT }, false>).is_none());
@@ -6634,6 +6866,7 @@ mod tests {
             "FLOCK_ZC_AB_Z_MT",
             "FLOCK_NO_ZC_AB_HORNER2",
             "FLOCK_NO_ZC_AB_HZ",
+            "FLOCK_NO_ZC_AB_HZ_HOIST",
             "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN",
         ];
         if switches.iter().all(|s| std::env::var_os(s).is_none()) {
@@ -7594,11 +7827,12 @@ mod tests {
                         check!(AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16);
                         check!(AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z);
                         check!(AB_HZ_VARIANT);
+                        check!(AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2);
                     }
                 }
             }
         }
-        assert_eq!(cases, 32 * 2 * 2 * 2 * 6);
+        assert_eq!(cases, 32 * 2 * 2 * 2 * 7);
     }
 
     /// The hoisted window check rejects slices that do not hold the
