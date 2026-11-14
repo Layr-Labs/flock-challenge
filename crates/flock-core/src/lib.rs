@@ -103,8 +103,12 @@ pub fn micro_stack_enabled() -> bool {
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
-    // Before anything exists: the ranked worker's one idle pause.
-    ranked_start_pause();
+    // Diagnostic run: before anything exists (no thread yet), give this
+    // worker its telemetry quantity (see `tmark`), ...
+    let telem_cut = tmark::telem_init().map(|_| tmark::telem_pause_cut());
+    // ... then the ranked worker's one idle pause, shortened by the time the
+    // telemetry will add later plus a margin.
+    ranked_start_pause(telem_cut.unwrap_or_default());
     let n = std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -173,12 +177,12 @@ fn is_ranked_worker_process() -> bool {
 }
 
 /// Sleep [`RANKED_START_PAUSE`] once per ranked worker process.
-fn ranked_start_pause() {
+fn ranked_start_pause(telem_cut: std::time::Duration) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let kill = std::env::var_os(ENV_NO_READY_PAUSE);
         if let Some(pause) = ranked_start_pause_for(is_ranked_worker_process(), kill.as_deref()) {
-            std::thread::sleep(pause);
+            std::thread::sleep(pause.saturating_sub(telem_cut));
         }
     });
 }
@@ -199,8 +203,10 @@ mod ranked_start_pause_tests {
         // A test binary is never the ranked worker, so this returns at once.
         assert!(!super::is_ranked_worker_process());
         let t = std::time::Instant::now();
-        super::ranked_start_pause();
+        super::ranked_start_pause(std::time::Duration::ZERO);
         assert!(t.elapsed() < super::RANKED_START_PAUSE);
+        // The diagnostic telemetry budget is written against this pause.
+        assert_eq!(super::RANKED_START_PAUSE.as_millis(), crate::tmark::TELEM_PAUSE_MS as u128);
     }
 }
 

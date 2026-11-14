@@ -159,6 +159,8 @@ fn linger_window_ns() -> u64 {
 /// Arm (`true`) or disarm the post-drain linger. The prover arms it for the
 /// post-commit phases only.
 pub fn set_linger_phase(on: bool) {
+    // Diagnostic run: `tmark::arm()` is 0 in every timed proof.
+    let on = on && crate::tmark::arm() != crate::tmark::ARM_NO_LINGER;
     LINGER_PHASE.store(on && linger_window_ns() > 0, Ordering::SeqCst);
 }
 

@@ -5170,6 +5170,23 @@ impl Blake3Setup {
                     blocks,
                 );
             }
+            // Diagnostic run, quantities with extra proofs only: the in-process
+            // A/B, still before readiness and outside every timed interval. A
+            // panic in an extra proof must not take the worker down: the
+            // reading is then reported as never recorded. (A local gate build
+            // lets it through, so the gate fails loudly.)
+            if flock_core::tmark::TELEM_GATE {
+                self.telem_paired_proves(blocks);
+            } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.telem_paired_proves(blocks)
+            }))
+            .is_err()
+            {
+                flock_core::tmark::set_arm(0);
+                flock_core::tmark::reset();
+                flock_core::cpu_keepalive::pool_spin_release();
+                flock_core::gpu_commit::gpu_keepwarm_unpause_if_started();
+            }
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
             // return and only then touches `io::stdin()`, so the splice lands
@@ -5188,6 +5205,104 @@ impl Blake3Setup {
             return (proof, commitment, claim);
         }
         (proof, commitment, claim)
+    }
+
+    /// Diagnostic run (`flock_core::tmark`): when this worker's quantity is a
+    /// pair, prove the warm-up statement `2 * pairs` more times, the default
+    /// path (arm 0) against the quantity's arm in alternating order, and
+    /// record the mean of `t(arm) - t(default)` over the quantity's half of
+    /// the proof and the mean whole time of the default-path proofs. Runs
+    /// before readiness; returns at once in any other worker.
+    fn telem_paired_proves(&self, blocks: &[Compression]) {
+        use flock_core::tmark;
+        let Some((arm, half, pairs, arm_first)) = tmark::telem_pair() else {
+            return;
+        };
+        let (mut sum, mut n) = (0i64, 0i64);
+        let (mut total, mut totals) = (0i64, 0i64);
+        // One unmeasured proof on the arm first: its one-time costs (code
+        // pages never executed in this process, lazy state) are paid here,
+        // as the warm-up proof paid the default path's.
+        {
+            flock_core::cpu_keepalive::keepalive_start();
+            let hot = tmark::now_ns();
+            while tmark::now_ns() < hot + 2_000_000 {
+                core::hint::spin_loop();
+            }
+            flock_core::cpu_keepalive::keepalive_signal();
+            flock_core::cpu_keepalive::keepalive_join();
+            tmark::reset();
+            flock_core::gpu_commit::gpu_keepwarm_prove_started();
+            let mut challenger = flock_core::challenger::FsChallenger::with_hash(
+                crate::seed_pipe::BENCH_DOMAIN,
+                HashKind::Blake3,
+            );
+            tmark::set_arm(arm);
+            let (proof, commitment, _claim) = self.prove_fast_inner(blocks, &mut challenger);
+            tmark::set_arm(0);
+            flock_core::cpu_keepalive::pool_spin_release();
+            if tmark::TELEM_GATE {
+                let mut verifier = flock_core::challenger::FsChallenger::with_hash(
+                    crate::seed_pipe::BENCH_DOMAIN,
+                    HashKind::Blake3,
+                );
+                self.verify(&commitment, &proof, &mut verifier)
+                    .expect("telemetry: an extra proof failed to verify");
+            }
+            drop((proof, commitment));
+        }
+        for pair in 0..pairs {
+            // ABBA inside the worker; the first order alternates by clock bin.
+            let arm_first = arm_first ^ (pair % 2 == 1);
+            let mut ns = [None; 2];
+            for i in 0..2 {
+                let on_arm = (i == 0) == arm_first;
+                // Start as the timed proof starts: pool hot (the keep-alive
+                // the worker runs across its ready -> seed gap), then stopped
+                // the way the seed-pipe thread stops it.
+                flock_core::cpu_keepalive::keepalive_start();
+                let hot = tmark::now_ns();
+                while tmark::now_ns() < hot + 2_000_000 {
+                    core::hint::spin_loop();
+                }
+                flock_core::cpu_keepalive::keepalive_signal();
+                flock_core::cpu_keepalive::keepalive_join();
+                tmark::reset();
+                flock_core::gpu_commit::gpu_keepwarm_prove_started();
+                let mut challenger = flock_core::challenger::FsChallenger::with_hash(
+                    crate::seed_pipe::BENCH_DOMAIN,
+                    HashKind::Blake3,
+                );
+                tmark::set_arm(if on_arm { arm } else { 0 });
+                let t0 = tmark::now_ns();
+                let (proof, commitment, _claim) = self.prove_fast_inner(blocks, &mut challenger);
+                let t1 = tmark::now_ns();
+                tmark::set_arm(0);
+                flock_core::cpu_keepalive::pool_spin_release();
+                ns[on_arm as usize] = tmark::telem_half_of_last_proof(half, t0, t1);
+                if !on_arm {
+                    total += (t1 - t0) as i64;
+                    totals += 1;
+                }
+                if tmark::TELEM_GATE {
+                    // Local gate builds: every extra proof must verify.
+                    let mut verifier = flock_core::challenger::FsChallenger::with_hash(
+                        crate::seed_pipe::BENCH_DOMAIN,
+                        HashKind::Blake3,
+                    );
+                    self.verify(&commitment, &proof, &mut verifier)
+                        .expect("telemetry: an extra proof failed to verify");
+                }
+                drop((proof, commitment));
+            }
+            if let (Some(on), Some(off)) = (ns[1], ns[0]) {
+                sum += on - off;
+                n += 1;
+            }
+        }
+        tmark::reset();
+        tmark::telem_pair_record((n > 0).then(|| sum / n), (totals > 0).then(|| total / totals));
+        flock_core::gpu_commit::gpu_keepwarm_unpause_if_started();
     }
 
     /// Start the speculative seed pipeline for this setup. No-op outside the
@@ -5222,6 +5337,11 @@ impl Blake3Setup {
         );
         let out = setup.prove_fast_inner(blocks, &mut challenger);
         flock_core::cpu_keepalive::pool_spin_release();
+        // Diagnostic run: this proof returns late, at the time that encodes
+        // the worker's telemetry quantity (`flock_core::tmark`). The seed and
+        // publication code that runs after it is untouched.
+        flock_core::tmark::mark("prove end");
+        flock_core::tmark::telem_hold();
         out
     }
 

@@ -1155,6 +1155,13 @@ pub fn gpu_keepwarm_prove_started() {
     imp::keepwarm_pause();
 }
 
+/// Diagnostic run: after extra untimed proves, put the keep-warm bridge back
+/// in the state the warm-up prove left it in.
+pub fn gpu_keepwarm_unpause_if_started() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::keepwarm_unpause_if_started();
+}
+
 pub fn gpu_keepwarm_resume() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     imp::keepwarm_arm();
@@ -1605,7 +1612,8 @@ pub(crate) fn gpu_wait_help_enabled() -> bool {
 )]
 pub(crate) fn help_pool_until(done: impl Fn() -> bool) -> usize {
     crate::epool::help_guest_until(
-        gpu_wait_help_enabled(),
+        // Diagnostic run: `tmark::arm()` is 0 in every timed proof.
+        gpu_wait_help_enabled() && crate::tmark::arm() != crate::tmark::ARM_NO_GPU_WAIT_HELP,
         std::time::Duration::from_millis(2),
         &done,
     )
@@ -10078,6 +10086,13 @@ kernel void blake3_pow_scan(
         use rayon::prelude::*;
         let (k_cpu16, fine_m) = decode_hybrid_split(k_split);
         debug_assert!((1..16).contains(&k_cpu16) && fine_m < 16);
+        // Diagnostic run: the CPU share of this proof's split, as a mark whose
+        // distance from "split base" is the value in ms.
+        {
+            let t = crate::tmark::now_ns();
+            crate::tmark::mark_ns("split base", t);
+            crate::tmark::mark_ns("split k_cpu16", t + k_cpu16 as u64 * 1_000_000);
+        }
         if fine_m > 0 && !hybrid_gpu_suffix_hash_enabled() {
             return Err("fine hybrid split requires the GPU suffix hash path".into());
         }
@@ -10152,6 +10167,7 @@ kernel void blake3_pow_scan(
                             16 - k_cpu16,
                             fine_m,
                             || {
+                                crate::tmark::mark("fine wait start");
                                 let mut spins = 0u32;
                                 while gpu.event_signaled_value(ev) < want {
                                     if gpu_cb_failed(gpu, cb2) {
@@ -10164,6 +10180,7 @@ kernel void blake3_pow_scan(
                                         core::hint::spin_loop();
                                     }
                                 }
+                                crate::tmark::mark("fine wait end");
                                 Ok(())
                             },
                             |_elem_offset: usize, _chunk: &[F128]| {},
@@ -11821,6 +11838,15 @@ kernel void blake3_pow_scan(
 
     pub(crate) fn keepwarm_pause() {
         KEEPWARM_PAUSED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Diagnostic run: undo a [`keepwarm_pause`] if, and only if, the bridge
+    /// had been started (never starts it).
+    pub(crate) fn keepwarm_unpause_if_started() {
+        use std::sync::atomic::Ordering;
+        if KEEPWARM_STARTED.load(Ordering::Acquire) {
+            KEEPWARM_PAUSED.store(false, Ordering::Release);
+        }
     }
 
     /// Resume (and lazily spawn) the keep-warm thread. Called only from the

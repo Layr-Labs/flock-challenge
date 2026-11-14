@@ -786,6 +786,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
+    crate::tmark::mark("zc r1 done");
     if zc_timing {
         eprintln!(
             "[zc-timing] round1 URM: {:.2} ms cpu={:.1}",
@@ -864,6 +865,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         (compact, m1, mi, None)
     };
 
+    crate::tmark::mark("zc r2 done");
     if zc_timing {
         eprintln!(
             "[zc-timing] round2 fused fold: {:.2} ms cpu={:.1}",

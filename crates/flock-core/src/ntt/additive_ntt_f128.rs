@@ -585,7 +585,7 @@ fn tile_prefetch_enabled() -> bool {
 /// Hint the eight positions `p + i * step` (i < 8) of one radix-8 row group,
 /// `num_ntts` lanes each, into L2. No-op off AArch64.
 #[inline(always)]
-unsafe fn prefetch_row_group_l2(p: *const F128, step: usize, num_ntts: usize) {
+unsafe fn prefetch_row_group_l2(p: *const F128, step: usize, num_ntts: usize, immediate: bool) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         const LINE: usize = 128;
@@ -593,6 +593,23 @@ unsafe fn prefetch_row_group_l2(p: *const F128, step: usize, num_ntts: usize) {
         for i in 0..8usize {
             let row = p.add(i * step).cast::<u8>();
             let mut off = 0usize;
+            // Encode the cache-line offsets in PRFM rather than materializing
+            // a new GPR address for every hint. The address set is unchanged.
+            while immediate && off + 8 * LINE <= bytes {
+                core::arch::asm!(
+                    "prfm pldl2keep, [{a}, #0]",
+                    "prfm pldl2keep, [{a}, #128]",
+                    "prfm pldl2keep, [{a}, #256]",
+                    "prfm pldl2keep, [{a}, #384]",
+                    "prfm pldl2keep, [{a}, #512]",
+                    "prfm pldl2keep, [{a}, #640]",
+                    "prfm pldl2keep, [{a}, #768]",
+                    "prfm pldl2keep, [{a}, #896]",
+                    a = in(reg) row.add(off),
+                    options(nostack, readonly, preserves_flags)
+                );
+                off += 8 * LINE;
+            }
             while off < bytes {
                 core::arch::asm!(
                     "prfm pldl2keep, [{a}]",
@@ -604,7 +621,7 @@ unsafe fn prefetch_row_group_l2(p: *const F128, step: usize, num_ntts: usize) {
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
-    let _ = (p, step, num_ntts);
+    let _ = (p, step, num_ntts, immediate);
 }
 
 /// Trailing lanes the ranked commit transform may skip on odd rows, or 0.
@@ -1433,6 +1450,11 @@ impl AdditiveNttF128 {
         let base = data.as_mut_ptr() as usize;
         let n_jobs = (b_end - b_start) * tiles_per_block;
         let prefetch = tile_prefetch_enabled();
+        // Read per transform so diagnostic runs can ablate this encoding alone.
+        let immediate_prefetch = crate::tmark::piece_on(
+            crate::tmark::ARM_NTT_PREFETCH_IMM,
+            std::env::var_os("FLOCK_NO_NTT_PREFETCH_IMMEDIATE").is_none(),
+        );
         // One compiled body for both fan-outs (see `ranked_suffix_hetero_enabled`).
         let job: &(dyn Fn(usize) + Sync) = &|job: usize| {
             let local = job / tiles_per_block;
@@ -1466,6 +1488,7 @@ impl AdditiveNttF128 {
                                     (base as *const F128).add(pos * NUM_NTTS),
                                     EIGHTH4 * NUM_NTTS,
                                     NUM_NTTS,
+                                    immediate_prefetch,
                                 );
                             }
                         }
