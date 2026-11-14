@@ -2270,6 +2270,39 @@ unsafe fn store_delta_a_only_gpr(dst: *mut u8, a0: u64, a1: u64) {
     }
 }
 
+/// Kill switch for the all-fused accumulation in the prescaled round-two
+/// pointer walk (`FLOCK_NO_R2P_FUSED`, any value): each product enters its
+/// `TriNeon` accumulator as `EXT` + four fused `PMULL`+`EOR` pairs (5 SIMD
+/// issue slots, [`tri_acc_q`]) instead of [`tri_acc_q_crossfused`]'s 7, and
+/// the walk runs two groups per trip so the fresh fused destinations
+/// alternate registers instead of needing loop-carried `MOV`s. Same
+/// products, same XORs, same bytes.
+#[cfg(target_arch = "aarch64")]
+fn r2p_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2P_FUSED").is_none())
+}
+
+/// Kill switch for the fused window-end products of the prescaled round-two
+/// kernel (`FLOCK_NO_R2P_TAIL_FUSED`, any value): each window's four
+/// `lambda * reduce(W)` products enter the chunk sums through [`tri_acc_q`]
+/// (5 SIMD issue slots) instead of [`tri_acc_q_crossfused`] (7). Same bytes.
+#[cfg(target_arch = "aarch64")]
+fn r2p_tail_fused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2P_TAIL_FUSED").is_none())
+}
+
+/// Kill switch for the all-fused K pass (`FLOCK_NO_ZC_K_ALLFUSED`, any
+/// value): `fold2_compact_and_round45_chunk_neon_8_fused_r1` accumulates
+/// with [`tri_acc_q`] (5 SIMD issue slots per product) two groups per trip
+/// instead of [`tri_acc_q_crossfused`] (7). Same bytes.
+#[cfg(target_arch = "aarch64")]
+fn zc_k_allfused_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_ALLFUSED").is_none())
+}
+
 /// Kill switch for the per-stream pointer form of the ranked round-two
 /// loops: `FLOCK_NO_R2_ASM_OFFSETS` (any value) runs the parent loops, which
 /// form every row, anchor and delta address per group. Same loads, stores and
@@ -3052,6 +3085,8 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
             && (pair_idx_base & 127) == 0
             && lo_size.is_multiple_of(128);
         let fixed_pads = FIXED_PADS && aligned_padding;
+        let init_first = r2p_fused_enabled();
+        let tail_fused = r2p_tail_fused_enabled();
         for first in (0..lo_size / 2).step_by(32) {
             for t in 0..2 {
                 let mut w0 = tri_zero;
@@ -3075,6 +3110,12 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                 let mut xb = vdupq_n_u64(1u64 << (b_end - 1));
                 macro_rules! group {
                     ($pos:expr, $pads:expr) => {
+                        group!(@ $pos, $pads, false)
+                    };
+                    // `$init`: the window's first group, whose accumulators
+                    // are still zero, so with `init_first` each product is
+                    // written by `tri_set_q` (XOR with zero is the identity).
+                    (@ $pos:expr, $pads:expr, $init:literal) => {
                         'group: {
                             let u = first + 2 * $pos + t;
                             let x_lo0 = 2 * u;
@@ -3137,19 +3178,32 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 let e_a = veorq_u64(a0, a2);
                                 let e_b = veorq_u64(b0, b2);
                                 if !pad1 {
-                                    tri_acc_q_crossfused(&mut w0, mul_xb_q(a2, xb, k87), b2);
+                                    if $init && init_first {
+                                        tri_set_q(&mut w0, mul_xb_q(a2, xb, k87), b2);
+                                    } else {
+                                        tri_acc_q_crossfused(&mut w0, mul_xb_q(a2, xb, k87), b2);
+                                    }
                                 }
                                 let e_s = mul_xb_q(e_a, xb, k87);
-                                tri_acc_q_crossfused(&mut w3, e_s, e_b);
+                                if $init && init_first {
+                                        tri_set_q(&mut w3, e_s, e_b);
+                                    } else {
+                                        tri_acc_q_crossfused(&mut w3, e_s, e_b);
+                                    }
                                 let (o_a, o_b) =
                                     fold_two_codes_paired_q(table_data, a1c ^ a3c, b1c ^ b3c);
                                 let o_s = mul_xb_q(o_a, xb, k87);
-                                tri_acc_q_crossfused(&mut w4, o_s, o_b);
-                                tri_acc_q_crossfused(
-                                    &mut w5,
-                                    veorq_u64(e_s, o_s),
-                                    veorq_u64(e_b, o_b),
-                                );
+                                if $init && init_first {
+                                        tri_set_q(&mut w4, o_s, o_b);
+                                    } else {
+                                        tri_acc_q_crossfused(&mut w4, o_s, o_b);
+                                    }
+                                let (s5, b5) = (veorq_u64(e_s, o_s), veorq_u64(e_b, o_b));
+                                if $init && init_first {
+                                    tri_set_q(&mut w5, s5, b5);
+                                } else {
+                                    tri_acc_q_crossfused(&mut w5, s5, b5);
+                                }
                             }
                         }
                         xb = vshrq_n_u64::<1>(xb);
@@ -3163,7 +3217,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                 };
                 if fixed_pads {
                     let boundary = b_end == 15;
-                    group!(b_end - 1, |_: usize, _: usize| (false, boundary));
+                    group!(@ b_end - 1, |_: usize, _: usize| (false, boundary), true);
                     if ASM_OFF {
                         // The live groups `pos = b_end - 2` down to 0 on one
                         // pointer per stream, stepped down once per group; the
@@ -3192,9 +3246,27 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                         }
                         // The ranked loop on the flags `$degen` and `$ones`
                         // (b == 1) and the reduction constant `$k`.
+                        // `$fused` (`FLOCK_NO_R2P_FUSED` kills): every product
+                        // enters its accumulator through `tri_acc_q` (5 SIMD
+                        // issue slots vs `tri_acc_q_crossfused`'s 7), two
+                        // groups per trip so the fused destinations alternate
+                        // registers. Same products, same XORs, same bytes.
                         macro_rules! ranked {
                             ($degen:expr, $ones:expr, $k:expr) => {
-                                for _ in 0..b_end - 1 {
+                                ranked!($degen, $ones, $k, false)
+                            };
+                            ($degen:expr, $ones:expr, $k:expr, $fused:literal) => {{
+                                macro_rules! tacc {
+                                    ($acc:expr, $x:expr, $y:expr) => {
+                                        if $fused {
+                                            tri_acc_q($acc, $x, $y)
+                                        } else {
+                                            tri_acc_q_crossfused($acc, $x, $y)
+                                        }
+                                    };
+                                }
+                                macro_rules! one_group {
+                                    () => {{
                                     let (a0, b0, a1c, b1c, deg0) = pair_off!(0, 0, $degen);
                                     let (a2, b2, a3c, b3c, deg1) = pair_off!(16, 32, $degen);
                                     if deg0 & deg1 & $ones {
@@ -3202,18 +3274,14 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                     } else {
                                         let e_a = veorq_u64(a0, a2);
                                         let e_b = veorq_u64(b0, b2);
-                                        tri_acc_q_crossfused(&mut w0, mul_xb_q(a2, xb, $k), b2);
+                                        tacc!(&mut w0, mul_xb_q(a2, xb, $k), b2);
                                         let e_s = mul_xb_q(e_a, xb, $k);
-                                        tri_acc_q_crossfused(&mut w3, e_s, e_b);
+                                        tacc!(&mut w3, e_s, e_b);
                                         let (o_a, o_b) =
                                             fold_two_codes_paired_q(table_data, a1c ^ a3c, b1c ^ b3c);
                                         let o_s = mul_xb_q(o_a, xb, $k);
-                                        tri_acc_q_crossfused(&mut w4, o_s, o_b);
-                                        tri_acc_q_crossfused(
-                                            &mut w5,
-                                            veorq_u64(e_s, o_s),
-                                            veorq_u64(e_b, o_b),
-                                        );
+                                        tacc!(&mut w4, o_s, o_b);
+                                        tacc!(&mut w5, veorq_u64(e_s, o_s), veorq_u64(e_b, o_b));
                                     }
                                     xb = vshrq_n_u64::<1>(xb);
                                     pa = pa.wrapping_sub(8);
@@ -3230,8 +3298,25 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                         inout(reg) pd,
                                         options(pure, nomem, nostack, preserves_flags),
                                     );
+                                    }};
                                 }
-                            };
+                                let n_groups = b_end - 1;
+                                if $fused {
+                                    let mut g = 0usize;
+                                    while g + 2 <= n_groups {
+                                        one_group!();
+                                        one_group!();
+                                        g += 2;
+                                    }
+                                    if g < n_groups {
+                                        one_group!();
+                                    }
+                                } else {
+                                    for _ in 0..n_groups {
+                                        one_group!();
+                                    }
+                                }
+                            }};
                         }
                         if RANKED_INV {
                             // The same constant as `k87`, built once per window
@@ -3247,10 +3332,13 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 k = out(vreg) k,
                                 options(nomem, nostack, preserves_flags),
                             );
-                            match (degen, ones_is_one) {
-                                (true, true) => ranked!(true, true, k),
-                                (true, false) => ranked!(true, false, k),
-                                (false, _) => ranked!(false, false, k),
+                            match (degen, ones_is_one, r2p_fused_enabled()) {
+                                (true, true, true) => ranked!(true, true, k, true),
+                                (true, false, true) => ranked!(true, false, k, true),
+                                (false, _, true) => ranked!(false, false, k, true),
+                                (true, true, false) => ranked!(true, true, k),
+                                (true, false, false) => ranked!(true, false, k),
+                                (false, _, false) => ranked!(false, false, k),
                             }
                         } else {
                             ranked!(degen, ones_is_one, k87);
@@ -3266,7 +3354,12 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                     }
                 }
                 let lambda = vld1q_u64(eq_lo.add(2 * (first + t) + 1).cast::<u64>());
-                if window_tri {
+                if window_tri && tail_fused {
+                    tri_acc_q(&mut sum0, lambda, reduce_tri_binius_xor_q(w0.ll, w0.cross, w0.hh, zero));
+                    tri_acc_q(&mut sum3, lambda, reduce_tri_binius_xor_q(w3.ll, w3.cross, w3.hh, zero));
+                    tri_acc_q(&mut sum4, lambda, reduce_tri_binius_xor_q(w4.ll, w4.cross, w4.hh, zero));
+                    tri_acc_q(&mut sum5, lambda, reduce_tri_binius_xor_q(w5.ll, w5.cross, w5.hh, zero));
+                } else if window_tri {
                     tri_acc_q_crossfused(&mut sum0, lambda, reduce_tri_binius_xor_q(w0.ll, w0.cross, w0.hh, zero));
                     tri_acc_q_crossfused(&mut sum3, lambda, reduce_tri_binius_xor_q(w3.ll, w3.cross, w3.hh, zero));
                     tri_acc_q_crossfused(&mut sum4, lambda, reduce_tri_binius_xor_q(w4.ll, w4.cross, w4.hh, zero));
@@ -3759,6 +3852,39 @@ unsafe fn tri_acc_q_crossfused(
     }
 }
 
+/// `*acc = a*b` in [`TriNeon`] form for an accumulator known to be zero:
+/// `EXT`, the `ll`/`hh` `PMULL`s straight into their registers and the two
+/// cross `PMULL`s as one fused pair (5 SIMD issue slots, 6 instructions vs
+/// [`tri_acc_q_crossfused`]'s 7 and 9). Same bits as accumulating into zero.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn tri_set_q(
+    acc: &mut TriNeon,
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+) {
+    // SAFETY: register-only; `t` and `p` are early clobbers and the outputs
+    // are written only after every input is read.
+    unsafe {
+        core::arch::asm!(
+            "ext {t:v}.16b, {a:v}.16b, {a:v}.16b, #8",
+            "pmull {p:v}.1q, {t:v}.1d, {b:v}.1d",
+            "pmull2 {cr:v}.1q, {t:v}.2d, {b:v}.2d",
+            "eor {cr:v}.16b, {cr:v}.16b, {p:v}.16b",
+            "pmull {ll:v}.1q, {a:v}.1d, {b:v}.1d",
+            "pmull2 {hh:v}.1q, {a:v}.2d, {b:v}.2d",
+            a = in(vreg) a,
+            b = in(vreg) b,
+            t = out(vreg) _,
+            p = out(vreg) _,
+            ll = out(vreg) acc.ll,
+            cr = out(vreg) acc.cross,
+            hh = lateout(vreg) acc.hh,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 /// `init` XOR the eight byte-lane entries of `code` in the 8 x 4 KiB `table`
 /// (four `EOR3`s).
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -4241,6 +4367,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
         // Slots: p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5'.
         let mut acc = LookaheadTriAcc::zero();
+        let allfused = zc_k_allfused_enabled();
 
         debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
         let n5 = out_pairs / 2;
@@ -4282,7 +4409,19 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
 
         // `$o`: the index of the group's first output in `a_out` / `b_out`.
         macro_rules! k_group {
-            ($t:expr, $o:expr) => {{
+            ($t:expr, $o:expr) => {
+                k_group!(@ $t, $o, false)
+            };
+            (@ $t:expr, $o:expr, $fused:literal) => {{
+                macro_rules! kacc {
+                    ($acc:expr, $x:expr, $y:expr) => {
+                        if $fused {
+                            tri_acc_q($acc, $x, $y)
+                        } else {
+                            tri_acc_q_crossfused($acc, $x, $y)
+                        }
+                    };
+                }
                 let t = $t;
                 let mut b_flat = true;
                 let ao = a_out.add($o);
@@ -4322,9 +4461,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     tri_acc_q_crossfused(&mut acc[4], a2w, b2);
                     let (e_aw, e_b) = (veorq_u64(a0w, a2w), veorq_u64(b0, b2));
                     let (o_aw, o_b) = (veorq_u64(a1w, a3w), veorq_u64(b1, b3));
-                    tri_acc_q_crossfused(&mut acc[5], e_aw, e_b);
-                    tri_acc_q_crossfused(&mut acc[6], o_aw, o_b);
-                    tri_acc_q_crossfused(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                    kacc!(&mut acc[5], e_aw, e_b);
+                    kacc!(&mut acc[6], o_aw, o_b);
+                    kacc!(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
                 }
             }};
         }
@@ -4345,8 +4484,20 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 } else {
                     4 * t0
                 };
-                for t in t0..t0 + 15 {
-                    k_group!(t, o0 + 4 * (t - t0));
+                if allfused {
+                    // Two groups per trip (seven pairs and one more): the
+                    // fused results alternate registers.
+                    let mut t = t0;
+                    while t + 2 <= t0 + 15 {
+                        k_group!(@ t, o0 + 4 * (t - t0), true);
+                        k_group!(@ t + 1, o0 + 4 * (t + 1 - t0), true);
+                        t += 2;
+                    }
+                    k_group!(@ t, o0 + 4 * (t - t0), true);
+                } else {
+                    for t in t0..t0 + 15 {
+                        k_group!(t, o0 + 4 * (t - t0));
+                    }
                 }
                 let t = t0 + 15;
                 let g = 4 * t;
@@ -4391,8 +4542,20 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 }
             }
         } else {
-            for t in 0..n5 {
-                k_group!(t, 4 * t);
+            if allfused {
+                let mut t = 0;
+                while t + 2 <= n5 {
+                    k_group!(@ t, 4 * t, true);
+                    k_group!(@ t + 1, 4 * (t + 1), true);
+                    t += 2;
+                }
+                if t < n5 {
+                    k_group!(@ t, 4 * t, true);
+                }
+            } else {
+                for t in 0..n5 {
+                    k_group!(t, 4 * t);
+                }
             }
         }
 

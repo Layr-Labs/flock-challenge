@@ -415,10 +415,68 @@ fn lc_gpu_wake_at2() -> u32 {
     *AT2
 }
 
+/// Lincheck GPU wake off the transcript spine (`FLOCK_NO_LC_WAKE_POST=1`,
+/// exact `1`, kills; read once). Each wake's command-buffer build and commit
+/// ran inline on the zerocheck thread between two tail passes while every
+/// other core waited for the next pass's queue: 0.12 ms for the first wake
+/// (it also pays, in every timed prove, the first-use allocation of the
+/// wake's two scratch buffers) and 0.05 ms for the second (M1 Max tmarks).
+/// A persistent poster thread, spawned by the first arm (the untimed warmup
+/// prove), now runs [`imp::lc_gpu_wake`]; the spine only bumps a counter
+/// and unparks it.
+/// The wake touches no prove buffer and nothing waits on it, so every proof
+/// byte is unchanged: only the thread that submits the one-threadgroup
+/// kernel moves, and its commit lands tens of microseconds later, still
+/// ~1.7 ms (first wake) and ~0.2 ms (second) ahead of the lincheck launch.
+pub const ENV_NO_LC_WAKE_POST: &str = "FLOCK_NO_LC_WAKE_POST";
+
+/// Wakes posted to the poster thread and not yet submitted.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+static LC_WAKE_POSTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The wake poster thread, or `None` (kill switch, spawn failure), in which
+/// case the wake runs inline as before. A post is one counter increment and
+/// one `unpark`; the poster drains the counter, so a post that races its
+/// `park` is never lost (`unpark` before `park` makes `park` return).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn lc_wake_poster() -> Option<&'static std::thread::Thread> {
+    static POSTER: std::sync::OnceLock<Option<std::thread::Thread>> = std::sync::OnceLock::new();
+    POSTER
+        .get_or_init(|| {
+            if std::env::var(ENV_NO_LC_WAKE_POST).is_ok_and(|v| v == "1") {
+                return None;
+            }
+            std::thread::Builder::new()
+                .name("flock-lc-wake".into())
+                .spawn(|| {
+                    // Same class as the prover's own workers, so a post made
+                    // while every core is busy is scheduled promptly.
+                    crate::set_calling_thread_prover_qos();
+                    loop {
+                        let n = LC_WAKE_POSTED.swap(0, std::sync::atomic::Ordering::AcqRel);
+                        for _ in 0..n {
+                            imp::lc_gpu_wake();
+                        }
+                        if n == 0 {
+                            std::thread::park();
+                        }
+                    }
+                })
+                .ok()
+                .map(|handle| handle.thread().clone())
+        })
+        .as_ref()
+}
+
 /// Arm (or, with `false`, disarm) the lincheck GPU wake for this prove.
 pub fn lc_gpu_wake_arm(on: bool) {
     if !on {
         lc_gpu_wake_fire(100);
+    }
+    // The first arm is the warmup prove's: spawn the poster there, untimed.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if on && lc_gpu_wake_enabled() {
+        let _ = lc_wake_poster();
     }
     LC_GPU_WAKE_ARMED.store(on && lc_gpu_wake_enabled(), std::sync::atomic::Ordering::Relaxed);
     LC_GPU_WAKE_ARMED2.store(
@@ -443,7 +501,13 @@ pub(crate) fn lc_gpu_wake_fire(point: u32) {
     }
     crate::tmark::mark(if first { "lc wake fired" } else { "lc wake2 fired" });
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    imp::lc_gpu_wake();
+    match lc_wake_poster() {
+        Some(poster) => {
+            LC_WAKE_POSTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            poster.unpark();
+        }
+        None => imp::lc_gpu_wake(),
+    }
 }
 
 pub(crate) fn gpu_lincheck_enabled() -> bool {
