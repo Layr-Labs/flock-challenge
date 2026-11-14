@@ -747,7 +747,7 @@ pub const ENV_NO_GPU_ZC_AB_COMPLETION: &str = "FLOCK_NO_GPU_ZC_AB_COMPLETION";
 /// `FLOCK_ZC_AB_GPU_CHUNKS=<n>`, `0` = arm off, clamped to the chunk count.
 /// Unset = [`ZC_AB_GPU_DEFAULT_CHUNKS`]. A non-integer value fails loudly.
 pub const ENV_ZC_AB_GPU_CHUNKS: &str = "FLOCK_ZC_AB_GPU_CHUNKS";
-const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 16;
+const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 32;
 
 /// Requested GPU chunk share of the round-one AB completion arm; `0` = off
 /// (kill switch, share 0, or GPU commit disabled).
@@ -7201,7 +7201,42 @@ kernel void blake3_pow_scan(
         if !super::gpu_commit_enabled() {
             return Err("gpu commit disabled".into());
         }
-        GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone())
+        let gpu = GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone());
+        if gpu.is_ok() {
+            zc_ab_prewarm_once();
+        }
+        gpu
+    }
+
+    /// Ranked worker: the moment the GPU exists (first use, in the warm-up
+    /// prove), start the round-one AB completion arm's one-time setup (its
+    /// shader library, pipelines and buffers) on a helper thread, so the
+    /// warm-up's round one finds it built instead of building it inline.
+    /// Once per process; nothing when the arm is off or its share is zero.
+    fn zc_ab_prewarm_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if !crate::is_ranked_worker_process() || super::gpu_zc_ab_completion_share() == 0 {
+                return;
+            }
+            let Some(basis) = crate::zerocheck::univariate_skip_optimized::ab_completion_convert_basis() else {
+                return;
+            };
+            let _ = std::thread::Builder::new()
+                .name("zc-ab-prewarm".into())
+                .spawn(move || {
+                    // Efficiency-core hint (`QOS_CLASS_UTILITY`, as the epool
+                    // helpers): the setup then runs beside the warm-up
+                    // prove's performance-core work instead of on top of it.
+                    unsafe extern "C" {
+                        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+                    }
+                    unsafe {
+                        let _ = pthread_set_qos_class_self_np(0x11, 0);
+                    }
+                    let _ = zc_ab_state(basis);
+                });
+        });
     }
 
     fn init_gpu() -> Result<Gpu, String> {
