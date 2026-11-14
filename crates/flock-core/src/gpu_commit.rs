@@ -11584,11 +11584,11 @@ kernel void blake3_pow_scan(
         Some(candidates[first_i])
     }
 
-    /// Initial candidates cover the historical basin [0..5]. Add k=6,7
+    /// Initial candidates cover the hybrid basin [2..5]. Add k=6,7
     /// only when the measured minimum remains at the upper boundary, so
     /// balanced hosts do not pay for a broader warmup search.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 7] = [0, 2, 3, 4, 5, 6, 7];
-    const RANKED_EXACT_INITIAL_CANDIDATES: usize = 5;
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 6] = [2, 3, 4, 5, 6, 7];
+    const RANKED_EXACT_INITIAL_CANDIDATES: usize = 4;
 
     fn hybrid_tune_lead_phi(value: Option<&str>) -> f64 {
         value
@@ -12325,12 +12325,14 @@ kernel void blake3_pow_scan(
     /// chunk before eviction. `FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP=1` restores the
     /// original all-layer streaming suffix plus separate leaf-hash pass for an
     /// exact same-binary comparison.
-    /// S1 kill switch: `FLOCK_NO_HYBRID_GPU_SUFFIX_HASH=1` restores the CPU
-    /// suffix leaf/parent hashing.
+    /// S1 (the GPU hashes the CPU suffix's leaves and parents in cb3, queued
+    /// behind cb2) is opt-in: `FLOCK_HYBRID_GPU_SUFFIX_HASH=1`. By default the
+    /// CPU hashes its own suffix leaves and parents as each NTT chunk
+    /// finalizes, so the window is max(cb2, cpu NTT + hash) with no cb3.
     fn hybrid_gpu_suffix_hash_enabled() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_GPU_SUFFIX_HASH").is_none())
+        *ON.get_or_init(|| std::env::var_os("FLOCK_HYBRID_GPU_SUFFIX_HASH").is_some())
     }
 
     fn hybrid_cpu_suffix_deep_pipeline_enabled() -> bool {
@@ -16013,8 +16015,8 @@ kernel void lc_fold_stripes_factored_b4(
 
         #[test]
         fn initial_candidates_and_extension_limit_are_stable() {
-            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [0, 2, 3, 4, 5, 6, 7]);
-            assert_eq!(super::RANKED_EXACT_INITIAL_CANDIDATES, 5);
+            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [2, 3, 4, 5, 6, 7]);
+            assert_eq!(super::RANKED_EXACT_INITIAL_CANDIDATES, 4);
         }
 
         #[test]
