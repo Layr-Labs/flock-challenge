@@ -11584,11 +11584,11 @@ kernel void blake3_pow_scan(
         Some(candidates[first_i])
     }
 
-    /// Initial candidates cover the historical basin [0..5]. Add k=6,7
+    /// Initial candidates cover the hybrid basin [2..5]. Add k=6,7
     /// only when the measured minimum remains at the upper boundary, so
     /// balanced hosts do not pay for a broader warmup search.
-    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 7] = [0, 2, 3, 4, 5, 6, 7];
-    const RANKED_EXACT_INITIAL_CANDIDATES: usize = 5;
+    const RANKED_EXACT_TUNE_CANDIDATES: [usize; 6] = [2, 3, 4, 5, 6, 7];
+    const RANKED_EXACT_INITIAL_CANDIDATES: usize = 4;
 
     fn hybrid_tune_lead_phi(value: Option<&str>) -> f64 {
         value
@@ -16013,8 +16013,8 @@ kernel void lc_fold_stripes_factored_b4(
 
         #[test]
         fn initial_candidates_and_extension_limit_are_stable() {
-            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [0, 2, 3, 4, 5, 6, 7]);
-            assert_eq!(super::RANKED_EXACT_INITIAL_CANDIDATES, 5);
+            assert_eq!(RANKED_EXACT_TUNE_CANDIDATES, [2, 3, 4, 5, 6, 7]);
+            assert_eq!(super::RANKED_EXACT_INITIAL_CANDIDATES, 4);
         }
 
         #[test]
