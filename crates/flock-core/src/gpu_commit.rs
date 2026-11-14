@@ -1484,6 +1484,27 @@ pub(crate) const fn zero_lane_groups_per_block(s: usize) -> u64 {
 }
 
 /// Kill switch for the tabled ranked final NTT pass (`ntt_final_t3`):
+/// Kill switch for the g1w mid-pass selection (`FLOCK_NO_G1W`, any value):
+/// the f = 4, s > 2 NTT passes keep `ntt_fused_reg4g4x2` and no candidate
+/// is compiled or timed. With the switch unset, the untimed warm-up times
+/// `ntt_g1w` (one table build per four tiles, 128-thread group) against the
+/// incumbent on this machine and keeps it only on a clear margin.
+pub(crate) fn gpu_g1w_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G1W").is_none())
+}
+
+/// Kill switch for building the g1w candidate during GPU init
+/// (`FLOCK_NO_G1W_PREBUILD`, any value): with the switch unset the mid-pass
+/// candidate's library and pipeline are compiled on a helper thread beside
+/// the rest of init, and the warm-up selection only times it. With it set,
+/// the selection compiles the candidate itself, as before. Same pipeline,
+/// same selection rule either way.
+pub(crate) fn gpu_g1w_prebuild_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G1W_PREBUILD").is_none())
+}
+
 /// `FLOCK_NO_GPU_FINAL_T3` (any value) keeps `ntt_pass5_mixed`. Both kernels
 /// write the same bytes.
 pub(crate) fn gpu_final_t3_enabled() -> bool {
@@ -4010,7 +4031,7 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// failure leaves `ntt_fused_reg4g4` in place.
     /// The g4x2 library source in use: the twiddle-prefetch form unless
     /// `FLOCK_NO_GPU_TW_PREFETCH` is set.
-    fn g4x2_msl_source() -> &'static str {
+    pub(crate) fn g4x2_msl_source() -> &'static str {
         if super::gpu_tw_prefetch_enabled() {
             NTT_G4X2_TWL_MSL_SOURCE
         } else {
@@ -4473,6 +4494,131 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     }
 }
 "#;
+
+    /// g1 lane: the g4x2 mid pass (f = 4, s > 2) with each of the block's 15
+    /// byte tables built ONCE per four tiles instead of once per two-tile
+    /// round. The group is 128 threads: lanes 0..63 hold tiles {0,1}, lanes
+    /// 64..127 tiles {2,3}, so both rounds of the 64-thread kernel run at
+    /// once over one shared table; each build is split over 128 threads
+    /// (four entries each). Every tile sees the same butterflies, in the same
+    /// order, over the same table entries: bit-identical output. Idea first
+    /// published as `ntt_fused_reg4g4x2w` in d64804b2; this text is our own
+    /// and appended to `NTT_G4X2_TWL_MSL_SOURCE` (it reuses its helpers).
+    /// Device bytes are unchanged; it removes half the table builds and
+    /// their barriers (13% of a mid pass on an M2 Pro by ablation).
+    pub(crate) const NTT_G1W_EXTRA_MSL: &str = r#"
+#ifndef G1W_PADN
+#define G1W_PADN 1u
+#endif
+// gf_build_byte16_twl over 128 threads: thread bit 6 owns entry bit 4.
+static inline void g1w_build(
+    threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = (lid >> 5) & 1u; // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;          // entry bits 2..3
+    const uint cc = u >> 2;          // entry bits 5..7
+    const uint hi = lid >> 6;        // entry bit 4
+    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    uint4 C = hi != 0u ? f0 : uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o = (cc << 5) + (hi << 4) + (aa << 2);
+    dst[o + 0u] = A ^ C;
+    dst[o + 1u] = A ^ e0 ^ C;
+    dst[o + 2u] = A ^ e1 ^ C;
+    dst[o + 3u] = A ^ e0 ^ e1 ^ C;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+#define NTT_G1W_SUBLAYER(J)                                                    \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint NC   = 1u << j;                                         \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        for (uint c = 0; c < NC; c++) {                                        \
+            g1w_build(tabB, twl, (1u << j) - 1u + c, lid);                     \
+            for (uint bb = 0; bb < BPER; bb++) {                               \
+                const uint b   = c * BPER + bb;                                \
+                const uint low = b & ((1u << bpos) - 1u);                      \
+                const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;           \
+                const uint ev  = eu | (1u << bpos);                            \
+                uint4 pa;                                                      \
+                uint4 pb;                                                      \
+                gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[0], pa, pb);            \
+                const uint4 na = ea[eu] ^ pa;                                  \
+                const uint4 nb = eb[eu] ^ pb;                                  \
+                ea[eu] = na;                                                   \
+                ea[ev] ^= na;                                                  \
+                eb[eu] = nb;                                                   \
+                eb[ev] ^= nb;                                                  \
+            }                                                                  \
+        }                                                                      \
+    }
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void ntt_g1w(device uint4* data                [[buffer(0)]],
+                    device const uint4* twiddles      [[buffer(1)]],
+                    constant NttParams& P             [[buffer(2)]],
+                    uint tgid [[threadgroup_position_in_grid]],
+                    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F     = 4u;
+    constexpr uint NF    = 1u << F;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabB[512u];
+    threadgroup uint4 twl[32u];
+    threadgroup uint4 pad[G1W_PADN];   // residency only, never read
+
+    const uint lane = lid & 63u;
+    const uint B = tgid >> (P.s - LOG_G);
+    const uint r_base = (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;
+    if (lid < 15u) {
+        const uint q  = lid + 1u;
+        const uint jj = 31u - clz(q);
+        const uint cj = q - (1u << jj);
+        uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cj];
+        twl[lid] = g;
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+        twl[16u + lid] = g;
+    }
+    const uint ra = r_base + ((lid >> 6) << 1);
+    const uint pa = (B << (P.log_d - P.l)) + ra;
+    const uint pb = pa + 1u;
+    uint4 ea[NF];
+    uint4 eb[NF];
+    for (uint e = 0; e < NF; e++) {
+        ea[e] = data[((pa + (e << P.s)) << 6) + lane];
+        eb[e] = data[((pb + (e << P.s)) << 6) + lane];
+    }
+    NTT_G1W_SUBLAYER(0u)
+    NTT_G1W_SUBLAYER(1u)
+    NTT_G1W_SUBLAYER(2u)
+    NTT_G1W_SUBLAYER(3u)
+    if (P.log_d == 77u) {          /* unreachable; keeps `pad` allocated */
+        pad[lid % G1W_PADN] = ea[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ea[0] ^= pad[(lid + 1u) % G1W_PADN];
+    }
+    for (uint e = 0; e < NF; e++) {
+        data[((pa + (e << P.s)) << 6) + lane] = ea[e];
+        data[((pb + (e << P.s)) << 6) + lane] = eb[e];
+    }
+}
+"#;
+
+    pub(crate) fn g1w_msl_source() -> String {
+        format!("{NTT_G4X2_TWL_MSL_SOURCE}{NTT_G1W_EXTRA_MSL}")
+    }
 
     /// The ranked final NTT pass (l = log_d - 4, s = 0) with byte tables for
     /// sub-layers 0..2 and the short-twiddle Horner for sub-layer 3 only.
@@ -6844,6 +6990,10 @@ kernel void blake3_pow_scan(
         /// `NIL` outside `cfg(test)`.
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) pso_export_from_z_zero_root_tabs: Id,
+        /// x1 lane: the g1w mid-pass candidate (pad `G1W_PADS[0]`) built on
+        /// a helper thread during init, or NIL. Owned by the one-time
+        /// mid-pass selection, which keeps or releases it.
+        pub(crate) pso_g1w_prebuilt: Id,
         pub(crate) pso_ntt4h8: Id,
         pub(crate) pso_ntt5mix: Id,
         pub(crate) pso_leaf: Id,
@@ -6890,10 +7040,152 @@ kernel void blake3_pow_scan(
         if !super::gpu_commit_enabled() {
             return Err("gpu commit disabled".into());
         }
-        GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone())
+        let g = GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone())?;
+        // Decide the mid-pass kernel at the process's first GPU use (the
+        // worker's untimed warm-up prove), never inside a timed window; a
+        // decided OnceLock read afterwards.
+        static DECIDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DECIDED.load(std::sync::atomic::Ordering::Relaxed) {
+            let t = std::time::Instant::now();
+            let _ = mid_pass_g1w_pso(g);
+            let mid = t.elapsed().as_secs_f64() * 1e3;
+            if !DECIDED.swap(true, std::sync::atomic::Ordering::Relaxed) && window_trace_enabled() {
+                eprintln!("[gpu-commit] warm-up selections: mid-pass {mid:.1} ms");
+            }
+        }
+        Ok(g)
+    }
+
+    /// The Objective-C entry points a helper thread needs, copied out of
+    /// [`Api`] so the thread borrows nothing.
+    #[derive(Clone, Copy)]
+    struct ThreadApi {
+        msg_send: *const c_void,
+        get_class: unsafe extern "C" fn(*const i8) -> Id,
+        sel_register: unsafe extern "C" fn(*const i8) -> Sel,
+        pool_push: unsafe extern "C" fn() -> *mut c_void,
+        pool_pop: unsafe extern "C" fn(*mut c_void),
+        device: Id,
+    }
+    // SAFETY: process-global function pointers and the process-lifetime
+    // device; Metal devices compile libraries and pipelines from any thread.
+    unsafe impl Send for ThreadApi {}
+
+    impl ThreadApi {
+        fn new(api: &Api, device: Id) -> Self {
+            Self {
+                msg_send: api.msg_send,
+                get_class: api.get_class,
+                sel_register: api.sel_register,
+                pool_push: api.pool_push,
+                pool_pop: api.pool_pop,
+                device,
+            }
+        }
+
+        /// Autoreleased `NSString`, or NIL.
+        unsafe fn nsstring(&self, s: &str) -> Id {
+            unsafe {
+                let cls = (self.get_class)(c"NSString".as_ptr().cast());
+                if cls.is_null() {
+                    return NIL;
+                }
+                let mut buf = Vec::with_capacity(s.len() + 1);
+                buf.extend_from_slice(s.as_bytes());
+                buf.push(0);
+                send!(
+                    self,
+                    unsafe extern "C" fn(Id, Sel, *const u8) -> Id,
+                    cls,
+                    c"stringWithUTF8String:",
+                    buf.as_ptr()
+                )
+            }
+        }
+
+        /// `newComputePipelineStateWithFunction:error:`; releases `f`.
+        unsafe fn pipeline(&self, f: Id) -> Id {
+            unsafe {
+                let mut err: Id = NIL;
+                let pso: Id = send!(
+                    self,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    self.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut err
+                );
+                send!(self, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                pso
+            }
+        }
+    }
+
+    /// A compute pipeline being built on a helper thread, so its compile
+    /// runs beside the rest of GPU init instead of adding to it (Metal
+    /// compiles concurrent requests in parallel).
+    struct PipelineJob(Option<std::thread::JoinHandle<usize>>);
+
+    impl PipelineJob {
+        fn start(work: impl FnOnce() -> Id + Send + 'static) -> Self {
+            Self(std::thread::Builder::new().name("flock-pipeline".into()).spawn(move || work() as usize).ok())
+        }
+
+        /// Library from `source`, then the pipeline of its kernel `name`.
+        fn spawn_library(api: &Api, device: Id, source: String, name: &'static str) -> Self {
+            let t = ThreadApi::new(api, device);
+            Self::start(move || unsafe {
+                let pool = (t.pool_push)();
+                let pso = (|| {
+                    let (src, ns) = (t.nsstring(&source), t.nsstring(name));
+                    if src.is_null() || ns.is_null() {
+                        return NIL;
+                    }
+                    let mut err: Id = NIL;
+                    let library: Id = send!(
+                        t,
+                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                        t.device,
+                        c"newLibraryWithSource:options:error:",
+                        src,
+                        NIL,
+                        &mut err
+                    );
+                    if library.is_null() {
+                        return NIL;
+                    }
+                    let f: Id = send!(
+                        t,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    let pso = if f.is_null() { NIL } else { t.pipeline(f) };
+                    send!(t, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                    pso
+                })();
+                (t.pool_pop)(pool);
+                pso
+            })
+        }
+
+        /// The finished pipeline, or NIL.
+        fn finish(mut self) -> Id {
+            self.0.take().and_then(|h| h.join().ok()).unwrap_or(0) as Id
+        }
+    }
+
+    impl Drop for PipelineJob {
+        fn drop(&mut self) {
+            if let Some(h) = self.0.take() {
+                let _ = h.join();
+            }
+        }
     }
 
     fn init_gpu() -> Result<Gpu, String> {
+        let t_init = std::time::Instant::now();
         let api = Api::load()?;
         unsafe {
             let pool_push = api.pool_push;
@@ -6927,6 +7219,11 @@ kernel void blake3_pow_scan(
                 if queue.is_null() {
                     return Err("newCommandQueue failed".into());
                 }
+                // The mid-pass candidate's library and pipeline compile on a
+                // helper thread from here on, beside everything init builds
+                // below; collected just before the `Gpu` is assembled.
+                let g1w_job = g1w_prebuild_selected()
+                    .then(|| PipelineJob::spawn_library(&api, device, g1w_pad_source(G1W_PADS[0], ""), "ntt_g1w"));
                 // Library + pipelines: try the embedded metallib first (no MSL
                 // frontend compile); on ANY failure — load rejected, kernel
                 // missing, pipeline error — rebuild everything from the MSL
@@ -7637,6 +7934,15 @@ kernel void blake3_pow_scan(
                 } else {
                     NIL
                 };
+                let t_join = std::time::Instant::now();
+                let pso_g1w_prebuilt = g1w_job.map_or(NIL, PipelineJob::finish);
+                if window_trace_enabled() {
+                    eprintln!(
+                        "[gpu-commit] helper-thread pipelines: g1w {} (waited {:.1} ms at the end of init)",
+                        if pso_g1w_prebuilt.is_null() { "absent" } else { "built" },
+                        t_join.elapsed().as_secs_f64() * 1e3
+                    );
+                }
                 Ok(Gpu {
                     api,
                     device,
@@ -7649,6 +7955,7 @@ kernel void blake3_pow_scan(
                     pso_ntt4zg4,
                     pso_ntt4zg4_zero_root,
                     pso_export_from_z_zero_root_tabs,
+                    pso_g1w_prebuilt,
                     pso_ntt4h8,
                     pso_ntt5mix,
                     pso_leaf,
@@ -7667,6 +7974,9 @@ kernel void blake3_pow_scan(
                 })
             })();
             pool_pop(pool);
+            if window_trace_enabled() {
+                eprintln!("[gpu-commit] gpu init: {:.1} ms", t_init.elapsed().as_secs_f64() * 1e3);
+            }
             result
         }
     }
@@ -8379,6 +8689,234 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// Mid-pass (f = 4, s > 2) pipeline in use: `(pso, threads per group)`.
+    /// Decided once per process at the first `gpu()` call (the worker's
+    /// untimed warm-up, before any mid-pass encode or hybrid split sweep):
+    /// `ntt_g1w` (residency pad 1) is compiled and
+    /// timed against the incumbent g4x2 on a 32 MiB scratch at the layer-8
+    /// ranked shape (random data and twiddles, order alternating, one warm
+    /// rep then three timed) and kept only when it is faster in every timed
+    /// rep and at least 4% faster at the minimum. The ranked verifier wipes
+    /// its scratch between workers, so every worker decides for itself. Any
+    /// failure keeps the incumbent. Both kernels write bit-identical output,
+    /// so the choice changes timing only.
+    pub(crate) fn mid_pass_pso(gpu: &Gpu) -> (Id, u64) {
+        let g1w = mid_pass_g1w_pso(gpu);
+        if g1w.is_null() { (gpu.pso_ntt4g4x2, 64) } else { (g1w, 128) }
+    }
+
+    /// The selected g1w pipeline, or NIL when the incumbent stays.
+    pub(crate) fn mid_pass_g1w_pso(gpu: &Gpu) -> Id {
+        static SEL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *SEL.get_or_init(|| unsafe { select_mid_pass(gpu) } as usize) as Id
+    }
+
+    /// (incumbent min ms, g1w min ms) of the selection run; trace only.
+    pub(crate) static MID_PASS_TIMES: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+
+    unsafe fn select_mid_pass(gpu: &Gpu) -> Id {
+        if !super::gpu_g1w_enabled() || gpu.pso_ntt4g4x2.is_null() {
+            return NIL;
+        }
+        let force = std::env::var_os("FLOCK_G1W_FORCE").is_some();
+        let trace = debug_enabled() || window_trace_enabled();
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = MidPassBench::new(gpu).and_then(|bench| {
+                // One compile and eight short dispatches.
+                let mut chosen = NIL;
+                for pad in G1W_PADS {
+                    let pso = match compile_g1w(gpu, pad) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            if trace {
+                                eprintln!("[gpu-commit] g1w pad {pad} unavailable ({e})");
+                            }
+                            continue;
+                        }
+                    };
+                    let (inc, cand, wins) = bench.duel(pso)?;
+                    let keep = force || (wins && cand < 0.96 * inc);
+                    *MID_PASS_TIMES.lock().unwrap_or_else(|e| e.into_inner()) = (inc, cand);
+                    if trace {
+                        eprintln!(
+                            "[gpu-commit] mid-pass select: g4x2 {inc:.3} ms, g1w(pad {pad}) {cand:.3} ms, wins every rep {wins} -> {}",
+                            if keep { "g1w" } else { "g4x2" }
+                        );
+                    }
+                    if keep {
+                        G1W_PAD_SEL.store(pad, std::sync::atomic::Ordering::Relaxed);
+                        chosen = pso;
+                        break;
+                    }
+                    gpu.release(pso);
+                }
+                bench.release();
+                Ok(chosen)
+            });
+            gpu.pool_pop(pool);
+            r.unwrap_or_else(|e| {
+                if trace {
+                    eprintln!("[gpu-commit] mid-pass select failed ({e}); keeping g4x2");
+                }
+                NIL
+            })
+        }
+    }
+
+    /// Residency pad of `ntt_g1w` (threadgroup uint4 entries). One candidate
+    /// only: each extra compile is paid by all ~120 workers of a ranked job,
+    /// whose time limit leaves ~0.1 s per worker.
+    const G1W_PADS: [u32; 1] = [1];
+    /// Pad of the selected g1w candidate (0 when the incumbent stays).
+    pub(crate) static G1W_PAD_SEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    /// `g1w_msl_source()` at residency pad `pad`.
+    fn g1w_pad_source(pad: u32, cold: &str) -> String {
+        g1w_msl_source().replacen(
+            "using namespace metal;\n",
+            &format!("using namespace metal;\n{cold}#define G1W_PADN {pad}u\n"),
+            1,
+        )
+    }
+
+    /// Whether GPU init builds the g1w candidate on a helper thread.
+    fn g1w_prebuild_selected() -> bool {
+        super::gpu_g1w_prebuild_enabled()
+            && super::gpu_g1w_enabled()
+            && super::gpu_g4x2_enabled()
+            && std::env::var_os("FLOCK_G1W_COLD").is_none()
+    }
+
+    unsafe fn compile_g1w(gpu: &Gpu, pad: u32) -> Result<Id, String> {
+        // Diagnostic only (`FLOCK_G1W_COLD`): a unique comment defeats the
+        // system shader cache, to measure a cold compile.
+        let cold = if std::env::var_os("FLOCK_G1W_COLD").is_some() {
+            format!("// cold {} {:?}\n", std::process::id(), std::time::Instant::now())
+        } else {
+            String::new()
+        };
+        unsafe {
+            // The candidate GPU init already built on its helper thread (the
+            // selection runs once, so the pipeline is handed over once).
+            let pso = if pad == G1W_PADS[0] && cold.is_empty() && !gpu.pso_g1w_prebuilt.is_null() {
+                gpu.pso_g1w_prebuilt
+            } else {
+                compile_supplemental_pipeline(gpu, &g1w_pad_source(pad, &cold), "ntt_g1w")?
+            };
+            let max_threads: u64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> u64,
+                pso,
+                c"maxTotalThreadsPerThreadgroup"
+            );
+            if max_threads < 128 {
+                gpu.release(pso);
+                return Err(format!("g1w pipeline allows {max_threads} threads"));
+            }
+            Ok(pso)
+        }
+    }
+
+    /// Scratch for timing a mid-pass kernel at the ranked layer-8 shape over
+    /// 1/32 of the positions (8 blocks of 4 MiB, twiddle indices < 2^12),
+    /// filled with xorshift words so table lookups see high-entropy bytes.
+    struct MidPassBench<'a> {
+        gpu: &'a Gpu,
+        data: Id,
+        tw: Id,
+    }
+
+    impl<'a> MidPassBench<'a> {
+        const LOG_D: u32 = 20;
+        const L: u32 = 8;
+        const DATA_BYTES: usize = 32 << 20;
+        const TW_BYTES: usize = 16 << 12;
+        const GROUPS: u64 = (1u64 << (20 - 4 - 2)) / 32;
+
+        unsafe fn new(gpu: &'a Gpu) -> Result<Self, String> {
+            unsafe {
+                let data = gpu.new_buffer(Self::DATA_BYTES)?;
+                let tw = match gpu.new_buffer(Self::TW_BYTES) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        gpu.release(data);
+                        return Err(e);
+                    }
+                };
+                let mut x = 0x9E37_79B9_7F4A_7C15u64;
+                for (buf, len) in [(data, Self::DATA_BYTES), (tw, Self::TW_BYTES)] {
+                    let w = core::slice::from_raw_parts_mut(gpu.buffer_contents(buf).cast::<u64>(), len / 8);
+                    for v in w.iter_mut() {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        *v = x;
+                    }
+                }
+                Ok(Self { gpu, data, tw })
+            }
+        }
+
+        unsafe fn run(&self, pso: Id, tpg: u64) -> Result<f64, String> {
+            let gpu = self.gpu;
+            unsafe {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, self.data, 0, 0);
+                gpu.set_buffer(enc, self.tw, 0, 1);
+                let prm = NttParams { log_d: Self::LOG_D, l: Self::L, f: 4, s: Self::LOG_D - Self::L - 4 };
+                let bytes = core::slice::from_raw_parts(
+                    (&prm as *const NttParams).cast::<u8>(),
+                    core::mem::size_of::<NttParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 2);
+                gpu.dispatch(enc, Self::GROUPS, tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb)?;
+                let (s0, e0) = cb_gpu_interval(gpu, cb);
+                if !(e0 > s0) {
+                    return Err("no GPU timestamps".into());
+                }
+                Ok((e0 - s0) * 1e3)
+            }
+        }
+
+        /// Incumbent vs `cand`, order alternating per rep, one untimed warm
+        /// rep then three timed: (incumbent min ms, candidate min ms,
+        /// candidate faster in every timed rep).
+        unsafe fn duel(&self, cand: Id) -> Result<(f64, f64, bool), String> {
+            let mut inc = f64::MAX;
+            let mut best = f64::MAX;
+            let mut wins = true;
+            for rep in 0..4 {
+                let (a, b) = unsafe {
+                    if rep % 2 == 0 {
+                        let a = self.run(self.gpu.pso_ntt4g4x2, 64)?;
+                        (a, self.run(cand, 128)?)
+                    } else {
+                        let b = self.run(cand, 128)?;
+                        (self.run(self.gpu.pso_ntt4g4x2, 64)?, b)
+                    }
+                };
+                if rep > 0 {
+                    inc = inc.min(a);
+                    best = best.min(b);
+                    wins &= b < a;
+                }
+            }
+            Ok((inc, best, wins))
+        }
+
+        unsafe fn release(self) {
+            unsafe {
+                self.gpu.release(self.data);
+                self.gpu.release(self.tw);
+            }
+        }
+    }
+
     /// Encode the fused NTT passes for `layers [start_layer, log_d)` over a
     /// 64-lane interleaved buffer bound at `data_buf`.
     pub(crate) unsafe fn encode_ntt_passes(
@@ -8435,7 +8973,8 @@ kernel void blake3_pow_scan(
                         (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
                     }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
-                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                        let (pso, tpg) = mid_pass_pso(gpu);
+                        (pso, tpg, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
@@ -8513,7 +9052,8 @@ kernel void blake3_pow_scan(
                         (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
                     }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
-                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                        let (pso, tpg) = mid_pass_pso(gpu);
+                        (pso, tpg, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
@@ -8598,7 +9138,8 @@ kernel void blake3_pow_scan(
                         (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
                     }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
-                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                        let (pso, tpg) = mid_pass_pso(gpu);
+                        (pso, tpg, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
@@ -11992,6 +12533,16 @@ kernel void blake3_pow_scan(
                 ^ 0x5A45_524F_4C41_4E45 // "ZEROLANE"
         } else {
             key
+        };
+        // The selected mid-pass kernel changes the GPU arm's cost: its tuned
+        // split must not be shared with incumbent-kernel processes.
+        let key = match gpu() {
+            Ok(g) if !mid_pass_g1w_pso(g).is_null() => {
+                key ^ fnv1a64(&g1w_msl_source()).rotate_left(9)
+                    ^ 0x4731_575F_4D49_4450 // "G1W_MIDP"
+                    ^ u64::from(G1W_PAD_SEL.load(std::sync::atomic::Ordering::Relaxed)).rotate_left(40)
+            }
+            _ => key,
         };
         let key = if super::gpu_final_leaf_enabled() {
             key ^ fnv1a64(&final_leaf_msl_source()).rotate_left(5) ^ 0x464C_4541_465F_3431
@@ -24286,6 +24837,85 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         }
     }
 
+    /// g1w writes the same bytes as the incumbent g4x2 at every mid-pass
+    /// shape (f = 4, s > 2) over the full buffer, chained from a random
+    /// buffer through layers 4.., and over a prefix fraction.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn g1w_matches_g4x2_every_mid_shape() {
+        use super::imp;
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        if gpu.pso_ntt4g4x2.is_null() {
+            return;
+        }
+        let log_d = 16usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let mut rng = Rng::new(0x6731);
+        let pso_w = unsafe {
+            imp::compile_supplemental_pipeline(gpu, &imp::g1w_msl_source(), "ntt_g1w").unwrap()
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            let bytes = (64usize << log_d) * 16;
+            let a = gpu.new_buffer(bytes).unwrap();
+            let b = gpu.new_buffer(bytes).unwrap();
+            let tw = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let init = rng.vec(64 << log_d);
+            for buf in [a, b] {
+                std::ptr::copy_nonoverlapping(init.as_ptr().cast::<u8>(), gpu.buffer_contents(buf), bytes);
+            }
+            let pass = |buf: imp::Id, pso: imp::Id, tpg: u64, l: usize, frac16: u64| {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, buf, 0, 0);
+                gpu.set_buffer(enc, tw, 0, 1);
+                let p = imp::NttParams { log_d: log_d as u32, l: l as u32, f: 4, s: (log_d - l - 4) as u32 };
+                let pb = core::slice::from_raw_parts(
+                    (&p as *const imp::NttParams).cast::<u8>(),
+                    core::mem::size_of::<imp::NttParams>(),
+                );
+                gpu.set_bytes(enc, pb, 2);
+                gpu.dispatch(enc, (1u64 << (log_d - 4 - 2)) / 16 * frac16, tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+            };
+            let same = || {
+                core::slice::from_raw_parts(gpu.buffer_contents(a), bytes)
+                    == core::slice::from_raw_parts(gpu.buffer_contents(b), bytes)
+            };
+            let mut shapes = 0;
+            for frac16 in [16u64, 11] {
+                for l in [4usize, 8] {
+                    // s = log_d - l - 4 > 2 for both
+                    pass(a, gpu.pso_ntt4g4x2, 64, l, frac16);
+                    pass(b, pso_w, 128, l, frac16);
+                    assert!(same(), "g1w != g4x2 at l={l} frac={frac16}/16");
+                    shapes += 1;
+                }
+            }
+            assert_eq!(shapes, 4);
+            // The data changed (the passes did run).
+            assert_ne!(
+                core::slice::from_raw_parts(gpu.buffer_contents(a).cast::<F128>(), 64 << log_d),
+                &init[..]
+            );
+            for x in [a, b, tw, pso_w] {
+                gpu.release(x);
+            }
+            gpu.pool_pop(pool);
+        }
+    }
+
     /// GL2 lane: per-stage GPU anatomy of the commit graph at log_d = 20
     /// (1 GiB codeword) next to streaming bandwidth floors.
     /// Run with `--ignored --nocapture gl2_anatomy`.
@@ -24438,6 +25068,80 @@ kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_
             let fl = |enc: imp::Id, pso: imp::Id| {
                 imp::encode_final_leaf_and_upper(gpu, enc, pso, data_buf, tw_buf, tree_buf, log_d, 4, false)
             };
+            // g1 lane: mid-pass (g4x2) ablations, timing only. nowrite makes
+            // the stores conditional on an impossible value; arith also
+            // synthesizes the loaded tiles from indices (no device bytes).
+            let g4 = imp::g4x2_msl_source();
+            let st = "            data[((pa + (e << P.s)) << 6) + lane] = ea[e];\n            data[((pb + (e << P.s)) << 6) + lane] = eb[e];\n";
+            let ld = "            ea[e] = data[((pa + (e << P.s)) << 6) + lane];\n            eb[e] = data[((pb + (e << P.s)) << 6) + lane];\n";
+            assert!(g4.contains(st) && g4.contains(ld));
+            let nw_st = "            if (ea[e].x == 0x9E3779B9u && P.s == 77u) { data[((pa + (e << P.s)) << 6) + lane] = ea[e]; data[((pb + (e << P.s)) << 6) + lane] = eb[e]; }\n";
+            let ar_ld = "            ea[e] = uint4((pa + e) * 0x9E3779B1u, lane * 0x85EBCA77u ^ tgid, (tgid + e) * 0xC2B2AE3Du, (lane ^ e) * 0x27D4EB2Fu ^ pa);\n            eb[e] = uint4((pb ^ e) * 0x165667B1u, (lane + 7u) * 0xD3A2646Cu, tgid * 0xFD7046C5u ^ e, (pb + lane) * 0xB55A4F09u);\n";
+            let g4_nw = g4.replacen(st, nw_st, 1);
+            let g4_ar = g4_nw.replacen(ld, ar_ld, 1);
+            let pso_p8ctl = imp::compile_supplemental_pipeline(gpu, g4, "ntt_fused_reg4g4x2").unwrap();
+            let bld = "            gf_build_byte16_twl(tabB, twl, (1u << j) - 1u + c, lid);           \\\n";
+            assert!(g4.contains(bld));
+            let g4_nb = g4.replacen(bld, "            if (it == 0u && j == 0u) { gf_build_byte16_twl(tabB, twl, (1u << j) - 1u + c, lid); } \\\n", 1);
+            let mul = "gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[0], pa, pb);";
+            assert!(g4.contains(mul));
+            let g4_nm = g4.replacen(mul, "pa = ea[ev].yzwx ^ tabB[lid]; pb = eb[ev].wxyz;", 1);
+            let pso_p8nb = imp::compile_supplemental_pipeline(gpu, &g4_nb, "ntt_fused_reg4g4x2").unwrap();
+            let pso_p8nm = imp::compile_supplemental_pipeline(gpu, &g4_nm, "ntt_fused_reg4g4x2").unwrap();
+            let shl = "        a = gf_shl16(a);\n        b = gf_shl16(b);\n";
+            assert!(g4.contains(shl));
+            let g4_ns = g4.replacen(shl, "        a = a.yzwx;\n        b = b.yzwx;\n", 1);
+            let lds = "        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];\n        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];\n";
+            assert!(g4.contains(lds));
+            let g4_l1 = g4.replacen(lds, "        a ^= tab[(ha ^ (ha >> 8)) & 255u];\n        b ^= tab[256u + ((hb ^ (hb >> 8)) & 255u)];\n", 1);
+            assert_eq!(g4.matches("252u").count(), 3);
+            let pso_gp: Vec<imp::Id> = ["1u", "124u"]
+                .iter()
+                .map(|pad| {
+                    let src = g4.replace("252u", pad);
+                    imp::compile_supplemental_pipeline(gpu, &src, "ntt_fused_reg4g4x2").unwrap()
+                })
+                .collect();
+            let pso_w: Vec<imp::Id> = [252u32, 1, 124, 508]
+                .iter()
+                .map(|pad| {
+                    let src = imp::g1w_msl_source().replacen(
+                        "using namespace metal;\n",
+                        &format!("using namespace metal;\n#define G1W_PADN {pad}u\n"),
+                        1,
+                    );
+                    imp::compile_supplemental_pipeline(gpu, &src, "ntt_g1w").unwrap()
+                })
+                .collect();
+            for (pi, &pso) in pso_w.iter().enumerate() {
+                // Exactness on the full 1 GiB buffer: from-z, then p4 by
+                // production, then p8 by production vs by g1w (multiplying fold).
+                let digest = || {
+                    let w = core::slice::from_raw_parts(gpu.buffer_contents(data_buf).cast::<u64>(), data_bytes / 8);
+                    w.iter().fold(0u64, |a, &v| (a ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29))
+                };
+                run(&|enc| { fz(enc); pass(enc, 4); pass(enc, 8); });
+                let want = digest();
+                run(&|enc| {
+                    fz(enc);
+                    pass(enc, 4);
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, data_buf, 0, 0);
+                    gpu.set_buffer(enc, tw_buf, 0, 1);
+                    let p = imp::NttParams { log_d: log_d as u32, l: 8, f: 4, s: (log_d - 12) as u32 };
+                    let bytes = core::slice::from_raw_parts(
+                        (&p as *const imp::NttParams).cast::<u8>(),
+                        core::mem::size_of::<imp::NttParams>(),
+                    );
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.dispatch(enc, 1u64 << (log_d - 4 - 2), 128);
+                });
+                eprintln!("g1w variant {pi}: p8 bit-exact vs production: {}", digest() == want);
+            }
+            let pso_p8ns = imp::compile_supplemental_pipeline(gpu, &g4_ns, "ntt_fused_reg4g4x2").unwrap();
+            let pso_p8l1 = imp::compile_supplemental_pipeline(gpu, &g4_l1, "ntt_fused_reg4g4x2").unwrap();
+            let pso_p8nw = imp::compile_supplemental_pipeline(gpu, &g4_nw, "ntt_fused_reg4g4x2").unwrap();
+            let pso_p8ar = imp::compile_supplemental_pipeline(gpu, &g4_ar, "ntt_fused_reg4g4x2").unwrap();
             // Background CPU load: 0 = none, 1 = memory streaming threads,
             // 2 = ALU-only threads (GL2_LOAD_THREADS, default 8).
             for load in [0u32, 1, 2] {
@@ -24469,7 +25173,7 @@ kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                let names = ["fused", "fused_nowrite", "p8", "merkle", "bw_rw4", "bw_read", "pfx166_inc", "pfx166_fused"];
+                let names = ["fused", "fused_nowrite", "p8", "merkle", "bw_rw4", "bw_read", "pfx166_inc", "pfx166_fused", "p8_nowrite", "p8_arith", "p8_ctl", "p8_nobuild", "p8_nomul", "p8_noshl", "p8_1load", "g1w_252", "g1w_1", "g1w_124", "g1w_508", "g4x2_pad1", "g4x2_pad124"];
                 let mut rr: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
                 for _ in 0..reps {
                     for (slot, fz) in [(6usize, false), (7, true)] {
@@ -24477,6 +25181,34 @@ kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_
                             imp::encode_hybrid_prefix_tail_with(
                                 gpu, enc, data_buf, tw_buf, tree_buf, log_d, n_leaves, 8, 166, 256, fz,
                             )
+                        }));
+                    }
+                    for (slot, pso) in [(8usize, pso_p8nw), (9, pso_p8ar), (10, pso_p8ctl), (11, pso_p8nb), (12, pso_p8nm), (13, pso_p8ns), (14, pso_p8l1), (19, pso_gp[0]), (20, pso_gp[1])] {
+                        rr[slot].push(run(&|enc| {
+                            gpu.set_pipeline(enc, pso);
+                            gpu.set_buffer(enc, data_buf, 0, 0);
+                            gpu.set_buffer(enc, tw_buf, 0, 1);
+                            let p = imp::NttParams { log_d: log_d as u32, l: 8, f: 4, s: (log_d - 12) as u32 };
+                            let bytes = core::slice::from_raw_parts(
+                                (&p as *const imp::NttParams).cast::<u8>(),
+                                core::mem::size_of::<imp::NttParams>(),
+                            );
+                            gpu.set_bytes(enc, bytes, 2);
+                            gpu.dispatch(enc, 1u64 << (log_d - 4 - 2), 64);
+                        }));
+                    }
+                    for (slot, pso) in [(15usize, pso_w[0]), (16, pso_w[1]), (17, pso_w[2]), (18, pso_w[3])] {
+                        rr[slot].push(run(&|enc| {
+                            gpu.set_pipeline(enc, pso);
+                            gpu.set_buffer(enc, data_buf, 0, 0);
+                            gpu.set_buffer(enc, tw_buf, 0, 1);
+                            let p = imp::NttParams { log_d: log_d as u32, l: 8, f: 4, s: (log_d - 12) as u32 };
+                            let bytes = core::slice::from_raw_parts(
+                                (&p as *const imp::NttParams).cast::<u8>(),
+                                core::mem::size_of::<imp::NttParams>(),
+                            );
+                            gpu.set_bytes(enc, bytes, 2);
+                            gpu.dispatch(enc, 1u64 << (log_d - 4 - 2), 128);
                         }));
                     }
                     rr[0].push(run(&|enc| fl(enc, pso_fp)));
