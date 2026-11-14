@@ -6212,11 +6212,16 @@ mod tests {
                 if sparse.tail_compact {
                     // Nothing is written in front of or past the compacted blocks.
                     let lo = sparse.delta_offset(0);
-                    let per_block = if sparse.head_compact {
-                        kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK
-                    } else {
-                        kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK
-                    };
+                    // The compacted layouts exist only in the aarch64 kernels.
+                    #[cfg(target_arch = "aarch64")]
+                    let (hc_bpb, tc_bpb) = (
+                        kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK,
+                        kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK,
+                    );
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let (hc_bpb, tc_bpb): (usize, usize) =
+                        unreachable!("tail compaction is an aarch64-only layout");
+                    let per_block = if sparse.head_compact { hc_bpb } else { tc_bpb };
                     let hi = sparse.delta_offset(n_pairs - 128) + per_block;
                     assert!(sparse.deltas[..lo].chunks_exact(16).all(|c| c == &poison_bytes[..]));
                     assert!(sparse.deltas[hi..].chunks_exact(16).all(|c| c == &poison_bytes[..]));
