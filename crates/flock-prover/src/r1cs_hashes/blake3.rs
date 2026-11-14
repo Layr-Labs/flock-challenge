@@ -3340,27 +3340,63 @@ pub(crate) mod witgen_simd {
             } else {
                 nt1
             };
-            // The copy loop is one asm block whose loop head is pinned to a
-            // 64-byte boundary (`.p2align 6` before the label; the padding
-            // runs once per block, never inside the loop), so its placement
-            // does not depend on the size of code elsewhere in the binary.
-            // Same loads and stores, in the same ascending order.
-            let n = end.saturating_sub(nt0);
+            copy_out_imm(scratch, dst, nt0, end);
+        }
+    }
+
+    macro_rules! for_each_dump_chunk {
+        ($m:ident) => {
+            $m!(0); $m!(1); $m!(2); $m!(3); $m!(4); $m!(5); $m!(6); $m!(7);
+            $m!(8); $m!(9); $m!(10); $m!(11); $m!(12); $m!(13); $m!(14); $m!(15);
+            $m!(16); $m!(17); $m!(18); $m!(19); $m!(20); $m!(21); $m!(22); $m!(23);
+            $m!(24); $m!(25); $m!(26); $m!(27); $m!(28); $m!(29); $m!(30); $m!(31);
+            $m!(32); $m!(33); $m!(34); $m!(35); $m!(36); $m!(37); $m!(38); $m!(39);
+            $m!(40); $m!(41); $m!(42); $m!(43); $m!(44); $m!(45); $m!(46); $m!(47);
+            $m!(48); $m!(49); $m!(50); $m!(51); $m!(52); $m!(53); $m!(54); $m!(55);
+            $m!(56); $m!(57); $m!(58); $m!(59); $m!(60); $m!(61); $m!(62); $m!(63);
+        };
+    }
+
+    #[inline(always)]
+    pub(super) unsafe fn copy_out_imm(scratch: *const u32, dst: *mut u32, g0: usize, g1: usize) {
+        debug_assert!(g0 <= g1 && g1 <= DUMP_CHUNKS);
+        unsafe {
+            for j in 0..4usize {
+                let src = scratch.add(j * U32_PER_BLOCK + 256);
+                let out = dst.add(j * U32_PER_BLOCK + 256);
+                macro_rules! chunk {
+                    ($g:literal) => {
+                        if g0 <= $g && $g < g1 {
+                            core::arch::asm!(
+                                "ldp {a:q}, {b:q}, [{s}, #{o}]",
+                                "stnp {a:q}, {b:q}, [{d}, #{o}]",
+                                s = in(reg) src,
+                                d = in(reg) out,
+                                o = const 32 * $g - 1024,
+                                a = out(vreg) _,
+                                b = out(vreg) _,
+                                options(nostack)
+                            );
+                        }
+                    };
+                }
+                for_each_dump_chunk!(chunk);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) unsafe fn copy_out_loop(scratch: *const u32, dst: *mut u32, g0: usize, g1: usize) {
+        unsafe {
             for j in 0..4usize {
                 let src = scratch.add(j * U32_PER_BLOCK);
                 let out = dst.add(j * U32_PER_BLOCK);
-                if n != 0 {
+                for g in g0..g1 {
                     core::arch::asm!(
-                        ".p2align 6",
-                        "2:",
-                        "ldp {a:q}, {b:q}, [{s}], #32",
+                        "ldp {a:q}, {b:q}, [{s}]",
                         "stnp {a:q}, {b:q}, [{d}]",
-                        "add {d}, {d}, #32",
-                        "subs {n}, {n}, #1",
-                        "b.ne 2b",
-                        s = inout(reg) src.add(8 * nt0) => _,
-                        d = inout(reg) out.add(8 * nt0) => _,
-                        n = inout(reg) n => _,
+                        s = in(reg) src.add(8 * g),
+                        d = in(reg) out.add(8 * g),
                         a = out(vreg) _,
                         b = out(vreg) _,
                         options(nostack)
@@ -6800,6 +6836,44 @@ mod tests {
     #[test]
     fn split_quad_input_mem_form_matches_register_form() {
         check_split_quad_memory_form(false);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn copy_out_imm_matches_addressed_loop() {
+        const BLK: usize = K / 32;
+        const GUARD: usize = 16;
+        const W: usize = 4 * BLK + 2 * GUARD;
+        let mut rng = Rng::new(0x5eed_c0f7_0002);
+        let ranges = [(0, 61), (4, 59), (0, 64), (0, 0), (5, 6), (31, 33), (63, 64), (0, 32)];
+        for (round, &(g0, g1)) in ranges.iter().enumerate() {
+            let scratch: Vec<u32> = (0..4 * BLK)
+                .map(|i| match (i + round) % 9 {
+                    0 => 0,
+                    1 => 1,
+                    2 => u32::MAX,
+                    _ => rng.next_u32(),
+                })
+                .collect();
+            let fill = rng.next_u32();
+            let mut want = vec![fill; W];
+            let mut got = vec![fill; W];
+            unsafe {
+                witgen_simd::copy_out_loop(scratch.as_ptr(), want.as_mut_ptr().add(GUARD), g0, g1);
+                witgen_simd::copy_out_imm(scratch.as_ptr(), got.as_mut_ptr().add(GUARD), g0, g1);
+            }
+            assert_eq!(got, want, "chunks {g0}..{g1}");
+            for j in 0..4 {
+                for w in 0..BLK {
+                    let x = got[GUARD + j * BLK + w];
+                    if (8 * g0..8 * g1).contains(&w) {
+                        assert_eq!(x, scratch[j * BLK + w]);
+                    } else {
+                        assert_eq!(x, fill);
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
