@@ -1921,6 +1921,12 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                         tri_acc_sw(&mut p1_odd, w, w_sw, a3);
                     }
                     tri_acc_sw(&mut w0, w, w_sw, a2);
+                    // W3/W4/W5 are unchanged here; give their fused limbs
+                    // fresh registers as the full path does.
+                    for t in [&mut w3, &mut w4, &mut w5] {
+                        t.ll = fresh_q(t.ll);
+                        t.hh = fresh_q(t.hh);
+                    }
                 } else {
                     #[cfg(target_feature = "sha3")]
                     let (a0w, a1w, a2w, a3w) = (
@@ -2057,14 +2063,17 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                 let first = block * 64;
                 if ASM_OFF {
                     // One pointer per stream at group `first`, stepped once per
-                    // group; the second pair of a group sits at fixed offsets.
+                    // two groups; every pair of a trip sits at a fixed offset.
                     let mut pa = a_packed.add(32 * first);
                     let mut pb = b_packed.add(32 * first);
                     let mut pn = anchors.add(4 * first);
                     let mut pd = deltas.add(32 * first);
                     // Group `u`'s prepared weight pair sits at `eq_prep[2u]`.
                     let mut pe = eq_prep.add(2 * first);
-                    for _ in 0..60 {
+                    // Two groups per trip (30 trips): the accumulators move
+                    // to fresh registers in the first group and back in the
+                    // second, so no loop-carried copies are needed.
+                    for _ in 0..30 {
                         let rows0 = r2_pair_fold_and_store_off::<0, 0>(
                             table_data, pa, pb, pn, pd, degen, b_ones,
                         );
@@ -2073,11 +2082,20 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                         );
                         let p0 = vld1q_u64(pe.cast::<u64>());
                         let p1 = vld1q_u64(pe.add(1).cast::<u64>());
-                        pa = pa.wrapping_add(32);
-                        pb = pb.wrapping_add(32);
-                        pn = pn.wrapping_add(4);
-                        pd = pd.wrapping_add(32);
-                        pe = pe.wrapping_add(2);
+                        process_group!(prepared rows0, rows1, p0, p1);
+                        let rows0 = r2_pair_fold_and_store_off::<32, 64>(
+                            table_data, pa, pb, pn, pd, degen, b_ones,
+                        );
+                        let rows1 = r2_pair_fold_and_store_off::<48, 96>(
+                            table_data, pa, pb, pn, pd, degen, b_ones,
+                        );
+                        let p0 = vld1q_u64(pe.add(2).cast::<u64>());
+                        let p1 = vld1q_u64(pe.add(3).cast::<u64>());
+                        pa = pa.wrapping_add(64);
+                        pb = pb.wrapping_add(64);
+                        pn = pn.wrapping_add(8);
+                        pd = pd.wrapping_add(64);
+                        pe = pe.wrapping_add(4);
                         // Emits nothing; keeps each stream in its own
                         // register rather than one index plus adds.
                         core::arch::asm!(
@@ -2311,6 +2329,23 @@ fn zc_k_allfused_enabled() -> bool {
 fn r2_asm_offsets_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_ASM_OFFSETS").is_none())
+}
+
+/// `x` copied into a register other than its own (one `mov`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fresh_q(x: core::arch::aarch64::uint64x2_t) -> core::arch::aarch64::uint64x2_t {
+    let out: core::arch::aarch64::uint64x2_t;
+    // SAFETY: register-only copy.
+    unsafe {
+        core::arch::asm!(
+            "mov {o:v}.16b, {x:v}.16b",
+            x = in(vreg) x,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
 }
 
 /// [`load_code_pair_gpr`] at the constant byte offset `OFF` from `p`.
@@ -4197,6 +4232,52 @@ unsafe fn mul_sw_fused_xor1_q(
     out
 }
 
+/// [`mul_prep86_q`] plus an addend: `x * t + e1` for a fixed `t` given as
+/// its prepared pair, with `k` holding `0x86` in its high lane. `x^64 * M` is
+/// formed as the swapped `M` plus `M.hi * 0x86`, so no zero-lane vector is
+/// needed. Four data `PMULL`s and one fold `PMULL`, each pair's `EOR` writing
+/// the `PMULL`'s own register; 10 instructions, as [`mul_prep_xor1_q`]. The
+/// product is fully reduced (`M.hi * 0x86` fits in 71 bits), so the result has
+/// the same bits as [`mul_prep_xor1_q`].
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn mul_prep86_xor1_q(
+    p0: core::arch::aarch64::uint64x2_t,
+    p1: core::arch::aarch64::uint64x2_t,
+    x: core::arch::aarch64::uint64x2_t,
+    k: core::arch::aarch64::uint64x2_t,
+    e1: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    let out: core::arch::aarch64::uint64x2_t;
+    // SAFETY: register-only carry-less products and XORs; every scratch
+    // register and the output are early clobbers.
+    unsafe {
+        core::arch::asm!(
+            "pmull {l:v}.1q, {x:v}.1d, {p0:v}.1d",
+            "pmull2 {h:v}.1q, {x:v}.2d, {p0:v}.2d",
+            "eor {h:v}.16b, {h:v}.16b, {l:v}.16b",
+            "pmull {l:v}.1q, {x:v}.1d, {p1:v}.1d",
+            "pmull2 {m:v}.1q, {x:v}.2d, {p1:v}.2d",
+            "eor {m:v}.16b, {m:v}.16b, {l:v}.16b",
+            "ext {l:v}.16b, {m:v}.16b, {m:v}.16b, #8",
+            "eor3 {l:v}.16b, {l:v}.16b, {h:v}.16b, {e1:v}.16b",
+            "pmull2 {o:v}.1q, {m:v}.2d, {k:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {l:v}.16b",
+            p0 = in(vreg) p0,
+            p1 = in(vreg) p1,
+            x = in(vreg) x,
+            k = in(vreg) k,
+            e1 = in(vreg) e1,
+            l = out(vreg) _,
+            h = out(vreg) _,
+            m = out(vreg) _,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
 /// `x * t + e1` in the field for a fixed `t` given as its prepared pair
 /// `(p0, p1) = const_prep(t)` (`p0 = (t.lo, R.lo)`, `p1 = (t.hi, t.lo ^ R.hi)`,
 /// `R = t.hi * 0x87`): `x * t = L + x^64 * M` with `L = x.lo*p0.lo +
@@ -4206,8 +4287,8 @@ unsafe fn mul_sw_fused_xor1_q(
 /// [`mul_sw_fused_xor1_q`] takes 13 and six `PMULL`s. The result is the fully
 /// reduced product plus `e1`, the same bits as [`mul_sw_fused_xor1_q`] with
 /// `a = t`. `k` holds `0x87` in its high lane; `z` is any vector whose high
-/// lane is zero.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+/// lane is zero. The test reference of [`mul_prep86_xor1_q`].
+#[cfg(all(test, target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(always)]
 unsafe fn mul_prep_xor1_q(
     p0: core::arch::aarch64::uint64x2_t,
@@ -4253,8 +4334,8 @@ unsafe fn mul_prep_xor1_q(
 /// vector whose high lane is zero). Four data `PMULL`s and one fold `PMULL`,
 /// 10 instructions where [`mul_sw_fused_q`] takes 12 and six `PMULL`s. The
 /// result is fully reduced (`M.hi * 0x87` fits in 71 bits): the same bits as
-/// [`mul_sw_fused_q`] with `a = t`.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+/// [`mul_sw_fused_q`] with `a = t`. Kept as a test reference.
+#[cfg(all(test, target_arch = "aarch64", target_feature = "sha3"))]
 #[inline(always)]
 unsafe fn mul_prep_q(
     p0: core::arch::aarch64::uint64x2_t,
@@ -4309,12 +4390,12 @@ unsafe fn mul_prep_q(
 /// spills (`ldr x?, [sp, ..]` per lane side for one λ₃ bank base), and the
 /// stores use immediate offsets (two address `ADD`s per group instead of
 /// six). The message half is unchanged. The `ρ₂` multiply-add runs on `ρ₂`'s
-/// prepared pair ([`mul_prep_xor1_q`]: five `PMULL`s, 10 instructions).
+/// prepared pair ([`mul_prep86_xor1_q`]: five `PMULL`s, 10 instructions).
 ///
 /// `eq_prep` holds the group weights in prepared form ([`round2_eq_prep`] of
 /// the chunk's `eq_lo`): entries `2t` and `2t + 1` are `const_prep(w)` for
 /// group `t`'s weight `w = eq_lo[2t + 1]`, read with one paired load. The
-/// four `w`-scaled rows are [`mul_prep_q`] products (five `PMULL`s, 10
+/// four `w`-scaled rows are [`mul_prep86_q`] products (five `PMULL`s, 10
 /// instructions each, against the schoolbook form's six and 12 plus a swap
 /// of `w`). The b ≡ 1 shortcut takes `w` itself as the pair's two low lanes.
 ///
@@ -4359,10 +4440,11 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
 
     unsafe {
         let zero = vdupq_n_u64(0);
-        let k87 = vdupq_n_u64(0x87);
+        // The fold constant of the prepared products (`mul_prep86_xor1_q`,
+        // `mul_prep86_q`): `0x86` in the high lane, no zero-lane vector.
+        let k86 = vdupq_n_u64(0x86);
         let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
-        // `rho2` in the prepared form of `mul_prep_xor1_q`; `one_q` (high
-        // lane zero) doubles as its zero lane.
+        // `rho2` in the prepared form of `mul_prep86_xor1_q`.
         let (rho2_p0, rho2_p1) = crate::field::gf2_128::aarch64::const_prep(rho2_q);
         let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
         // Slots: p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5'.
@@ -4388,20 +4470,20 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
 
                 let xa0 = lookup8_acc_q(table_r1, da0, anc_a0);
                 let xa1 = lookup8_acc_q(table_r1, da1, anc_a1);
-                let av = mul_prep_xor1_q(rho2_p0, rho2_p1, veorq_u64(xa0, xa1), k87, one_q, xa0);
+                let av = mul_prep86_xor1_q(rho2_p0, rho2_p1, veorq_u64(xa0, xa1), k86, xa0);
                 let bv = if degen && (db0 | db1) == 0 {
                     let bd = veorq_u64(anc_b0, anc_b1);
                     if is_zero_q(bd) {
                         anc_b0
                     } else {
                         $b_flat = false;
-                        mul_prep_xor1_q(rho2_p0, rho2_p1, bd, k87, one_q, anc_b0)
+                        mul_prep86_xor1_q(rho2_p0, rho2_p1, bd, k86, anc_b0)
                     }
                 } else {
                     $b_flat = false;
                     let xb0 = lookup8_acc_q(table_r1, db0, anc_b0);
                     let xb1 = lookup8_acc_q(table_r1, db1, anc_b1);
-                    mul_prep_xor1_q(rho2_p0, rho2_p1, veorq_u64(xb0, xb1), k87, one_q, xb0)
+                    mul_prep86_xor1_q(rho2_p0, rho2_p1, veorq_u64(xb0, xb1), k86, xb0)
                 };
                 (av, bv)
             }};
@@ -4450,10 +4532,10 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     tri_acc_q_crossfused(&mut acc[2], w, a3);
                     tri_acc_q_crossfused(&mut acc[4], w, a2);
                 } else {
-                    let a0w = mul_prep_q(w_p0, w_p1, a0, k87, one_q);
-                    let a1w = mul_prep_q(w_p0, w_p1, a1, k87, one_q);
-                    let a2w = mul_prep_q(w_p0, w_p1, a2, k87, one_q);
-                    let a3w = mul_prep_q(w_p0, w_p1, a3, k87, one_q);
+                    let a0w = mul_prep86_q(w_p0, w_p1, a0, k86);
+                    let a1w = mul_prep86_q(w_p0, w_p1, a1, k86);
+                    let a2w = mul_prep86_q(w_p0, w_p1, a2, k86);
+                    let a3w = mul_prep86_q(w_p0, w_p1, a3, k86);
                     tri_acc_q_crossfused(&mut acc[0], a1w, b1);
                     tri_acc_q_crossfused(&mut acc[1], veorq_u64(a0w, a1w), veorq_u64(b0, b1));
                     tri_acc_q_crossfused(&mut acc[2], a3w, b3);
@@ -4509,8 +4591,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
                 let xa0 = lookup8_acc_q(table_r1, da0, anc_a0);
                 let xb0 = lookup8_acc_q(table_r1, db0, anc_b0);
-                let av0 = mul_prep_xor1_q(rho2_p0, rho2_p1, xa0, k87, one_q, xa0);
-                let bv0 = mul_prep_xor1_q(rho2_p0, rho2_p1, xb0, k87, one_q, xb0);
+                let av0 = mul_prep86_xor1_q(rho2_p0, rho2_p1, xa0, k86, xa0);
+                let bv0 = mul_prep86_xor1_q(rho2_p0, rho2_p1, xb0, k86, xb0);
                 if PACK {
                     let slot = blk % PACK_BLOCKS;
                     stage_a[slot] = av0;
@@ -4532,7 +4614,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     store_pair_nt_off::<32>(bo, zero, zero);
                 }
                 let wp = eq_prep.add(2 * t).cast::<u64>();
-                let a0w = mul_prep_q(vld1q_u64(wp), vld1q_u64(wp.add(2)), av0, k87, one_q);
+                let a0w = mul_prep86_q(vld1q_u64(wp), vld1q_u64(wp.add(2)), av0, k86);
                 let (ll, cross, hh) = clmul_products_q(a0w, bv0);
                 for slot in [1usize, 5, 7] {
                     let t = &mut acc.0[slot];
@@ -7638,6 +7720,97 @@ mod tests {
         }
     }
 
+    /// The ranked full-sweep loop, two groups per trip, writes the same
+    /// anchors and deltas and returns the same slots as the parent loop
+    /// (one group per step, addressed per group). Every trip slot sees each
+    /// group kind: full, b == 1 in both pairs (the group shortcut, which
+    /// leaves W3/W4/W5 unchanged), and a lone degenerate pair in either
+    /// pair, in all combinations across the trip's two groups, with and
+    /// without the shortcut, `degen` and dead stores.
+    #[test]
+    fn round2_two_group_trips_match_parent_loop() {
+        const LO_SIZE: usize = 2048;
+        let mut state = 0x5232_4455_4f54_5250;
+        let mut a_packed = vec![0u8; 16 * LO_SIZE];
+        let mut b_packed = vec![0u8; 16 * LO_SIZE];
+        for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+            *byte = splitmix64(&mut state) as u8;
+        }
+        // Group kinds: 0 full, 1 both pairs b == 1, 2 pair 0 only, 3 pair 1 only.
+        let mark = |b: &mut Vec<u8>, g: usize, kind: usize| match kind {
+            1 => b[g * 32..(g + 1) * 32].fill(0xff),
+            2 => b[g * 32..g * 32 + 16].fill(0xff),
+            3 => b[g * 32 + 16..(g + 1) * 32].fill(0xff),
+            _ => {}
+        };
+        let n_groups = LO_SIZE / 2;
+        for block in 0..n_groups / 64 {
+            for trip in 0..30 {
+                let (g0, g1) = (64 * block + 2 * trip, 64 * block + 2 * trip + 1);
+                let k = (trip + 3 * block) % 16;
+                mark(&mut b_packed, g0, k / 4);
+                mark(&mut b_packed, g1, k % 4);
+            }
+        }
+        let eq_lo: Vec<F128> = (0..LO_SIZE)
+            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+            .collect();
+        let eq_prep = round2_eq_prep(&eq_lo);
+        let mut table: Vec<F128> = (0..8 * 256)
+            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+            .collect();
+        let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
+        for ones_is_one in [false, true] {
+            if ones_is_one {
+                // An all-ones row folds to one: the b == 1 group shortcut.
+                let rest = (0..7).fold(F128::ZERO, |acc, c| acc + table[c * 256 + 0xff]);
+                table[7 * 256 + 0xff] = F128::ONE + rest;
+            }
+            for base in [0, 128, 7 * LO_SIZE] {
+                for (degen, skip_dead) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let run = |trips: bool| {
+                        let mut anchors = vec![poison; 2 * LO_SIZE];
+                        let mut deltas = vec![0xa5u8; 16 * LO_SIZE];
+                        let mut out = [poison; 8];
+                        unsafe {
+                            let k = if trips {
+                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true>
+                            } else {
+                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false>
+                            };
+                            k(
+                                table.as_ptr().cast::<u8>(),
+                                a_packed.as_ptr(),
+                                b_packed.as_ptr(),
+                                anchors.as_mut_ptr(),
+                                deltas.as_mut_ptr(),
+                                eq_lo.as_ptr(),
+                                eq_prep.as_ptr(),
+                                LO_SIZE,
+                                base,
+                                127,
+                                121,
+                                degen,
+                                true,
+                                skip_dead,
+                                out.as_mut_ptr(),
+                            );
+                        }
+                        (anchors, deltas, out)
+                    };
+                    let (want, got) = (run(false), run(true));
+                    let at = format!("ones {ones_is_one} base {base} degen {degen} skip {skip_dead}");
+                    assert_eq!(got.0, want.0, "anchors: {at}");
+                    assert_eq!(got.1, want.1, "deltas: {at}");
+                    assert_eq!(got.2, want.2, "slots: {at}");
+                    assert!(got.2.iter().all(|v| *v != poison), "slots written: {at}");
+                }
+            }
+        }
+    }
+
     /// The ranked pre-scaled loop with the reduction constant held in a
     /// register and one copy per `degen` and b == 1 flag writes the same
     /// anchors and deltas and returns the same slots as the parent loop:
@@ -8775,6 +8948,49 @@ mod tests {
         for edge in [[0, 0], [1, 0], [0, 1], [u64::MAX, u64::MAX], [1, 1]] {
             check(edge, [next(), next()]);
             check([next(), next()], edge);
+        }
+    }
+
+    /// The K pass's 0x86-fold products return the same bits as the forms
+    /// they replace: [`mul_prep86_xor1_q`] against [`mul_prep_xor1_q`] (zero
+    /// lane from `ONE`, as the K pass passed it) and the schoolbook
+    /// [`mul_sw_fused_xor1_q`], with the operand also the addend (the last
+    /// group of a block); [`mul_prep86_q`] against [`mul_prep_q`] and
+    /// [`mul_sw_fused_q`], the pair read back from a [`round2_eq_prep`] table
+    /// as the kernel reads it. 512 random constants, operands and addends
+    /// plus zero/one edges.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn k_prep86_forms_match_prep_forms() {
+        use core::arch::aarch64::*;
+        let mut state = 0x4b38_3646_4f52_4d53;
+        let mut next = || splitmix64(&mut state);
+        let lanes = |v: uint64x2_t| unsafe { (vgetq_lane_u64::<0>(v), vgetq_lane_u64::<1>(v)) };
+        let check = |t: [u64; 2], x: [u64; 2], e: [u64; 2]| unsafe {
+            let (tv, xv, ev): (uint64x2_t, uint64x2_t, uint64x2_t) =
+                (std::mem::transmute(t), std::mem::transmute(x), std::mem::transmute(e));
+            let (k87, k86) = (vdupq_n_u64(0x87), vdupq_n_u64(0x86));
+            let one = std::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+            let (p0, p1) = crate::field::gf2_128::aarch64::const_prep(tv);
+            let want = mul_sw_fused_xor1_q(tv, swap_halves_q(tv), xv, k87, ev);
+            assert_eq!(lanes(mul_prep_xor1_q(p0, p1, xv, k87, one, ev)), lanes(want));
+            assert_eq!(lanes(mul_prep86_xor1_q(p0, p1, xv, k86, ev)), lanes(want));
+            let alias = mul_sw_fused_xor1_q(tv, swap_halves_q(tv), xv, k87, xv);
+            assert_eq!(lanes(mul_prep86_xor1_q(p0, p1, xv, k86, xv)), lanes(alias));
+            let prep = round2_eq_prep(&[F128::ZERO, std::mem::transmute::<uint64x2_t, F128>(tv)]);
+            let w0 = vld1q_u64(prep.as_ptr().cast::<u64>());
+            let w1 = vld1q_u64(prep.as_ptr().add(1).cast::<u64>());
+            let prod = mul_sw_fused_q(tv, swap_halves_q(tv), xv, k87);
+            assert_eq!(lanes(mul_prep_q(w0, w1, xv, k87, one)), lanes(prod));
+            assert_eq!(lanes(mul_prep86_q(w0, w1, xv, k86)), lanes(prod));
+        };
+        for _ in 0..512 {
+            check([next(), next()], [next(), next()], [next(), next()]);
+        }
+        for edge in [[0, 0], [1, 0], [0, 1], [u64::MAX, u64::MAX], [1, 1]] {
+            check(edge, [next(), next()], [next(), next()]);
+            check([next(), next()], edge, [next(), next()]);
+            check([next(), next()], [next(), next()], edge);
         }
     }
 
