@@ -101,6 +101,7 @@ use kernels::aarch64::{
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::{
     fold2_compact_and_round45_chunk_neon_8_fused, fold2_compact_and_round45_chunk_neon_8_fused_r1,
+    fold2_compact_and_round45_chunk_neon_8_fused_r1_k,
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_prescaled_8;
@@ -2797,6 +2798,12 @@ pub(crate) fn zc_k_bone_pack_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_BONE_PACK").is_none())
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn zc_k_horner_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_HORNER").is_none())
+}
+
 /// [`fold2_compact_and_round45_into`] that, with `pack` and when the state
 /// and split allow it (one-table fused kernel, dead-tail state, chunks of
 /// whole four-block superblocks), writes the dead-tail-packed layout: the
@@ -2929,6 +2936,15 @@ fn fold2_compact_and_round45_into_packed_b(
     // prepared form, one table shared by every chunk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let horner = one_table
+        && compact.dead_tail
+        && eq.n_lo >= 4
+        && zc_k_horner_enabled()
+        && (1..4u32).all(|j| {
+            let g = F128::new(1u64 << (1u32 << j), 0);
+            r_next4[1 + j as usize] * (F128::ONE + g) == g
+        });
     // b-one pack (packed outputs only): each 64-output block's b takes
     // `B_PACK_BLOCK` entries; a kernel that meets a skipped b output that is
     // not one says so, and the whole pass is rerun without it.
@@ -2983,6 +2999,16 @@ fn fold2_compact_and_round45_into_packed_b(
             let out_ptr = outv.as_mut_ptr();
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
+                (true, true) if one_table && pack && horner => {
+                    let ok = fold2_compact_and_round45_chunk_neon_8_fused_r1_k::<true, true, true>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                        compact.tail_compact, compact.head_compact, compact.head_b,
+                    );
+                    if !ok {
+                        b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
                     let ok = fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
@@ -2991,6 +3017,13 @@ fn fold2_compact_and_round45_into_packed_b(
                     if !ok {
                         b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+                }
+                #[cfg(target_feature = "sha3")]
+                (true, true) if one_table && horner => {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1_k::<true, false, true>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                        compact.tail_compact, compact.head_compact, compact.head_b,
+                    );
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
