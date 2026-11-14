@@ -3523,10 +3523,27 @@ pub(crate) fn fold_cascade_t_into_packed(
     };
 
     let mut s = [F128::ZERO; 26];
-    for (x_hi, outv) in partials.iter().enumerate() {
-        let eq_h = eq_hi[x_hi];
-        for (slot, &v) in s.iter_mut().zip(outv.iter()) {
-            *slot += eq_h * v;
+    if hi_size == 1 {
+        // No repeated reductions to eliminate for the single-chunk tail.
+        for (x_hi, outv) in partials.iter().enumerate() {
+            let eq_h = eq_hi[x_hi];
+            for (slot, &v) in s.iter_mut().zip(outv.iter()) {
+                *slot += eq_h * v;
+            }
+        }
+    } else {
+        // Reduction modulo the binary field polynomial is XOR-linear.
+        // Accumulate each weighted column in 256 bits, then reduce once:
+        // 26 * hi_size reductions become 26, with identical field values.
+        let mut unreduced = [F256Unreduced::ZERO; 26];
+        for (x_hi, outv) in partials.iter().enumerate() {
+            let eq_h = eq_hi[x_hi];
+            for (acc, &v) in unreduced.iter_mut().zip(outv.iter()) {
+                *acc ^= eq_h.mul_unreduced(v);
+            }
+        }
+        for (slot, acc) in s.iter_mut().zip(unreduced) {
+            *slot = acc.reduce();
         }
     }
     tri_finish(&s, r_next)
