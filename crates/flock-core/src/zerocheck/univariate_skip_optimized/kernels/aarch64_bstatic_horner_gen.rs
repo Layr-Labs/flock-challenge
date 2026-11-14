@@ -1335,7 +1335,13 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                 // kills).
                 if ab_z_out3_enabled() {
                     const BASE: u32 = AB_UNIT_MAIN | ABV_Z_OUT3;
-                    if ab_fuse_enabled() {
+                    if ab_fuse_enabled() && ab_zscaled_enabled() {
+                        // The `x^4` image in z-basis form
+                        // ([`ab_zscaled_enabled`]).
+                        bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM | ABV_Z_SCALED }, true, true>(
+                            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                        )
+                    } else if ab_fuse_enabled() {
                         bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM }, true, true>(
                             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                         )
@@ -1837,6 +1843,7 @@ fn ab_window_unit_fuse_matches_parent() {
                 assert!(want.0.iter().any(|&x| x != 0x3c), "{at}");
                 assert_eq!(want.0, want.1, "{at}");
                 assert_eq!(both!(BASE | ABV_FUSE, true), want, "FUSE {at}");
+                assert_eq!(both!(BASE | ABV_FUSE | ABV_Z_SCALED, true), want, "FUSE Z_SCALED {at}");
                 let helper_want = both!(AB_UNIT_HELPER, false);
                 assert_eq!(helper_want.0, want.0, "helper {at}");
                 assert_eq!(both!(AB_UNIT_HELPER | ABV_FUSE, false), helper_want, "FUSE_E {at}");

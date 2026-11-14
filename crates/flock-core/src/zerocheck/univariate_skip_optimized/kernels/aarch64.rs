@@ -4387,6 +4387,20 @@ pub(crate) fn ab_bstatic_z_low_forms<const NB: u32>(
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_Z_SCALED: u32 = 16;
 
+/// Kill switch for [`ABV_Z_SCALED`] in the fused window rows and the fused
+/// mixed const-one rows: any value of `FLOCK_NO_ZC_AB_ZSCALED` applies the
+/// `x^4` image of the A words K = 4..7 in the Karatsuba form again (eighteen
+/// lookups, eight slot-base adds and three index words per word) instead of
+/// the z-basis form the plain image takes (fourteen lookups out of the
+/// image's own z tables, built with the Karatsuba tables at start-up). Both
+/// forms XOR the same table bits into every output byte, so the rows are
+/// byte-identical. Read once per process.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_zscaled_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_ZSCALED").is_none())
+}
+
 #[cfg(target_arch = "aarch64")]
 const AB_Z_L1: usize = 0; // 256 x 32: lanes M0, M2 of R^{l1}
 #[cfg(target_arch = "aarch64")]
@@ -5700,7 +5714,10 @@ pub(crate) fn ab_mixed_row_guarded(
     // takes the incumbent form `V0`; the unfused H2 instance is kept for
     // the tests only, so the binary carries no extra mixed-row instance.
     const VF: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE;
+    // With the `x^4` image in z-basis form ([`ab_zscaled_enabled`]).
+    const VFZ: u32 = VF | ABV_Z_SCALED;
     let fuse = ab_mixed_h2_enabled() && ab_mixed_fuse_enabled();
+    let zs = fuse && ab_zscaled_enabled();
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
     let word = |packed: &[u8], k: usize| -> u64 {
@@ -5714,7 +5731,11 @@ pub(crate) fn ab_mixed_row_guarded(
         {
             return false;
         }
-        if fuse {
+        if zs {
+            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VFZ>(
+                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
+            );
+        } else if fuse {
             shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VF>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
@@ -5733,7 +5754,11 @@ pub(crate) fn ab_mixed_row_guarded(
         if word(b_packed, 4) & word(b_packed, 5) & word(b_packed, 6) & word(b_packed, 7) != u64::MAX {
             return false;
         }
-        if fuse {
+        if zs {
+            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VFZ>(
+                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
+            );
+        } else if fuse {
             shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VF>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
@@ -5831,17 +5856,22 @@ fn ab_mixed_fuse_matches_h2_and_incumbent() {
             let mut inc = [0u8; 64];
             let mut h2 = [0u8; 64];
             let mut got = [0u8; 64];
+            let mut got_z = [0u8; 64];
+            const VFZ: u32 = VF | ABV_Z_SCALED;
             if w0 {
                 shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V0>(&a, &b, &table, 0, None, &mut inc, nt);
                 shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, AB_MIXED_H2_VARIANT>(&a, &b, &table, 0, None, &mut h2, nt);
                 shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VF>(&a, &b, &table, 0, None, &mut got, nt);
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VFZ>(&a, &b, &table, 0, None, &mut got_z, nt);
             } else {
                 shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V0>(&a, &b, &table, 0, None, &mut inc, nt);
                 shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, AB_MIXED_H2_VARIANT>(&a, &b, &table, 0, None, &mut h2, nt);
                 shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VF>(&a, &b, &table, 0, None, &mut got, nt);
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VFZ>(&a, &b, &table, 0, None, &mut got_z, nt);
             }
             assert_eq!(h2, inc, "h2 case {case} w0={w0} nt={nt}");
             assert_eq!(got, h2, "fuse case {case} w0={w0} nt={nt}");
+            assert_eq!(got_z, h2, "fuse z-scaled case {case} w0={w0} nt={nt}");
         }
     }
 }
