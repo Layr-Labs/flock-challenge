@@ -5170,12 +5170,6 @@ impl Blake3Setup {
                     blocks,
                 );
             }
-            // Untimed: give the streamed first pass its first production
-            // execution here instead of in the timed prove (see
-            // `gpu_commit::ENV_NO_STREAM_WARM`). Ranked worker only.
-            if crate::seed_pipe::is_ranked_worker() {
-                flock_core::gpu_commit::warm_streamed_first_pass(&self.pcs_params);
-            }
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
             // return and only then touches `io::stdin()`, so the splice lands
