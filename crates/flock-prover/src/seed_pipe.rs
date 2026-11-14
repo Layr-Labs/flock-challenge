@@ -803,6 +803,15 @@ fn ranked_proof_path() -> Option<PathBuf> {
         .clone()
 }
 
+/// Kill switch for the hot parked-arm wait: `FLOCK_NO_PARK_KEEPALIVE=1` (exact
+/// '1') restores the blocking wait with the keep-alive started after `arm`.
+pub(crate) fn park_keepalive_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_PARK_KEEPALIVE").as_deref() != Some(OsStr::new("1"))
+    })
+}
+
 /// Sibling temporary name: distinct from the wrapper's `{proof}.tmp`, and on
 /// the same filesystem as the destination so the final rename is atomic.
 /// Kill switch for the publish-path rename warm-up: set exactly
@@ -1368,7 +1377,30 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     // reporting drops the sender and `recv` returns at once; the timeout only
     // bounds a pathological stall. `FLOCK_NO_PARKED_ARM=1` returns at once.
     if std::env::var_os("FLOCK_NO_PARKED_ARM").is_none() {
-        let _ = parked_rx.recv_timeout(std::time::Duration::from_millis(500));
+        let t_park = std::time::Instant::now();
+        if park_keepalive_enabled() {
+            // Hot wait: the caller lit the P-core keep-alive before `arm`
+            // (see `Blake3Setup::prove_fast`), and this thread polls instead
+            // of blocking, so no core of the P cluster goes idle between the
+            // warm-up tail and the ready report. Same bound as the blocking
+            // wait; a dead thread drops the sender and ends the loop at once.
+            let deadline = t_park + std::time::Duration::from_millis(500);
+            loop {
+                match parked_rx.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+        } else {
+            let _ = parked_rx.recv_timeout(std::time::Duration::from_millis(500));
+        }
+        if std::env::var_os("FLOCK_PARK_TRACE").is_some() {
+            eprintln!("[park] arm waited {:.3} ms", t_park.elapsed().as_secs_f64() * 1e3);
+        }
     }
 
     // Everything this thread does from here until adoption is shadow work that
