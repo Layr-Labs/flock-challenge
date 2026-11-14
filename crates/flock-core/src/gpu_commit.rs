@@ -730,6 +730,54 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the round-one AB completion GPU prefix arm (any value
+/// restores the exact CPU-only completion). With the arm on, the GPU computes
+/// the per-chunk 64-lane partials of a leading prefix of the 128 `x_hi`
+/// chunks of the challenge-weighted AB completion from the CPU-written
+/// `ab_inner` transform (read-only no-copy view) and returns them through a
+/// small partials buffer; the CPU drains the remaining chunks with the
+/// incumbent kernel and XOR-folds the GPU partials into the same reduction.
+/// Every partial is a sum of exact GF(2^128) products, so the folded message
+/// is bit-identical; the untimed warm-up prove additionally byte-compares the
+/// GPU partials against the CPU's own and disables the arm for the process on
+/// any mismatch.
+pub const ENV_NO_GPU_ZC_AB_COMPLETION: &str = "FLOCK_NO_GPU_ZC_AB_COMPLETION";
+
+/// Fixed GPU chunk share of the round-one AB completion arm (exactness build):
+/// `FLOCK_ZC_AB_GPU_CHUNKS=<n>`, `0` = arm off, clamped to the chunk count.
+/// Unset = [`ZC_AB_GPU_DEFAULT_CHUNKS`]. A non-integer value fails loudly.
+pub const ENV_ZC_AB_GPU_CHUNKS: &str = "FLOCK_ZC_AB_GPU_CHUNKS";
+const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 16;
+
+/// Requested GPU chunk share of the round-one AB completion arm; `0` = off
+/// (kill switch, share 0, or GPU commit disabled).
+pub(crate) fn gpu_zc_ab_completion_share() -> usize {
+    static SHARE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os(ENV_NO_GPU_ZC_AB_COMPLETION).is_some() {
+            return 0;
+        }
+        match std::env::var_os(ENV_ZC_AB_GPU_CHUNKS) {
+            None => ZC_AB_GPU_DEFAULT_CHUNKS,
+            Some(value) => value
+                .to_str()
+                .and_then(|text| text.trim().parse::<usize>().ok())
+                .expect("FLOCK_ZC_AB_GPU_CHUNKS must be a non-negative integer"),
+        }
+    });
+    if gpu_commit_enabled() { *SHARE } else { 0 }
+}
+
+/// Diagnostic trace for the round-one AB completion arm: the warm-up oracle
+/// verdict and, per prove that folds GPU partials, one `[zc-ab-gpu] fired`
+/// line (`FLOCK_ZC_AB_GPU_DEBUG=1`, or any `FLOCK_PHASE_TIMING` run).
+pub(crate) fn gpu_zc_ab_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_ZC_AB_GPU_DEBUG").is_some()
+            || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+    });
+    *ON
+}
+
 /// Kill switch for the L1 recursive-commit NTT/Merkle-leaf overlap
 /// (`FLOCK_NO_L1_MERKLE_OVERLAP=1`): instead of hashing each finalized NTT
 /// chunk's 128-byte leaves on the GPU while the CPU transform is still
@@ -1570,6 +1618,91 @@ pub(crate) fn gpu_zero_lane_pass(log_d: usize, s: usize) -> bool {
         && (s == 12 || (s == 8 && gpu_zero_lane_s8_enabled()))
         && gpu_zero_lane_enabled()
         && GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst) == GPU_ZERO_TAIL_LANES_RANKED
+}
+
+/// Exact-`1`, uncached rollback for first-pass zero-column compaction.
+/// All output stores remain: only known-zero input loads, products and table
+/// builds disappear. The ranked padding descriptor must also be published.
+pub const ENV_NO_GPU_FROM_Z_ZERO_COLUMNS: &str = "FLOCK_NO_GPU_FROM_Z_ZERO_COLUMNS";
+
+fn gpu_from_z_zero_columns_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+fn gpu_from_z_zero_columns_enabled() -> bool {
+    gpu_from_z_zero_columns_value_enabled(
+        std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_COLUMNS).as_deref(),
+    )
+}
+
+fn select_from_z_zero_columns(log_d: usize, zero_lanes: usize, enabled: bool) -> bool {
+    enabled && log_d == 20 && zero_lanes == GPU_ZERO_TAIL_LANES_RANKED
+}
+
+/// 256 columns/group and 121 live columns/pair require 512 rows/band.
+/// The byte offset is shared by the input and output and must start even.
+fn from_z_zero_columns_range(byte_offset: usize, r_count: usize) -> bool {
+    byte_offset.is_multiple_of(2 * 64 * 16) && r_count != 0 && r_count.is_multiple_of(512)
+}
+
+#[cfg(test)]
+mod from_z_zero_columns_gate_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn exact_one_shape_and_band_gates() {
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(gpu_from_z_zero_columns_value_enabled(value.map(OsStr::new)));
+        }
+        assert!(!gpu_from_z_zero_columns_value_enabled(Some(OsStr::new("1"))));
+        assert!(select_from_z_zero_columns(20, 7, true));
+        assert!(!select_from_z_zero_columns(19, 7, true));
+        assert!(!select_from_z_zero_columns(20, 0, true));
+        assert!(!select_from_z_zero_columns(20, 6, true));
+        assert!(!select_from_z_zero_columns(20, 7, false));
+        let mut start = 0;
+        // The unchanged ranked tapered witness schedule, in groups of 16 rows.
+        for groups in [64, 448, 512, 512, 512, 512, 512, 512, 448, 64] {
+            let rows = groups * 16;
+            assert!(from_z_zero_columns_range(start * 1024, rows));
+            start += rows;
+        }
+        assert_eq!(start, 1 << 16);
+        assert!(!from_z_zero_columns_range(1024, 512));
+        assert!(!from_z_zero_columns_range(16, 512));
+        assert!(!from_z_zero_columns_range(0, 256));
+        assert!(!from_z_zero_columns_range(0, 0));
+    }
+
+    #[test]
+    fn compact_column_partition_is_exact() {
+        for rows in [512, 1024, 7168, 8192] {
+            let live_groups = (rows / 512) * 121;
+            let mut seen = vec![false; rows * 64];
+            for group in 0..rows / 4 {
+                for rr in 0..4 {
+                    for lid in 0..64 {
+                        let (r, lane) = if group < live_groups {
+                            let col = (group * 4 + rr) * 64 + lid;
+                            let pair = col / 121;
+                            let m = col % 121;
+                            let odd = usize::from(m >= 64);
+                            (pair * 2 + odd, m - odd * 64)
+                        } else {
+                            let col = ((group - live_groups) * 4 + rr) * 64 + lid;
+                            (col / 7 * 2 + 1, 57 + col % 7)
+                        };
+                        assert!(r < rows && lane < 64);
+                        assert_eq!(r % 2 == 1 && lane >= 57, group >= live_groups);
+                        assert!(!seen[r * 64 + lane]);
+                        seen[r * 64 + lane] = true;
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&v| v));
+        }
+    }
 }
 
 /// Groups per block of the compacted grid: 121 live columns per (even, odd)
@@ -3921,6 +4054,8 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
     device const uint4* twiddles   [[buffer(1)]],
     constant NttParams& P          [[buffer(2)]],
     device const uint4* z          [[buffer(3)]],
+    constant uint& compact        [[buffer(4)]],
+    uint grid [[threadgroups_per_grid]],
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_index_in_threadgroup]])
 {
@@ -3935,6 +4070,23 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
     // groups up to 13.5 KiB, five from 13.8 KiB at 25.2 ms, four from
     // 16.8 KiB at 25.5 ms, three at 21.6 KiB at 31.1 ms).
     threadgroup uint4 pad[256u];
+    // The host admits only even-start bands with a multiple of 512 rows.
+    // Compact 121 live columns per even/odd pair into complete groups. The
+    // other 7/128 groups initialize zero outputs without tables or products.
+    // The return is uniform across the group, before either table barrier.
+    const uint live_groups = (grid >> 7) * 121u;
+    if (compact && tgid >= live_groups) {
+        for (uint rr = 0u; rr < 4u; rr++) {
+            const uint col = (((tgid - live_groups) << 2) + rr) * 64u + lid;
+            const uint pair = col / 7u;
+            const uint lane = 57u + col - pair * 7u;
+            const uint r = pair * 2u + 1u;
+            for (uint e = 0u; e < NF; e++) {
+                data[((r + (e << P.s)) << 6) + lane] = uint4(0u);
+            }
+        }
+        return;
+    }
     build_zero_root_tabs(twiddles, bases, tabs, lid);
     if (P.log_d == 77u) {          // unreachable; keeps `pad` allocated
         pad[lid % 256u] = tabs[lid];
@@ -3942,10 +4094,14 @@ kernel void ntt_fused_reg4_from_zg4_zero_root(
         tabs[lid] ^= pad[(lid + 1u) % 256u];
     }
 
-    const uint lane = lid & 63u;
     const uint r_base = tgid << LOG_G;
     for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
-        const uint r = r_base + rr;
+        const uint col = ((r_base + rr) << 6) + lid;
+        const uint pair = col / 121u;
+        const uint m = col - pair * 121u;
+        const uint odd = uint(m >= 64u);
+        const uint r = compact ? pair * 2u + odd : r_base + rr;
+        const uint lane = compact ? m - odd * 64u : lid;
         uint4 elems[NF];
 
         // Layer zero has v=0: load the message half once and duplicate it.
@@ -8422,6 +8578,11 @@ kernel void blake3_pow_scan(
         pub(crate) s: u32,
     }
 
+    #[cfg(test)]
+    std::thread_local! {
+        pub(crate) static TEST_FROM_Z_ZERO_COLUMN_BINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     /// Immutable selection for one logical from-z first pass. Every full,
     /// streamed, and blocking/reprime dispatch goes through this helper, so
     /// the candidate and exact rollback cannot silently diverge by path.
@@ -8429,14 +8590,21 @@ kernel void blake3_pow_scan(
     pub(crate) struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
+        zero_columns: bool,
     }
 
     impl FromZFirstPassPlan {
         pub(crate) fn new(log_d: usize) -> Self {
             let grouped = super::pass_tune_enabled();
+            let zero_root = grouped && super::gpu_from_z_zero_root_selected(log_d);
             Self {
                 grouped,
-                zero_root: grouped && super::gpu_from_z_zero_root_selected(log_d),
+                zero_root,
+                zero_columns: zero_root && super::select_from_z_zero_columns(
+                    log_d,
+                    super::GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst),
+                    super::gpu_from_z_zero_columns_enabled(),
+                ),
             }
         }
 
@@ -8477,6 +8645,14 @@ kernel void blake3_pow_scan(
                 );
                 gpu.set_bytes(enc, bytes, 2);
                 gpu.set_buffer(enc, z_buf, byte_offset, 3);
+                if self.zero_root {
+                    let compact = u32::from(
+                        self.zero_columns && super::from_z_zero_columns_range(byte_offset, r_count),
+                    );
+                    gpu.set_bytes(enc, &compact.to_ne_bytes(), 4);
+                    #[cfg(test)]
+                    TEST_FROM_Z_ZERO_COLUMN_BINDS.with(|n| n.set(n.get() + compact as usize));
+                }
                 gpu.dispatch(
                     enc,
                     (r_count >> if self.grouped { 2 } else { 0 }) as u64,
@@ -8501,6 +8677,7 @@ kernel void blake3_pow_scan(
             FromZFirstPassPlan {
                 grouped: true,
                 zero_root: true,
+                zero_columns: false,
             }
             .encode_range(
                 gpu,
@@ -12322,6 +12499,13 @@ kernel void blake3_pow_scan(
             super::gpu_from_z_zero_root_selected(20),
             super::gpu_leaf_vec4_enabled(),
         ), lead, extend, phi);
+        // Same library, different first-pass work: keep the dense rollback's
+        // latch/tuned split separate from the compact-column execution.
+        let key = if super::gpu_from_z_zero_root_selected(20) && super::gpu_from_z_zero_columns_enabled() {
+            key ^ 0x5A43_4F4C_554D_4E31 // "ZCOLUMN1"
+        } else {
+            key
+        };
         let key = if super::gpu_t3_bytetab2_enabled() {
             key ^ fnv1a64(T3_BYTETAB2).rotate_left(10) ^ 0x5433_4259_5445_3242
         } else {
@@ -18420,6 +18604,721 @@ kernel void zc_r2_horner_oracle(
     }
 
     // -----------------------------------------------------------------------
+    // Zerocheck round-one AB completion GPU prefix arm (see
+    // `ENV_NO_GPU_ZC_AB_COMPLETION`).
+    //
+    // The CPU completion computes, per `x_hi` chunk (4096 `x_lo` rows of
+    // 16 `b_med` x 64 lambda bytes of `ab_inner`), the 64 lanes
+    //   eq_hi[x_hi] * sum_{x_lo} eq_lo[x_lo] * D^-1 * sum_b convert[b][byte]
+    // through its 32-table / 128-bank tensor split of the twelve lo bits. The
+    // GPU regroups the same lo bits as top' = x_lo >> 4 (256 pre-scaled
+    // tables T_t[b][v] = convert[b][v] * eq_top'[t] * D^-1, built on the GPU
+    // each prove from the F2-linear basis convert[b][1 << k]) and
+    // bot' = x_lo & 15 (16 register banks per lambda thread), then finishes
+    // each (chunk, half of top') with sum_bot' eq_bot'[bot'] * bank and the
+    // eq_hi[x_hi] weight. eq_lo = eq_bot' * eq_top' exactly and every step is
+    // an exact GF(2^128) product or XOR, so each chunk's partial equals the
+    // CPU's bit for bit. Only the rows the CPU reads are gathered: the per-`b`
+    // mask carries each bot' class's materialized span
+    // `[first_materialized_b_med(w), materialized_b_med_end(w))` with
+    // `w = x_lo & within_outer_mask`, so the stale unmaterialized rows are
+    // never loaded. The GPU writes only its own small partials buffer.
+    // -----------------------------------------------------------------------
+
+    const ZC_AB_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+static inline ulong clmul32(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
+}
+
+struct U128k { ulong lo; ulong hi; };
+struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+static inline U128k clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = clmul32(al, bl);
+    ulong p_hi = clmul32(ah, bh);
+    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    U128k r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    U128k p0 = clmul64(al, bl);
+    U128k p2 = clmul64(ah, bh);
+    U128k pm = clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    U256k r;
+    r.r0 = p0.lo;
+    r.r1 = p0.hi ^ pm.lo;
+    r.r2 = p2.lo ^ pm.hi;
+    r.r3 = p2.hi;
+    return r;
+}
+
+// Reduce a 255-bit product (or an XOR of such) mod x^128 + x^7 + x^2 + x + 1.
+static inline uint4 gf_reduce(U256k p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+struct ZcAbParams {
+    uint tops_per_group;
+    uint groups_per_chunk;
+    uint chunk_shift;
+    uint pad;
+    // Bit `bot` of bmask[b] is set iff b_med row `b` is materialized (read
+    // by the CPU sweep) for the rows with x_lo % 16 == bot.
+    uint bmask[16];
+};
+
+// One threadgroup per top' value t; thread `lid` = byte value v.
+// Row b = 0: T_t[0][v] = sum_{k : v_k = 1} convert[0][1 << k] * e_top[t], the
+// F2-linear expansion of convert[0][v] * e_top[t] (8 products per t, shared
+// through threadgroup memory). Rows b = 1..15: T_t[b][v] = x * T_t[b-1][v],
+// since convert[b][v] = x * convert[b-1][v] and the e_top[t] scale commutes
+// (both identities verified on the host before the arm may run).
+kernel void zc_ab_tables(
+    device const uint4* basis  [[buffer(0)]],
+    device const uint4* e_top  [[buffer(1)]],
+    device uint4*       tables [[buffer(2)]],
+    uint t   [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 scaled[8];
+    if (lid < 8u) {
+        scaled[lid] = gf_reduce(clmul128(basis[lid], e_top[t]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint4 acc = uint4(0u);
+    for (uint k = 0u; k < 8u; k++) {
+        if (((lid >> k) & 1u) != 0u) { acc ^= scaled[k]; }
+    }
+    ulong lo = (ulong(acc.y) << 32) | ulong(acc.x);
+    ulong hi = (ulong(acc.w) << 32) | ulong(acc.z);
+    device uint4* row = tables + (ulong(t) << 12) + ulong(lid);
+    for (uint b = 0u; b < 16u; b++) {
+        if (b != 0u) {
+            // Multiply by x mod x^128 + x^7 + x^2 + x + 1.
+            ulong red = (hi >> 63) * 0x87ul;
+            hi = (hi << 1) | (lo >> 63);
+            lo = (lo << 1) ^ red;
+        }
+        row[b * 256u] = uint4(uint(lo), uint(lo >> 32), uint(hi), uint(hi >> 32));
+    }
+}
+
+// One threadgroup per (chunk, block of tops_per_group top' values); thread
+// `lam` = lambda lane. Loop order t -> b -> bot keeps one 4 KiB sub-table hot
+// for the 16 rows of a top'. Writes its 16 raw bot' banks (the k_bouter
+// epilogue: banks[(tg * 16 + bot) * 64 + lam]); `zc_ab_finish` weights them.
+kernel void zc_ab_gather(
+    device const uchar* ab       [[buffer(0)]],
+    device const uint4* tables   [[buffer(1)]],
+    device uint4*       banks    [[buffer(2)]],
+    constant ZcAbParams& p       [[buffer(3)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint lam [[thread_index_in_threadgroup]])
+{
+    uint chunk = tg / p.groups_per_chunk;
+    uint t0 = (tg % p.groups_per_chunk) * p.tops_per_group;
+    uint4 acc[16];
+    for (int i = 0; i < 16; i++) { acc[i] = uint4(0u); }
+    for (uint t = t0; t < t0 + p.tops_per_group; t++) {
+        // Row x_lo = t * 16 + bot is 1 KiB at byte x_lo << 10 of the chunk.
+        ulong rbase = (ulong(chunk) << p.chunk_shift) + (ulong(t) << 14) + ulong(lam);
+        for (uint b = 0u; b < 16u; b++) {
+            device const uint4* tb = tables + ((t * 16u + b) << 8);
+            // Byte (b, lam) of row bot sits at col[bot * 1024].
+            device const uchar* col = ab + (rbase + ulong(b) * 64ul);
+            // One threadgroup-uniform branch per b on its materialized-row
+            // mask: all rows / even rows only / odd rows only take an
+            // unconditional unrolled form (the row loads of a b issue
+            // together, as in the k_bouter bench); any other mask takes the
+            // per-row predicated form. Unmaterialized rows are never loaded.
+            uint m = p.bmask[b];
+            if (m == 0xFFFFu) {
+                for (int bot = 0; bot < 16; bot++) { uchar v = col[bot * 1024]; acc[bot] ^= tb[v]; }
+            } else if (m == 0x5555u) {
+                for (int bot = 0; bot < 16; bot += 2) { uchar v = col[bot * 1024]; acc[bot] ^= tb[v]; }
+            } else if (m == 0xAAAAu) {
+                for (int bot = 1; bot < 16; bot += 2) { uchar v = col[bot * 1024]; acc[bot] ^= tb[v]; }
+            } else if (m != 0u) {
+                for (int bot = 0; bot < 16; bot++) {
+                    if (((m >> uint(bot)) & 1u) != 0u) { uchar v = col[bot * 1024]; acc[bot] ^= tb[v]; }
+                }
+            }
+        }
+    }
+    for (int bot = 0; bot < 16; bot++) {
+        banks[(ulong(tg) * 16ul + ulong(bot)) * 64ul + ulong(lam)] = acc[bot];
+    }
+}
+
+// One threadgroup per chunk, thread `lam` = lambda lane: XOR the chunk's
+// groups_per_chunk raw banks per bot', then
+// partial = eq_hi[chunk] * sum_bot' eq_bot'[bot'] * bank[bot'] (unreduced
+// 256-bit XOR of exact products, one reduction, then the eq_hi product).
+// Exact: the eq weights are common to every group of the chunk.
+kernel void zc_ab_finish(
+    device const uint4* banks    [[buffer(0)]],
+    device const uint4* eq_bot   [[buffer(1)]],
+    device const uint4* eq_hi    [[buffer(2)]],
+    device uint4*       partials [[buffer(3)]],
+    constant ZcAbParams& p       [[buffer(4)]],
+    uint chunk [[threadgroup_position_in_grid]],
+    uint lam   [[thread_index_in_threadgroup]])
+{
+    U256k s;
+    s.r0 = 0ul; s.r1 = 0ul; s.r2 = 0ul; s.r3 = 0ul;
+    for (uint bot = 0u; bot < 16u; bot++) {
+        uint4 v = uint4(0u);
+        for (uint g = 0u; g < p.groups_per_chunk; g++) {
+            ulong group = ulong(chunk) * ulong(p.groups_per_chunk) + ulong(g);
+            v ^= banks[(group * 16ul + ulong(bot)) * 64ul + ulong(lam)];
+        }
+        U256k q = clmul128(eq_bot[bot], v);
+        s.r0 ^= q.r0; s.r1 ^= q.r1; s.r2 ^= q.r2; s.r3 ^= q.r3;
+    }
+    partials[chunk * 64u + lam] = gf_reduce(clmul128(eq_hi[chunk], gf_reduce(s)));
+}
+"#;
+
+    /// Chunk geometry the kernel is built for: 4096 `x_lo` rows of 1 KiB.
+    const ZC_AB_CHUNK_SHIFT: u32 = 22;
+    const ZC_AB_MAX_CHUNKS: usize = 128;
+    /// top' tables (x_lo >> 4); one threadgroup sweeps a block of
+    /// [`zc_ab_tops_per_group`] of them.
+    const ZC_AB_TOPS: usize = 256;
+    /// Smallest top' block per threadgroup.
+    const ZC_AB_MIN_TOPS_PER_GROUP: usize = 8;
+    /// Largest top' block per threadgroup (the k_bouter bench shape).
+    const ZC_AB_MAX_TOPS_PER_GROUP: usize = 128;
+    /// Partials slots (threadgroups of one launch; < 512 under
+    /// [`zc_ab_tops_per_group`] for every share up to 128 chunks).
+    const ZC_AB_MAX_GROUPS: usize = 512;
+
+    /// top' block per threadgroup for a `chunks`-chunk prefix: the largest
+    /// power of two <= `chunks`, clamped to [8, 128]. Each chunk splits into
+    /// 256 / TB threadgroups, so every share from 8 chunks up launches
+    /// ~256-511 threadgroups and the wall tracks the share instead of one
+    /// threadgroup's serial 128 x 16 x 16 gather chain.
+    fn zc_ab_tops_per_group(chunks: usize) -> usize {
+        let pow2_floor = 1usize << (usize::BITS - 1 - chunks.max(1).leading_zeros());
+        pow2_floor.clamp(ZC_AB_MIN_TOPS_PER_GROUP, ZC_AB_MAX_TOPS_PER_GROUP)
+    }
+    /// F128 slot offsets inside the persistent constants buffer.
+    const ZC_AB_BASIS_OFF: usize = 0;
+    const ZC_AB_ETOP_OFF: usize = ZC_AB_BASIS_OFF + 128;
+    const ZC_AB_EQBOT_OFF: usize = ZC_AB_ETOP_OFF + ZC_AB_TOPS;
+    const ZC_AB_EQHI_OFF: usize = ZC_AB_EQBOT_OFF + 16;
+    const ZC_AB_CONSTS_LEN: usize = ZC_AB_EQHI_OFF + ZC_AB_MAX_CHUNKS;
+
+    /// Process-lifetime Metal state for the round-one AB completion arm.
+    struct ZcAb {
+        tables_pso: Id,
+        gather_pso: Id,
+        finish_pso: Id,
+        /// 256 pre-scaled top' tables (16 MiB), rebuilt by the GPU per prove.
+        tables_buf: Id,
+        /// basis[128] | e_top[256] | eq_bot[16] | eq_hi[128] (F128 slots).
+        consts_buf: Id,
+        /// Raw bot' banks, 16 x 64 lanes per threadgroup (8 MiB, GPU-only).
+        banks_buf: Id,
+        /// Reduced per-chunk partials, 64 lanes each (128 KiB).
+        part_buf: Id,
+        /// Cached no-copy view of the `ab_inner` allocation `(ptr, len, buf)`.
+        wrap: Option<(usize, usize, Id)>,
+    }
+
+    // SAFETY: the Metal handles are only touched under the state mutex;
+    // Metal objects themselves are thread-safe.
+    unsafe impl Send for ZcAb {}
+
+    static ZC_AB_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcAb>>> =
+        std::sync::OnceLock::new();
+    /// 0 = uncalibrated (the next launch is the warm-up oracle probe),
+    /// 1 = admitted, 2 = disabled for the rest of the process.
+    static ZC_AB_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    const ZC_AB_UNCALIBRATED: u8 = 0;
+    const ZC_AB_ADMITTED: u8 = 1;
+    const ZC_AB_DISABLED: u8 = 2;
+    /// Proves whose AB message folded GPU partials (diagnostic receipt).
+    static ZC_AB_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn zc_ab_init(gpu: &'static Gpu, basis: &[F128; 128]) -> Result<ZcAb, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<(Id, Id, Id), String> {
+                let src = gpu.api.nsstring(ZC_AB_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "zc-ab shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let make_pipeline = |name: &str| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("{name} kernel not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    gpu.release(f);
+                    if pso.is_null() {
+                        return Err(format!("{name} pipeline: {}", gpu.api.error_string(perr)));
+                    }
+                    Ok(pso)
+                };
+                let mut psos: Vec<Id> = Vec::with_capacity(3);
+                let mut failed = None;
+                for name in ["zc_ab_tables", "zc_ab_gather", "zc_ab_finish"] {
+                    match make_pipeline(name) {
+                        Ok(pso) => psos.push(pso),
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
+                gpu.release(library);
+                if let Some(e) = failed {
+                    for pso in psos {
+                        gpu.release(pso);
+                    }
+                    return Err(e);
+                }
+                Ok((psos[0], psos[1], psos[2]))
+            })();
+            gpu.pool_pop(pool);
+            let (tables_pso, gather_pso, finish_pso) = built?;
+            let max_threads = |pso: Id| -> u64 {
+                send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    pso,
+                    c"maxTotalThreadsPerThreadgroup"
+                )
+            };
+            if max_threads(tables_pso) < 256 || max_threads(gather_pso) < 64 || max_threads(finish_pso) < 64 {
+                gpu.release(tables_pso);
+                gpu.release(gather_pso);
+                gpu.release(finish_pso);
+                return Err("zc-ab PSOs cannot run their threadgroup widths".into());
+            }
+            let buffers = (|| -> Result<(Id, Id, Id, Id), String> {
+                let mut made: Vec<Id> = Vec::with_capacity(4);
+                for len in [
+                    ZC_AB_TOPS * 16 * 256 * 16,
+                    ZC_AB_CONSTS_LEN * 16,
+                    ZC_AB_MAX_GROUPS * 16 * 64 * 16,
+                    ZC_AB_MAX_CHUNKS * 64 * 16,
+                ] {
+                    match gpu.new_buffer(len) {
+                        Ok(b) => made.push(b),
+                        Err(e) => {
+                            for b in made {
+                                gpu.release(b);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                Ok((made[0], made[1], made[2], made[3]))
+            })();
+            let (tables_buf, consts_buf, banks_buf, part_buf) = match buffers {
+                Ok(b) => b,
+                Err(e) => {
+                    gpu.release(tables_pso);
+                    gpu.release(gather_pso);
+                    gpu.release(finish_pso);
+                    return Err(e);
+                }
+            };
+            // The convert basis is a process constant: written once.
+            std::ptr::copy_nonoverlapping(
+                basis.as_ptr(),
+                gpu.buffer_contents(consts_buf).cast::<F128>().add(ZC_AB_BASIS_OFF),
+                128,
+            );
+            Ok(ZcAb {
+                tables_pso,
+                gather_pso,
+                finish_pso,
+                tables_buf,
+                consts_buf,
+                banks_buf,
+                part_buf,
+                wrap: None,
+            })
+        }
+    }
+
+    fn zc_ab_state(basis: &[F128; 128]) -> Option<&'static std::sync::Mutex<ZcAb>> {
+        ZC_AB_STATE
+            .get_or_init(|| {
+                let gpu = gpu().ok()?;
+                match zc_ab_init(gpu, basis) {
+                    Ok(s) => Some(std::sync::Mutex::new(s)),
+                    Err(e) => {
+                        if super::gpu_zc_ab_debug() {
+                            eprintln!("[zc-ab-gpu] init failed (arm off): {e}");
+                        }
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// An in-flight round-one AB completion GPU prefix.
+    pub(crate) struct ZcAbJob {
+        /// Table build, then gather + finish (same queue, in order; the
+        /// second reads the tables the first wrote, hazard-tracked).
+        cb_tables: Id,
+        cb: Id,
+        chunks: usize,
+        /// top' block per threadgroup and threadgroups per chunk.
+        tops_per_group: usize,
+        groups_per_chunk: usize,
+        calibration: bool,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: the command buffer handle is only waited/released by the
+    // launching thread; Metal command buffers are themselves thread-safe.
+    unsafe impl Send for ZcAbJob {}
+
+    impl ZcAbJob {
+        /// First chunk the CPU drains. Zero for the warm-up oracle probe (the
+        /// CPU computes every chunk; the GPU's are compared, then discarded).
+        pub(crate) fn cpu_base(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+    }
+
+    /// Result of joining the round-one AB completion GPU prefix.
+    pub(crate) enum ZcAbResult {
+        /// Admitted prove: the GPU's per-chunk 64-lane partials of chunks
+        /// `0..chunks`, eq_hi-weighted exactly like the CPU's.
+        Prefix(Vec<[F128; 64]>),
+        /// Warm-up oracle probe compared (verdict recorded for the process);
+        /// the caller's CPU partials are authoritative.
+        Calibrated,
+        /// Metal failed: the caller must CPU-compute its GPU chunks. The arm
+        /// is disabled for the process.
+        Failed,
+    }
+
+    /// Launch the GPU prefix over chunks `0..chunks` of the round-one AB
+    /// completion. `None` = the CPU drains every chunk (arm disabled, shape
+    /// or wrap declined, no Metal). `ab` is the complete `ab_inner` byte view
+    /// (read-only to the GPU); `bmask[b]` bit `bot` marks the materialized
+    /// rows; `e_top` = eq(r_lo[4..12]) * D^-1, `eq_bot` = eq(r_lo[..4]),
+    /// `eq_hi` = eq(r_outer[n_lo..]) — all from the round's bound challenges.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_ab_completion(
+        ab: &[u8],
+        provenance_hit: bool,
+        chunks: usize,
+        bmask: &[u32; 16],
+        basis: &[F128; 128],
+        e_top: &[F128],
+        eq_bot: &[F128],
+        eq_hi: &[F128],
+    ) -> Option<ZcAbJob> {
+        use std::sync::atomic::Ordering;
+        let debug = super::gpu_zc_ab_debug();
+        let mode = ZC_AB_MODE.load(Ordering::Relaxed);
+        if mode == ZC_AB_DISABLED {
+            return None;
+        }
+        if chunks == 0
+            || chunks > ZC_AB_MAX_CHUNKS
+            || e_top.len() != ZC_AB_TOPS
+            || eq_bot.len() != 16
+            || eq_hi.len() < chunks
+            || ab.len() < chunks << ZC_AB_CHUNK_SHIFT
+        {
+            return None;
+        }
+        let tops_per_group = zc_ab_tops_per_group(chunks);
+        let groups_per_chunk = ZC_AB_TOPS / tops_per_group;
+        if chunks * groups_per_chunk > ZC_AB_MAX_GROUPS {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let state_mutex = zc_ab_state(basis)?;
+        // Not poison-tolerant (the wrap swap below is not unwind-atomic):
+        // a poisoned lock keeps the arm off, which is the exact incumbent.
+        let mut state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-ab launch", false);
+                return None;
+            }
+        };
+        unsafe {
+            // Reuse the cached view only when allocation identity is proven
+            // (provenance-token hit on the exact (ptr, len)); otherwise drop
+            // it and wrap the current allocation afresh.
+            let ptr = ab.as_ptr() as usize;
+            let len = ab.len();
+            let ab_buf = match state.wrap {
+                Some((p, l, buf)) if p == ptr && l == len && provenance_hit => buf,
+                _ => {
+                    if let Some((_, _, old)) = state.wrap.take() {
+                        gpu.release(old);
+                    }
+                    // A pinned allocation already carries a process-lifetime
+                    // view; never alias it with a second one.
+                    if crate::scratch::f128_range_overlaps_pin(ptr, len) {
+                        if debug {
+                            eprintln!("[zc-ab-gpu] ab_inner overlaps a pinned view; arm skipped");
+                        }
+                        return None;
+                    }
+                    match gpu.wrap_buffer(ab.as_ptr().cast_mut(), len) {
+                        Ok(buf) => {
+                            state.wrap = Some((ptr, len, buf));
+                            buf
+                        }
+                        Err(e) => {
+                            if debug {
+                                eprintln!("[zc-ab-gpu] ab_inner wrap failed ({e}); arm skipped");
+                            }
+                            return None;
+                        }
+                    }
+                }
+            };
+            // Challenge-derived constants (the previous prove's job has been
+            // joined, so nothing in flight reads these slots).
+            let consts = gpu.buffer_contents(state.consts_buf).cast::<F128>();
+            std::ptr::copy_nonoverlapping(e_top.as_ptr(), consts.add(ZC_AB_ETOP_OFF), ZC_AB_TOPS);
+            std::ptr::copy_nonoverlapping(eq_bot.as_ptr(), consts.add(ZC_AB_EQBOT_OFF), 16);
+            std::ptr::copy_nonoverlapping(eq_hi.as_ptr(), consts.add(ZC_AB_EQHI_OFF), chunks);
+            #[repr(C)]
+            struct P {
+                tops_per_group: u32,
+                groups_per_chunk: u32,
+                chunk_shift: u32,
+                pad: u32,
+                bmask: [u32; 16],
+            }
+            let params = P {
+                tops_per_group: tops_per_group as u32,
+                groups_per_chunk: groups_per_chunk as u32,
+                chunk_shift: ZC_AB_CHUNK_SHIFT,
+                pad: 0,
+                bmask: *bmask,
+            };
+            let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
+            let pool = gpu.pool_push();
+            let submitted = (|| -> Result<(Id, Id), String> {
+                // Command buffer 1: the table build (own GPU wall in the
+                // diagnostics).
+                let cb_tables = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb_tables)?;
+                gpu.set_pipeline(enc, state.tables_pso);
+                gpu.set_buffer(enc, state.consts_buf, ZC_AB_BASIS_OFF * 16, 0);
+                gpu.set_buffer(enc, state.consts_buf, ZC_AB_ETOP_OFF * 16, 1);
+                gpu.set_buffer(enc, state.tables_buf, 0, 2);
+                gpu.dispatch(enc, ZC_AB_TOPS as u64, 256);
+                gpu.end_encoding(enc);
+                // Command buffer 2: gather, then finish (serial dispatches of
+                // one encoder: the finish reads the banks the gather wrote).
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, state.gather_pso);
+                gpu.set_buffer(enc, ab_buf, 0, 0);
+                gpu.set_buffer(enc, state.tables_buf, 0, 1);
+                gpu.set_buffer(enc, state.banks_buf, 0, 2);
+                gpu.set_bytes(enc, pb, 3);
+                gpu.dispatch(enc, (chunks * groups_per_chunk) as u64, 64);
+                gpu.set_pipeline(enc, state.finish_pso);
+                gpu.set_buffer(enc, state.banks_buf, 0, 0);
+                gpu.set_buffer(enc, state.consts_buf, ZC_AB_EQBOT_OFF * 16, 1);
+                gpu.set_buffer(enc, state.consts_buf, ZC_AB_EQHI_OFF * 16, 2);
+                gpu.set_buffer(enc, state.part_buf, 0, 3);
+                gpu.set_bytes(enc, pb, 4);
+                gpu.dispatch(enc, chunks as u64, 64);
+                gpu.end_encoding(enc);
+                let cb_tables = gpu.retain(cb_tables);
+                let cb = gpu.retain(cb);
+                gpu.commit_async(cb_tables);
+                gpu.commit_async(cb);
+                Ok((cb_tables, cb))
+            })();
+            gpu.pool_pop(pool);
+            match submitted {
+                Ok((cb_tables, cb)) => Some(ZcAbJob {
+                    cb_tables,
+                    cb,
+                    chunks,
+                    tops_per_group,
+                    groups_per_chunk,
+                    calibration: mode == ZC_AB_UNCALIBRATED,
+                    submitted: std::time::Instant::now(),
+                }),
+                Err(e) => {
+                    if debug {
+                        eprintln!("[zc-ab-gpu] submit failed ({e}); arm skipped");
+                    }
+                    None
+                }
+            }
+        }
+    }
+
+    /// Join the GPU prefix. During the warm-up oracle probe, `cpu_partials`
+    /// must hold the CPU's own per-chunk partials of every chunk; the GPU's
+    /// `0..chunks` are byte-compared against them and the arm is admitted
+    /// only on full equality (disabled for the process otherwise).
+    pub(crate) fn zc_ab_wait(job: ZcAbJob, cpu_partials: &[[F128; 64]], hi_size: usize) -> ZcAbResult {
+        use std::sync::atomic::Ordering;
+        let debug = super::gpu_zc_ab_debug();
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => {
+                ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
+                return ZcAbResult::Failed;
+            }
+        };
+        unsafe {
+            let waited = std::time::Instant::now();
+            // The main buffer reads the tables buffer, so it completes after
+            // the table build; the table build's status is checked too.
+            let ok = gpu.spin_wait_cb(job.cb, 2.0).and_then(|()| gpu.wait_cb(job.cb_tables));
+            let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
+            let (tables_ms, gather_ms) = if ok.is_ok() {
+                (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
+            } else {
+                (0.0, 0.0)
+            };
+            let gpu_ms = tables_ms + gather_ms;
+            gpu.release(job.cb_tables);
+            gpu.release(job.cb);
+            if let Err(e) = ok {
+                ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
+                if debug {
+                    eprintln!("[zc-ab-gpu] command buffer failed ({e}); arm disabled, CPU redoes the prefix");
+                }
+                return ZcAbResult::Failed;
+            }
+            let state_mutex = match ZC_AB_STATE.get().and_then(|s| s.as_ref()) {
+                Some(s) => s,
+                None => {
+                    ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
+                    return ZcAbResult::Failed;
+                }
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("zc-ab wait", false);
+                    ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
+                    return ZcAbResult::Failed;
+                }
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 64]>();
+            let out: Vec<[F128; 64]> = std::slice::from_raw_parts(parts, job.chunks).to_vec();
+            drop(state);
+            if !job.calibration {
+                let fired = ZC_AB_FIRED.fetch_add(1, Ordering::Relaxed) + 1;
+                if debug {
+                    eprintln!(
+                        "[zc-ab-gpu] fired: GPU prefix {}/{hi_size} chunks folded into the round-one AB \
+                         message (CPU drained {}), tb={} groups={} gpu={gpu_ms:.2}ms \
+                         (tables={tables_ms:.2} gather+finish={gather_ms:.2}) \
+                         submit-to-drain={:.2}ms wait={wait_ms:.2}ms fired_proves={fired}",
+                        job.chunks,
+                        hi_size - job.chunks,
+                        job.tops_per_group,
+                        job.chunks * job.groups_per_chunk,
+                        job.submitted.elapsed().as_secs_f64() * 1e3,
+                    );
+                }
+                return ZcAbResult::Prefix(out);
+            }
+            // ---- Warm-up oracle: GPU partials must equal the CPU's own ----
+            let mismatch = if cpu_partials.len() < job.chunks {
+                Some(usize::MAX)
+            } else {
+                (0..job.chunks).find(|&c| out[c] != cpu_partials[c])
+            };
+            match mismatch {
+                None => {
+                    ZC_AB_MODE.store(ZC_AB_ADMITTED, Ordering::Relaxed);
+                    if debug {
+                        eprintln!(
+                            "[zc-ab-gpu] oracle: GPU partials of chunks 0..{} EQUAL the CPU's \
+                             ({} lanes each) -> admitted, share {}/{hi_size}; tb={} gpu={gpu_ms:.2}ms \
+                             (tables={tables_ms:.2} gather+finish={gather_ms:.2})",
+                            job.chunks, 64, job.chunks, job.tops_per_group,
+                        );
+                    }
+                }
+                Some(c) => {
+                    ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
+                    if debug {
+                        eprintln!("[zc-ab-gpu] oracle MISMATCH at chunk {c} -> arm disabled for the process");
+                    }
+                }
+            }
+            ZcAbResult::Calibrated
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Zerocheck first-tail-round (T3) compact-reconstruction products GPU
     // arm (see `ENV_NO_GPU_ZC_T3`).
     //
@@ -20527,6 +21426,10 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 
+/// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_wait};
+
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -21718,6 +22621,97 @@ mod tests {
             gpu.release(tree_buf);
             gpu.pool_pop(pool);
         }
+    }
+
+    /// Use the actual ranked selector/encoder/PSO with a scaled address stride.
+    /// The descriptor, range checks and runtime rollback remain live. Reused
+    /// stale buffers and out-of-band sentinels catch missing zero stores.
+    #[test]
+    #[ignore = "real Metal oracle; run alone with two Rayon threads"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_from_z_zero_columns_match_cpu_scaled() {
+        let gpu = imp::gpu().expect("zero-column oracle requires real Metal");
+        assert!(gpu_from_z_zero_root_selected(20));
+        assert!(!gpu_from_z_zero_root_selected(14));
+        let log_d = 14usize;
+        let rows = 1usize << (log_d - 4);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let mut rng = Rng::new(0x5A43_4F4C_554D_4E31);
+        let mut z = rng.vec(64 << (log_d - 1));
+        let mut expect = vec![F128::ZERO; 64 << log_d];
+        let sentinel = F128::new(0xa5a5_a5a5_a5a5_a5a5, 0xa5a5_a5a5_a5a5_a5a5);
+        let mut cases = 0;
+        let mut binds = 0;
+        unsafe {
+            let pool = gpu.pool_push();
+            let data_bytes = core::mem::size_of_val(expect.as_slice());
+            let z_bytes = core::mem::size_of_val(z.as_slice());
+            let out = gpu.new_buffer(data_bytes).unwrap();
+            let input = gpu.new_buffer(z_bytes).unwrap();
+            let tw = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(), gpu.buffer_contents(tw),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            assert_eq!(gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root).0, 16_064);
+            for repeat in 0..3 {
+                let padded = repeat != 2;
+                // Change live and zero columns at the same input addresses.
+                for (i, value) in z.iter_mut().enumerate() {
+                    *value = crate::field::mul_by_x(*value) + F128::new(i as u64 | 1, 0xf001);
+                }
+                if padded {
+                    for pos in (1..(1usize << (log_d - 1))).step_by(2) {
+                        z[pos * 64 + 57..pos * 64 + 64].fill(F128::ZERO);
+                    }
+                }
+                let _scope = GpuZeroTailLanes::scope(64, if padded { 7 } else { 0 });
+                crate::pcs::commit::replicate_message_fill(&mut expect, &z);
+                ntt.forward_transform_interleaved_block_range(&mut expect, 64, 1, 4, 0, 2, 0);
+                std::ptr::copy_nonoverlapping(z.as_ptr().cast::<u8>(), gpu.buffer_contents(input), z_bytes);
+                // The even unaligned start is supported; odd/short ranges fall
+                // back to dense. Production's ten bands are all admitted.
+                for (start, count) in [(0, 512), (512, 512), (2, 512), (1, 512), (0, 256), (0, rows)] {
+                    std::ptr::write_bytes(gpu.buffer_contents(out), 0xa5, data_bytes);
+                    imp::TEST_FROM_Z_ZERO_COLUMN_BINDS.with(|n| n.set(0));
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    imp::FromZFirstPassPlan::new(20).encode_range(
+                        gpu, enc, out, tw, input, log_d, start * 1024, count,
+                    );
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let expected_bind = usize::from(
+                        padded && gpu_from_z_zero_columns_enabled()
+                            && from_z_zero_columns_range(start * 1024, count),
+                    );
+                    let actual_bind = imp::TEST_FROM_Z_ZERO_COLUMN_BINDS.with(|n| n.get());
+                    assert_eq!(actual_bind, expected_bind, "production encoder engagement");
+                    binds += actual_bind;
+                    let got = core::slice::from_raw_parts(
+                        gpu.buffer_contents(out).cast::<F128>(), expect.len(),
+                    );
+                    for e in 0..16 {
+                        let block = &got[e * rows * 64..(e + 1) * rows * 64];
+                        assert!(block[..start * 64].iter().all(|&x| x == sentinel));
+                        assert!(block[(start + count) * 64..].iter().all(|&x| x == sentinel));
+                        let begin = (e * rows + start) * 64;
+                        assert_eq!(
+                            &block[start * 64..(start + count) * 64],
+                            &expect[begin..begin + count * 64],
+                            "first-pass output repeat={repeat} start={start} count={count} e={e}",
+                        );
+                    }
+                    cases += 1;
+                }
+            }
+            gpu.release(out);
+            gpu.release(input);
+            gpu.release(tw);
+            gpu.pool_pop(pool);
+        }
+        eprintln!("from-z-zero-columns log_d={log_d} cases={cases} compact_binds={binds} exact=true");
     }
 
     /// The hybrid commit sends only a high-block prefix through the GPU NTT
