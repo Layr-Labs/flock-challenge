@@ -101,6 +101,7 @@ use kernels::aarch64::{
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::{
     fold2_compact_and_round45_chunk_neon_8_fused, fold2_compact_and_round45_chunk_neon_8_fused_r1,
+    fold2_compact_and_round45_chunk_neon_8_fused_r1_k,
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_prescaled_8;
@@ -2797,6 +2798,12 @@ pub(crate) fn zc_k_bone_pack_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_BONE_PACK").is_none())
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn zc_k_horner_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_HORNER").is_none())
+}
+
 /// [`fold2_compact_and_round45_into`] that, with `pack` and when the state
 /// and split allow it (one-table fused kernel, dead-tail state, chunks of
 /// whole four-block superblocks), writes the dead-tail-packed layout: the
@@ -2929,6 +2936,15 @@ fn fold2_compact_and_round45_into_packed_b(
     // prepared form, one table shared by every chunk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let horner = one_table
+        && compact.dead_tail
+        && eq.n_lo >= 4
+        && zc_k_horner_enabled()
+        && (1..4u32).all(|j| {
+            let g = F128::new(1u64 << (1u32 << j), 0);
+            r_next4[1 + j as usize] * (F128::ONE + g) == g
+        });
     // b-one pack (packed outputs only): each 64-output block's b takes
     // `B_PACK_BLOCK` entries; a kernel that meets a skipped b output that is
     // not one says so, and the whole pass is rerun without it.
@@ -2983,6 +2999,16 @@ fn fold2_compact_and_round45_into_packed_b(
             let out_ptr = outv.as_mut_ptr();
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
+                (true, true) if one_table && pack && horner => {
+                    let ok = fold2_compact_and_round45_chunk_neon_8_fused_r1_k::<true, true, true>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                        compact.tail_compact, compact.head_compact, compact.head_b,
+                    );
+                    if !ok {
+                        b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
                     let ok = fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
@@ -2991,6 +3017,13 @@ fn fold2_compact_and_round45_into_packed_b(
                     if !ok {
                         b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+                }
+                #[cfg(target_feature = "sha3")]
+                (true, true) if one_table && horner => {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1_k::<true, false, true>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                        compact.tail_compact, compact.head_compact, compact.head_b,
+                    );
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
@@ -6212,11 +6245,16 @@ mod tests {
                 if sparse.tail_compact {
                     // Nothing is written in front of or past the compacted blocks.
                     let lo = sparse.delta_offset(0);
-                    let per_block = if sparse.head_compact {
-                        kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK
-                    } else {
-                        kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK
-                    };
+                    // The compacted layouts exist only in the aarch64 kernels.
+                    #[cfg(target_arch = "aarch64")]
+                    let (hc_bpb, tc_bpb) = (
+                        kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK,
+                        kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK,
+                    );
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let (hc_bpb, tc_bpb): (usize, usize) =
+                        unreachable!("tail compaction is an aarch64-only layout");
+                    let per_block = if sparse.head_compact { hc_bpb } else { tc_bpb };
                     let hi = sparse.delta_offset(n_pairs - 128) + per_block;
                     assert!(sparse.deltas[..lo].chunks_exact(16).all(|c| c == &poison_bytes[..]));
                     assert!(sparse.deltas[hi..].chunks_exact(16).all(|c| c == &poison_bytes[..]));
@@ -6267,6 +6305,129 @@ mod tests {
             off.recycle();
             crate::scratch::clear();
         }
+    }
+
+    /// Digest probe (ignored) for the K-Horner arms on round two's own
+    /// states. The ranked padded fixture of `dead_pair_skip_matches_dense_k_pass`
+    /// with the medium-challenge literals in `r_next4[1..5]`; the dense state
+    /// and the dead-pair state (tail-compacted, and head-compacted when the
+    /// head b rows are all ones); the cascade K pass unpacked, packed, and
+    /// packed with the b-one pack. Prints the layouts and arms taken and one
+    /// BLAKE3 digest over every message, flag and output buffer (the buffers
+    /// are poison-filled, so a stray or missing store changes it). Run it once
+    /// as is (K-Horner kernel) and once with `FLOCK_NO_ZC_K_HORNER=1` (the
+    /// weighted kernel): the two digests must be equal.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    #[test]
+    #[ignore = "digest probe: compare a run with and without FLOCK_NO_ZC_K_HORNER"]
+    fn k_horner_ranked_layouts_digest() {
+        use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
+        unsafe {
+            std::env::remove_var("FLOCK_NO_R2_DEGEN");
+            std::env::remove_var("FLOCK_NO_ZC_R2_PERIODIC");
+            std::env::remove_var("FLOCK_NO_R2_DEADPAIR_SKIP");
+        }
+        let put = |h: &mut blake3::Hasher, v: &[F128]| {
+            for x in v {
+                h.update(&x.lo.to_le_bytes());
+                h.update(&x.hi.to_le_bytes());
+            }
+        };
+        let mut h = blake3::Hasher::new();
+        let mut arms = std::collections::BTreeSet::new();
+        // m = 25: 32-pair K chunks (too small to pack); m = 27: 128-pair
+        // chunks, the smallest the packed and b-one-packed arms take.
+        for (m, ones_head) in [(25, false), (25, true), (27, false), (27, true)] {
+            let mut f = la_fixture(m, 0xDEAD_0001, true);
+            if ones_head {
+                for blk in 0..f.b_packed.len() / 2048 {
+                    f.b_packed[2048 * blk..2048 * blk + 128].fill(0xFF);
+                }
+            }
+            f.mlv[3..7].copy_from_slice(&medium_challenges_ghash());
+            let r_next4 = la_r_next4(&f);
+            assert_eq!(&r_next4[1..5], &medium_challenges_ghash()[..]);
+            let n_vars = r_next4.len() - 1;
+            let lo_size = 1usize << (n_vars - cascade_k_pass_n_hi(n_vars));
+            assert!(lo_size.is_multiple_of(16), "lo_size {lo_size}");
+            assert!(m < 27 || (2 * lo_size).is_multiple_of(256), "lo_size {lo_size}");
+            let deltas_f128 = 1usize << (f.m - 7);
+            crate::scratch::clear();
+            let (dense, ..) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                6,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                None,
+            );
+            let backing = ScratchBytes::from_initialized_f128(vec![LA_POISON; deltas_f128]);
+            let (sparse, ..) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                6,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                Some(backing),
+                true,
+            );
+            let n_groups = dense.len() / 2;
+            for (name, state) in [("dense", &dense), ("dead-pair", &sparse)] {
+                let layout = format!(
+                    "m {m} lo_size {lo_size}, head b ones {ones_head}, {name} state: dead_tail {} tail_compact {} head_compact {}",
+                    state.dead_tail, state.tail_compact, state.head_compact
+                );
+                h.update(layout.as_bytes());
+                for &(rho1, rho2) in &[
+                    (f.rho_grid[3], f.rho_grid[2]),
+                    (F128::ONE, f.rho_grid[3]),
+                    (F128::ZERO, F128::ONE),
+                ] {
+                    let mut a = vec![LA_POISON; n_groups];
+                    let mut b = vec![LA_POISON; n_groups];
+                    let (m1, mi, la) =
+                        fold2_compact_and_round45_into(state, &f.table, rho1, rho2, &r_next4, &mut a, &mut b);
+                    h.update(format!("{m1:?} {mi:?} {:?}", la.c).as_bytes());
+                    put(&mut h, &a);
+                    put(&mut h, &b);
+                    for bpack in [false, true] {
+                        let mut a = vec![LA_POISON; n_groups];
+                        let mut b = vec![LA_POISON; n_groups];
+                        match fold2_compact_and_round45_into_packed_b(
+                            state, &f.table, rho1, rho2, &r_next4, &mut a, &mut b, true, bpack,
+                        ) {
+                            Some((m1, mi, la, packed, bpacked)) => {
+                                arms.insert(format!("{layout}; bpack {bpack}: packed {packed} bpacked {bpacked}"));
+                                h.update(format!("{m1:?} {mi:?} {:?} {packed} {bpacked}", la.c).as_bytes());
+                                put(&mut h, &a);
+                                put(&mut h, &b);
+                            }
+                            None => {
+                                arms.insert(format!("{layout}; bpack {bpack}: a skipped b is not one"));
+                                h.update(b"none");
+                            }
+                        }
+                    }
+                }
+            }
+            dense.recycle();
+            sparse.recycle();
+            crate::scratch::clear();
+        }
+        println!(
+            "KHFLAGS fused {} one_table {} k_horner {}",
+            cascade_k_fused_enabled(),
+            zc_k_one_table_enabled(),
+            zc_k_horner_enabled()
+        );
+        for a in &arms {
+            println!("KHARM {a}");
+        }
+        println!("KHDIGEST {}", h.finalize().to_hex());
     }
 
 
@@ -7012,10 +7173,14 @@ mod tests {
         }
 
         fn qos() {
-            unsafe extern "C" {
-                fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
+            // macOS-only call: elsewhere (aarch64 Linux test runs) a no-op.
+            #[cfg(target_os = "macos")]
+            {
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
+                }
+                unsafe { pthread_set_qos_class_self_np(0x21, 0) };
             }
-            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
         }
 
         fn lq(v: &mut [f64]) -> (f64, f64) {
