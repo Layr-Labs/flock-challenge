@@ -3794,7 +3794,7 @@ impl AbGpuPrefix {
 /// (`convert[b][v] = mul_by_x(convert[b - 1][v])`) — the GPU arm expands its
 /// pre-scaled row 0 from the basis and derives rows 1..15 by multiplication
 /// by `x`, so it runs only when both identities reproduce the table.
-fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
+pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
     static BASIS: OnceLock<Option<[F128; 128]>> = OnceLock::new();
     BASIS
         .get_or_init(|| {
