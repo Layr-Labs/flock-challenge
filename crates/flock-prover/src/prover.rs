@@ -513,9 +513,52 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
-    let lig_config = pcs_params
-        .ligerito_prover_config()
-        .expect("Ligerito default config; bump m for tiny instances");
+    // The underlying config lookup caches parsing but clones seven vectors.
+    // Keep one immutable complete-key config for repeated fixed-parameter
+    // proves. Other keys and disabled caching retain the owned lookup.
+    type CfgKey = (
+        usize,
+        usize,
+        usize,
+        pcs::ligerito::LigeritoProfile,
+        flock_core::hash::HashKind,
+    );
+    static CFG: std::sync::OnceLock<(CfgKey, pcs::ligerito::ProverConfig)> =
+        std::sync::OnceLock::new();
+    static CFG_ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_IMMUTABLE_PROVER_CONFIG").is_none()
+    });
+    let owned_cfg;
+    let lig_config: &pcs::ligerito::ProverConfig = if *CFG_ON {
+        let key: CfgKey = (
+            pcs_params.m,
+            pcs_params.log_inv_rate,
+            pcs_params.log_batch_size,
+            pcs_params.profile,
+            pcs_params.merkle_hash,
+        );
+        let (cached_key, cached) = CFG.get_or_init(|| {
+            (
+                key,
+                pcs_params
+                    .ligerito_prover_config()
+                    .expect("Ligerito default config; bump m for tiny instances"),
+            )
+        });
+        if *cached_key == key {
+            cached
+        } else {
+            owned_cfg = pcs_params
+                .ligerito_prover_config()
+                .expect("Ligerito default config; bump m for tiny instances");
+            &owned_cfg
+        }
+    } else {
+        owned_cfg = pcs_params
+            .ligerito_prover_config()
+            .expect("Ligerito default config; bump m for tiny instances");
+        &owned_cfg
+    };
 
     let ProveCore {
         zc_proof,
@@ -595,7 +638,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
                     &claims,
                     &[pre_ab, pre_c],
                     &padding,
-                    &lig_config,
+                    lig_config,
                     challenger,
                 )
             })
@@ -608,7 +651,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
                 &claims,
                 &[pre_ab, pre_c],
                 &padding,
-                &lig_config,
+                lig_config,
                 challenger,
             )
         }),
