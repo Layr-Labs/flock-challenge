@@ -623,6 +623,7 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
     }
     out[0] = F128::ONE;
     const PAR_THRESHOLD: usize = 1 << 12;
+    const PAR_CHUNK: usize = 1 << 8;
     for j in 0..d {
         let r_j = point[j];
         let len = 1usize << j;
@@ -632,21 +633,14 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
         //   hi[i] = v * r_j              ← new bit_j = 1
         //   lo[i] = v * (1 + r_j)
         //         = v + hi[i]             ← new bit_j = 0
-        // The distributive identity saves one field multiplication per pair.
-        let build_pair = |lo_i: &mut F128, hi_i: &mut F128| {
-            let v = *lo_i;
-            let vr = v * r_j;
-            *hi_i = vr;
-            *lo_i = v + vr;
-        };
         if len < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+            crate::field::f128_slice::expand_eq_table_level(lo, hi, r_j);
         } else {
-            lo.par_iter_mut()
-                .zip(hi.par_iter_mut())
-                .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+            lo.par_chunks_mut(PAR_CHUNK)
+                .zip(hi.par_chunks_mut(PAR_CHUNK))
+                .for_each(|(lo_chunk, hi_chunk)| {
+                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_j);
+                });
         }
     }
 }
