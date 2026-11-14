@@ -1533,6 +1533,9 @@ impl AdditiveNttF128 {
         stop_layer: usize,
         b_start: usize,
         b_end: usize,
+        // Ordered deep-pair schedule (see
+        // `forward_transform_interleaved_deep_fused_pairs_range_sched_and_then`).
+        ordered_deep: bool,
         finish_chunk: F,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
@@ -1571,7 +1574,7 @@ impl AdditiveNttF128 {
         // match the unsplit transform exactly.
         let sub_start = b_start << (DEEP_LAYER - start_layer);
         let sub_end = b_end << (DEEP_LAYER - start_layer);
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+        self.forward_transform_interleaved_deep_fused_pairs_range_sched_and_then(
             data,
             num_ntts,
             DEEP_LAYER,
@@ -1580,6 +1583,7 @@ impl AdditiveNttF128 {
             sub_end,
             odd_tail,
             &finish_chunk,
+            ordered_deep,
         );
     }
 
@@ -1595,6 +1599,7 @@ impl AdditiveNttF128 {
         num_ntts: usize,
         b_start: usize,
         fine_m: usize,
+        ordered_deep: bool,
         wait_boundary: W,
         finish_chunk: F,
     ) -> Result<(), String>
@@ -1619,7 +1624,7 @@ impl AdditiveNttF128 {
         self.forward_transform_interleaved_block_range(
             data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
         );
-        self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+        self.forward_transform_interleaved_deep_fused_pairs_range_sched_and_then(
             data,
             num_ntts,
             DEEP_LAYER,
@@ -1628,6 +1633,7 @@ impl AdditiveNttF128 {
             16 << (DEEP_LAYER - 4),
             odd_tail,
             &finish_chunk,
+            ordered_deep,
         );
         Ok(())
     }
@@ -2388,6 +2394,35 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
+        self.forward_transform_interleaved_deep_fused_pairs_range_sched_and_then(
+            data, num_ntts, n_top, log_d, sub_start, sub_end, zero_tail, finish_chunk, false,
+        );
+    }
+
+    /// [`Self::forward_transform_interleaved_deep_fused_pairs_range_and_then`]
+    /// with a choice of schedule. `ordered = false`: rayon splits the
+    /// sub-NTT range recursively (each thread walks its own contiguous run,
+    /// so most chunks finish near the end). `ordered = true`: every thread
+    /// takes the next unclaimed sub-NTT from one shared counter, so
+    /// `finish_chunk` fires in nearly ascending order and any aligned group
+    /// of chunks is complete shortly after the schedule passes it. Each
+    /// sub-NTT runs the same code on the same data either way, so the output
+    /// is bit-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_transform_interleaved_deep_fused_pairs_range_sched_and_then<F>(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        n_top: usize,
+        log_d: usize,
+        sub_start: usize,
+        sub_end: usize,
+        zero_tail: usize,
+        finish_chunk: &F,
+        ordered: bool,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
         use rayon::prelude::*;
 
         debug_assert!(n_top <= log_d);
@@ -2547,6 +2582,21 @@ impl AdditiveNttF128 {
                 sub_job(i, sub_data);
             };
             crate::epool::run_hetero_chunks(sub_end - sub_start, claim);
+        } else if ordered {
+            let n = sub_end - sub_start;
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let base = crate::epool::SyncPtr(data[range_start..range_end].as_mut_ptr());
+            let workers = rayon::current_num_threads().clamp(1, n);
+            (0..workers).into_par_iter().for_each(|_| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                // SAFETY: the counter hands out each index once, so the
+                // `sub_elems` ranges are pairwise disjoint inside the range.
+                let sub_data = unsafe { core::slice::from_raw_parts_mut(base.ptr().add(i * sub_elems), sub_elems) };
+                sub_job(i, sub_data);
+            });
         } else {
             data[range_start..range_end]
                 .par_chunks_mut(sub_elems)

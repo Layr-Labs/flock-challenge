@@ -622,6 +622,45 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
         return;
     }
     out[0] = F128::ONE;
+    // The doubling levels run through the two-lane PMULL level kernel
+    // (`expand_eq_table_level`, the builder `build_eq_table_optimized_into`
+    // already routes): below the crossover each level is one serial kernel
+    // call instead of a per-entry closure, above it 256-entry `lo`/`hi` chunk
+    // pairs over Rayon instead of per-element parallel zips. The kernel's
+    // `hi[i] = lo[i]·r_j`, `lo[i] = lo[i] + hi[i]` is the same pair of field
+    // operations as the closure it replaces, so every entry is bit-identical.
+    // `FLOCK_NO_EQ_KERNEL_GENERIC=1` restores the closure doubling.
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_EQ_KERNEL_GENERIC").is_some()) {
+        const PAR_THRESHOLD: usize = 1 << 12;
+        for j in 0..d {
+            let r_j = point[j];
+            let len = 1usize << j;
+            let (lo, rest) = out.split_at_mut(len);
+            let hi = &mut rest[..len];
+            // For each existing entry i ∈ [0, len), produce two children:
+            //   hi[i] = v * r_j              ← new bit_j = 1
+            //   lo[i] = v * (1 + r_j)
+            //         = v + hi[i]             ← new bit_j = 0
+            // The distributive identity saves one field multiplication per pair.
+            let build_pair = |lo_i: &mut F128, hi_i: &mut F128| {
+                let v = *lo_i;
+                let vr = v * r_j;
+                *hi_i = vr;
+                *lo_i = v + vr;
+            };
+            if len < PAR_THRESHOLD {
+                lo.iter_mut()
+                    .zip(hi.iter_mut())
+                    .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+            } else {
+                lo.par_iter_mut()
+                    .zip(hi.par_iter_mut())
+                    .for_each(|(lo_i, hi_i)| build_pair(lo_i, hi_i));
+            }
+        }
+        return;
+    }
     const PAR_THRESHOLD: usize = 1 << 12;
     const PAR_CHUNK: usize = 1 << 8;
     for j in 0..d {
@@ -2330,6 +2369,37 @@ mod tests {
         }
         fn bits(&mut self, n: usize) -> Vec<bool> {
             (0..n).map(|_| self.next_u64() & 1 == 1).collect()
+        }
+    }
+
+    #[test]
+    fn generic_eq_builder_matches_optimized_builder_and_scalar_doubling() {
+        // The generic builder's doubling levels run through the PMULL level
+        // kernel; the table must equal the optimized builder and the scalar
+        // closure doubling at every size, including the d >= 14 tensor split.
+        let mut rng = Rng::new(0x61E0_71A5);
+        for d in 0..=17usize {
+            let r = rng.f128_vec(d);
+            let mut expected = crate::alloc_uninit_f128_vec(1usize << d);
+            expected[0] = F128::ONE;
+            for j in 0..d {
+                let r_j = r[j];
+                let len = 1usize << j;
+                let (lo, rest) = expected.split_at_mut(len);
+                let hi = &mut rest[..len];
+                for i in 0..len {
+                    let v = lo[i];
+                    let vr = v * r_j;
+                    hi[i] = vr;
+                    lo[i] = v + vr;
+                }
+            }
+            let mut got = crate::alloc_uninit_f128_vec(1usize << d);
+            build_eq_table_into(&r, &mut got);
+            assert_eq!(got, expected, "generic builder d={d}");
+            let mut opt = crate::alloc_uninit_f128_vec(1usize << d);
+            build_eq_table_optimized_into(&r, &mut opt);
+            assert_eq!(opt, expected, "optimized builder d={d}");
         }
     }
 
