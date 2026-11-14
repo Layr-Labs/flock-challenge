@@ -1340,12 +1340,8 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                         )
                     } else {
-                        // Kill switch only (build budget): the per-chunk rows
-                        // write the same bytes; no separate unit instance.
-                        let _ = BASE;
-                        bstatic_horner_window_unit_per_chunk::<V, HOIST>(
+                        bstatic_horner_window_unit_nt::<BASE, true, true>(
                             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
-                            true,
                         )
                     }
                 } else {
@@ -1361,11 +1357,8 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                         x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                     )
                 } else {
-                    // Kill switch only (build budget): the per-chunk rows
-                    // write the same bytes; no separate unit instance.
-                    bstatic_horner_window_unit_per_chunk::<V, HOIST>(
+                    bstatic_horner_window_unit_nt::<V, HOIST, true>(
                         x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
-                        true,
                     )
                 }
             } else {

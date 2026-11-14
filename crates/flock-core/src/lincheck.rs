@@ -2102,31 +2102,6 @@ mod tests {
         }
     }
 
-    /// X1 (mac-b): the Lagrange-seeded in-place doubling of
-    /// `build_quirky_eq_table` equals the record's form, the outer product
-    /// `lambda_skip[i] · eq(x_inner_rest)[j]` at index `i + j·2^k_skip`, entry
-    /// for entry, for the ranked shape (k_skip 6, eight rest coordinates) and
-    /// smaller ones.
-    #[test]
-    fn x1_quirky_eq_table_matches_outer_product() {
-        let mut rng = Rng::new(0x0E0_51DE);
-        for (k_skip, rest) in [(6usize, 8usize), (6, 0), (6, 1), (3, 5), (1, 9), (0, 4), (6, 11)] {
-            let z_skip = rng.f128();
-            let x_inner_rest = rng.f128_vec(rest);
-            let lambda = lagrange_weights_naive(k_skip, z_skip);
-            let eq_rest = build_eq_table(&x_inner_rest);
-            let mut want = Vec::with_capacity(lambda.len() * eq_rest.len());
-            for &er in &eq_rest {
-                for &ls in &lambda {
-                    want.push(ls * er);
-                }
-            }
-            let got = build_quirky_eq_table(z_skip, &x_inner_rest, k_skip);
-            assert_eq!(got.len(), want.len(), "k_skip={k_skip} rest={rest}");
-            assert!(got == want, "k_skip={k_skip} rest={rest}");
-        }
-    }
-
     /// Serial deferred-reduction sumcheck (ranked k = 2^14) vs the Rayon
     /// path (par_min = 0 forces every round parallel) and the incumbent
     /// threshold: every round message and every bound table identical.

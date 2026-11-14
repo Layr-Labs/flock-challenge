@@ -473,6 +473,7 @@ static L1_TAIL_SPLIT_OVERRIDE: std::sync::atomic::AtomicUsize =
 
 /// Ragged-tail split of the recursive L1 deep pass
 /// (`FLOCK_NO_L1_TAIL_SPLIT=1` kills; `FLOCK_L1_TAIL_SPLIT_N` sets how many
+/// of the 32 trailing subtrees are claimed as two half-claims, default 8).
 /// Scheduling only: the codeword is bit-identical either way.
 fn l1_tail_split_count(log_d: usize, start_layer: usize, num_subs: usize) -> usize {
     #[cfg(test)]
@@ -489,7 +490,7 @@ fn l1_tail_split_count(log_d: usize, start_layer: usize, num_subs: usize) -> usi
         std::env::var("FLOCK_L1_TAIL_SPLIT_N")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(4)
+            .unwrap_or(8)
     });
     if (log_d, start_layer, num_subs) == (18, 5, 32) {
         (*N).min(num_subs)
@@ -3498,8 +3499,10 @@ mod tests {
     }
 
     /// Exhaust the exact production tables used by layers 18 and 19. This is
-    /// the invariant that makes the ranked narrow dispatch sound.
+    /// the invariant that makes the ranked narrow dispatch sound. The
+    /// dispatch is macOS-gated, so the assertion runs only on Apple hosts.
     #[test]
+    #[cfg(target_os = "macos")]
     fn standard_dim20_final_pair_twiddles_have_zero_high_limbs() {
         let ntt = AdditiveNttF128::standard(20);
         for layer in 18..20 {
