@@ -15950,19 +15950,70 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<RecMerkle, String> {
-                let pso_leaf128 =
-                    compile_supplemental_pipeline(gpu, REC_MERKLE_MSL_SOURCE, "leaf_hash128")?;
-                let pso_parent = match compile_supplemental_pipeline(
-                    gpu,
-                    REC_MERKLE_MSL_SOURCE,
-                    "rec_parent_hash",
-                ) {
+                let src = gpu.api.nsstring(REC_MERKLE_MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!(
+                        "supplemental shader compile failed: {}",
+                        gpu.api.error_string(err)
+                    ));
+                }
+                let build_pipeline = |name: &str| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring(name)?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err(format!("supplemental kernel {name} not found"));
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    gpu.release(f);
+                    if pso.is_null() {
+                        Err(format!(
+                            "supplemental pipeline {name}: {}",
+                            gpu.api.error_string(perr)
+                        ))
+                    } else {
+                        Ok(pso)
+                    }
+                };
+                let pso_leaf128 = match build_pipeline("leaf_hash128") {
                     Ok(p) => p,
                     Err(e) => {
-                        gpu.release(pso_leaf128);
+                        gpu.release(library);
                         return Err(e);
                     }
                 };
+                let pso_parent = match build_pipeline("rec_parent_hash") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        gpu.release(pso_leaf128);
+                        gpu.release(library);
+                        return Err(e);
+                    }
+                };
+                gpu.release(library);
                 let mut tree_bufs = [(0usize, NIL); REC_MERKLE_SHAPES.len()];
                 for (slot, &n) in tree_bufs.iter_mut().zip(REC_MERKLE_SHAPES.iter()) {
                     match gpu.new_buffer((2 * n - 1) * 32) {
