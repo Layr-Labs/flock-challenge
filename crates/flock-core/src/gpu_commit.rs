@@ -791,10 +791,27 @@ pub const ENV_NO_ZC_K_GPU: &str = "FLOCK_NO_ZC_K_GPU";
 
 /// Fixed GPU chunk share of the K pass arm: `FLOCK_ZC_K_GPU_CHUNKS=<n>`
 /// (`0` = off), clamped to the chunk count. Unset = [`ZC_K_GPU_DEFAULT_CHUNKS`]
-/// of the 2048 K chunks of the ranked shape (1/8). A non-integer value fails
+/// of the 2048 K chunks of the ranked shape (3/16). A non-integer value fails
 /// loudly.
 pub const ENV_ZC_K_GPU_CHUNKS: &str = "FLOCK_ZC_K_GPU_CHUNKS";
-const ZC_K_GPU_DEFAULT_CHUNKS: usize = 256;
+const ZC_K_GPU_DEFAULT_CHUNKS: usize = 384;
+
+/// Kill switch for mapping the K pass arm's anchors view during round two
+/// (`FLOCK_NO_ZC_K_PREMAP`, any value): the K launch then creates the view
+/// itself, and the GPU maps its pages when the K command buffer is scheduled,
+/// as before. With the switch unset, round two creates the view over the
+/// prefix of the anchors it has just taken and submits one one-thread touch
+/// dispatch that binds it on a second command queue, so the pages are
+/// mapped while round two runs and the K command buffer starts at once. The
+/// view is used by the K launch of the same prove only, over the same
+/// allocation. Read once per process.
+pub const ENV_NO_ZC_K_PREMAP: &str = "FLOCK_NO_ZC_K_PREMAP";
+
+pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_K_PREMAP).is_none());
+    *ON
+}
 
 /// Requested GPU chunk share of the K pass arm; `0` = off (kill switch, share
 /// 0, or GPU commit disabled).
@@ -20230,6 +20247,8 @@ kernel void zc_ab_finish(
         part_buf: Id,
         /// Set by the GPU when a b output the b-one pack skips is not one.
         flag_buf: Id,
+        /// Scratch output of the round-two premap touch dispatch.
+        touch_buf: Id,
         chunks: usize,
         per_chunk_a: usize,
         per_chunk_b: usize,
@@ -20430,7 +20449,7 @@ kernel void zc_ab_finish(
             if super::gpu_zc_k_debug() {
                 eprintln!("[zc-k-gpu] pipelines: {how} (joined after {wait_ms:.2} ms)");
             }
-            let mut made: Vec<Id> = Vec::with_capacity(7);
+            let mut made: Vec<Id> = Vec::with_capacity(8);
             for len in [
                 256 * 16,
                 (2 + n_weights + chunks) * 16,
@@ -20439,6 +20458,7 @@ kernel void zc_ab_finish(
                 chunks * sb_per_chunk * 8 * 16,
                 chunks * 8 * 16,
                 16,
+                8 * 16,
             ] {
                 match gpu.new_buffer(len) {
                     Ok(b) => made.push(b),
@@ -20462,6 +20482,7 @@ kernel void zc_ab_finish(
                 tgp_buf: made[4],
                 part_buf: made[5],
                 flag_buf: made[6],
+                touch_buf: made[7],
                 chunks,
                 per_chunk_a,
                 per_chunk_b,
@@ -20540,6 +20561,102 @@ kernel void zc_ab_finish(
         }
     }
 
+    /// The anchors view mapped during round two for this prove's K launch:
+    /// (ptr, len, retained view). Cleared at every round-two premap and taken
+    /// by the K launch, so it never names an earlier prove's allocation.
+    static ZC_K_PREMAP: std::sync::Mutex<Option<(usize, usize, usize)>> = std::sync::Mutex::new(None);
+
+    fn zc_k_premap_take() -> Option<(usize, usize, Id)> {
+        let mut slot = match ZC_K_PREMAP.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        slot.take().map(|(p, l, v)| (p, l, v as Id))
+    }
+
+    /// Releases a premapped view the K launch did not use.
+    struct ZcKPremap(Option<(usize, usize, Id)>);
+
+    impl Drop for ZcKPremap {
+        fn drop(&mut self) {
+            if let (Some((_, _, v)), Ok(g)) = (self.0.take(), gpu()) {
+                unsafe { g.release(v) };
+            }
+        }
+    }
+
+    /// Round two, right after it takes the compact anchors: create the K
+    /// arm's view over the first `prefix_bytes` of `anchors` (the dense
+    /// prefix, which covers every compacted layout's prefix) and bind it in a
+    /// one-thread touch dispatch on a second command queue, so the GPU maps
+    /// its pages while round two runs instead of when the K command buffer is
+    /// scheduled. Only once the arm is admitted (its pipelines and buffers
+    /// exist); no-op otherwise.
+    pub(crate) fn zc_k_premap(anchors: &[F128], prefix_bytes: usize) {
+        use std::sync::atomic::Ordering;
+        drop(ZcKPremap(zc_k_premap_take()));
+        if !super::gpu_zc_k_premap_enabled() || ZC_K_MODE.load(Ordering::Relaxed) != ZC_K_ADMITTED {
+            return;
+        }
+        let page = 16384usize;
+        let len = prefix_bytes.div_ceil(page) * page;
+        let ptr = anchors.as_ptr() as usize;
+        if len == 0 || len > anchors.len() * 16 || crate::scratch::f128_range_overlaps_pin(ptr, len) {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        let Some(state_mutex) = ZC_K_STATE.get().and_then(|s| s.as_ref()) else { return };
+        let Ok(state) = state_mutex.lock() else { return };
+        static QUEUE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let Some(queue) = *QUEUE.get_or_init(|| unsafe {
+            let q: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newCommandQueue");
+            (!q.is_null()).then_some(q as usize)
+        }) else {
+            return;
+        };
+        unsafe {
+            let Ok(view) = gpu.wrap_buffer(anchors.as_ptr().cast::<u8>().cast_mut(), len) else { return };
+            #[repr(C)]
+            struct P {
+                sb_per_chunk: u32,
+                eq_hi_off: u32,
+                pad: [u32; 10],
+            }
+            let params = P { sb_per_chunk: 1, eq_hi_off: 0, pad: [0; 10] };
+            let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
+            let pool = gpu.pool_push();
+            let cb: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, queue as Id, c"commandBuffer");
+            let ok = !cb.is_null()
+                && match gpu.compute_encoder(cb) {
+                    Ok(enc) => {
+                        // `zc_k_finish` over one superblock slot: reads the
+                        // view's first 128 bytes and writes one entry of the
+                        // flag buffer's tail (scratch); nothing else reads it.
+                        gpu.set_pipeline(enc, state.finish_pso);
+                        gpu.set_buffer(enc, view, 0, 0);
+                        gpu.set_buffer(enc, state.nib_buf, 0, 1);
+                        gpu.set_buffer(enc, state.touch_buf, 0, 2);
+                        gpu.set_bytes(enc, pb, 3);
+                        gpu.dispatch(enc, 1, 1);
+                        gpu.end_encoding(enc);
+                        gpu.commit_async(cb);
+                        true
+                    }
+                    Err(_) => false,
+                };
+            gpu.pool_pop(pool);
+            if !ok {
+                gpu.release(view);
+                return;
+            }
+            let mut slot = match ZC_K_PREMAP.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            *slot = Some((ptr, len, view as usize));
+        }
+    }
+
     /// Launch the GPU prefix over K chunks `0..chunks`. `None` = the CPU
     /// queue folds every chunk (arm off or disabled, geometry or view
     /// declined, no Metal). `anchors` / `deltas` are the complete compact
@@ -20565,8 +20682,10 @@ kernel void zc_ab_finish(
         use std::sync::atomic::Ordering;
         let debug = super::gpu_zc_k_debug();
         let mode = ZC_K_MODE.load(Ordering::Relaxed);
-        // The round-one view is consumed here whether or not it is used.
+        // The round-one view and the round-two premapped anchors view are
+        // consumed here whether or not they are used.
         let ab_view = zc_k_view_take();
+        let mut premap = ZcKPremap(zc_k_premap_take());
         let release_view = |v: Option<(usize, usize, Id)>| {
             if let (Some((_, _, b)), Ok(g)) = (v, gpu()) {
                 unsafe { g.release(b) };
@@ -20652,15 +20771,26 @@ kernel void zc_ab_finish(
                 release_view(ab_view);
                 return None;
             }
-            let a_view = match gpu.wrap_buffer(anchors.as_ptr().cast::<u8>().cast_mut(), a_bytes) {
-                Ok(b) => b,
-                Err(e) => {
-                    if debug {
-                        eprintln!("[zc-k-gpu] anchors view failed ({e}); arm skipped");
-                    }
-                    release_view(ab_view);
-                    return None;
+            // The view round two mapped over this allocation, else a fresh one.
+            let premapped = match premap.0.take() {
+                Some((p, l, v)) if p == a_ptr && l >= a_bytes => Some(v),
+                other => {
+                    premap.0 = other;
+                    None
                 }
+            };
+            let a_view = match premapped {
+                Some(v) => v,
+                None => match gpu.wrap_buffer(anchors.as_ptr().cast::<u8>().cast_mut(), a_bytes) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        if debug {
+                            eprintln!("[zc-k-gpu] anchors view failed ({e}); arm skipped");
+                        }
+                        release_view(ab_view);
+                        return None;
+                    }
+                },
             };
             // Deltas: the round-one arm's view of the same allocation when
             // its join handed one over in this prove; a fresh view only when
@@ -22972,8 +23102,8 @@ pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm
 /// Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
-    ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_prewarm, zc_k_prewarm_wanted, zc_k_verdict,
-    zc_k_wait,
+    ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_premap, zc_k_prewarm, zc_k_prewarm_wanted,
+    zc_k_verdict, zc_k_wait,
 };
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
