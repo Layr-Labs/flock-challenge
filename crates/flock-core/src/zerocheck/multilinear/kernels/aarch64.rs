@@ -8536,6 +8536,8 @@ mod tests {
                                 degen,
                                 true,
                                 skip_dead,
+                                false,
+                                core::ptr::null(),
                                 out.as_mut_ptr(),
                             );
                         }
@@ -10080,19 +10082,20 @@ mod tests {
             }
             let (ap_in, bp_in) = (pack(&a), pack(&b));
             let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+            let ep = round2_eq_prep(&eq);
             let (ra, rb) = (rho(&mut state), rho(&mut state));
             for nt in [false, true] {
                 let (mut ao, mut bo) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
                 let (mut ap, mut bp) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
                 let (packed, bone) = if nt {
                     (
-                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq),
-                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq),
+                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq, &ep),
+                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq, &ep),
                     )
                 } else {
                     (
-                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq),
-                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq),
+                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq, &ep),
+                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq, &ep),
                     )
                 };
                 assert_eq!(bone, packed, "slots, case {case}, nt {nt}");
