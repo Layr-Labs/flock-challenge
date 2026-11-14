@@ -12520,8 +12520,18 @@ kernel void blake3_pow_scan(
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate() {
             walls[i][0] = sample(k)?;
         }
+        // Lean second pass: only the first pass's best candidate and its two
+        // neighbours are sampled again; a candidate further away keeps its one
+        // sample for both slots. The pick is the crossing of lines fitted
+        // through every hybrid sample, so the samples next to it carry the
+        // decision and the far ones only anchor the slopes, which one sample
+        // each still does. Three of the ten graph runs (and their AB replays)
+        // go: less GPU heat right before the proof and a shorter worker
+        // start. `FLOCK_NO_TUNE_LEAN=1` (exact '1') samples every candidate
+        // twice as before.
+        let repeat = lean_second_pass(&walls.iter().map(|w| w[0]).collect::<Vec<f64>>(), tune_lean_enabled());
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate().rev() {
-            walls[i][1] = sample(k)?;
+            walls[i][1] = if repeat[i] { sample(k)? } else { walls[i][0] };
         }
         while extend && walls.len() < RANKED_EXACT_TUNE_CANDIDATES.len() {
             let Some(means) = mean_ranked_exact_samples(&walls) else { break };
@@ -12533,6 +12543,41 @@ kernel void blake3_pow_scan(
             walls.push([sample(k)?, sample(k)?]);
         }
         Ok(walls)
+    }
+
+    fn tune_lean_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_TUNE_LEAN").as_deref() != Some(std::ffi::OsStr::new("1"))
+        })
+    }
+
+    /// Which candidates the second pass samples again: all of them when
+    /// `lean` is off or a first-pass score is unusable, otherwise the best
+    /// first-pass candidate and its neighbours on both sides.
+    fn lean_second_pass(first: &[f64], lean: bool) -> Vec<bool> {
+        if !lean || first.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return vec![true; first.len()];
+        }
+        let Some(best) = (0..first.len()).min_by(|&a, &b| first[a].total_cmp(&first[b])) else {
+            return Vec::new();
+        };
+        (0..first.len()).map(|i| i.abs_diff(best) <= 1).collect()
+    }
+
+    #[cfg(test)]
+    mod tune_lean_tests {
+        use super::lean_second_pass;
+
+        #[test]
+        fn second_pass_keeps_the_best_and_its_neighbours() {
+            assert_eq!(lean_second_pass(&[70.0, 52.0, 50.0, 53.0, 57.0], true), [false, true, true, true, false]);
+            assert_eq!(lean_second_pass(&[50.0, 52.0, 55.0, 58.0, 61.0], true), [true, true, false, false, false]);
+            assert_eq!(lean_second_pass(&[70.0, 60.0, 55.0, 52.0, 50.0], true), [false, false, false, true, true]);
+            assert_eq!(lean_second_pass(&[70.0, 52.0, 50.0, 53.0, 57.0], false), [true; 5]);
+            assert_eq!(lean_second_pass(&[70.0, f64::NAN, 50.0, 53.0, 57.0], true), [true; 5]);
+        }
     }
 
     fn mean_ranked_exact_samples(samples: &[[f64; 2]]) -> Option<Vec<f64>> {
