@@ -884,15 +884,22 @@ impl Drop for Round1AbInner {
     }
 }
 
-/// Kill switch for the non-temporal store flavor of the deferred AB
-/// precompute output: `FLOCK_NO_ZC_AB_PRE_NT=1` restores the incumbent plain
-/// cached stores as a same-binary control. Store flavor only — the bytes
-/// written are identical.
+/// Store flavor of the deferred AB precompute output. The default is plain
+/// cached stores; `FLOCK_ZC_AB_PRE_NT=1` (exact '1') selects the
+/// non-temporal flavor. `FLOCK_NO_ZC_AB_PRE_NT` keeps its old meaning (plain
+/// stores) and wins over the opt-in. Store flavor only — the bytes written are
+/// identical.
 pub const ENV_NO_ZC_AB_PRE_NT: &str = "FLOCK_NO_ZC_AB_PRE_NT";
+
+/// Opt-in for the non-temporal flavor of the deferred AB precompute output.
+pub const ENV_ZC_AB_PRE_NT: &str = "FLOCK_ZC_AB_PRE_NT";
 
 fn ab_pre_nt_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none())
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_ZC_AB_PRE_NT).is_none()
+            && std::env::var_os(ENV_ZC_AB_PRE_NT).as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 /// Kill switch for the register-direct `stnp` drain of the AB precompute
