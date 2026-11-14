@@ -1120,6 +1120,20 @@ fn prove_packed_padded_inner<C: Challenger>(
                     challenger.observe_f128(e1);
                     challenger.observe_f128(einf);
                     mlv_rhos.push(challenger.sample_f128());
+
+                    // Lincheck comb prestage (`FLOCK_NO_LC_COMB_PRESTAGE=1`
+                    // kills): the claim point's inner coords are the FIRST
+                    // `k_log - k_skip` mlv challenges (r1cs::x_ab_from_mlv
+                    // takes the leading slice). Step 0's pass message just
+                    // completed them (8 by the tri route's construction), and
+                    // the quirky eq table needs nothing sampled later. Fire
+                    // the registered producer so the two alpha-free circuit
+                    // walks cover the remaining tail (later tri passes and
+                    // the serial loop rounds) on otherwise idle pool threads.
+                    if step == 0 && mlv_rhos.len() >= 8 {
+                        crate::lincheck::fire_comb_prestage(z, &mlv_rhos[..8]);
+                    }
+
                     pending = Some((la, la2));
                     cur_a = na;
                     cur_b = nb;
