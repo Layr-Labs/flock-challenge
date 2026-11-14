@@ -10860,8 +10860,31 @@ kernel void blake3_pow_scan(
         }
         match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
             usize::MAX => DEFAULT_HYBRID_K,
-            k => k,
+            k => hybrid_k_bias(k),
         }
+    }
+
+    /// GPU-ward bias of the warmup-tuned split, in sixteenths
+    /// (`FLOCK_HYBRID_K_BIAS=n`, signed, default -1; `FLOCK_NO_HYBRID_K_BIAS`
+    /// kills). The opposite sign was measured officially: a +1 CPU-ward bias
+    /// scored 0.7% below the record (entry 1dba21b9), so this tests one
+    /// sixteenth toward the GPU. Only the sixteenths field moves; the fine
+    /// `m` field is unchanged and the result stays at `k >= 1`.
+    fn hybrid_k_bias(k_split: usize) -> usize {
+        use std::sync::OnceLock;
+        static B: OnceLock<i32> = OnceLock::new();
+        let bias = *B.get_or_init(|| {
+            if std::env::var_os("FLOCK_NO_HYBRID_K_BIAS").is_some() {
+                return 0;
+            }
+            std::env::var("FLOCK_HYBRID_K_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(-1)
+        });
+        let (k, m) = decode_hybrid_split(k_split);
+        let nk = k as i32 + bias;
+        if bias == 0 || k == 0 || nk < 1 || nk as usize > ARM_SPLIT_MAX_K {
+            return k_split;
+        }
+        nk as usize + 16 * m
     }
 
     /// Promoted fixed default, used when the warmup sweep is disabled or has
