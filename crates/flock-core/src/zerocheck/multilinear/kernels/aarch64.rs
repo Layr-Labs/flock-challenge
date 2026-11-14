@@ -687,8 +687,10 @@ unsafe fn fold4_pair_expanded_tri_q(
 /// `cross` starts from [`cross_sum_q`] and takes the other four cross
 /// products the same way ([`fused_cross_acc`]). The tri words are the XOR of
 /// the same twelve products, so the reduction returns the same bits; 12
-/// SIMD issue slots for the products and their sums instead of 17.
+/// SIMD issue slots for the products and their sums instead of 17. The tri
+/// kernel now takes [`fold4_prep_one_q`]; this form is its test reference.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 unsafe fn fold4_expanded_tri_one_fused_q(
     v0: core::arch::aarch64::uint64x2_t,
@@ -717,6 +719,7 @@ unsafe fn fold4_expanded_tri_one_fused_q(
 
 /// Without SHA3 (no fused helpers): [`fold4_expanded_tri_one_q`] itself.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes", not(target_feature = "sha3")))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 unsafe fn fold4_expanded_tri_one_fused_q(
     v0: core::arch::aarch64::uint64x2_t,
@@ -730,8 +733,10 @@ unsafe fn fold4_expanded_tri_one_fused_q(
 
 /// [`mul_sw_tri_binius_q`] with the two cross products summed by
 /// [`cross_sum_q`] (a fused `PMULL2`+`EOR`): the same four products, the same
-/// reduction, the same bits.
+/// reduction, the same bits. The tri kernel's weight and `ρc` products now
+/// take the prepared forms; this form is their test reference.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 unsafe fn mul_sw_tri_binius_fused_q(
     a: core::arch::aarch64::uint64x2_t,
@@ -755,13 +760,179 @@ unsafe fn mul_sw_tri_binius_fused_q(
     }
 }
 
-/// [`fold4_pair_expanded_tri_q`] through [`fold4_expanded_tri_one_fused_q`]
-/// (`F`) or [`fold4_expanded_tri_one_q`]: the same loads, the same outputs.
+/// The tri kernel's pass constants as prepared pairs (`const_prep`, see
+/// [`mul_prep86_q`]), built once per call: the fold constants `ρa`, `ρb` and
+/// `ρa·ρb`, the third fold level's `ρc` (zero at depth two), and `k` with
+/// `0x86` in its high lane.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[derive(Clone, Copy)]
+struct TriPrepQ {
+    a0: core::arch::aarch64::uint64x2_t,
+    a1: core::arch::aarch64::uint64x2_t,
+    b0: core::arch::aarch64::uint64x2_t,
+    b1: core::arch::aarch64::uint64x2_t,
+    ab0: core::arch::aarch64::uint64x2_t,
+    ab1: core::arch::aarch64::uint64x2_t,
+    c0: core::arch::aarch64::uint64x2_t,
+    c1: core::arch::aarch64::uint64x2_t,
+    k: core::arch::aarch64::uint64x2_t,
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+impl TriPrepQ {
+    #[inline(always)]
+    unsafe fn new(
+        a: core::arch::aarch64::uint64x2_t,
+        b: core::arch::aarch64::uint64x2_t,
+        ab: core::arch::aarch64::uint64x2_t,
+        c: core::arch::aarch64::uint64x2_t,
+    ) -> Self {
+        use crate::field::gf2_128::aarch64::const_prep;
+        unsafe {
+            let ((a0, a1), (b0, b1), (ab0, ab1), (c0, c1)) =
+                (const_prep(a), const_prep(b), const_prep(ab), const_prep(c));
+            Self { a0, a1, b0, b1, ab0, ab1, c0, c1, k: core::arch::aarch64::vdupq_n_u64(0x86) }
+        }
+    }
+}
+
+/// `pmull2(m, k) + s` as one fused `PMULL2`+`EOR` pair: the fold that ends
+/// every prepared product, `s` holding `L + swap(M)` (plus any addend).
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn fold86_add_q(
+    m: core::arch::aarch64::uint64x2_t,
+    k: core::arch::aarch64::uint64x2_t,
+    s: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    let out: core::arch::aarch64::uint64x2_t;
+    // SAFETY: register-only carry-less product and XOR; `o` is an early
+    // clobber.
+    unsafe {
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {m:v}.2d, {k:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+            m = in(vreg) m,
+            k = in(vreg) k,
+            s = in(vreg) s,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// One fold4 output, `v0 + ρa·(v0+v1) + ρb·(v0+v2) + ρab·(v0+v1+v2+v3)`,
+/// from the prepared constants: the three products' `L` and `M` halves
+/// (see [`mul_prep86_q`]) are summed first, twelve data `PMULL`s in fused
+/// `PMULL`/`EOR` pairs, and one fold reduces all three at once,
+/// `v0 + L + swap(M) + M.hi·0x86`. With the operand sums (the third one
+/// taken from the first, so three instructions), 13 `PMULL`s and 29
+/// instructions where [`fold4_expanded_tri_one_fused_q`] takes 14 and 31.
+/// Fully reduced: the same bits.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn fold4_prep_one_q(
+    v0: core::arch::aarch64::uint64x2_t,
+    v1: core::arch::aarch64::uint64x2_t,
+    v2: core::arch::aarch64::uint64x2_t,
+    v3: core::arch::aarch64::uint64x2_t,
+    p: &TriPrepQ,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let da = veorq_u64(v0, v1);
+        let db = veorq_u64(v0, v2);
+        let dab = xor3_u64(da, v2, v3);
+        let (l, m): (uint64x2_t, uint64x2_t);
+        // SAFETY: register-only carry-less products and XORs; the scratch
+        // register and both outputs are early clobbers.
+        core::arch::asm!(
+            "pmull {t:v}.1q, {da:v}.1d, {a0:v}.1d",
+            "pmull2 {l:v}.1q, {da:v}.2d, {a0:v}.2d",
+            "eor {l:v}.16b, {l:v}.16b, {t:v}.16b",
+            "pmull {t:v}.1q, {db:v}.1d, {b0:v}.1d",
+            "eor {t:v}.16b, {t:v}.16b, {l:v}.16b",
+            "pmull2 {l:v}.1q, {db:v}.2d, {b0:v}.2d",
+            "eor {l:v}.16b, {l:v}.16b, {t:v}.16b",
+            "pmull {t:v}.1q, {dab:v}.1d, {ab0:v}.1d",
+            "eor {t:v}.16b, {t:v}.16b, {l:v}.16b",
+            "pmull2 {l:v}.1q, {dab:v}.2d, {ab0:v}.2d",
+            "eor {l:v}.16b, {l:v}.16b, {t:v}.16b",
+            "pmull {t:v}.1q, {da:v}.1d, {a1:v}.1d",
+            "pmull2 {m:v}.1q, {da:v}.2d, {a1:v}.2d",
+            "eor {m:v}.16b, {m:v}.16b, {t:v}.16b",
+            "pmull {t:v}.1q, {db:v}.1d, {b1:v}.1d",
+            "eor {t:v}.16b, {t:v}.16b, {m:v}.16b",
+            "pmull2 {m:v}.1q, {db:v}.2d, {b1:v}.2d",
+            "eor {m:v}.16b, {m:v}.16b, {t:v}.16b",
+            "pmull {t:v}.1q, {dab:v}.1d, {ab1:v}.1d",
+            "eor {t:v}.16b, {t:v}.16b, {m:v}.16b",
+            "pmull2 {m:v}.1q, {dab:v}.2d, {ab1:v}.2d",
+            "eor {m:v}.16b, {m:v}.16b, {t:v}.16b",
+            da = in(vreg) da,
+            db = in(vreg) db,
+            dab = in(vreg) dab,
+            a0 = in(vreg) p.a0,
+            a1 = in(vreg) p.a1,
+            b0 = in(vreg) p.b0,
+            b1 = in(vreg) p.b1,
+            ab0 = in(vreg) p.ab0,
+            ab1 = in(vreg) p.ab1,
+            t = out(vreg) _,
+            l = out(vreg) l,
+            m = out(vreg) m,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        fold86_add_q(m, p.k, xor3_u64(vextq_u64::<1>(m, m), l, v0))
+    }
+}
+
+/// `x * t + e` for a `t` given as its prepared pair (`p0`, `p1`):
+/// [`mul_prep86_q`] with the addend taken into the fold's sum (one `EOR3`),
+/// 10 instructions where [`mul_sw_tri_binius_fused_q`] plus the add takes
+/// 12 and six `PMULL`s. The same bits.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn mul_prep86_add_q(
+    p0: core::arch::aarch64::uint64x2_t,
+    p1: core::arch::aarch64::uint64x2_t,
+    x: core::arch::aarch64::uint64x2_t,
+    k: core::arch::aarch64::uint64x2_t,
+    e: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        let (l, m): (uint64x2_t, uint64x2_t);
+        // SAFETY: register-only carry-less products and XORs; the scratch
+        // register and both outputs are early clobbers.
+        core::arch::asm!(
+            "pmull {t:v}.1q, {x:v}.1d, {p0:v}.1d",
+            "pmull2 {l:v}.1q, {x:v}.2d, {p0:v}.2d",
+            "eor {l:v}.16b, {l:v}.16b, {t:v}.16b",
+            "pmull {t:v}.1q, {x:v}.1d, {p1:v}.1d",
+            "pmull2 {m:v}.1q, {x:v}.2d, {p1:v}.2d",
+            "eor {m:v}.16b, {m:v}.16b, {t:v}.16b",
+            x = in(vreg) x,
+            p0 = in(vreg) p0,
+            p1 = in(vreg) p1,
+            t = out(vreg) _,
+            l = out(vreg) l,
+            m = out(vreg) m,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        fold86_add_q(m, k, xor3_u64(vextq_u64::<1>(m, m), l, e))
+    }
+}
+
+/// [`fold4_pair_expanded_tri_q`] through [`fold4_prep_one_q`] (`F`) or
+/// [`fold4_expanded_tri_one_q`]: the same loads, the same outputs.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline(always)]
 unsafe fn fold4_pair_expanded_tri_f_q<const F: bool>(
     values: *const F128,
     rho: &Fold4RhoQ,
+    pp: &TriPrepQ,
 ) -> (
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
@@ -780,8 +951,8 @@ unsafe fn fold4_pair_expanded_tri_f_q<const F: bool>(
         let v6 = vld1q_u64(values.add(6).cast::<u64>());
         let v7 = vld1q_u64(values.add(7).cast::<u64>());
         (
-            fold4_expanded_tri_one_fused_q(v0, v1, v2, v3, rho),
-            fold4_expanded_tri_one_fused_q(v4, v5, v6, v7, rho),
+            fold4_prep_one_q(v0, v1, v2, v3, pp),
+            fold4_prep_one_q(v4, v5, v6, v7, pp),
         )
     }
 }
@@ -1625,7 +1796,7 @@ unsafe fn r2_pair_fold_and_store_off<const CODE: usize, const ANC: usize>(
 /// 10 instructions where [`mul_sw_fused_q`] takes 12 and six `PMULL`s. The
 /// result is fully reduced (`M.hi * 0x86` fits in 71 bits): the same bits as
 /// [`mul_sw_fused_q`].
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline(always)]
 unsafe fn mul_prep86_q(
     p0: core::arch::aarch64::uint64x2_t,
@@ -1666,15 +1837,16 @@ unsafe fn mul_prep86_q(
 /// `2u + 1` hold `const_prep(eq_lo[2u + 1])`, the weight of group `u` of
 /// every chunk. One pass over half of `eq_lo`, shared by all chunks. The
 /// K pass's group weights (also `eq_lo[2t + 1]` of its own `eq_lo`) use the
-/// same layout.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+/// same layout, and so do the tri pass's (`eq_lo[4y + 3]`, entries `4y + 2`,
+/// `4y + 3`).
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 pub(crate) fn round2_eq_prep(eq_lo: &[F128]) -> Vec<F128> {
     use core::arch::aarch64::uint64x2_t;
     // Every slot is written below: one pair per pair of `eq_lo`.
     let mut prep = crate::alloc_uninit_vec::<F128>(eq_lo.len() & !1);
     for (pair, w) in prep.chunks_exact_mut(2).zip(eq_lo.chunks_exact(2)) {
         // SAFETY: `F128` is two little-endian `u64` lanes, the `uint64x2_t`
-        // layout; `aes` is enabled for every `sha3` build of this module.
+        // layout; `aes` is enabled (cfg gate).
         unsafe {
             let (p0, p1) = crate::field::gf2_128::aarch64::const_prep(
                 core::mem::transmute::<F128, uint64x2_t>(w[1]),
@@ -3052,6 +3224,11 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
             && (pair_idx_base & 127) == 0
             && lo_size.is_multiple_of(128);
         let fixed_pads = FIXED_PADS && aligned_padding;
+        // The ranked loop's deltas of one 32-group window, in stream layout
+        // (group `2 * pos + t` at byte `32 * (2 * pos + t)`), until the
+        // window's two parity passes are done; see the flush below.
+        let mut stash = [0u64; 128];
+        let stash_p = stash.as_mut_ptr().cast::<u8>();
         for first in (0..lo_size / 2).step_by(32) {
             for t in 0..2 {
                 let mut w0 = tri_zero;
@@ -3172,7 +3349,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                         let mut pa = a_packed.add(32 * top).cast::<u64>();
                         let mut pb = b_packed.add(32 * top).cast::<u64>();
                         let mut pn = anchors.add(4 * top);
-                        let mut pd = deltas.add(32 * top);
+                        let mut pd = stash_p.add(32 * (2 * (b_end - 2) + t));
                         // `pair` above for a live pair `CODE` bytes into the
                         // group's rows and deltas, `ANC` bytes into its anchors.
                         macro_rules! pair_off {
@@ -3263,6 +3440,30 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                 } else {
                     for pos in (0..b_end).rev() {
                         group!(pos, generic_pads);
+                    }
+                }
+                if fixed_pads && ASM_OFF && t == 1 {
+                    // Both parity passes of the window have run: write the
+                    // ranked loop's deltas to the stream one 64-byte line
+                    // (groups `2 * pos`, `2 * pos + 1`) at a time, each line
+                    // with two consecutive `stnp q, q`. The even pass stashed
+                    // positions `0..n0`, the odd pass `0..n1` (`n1 <= n0`).
+                    // An even group without its odd neighbour (the padded
+                    // window's last one) is half a line: plain stores, like
+                    // the group stores outside the ranked loop.
+                    let (n0, n1) = if b_end == 16 { (15, 15) } else { (14, 13) };
+                    let line = deltas.add(32 * first);
+                    for pos in 0..n1 {
+                        let src = stash_p.add(64 * pos).cast::<u64>();
+                        let dst = line.add(64 * pos).cast::<F128>();
+                        store_anchor_pair_nt_off::<0>(dst, vld1q_u64(src), vld1q_u64(src.add(2)));
+                        store_anchor_pair_nt_off::<32>(dst, vld1q_u64(src.add(4)), vld1q_u64(src.add(6)));
+                    }
+                    for pos in n1..n0 {
+                        let src = stash_p.add(64 * pos).cast::<u64>();
+                        let dst = line.add(64 * pos).cast::<u64>();
+                        vst1q_u64(dst, vld1q_u64(src));
+                        vst1q_u64(dst.add(2), vld1q_u64(src.add(2)));
                     }
                 }
                 let lambda = vld1q_u64(eq_lo.add(2 * (first + t) + 1).cast::<u64>());
@@ -5647,6 +5848,10 @@ pub(crate) const TRI_SLOTS: usize = 26;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
+///
+/// `eq_prep` holds the group weights `eq_lo[4y + 3]` as prepared pairs
+/// ([`round2_eq_prep`] of `eq_lo`, entries `4y + 2`, `4y + 3`); the `FF`
+/// instances read the weights there, the others read `eq_lo`.
 pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, const ABL: u32>(
     a_in: &[F128],
     b_in: &[F128],
@@ -5656,32 +5861,33 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
     rho_b: F128,
     rho_c: F128,
     eq_lo: &[F128],
+    eq_prep: &[F128],
 ) -> [F128; TRI_SLOTS] {
     if zc_tri_group_inline_enabled() {
         if DEPTH == 2 && zc_tri_fold_regs_enabled() {
             fold_tri_and_message_core::<DEPTH, NT, ABL, false, true, true, false>(
-                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
             )
         } else if DEPTH == 3 && zc_tri_fused_fold_enabled() {
-            // Depth three: the inlined group fold with fused product sums;
-            // `FLOCK_NO_ZC_TRI_FUSED_FOLD` takes the parent's out-of-line
-            // group fold (the binary keeps no unfused inlined depth-three
-            // instance). Same outputs and slots.
+            // Depth three: the inlined group fold with prepared-constant
+            // products; `FLOCK_NO_ZC_TRI_FUSED_FOLD` takes the parent's
+            // out-of-line group fold (the binary keeps no other inlined
+            // depth-three instance). Same outputs and slots.
             fold_tri_and_message_core::<DEPTH, NT, ABL, false, true, false, true>(
-                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
             )
         } else if DEPTH == 3 {
             fold_tri_and_message_impl::<DEPTH, NT, ABL, false, false>(
-                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
             )
         } else {
             fold_tri_and_message_impl::<DEPTH, NT, ABL, false, true>(
-                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
             )
         }
     } else {
         fold_tri_and_message_impl::<DEPTH, NT, ABL, false, false>(
-            a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+            a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
         )
     }
 }
@@ -5730,24 +5936,25 @@ pub(crate) fn fold_tri_and_message_packed_aarch64<const NT: bool>(
     rho_a: F128,
     rho_b: F128,
     eq_lo: &[F128],
+    eq_prep: &[F128],
 ) -> [F128; TRI_SLOTS] {
     if zc_tri_group_inline_enabled() {
-        // The straight-line groups with the fused fold products; either
-        // `FLOCK_NO_ZC_TRI_FOLD_REGS` or `FLOCK_NO_ZC_TRI_FUSED_FOLD` takes
-        // the parent's group fold (the binary keeps no unfused straight-line
-        // instance of this pass).
+        // The straight-line groups with the prepared-constant products;
+        // either `FLOCK_NO_ZC_TRI_FOLD_REGS` or `FLOCK_NO_ZC_TRI_FUSED_FOLD`
+        // takes the parent's group fold (the binary keeps no other
+        // straight-line instance of this pass).
         if zc_tri_fold_regs_enabled() && zc_tri_fused_fold_enabled() {
             fold_tri_and_message_core::<2, NT, 0, true, true, true, true>(
-                a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo,
+                a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo, eq_prep,
             )
         } else {
             fold_tri_and_message_impl::<2, NT, 0, true, true>(
-                a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo,
+                a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo, eq_prep,
             )
         }
     } else {
         fold_tri_and_message_impl::<2, NT, 0, true, false>(
-            a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo,
+            a_in, b_in, a_out, b_out, rho_a, rho_b, F128::ZERO, eq_lo, eq_prep,
         )
     }
 }
@@ -5772,9 +5979,10 @@ fn fold_tri_and_message_impl<
     rho_b: F128,
     rho_c: F128,
     eq_lo: &[F128],
+    eq_prep: &[F128],
 ) -> [F128; TRI_SLOTS] {
     fold_tri_and_message_core::<DEPTH, NT, ABL, PACK, INL, false, false>(
-        a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo,
+        a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
     )
 }
 
@@ -5785,9 +5993,12 @@ fn fold_tri_and_message_impl<
 /// the same order, so every output and slot is unchanged. Depth three keeps
 /// `fold_eight`.
 ///
-/// `FF` (with `SL`): the straight-line group folds and the packed tail fold
-/// sum their constant products with fused `PMULL`+`EOR` pairs
-/// ([`fold4_expanded_tri_one_fused_q`]); same products, same outputs.
+/// `FF` (with `SL`, or at depth three): every product by a pass constant
+/// runs on its prepared pair ([`TriPrepQ`]): the group folds and the packed
+/// tail fold through [`fold4_prep_one_q`], the depth-three `ρc` level
+/// through [`mul_prep86_add_q`], and the group weights `eq_lo[4y + 3]`
+/// through [`mul_prep86_q`] with their pairs read from `eq_prep`. Same field
+/// products, fully reduced: same outputs and slots.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -5808,6 +6019,7 @@ fn fold_tri_and_message_core<
     rho_b: F128,
     rho_c: F128,
     eq_lo: &[F128],
+    eq_prep: &[F128],
 ) -> [F128; TRI_SLOTS] {
     use core::arch::aarch64::*;
     assert!(DEPTH == 2 || DEPTH == 3);
@@ -5816,6 +6028,8 @@ fn fold_tri_and_message_core<
     assert_eq!(b_out.len(), n_out);
     assert_eq!(n_out, 2 * eq_lo.len());
     assert!(n_out.is_multiple_of(8));
+    // The `FF` weights: group `y` reads entries `4y + 2`, `4y + 3`.
+    assert!(!FF || eq_prep.len() == eq_lo.len());
     if PACK {
         let n_in = n_out << DEPTH;
         assert!(n_in.is_multiple_of(64 * PACK_BLOCKS));
@@ -5846,9 +6060,11 @@ fn fold_tri_and_message_core<
 
     unsafe {
         let q = |v: F128| core::mem::transmute::<F128, uint64x2_t>(v);
-        let rho = Fold4RhoQ::new(q(rho_a), q(rho_b), q(rho_a * rho_b));
+        let rho_ab = rho_a * rho_b;
+        let rho = Fold4RhoQ::new(q(rho_a), q(rho_b), q(rho_ab));
         let rc = q(rho_c);
         let rc_sw = swap_halves_q(rc);
+        let pp = TriPrepQ::new(q(rho_a), q(rho_b), q(rho_ab), rc);
         let zero = vdupq_n_u64(0);
         let mut acc = [TriNeon {
             ll: zero,
@@ -5867,24 +6083,24 @@ fn fold_tri_and_message_core<
             rho: &Fold4RhoQ,
             rc: uint64x2_t,
             rc_sw: uint64x2_t,
+            pp: &TriPrepQ,
         ) -> [uint64x2_t; 8] {
             unsafe {
                 let mut v = [vdupq_n_u64(0); 8];
                 if DEPTH == 2 {
                     for h in 0..4 {
-                        let (x, y) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8 * h), rho);
+                        let (x, y) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8 * h), rho, pp);
                         v[2 * h] = x;
                         v[2 * h + 1] = y;
                     }
                 } else {
                     for (h, slot) in v.iter_mut().enumerate() {
-                        let (t0, t1) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8 * h), rho);
-                        let m = if FF {
-                            mul_sw_tri_binius_fused_q(rc, rc_sw, veorq_u64(t0, t1))
+                        let (t0, t1) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8 * h), rho, pp);
+                        *slot = if FF {
+                            mul_prep86_add_q(pp.c0, pp.c1, veorq_u64(t0, t1), pp.k, t0)
                         } else {
-                            mul_sw_tri_binius_q(rc, rc_sw, veorq_u64(t0, t1))
+                            veorq_u64(t0, mul_sw_tri_binius_q(rc, rc_sw, veorq_u64(t0, t1)))
                         };
-                        *slot = veorq_u64(t0, m);
                     }
                 }
                 v
@@ -5894,12 +6110,16 @@ fn fold_tri_and_message_core<
         /// [`fold_eight`] at depth two written out: the four pair folds in
         /// the same order, the result an array literal.
         #[inline(always)]
-        unsafe fn fold_eight_sl<const FF: bool>(src: *const F128, rho: &Fold4RhoQ) -> [uint64x2_t; 8] {
+        unsafe fn fold_eight_sl<const FF: bool>(
+            src: *const F128,
+            rho: &Fold4RhoQ,
+            pp: &TriPrepQ,
+        ) -> [uint64x2_t; 8] {
             unsafe {
-                let (v0, v1) = fold4_pair_expanded_tri_f_q::<FF>(src, rho);
-                let (v2, v3) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8), rho);
-                let (v4, v5) = fold4_pair_expanded_tri_f_q::<FF>(src.add(16), rho);
-                let (v6, v7) = fold4_pair_expanded_tri_f_q::<FF>(src.add(24), rho);
+                let (v0, v1) = fold4_pair_expanded_tri_f_q::<FF>(src, rho, pp);
+                let (v2, v3) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8), rho, pp);
+                let (v4, v5) = fold4_pair_expanded_tri_f_q::<FF>(src.add(16), rho, pp);
+                let (v6, v7) = fold4_pair_expanded_tri_f_q::<FF>(src.add(24), rho, pp);
                 [v0, v1, v2, v3, v4, v5, v6, v7]
             }
         }
@@ -5912,11 +6132,12 @@ fn fold_tri_and_message_core<
             src: *const F128,
             side: *const F128,
             rho: &Fold4RhoQ,
+            pp: &TriPrepQ,
         ) -> [uint64x2_t; 8] {
             unsafe {
                 let mut v = [vdupq_n_u64(0); 8];
                 for h in 0..3 {
-                    let (x, y) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8 * h), rho);
+                    let (x, y) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8 * h), rho, pp);
                     v[2 * h] = x;
                     v[2 * h + 1] = y;
                 }
@@ -5924,7 +6145,7 @@ fn fold_tri_and_message_core<
                 let zero = vdupq_n_u64(0);
                 let one = |a, b, c, d| {
                     if FF {
-                        fold4_expanded_tri_one_fused_q(a, b, c, d, rho)
+                        fold4_prep_one_q(a, b, c, d, pp)
                     } else {
                         fold4_expanded_tri_one_q(a, b, c, d, rho)
                     }
@@ -5943,12 +6164,12 @@ fn fold_tri_and_message_core<
                 let sup = ip.add(PACK_SUPER * (blk / PACK_BLOCKS));
                 let main = sup.add(60 * w);
                 if y % 2 == 0 {
-                    fold_eight::<2, false>(main, &rho, rc, rc_sw)
+                    fold_eight::<2, false>(main, &rho, rc, rc_sw, &pp)
                 } else {
-                    fold_eight_packed_tail::<false>(main.add(32), sup.add(60 * PACK_BLOCKS + w), &rho)
+                    fold_eight_packed_tail::<false>(main.add(32), sup.add(60 * PACK_BLOCKS + w), &rho, &pp)
                 }
             } else {
-                fold_eight::<DEPTH, false>(ip.add((8 * y) << DEPTH), &rho, rc, rc_sw)
+                fold_eight::<DEPTH, false>(ip.add((8 * y) << DEPTH), &rho, rc, rc_sw, &pp)
             }
         };
         // `INL`: the same group fold as `fold_group`, as an always-inlined
@@ -5963,6 +6184,7 @@ fn fold_tri_and_message_core<
             rho: &Fold4RhoQ,
             rc: uint64x2_t,
             rc_sw: uint64x2_t,
+            pp: &TriPrepQ,
         ) -> [uint64x2_t; 8] {
             unsafe {
                 if PACK {
@@ -5971,17 +6193,17 @@ fn fold_tri_and_message_core<
                     let main = sup.add(60 * w);
                     if y % 2 == 0 {
                         if SL {
-                            fold_eight_sl::<FF>(main, rho)
+                            fold_eight_sl::<FF>(main, rho, pp)
                         } else {
-                            fold_eight::<2, FF>(main, rho, rc, rc_sw)
+                            fold_eight::<2, FF>(main, rho, rc, rc_sw, pp)
                         }
                     } else {
-                        fold_eight_packed_tail::<FF>(main.add(32), sup.add(60 * PACK_BLOCKS + w), rho)
+                        fold_eight_packed_tail::<FF>(main.add(32), sup.add(60 * PACK_BLOCKS + w), rho, pp)
                     }
                 } else if SL && DEPTH == 2 {
-                    fold_eight_sl::<FF>(ip.add((8 * y) << 2), rho)
+                    fold_eight_sl::<FF>(ip.add((8 * y) << 2), rho, pp)
                 } else {
-                    fold_eight::<DEPTH, FF>(ip.add((8 * y) << DEPTH), rho, rc, rc_sw)
+                    fold_eight::<DEPTH, FF>(ip.add((8 * y) << DEPTH), rho, rc, rc_sw, pp)
                 }
             }
         }
@@ -5997,8 +6219,8 @@ fn fold_tri_and_message_core<
                 let y = g0 + t;
                 let (a, b) = if INL {
                     (
-                        fold_group_inl::<DEPTH, PACK, SL, FF>(a_ip, y, &rho, rc, rc_sw),
-                        fold_group_inl::<DEPTH, PACK, SL, FF>(b_ip, y, &rho, rc, rc_sw),
+                        fold_group_inl::<DEPTH, PACK, SL, FF>(a_ip, y, &rho, rc, rc_sw, &pp),
+                        fold_group_inl::<DEPTH, PACK, SL, FF>(b_ip, y, &rho, rc, rc_sw, &pp),
                     )
                 } else {
                     (fold_group(a_ip, y), fold_group(b_ip, y))
@@ -6017,17 +6239,17 @@ fn fold_tri_and_message_core<
                     sink = xor3_u64(sink, a[0], b[7]);
                     continue;
                 }
-                let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
                 if FF {
-                    // Schoolbook with the cross pair fused (four products, no
-                    // lane moves to general registers): the tri words equal
-                    // the Karatsuba form's (`mid ^ ll ^ hh == p01 ^ p10`), so
-                    // the reduced products are the same bits.
-                    let w_sw = swap_halves_q(w);
+                    // The weight's prepared pair (one paired load): five
+                    // `PMULL`s and 10 instructions per row; the same fully
+                    // reduced products as the schoolbook and Karatsuba forms.
+                    let p0 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 2).cast::<u64>());
+                    let p1 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 3).cast::<u64>());
                     for i in 0..8 {
-                        ta[t][i] = mul_sw_tri_binius_fused_q(w, w_sw, a[i]);
+                        ta[t][i] = mul_prep86_q(p0, p1, a[i], pp.k);
                     }
                 } else {
+                    let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
                     let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
                     for i in 0..8 {
                         ta[t][i] = mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]);
@@ -6130,7 +6352,7 @@ fn fold_tri_and_message_core<
 mod tri_fold_regs_tests {
     use super::*;
 
-    type K = fn(&[F128], &[F128], &mut [F128], &mut [F128], F128, F128, F128, &[F128]) -> [F128; TRI_SLOTS];
+    type K = fn(&[F128], &[F128], &mut [F128], &mut [F128], F128, F128, F128, &[F128], &[F128]) -> [F128; TRI_SLOTS];
 
     fn draw(state: &mut u64) -> F128 {
         let mut next = || {
@@ -6151,12 +6373,13 @@ mod tri_fold_regs_tests {
         let a: Vec<F128> = (0..len).map(|_| draw(state)).collect();
         let b: Vec<F128> = (0..len).map(|_| draw(state)).collect();
         let eq: Vec<F128> = (0..n_out / 2).map(|_| draw(state)).collect();
+        let ep = round2_eq_prep(&eq);
         let (ra, rb) = (draw(state), draw(state));
         let poison = F128::new(3, 5);
         let (mut an, mut bn) = (vec![poison; n_out + 1], vec![poison; n_out + 1]);
         let (mut ao, mut bo) = (vec![poison; n_out + 1], vec![poison; n_out + 1]);
-        let sn = new(&a, &b, &mut an[..n_out], &mut bn[..n_out], ra, rb, F128::ZERO, &eq);
-        let so = old(&a, &b, &mut ao[..n_out], &mut bo[..n_out], ra, rb, F128::ZERO, &eq);
+        let sn = new(&a, &b, &mut an[..n_out], &mut bn[..n_out], ra, rb, F128::ZERO, &eq, &ep);
+        let so = old(&a, &b, &mut ao[..n_out], &mut bo[..n_out], ra, rb, F128::ZERO, &eq, &ep);
         let what = format!("packed {packed}, n_out {n_out}");
         assert_eq!(sn, so, "slots, {what}");
         assert_eq!(an, ao, "a outputs, {what}");
@@ -6177,6 +6400,7 @@ mod tri_fold_regs_tests {
                 let a: Vec<F128> = (0..n_in).map(|_| draw(&mut state)).collect();
                 let b: Vec<F128> = (0..n_in).map(|_| draw(&mut state)).collect();
                 let eq: Vec<F128> = (0..n_out / 2).map(|_| draw(&mut state)).collect();
+                let ep = round2_eq_prep(&eq);
                 let (ra, rb, rc) = (draw(&mut state), draw(&mut state), draw(&mut state));
                 let forms: [K; 3] = if nt {
                     [
@@ -6195,12 +6419,73 @@ mod tri_fold_regs_tests {
                 let mut outs = Vec::new();
                 for f in forms {
                     let (mut ao, mut bo) = (vec![poison; n_out + 1], vec![poison; n_out + 1]);
-                    let slots = f(&a, &b, &mut ao[..n_out], &mut bo[..n_out], ra, rb, rc, &eq);
+                    let slots = f(&a, &b, &mut ao[..n_out], &mut bo[..n_out], ra, rb, rc, &eq, &ep);
                     assert_eq!((ao[n_out], bo[n_out]), (poison, poison), "overrun nt={nt} n_out={n_out}");
                     outs.push((slots, ao, bo));
                 }
                 assert_eq!(outs[1], outs[0], "out-of-line parent nt={nt} n_out={n_out}");
                 assert_eq!(outs[2], outs[0], "fused nt={nt} n_out={n_out}");
+            }
+        }
+    }
+
+    /// The prepared-constant forms against the fused schoolbook forms they
+    /// replace, for 512 random draws plus zero/one edges: one fold4 output
+    /// (also with three zero inputs, the packed tail's form), the `ρc`
+    /// product with its addend, and a group weight read back from a
+    /// `round2_eq_prep` table at entries `4y + 2`, `4y + 3` (also against
+    /// the Karatsuba form).
+    #[test]
+    fn tri_prep_matches_fused_forms() {
+        use core::arch::aarch64::*;
+        let mut state = 0x7472_6970_7265_7031;
+        let q = |v: F128| unsafe { core::mem::transmute::<F128, uint64x2_t>(v) };
+        let f = |v: uint64x2_t| unsafe { core::mem::transmute::<uint64x2_t, F128>(v) };
+        let (zero, one) = (F128::ZERO, F128::ONE);
+        for i in 0..512 + 9 {
+            let mut d = || draw(&mut state);
+            let (mut ra, mut rb, mut rc) = (d(), d(), d());
+            let mut v = [d(), d(), d(), d()];
+            match i {
+                512 => (ra, rb, rc) = (zero, zero, zero),
+                513 => (ra, rb, rc) = (one, one, one),
+                514 => v = [zero; 4],
+                515 => v = [one, zero, zero, zero],
+                516 => (ra, v) = (one, [one; 4]),
+                517 => rb = zero,
+                518 => rc = one,
+                519 => v[3] = zero,
+                _ => {}
+            }
+            let rab = ra * rb;
+            unsafe {
+                let rho = Fold4RhoQ::new(q(ra), q(rb), q(rab));
+                let pp = TriPrepQ::new(q(ra), q(rb), q(rab), q(rc));
+                let (v0, v1, v2, v3) = (q(v[0]), q(v[1]), q(v[2]), q(v[3]));
+                let want = f(fold4_expanded_tri_one_fused_q(v0, v1, v2, v3, &rho));
+                assert_eq!(want, f(fold4_expanded_tri_one_q(v0, v1, v2, v3, &rho)), "draw {i}");
+                assert_eq!(f(fold4_prep_one_q(v0, v1, v2, v3, &pp)), want, "fold4, draw {i}");
+                let z = vdupq_n_u64(0);
+                assert_eq!(
+                    f(fold4_prep_one_q(v0, z, z, z, &pp)),
+                    f(fold4_expanded_tri_one_fused_q(v0, z, z, z, &rho)),
+                    "fold4 tail, draw {i}"
+                );
+                let (x, e) = (q(v[1]), q(v[2]));
+                let want = veorq_u64(e, mul_sw_tri_binius_fused_q(q(rc), swap_halves_q(q(rc)), x));
+                assert_eq!(f(mul_prep86_add_q(pp.c0, pp.c1, x, pp.k, e)), f(want), "rho_c, draw {i}");
+                assert_eq!(f(want), v[2] + rc * v[1], "rho_c field, draw {i}");
+                let eq = [d(), d(), d(), rc, d(), d(), d(), ra];
+                let ep = round2_eq_prep(&eq);
+                for y in 0..2 {
+                    let w = q(eq[4 * y + 3]);
+                    let (p0, p1) = (q(ep[4 * y + 2]), q(ep[4 * y + 3]));
+                    let want = f(mul_sw_tri_binius_fused_q(w, swap_halves_q(w), x));
+                    let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
+                    assert_eq!(f(mul_sw_tri_binius_karatsuba_q(w, w_sum, x)), want, "draw {i}");
+                    assert_eq!(f(mul_prep86_q(p0, p1, x, pp.k)), want, "weight {y}, draw {i}");
+                    assert_eq!(want, eq[4 * y + 3] * v[1], "weight field {y}, draw {i}");
+                }
             }
         }
     }
@@ -6270,6 +6555,7 @@ mod tri_fused_fold_probe {
         let a: Vec<F128> = (0..len).map(|_| draw()).collect();
         let b: Vec<F128> = (0..len).map(|_| draw()).collect();
         let eq: Vec<F128> = (0..N_OUT / 2).map(|_| draw()).collect();
+        let ep = round2_eq_prep(&eq);
         let (ra, rb) = (draw(), draw());
         let (mut ao, mut bo) = (vec![F128::ZERO; N_OUT], vec![F128::ZERO; N_OUT]);
         let rounds: usize = std::env::var("PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
@@ -6282,9 +6568,9 @@ mod tri_fused_fold_probe {
                 let t0 = std::time::Instant::now();
                 for _ in 0..ITERS {
                     slots[form] = if form == 0 {
-                        fold_tri_and_message_core::<2, true, 0, true, true, true, false>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq)
+                        fold_tri_and_message_core::<2, true, 0, true, true, true, false>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq, &ep)
                     } else {
-                        fold_tri_and_message_core::<2, true, 0, true, true, true, true>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq)
+                        fold_tri_and_message_core::<2, true, 0, true, true, true, true>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq, &ep)
                     };
                 }
                 if round > 0 {
@@ -6318,6 +6604,7 @@ mod tri_fused_fold_probe {
         let a: Vec<F128> = (0..8 * N_OUT).map(|_| draw()).collect();
         let b: Vec<F128> = (0..8 * N_OUT).map(|_| draw()).collect();
         let eq: Vec<F128> = (0..N_OUT / 2).map(|_| draw()).collect();
+        let ep = round2_eq_prep(&eq);
         let (ra, rb, rc) = (draw(), draw(), draw());
         let (mut ao, mut bo) = (vec![F128::ZERO; N_OUT], vec![F128::ZERO; N_OUT]);
         let rounds: usize = std::env::var("PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
@@ -6330,9 +6617,9 @@ mod tri_fused_fold_probe {
                 let t0 = std::time::Instant::now();
                 for _ in 0..ITERS {
                     slots[form] = if form == 0 {
-                        fold_tri_and_message_impl::<3, false, 0, false, true>(&a, &b, &mut ao, &mut bo, ra, rb, rc, &eq)
+                        fold_tri_and_message_impl::<3, false, 0, false, true>(&a, &b, &mut ao, &mut bo, ra, rb, rc, &eq, &ep)
                     } else {
-                        fold_tri_and_message_core::<3, false, 0, false, true, false, true>(&a, &b, &mut ao, &mut bo, ra, rb, rc, &eq)
+                        fold_tri_and_message_core::<3, false, 0, false, true, false, true>(&a, &b, &mut ao, &mut bo, ra, rb, rc, &eq, &ep)
                     };
                 }
                 if round > 0 {
@@ -8821,19 +9108,20 @@ mod tests {
             };
             let (ap_in, bp_in) = (pack(&a), pack(&b));
             let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+            let ep = round2_eq_prep(&eq);
             let (ra, rb) = (rho(&mut state), rho(&mut state));
             for nt in [false, true] {
                 let (mut ao, mut bo) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
                 let (mut ap, mut bp) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
                 let (full, packed) = if nt {
                     (
-                        fold_tri_and_message_aarch64::<2, true, 0>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq),
-                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bp_in, &mut ap, &mut bp, ra, rb, &eq),
+                        fold_tri_and_message_aarch64::<2, true, 0>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq, &ep),
+                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bp_in, &mut ap, &mut bp, ra, rb, &eq, &ep),
                     )
                 } else {
                     (
-                        fold_tri_and_message_aarch64::<2, false, 0>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq),
-                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bp_in, &mut ap, &mut bp, ra, rb, &eq),
+                        fold_tri_and_message_aarch64::<2, false, 0>(&a, &b, &mut ao, &mut bo, ra, rb, F128::ZERO, &eq, &ep),
+                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bp_in, &mut ap, &mut bp, ra, rb, &eq, &ep),
                     )
                 };
                 assert_eq!(packed, full, "slots, case {case}, nt {nt}");
@@ -8848,7 +9136,7 @@ mod tests {
     /// and three, dead-tail-packed inputs, both store flavours.
     #[test]
     fn tri_group_inline_matches_closure_form() {
-        type K = fn(&[F128], &[F128], &mut [F128], &mut [F128], F128, F128, F128, &[F128]) -> [F128; TRI_SLOTS];
+        type K = fn(&[F128], &[F128], &mut [F128], &mut [F128], F128, F128, F128, &[F128], &[F128]) -> [F128; TRI_SLOTS];
         let mut state = 0x7472_6967_696e_6c31;
         let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
         let full: [(usize, K, K); 4] = [
@@ -8868,12 +9156,13 @@ mod tests {
                 let a: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
                 let b: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
                 let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+                let ep = round2_eq_prep(&eq);
                 let (ra, rb) = (rho(&mut state), rho(&mut state));
                 let rc = if depth == 3 { rho(&mut state) } else { F128::ZERO };
                 let (mut ai, mut bi) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
                 let (mut ac, mut bc) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
-                let si = k_inl(&a, &b, &mut ai, &mut bi, ra, rb, rc, &eq);
-                let sc = k_closure(&a, &b, &mut ac, &mut bc, ra, rb, rc, &eq);
+                let si = k_inl(&a, &b, &mut ai, &mut bi, ra, rb, rc, &eq, &ep);
+                let sc = k_closure(&a, &b, &mut ac, &mut bc, ra, rb, rc, &eq, &ep);
                 assert_eq!(si, sc, "slots, case {case}, depth {depth}");
                 assert_eq!(ai, ac, "a outputs, case {case}, depth {depth}");
                 assert_eq!(bi, bc, "b outputs, case {case}, depth {depth}");
@@ -8896,12 +9185,13 @@ mod tests {
             };
             let (ap_in, bp_in) = (pack(&a), pack(&b));
             let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+            let ep = round2_eq_prep(&eq);
             let (ra, rb) = (rho(&mut state), rho(&mut state));
             for (_, k_inl, k_closure) in packed {
                 let (mut ai, mut bi) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
                 let (mut ac, mut bc) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
-                let si = k_inl(&ap_in, &bp_in, &mut ai, &mut bi, ra, rb, F128::ZERO, &eq);
-                let sc = k_closure(&ap_in, &bp_in, &mut ac, &mut bc, ra, rb, F128::ZERO, &eq);
+                let si = k_inl(&ap_in, &bp_in, &mut ai, &mut bi, ra, rb, F128::ZERO, &eq, &ep);
+                let sc = k_closure(&ap_in, &bp_in, &mut ac, &mut bc, ra, rb, F128::ZERO, &eq, &ep);
                 assert_eq!(si, sc, "packed slots, case {case}");
                 assert_eq!(ai, ac, "packed a outputs, case {case}");
                 assert_eq!(bi, bc, "packed b outputs, case {case}");

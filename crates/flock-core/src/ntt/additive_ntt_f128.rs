@@ -232,6 +232,15 @@ fn use_ranked_deep_pair_fusion(
 /// (default 64) is the group size bound. At 64 lanes that is `2^6` positions
 /// (64 KiB, the last three pairs); at 8 lanes `2^8` positions (32 KiB, the
 /// last four pairs).
+/// Fine hybrid split order (`FLOCK_NO_FINE_DEEP_FIRST`, any value, kills):
+/// the CPU suffix runs the deep pairs of its full layer-4 blocks before it
+/// waits for the GPU's boundary layers 4..8. Read once per process; the
+/// codeword is the same either way.
+fn fine_deep_first_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FINE_DEEP_FIRST").is_none())
+}
+
 fn deep_l1_group_layer(log_d: usize, num_ntts: usize, first_pair_layer: usize) -> usize {
     static BUDGET_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         if std::env::var("FLOCK_NO_MF_DEEP_L1_GROUPS").is_ok_and(|v| v == "1") {
@@ -508,6 +517,20 @@ fn l1_tail_split_count(log_d: usize, start_layer: usize, num_subs: usize) -> usi
 #[inline]
 fn recursive_top_hetero_enabled() -> bool {
     std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none()
+}
+
+/// Kill switch for the two-pool claim queue on the ranked L0 CPU suffix
+/// (`FLOCK_NO_RANKED_SUFFIX_HETERO=1`): restores the main-pool-only
+/// `into_par_iter` / `par_chunks_mut` fan-out of the hybrid suffix's top
+/// tiles and fused deep pairs. Once the round-one AB queue is drained the
+/// efficiency cores idle until the commit root; the queue lets them claim
+/// suffix tiles and sub-NTTs (the tail guard keeps a slow claim off the
+/// end). Same per-tile and per-sub kernels on disjoint rows, so every output
+/// byte is identical whichever core ran it.
+#[inline]
+fn ranked_suffix_hetero_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_RANKED_SUFFIX_HETERO").is_none())
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,7 +1442,8 @@ impl AdditiveNttF128 {
         let base = data.as_mut_ptr() as usize;
         let n_jobs = (b_end - b_start) * tiles_per_block;
         let prefetch = tile_prefetch_enabled();
-        let job = |job: usize| {
+        // One compiled body for both fan-outs (see `ranked_suffix_hetero_enabled`).
+        let job: &(dyn Fn(usize) + Sync) = &|job: usize| {
             let local = job / tiles_per_block;
             let r0 = (job % tiles_per_block) * ROWS;
             let abs_b = b_start + local;
@@ -1486,9 +1510,13 @@ impl AdditiveNttF128 {
                 }
             }
         };
-        (0..(b_end - b_start) * tiles_per_block)
-            .into_par_iter()
-            .for_each(job);
+        if ranked_suffix_hetero_enabled() {
+            crate::epool::run_hetero_chunks((b_end - b_start) * tiles_per_block, job);
+        } else {
+            (0..(b_end - b_start) * tiles_per_block)
+                .into_par_iter()
+                .for_each(job);
+        }
         true
     }
 
@@ -1596,6 +1624,39 @@ impl AdditiveNttF128 {
         }
         let sb_end = b_start << 4;
         let sb_start = sb_end - fine_m;
+        if fine_deep_first_enabled() {
+            // The full blocks' layer-10 sub-NTTs need nothing from the GPU:
+            // finish them before waiting for the boundary sixteenth's
+            // layers 4..8, then run the boundary sub-blocks' layers 8..10
+            // and their own deep pairs. Every sub-NTT runs the same pairs
+            // on the same data with its absolute index, so the codeword is
+            // bit-identical; only the order of disjoint sub-NTTs changes.
+            self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                data,
+                num_ntts,
+                DEEP_LAYER,
+                log_d,
+                b_start << (DEEP_LAYER - 4),
+                16 << (DEEP_LAYER - 4),
+                odd_tail,
+                &finish_chunk,
+            );
+            wait_boundary()?;
+            self.forward_transform_interleaved_block_range(
+                data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
+            );
+            self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                data,
+                num_ntts,
+                DEEP_LAYER,
+                log_d,
+                sb_start << (DEEP_LAYER - 8),
+                b_start << (DEEP_LAYER - 4),
+                odd_tail,
+                &finish_chunk,
+            );
+            return Ok(());
+        }
         wait_boundary()?;
         self.forward_transform_interleaved_block_range(
             data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
@@ -2394,10 +2455,8 @@ impl AdditiveNttF128 {
         let range_end = sub_end * sub_elems;
         let group_layer = deep_l1_group_layer(log_d, num_ntts, n_top);
 
-        data[range_start..range_end]
-            .par_chunks_mut(sub_elems)
-            .enumerate()
-            .for_each(|(local_sub_idx, sub_data)| {
+        // One compiled body for both fan-outs (see `ranked_suffix_hetero_enabled`).
+        let sub_job: &(dyn Fn(usize, &mut [F128]) + Sync) = &|local_sub_idx: usize, sub_data: &mut [F128]| {
                 let sub_idx = sub_start + local_sub_idx;
                 // One fused pair (`layer`, `layer + 1`) over this sub's blocks
                 // `block_lo..block_hi` of that layer (a power-of-two count
@@ -2519,7 +2578,23 @@ impl AdditiveNttF128 {
                     }
                 }
                 finish_chunk(sub_idx * sub_elems, sub_data);
-            });
+            };
+        if ranked_suffix_hetero_enabled() {
+            let base = crate::epool::SyncPtr(data[range_start..range_end].as_mut_ptr());
+            let claim: &(dyn Fn(usize) + Sync) = &|i| {
+                // SAFETY: queue index `i` owns sub-NTT `i` of the range, a
+                // disjoint `sub_elems` run inside `data[range_start..range_end]`.
+                let sub_data =
+                    unsafe { core::slice::from_raw_parts_mut(base.ptr().add(i * sub_elems), sub_elems) };
+                sub_job(i, sub_data);
+            };
+            crate::epool::run_hetero_chunks(sub_end - sub_start, claim);
+        } else {
+            data[range_start..range_end]
+                .par_chunks_mut(sub_elems)
+                .enumerate()
+                .for_each(|(local_sub_idx, sub_data)| sub_job(local_sub_idx, sub_data));
+        }
     }
 
     /// Low-twiddle final pair (`layer`, `layer + 1`; `quarter == 1`) of one
@@ -3498,8 +3573,10 @@ mod tests {
     }
 
     /// Exhaust the exact production tables used by layers 18 and 19. This is
-    /// the invariant that makes the ranked narrow dispatch sound.
+    /// the invariant that makes the ranked narrow dispatch sound. The
+    /// dispatch is macOS-gated, so the assertion runs only on Apple hosts.
     #[test]
+    #[cfg(target_os = "macos")]
     fn standard_dim20_final_pair_twiddles_have_zero_high_limbs() {
         let ntt = AdditiveNttF128::standard(20);
         for layer in 18..20 {

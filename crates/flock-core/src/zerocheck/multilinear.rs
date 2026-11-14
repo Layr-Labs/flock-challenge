@@ -3438,6 +3438,10 @@ pub(crate) fn fold_cascade_t_into_packed(
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
     let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
+    // The group weights `eq_lo[4y + 3]` as prepared pairs, one table per
+    // pass shared by every chunk.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let eq_prep = kernels::aarch64::round2_eq_prep(eq_lo);
 
     // Chunk `x_hi`'s input entries: `chunk_in` logical inputs, 244 entries
     // per 256 of them when packed.
@@ -3459,17 +3463,18 @@ pub(crate) fn fold_cascade_t_into_packed(
             if packed {
                 use kernels::aarch64::fold_tri_and_message_packed_aarch64 as kp;
                 return if nt_stores {
-                    kp::<true>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo)
+                    kp::<true>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo, &eq_prep)
                 } else {
-                    kp::<false>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo)
+                    kp::<false>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo, &eq_prep)
                 };
             }
             use kernels::aarch64::fold_tri_and_message_aarch64 as k;
+            let ep = &eq_prep;
             match (depth, nt_stores) {
-                (2, true) => k::<2, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
-                (2, false) => k::<2, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
-                (_, true) => k::<3, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
-                (_, false) => k::<3, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                (2, true) => k::<2, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo, ep),
+                (2, false) => k::<2, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo, ep),
+                (_, true) => k::<3, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo, ep),
+                (_, false) => k::<3, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo, ep),
             }
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
@@ -6383,6 +6388,7 @@ mod tests {
         let nck = a.len() / (8 * eq_lo.len());
         let ci = 8 * eq_lo.len();
         let co = 2 * eq_lo.len();
+        let ep = kernels::aarch64::round2_eq_prep(&eq_lo);
         for c in 0..nck {
             let (ai, bi) = (&a[c * ci..(c + 1) * ci], &b[c * ci..(c + 1) * ci]);
             let mut a1 = vec![LA_POISON; co];
@@ -6393,7 +6399,7 @@ mod tests {
             let mut a2 = vec![LA_POISON; co];
             let mut b2 = vec![LA_POISON; co];
             let tri = kernels::aarch64::fold_tri_and_message_aarch64::<2, true, 0>(
-                ai, bi, &mut a2, &mut b2, rho3, rho4, F128::ZERO, &eq_lo,
+                ai, bi, &mut a2, &mut b2, rho3, rho4, F128::ZERO, &eq_lo, &ep,
             );
             let mut a3 = vec![LA_POISON; co];
             let mut b3 = vec![LA_POISON; co];
@@ -6437,10 +6443,15 @@ mod tests {
         }
 
         fn qos() {
+            // QoS classes are a macOS pthread extension; a no-op elsewhere.
+            #[cfg(target_os = "macos")]
             unsafe extern "C" {
                 fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
             }
-            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+            #[cfg(target_os = "macos")]
+            unsafe {
+                pthread_set_qos_class_self_np(0x21, 0);
+            }
         }
 
         fn lq(v: &mut [f64]) -> (f64, f64) {
@@ -6503,6 +6514,7 @@ mod tests {
             let ao_p = ao.as_mut_ptr();
             let bo_p = bo.as_mut_ptr();
             let eq8 = &eq56[..lo / 2];
+            let (ep56, ep8) = (round2_eq_prep(&eq56), round2_eq_prep(eq8));
             macro_rules! outs {
                 ($n:expr) => {
                     unsafe {
@@ -6550,7 +6562,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 0>(
-                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56, &ep56,
                         ));
                     }),
                     cif,
@@ -6560,7 +6572,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 1>(
-                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56, &ep56,
                         ));
                     }),
                     cif,
@@ -6570,7 +6582,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 2>(
-                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56, &ep56,
                         ));
                     }),
                     cif,
@@ -6580,7 +6592,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 3>(
-                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56, &ep56,
                         ));
                     }),
                     cif,
@@ -6590,7 +6602,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co / 2);
                         std::hint::black_box(fold_tri_and_message_aarch64::<3, false, 0>(
-                            a_c, b_c, x, y, rho3, rho4, rho5, eq8,
+                            a_c, b_c, x, y, rho3, rho4, rho5, eq8, &ep8,
                         ));
                     }),
                     cif,
@@ -6600,7 +6612,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co / 2);
                         std::hint::black_box(fold_tri_and_message_aarch64::<3, true, 0>(
-                            a_c, b_c, x, y, rho3, rho4, rho5, eq8,
+                            a_c, b_c, x, y, rho3, rho4, rho5, eq8, &ep8,
                         ));
                     }),
                     cif,
@@ -6610,7 +6622,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co / 2);
                         std::hint::black_box(fold_tri_and_message_aarch64::<3, false, 1>(
-                            a_c, b_c, x, y, rho3, rho4, rho5, eq8,
+                            a_c, b_c, x, y, rho3, rho4, rho5, eq8, &ep8,
                         ));
                     }),
                     cif,
@@ -6660,7 +6672,7 @@ mod tests {
                     Box::new(|c| {
                         let (x, y, p, q) = sl!(c, 4);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 0>(
-                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56,
+                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56, &ep56,
                         ));
                     }),
                     cif,
@@ -6670,7 +6682,7 @@ mod tests {
                     Box::new(|c| {
                         let (x, y, p, q) = sl!(c, 4);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 1>(
-                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56,
+                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56, &ep56,
                         ));
                     }),
                     cif,
@@ -6680,7 +6692,7 @@ mod tests {
                     Box::new(|c| {
                         let (x, y, p, q) = sl!(c, 8);
                         std::hint::black_box(fold_tri_and_message_aarch64::<3, true, 0>(
-                            x, y, p, q, rho3, rho4, rho5, eq8,
+                            x, y, p, q, rho3, rho4, rho5, eq8, &ep8,
                         ));
                     }),
                     cif,
