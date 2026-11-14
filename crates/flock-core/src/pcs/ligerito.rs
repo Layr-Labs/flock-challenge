@@ -3041,6 +3041,11 @@ fn transpose_forward_ntt_fused_3layer(
 ) {
     use rayon::prelude::*;
 
+    // Read once per group, not per product; an in-process diagnostic can ablate
+    // this fold without changing the transpose schedule or prepared twiddles.
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    let pmull_fold = std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none();
+
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
     type Twiddle = crate::field::gf2_128::aarch64::ConstPrep;
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
@@ -3061,21 +3066,23 @@ fn transpose_forward_ntt_fused_3layer(
         a: [usize; 2],
         b: [usize; 2],
         tw: [Twiddle; 2],
+        pmull_fold: bool,
     ) {
         use core::arch::aarch64::uint64x2_t;
-        use crate::field::gf2_128::aarch64::mul_const_pair_prep;
+        use crate::field::gf2_128::aarch64::{mul_const_pair_prep, mul_const_pair_prep_pmull};
 
         let bottom = [values[b[0]], values[b[1]]];
         let sums = [values[a[0]] + bottom[0], values[a[1]] + bottom[1]];
         // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
         // layout maps lo/hi to vector lanes 0/1 without padding.
         let products = unsafe {
-            let products = mul_const_pair_prep(
-                tw[0],
-                core::mem::transmute::<F128, uint64x2_t>(sums[0]),
-                tw[1],
-                core::mem::transmute::<F128, uint64x2_t>(sums[1]),
-            );
+            let x0 = core::mem::transmute::<F128, uint64x2_t>(sums[0]);
+            let x1 = core::mem::transmute::<F128, uint64x2_t>(sums[1]);
+            let products = if pmull_fold {
+                mul_const_pair_prep_pmull(tw[0], x0, tw[1], x1)
+            } else {
+                mul_const_pair_prep(tw[0], x0, tw[1], x1)
+            };
             products.map(|p| core::mem::transmute::<uint64x2_t, F128>(p))
         };
         values[a[0]] = sums[0];
@@ -3144,6 +3151,7 @@ fn transpose_forward_ntt_fused_3layer(
                         [4 * half, 4 * half + 2],
                         [4 * half + 1, 4 * half + 3],
                         [tw[3 + 2 * half], tw[4 + 2 * half]],
+                        pmull_fold,
                     );
                 }
                 for half in 0..2 {
@@ -3152,6 +3160,7 @@ fn transpose_forward_ntt_fused_3layer(
                         [4 * half, 4 * half + 1],
                         [4 * half + 2, 4 * half + 3],
                         [tw[1 + half]; 2],
+                        pmull_fold,
                     );
                 }
                 for pair in 0..2 {
@@ -3160,6 +3169,7 @@ fn transpose_forward_ntt_fused_3layer(
                         [2 * pair, 2 * pair + 1],
                         [2 * pair + 4, 2 * pair + 5],
                         [tw[0]; 2],
+                        pmull_fold,
                     );
                 }
             }
