@@ -232,6 +232,15 @@ fn use_ranked_deep_pair_fusion(
 /// (default 64) is the group size bound. At 64 lanes that is `2^6` positions
 /// (64 KiB, the last three pairs); at 8 lanes `2^8` positions (32 KiB, the
 /// last four pairs).
+/// Fine hybrid split order (`FLOCK_NO_FINE_DEEP_FIRST`, any value, kills):
+/// the CPU suffix runs the deep pairs of its full layer-4 blocks before it
+/// waits for the GPU's boundary layers 4..8. Read once per process; the
+/// codeword is the same either way.
+fn fine_deep_first_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FINE_DEEP_FIRST").is_none())
+}
+
 fn deep_l1_group_layer(log_d: usize, num_ntts: usize, first_pair_layer: usize) -> usize {
     static BUDGET_BYTES: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         if std::env::var("FLOCK_NO_MF_DEEP_L1_GROUPS").is_ok_and(|v| v == "1") {
@@ -1596,6 +1605,39 @@ impl AdditiveNttF128 {
         }
         let sb_end = b_start << 4;
         let sb_start = sb_end - fine_m;
+        if fine_deep_first_enabled() {
+            // The full blocks' layer-10 sub-NTTs need nothing from the GPU:
+            // finish them before waiting for the boundary sixteenth's
+            // layers 4..8, then run the boundary sub-blocks' layers 8..10
+            // and their own deep pairs. Every sub-NTT runs the same pairs
+            // on the same data with its absolute index, so the codeword is
+            // bit-identical; only the order of disjoint sub-NTTs changes.
+            self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                data,
+                num_ntts,
+                DEEP_LAYER,
+                log_d,
+                b_start << (DEEP_LAYER - 4),
+                16 << (DEEP_LAYER - 4),
+                odd_tail,
+                &finish_chunk,
+            );
+            wait_boundary()?;
+            self.forward_transform_interleaved_block_range(
+                data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
+            );
+            self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                data,
+                num_ntts,
+                DEEP_LAYER,
+                log_d,
+                sb_start << (DEEP_LAYER - 8),
+                b_start << (DEEP_LAYER - 4),
+                odd_tail,
+                &finish_chunk,
+            );
+            return Ok(());
+        }
         wait_boundary()?;
         self.forward_transform_interleaved_block_range(
             data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
