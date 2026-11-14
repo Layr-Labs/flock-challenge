@@ -1728,27 +1728,6 @@ pub fn inner_product(a: &[F128], b: &[F128]) -> F128 {
     acc
 }
 
-/// For R=[E,O], u0=J((1+r)E) and u2=J(E+O), where
-/// J(V)=<transpose(V),q>. J is only F2-linear: scale before transpose.
-fn round0_from_two_bank_statistic(values: &[F128], r: F128, q: &[F128]) -> (F128, F128) {
-    assert_eq!(values.len(), 256);
-    assert_eq!(q.len(), 128);
-    let (even, odd) = values.split_at(128);
-    let mut endpoint = [F128::ZERO; 128];
-    let mut transposed = [F128::ZERO; 128];
-    let scale = F128::ONE + r;
-    for i in 0..128 {
-        endpoint[i] = scale * even[i];
-    }
-    tensor_algebra_transpose_into(&endpoint, &mut transposed);
-    let u0 = inner_product(&transposed, q);
-    for i in 0..128 {
-        endpoint[i] = even[i] + odd[i];
-    }
-    tensor_algebra_transpose_into(&endpoint, &mut transposed);
-    (u0, inner_product(&transposed, q))
-}
-
 /// **TensorAlgebra transpose** (a.k.a. "bit transpose" of `s_hat_v`).
 ///
 /// View `s_hat_v` (length 128) as a 128×128 binary matrix with row `i_skip` =
@@ -3029,27 +3008,6 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
     challenger: &mut Ch,
     basis_elidable: bool,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
-    prove_batched_padded_with_fold8_round0(
-        packed_witness, x_outers, precomputed_s_hat_v, canonical_fold8,
-        &mut [], padding, challenger, basis_elidable,
-    )
-}
-
-/// Optional two-bank hints use original claim order. Each hint must be the
-/// same Fold8 tensor collapsed at suffix[1..6], retaining suffix[0]'s bank
-/// bit. Only a dense Fold8 claim with a 256-value hint uses it. Canonical
-/// proof owners and the complete factor states keep their existing paths.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_batched_padded_with_fold8_round0<Ch: Challenger>(
-    packed_witness: &[F128],
-    x_outers: &[&[F128]],
-    precomputed_s_hat_v: &[Option<&[F128]>],
-    canonical_fold8: &mut [Option<Vec<F128>>],
-    round0_fold8: &mut [Option<Vec<F128>>],
-    padding: &PaddingSpec,
-    challenger: &mut Ch,
-    basis_elidable: bool,
-) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
     let trace =
         std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
@@ -3313,7 +3271,6 @@ pub(crate) fn prove_batched_padded_with_fold8_round0<Ch: Challenger>(
         s_hat_v_quad: Option<&'a [F128]>,
         s_hat_v_fold4: Option<&'a [F128]>,
         s_hat_v_fold8: Option<&'a [F128]>,
-        round0_fold8: Option<Vec<F128>>,
         sumcheck_claim: F128,
         eq_r_dprime: Vec<F128>,
     }
@@ -3352,7 +3309,6 @@ pub(crate) fn prove_batched_padded_with_fold8_round0<Ch: Challenger>(
             s_hat_v_quad,
             s_hat_v_fold4,
             s_hat_v_fold8,
-            round0_fold8: if round0_fold8.len() == n { round0_fold8[i].take() } else { None },
             sumcheck_claim,
             eq_r_dprime,
         });
@@ -3584,12 +3540,7 @@ pub(crate) fn prove_batched_padded_with_fold8_round0<Ch: Challenger>(
                                 }
                             }
                         }
-                        let round0 = match w.round0_fold8.take().filter(|values| values.len() == 256) {
-                            Some(values) => round0_from_two_bank_statistic(
-                                &values, suffix[0], &scaled_eq_r_dprime,
-                            ),
-                            None => super::round0_deferred(&a_state, &w_state),
-                        };
+                        let round0 = super::round0_deferred(&a_state, &w_state);
                         let tail = &suffix[6..];
                         let (eq_lo, eq_hi) = build_eq_split(tail, deferred_split_n_lo(tail.len()));
                         Some(DirectFold8Factors {
@@ -3929,179 +3880,10 @@ pub fn eval_rs_eq_finish_from_prefix_binary_q(
 }
 
 #[cfg(test)]
-pub(crate) mod round0_ab_oracle {
-    use crate::field::F128;
-    use crate::lincheck::canonical_ab_oracle::{eq, mul};
-
-    pub fn basis(bit: usize) -> F128 {
-        if bit < 64 { F128::new(1 << bit, 0) } else { F128::new(0, 1 << (bit - 64)) }
-    }
-
-    pub fn phi(value: F128, q: &[F128]) -> F128 {
-        let bits = u128::from(value.lo) | (u128::from(value.hi) << 64);
-        (0..128).filter(|&bit| bits >> bit & 1 == 1)
-            .fold(F128::ZERO, |sum, bit| sum + q[bit])
-    }
-
-    // Direct contraction of arbitrary field banks, not the production bind.
-    pub fn two_banks(wide: &[F128], low: &[F128]) -> Vec<F128> {
-        assert_eq!(wide.len(), 8192);
-        assert_eq!(low.len(), 6);
-        let mut out = vec![F128::ZERO; 256];
-        for j in 0..32 {
-            let weight = eq(&low[1..], j);
-            for parity in 0..2 {
-                for p in 0..128 {
-                    out[parity * 128 + p] += mul(weight, wide[(2 * j + parity) * 128 + p]);
-                }
-            }
-        }
-        out
-    }
-
-    // Build every old A/W slot from bit tests and the software multiplier.
-    // No production transpose, equality, Phi table, factor build or scan.
-    pub fn old_factor_pair(wide: &[F128], low: &[F128], q: &[F128]) -> (F128, F128) {
-        assert_eq!(wide.len(), 8192);
-        assert_eq!(low.len(), 6);
-        assert_eq!(q.len(), 128);
-        let mut a = vec![F128::ZERO; 8192];
-        let mut w = vec![F128::ZERO; 8192];
-        for bank in 0..64 {
-            let weight = eq(low, bank);
-            for bit in 0..128 {
-                let mut column = 0u128;
-                for p in 0..128 {
-                    let value = wide[128 * bank + p];
-                    let bits = u128::from(value.lo) | (u128::from(value.hi) << 64);
-                    column |= ((bits >> bit) & 1) << p;
-                }
-                a[bit * 64 + bank] = F128::new(column as u64, (column >> 64) as u64);
-                w[bit * 64 + bank] = phi(mul(weight, basis(bit)), q);
-            }
-        }
-        let (mut u0, mut u2) = (F128::ZERO, F128::ZERO);
-        for bit in 0..128 {
-            for j in 0..32 {
-                let i = bit * 64 + 2 * j;
-                u0 += mul(a[i], w[i]);
-                u2 += mul(a[i] + a[i + 1], w[i] + w[i + 1]);
-            }
-        }
-        (u0, u2)
-    }
-
-    // Independent J definition: sum polynomial-basis[p] * Phi(value[p]).
-    pub fn direct_pair(two: &[F128], r: F128, q: &[F128]) -> (F128, F128) {
-        assert_eq!(two.len(), 256);
-        assert_eq!(q.len(), 128);
-        let (mut u0, mut u2) = (F128::ZERO, F128::ZERO);
-        for p in 0..128 {
-            u0 += mul(basis(p), phi(mul(F128::ONE + r, two[p]), q));
-            u2 += mul(basis(p), phi(two[p] + two[128 + p], q));
-        }
-        (u0, u2)
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::pcs::pack::pack_witness;
     use crate::zerocheck::univariate_skip::build_eq;
-
-    #[test]
-    fn fold8_round0_z6_matches_software_old_factors() {
-        use crate::lincheck::canonical_ab_oracle::{eq, mul};
-        use super::round0_ab_oracle::{direct_pair, old_factor_pair, two_banks};
-        let mut rng = Rng::new(0x5a36_4f4c_4446_4143);
-        for case in 0..10 {
-            let mut wide: Vec<_> = (0..8192).map(|_| rng.f128()).collect();
-            let mut low: Vec<_> = (0..6).map(|_| rng.f128()).collect();
-            let mut q: Vec<_> = (0..128).map(|_| rng.f128()).collect();
-            match case {
-                1 => for (i, value) in wide.iter_mut().enumerate() {
-                    if i % 257 != 0 { *value = F128::ZERO; }
-                },
-                2 => wide.fill(F128::ZERO),
-                3 => wide.fill(F128::ONE),
-                4 => low.fill(F128::ZERO),
-                5 => low.fill(F128::ONE),
-                6..=8 => {
-                    let r_dprime: Vec<_> = (0..7).map(|_| rng.f128()).collect();
-                    let gamma = match case { 6 => F128::ZERO, 7 => F128::ONE, _ => rng.f128() };
-                    q = (0..128).map(|i| mul(gamma, eq(&r_dprime, i))).collect();
-                }
-                9 => {
-                    // Weighted cancellation in two even banks, including
-                    // arbitrary non-Boolean field values and reductions.
-                    wide.fill(F128::ZERO);
-                    let h0 = eq(&low[1..], 0);
-                    let h1 = eq(&low[1..], 1);
-                    for p in 0..128 {
-                        let value = rng.f128();
-                        wide[p] = mul(h1, value);
-                        wide[256 + p] = mul(h0, value);
-                    }
-                }
-                _ => {}
-            }
-            let two = two_banks(&wide, &low);
-            let old = old_factor_pair(&wide, &low, &q);
-            let direct = direct_pair(&two, low[0], &q);
-            assert_eq!(old, direct, "independent forms, case={case}");
-            assert_eq!(round0_from_two_bank_statistic(&two, low[0], &q), old, "case={case}");
-            if matches!(case, 2 | 6 | 9) { assert_eq!(old, (F128::ZERO, F128::ZERO)); }
-        }
-    }
-
-    #[test]
-    fn fold8_round0_z6_fixed_vectors_and_limb_boundaries() {
-        use super::round0_ab_oracle::{basis, direct_pair, old_factor_pair, two_banks};
-        let mut wide = vec![F128::ZERO; 8192];
-        let mut low = [F128::ZERO; 6];
-        let mut q = [F128::ZERO; 128];
-        wide[0] = F128::ONE;
-        low[0] = F128::new(3, 0);
-        q[1] = F128::ONE;
-        let two = two_banks(&wide, &low);
-        assert_eq!(old_factor_pair(&wide, &low, &q), (F128::ONE, F128::ZERO));
-        assert_eq!(round0_from_two_bank_statistic(&two, low[0], &q), (F128::ONE, F128::ZERO));
-        assert_eq!(super::round0_ab_oracle::phi(two[0], &q), F128::ZERO,
-            "moving the scale outside J would give the wrong zero");
-
-        // All source-bank address boundaries and both field/prefix limbs.
-        // A Boolean five-coordinate point selects exactly the supplied j.
-        for (case, (j, p, bit)) in [(0, 0, 0), (1, 63, 63), (15, 64, 64),
-            (16, 127, 127), (31, 0, 127)].into_iter().enumerate()
-        {
-            for parity in 0..2 {
-                wide.fill(F128::ZERO);
-                low.fill(F128::ZERO);
-                q.fill(F128::ZERO);
-                for b in 0..5 { if j >> b & 1 == 1 { low[1 + b] = F128::ONE; } }
-                wide[(2 * j + parity) * 128 + p] = basis(bit);
-                q[bit] = F128::ONE;
-                let two = two_banks(&wide, &low);
-                let want = (if parity == 0 { basis(p) } else { F128::ZERO }, basis(p));
-                assert_eq!(old_factor_pair(&wide, &low, &q), want, "old case={case} parity={parity}");
-                assert_eq!(direct_pair(&two, low[0], &q), want);
-                assert_eq!(round0_from_two_bank_statistic(&two, low[0], &q), want);
-            }
-        }
-
-        // S is zero for both inputs, but the two-bank message differs.
-        q.fill(F128::ZERO);
-        q[0] = F128::ONE;
-        let r = F128::new(3, 0);
-        let mut two = vec![F128::ZERO; 256];
-        two[0] = r;
-        two[128] = F128::ONE + r;
-        assert_eq!(two[0] + crate::lincheck::canonical_ab_oracle::mul(r, two[0] + two[128]), F128::ZERO);
-        assert_eq!(round0_from_two_bank_statistic(&two, r, &q).1, F128::ONE);
-        two.fill(F128::ZERO);
-        assert_eq!(round0_from_two_bank_statistic(&two, r, &q), (F128::ZERO, F128::ZERO));
-    }
 
     /// Binary-query specialization matches the general path bit-for-bit.
     #[test]
@@ -5013,184 +4795,6 @@ mod tests {
                 _ => panic!("canonical hint changed direct Fold8 admission"),
             }
         }
-    }
-
-    #[test]
-    #[ignore = "uses process-global ring gates and stash; run alone"]
-    fn fold8_round0_hints_preserve_order_state_and_c_stash() {
-        use crate::challenger::FsChallenger;
-        use crate::lincheck::canonical_ab_oracle::packed_statistic;
-        const M: usize = 17;
-        let mut rng = Rng::new(0x5a36_4f52_4445_5243);
-        let packed: Vec<_> = (0..1usize << (M - LOG_PACKING)).map(|_| rng.f128()).collect();
-        let mut points: Vec<Vec<F128>> = (0..4)
-            .map(|_| (0..M - 6).map(|_| rng.f128()).collect()).collect();
-        for i in [1, 3] { points[i][1..4].fill(F128::ZERO); }
-        let wide: Vec<_> = points.iter().map(|p| packed_statistic(&packed, &p[1..], 6)).collect();
-        let canonical: Vec<_> = points.iter().map(|p| packed_statistic(&packed, &p[1..], 0)).collect();
-        let two: Vec<_> = points.iter().map(|p| packed_statistic(&packed, &p[1..], 1)).collect();
-        let padding = PaddingSpec::dense(M);
-        clear_collapsed_s_hat_v_fold8();
-
-        // Interleaved sparse claims make local dense indices differ from
-        // original claim indices. Every hint has its own matching values.
-        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 0, 3, 2]] {
-            let refs: Vec<_> = order.iter().map(|&i| points[i].as_slice()).collect();
-            let pre: Vec<_> = order.iter().map(|&i| Some(wide[i].as_slice())).collect();
-            let mut old_ch = FsChallenger::new(b"z6-claim-order");
-            let (old, old_g) = prove_batched_padded_with_owned_canonical_fold8(
-                &packed, &refs, &pre, &mut [], &padding, &mut old_ch, false,
-            );
-            let mut s: Vec<_> = order.iter().map(|&i| Some(canonical[i].clone())).collect();
-            let mut r: Vec<_> = order.iter().map(|&i| Some(two[i].clone())).collect();
-            let s_ptrs: Vec<_> = s.iter().map(|v| v.as_ref().unwrap().as_ptr()).collect();
-            for (slot, &i) in order.iter().enumerate() {
-                assert_ne!(r[slot].as_ref().unwrap().as_ptr(), s_ptrs[slot]);
-                assert_ne!(r[slot].as_ref().unwrap().as_ptr(), wide[i].as_ptr());
-            }
-            let mut ch = FsChallenger::new(b"z6-claim-order");
-            let (got, g) = prove_batched_padded_with_fold8_round0(
-                &packed, &refs, &pre, &mut s, &mut r, &padding, &mut ch, false,
-            );
-            assert_eq!(g, old_g);
-            assert_eq!(ch.sample_f128(), old_ch.sample_f128());
-            assert_owned_canonical_intake_equal(&got, &old, true);
-            assert!(s.iter().all(Option::is_none) && r.iter().all(Option::is_none));
-            for (slot, &i) in order.iter().enumerate() {
-                assert_eq!(got[slot].0.s_hat_v.as_ptr(), s_ptrs[slot]);
-                assert_eq!(got[slot].1.direct_fold8.is_some(), i % 2 == 0);
-            }
-        }
-
-        // Model the normal [AB,C] owners. Only AB receives R. Canonical
-        // AB S and the current C stash are independent of R.
-        let refs = [points[0].as_slice(), points[2].as_slice()];
-        let pre = [Some(wide[0].as_slice()), Some(wide[2].as_slice())];
-        for basis_elidable in [false, true] {
-            let mut old_ch = FsChallenger::new(b"z6-c-stash");
-            let (old, old_g) = prove_batched_padded_with_owned_canonical_fold8(
-                &packed, &refs, &pre, &mut [], &padding, &mut old_ch, basis_elidable,
-            );
-            let next = old_ch.sample_f128();
-            let elided = basis_elidable && crate::pcs::ranked_direct_fold8_enabled()
-                && rs_elide_dead_basis_enabled();
-            for mask in 0..4 {
-                for use_r in [false, true] {
-                    let mut s = [
-                        (mask & 1 != 0).then(|| canonical[0].clone()),
-                        None,
-                    ];
-                    let ab_ptr = s[0].as_ref().map(|v| v.as_ptr());
-                    clear_collapsed_s_hat_v_fold8();
-                    let c_ptr = if mask & 2 != 0 {
-                        stash_collapsed_s_hat_v_fold8(&wide[2], &canonical[2]);
-                        Some(COLLAPSED_FOLD8_STASH.lock().unwrap().as_ref().unwrap().canonical.as_ptr())
-                    } else { None };
-                    let mut r = [use_r.then(|| two[0].clone()), None];
-                    let mut ch = FsChallenger::new(b"z6-c-stash");
-                    let (got, g) = prove_batched_padded_with_fold8_round0(
-                        &packed, &refs, &pre, &mut s, &mut r, &padding, &mut ch, basis_elidable,
-                    );
-                    clear_collapsed_s_hat_v_fold8();
-                    assert_eq!(g, old_g);
-                    assert_eq!(ch.sample_f128(), next);
-                    assert_owned_canonical_intake_equal(&got, &old, !elided);
-                    if let Some(ptr) = ab_ptr { assert_eq!(got[0].0.s_hat_v.as_ptr(), ptr); }
-                    if let Some(ptr) = c_ptr { assert_eq!(got[1].0.s_hat_v.as_ptr(), ptr); }
-                    assert_eq!(got[1].0.s_hat_v, canonical[2]);
-                    assert!(s.iter().all(Option::is_none));
-                    assert!(r.iter().all(Option::is_none));
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "uses process-global ring gates and stash; run alone"]
-    fn fold8_round0_hint_fallbacks_and_selected_branch() {
-        use crate::challenger::FsChallenger;
-        use crate::lincheck::canonical_ab_oracle::packed_statistic;
-        const M: usize = 17;
-        let mut rng = Rng::new(0x5a36_4641_4c4c_424b);
-        let packed: Vec<_> = (0..1usize << (M - LOG_PACKING)).map(|_| rng.f128()).collect();
-        let point: Vec<_> = (0..M - 6).map(|_| rng.f128()).collect();
-        let views: Vec<_> = [6, 4, 2, 0].into_iter()
-            .map(|retain| packed_statistic(&packed, &point[1..], retain)).collect();
-        let two = packed_statistic(&packed, &point[1..], 1);
-        let padding = PaddingSpec::dense(M);
-        for case in 0..8 {
-            let view = match case { 4..=6 => Some(views[case - 3].as_slice()), 7 => None, _ => Some(views[0].as_slice()) };
-            let mut hints = match case {
-                0 => vec![None],
-                1 => vec![Some(two.clone()), Some(two.clone())],
-                2 => vec![Some(vec![F128::ONE; 255])],
-                3 => vec![Some(vec![F128::ONE; 257])],
-                _ => vec![Some(vec![F128::ONE; 256])],
-            };
-            let mut old_ch = FsChallenger::new(b"z6-fallback");
-            let (old, old_g) = prove_batched_padded_with_owned_canonical_fold8(
-                &packed, &[&point], &[view], &mut [], &padding, &mut old_ch, false,
-            );
-            let mut ch = FsChallenger::new(b"z6-fallback");
-            let (got, g) = prove_batched_padded_with_fold8_round0(
-                &packed, &[&point], &[view], &mut [], &mut hints, &padding, &mut ch, false,
-            );
-            assert_eq!(g, old_g);
-            assert_eq!(ch.sample_f128(), old_ch.sample_f128());
-            assert_owned_canonical_intake_equal(&got, &old, true);
-            if case == 1 { assert!(hints.iter().all(Option::is_some)); }
-        }
-
-        // Valid small ordinary inputs cover non-split and short suffix
-        // routes. A Fold8 view itself would violate their existing contract.
-        for m in [7, 10, 11] {
-            let packed = vec![F128::new(3, 1); 1 << (m - LOG_PACKING)];
-            let point = vec![F128::new(2, 1); m - 6];
-            let padding = PaddingSpec::dense(m);
-            let mut old_ch = FsChallenger::new(b"z6-short-fallback");
-            let (old, old_g) = prove_batched_padded_with_owned_canonical_fold8(
-                &packed, &[&point], &[], &mut [], &padding, &mut old_ch, false,
-            );
-            let mut ch = FsChallenger::new(b"z6-short-fallback");
-            let (got, g) = prove_batched_padded_with_fold8_round0(
-                &packed, &[&point], &[], &mut [], &mut [Some(two.clone())], &padding, &mut ch, false,
-            );
-            assert_eq!(g, old_g);
-            assert_eq!(ch.sample_f128(), old_ch.sample_f128());
-            assert_owned_canonical_intake_equal(&got, &old, true);
-        }
-
-        // Explicit intake probe, NOT a valid proof: a wrong R must affect
-        // only the cached message. Script q[0]=1 and gamma=1, so the delta
-        // in u2 is exactly one. This proves the new branch is reached.
-        struct Q0(usize);
-        impl Challenger for Q0 {
-            fn observe_f128(&mut self, _: F128) {}
-            fn sample_f128(&mut self) -> F128 {
-                let index = self.0;
-                self.0 += 1;
-                if index == 7 { F128::ONE } else { F128::ZERO }
-            }
-        }
-        let packed = vec![F128::ZERO; 1 << (M - LOG_PACKING)];
-        let point = vec![F128::new(2, 1); M - 6];
-        let wide = vec![F128::ZERO; 8192];
-        let (old, old_g) = prove_batched_padded_with_owned_canonical_fold8(
-            &packed, &[&point], &[Some(&wide)], &mut [], &padding, &mut Q0(0), false,
-        );
-        let mut wrong = vec![F128::ZERO; 256];
-        wrong[0] = F128::ONE;
-        let (got, g) = prove_batched_padded_with_fold8_round0(
-            &packed, &[&point], &[Some(&wide)], &mut [], &mut [Some(wrong)], &padding, &mut Q0(0), false,
-        );
-        assert_eq!(g, old_g);
-        assert_eq!(got[0].0, old[0].0);
-        let (a, b) = (got[0].1.direct_fold8.as_ref().unwrap(), old[0].1.direct_fold8.as_ref().unwrap());
-        assert_eq!(a.a_state, b.a_state);
-        assert_eq!(a.w_state, b.w_state);
-        assert_eq!(a.eq_lo, b.eq_lo);
-        assert_eq!(a.eq_hi, b.eq_hi);
-        assert_eq!(a.round0.1, b.round0.1 + F128::ONE);
     }
 
     #[test]

@@ -2548,7 +2548,7 @@ pub(crate) fn fold2_compact_and_round45_into(
     a_out: &mut [F128],
     b_out: &mut [F128],
 ) -> (F128, F128, Round3Lookahead) {
-    let (m1, minf, la, _) =
+    let (m1, minf, la, _, _) =
         fold2_compact_and_round45_into_packed(compact, table, rho1, rho2, r_next4, a_out, b_out, false);
     (m1, minf, la)
 }
@@ -2564,13 +2564,29 @@ pub(crate) fn zc_k_dead_pack_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_DEAD_PACK").is_none())
 }
 
+/// Kill switch for the b-one-packed K b output (`FLOCK_NO_ZC_K_BONE_PACK`,
+/// any value): with the dead-tail pack, the K pass writes b outputs 0..3 and
+/// 59 of every 64 (one at the ranked shape: const-one wires of BLAKE3's
+/// linear constraints) and the tri pass reads them back. Packed, the K pass
+/// writes 56 b entries per 64 outputs (`kernels::aarch64::B_PACK_BLOCK`, 14
+/// lines instead of 61/4 + ...: 56 lines per 256 outputs instead of 61) and
+/// the tri pass takes those ones as one registers; it checks every skipped
+/// value and reruns the pass unpacked if one is not one. Same values, same
+/// messages. Read once per process.
+pub(crate) fn zc_k_bone_pack_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_BONE_PACK").is_none())
+}
+
 /// [`fold2_compact_and_round45_into`] that, with `pack` and when the state
 /// and split allow it (one-table fused kernel, dead-tail state, chunks of
 /// whole four-block superblocks), writes the dead-tail-packed layout: the
 /// first `n_groups / 256 * 244` entries of `a_out` / `b_out` (see
 /// `kernels::aarch64::PACK_SUPER`); outputs 61..63 of every 64 are zero and
 /// are not written. Returns whether it packed (otherwise every output is
-/// written as usual).
+/// written as usual) and whether b is in the b-one-packed layout instead
+/// (the first `n_groups / 64 * 56` entries of `b_out`, see
+/// [`zc_k_bone_pack_enabled`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold2_compact_and_round45_into_packed(
     compact: &UniSkipCompactFold,
@@ -2581,7 +2597,34 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
     a_out: &mut [F128],
     b_out: &mut [F128],
     pack: bool,
-) -> (F128, F128, Round3Lookahead, bool) {
+) -> (F128, F128, Round3Lookahead, bool, bool) {
+    let bpack = pack && zc_k_bone_pack_enabled();
+    if bpack {
+        if let Some((m1, minf, la, packed, bpacked)) =
+            fold2_compact_and_round45_into_packed_b(compact, table, rho1, rho2, r_next4, a_out, b_out, pack, true)
+        {
+            return (m1, minf, la, packed, bpacked);
+        }
+    }
+    fold2_compact_and_round45_into_packed_b(compact, table, rho1, rho2, r_next4, a_out, b_out, pack, false)
+        .expect("a K pass without the b-one pack always completes")
+}
+
+/// [`fold2_compact_and_round45_into_packed`] with the b-one pack requested
+/// by `bpack`; `None` when a b output the pack skips is not one (every output
+/// is then rewritten by the caller's unpacked rerun).
+#[allow(clippy::too_many_arguments)]
+fn fold2_compact_and_round45_into_packed_b(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    pack: bool,
+    bpack: bool,
+) -> Option<(F128, F128, Round3Lookahead, bool, bool)> {
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
     assert!(n_groups >= 4 && n_groups.is_power_of_two());
@@ -2660,13 +2703,23 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
     // prepared form, one table shared by every chunk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
+    // b-one pack (packed outputs only): each 64-output block's b takes
+    // `B_PACK_BLOCK` entries; a kernel that meets a skipped b output that is
+    // not one says so, and the whole pass is rerun without it.
+    let bpack = bpack && pack;
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let b_block = kernels::aarch64::B_PACK_BLOCK;
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+    let b_block = 61;
+    let b_failed = std::sync::atomic::AtomicBool::new(false);
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them. Packed: each of a
         // chunk's `out_chunk / 256` superblocks takes 244 entries.
         let (a_ptr, b_ptr) = unsafe {
             let o = if pack { x_hi * out_chunk / 256 * 244 } else { x_hi * out_chunk };
-            (a_base.ptr().add(o), b_base.ptr().add(o))
+            let ob = if bpack { x_hi * out_chunk / 64 * b_block } else { o };
+            (a_base.ptr().add(o), b_base.ptr().add(ob))
         };
         // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
         let pair_base = 2 * x_hi * out_chunk;
@@ -2687,18 +2740,25 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
-                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
-                    )
+                    let ok = fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                    );
+                    if !ok {
+                        b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 #[cfg(target_feature = "sha3")]
-                (true, true) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
-                    t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
-                ),
+                (true, true) if one_table => {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                    );
+                }
                 #[cfg(target_feature = "sha3")]
-                (true, false) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
-                    t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
-                ),
+                (true, false) if one_table => {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                    );
+                }
                 #[cfg(target_feature = "sha3")]
                 (true, true) => fold2_compact_and_round45_chunk_neon_8_fused::<true>(
                     t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
@@ -2731,6 +2791,9 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
     });
+    if b_failed.into_inner() {
+        return None;
+    }
 
     let mut agg = [F128::ZERO; 8];
     for slot in &partials {
@@ -2753,7 +2816,7 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
         c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
     };
 
-    (r_next4[0] * sum1, sum_inf, la5, pack)
+    Some((r_next4[0] * sum1, sum_inf, la5, pack, bpack))
 }
 
 /// Portable reference for one cascade K chunk (non-AArch64 builds). Same
@@ -3390,17 +3453,21 @@ pub(crate) fn fold_cascade_t_into(
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
-    fold_cascade_t_into_packed(a, b, false, a_out, b_out, rhos, r_next)
+    fold_cascade_t_into_packed(a, b, false, false, a_out, b_out, rhos, r_next)
 }
 
 /// [`fold_cascade_t_into`] whose input, with `packed`, is in the
 /// dead-tail-packed layout of [`fold2_compact_and_round45_into_packed`]
 /// (depth two only): `a` / `b` hold 244 entries per 256 logical inputs and
-/// logical inputs 61..63 of every 64 are zero.
+/// logical inputs 61..63 of every 64 are zero. With `bpacked` (and
+/// `packed`), `b` is in the K pass's b-one-packed layout instead: 56 entries
+/// per 64 logical inputs, inputs 0..3 and 59 of every 64 are one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fold_cascade_t_into_packed(
     a: &[F128],
     b: &[F128],
     packed: bool,
+    bpacked: bool,
     a_out: &mut [F128],
     b_out: &mut [F128],
     rhos: &[F128],
@@ -3408,6 +3475,7 @@ pub(crate) fn fold_cascade_t_into_packed(
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
     let depth = rhos.len();
     assert!(depth == 2 || depth == 3);
+    let bpacked = packed && bpacked;
     let n = if packed {
         assert_eq!(depth, 2, "a packed input is the K pass output (depth two)");
         assert!(a.len().is_multiple_of(244));
@@ -3415,7 +3483,11 @@ pub(crate) fn fold_cascade_t_into_packed(
     } else {
         a.len()
     };
-    assert_eq!(b.len(), a.len());
+    if bpacked {
+        assert_eq!(b.len(), n / 64 * 56);
+    } else {
+        assert_eq!(b.len(), a.len());
+    }
     let out_n = n >> depth;
     assert!(n.is_power_of_two() && out_n >= 8);
     assert_eq!(a_out.len(), out_n);
@@ -3447,10 +3519,12 @@ pub(crate) fn fold_cascade_t_into_packed(
     } else {
         chunk_in
     };
+    // The packed tri kernel tells the b layout from the slice length.
+    let per_chunk_b = if bpacked { chunk_in / 64 * 56 } else { per_chunk };
     let inputs = |x_hi: usize| -> (&[F128], &[F128]) {
         (
             &a[x_hi * per_chunk..(x_hi + 1) * per_chunk],
-            &b[x_hi * per_chunk..(x_hi + 1) * per_chunk],
+            &b[x_hi * per_chunk_b..(x_hi + 1) * per_chunk_b],
         )
     };
     let chunk = |a_in: &[F128], b_in: &[F128], a_o: &mut [F128], b_o: &mut [F128]| -> [F128; 26] {
@@ -4532,6 +4606,107 @@ mod tests {
         fn f128_vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
         }
+    }
+
+    /// Timing probe (ignored): the ranked-size cascade K pass and composed
+    /// 5+6 pass with the b-one pack on and off, interleaved in one process
+    /// on a synthetic compact state with the ranked b == 1 pairs. Prints the
+    /// per-mode medians and the paired differences; asserts equal messages.
+    /// `KBONE_LOG_GROUPS` (default 24) and `KBONE_SAMPLES` (default 21).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    #[test]
+    #[ignore = "timing probe"]
+    fn k_bone_pack_timing() {
+        let _ = rayon::ThreadPoolBuilder::new().num_threads(8).build_global();
+        crate::set_calling_thread_prover_qos();
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let log_groups = env("KBONE_LOG_GROUPS", 24);
+        let samples = env("KBONE_SAMPLES", 21);
+        let n_groups = 1usize << log_groups;
+        let n_pairs = 2 * n_groups;
+        let mut rng = Rng::new(0x6b62_6f6e_6531);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let mut anchors = rng.f128_vec(2 * n_pairs);
+        let mut deltas = crate::scratch::ScratchBytes::take(16 * n_pairs);
+        for chunk in deltas.chunks_exact_mut(8) {
+            chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
+        }
+        for p in 0..n_pairs {
+            if matches!(p % 128, 0..=8 | 118 | 119) {
+                anchors[2 * p + 1] = F128::ONE;
+                deltas[16 * p + 8..16 * p + 16].fill(0);
+            }
+        }
+        let compact = UniSkipCompactFold { anchors, deltas, dead_tail: true };
+        let (rho1, rho2) = (rng.f128(), rng.f128());
+        let mut r_next4 = vec![F128::ONE; log_groups];
+        for r in &mut r_next4[1..] {
+            *r = rng.f128();
+        }
+        let rhos = [rng.f128(), rng.f128()];
+        let mut r_next6 = vec![F128::ONE; log_groups - 2];
+        for r in &mut r_next6[1..] {
+            *r = rng.f128();
+        }
+        let mut a_out = vec![F128::ZERO; n_groups];
+        let mut b_out = vec![F128::ZERO; n_groups];
+        let mut a2 = vec![F128::ZERO; n_groups / 4];
+        let mut b2 = vec![F128::ZERO; n_groups / 4];
+        let mut run = |bpack: bool| {
+            let t = std::time::Instant::now();
+            let (m1, minf, la, packed, bpacked) = fold2_compact_and_round45_into_packed_b(
+                &compact, &table, rho1, rho2, &r_next4, &mut a_out, &mut b_out, true, bpack,
+            )
+            .expect("ranked b == 1 pairs");
+            let k_ms = t.elapsed().as_secs_f64() * 1e3;
+            assert!(packed && bpacked == bpack);
+            let main = n_groups / 256 * 244;
+            let main_b = if bpacked { n_groups / 64 * 56 } else { main };
+            let t = std::time::Instant::now();
+            let (e1, einf, _, _) = fold_cascade_t_into_packed(
+                &a_out[..main], &b_out[..main_b], true, bpacked, &mut a2, &mut b2, &rhos, &r_next6,
+            );
+            let c_ms = t.elapsed().as_secs_f64() * 1e3;
+            (k_ms, c_ms, (m1, minf, la.c, e1, einf, a2[a2.len() - 1], b2[1]))
+        };
+        let want = run(false).2;
+        assert_eq!(run(true).2, want);
+        let (mut k_off, mut k_on, mut c_off, mut c_on) = (vec![], vec![], vec![], vec![]);
+        for i in 0..samples {
+            let order = if i % 2 == 0 { [false, true] } else { [true, false] };
+            for bpack in order {
+                let (k, c, v) = run(bpack);
+                assert_eq!(v, want);
+                if bpack {
+                    k_on.push(k);
+                    c_on.push(c);
+                } else {
+                    k_off.push(k);
+                    c_off.push(c);
+                }
+            }
+        }
+        let med = |v: &[f64]| {
+            let mut s = v.to_vec();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            s[s.len() / 2]
+        };
+        let diff = |on: &[f64], off: &[f64]| -> (f64, f64, f64, usize) {
+            let d: Vec<f64> = on.iter().zip(off).map(|(a, b)| a - b).collect();
+            let n = d.len() as f64;
+            let mean = d.iter().sum::<f64>() / n;
+            let sd = (d.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+            (mean, sd / n.sqrt(), med(&d), d.iter().filter(|&&x| x < 0.0).count())
+        };
+        let (km, kse, kmed, kn) = diff(&k_on, &k_off);
+        let (cm, cse, cmed, cn) = diff(&c_on, &c_off);
+        println!(
+            "KBONE n_groups 2^{log_groups} samples {samples}: K off med {:.3} on med {:.3} ms, paired on-off mean {km:+.3} se {kse:.3} med {kmed:+.3} faster {kn}/{samples} | 5+6 off med {:.3} on med {:.3} ms, paired mean {cm:+.3} se {cse:.3} med {cmed:+.3} faster {cn}/{samples}",
+            med(&k_off),
+            med(&k_on),
+            med(&c_off),
+            med(&c_on),
+        );
     }
 
     #[test]

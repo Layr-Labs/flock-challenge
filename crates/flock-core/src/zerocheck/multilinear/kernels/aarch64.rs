@@ -4322,6 +4322,14 @@ unsafe fn mul_prep_q(
 /// dead-tail-packed layout ([`PACK_SUPER`]): outputs 61..63 of every block of
 /// 64, which are zero, are not written. Same values, same slots. The chunk
 /// must hold a whole number of four-block superblocks.
+///
+/// `bpack` (with `PACK` only): the b outputs are written in the b-one-packed
+/// layout ([`B_PACK_BLOCK`]) instead: b outputs 0..3 and 59 of every block,
+/// which are one at the ranked shape (const-one wires of the linear
+/// constraints), are not written. The kernel checks every one of them and
+/// returns false if any is not one; the caller then discards the pass and
+/// reruns it without `bpack`. The a outputs and the slots do not depend on
+/// `bpack`. Returns true without `bpack`.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
@@ -4339,7 +4347,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     out_pairs: usize,
     degen: bool,
     out: *mut F128,
-) {
+    bpack: bool,
+) -> bool {
     const { assert!(DEAD_TAIL || !PACK) };
     use core::arch::aarch64::*;
 
@@ -4368,6 +4377,14 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         // Slots: p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5'.
         let mut acc = LookaheadTriAcc::zero();
         let allfused = zc_k_allfused_enabled();
+        // b-one pack: block `blk`'s b outputs 4..58 at `B_PACK_BLOCK * blk`,
+        // its output 60 after them; `b_ok` collects the checks of the
+        // unwritten ones, `b58` holds output 58 until output 60 pairs it.
+        let bpack = PACK && bpack;
+        let mut b_ok = true;
+        let mut b_main = b_out;
+        let mut bt0 = 0usize;
+        let mut b58 = zero;
 
         debug_assert!(out_pairs >= 2 && out_pairs.is_multiple_of(2));
         let n5 = out_pairs / 2;
@@ -4425,15 +4442,35 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 let t = $t;
                 let mut b_flat = true;
                 let ao = a_out.add($o);
-                let bo = b_out.add($o);
+                // bpack: group `bt0` (b outputs 0..3) has no b entries, group
+                // `bt0 + 14` stores outputs 56, 57 and keeps 58 for output 60.
+                let bo = if bpack {
+                    b_main.wrapping_add((4 * (t - bt0)).wrapping_sub(4))
+                } else {
+                    b_out.add($o)
+                };
                 let (a0, b0) = fold_lane!(4 * t, b_flat);
                 let (a1, b1) = fold_lane!(4 * t + 1, b_flat);
                 store_pair_nt_off::<0>(ao, a0, a1);
-                store_pair_nt_off::<0>(bo, b0, b1);
+                if !bpack || t != bt0 {
+                    store_pair_nt_off::<0>(bo, b0, b1);
+                }
                 let (a2, b2) = fold_lane!(4 * t + 2, b_flat);
                 let (a3, b3) = fold_lane!(4 * t + 3, b_flat);
                 store_pair_nt_off::<32>(ao, a2, a3);
-                store_pair_nt_off::<32>(bo, b2, b3);
+                if !bpack {
+                    store_pair_nt_off::<32>(bo, b2, b3);
+                } else if t == bt0 {
+                    b_ok &= is_zero_q(vorrq_u64(
+                        vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
+                        vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
+                    ));
+                } else if t == bt0 + 14 {
+                    b58 = b2;
+                    b_ok &= is_zero_q(veorq_u64(b3, one_q));
+                } else {
+                    store_pair_nt_off::<32>(bo, b2, b3);
+                }
                 // The group weight `w = eq_lo[2t + 1]` as its prepared pair.
                 let wp = eq_prep.add(2 * t).cast::<u64>();
                 let (w_p0, w_p1) = (vld1q_u64(wp), vld1q_u64(wp.add(2)));
@@ -4484,6 +4521,10 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 } else {
                     4 * t0
                 };
+                if bpack {
+                    b_main = b_out.add(B_PACK_BLOCK * blk);
+                    bt0 = t0;
+                }
                 if allfused {
                     // Two groups per trip (seven pairs and one more): the
                     // fused results alternate registers.
@@ -4515,13 +4556,20 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     let slot = blk % PACK_BLOCKS;
                     stage_a[slot] = av0;
                     stage_b[slot] = bv0;
+                    if bpack {
+                        // Outputs 58 and 60 close the block's 14th line.
+                        store_pair_nt_off::<0>(b_main.add(B_PACK_BLOCK - 2), b58, bv0);
+                    }
                     if slot == PACK_BLOCKS - 1 {
                         let line = PACK_SUPER * (blk / PACK_BLOCKS) + 60 * PACK_BLOCKS;
-                        let (sa, sb) = (a_out.add(line), b_out.add(line));
+                        let sa = a_out.add(line);
                         store_pair_nt_off::<0>(sa, stage_a[0], stage_a[1]);
                         store_pair_nt_off::<32>(sa, stage_a[2], stage_a[3]);
-                        store_pair_nt_off::<0>(sb, stage_b[0], stage_b[1]);
-                        store_pair_nt_off::<32>(sb, stage_b[2], stage_b[3]);
+                        if !bpack {
+                            let sb = b_out.add(line);
+                            store_pair_nt_off::<0>(sb, stage_b[0], stage_b[1]);
+                            store_pair_nt_off::<32>(sb, stage_b[2], stage_b[3]);
+                        }
                     }
                 } else {
                     let ao = a_out.add(4 * t);
@@ -4563,8 +4611,16 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         for (k, v) in sums.into_iter().enumerate() {
             *out.add(k) = v;
         }
+        b_ok
     }
 }
+
+/// Entries per 64-output block of the b-one-packed K b output: b outputs
+/// 4..58 at `0..55`, output 60 at `55`. Outputs 0..3 and 59 (one at the
+/// ranked shape) and 61..63 (zero) have no entry. 56 entries are 14 cache
+/// lines, so every block starts on a line (the [`PACK_SUPER`] layout spends
+/// 61 lines per 64 outputs).
+pub(crate) const B_PACK_BLOCK: usize = 56;
 
 /// XOR of the `L` table entries for byte lanes `lane0..lane0 + L` of `code`.
 /// One 16-byte L1 load per lane; the tree shape matches `fold_row_q` so the
@@ -5979,11 +6035,16 @@ fn fold_tri_and_message_core<
     assert_eq!(b_out.len(), n_out);
     assert_eq!(n_out, 2 * eq_lo.len());
     assert!(n_out.is_multiple_of(8));
+    // `PACK` with a b input of `B_PACK_BLOCK` entries per 64 logical inputs:
+    // b is in the K pass's b-one-packed layout (inputs 0..3 and 59 of every
+    // block are one).
+    let mut bpack = false;
     if PACK {
         let n_in = n_out << DEPTH;
         assert!(n_in.is_multiple_of(64 * PACK_BLOCKS));
         assert_eq!(a_in.len(), n_in / (64 * PACK_BLOCKS) * PACK_SUPER);
-        assert_eq!(b_in.len(), n_in / (64 * PACK_BLOCKS) * PACK_SUPER);
+        bpack = b_in.len() == n_in / 64 * B_PACK_BLOCK;
+        assert!(bpack || b_in.len() == n_in / (64 * PACK_BLOCKS) * PACK_SUPER);
     } else {
         assert_eq!(a_in.len(), n_out << DEPTH);
         assert_eq!(b_in.len(), n_out << DEPTH);
@@ -6149,6 +6210,45 @@ fn fold_tri_and_message_core<
             }
         }
 
+        /// The group fold of a b-one-packed b input (block `y / 2` at
+        /// `B_PACK_BLOCK * (y / 2)`): logical inputs 0..3 and 59 are one, so
+        /// the first half's output 0 (the fold of four ones) is one, and
+        /// input 59 enters the second half's output 6 as a one register.
+        /// The other outputs fold the same inputs through the same
+        /// products as [`fold_group_inl`].
+        #[inline(always)]
+        unsafe fn fold_group_bpack<const FF: bool>(ip: *const F128, y: usize, rho: &Fold4RhoQ) -> [uint64x2_t; 8] {
+            unsafe {
+                let main = ip.add(B_PACK_BLOCK * (y / 2));
+                let ld = |p: *const F128| vld1q_u64(p.cast::<u64>());
+                let zero = vdupq_n_u64(0);
+                let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
+                let one = |a, b, c, d| {
+                    if FF {
+                        fold4_expanded_tri_one_fused_q(a, b, c, d, rho)
+                    } else {
+                        fold4_expanded_tri_one_q(a, b, c, d, rho)
+                    }
+                };
+                if y % 2 == 0 {
+                    // Inputs 4..31 at `main[0..28]`.
+                    let v1 = one(ld(main), ld(main.add(1)), ld(main.add(2)), ld(main.add(3)));
+                    let (v2, v3) = fold4_pair_expanded_tri_f_q::<FF>(main.add(4), rho);
+                    let (v4, v5) = fold4_pair_expanded_tri_f_q::<FF>(main.add(12), rho);
+                    let (v6, v7) = fold4_pair_expanded_tri_f_q::<FF>(main.add(20), rho);
+                    [one_q, v1, v2, v3, v4, v5, v6, v7]
+                } else {
+                    // Inputs 32..58 at `main[28..55]`, input 60 at `main[55]`.
+                    let (v0, v1) = fold4_pair_expanded_tri_f_q::<FF>(main.add(28), rho);
+                    let (v2, v3) = fold4_pair_expanded_tri_f_q::<FF>(main.add(36), rho);
+                    let (v4, v5) = fold4_pair_expanded_tri_f_q::<FF>(main.add(44), rho);
+                    let v6 = one(ld(main.add(52)), ld(main.add(53)), ld(main.add(54)), one_q);
+                    let v7 = one(ld(main.add(55)), zero, zero, zero);
+                    [v0, v1, v2, v3, v4, v5, v6, v7]
+                }
+            }
+        }
+
         const TG: usize = 16;
         let ng = n_out / 8;
         let mut ta = [[zero; 8]; TG];
@@ -6161,8 +6261,14 @@ fn fold_tri_and_message_core<
                 let (a, b) = if INL {
                     (
                         fold_group_inl::<DEPTH, PACK, SL, FF>(a_ip, y, &rho, rc, rc_sw),
-                        fold_group_inl::<DEPTH, PACK, SL, FF>(b_ip, y, &rho, rc, rc_sw),
+                        if PACK && bpack {
+                            fold_group_bpack::<FF>(b_ip, y, &rho)
+                        } else {
+                            fold_group_inl::<DEPTH, PACK, SL, FF>(b_ip, y, &rho, rc, rc_sw)
+                        },
                     )
+                } else if PACK && bpack {
+                    (fold_group(a_ip, y), fold_group_bpack::<false>(b_ip, y, &rho))
                 } else {
                     (fold_group(a_ip, y), fold_group(b_ip, y))
                 };
@@ -8838,16 +8944,20 @@ mod tests {
                                 deltas.as_ptr(), a.as_mut_ptr(), b.as_mut_ptr(), eq.as_ptr(),
                                 OUT_PAIRS, true, out.as_mut_ptr(),
                             ),
-                            (false, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
-                                r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
-                                a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
-                                out.as_mut_ptr(),
-                            ),
-                            (false, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
-                                r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
-                                a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
-                                out.as_mut_ptr(),
-                            ),
+                            (false, false) => {
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
+                                    r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                    a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
+                                    out.as_mut_ptr(), false,
+                                );
+                            }
+                            (false, true) => {
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                                    r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                    a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
+                                    out.as_mut_ptr(), false,
+                                );
+                            }
                         }
                     }
                     (a, b, out)
@@ -8929,12 +9039,12 @@ mod tests {
                     fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
-                        o_full.as_mut_ptr(),
+                        o_full.as_mut_ptr(), false,
                     );
                     fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         ap.as_mut_ptr(), bp.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
-                        o_pack.as_mut_ptr(),
+                        o_pack.as_mut_ptr(), false,
                     );
                 }
                 assert_eq!(o_pack, o_full, "slots, case {case}, degen {degen}");
@@ -8953,6 +9063,158 @@ mod tests {
                 let packed_len = n_out / 256 * PACK_SUPER;
                 assert!(ap[packed_len..].iter().all(|&v| v == poison));
                 assert!(bp[packed_len..].iter().all(|&v| v == poison));
+            }
+        }
+    }
+
+    /// Logical output `i` of a b-one-packed b array (`B_PACK_BLOCK` layout),
+    /// or `None` for the unstored ones (0..3, 59) and zeros (61..63).
+    fn bpack_index(i: usize) -> Option<usize> {
+        let (blk, j) = (i / 64, i % 64);
+        match j {
+            4..59 => Some(B_PACK_BLOCK * blk + j - 4),
+            60 => Some(B_PACK_BLOCK * blk + 55),
+            _ => None,
+        }
+    }
+
+    /// The b-one-packed K output (`bpack`) holds exactly the dead-tail-packed
+    /// output's b values minus the ones at outputs 0..3 and 59 of every
+    /// block, the a output and the slots are unchanged, nothing past the
+    /// packed length is written; one non-one value in a skipped slot makes
+    /// the kernel report failure.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn k_bone_pack_matches_dead_pack() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        let mut state = 0x4b31_424f_4e45_3631;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, rho(&mut state));
+        for case in 0..12 {
+            let out_pairs = if case % 2 == 0 { 2 * 16 * 8 } else { 2 * 16 * 4 };
+            let n_out = 2 * out_pairs;
+            let (rho1, rho2) = match case / 2 {
+                0 => (F128::ONE, F128::ONE),
+                1 => (rho(&mut state), F128::ZERO),
+                _ => (rho(&mut state), rho(&mut state)),
+            };
+            let r1 = table.scaled_linear(rho1);
+            let mut anchors: Vec<F128> = (0..8 * out_pairs).map(|_| rho(&mut state)).collect();
+            let mut deltas: Vec<u8> =
+                (0..64 * out_pairs).map(|_| splitmix64(&mut state) as u8).collect();
+            let eq: Vec<F128> = (0..out_pairs).map(|_| rho(&mut state)).collect();
+            let eq_prep = round2_eq_prep(&eq);
+            // Lanes (K outputs) 0..3 and 59 of every 64: b == 1 (both pairs).
+            let set_one = |anchors: &mut Vec<F128>, deltas: &mut Vec<u8>, g: usize| {
+                anchors[4 * g + 1] = F128::ONE;
+                anchors[4 * g + 3] = F128::ONE;
+                deltas[32 * g + 8..32 * g + 16].fill(0);
+                deltas[32 * g + 24..32 * g + 32].fill(0);
+            };
+            for g in 0..n_out {
+                if matches!(g % 64, 0..4 | 59) {
+                    set_one(&mut anchors, &mut deltas, g);
+                } else if splitmix64(&mut state) % 4 == 0 {
+                    deltas[32 * g + 8..32 * g + 16].fill(0);
+                    deltas[32 * g + 24..32 * g + 32].fill(0);
+                }
+            }
+            for degen in [false, true] {
+                let poison = F128::new(0xdead, 0xbeef);
+                let run = |anchors: &[F128], deltas: &[u8], bpack: bool| {
+                    let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
+                    let mut o = [F128::ZERO; 8];
+                    let ok = unsafe {
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                            r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                            a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
+                            o.as_mut_ptr(), bpack,
+                        )
+                    };
+                    (a, b, o, ok)
+                };
+                let (ap, bp, o_pack, ok_pack) = run(&anchors, &deltas, false);
+                let (aq, bq, o_bone, ok_bone) = run(&anchors, &deltas, true);
+                assert!(ok_pack && ok_bone, "case {case}, degen {degen}");
+                assert_eq!(o_bone, o_pack, "slots, case {case}, degen {degen}");
+                assert_eq!(aq, ap, "a outputs, case {case}, degen {degen}");
+                for i in 0..n_out {
+                    let Some(k) = packed_index(i) else { continue };
+                    match bpack_index(i) {
+                        Some(kb) => assert_eq!(bq[kb], bp[k], "b output {i}, case {case}"),
+                        None => assert_eq!(bp[k], F128::ONE, "b output {i} not one, case {case}"),
+                    }
+                }
+                let b_len = n_out / 64 * B_PACK_BLOCK;
+                assert!(bq[b_len..].iter().all(|&v| v == poison), "b overrun, case {case}");
+                // A skipped value that is not one is reported.
+                for bad in [64 + 2, 128 + 59] {
+                    if bad >= n_out {
+                        continue;
+                    }
+                    let mut anc = anchors.clone();
+                    anc[4 * bad + 1] = F128::new(5, 0);
+                    anc[4 * bad + 3] = F128::new(5, 0);
+                    let (_, _, _, ok) = run(&anc, &deltas, true);
+                    assert!(!ok, "bad b at {bad} not reported, case {case}, degen {degen}");
+                }
+            }
+        }
+    }
+
+    /// The tri pass over a b-one-packed b input equals the tri pass over the
+    /// dead-tail-packed one: every output and all 26 slots, both store
+    /// flavours.
+    #[test]
+    fn tri_bone_packed_input_matches_packed_input() {
+        let mut state = 0x7472_6962_6f6e_6531;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        for case in 0..4 {
+            let n_out = 64 << case;
+            let n_in = 4 * n_out;
+            let mut a: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+            let mut b: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+            for blk in 0..n_in / 64 {
+                a[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+                b[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+                b[64 * blk..64 * blk + 4].fill(F128::ONE);
+                b[64 * blk + 59] = F128::ONE;
+            }
+            let pack = |v: &[F128]| -> Vec<F128> {
+                let mut p = vec![F128::new(1, 2); n_in / 256 * PACK_SUPER];
+                for (i, &x) in v.iter().enumerate() {
+                    if let Some(k) = packed_index(i) {
+                        p[k] = x;
+                    }
+                }
+                p
+            };
+            let mut bb = vec![F128::new(3, 4); n_in / 64 * B_PACK_BLOCK];
+            for (i, &x) in b.iter().enumerate() {
+                if let Some(k) = bpack_index(i) {
+                    bb[k] = x;
+                }
+            }
+            let (ap_in, bp_in) = (pack(&a), pack(&b));
+            let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+            let (ra, rb) = (rho(&mut state), rho(&mut state));
+            for nt in [false, true] {
+                let (mut ao, mut bo) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                let (mut ap, mut bp) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+                let (packed, bone) = if nt {
+                    (
+                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq),
+                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq),
+                    )
+                } else {
+                    (
+                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq),
+                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq),
+                    )
+                };
+                assert_eq!(bone, packed, "slots, case {case}, nt {nt}");
+                assert_eq!(ap, ao, "a outputs, case {case}, nt {nt}");
+                assert_eq!(bp, bo, "b outputs, case {case}, nt {nt}");
             }
         }
     }

@@ -142,30 +142,6 @@ pub fn open_batch_mixed_ligerito_with_owned_canonical_fold8<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
-    open_batch_mixed_ligerito_with_fold8_round0(
-        packed_witness, prover_data, commitment, x_outers, precomputed_s_hat_v,
-        canonical_fold8, &mut [], packed_direct, padding, lig_config, challenger,
-    )
-}
-
-/// As the canonical-hint opening, with separate two-bank round-zero owners.
-/// Hint i must contract its Fold8 tensor at x_outers[i][2..7], retaining the
-/// x_outers[i][1] bank bit. Only a matching dense Fold8 slot uses the hint.
-/// Missing or wrong-size hints keep the existing factor scan.
-#[allow(clippy::too_many_arguments)]
-pub fn open_batch_mixed_ligerito_with_fold8_round0<Ch: Challenger>(
-    packed_witness: Vec<F128>,
-    prover_data: &ProverData,
-    commitment: &Commitment,
-    x_outers: &[&[F128]],
-    precomputed_s_hat_v: &[Option<&[F128]>],
-    canonical_fold8: &mut [Option<Vec<F128>>],
-    round0_fold8: &mut [Option<Vec<F128>>],
-    packed_direct: &[PackedDirectClaim],
-    padding: &PaddingSpec,
-    lig_config: &ligerito::ProverConfig,
-    challenger: &mut Ch,
-) -> BatchOpeningProofLigerito {
     let trace =
         std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
     let t_total = std::time::Instant::now();
@@ -186,7 +162,6 @@ pub fn open_batch_mixed_ligerito_with_fold8_round0<Ch: Challenger>(
         x_outers,
         precomputed_s_hat_v,
         canonical_fold8,
-        round0_fold8,
         packed_direct,
         padding,
         challenger,
@@ -1078,7 +1053,6 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     x_outers: &[&[F128]],
     precomputed_s_hat_v: &[Option<&[F128]>],
     canonical_fold8: &mut [Option<Vec<F128>>],
-    round0_fold8: &mut [Option<Vec<F128>>],
     packed_direct: &[PackedDirectClaim],
     padding: &PaddingSpec,
     challenger: &mut Ch,
@@ -1114,12 +1088,11 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
     ) = if n_rs > 0 {
-        ring_switch::prove_batched_padded_with_fold8_round0(
+        ring_switch::prove_batched_padded_with_owned_canonical_fold8(
             packed_witness,
             x_outers,
             precomputed_s_hat_v,
             canonical_fold8,
-            round0_fold8,
             padding,
             challenger,
             basis_elidable,

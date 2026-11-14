@@ -5182,6 +5182,13 @@ impl Blake3Setup {
         // the first ranked commit (untimed), bridging the warmup CPU tail
         // and the ready->seed gap.
         flock_core::gpu_commit::gpu_keepwarm_prove_started();
+        // Untimed warm-up: start building the round-one AB completion GPU
+        // arm (a Metal source compile) on a background thread now, so it
+        // overlaps witness generation and the commit instead of stalling the
+        // warm-up's round one.
+        if call == 0 {
+            flock_core::zerocheck::univariate_skip_optimized::ab_completion_gpu_prewarm();
+        }
         // Call zero is the untimed warmup but materializes an eager lincheck
         // stripe before the timed proof establishes streaming. Issue the
         // exact-contention ticket here, before witness generation, so only
@@ -5227,6 +5234,15 @@ impl Blake3Setup {
             // return and only then touches `io::stdin()`, so the splice lands
             // outside every measured interval and before the wrapper's
             // `BufReader` binds a descriptor.
+            // `arm` holds the ready report until the seed-pipe thread has
+            // pre-opened the publication target (about a millisecond of file
+            // work). Light the keep-alive before that wait instead of after
+            // it, so the P cluster is never idle between the warm-up tail and
+            // the seed. The start below is then a no-op.
+            // `FLOCK_NO_PARK_KEEPALIVE=1` restores the incumbent order.
+            if crate::seed_pipe::is_ranked_worker() && crate::seed_pipe::park_keepalive_enabled() {
+                flock_core::cpu_keepalive::keepalive_start();
+            }
             self.arm_seed_pipe();
             // Last thing before the worker publishes "ready" and every thread
             // parks for the seed: light up a P-core keep-alive so the cluster

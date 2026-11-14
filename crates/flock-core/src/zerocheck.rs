@@ -1004,7 +1004,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         if use_cascade {
             // Dead-tail-packed K output only when the tri pass, the one
             // reader of that layout, comes next.
-            let (m4_1, m4_inf, la5, packed) = multilinear::fold2_compact_and_round45_into_packed(
+            let (m4_1, m4_inf, la5, packed, bpacked) = multilinear::fold2_compact_and_round45_into_packed(
                 &compact_mlv,
                 &fold_table,
                 mlv_rhos[0],
@@ -1016,7 +1016,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             );
             if tail_round_timing {
                 eprintln!(
-                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}, packed={packed}): {:.2} ms",
+                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}, packed={packed}, bpacked={bpacked}): {:.2} ms",
                     compact_mlv.dead_tail,
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
@@ -1047,10 +1047,12 @@ fn prove_packed_padded_inner<C: Challenger>(
             let mut b2_out = crate::scratch::take_f128_unpinned(quarter);
             if tri_steps > 0 {
                 let main = if packed { n_groups / 256 * 244 } else { n_groups };
+                let main_b = if bpacked { n_groups / 64 * 56 } else { main };
                 let (m6_1, m6_inf, la7, la8) = multilinear::fold_cascade_t_into_packed(
                     &a_out[..main],
-                    &b_out[..main],
+                    &b_out[..main_b],
                     packed,
+                    bpacked,
                     &mut a2_out,
                     &mut b2_out,
                     &mlv_rhos[2..4],
