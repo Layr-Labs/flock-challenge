@@ -1963,6 +1963,19 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         head_compact: false,
         head_b: F128::ZERO,
     };
+    // K pass GPU prefix arm (`FLOCK_NO_ZC_K_PREMAP` kills this step): map
+    // its view of the anchors prefix now, while round two runs, so the K
+    // command buffer does not wait for the mapping. The dense prefix covers
+    // every compacted layout's prefix.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if n_pairs >= 16 {
+        let share = crate::gpu_commit::gpu_zc_k_share();
+        if share > 0 {
+            let k_hi = 1usize << cascade_k_pass_n_hi(n_pairs.trailing_zeros() as usize - 2);
+            let prefix_pairs = share.min(k_hi) * (n_pairs / k_hi);
+            crate::gpu_commit::zc_k_premap(&compact.anchors, prefix_pairs * 32);
+        }
+    }
 
     let n_vars = mlv_challenges.len() - 1;
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], lookahead_n_hi(n_vars));
