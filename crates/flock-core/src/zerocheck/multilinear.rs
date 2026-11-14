@@ -101,6 +101,7 @@ use kernels::aarch64::{
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::{
     fold2_compact_and_round45_chunk_neon_8_fused, fold2_compact_and_round45_chunk_neon_8_fused_r1,
+    fold2_compact_and_round45_chunk_neon_8_fused_r1_w9,
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_prescaled_8;
@@ -134,6 +135,60 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 #[cfg(target_arch = "aarch64")]
 fn r2_degen_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+}
+
+/// Kill switch for the seven-bank fold tables in round two and the K pass
+/// (`FLOCK_NO_ZC_W9`, any value): the kernels fold every packed code through
+/// the eight 256-entry byte banks again instead of the seven `W9` banks.
+/// Same values either way. Read at each phase entry.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn zc_w9_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_ZC_W9").is_none()
+}
+
+/// Whether the calling thread belongs to the efficiency-core helper pool
+/// (`crate::epool`, threads named `flock-ecore-*`). Those cores have half a
+/// performance core's L1 data cache (64 KiB on M-series E-cores), which a
+/// 64 KiB `W9` table would fill on its own, so their chunks keep the byte
+/// banks (same values).
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn on_ecore_helper() -> bool {
+    std::thread::current().name().is_some_and(|n| n.starts_with("flock-ecore-"))
+}
+
+/// The seven-bank (`W9`) form of a byte fold table, every entry multiplied
+/// by `scale` when given. `bytes` is a [`UniSkipFoldTable::data`]-shaped
+/// table of eight 256-entry banks, each GF(2)-linear in its byte; code bit
+/// `i` carries weight `bytes[256 * (i / 8) + (1 << (i % 8))]`. Bank 0 of the
+/// result covers code bits 0..10 (1,024 entries), bank `k` = 1..7 the bits
+/// `9k + 1 .. 9k + 10` (512 entries each), and entry `v` of a bank is the
+/// sum of the weights of the bits set in `v`, built by one XOR per entry.
+/// A code folds to the same field element through either layout: both sum
+/// the weights of its set bits, and with `scale` each sum is `scale` times
+/// the unscaled one by distributivity (64 products, the basis only).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn w9_table_from_bytes(bytes: &[F128], scale: Option<F128>) -> Vec<F128> {
+    assert_eq!(bytes.len(), 8 * 256);
+    let weight = |i: usize| {
+        let w = bytes[256 * (i / 8) + (1 << (i % 8))];
+        scale.map_or(w, |r| r * w)
+    };
+    let weights: [F128; 64] = core::array::from_fn(weight);
+    let mut out = vec![F128::ZERO; kernels::aarch64::W9_ENTRIES];
+    let mut base = 0usize;
+    for (bank, (first_bit, width)) in [(0usize, 10usize), (10, 9), (19, 9), (28, 9), (37, 9), (46, 9), (55, 9)]
+        .into_iter()
+        .enumerate()
+    {
+        debug_assert_eq!(base, if bank == 0 { 0 } else { 1024 + 512 * (bank - 1) });
+        for v in 1usize..1 << width {
+            let low = v & v.wrapping_neg();
+            out[base + v] = out[base + (v ^ low)] + weights[first_bit + low.trailing_zeros() as usize];
+        }
+        base += 1 << width;
+    }
+    debug_assert_eq!(base, kernels::aarch64::W9_ENTRIES);
+    out
 }
 
 /// Kill switch for the peeled first group of the round-two Horner kernel:
@@ -1964,6 +2019,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let eq_prep = kernels::aarch64::round2_eq_prep(eq_lo);
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep_addr = eq_prep.as_ptr() as usize;
+    // The seven-bank form of the fold table (`zc_w9_enabled`), shared by
+    // every chunk; null keeps the byte banks.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let w9 = zc_w9_enabled().then(|| w9_table_from_bytes(&table.data, None));
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let w9_addr = w9.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let w9_addr = 0usize;
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let eq_prep_addr = 0usize;
     let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
@@ -1991,11 +2054,17 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
             let full = true;
             unsafe {
                 let t = table.data.as_ptr().cast::<u8>();
+                // Performance-core chunks only (`on_ecore_helper`).
+                #[cfg(target_feature = "sha3")]
+                let w = if w9_addr != 0 && !on_ecore_helper() { w9_addr } else { 0 } as *const u8;
+                #[cfg(not(target_feature = "sha3"))]
+                let w = w9_addr as *const u8;
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
                 if full {
                     fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                         t,
+                        w,
                         ap,
                         bp,
                         anchors,
@@ -2016,6 +2085,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         #[cfg(target_feature = "sha3")]
                         fold_round2_compact_chunk_neon_prescaled_8(
                             t,
+                            w,
                             ap,
                             bp,
                             anchors,
@@ -2076,6 +2146,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 } else if odd_on_gpu {
                     fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
                         t,
+                        w,
                         ap,
                         bp,
                         anchors,
@@ -2094,6 +2165,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 } else {
                     fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
                         t,
+                        w,
                         ap,
                         bp,
                         anchors,
@@ -2201,6 +2273,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     unsafe {
                         fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                             table.data.as_ptr().cast::<u8>(),
+                            core::ptr::null(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
                             scr_anchors.as_mut_ptr(),
@@ -2602,6 +2675,15 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
     let one_table = fused_k && zc_k_one_table_enabled();
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let one_table = false;
+    // One-table kernel: `rho1 * T` in the seven-bank layout when
+    // `zc_w9_enabled`, else in the byte layout.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let w9 = one_table && zc_w9_enabled();
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+    let w9 = false;
+    // The byte form stays: efficiency-core chunks fold through it.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let table_w9 = if w9 { w9_table_from_bytes(&table.data, Some(rho1)) } else { Vec::new() };
     let (table_l1, table_l3) = if one_table {
         (table.scaled_linear(rho1), Vec::new())
     } else {
@@ -2680,23 +2762,40 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
                 table_l1.as_ptr().cast::<u8>(),
                 table_l3.as_ptr().cast::<u8>(),
             );
+            // `W9` on performance-core chunks only (`on_ecore_helper`).
+            #[cfg(target_feature = "sha3")]
+            let (w9, tw) = (w9 && !on_ecore_helper(), table_w9.as_ptr().cast::<u8>());
             let eq_ptr = eq_lo.as_ptr();
             #[cfg(target_feature = "sha3")]
             let prep_ptr = eq_prep.as_ptr();
             let out_ptr = outv.as_mut_ptr();
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
+                (true, true) if w9 && pack => {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1_w9::<true, true>(
+                        tw, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
+                    )
+                }
+                #[cfg(target_feature = "sha3")]
+                (true, true) if w9 => fold2_compact_and_round45_chunk_neon_8_fused_r1_w9::<true, false>(
+                    tw, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
+                ),
+                #[cfg(target_feature = "sha3")]
+                (true, false) if w9 => fold2_compact_and_round45_chunk_neon_8_fused_r1_w9::<false, false>(
+                    tw, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
+                ),
+                #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
                     )
                 }
                 #[cfg(target_feature = "sha3")]
-                (true, true) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                (true, true) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
                     t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
                 ),
                 #[cfg(target_feature = "sha3")]
-                (true, false) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
+                (true, false) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
                     t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
                 ),
                 #[cfg(target_feature = "sha3")]

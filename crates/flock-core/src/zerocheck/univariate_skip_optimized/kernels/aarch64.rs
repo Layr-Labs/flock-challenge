@@ -2515,6 +2515,12 @@ fn shift_reduce_inner_mixed_const_b_h4<
         core::ptr::null()
     };
     let kscaled = kplain.wrapping_add(AB_KARA_IMAGE_BYTES);
+    // [`ABV_HZ_SCALED`]: the `x^4` sigma table in place of the half-swapped image.
+    let scaled_sw = if V & ABV_HZ_SCALED != 0 {
+        ab_hz_tables(inv_table).wrapping_add(AB_HZ_IMAGE_BYTES)
+    } else {
+        scaled_sw
+    };
 
     #[inline(always)]
     unsafe fn widen_lo(v: uint8x16_t) -> uint16x8_t {
@@ -4387,6 +4393,31 @@ pub(crate) fn ab_bstatic_z_low_forms<const NB: u32>(
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ABV_Z_SCALED: u32 = 16;
 
+/// Row-body variant bit (fused rows): the A words of K = 4..7 take the
+/// half-pair z apply ([`apply_word_hz`]) out of the `x^4` image's rows and
+/// that image's sigma table ([`ab_hz_tables`]), 24 KiB in all, instead of
+/// the Karatsuba `x^4` image (36 KiB). Call sites pass the `x^4` sigma table
+/// in place of the `x^4` half-swapped image. Every output byte is the XOR of
+/// the same table bits, so the rows are byte-identical. The plain image keeps
+/// its z-basis apply.
+///
+/// Why: the window rows' tables, the producer's unit scratch and its stores
+/// share each performance core's L1D; the smaller `x^4` working set (and the
+/// eighteen-to-twelve lookup cut) shortens the rows in proof even though the
+/// half-pair apply is not the cheapest form in isolation.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_HZ_SCALED: u32 = 1 << 18;
+
+/// Kill switch for [`ABV_HZ_SCALED`]: any value of `FLOCK_NO_ZC_AB_HZ_SCALED`
+/// runs the window rows per chunk and the mixed const-one rows in the
+/// incumbent form (the binary keeps no second fused instance). Read once per
+/// process. The rows written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_hz_scaled_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_HZ_SCALED").is_none())
+}
+
 #[cfg(target_arch = "aarch64")]
 const AB_Z_L1: usize = 0; // 256 x 32: lanes M0, M2 of R^{l1}
 #[cfg(target_arch = "aarch64")]
@@ -5011,6 +5042,10 @@ unsafe fn apply_word_into_4_regs_v<const V: u32, const SCALED: bool>(
     core::arch::aarch64::uint8x16_t,
 ) {
     unsafe {
+        if SCALED && V & ABV_HZ_SCALED != 0 {
+            // `half_swapped_table_base` carries the `x^4` sigma table here.
+            return apply_word_hz(table_base, half_swapped_table_base, word);
+        }
         if V & ABV_Z != 0 && (!SCALED || V & ABV_Z_SCALED != 0) {
             let z = if SCALED {
                 kara.add(AB_KARA_IMAGE_BYTES + AB_Z_IMAGE_BYTES)
@@ -5700,7 +5735,10 @@ pub(crate) fn ab_mixed_row_guarded(
     // takes the incumbent form `V0`; the unfused H2 instance is kept for
     // the tests only, so the binary carries no extra mixed-row instance.
     const VF: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE;
-    let fuse = ab_mixed_h2_enabled() && ab_mixed_fuse_enabled();
+    // The production form: the fused rows with the `x^4` image in half-pair
+    // z form ([`ABV_HZ_SCALED`]); `FLOCK_NO_ZC_AB_HZ_SCALED` also takes `V0`.
+    const VFH: u32 = VF | ABV_HZ_SCALED;
+    let fuse = ab_mixed_h2_enabled() && ab_mixed_fuse_enabled() && ab_hz_scaled_enabled();
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
     let word = |packed: &[u8], k: usize| -> u64 {
@@ -5715,7 +5753,7 @@ pub(crate) fn ab_mixed_row_guarded(
             return false;
         }
         if fuse {
-            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VF>(
+            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VFH>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
         } else {
@@ -5734,7 +5772,7 @@ pub(crate) fn ab_mixed_row_guarded(
             return false;
         }
         if fuse {
-            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VF>(
+            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VFH>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
         } else {
@@ -5842,6 +5880,14 @@ fn ab_mixed_fuse_matches_h2_and_incumbent() {
             }
             assert_eq!(h2, inc, "h2 case {case} w0={w0} nt={nt}");
             assert_eq!(got, h2, "fuse case {case} w0={w0} nt={nt}");
+            let mut got_h = [0u8; 64];
+            const VFH: u32 = VF | ABV_HZ_SCALED;
+            if w0 {
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VFH>(&a, &b, &table, 0, None, &mut got_h, nt);
+            } else {
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VFH>(&a, &b, &table, 0, None, &mut got_h, nt);
+            }
+            assert_eq!(got_h, h2, "fuse hz-scaled case {case} w0={w0} nt={nt}");
         }
     }
 }

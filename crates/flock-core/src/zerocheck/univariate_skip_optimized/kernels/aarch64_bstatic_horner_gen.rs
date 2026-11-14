@@ -90,6 +90,12 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
     // unused unless `V` applies the table in that form).
     let kplain = kara;
     let kscaled = kara.wrapping_add(AB_KARA_IMAGE_BYTES);
+    // [`ABV_HZ_SCALED`]: the `x^4` sigma table in place of the half-swapped image.
+    let scaled_sw = if V & ABV_HZ_SCALED != 0 {
+        ab_hz_tables(inv_table).wrapping_add(AB_HZ_IMAGE_BYTES)
+    } else {
+        scaled_sw
+    };
     unsafe {
         let a_base = a_packed.as_ptr().add(byte_base_b);
         let b_base = b_packed.as_ptr().add(byte_base_b);
@@ -1335,12 +1341,13 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                 // kills).
                 if ab_z_out3_enabled() {
                     const BASE: u32 = AB_UNIT_MAIN | ABV_Z_OUT3;
-                    if ab_fuse_enabled() {
-                        bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM }, true, true>(
+                    if ab_fuse_enabled() && ab_hz_scaled_enabled() {
+                        // The `x^4` image in half-pair z form ([`ABV_HZ_SCALED`]).
+                        bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM | ABV_HZ_SCALED }, true, true>(
                             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                         )
                     } else {
-                        // Kill switch only (build budget): the per-chunk rows
+                        // Kill switches only (build budget): the per-chunk rows
                         // write the same bytes; no separate unit instance.
                         let _ = BASE;
                         bstatic_horner_window_unit_per_chunk::<V, HOIST>(
@@ -1837,6 +1844,7 @@ fn ab_window_unit_fuse_matches_parent() {
                 assert!(want.0.iter().any(|&x| x != 0x3c), "{at}");
                 assert_eq!(want.0, want.1, "{at}");
                 assert_eq!(both!(BASE | ABV_FUSE, true), want, "FUSE {at}");
+                assert_eq!(both!(BASE | ABV_FUSE | ABV_HZ_SCALED, true), want, "FUSE HZ_SCALED {at}");
                 let helper_want = both!(AB_UNIT_HELPER, false);
                 assert_eq!(helper_want.0, want.0, "helper {at}");
                 assert_eq!(both!(AB_UNIT_HELPER | ABV_FUSE, false), helper_want, "FUSE_E {at}");
