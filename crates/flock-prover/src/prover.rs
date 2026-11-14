@@ -147,8 +147,12 @@ fn ab_round0_reuse_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 }
 
 fn open_ab_round0_reuse_enabled() -> bool {
+    // Off by default: on the ranked runner the official medians read the
+    // round-0 reuse slower (see the submission note);
+    // `FLOCK_OPEN_AB_ROUND0_REUSE=1` turns it back on.
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        ab_round0_reuse_value_enabled(std::env::var_os("FLOCK_NO_OPEN_AB_ROUND0_REUSE").as_deref())
+        std::env::var_os("FLOCK_OPEN_AB_ROUND0_REUSE").is_some_and(|v| v == "1")
+            && ab_round0_reuse_value_enabled(std::env::var_os("FLOCK_NO_OPEN_AB_ROUND0_REUSE").as_deref())
     });
     *ON
 }
