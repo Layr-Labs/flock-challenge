@@ -2572,6 +2572,7 @@ pub(crate) fn zc_k_dead_pack_enabled() -> bool {
 /// are not written. Returns whether it packed (otherwise every output is
 /// written as usual).
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fold2_compact_and_round45_into_packed(
     compact: &UniSkipCompactFold,
     table: &UniSkipFoldTable,
@@ -2582,6 +2583,52 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
     b_out: &mut [F128],
     pack: bool,
 ) -> (F128, F128, Round3Lookahead, bool) {
+    let (m1, minf, la, packed, _) = fold2_compact_and_round45_into_packed_gpu(
+        compact, table, rho1, rho2, r_next4, a_out, b_out, pack, false,
+    );
+    (m1, minf, la, packed)
+}
+
+/// Packed K outputs of the leading chunks that the K pass GPU prefix arm
+/// folded (see `gpu_commit::ENV_NO_ZC_K_GPU`): `len` entries of the packed
+/// `a_out` / `b_out` layout, held in the arm's process-lifetime buffers. The
+/// same entries of `a_out` / `b_out` were not written; the tri pass reads them
+/// from here. Valid until the next K pass.
+pub(crate) struct KGpuPrefix {
+    a: *const F128,
+    b: *const F128,
+    len: usize,
+}
+
+impl KGpuPrefix {
+    /// SAFETY: call before the next K pass of the process (which rewrites
+    /// the buffers).
+    pub(crate) unsafe fn slices<'a>(&self) -> (&'a [F128], &'a [F128]) {
+        unsafe {
+            (
+                std::slice::from_raw_parts(self.a, self.len),
+                std::slice::from_raw_parts(self.b, self.len),
+            )
+        }
+    }
+}
+
+/// [`fold2_compact_and_round45_into_packed`] with the K pass GPU prefix arm
+/// when `gpu` is set and the output is packed. Returns the GPU prefix the
+/// tri pass must read in place of the leading entries of `a_out` / `b_out`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold2_compact_and_round45_into_packed_gpu(
+    compact: &UniSkipCompactFold,
+    table: &UniSkipFoldTable,
+    rho1: F128,
+    rho2: F128,
+    r_next4: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    pack: bool,
+    gpu: bool,
+) -> (F128, F128, Round3Lookahead, bool, Option<KGpuPrefix>) {
+    let _ = gpu;
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
     assert!(n_groups >= 4 && n_groups.is_power_of_two());
@@ -2656,11 +2703,40 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
         let _ = pack;
         false
     };
+    // K pass GPU prefix arm (`FLOCK_NO_ZC_K_GPU` kills): the GPU folds the
+    // fixed leading chunks `0..cpu_base` into its own buffers, submitted
+    // before the CPU queue, which starts at `cpu_base`. Packed output only
+    // (one-table fused kernel on a dead-tail state: the arm's layout). During
+    // the arm's first launch (oracle probe) `cpu_base == 0` and the queue is
+    // exactly the incumbent one.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_job = {
+        let share = crate::gpu_commit::gpu_zc_k_share().min(hi_size);
+        if gpu && pack && share > 0 {
+            crate::gpu_commit::launch_zc_k_prefix(
+                &compact.anchors,
+                &compact.deltas,
+                &table_l1,
+                rho2,
+                eq_lo,
+                eq_hi,
+                share,
+                2 * out_chunk,
+                out_chunk / 256 * 244,
+            )
+        } else {
+            None
+        }
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cpu_base = gpu_job.as_ref().map_or(0, crate::gpu_commit::ZcKJob::cpu_base);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let cpu_base = 0usize;
     // The one-table kernel reads its group weights `eq_lo[2t + 1]` in
     // prepared form, one table shared by every chunk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+    let chunk_body = |x_hi: usize| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them. Packed: each of a
         // chunk's `out_chunk / 256` superblocks takes 244 entries.
@@ -2730,7 +2806,42 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
         unsafe {
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
-    });
+    };
+    crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
+
+    // Join the GPU prefix (it was submitted first and is normally done).
+    #[allow(unused_mut)]
+    let mut gpu_prefix: Option<KGpuPrefix> = None;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(job) = gpu_job {
+        let calibration = job.calibration();
+        let chunks = job.chunks();
+        match crate::gpu_commit::zc_k_wait(job, hi_size) {
+            crate::gpu_commit::ZcKResult::Prefix { parts, a, b, len } => {
+                if calibration {
+                    // Oracle probe: the CPU folded every chunk; the GPU's
+                    // outputs and weighted sums must equal the CPU's.
+                    // SAFETY: the joined job's buffers hold `len` entries.
+                    let (ga, gb) = unsafe {
+                        (std::slice::from_raw_parts(a, len), std::slice::from_raw_parts(b, len))
+                    };
+                    let equal = len <= a_out.len()
+                        && ga == &a_out[..len]
+                        && gb == &b_out[..len]
+                        && parts.as_slice() == &partials[..chunks];
+                    crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
+                } else {
+                    partials[..chunks].copy_from_slice(&parts);
+                    gpu_prefix = Some(KGpuPrefix { a, b, len });
+                }
+            }
+            crate::gpu_commit::ZcKResult::Failed => {
+                // The GPU failed after admission: the CPU folds the prefix
+                // chunks with the same kernel (the arm is now disabled).
+                crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
+            }
+        }
+    }
 
     let mut agg = [F128::ZERO; 8];
     for slot in &partials {
@@ -2753,7 +2864,7 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
         c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
     };
 
-    (r_next4[0] * sum1, sum_inf, la5, pack)
+    (r_next4[0] * sum1, sum_inf, la5, pack, gpu_prefix)
 }
 
 /// Portable reference for one cascade K chunk (non-AArch64 builds). Same
@@ -3406,6 +3517,24 @@ pub(crate) fn fold_cascade_t_into_packed(
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
+    fold_cascade_t_into_packed_prefix(a, b, packed, None, a_out, b_out, rhos, r_next)
+}
+
+/// [`fold_cascade_t_into_packed`] whose input entries `0..p.len()` come from
+/// `prefix = Some((pa, pb))` instead of `a` / `b` (the K pass GPU prefix,
+/// [`KGpuPrefix`]); `a` / `b` are not read there. A chunk that straddles the
+/// boundary reads each side from its own source.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_cascade_t_into_packed_prefix(
+    a: &[F128],
+    b: &[F128],
+    packed: bool,
+    prefix: Option<(&[F128], &[F128])>,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+) -> (F128, F128, Round3Lookahead, Lookahead2) {
     let depth = rhos.len();
     assert!(depth == 2 || depth == 3);
     let n = if packed {
@@ -3447,11 +3576,19 @@ pub(crate) fn fold_cascade_t_into_packed(
     } else {
         chunk_in
     };
-    let inputs = |x_hi: usize| -> (&[F128], &[F128]) {
-        (
-            &a[x_hi * per_chunk..(x_hi + 1) * per_chunk],
-            &b[x_hi * per_chunk..(x_hi + 1) * per_chunk],
-        )
+    let (pre_a, pre_b) = prefix.unwrap_or((&[], &[]));
+    assert_eq!(pre_a.len(), pre_b.len());
+    assert!(pre_a.len() <= a.len());
+    let inputs = |x_hi: usize| -> (std::borrow::Cow<'_, [F128]>, std::borrow::Cow<'_, [F128]>) {
+        let (lo, hi) = (x_hi * per_chunk, (x_hi + 1) * per_chunk);
+        let p = pre_a.len();
+        if hi <= p {
+            (pre_a[lo..hi].into(), pre_b[lo..hi].into())
+        } else if lo >= p {
+            (a[lo..hi].into(), b[lo..hi].into())
+        } else {
+            ([&pre_a[lo..], &a[p..hi]].concat().into(), [&pre_b[lo..], &b[p..hi]].concat().into())
+        }
     };
     let chunk = |a_in: &[F128], b_in: &[F128], a_o: &mut [F128], b_o: &mut [F128]| -> [F128; 26] {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -3499,7 +3636,7 @@ pub(crate) fn fold_cascade_t_into_packed(
                 )
             };
             let (a_in, b_in) = inputs(x_hi);
-            let outv = chunk(a_in, b_in, a_o, b_o);
+            let outv = chunk(&a_in, &b_in, a_o, b_o);
             // SAFETY: exclusive owner of partials[x_hi].
             unsafe {
                 *partials_base.ptr().add(x_hi) = outv;
@@ -3508,7 +3645,7 @@ pub(crate) fn fold_cascade_t_into_packed(
         partials
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
-        vec![chunk(a_in, b_in, a_out, b_out)]
+        vec![chunk(&a_in, &b_in, a_out, b_out)]
     } else {
         use rayon::prelude::*;
         a_out
@@ -3517,7 +3654,7 @@ pub(crate) fn fold_cascade_t_into_packed(
             .enumerate()
             .map(|(x_hi, (a_o, b_o))| {
                 let (a_in, b_in) = inputs(x_hi);
-                chunk(a_in, b_in, a_o, b_o)
+                chunk(&a_in, &b_in, a_o, b_o)
             })
             .collect()
     };

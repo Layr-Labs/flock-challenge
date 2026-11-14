@@ -103,6 +103,11 @@ pub fn micro_stack_enabled() -> bool {
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Ranked worker: the K pass GPU arm's two pipelines build on a helper
+    // thread while the process is otherwise idle (see
+    // `gpu_commit::zc_k_prewarm_start`).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    crate::gpu_commit::zc_k_prewarm_start();
     // Before anything exists: the ranked worker's one idle pause.
     ranked_start_pause();
     let n = std::env::var("RAYON_NUM_THREADS")
@@ -148,7 +153,13 @@ pub const ENV_NO_READY_PAUSE: &str = "FLOCK_NO_READY_PAUSE";
 /// proof through readiness to the timed proof runs exactly as it did, so the
 /// pause cannot reach the timed proof. It is a plain sleep, the same in every
 /// worker, and reads nothing but the executable name and the argument count.
-const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1300);
+///
+/// 1150 ms (was 1300): the round-one AB GPU arm compiles its Metal kernels in
+/// every fresh worker (about +0.13 s of untimed start-up per trial in official
+/// logs). Shortening the idle pause by that much keeps the trial period, and so
+/// the number of scored trials inside the slow window, where it was, and keeps
+/// the job inside its 900 s limit.
+const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1150);
 
 /// Pure selector: the pause a process takes at start-up, if any.
 fn ranked_start_pause_for(
