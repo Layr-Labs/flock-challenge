@@ -1320,6 +1320,18 @@ pub const ENV_NO_GPU_PARENT3: &str = "FLOCK_NO_GPU_PARENT3";
 /// `leaf_hash` + `parent_hash3` when the supplemental PSO is NIL.
 pub const ENV_NO_GPU_LEAF_PARENT3: &str = "FLOCK_NO_GPU_LEAF_PARENT3";
 
+/// Exact-`1` rollback for the contiguous suffix-Merkle schedule. Deliberately
+/// read at each dispatch so a diagnostic can compare both arms in one process.
+pub const ENV_NO_GPU_SUFFIX_COALESCE: &str = "FLOCK_NO_GPU_SUFFIX_COALESCE";
+
+fn gpu_suffix_coalesce_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+pub(crate) fn gpu_suffix_coalesce_enabled() -> bool {
+    gpu_suffix_coalesce_value_enabled(std::env::var_os(ENV_NO_GPU_SUFFIX_COALESCE).as_deref())
+}
+
 fn gpu_parent3_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -1355,6 +1367,15 @@ fn select_gpu_leaf_parent3(pso_ok: bool) -> bool {
 #[cfg(test)]
 mod parent3_gate_tests {
     use std::ffi::OsStr;
+
+    #[test]
+    fn suffix_coalesce_default_on_exact_kill_switch() {
+        assert_eq!(super::ENV_NO_GPU_SUFFIX_COALESCE, "FLOCK_NO_GPU_SUFFIX_COALESCE");
+        assert!(!super::gpu_suffix_coalesce_value_enabled(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("01"), Some("true")] {
+            assert!(super::gpu_suffix_coalesce_value_enabled(value.map(OsStr::new)));
+        }
+    }
 
     #[test]
     fn default_on_exact_kill_switch_and_ranked_tree_only() {
@@ -6884,6 +6905,11 @@ kernel void blake3_pow_scan(
     unsafe impl Send for Gpu {}
     unsafe impl Sync for Gpu {}
 
+    #[cfg(test)]
+    std::thread_local! {
+        pub(crate) static TEST_GPU_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     static GPU: OnceLock<Result<Gpu, String>> = OnceLock::new();
 
     pub(crate) fn gpu() -> Result<&'static Gpu, String> {
@@ -7843,6 +7869,8 @@ kernel void blake3_pow_scan(
         }
 
         pub(crate) unsafe fn dispatch(&self, enc: Id, groups: u64, threads_per_group: u64) {
+            #[cfg(test)]
+            TEST_GPU_DISPATCHES.set(TEST_GPU_DISPATCHES.get() + 1);
             unsafe {
                 send!(
                     self.api,
@@ -8776,6 +8804,166 @@ kernel void blake3_pow_scan(
                 local_start /= 2;
                 local_len = n_out;
             }
+        }
+    }
+
+    /// The exact rollback keeps the incumbent aligned-subtree forest. The
+    /// boolean is explicit so the native engagement test exercises both arms
+    /// without mutating process environment while Metal may have worker threads.
+    pub(crate) unsafe fn encode_merkle_suffix_selected(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves: usize,
+        leaf_start: usize,
+        parent3: bool,
+        coalesce: bool,
+    ) {
+        unsafe {
+            if coalesce {
+                encode_merkle_suffix_impl(
+                    gpu, enc, codeword_buf, tree_buf, n_leaves, leaf_start, parent3,
+                );
+            } else {
+                let mut start = leaf_start;
+                while start < n_leaves {
+                    let mut size = 1usize << (n_leaves - start).ilog2();
+                    while start % size != 0 {
+                        size >>= 1;
+                    }
+                    encode_merkle_subtree_impl(
+                        gpu, enc, codeword_buf, tree_buf, n_leaves, start, size, parent3,
+                    );
+                    start += size;
+                }
+            }
+        }
+    }
+
+    /// Hash one contiguous CPU-owned suffix into the global flat tree, stopping
+    /// at the sixteen-node CPU join. Unlike a forest of power-of-two subtrees,
+    /// this needs only one leaf dispatch and one dispatch per remaining level
+    /// (or parent3 ladder). A fine split may leave an unpaired first child: its
+    /// crossing parent belongs to the existing CPU boundary reconstruction.
+    pub(crate) unsafe fn encode_merkle_suffix_impl(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves: usize,
+        leaf_start: usize,
+        parent3: bool,
+    ) {
+        debug_assert!(n_leaves.is_power_of_two() && n_leaves >= 256);
+        debug_assert!(leaf_start < n_leaves);
+        unsafe {
+            let pso_leaf = if gpu.pso_leaf_v4.is_null() {
+                gpu.pso_leaf
+            } else {
+                gpu.pso_leaf_v4
+            };
+            let pso_parent3 = if gpu.pso_parent3_v4.is_null() {
+                gpu.pso_parent3
+            } else {
+                gpu.pso_parent3_v4
+            };
+            let mut level_start = 0usize;
+            let mut level_len = n_leaves;
+            let mut local_start = leaf_start;
+            let local_len = n_leaves - leaf_start;
+            if parent3
+                && super::select_gpu_leaf_parent3(!gpu.pso_leaf_parent3.is_null())
+                && local_len.is_multiple_of(256)
+            {
+                gpu.set_pipeline(enc, gpu.pso_leaf_parent3);
+                gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
+                gpu.set_buffer(enc, tree_buf, local_start * 32, 1);
+                gpu.set_buffer(enc, tree_buf, (level_len + local_start / 2) * 32, 2);
+                gpu.set_buffer(
+                    enc,
+                    tree_buf,
+                    (level_len + level_len / 2 + local_start / 4) * 32,
+                    3,
+                );
+                gpu.set_buffer(
+                    enc,
+                    tree_buf,
+                    (level_len + level_len / 2 + level_len / 4 + local_start / 8) * 32,
+                    4,
+                );
+                gpu.dispatch(enc, (local_len / 256) as u64, 256);
+                level_start += level_len + level_len / 2 + level_len / 4;
+                level_len /= 8;
+                local_start /= 8;
+            } else {
+                gpu.set_pipeline(enc, pso_leaf);
+                gpu.set_buffer(enc, codeword_buf, leaf_start * 1024, 0);
+                gpu.set_buffer(enc, tree_buf, leaf_start * 32, 1);
+                let tpg = exact_merkle_threads(local_len);
+                gpu.dispatch(enc, (local_len / tpg) as u64, tpg as u64);
+            }
+
+            while level_len > 16 {
+                let local_len = level_len - local_start;
+                if parent3 && local_len >= 256 && local_len.is_multiple_of(256) {
+                    gpu.set_pipeline(enc, pso_parent3);
+                    gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
+                    gpu.set_buffer(
+                        enc,
+                        tree_buf,
+                        (level_start + level_len + local_start / 2) * 32,
+                        1,
+                    );
+                    gpu.set_buffer(
+                        enc,
+                        tree_buf,
+                        (level_start + level_len + level_len / 2 + local_start / 4) * 32,
+                        2,
+                    );
+                    gpu.set_buffer(
+                        enc,
+                        tree_buf,
+                        (level_start + level_len + level_len / 2 + level_len / 4 + local_start / 8)
+                            * 32,
+                        3,
+                    );
+                    gpu.dispatch(enc, (local_len / 256) as u64, 128);
+                    level_start += level_len + level_len / 2 + level_len / 4;
+                    level_len /= 8;
+                    local_start /= 8;
+                } else {
+                    // Only pairs with both children in the suffix are owned.
+                    let parent_start = local_start.div_ceil(2);
+                    let parent_len = level_len / 2 - parent_start;
+                    if parent_len > 0 {
+                        gpu.set_pipeline(enc, gpu.pso_parent);
+                        gpu.set_buffer(enc, tree_buf, (level_start + 2 * parent_start) * 32, 0);
+                        gpu.set_buffer(
+                            enc,
+                            tree_buf,
+                            (level_start + level_len + parent_start) * 32,
+                            1,
+                        );
+                        let tpg = exact_merkle_threads(parent_len);
+                        gpu.dispatch(enc, (parent_len / tpg) as u64, tpg as u64);
+                    }
+                    level_start += level_len;
+                    level_len /= 2;
+                    local_start = parent_start;
+                }
+            }
+        }
+    }
+
+    /// The kernels have no bounds check. Non-power-of-two suffix counts must
+    /// launch exactly `count` threads, not a rounded or truncated 256-wide grid.
+    fn exact_merkle_threads(count: usize) -> usize {
+        debug_assert!(count > 0);
+        if count <= 256 {
+            count
+        } else {
+            1usize << count.trailing_zeros().min(8)
         }
     }
 
@@ -10124,9 +10312,9 @@ kernel void blake3_pow_scan(
                 // S1: the GPU hashes the CPU suffix's leaves and subtree
                 // parents. The CPU still finishes the suffix NTT (same
                 // kernels, same order, a no-op chunk callback), then queues
-                // one more command buffer that runs the same
-                // `encode_merkle_subtree` kernels the GPU prefix uses over
-                // the suffix's aligned subtrees. Same leaf bytes, same BLAKE3
+                // one more command buffer that runs the same Merkle kernels
+                // over the contiguous suffix, stopping at the CPU join.
+                // Same leaf bytes, same BLAKE3
                 // tree, same flat-tree slots, so the root is unchanged.
                 if hybrid_gpu_suffix_hash_enabled() {
                     let t_cpu_ntt = std::time::Instant::now();
@@ -10175,15 +10363,16 @@ kernel void blake3_pow_scan(
                     crate::tmark::mark("hybrid cpu ntt done");
                     let cb3 = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb3)?;
-                    let mut sstart = suffix_leaf_start;
-                    while sstart < n_leaves {
-                        let mut size = 1usize << (n_leaves - sstart).ilog2();
-                        while sstart % size != 0 {
-                            size >>= 1;
-                        }
-                        encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, sstart, size);
-                        sstart += size;
-                    }
+                    encode_merkle_suffix_selected(
+                        gpu,
+                        enc,
+                        staging,
+                        tree_buf,
+                        n_leaves,
+                        suffix_leaf_start,
+                        super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled()),
+                        super::gpu_suffix_coalesce_enabled(),
+                    );
                     gpu.end_encoding(enc);
                     // Completion signal outside the tuner's sweep only: the
                     // sweep prices arms from GPU timestamps read right after
@@ -11995,6 +12184,13 @@ kernel void blake3_pow_scan(
         };
         let key = if super::gpu_final_leaf_enabled() {
             key ^ fnv1a64(&final_leaf_msl_source()).rotate_left(5) ^ 0x464C_4541_465F_3431
+        } else {
+            key
+        };
+        // The contiguous suffix schedule changes cb3's launch cost. Do not
+        // reuse a split priced using the incumbent power-of-two forest.
+        let key = if hybrid_gpu_suffix_hash_enabled() && super::gpu_suffix_coalesce_enabled() {
+            key ^ 0x5355_4646_4958_3031 // "SUFFIX01"
         } else {
             key
         };
@@ -21687,6 +21883,102 @@ mod tests {
             gpu.pool_pop(pool);
         }
     }
+
+    /// Hardware-required engagement gate: real production encoder, all fine
+    /// split points, CPU BLAKE3 oracle, and sentinels for every unowned slot.
+    #[test]
+    #[ignore = "requires real Metal; run explicitly for GPU schedule changes"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_suffix_forest_matches_cpu_compact() {
+        use super::imp;
+
+        const SENTINEL: crate::merkle::Hash = [0xA5; 32];
+        for (log_d, prefixes) in [
+            (12, (1..256).collect::<Vec<usize>>()),
+            (16, vec![1, 128, 166, 175, 176, 255]),
+        ] {
+            let n = 1usize << log_d;
+            let gpu = imp::gpu().expect("real Metal is required for the engagement gate");
+            assert!(!gpu.pso_leaf_parent3.is_null());
+            assert!(super::select_gpu_parent3(
+                1 << 20,
+                super::gpu_parent3_enabled()
+            ));
+            let mut rng = Rng::new(0xB3_5AFF_12);
+            let data: Vec<u8> = (0..n * 1024).map(|_| rng.next_u64() as u8).collect();
+            let expect = crate::merkle::merkle_tree(&data, n, crate::merkle::HashKind::Blake3);
+            unsafe {
+                let pool = gpu.pool_push();
+                let data_buf = gpu.new_buffer(data.len()).unwrap();
+                let tree_bytes = core::mem::size_of_val(expect.as_slice());
+                let tree_buf = gpu.new_buffer(tree_bytes).unwrap();
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    gpu.buffer_contents(data_buf),
+                    data.len(),
+                );
+                for parent3 in [false, true] {
+                    for &prefix256 in &prefixes {
+                        let start = prefix256 * (n / 256);
+                        imp::TEST_GPU_DISPATCHES.set(0);
+                        let cb = gpu.command_buffer().unwrap();
+                        let enc = gpu.compute_encoder(cb).unwrap();
+                        imp::encode_merkle_suffix_selected(
+                            gpu, enc, data_buf, tree_buf, n, start, parent3, false,
+                        );
+                        let before = imp::TEST_GPU_DISPATCHES.get();
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_wait(cb).unwrap();
+
+                        std::ptr::write_bytes(gpu.buffer_contents(tree_buf), 0xA5, tree_bytes);
+                        imp::TEST_GPU_DISPATCHES.set(0);
+                        let cb = gpu.command_buffer().unwrap();
+                        let enc = gpu.compute_encoder(cb).unwrap();
+                        imp::encode_merkle_suffix_selected(
+                            gpu, enc, data_buf, tree_buf, n, start, parent3, true,
+                        );
+                        let after = imp::TEST_GPU_DISPATCHES.get();
+                        gpu.end_encoding(enc);
+                        gpu.commit_and_wait(cb).unwrap();
+                        assert!(after > 0 && after <= before);
+                        let got = core::slice::from_raw_parts(
+                            gpu.buffer_contents(tree_buf).cast::<crate::merkle::Hash>(),
+                            expect.len(),
+                        );
+                        let mut level_start = 0usize;
+                        let mut level_len = n;
+                        let mut local_start = start;
+                        while level_len >= 16 {
+                            let owned = level_start + local_start..level_start + level_len;
+                            assert_eq!(
+                                &got[owned.clone()],
+                                &expect[owned],
+                                "owned suffix: parent3={parent3} prefix={prefix256} level={level_len}",
+                            );
+                            assert!(
+                                got[level_start..level_start + local_start]
+                                    .iter()
+                                    .all(|node| *node == SENTINEL)
+                            );
+                            level_start += level_len;
+                            level_len /= 2;
+                            local_start = local_start.div_ceil(2);
+                        }
+                        assert!(got[level_start..].iter().all(|node| *node == SENTINEL));
+                        if [166, 176, 128, 255].contains(&prefix256) {
+                            eprintln!(
+                                "suffix-production log_d={log_d} prefix256={prefix256} parent3={parent3} dispatches={before}->{after} cpu_exact=true sentinels=true",
+                            );
+                        }
+                    }
+                }
+                gpu.release(data_buf);
+                gpu.release(tree_buf);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
 
     /// The hybrid GPU prefix hashes aligned subtrees into global flat-tree
     /// slots. Verify the fused pass writes every owned node at every level and
