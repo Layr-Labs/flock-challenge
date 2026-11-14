@@ -7196,7 +7196,34 @@ kernel void blake3_pow_scan(
         if !super::gpu_commit_enabled() {
             return Err("gpu commit disabled".into());
         }
-        GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone())
+        let gpu = GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone());
+        if gpu.is_ok() {
+            zc_ab_prewarm_once();
+        }
+        gpu
+    }
+
+    /// Ranked worker: the moment the GPU exists (first use, in the warm-up
+    /// prove), start the round-one AB completion arm's one-time setup (its
+    /// shader library, pipelines and buffers) on a helper thread, so the
+    /// warm-up's round one finds it built instead of building it inline.
+    /// Once per process; nothing when the arm is off or its share is zero.
+    /// Applied unchanged from 7c51e3f9's recorded implementation.
+    fn zc_ab_prewarm_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if !crate::is_ranked_worker_process() || super::gpu_zc_ab_completion_share() == 0 {
+                return;
+            }
+            let Some(basis) = crate::zerocheck::univariate_skip_optimized::ab_completion_convert_basis() else {
+                return;
+            };
+            let _ = std::thread::Builder::new()
+                .name("zc-ab-prewarm".into())
+                .spawn(move || {
+                    let _ = zc_ab_state(basis);
+                });
+        });
     }
 
     fn init_gpu() -> Result<Gpu, String> {
