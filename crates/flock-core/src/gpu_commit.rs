@@ -1484,6 +1484,11 @@ pub(crate) const fn zero_lane_groups_per_block(s: usize) -> u64 {
 }
 
 /// Kill switch for the tabled ranked final NTT pass (`ntt_final_t3`):
+pub(crate) fn gpu_g1w_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G1W").is_none())
+}
+
 /// `FLOCK_NO_GPU_FINAL_T3` (any value) keeps `ntt_pass5_mixed`. Both kernels
 /// write the same bytes.
 pub(crate) fn gpu_final_t3_enabled() -> bool {
@@ -4010,7 +4015,7 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// failure leaves `ntt_fused_reg4g4` in place.
     /// The g4x2 library source in use: the twiddle-prefetch form unless
     /// `FLOCK_NO_GPU_TW_PREFETCH` is set.
-    fn g4x2_msl_source() -> &'static str {
+    pub(crate) fn g4x2_msl_source() -> &'static str {
         if super::gpu_tw_prefetch_enabled() {
             NTT_G4X2_TWL_MSL_SOURCE
         } else {
@@ -4473,6 +4478,120 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     }
 }
 "#;
+
+    pub(crate) const NTT_G1W_EXTRA_MSL: &str = r#"
+#ifndef G1W_PADN
+#define G1W_PADN 1u
+#endif
+// gf_build_byte16_twl over 128 threads: thread bit 6 owns entry bit 4.
+static inline void g1w_build(
+    threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = (lid >> 5) & 1u; // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;          // entry bits 2..3
+    const uint cc = u >> 2;          // entry bits 5..7
+    const uint hi = lid >> 6;        // entry bit 4
+    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    uint4 C = hi != 0u ? f0 : uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o = (cc << 5) + (hi << 4) + (aa << 2);
+    dst[o + 0u] = A ^ C;
+    dst[o + 1u] = A ^ e0 ^ C;
+    dst[o + 2u] = A ^ e1 ^ C;
+    dst[o + 3u] = A ^ e0 ^ e1 ^ C;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+#define NTT_G1W_SUBLAYER(J)                                                    \
+    {                                                                          \
+        constexpr uint j    = (J);                                             \
+        constexpr uint bpos = F - 1u - j;                                      \
+        constexpr uint NC   = 1u << j;                                         \
+        constexpr uint BPER = (NF >> 1) >> j;                                  \
+        for (uint c = 0; c < NC; c++) {                                        \
+            g1w_build(tabB, twl, (1u << j) - 1u + c, lid);                     \
+            for (uint bb = 0; bb < BPER; bb++) {                               \
+                const uint b   = c * BPER + bb;                                \
+                const uint low = b & ((1u << bpos) - 1u);                      \
+                const uint eu  = ((b >> bpos) << (bpos + 1u)) | low;           \
+                const uint ev  = eu | (1u << bpos);                            \
+                uint4 pa;                                                      \
+                uint4 pb;                                                      \
+                gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[0], pa, pb);            \
+                const uint4 na = ea[eu] ^ pa;                                  \
+                const uint4 nb = eb[eu] ^ pb;                                  \
+                ea[eu] = na;                                                   \
+                ea[ev] ^= na;                                                  \
+                eb[eu] = nb;                                                   \
+                eb[ev] ^= nb;                                                  \
+            }                                                                  \
+        }                                                                      \
+    }
+
+[[max_total_threads_per_threadgroup(128)]]
+kernel void ntt_g1w(device uint4* data                [[buffer(0)]],
+                    device const uint4* twiddles      [[buffer(1)]],
+                    constant NttParams& P             [[buffer(2)]],
+                    uint tgid [[threadgroup_position_in_grid]],
+                    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint F     = 4u;
+    constexpr uint NF    = 1u << F;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabB[512u];
+    threadgroup uint4 twl[32u];
+    threadgroup uint4 pad[G1W_PADN];   // residency only, never read
+
+    const uint lane = lid & 63u;
+    const uint B = tgid >> (P.s - LOG_G);
+    const uint r_base = (tgid & ((1u << (P.s - LOG_G)) - 1u)) << LOG_G;
+    if (lid < 15u) {
+        const uint q  = lid + 1u;
+        const uint jj = 31u - clz(q);
+        const uint cj = q - (1u << jj);
+        uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cj];
+        twl[lid] = g;
+        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
+        twl[16u + lid] = g;
+    }
+    const uint ra = r_base + ((lid >> 6) << 1);
+    const uint pa = (B << (P.log_d - P.l)) + ra;
+    const uint pb = pa + 1u;
+    uint4 ea[NF];
+    uint4 eb[NF];
+    for (uint e = 0; e < NF; e++) {
+        ea[e] = data[((pa + (e << P.s)) << 6) + lane];
+        eb[e] = data[((pb + (e << P.s)) << 6) + lane];
+    }
+    NTT_G1W_SUBLAYER(0u)
+    NTT_G1W_SUBLAYER(1u)
+    NTT_G1W_SUBLAYER(2u)
+    NTT_G1W_SUBLAYER(3u)
+    if (P.log_d == 77u) {          /* unreachable; keeps `pad` allocated */
+        pad[lid % G1W_PADN] = ea[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        ea[0] ^= pad[(lid + 1u) % G1W_PADN];
+    }
+    for (uint e = 0; e < NF; e++) {
+        data[((pa + (e << P.s)) << 6) + lane] = ea[e];
+        data[((pb + (e << P.s)) << 6) + lane] = eb[e];
+    }
+}
+"#;
+
+    pub(crate) fn g1w_msl_source() -> String {
+        format!("{NTT_G4X2_TWL_MSL_SOURCE}{NTT_G1W_EXTRA_MSL}")
+    }
 
     /// The ranked final NTT pass (l = log_d - 4, s = 0) with byte tables for
     /// sub-layers 0..2 and the short-twiddle Horner for sub-layer 3 only.
@@ -6890,7 +7009,9 @@ kernel void blake3_pow_scan(
         if !super::gpu_commit_enabled() {
             return Err("gpu commit disabled".into());
         }
-        GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone())
+        let g = GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone())?;
+        let _ = mid_pass_g1w_pso(g);
+        Ok(g)
     }
 
     fn init_gpu() -> Result<Gpu, String> {
@@ -8379,6 +8500,190 @@ kernel void blake3_pow_scan(
         }
     }
 
+    pub(crate) fn mid_pass_pso(gpu: &Gpu) -> (Id, u64) {
+        let g1w = mid_pass_g1w_pso(gpu);
+        if g1w.is_null() { (gpu.pso_ntt4g4x2, 64) } else { (g1w, 128) }
+    }
+
+    pub(crate) fn mid_pass_g1w_pso(gpu: &Gpu) -> Id {
+        static SEL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *SEL.get_or_init(|| unsafe { select_mid_pass(gpu) } as usize) as Id
+    }
+
+    pub(crate) static MID_PASS_TIMES: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+
+    unsafe fn select_mid_pass(gpu: &Gpu) -> Id {
+        if !super::gpu_g1w_enabled() || gpu.pso_ntt4g4x2.is_null() {
+            return NIL;
+        }
+        let force = std::env::var_os("FLOCK_G1W_FORCE").is_some();
+        let trace = debug_enabled() || window_trace_enabled();
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = MidPassBench::new(gpu).and_then(|bench| {
+                let mut chosen = NIL;
+                for pad in G1W_PADS {
+                    let pso = match compile_g1w(gpu, pad) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            if trace {
+                                eprintln!("[gpu-commit] g1w pad {pad} unavailable ({e})");
+                            }
+                            continue;
+                        }
+                    };
+                    let (inc, cand, wins) = bench.duel(pso)?;
+                    let keep = force || (wins && cand < 0.96 * inc);
+                    *MID_PASS_TIMES.lock().unwrap_or_else(|e| e.into_inner()) = (inc, cand);
+                    if trace {
+                        eprintln!(
+                            "[gpu-commit] mid-pass select: g4x2 {inc:.3} ms, g1w(pad {pad}) {cand:.3} ms, wins every rep {wins} -> {}",
+                            if keep { "g1w" } else { "g4x2" }
+                        );
+                    }
+                    if keep {
+                        G1W_PAD_SEL.store(pad, std::sync::atomic::Ordering::Relaxed);
+                        chosen = pso;
+                        break;
+                    }
+                    gpu.release(pso);
+                }
+                bench.release();
+                Ok(chosen)
+            });
+            gpu.pool_pop(pool);
+            r.unwrap_or_else(|e| {
+                if trace {
+                    eprintln!("[gpu-commit] mid-pass select failed ({e}); keeping g4x2");
+                }
+                NIL
+            })
+        }
+    }
+
+    const G1W_PADS: [u32; 1] = [1];
+    pub(crate) static G1W_PAD_SEL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    unsafe fn compile_g1w(gpu: &Gpu, pad: u32) -> Result<Id, String> {
+        let cold = if std::env::var_os("FLOCK_G1W_COLD").is_some() {
+            format!("// cold {} {:?}\n", std::process::id(), std::time::Instant::now())
+        } else {
+            String::new()
+        };
+        let src = g1w_msl_source().replacen(
+            "using namespace metal;\n",
+            &format!("using namespace metal;\n{cold}#define G1W_PADN {pad}u\n"),
+            1,
+        );
+        unsafe {
+            let pso = compile_supplemental_pipeline(gpu, &src, "ntt_g1w")?;
+            let max_threads: u64 = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel) -> u64,
+                pso,
+                c"maxTotalThreadsPerThreadgroup"
+            );
+            if max_threads < 128 {
+                gpu.release(pso);
+                return Err(format!("g1w pipeline allows {max_threads} threads"));
+            }
+            Ok(pso)
+        }
+    }
+
+    struct MidPassBench<'a> {
+        gpu: &'a Gpu,
+        data: Id,
+        tw: Id,
+    }
+
+    impl<'a> MidPassBench<'a> {
+        const LOG_D: u32 = 20;
+        const L: u32 = 8;
+        const DATA_BYTES: usize = 32 << 20;
+        const TW_BYTES: usize = 16 << 12;
+        const GROUPS: u64 = (1u64 << (20 - 4 - 2)) / 32;
+
+        unsafe fn new(gpu: &'a Gpu) -> Result<Self, String> {
+            unsafe {
+                let data = gpu.new_buffer(Self::DATA_BYTES)?;
+                let tw = match gpu.new_buffer(Self::TW_BYTES) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        gpu.release(data);
+                        return Err(e);
+                    }
+                };
+                let mut x = 0x9E37_79B9_7F4A_7C15u64;
+                for (buf, len) in [(data, Self::DATA_BYTES), (tw, Self::TW_BYTES)] {
+                    let w = core::slice::from_raw_parts_mut(gpu.buffer_contents(buf).cast::<u64>(), len / 8);
+                    for v in w.iter_mut() {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        *v = x;
+                    }
+                }
+                Ok(Self { gpu, data, tw })
+            }
+        }
+
+        unsafe fn run(&self, pso: Id, tpg: u64) -> Result<f64, String> {
+            let gpu = self.gpu;
+            unsafe {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, self.data, 0, 0);
+                gpu.set_buffer(enc, self.tw, 0, 1);
+                let prm = NttParams { log_d: Self::LOG_D, l: Self::L, f: 4, s: Self::LOG_D - Self::L - 4 };
+                let bytes = core::slice::from_raw_parts(
+                    (&prm as *const NttParams).cast::<u8>(),
+                    core::mem::size_of::<NttParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 2);
+                gpu.dispatch(enc, Self::GROUPS, tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb)?;
+                let (s0, e0) = cb_gpu_interval(gpu, cb);
+                if !(e0 > s0) {
+                    return Err("no GPU timestamps".into());
+                }
+                Ok((e0 - s0) * 1e3)
+            }
+        }
+
+        unsafe fn duel(&self, cand: Id) -> Result<(f64, f64, bool), String> {
+            let mut inc = f64::MAX;
+            let mut best = f64::MAX;
+            let mut wins = true;
+            for rep in 0..4 {
+                let (a, b) = unsafe {
+                    if rep % 2 == 0 {
+                        let a = self.run(self.gpu.pso_ntt4g4x2, 64)?;
+                        (a, self.run(cand, 128)?)
+                    } else {
+                        let b = self.run(cand, 128)?;
+                        (self.run(self.gpu.pso_ntt4g4x2, 64)?, b)
+                    }
+                };
+                if rep > 0 {
+                    inc = inc.min(a);
+                    best = best.min(b);
+                    wins &= b < a;
+                }
+            }
+            Ok((inc, best, wins))
+        }
+
+        unsafe fn release(self) {
+            unsafe {
+                self.gpu.release(self.data);
+                self.gpu.release(self.tw);
+            }
+        }
+    }
+
     /// Encode the fused NTT passes for `layers [start_layer, log_d)` over a
     /// 64-lane interleaved buffer bound at `data_buf`.
     pub(crate) unsafe fn encode_ntt_passes(
@@ -8435,7 +8740,8 @@ kernel void blake3_pow_scan(
                         (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
                     }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
-                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                        let (pso, tpg) = mid_pass_pso(gpu);
+                        (pso, tpg, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
@@ -8513,7 +8819,8 @@ kernel void blake3_pow_scan(
                         (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
                     }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
-                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                        let (pso, tpg) = mid_pass_pso(gpu);
+                        (pso, tpg, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
@@ -8598,7 +8905,8 @@ kernel void blake3_pow_scan(
                         (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
                     }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
-                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                        let (pso, tpg) = mid_pass_pso(gpu);
+                        (pso, tpg, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
@@ -11992,6 +12300,14 @@ kernel void blake3_pow_scan(
                 ^ 0x5A45_524F_4C41_4E45 // "ZEROLANE"
         } else {
             key
+        };
+        let key = match gpu() {
+            Ok(g) if !mid_pass_g1w_pso(g).is_null() => {
+                key ^ fnv1a64(&g1w_msl_source()).rotate_left(9)
+                    ^ 0x4731_575F_4D49_4450
+                    ^ u64::from(G1W_PAD_SEL.load(std::sync::atomic::Ordering::Relaxed)).rotate_left(40)
+            }
+            _ => key,
         };
         let key = if super::gpu_final_leaf_enabled() {
             key ^ fnv1a64(&final_leaf_msl_source()).rotate_left(5) ^ 0x464C_4541_465F_3431
@@ -24334,6 +24650,80 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             gpu.release(tw_buf);
             gpu.pool_pop(pool);
             assert!(exact);
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn g1w_matches_g4x2_every_mid_shape() {
+        use super::imp;
+        let gpu = match gpu_or_skip(imp::gpu().map(|g| g as *const imp::Gpu)) {
+            Some(g) => unsafe { &*g },
+            None => return,
+        };
+        if gpu.pso_ntt4g4x2.is_null() {
+            return;
+        }
+        let log_d = 16usize;
+        let ntt = AdditiveNttF128::standard(log_d);
+        let twiddles = flat_twiddle_table(&ntt, log_d);
+        let mut rng = Rng::new(0x6731);
+        let pso_w = unsafe {
+            imp::compile_supplemental_pipeline(gpu, &imp::g1w_msl_source(), "ntt_g1w").unwrap()
+        };
+        unsafe {
+            let pool = gpu.pool_push();
+            let bytes = (64usize << log_d) * 16;
+            let a = gpu.new_buffer(bytes).unwrap();
+            let b = gpu.new_buffer(bytes).unwrap();
+            let tw = gpu.new_buffer(core::mem::size_of_val(twiddles.as_slice())).unwrap();
+            std::ptr::copy_nonoverlapping(
+                twiddles.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(tw),
+                core::mem::size_of_val(twiddles.as_slice()),
+            );
+            let init = rng.vec(64 << log_d);
+            for buf in [a, b] {
+                std::ptr::copy_nonoverlapping(init.as_ptr().cast::<u8>(), gpu.buffer_contents(buf), bytes);
+            }
+            let pass = |buf: imp::Id, pso: imp::Id, tpg: u64, l: usize, frac16: u64| {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, buf, 0, 0);
+                gpu.set_buffer(enc, tw, 0, 1);
+                let p = imp::NttParams { log_d: log_d as u32, l: l as u32, f: 4, s: (log_d - l - 4) as u32 };
+                let pb = core::slice::from_raw_parts(
+                    (&p as *const imp::NttParams).cast::<u8>(),
+                    core::mem::size_of::<imp::NttParams>(),
+                );
+                gpu.set_bytes(enc, pb, 2);
+                gpu.dispatch(enc, (1u64 << (log_d - 4 - 2)) / 16 * frac16, tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+            };
+            let same = || {
+                core::slice::from_raw_parts(gpu.buffer_contents(a), bytes)
+                    == core::slice::from_raw_parts(gpu.buffer_contents(b), bytes)
+            };
+            let mut shapes = 0;
+            for frac16 in [16u64, 11] {
+                for l in [4usize, 8] {
+                    pass(a, gpu.pso_ntt4g4x2, 64, l, frac16);
+                    pass(b, pso_w, 128, l, frac16);
+                    assert!(same(), "g1w != g4x2 at l={l} frac={frac16}/16");
+                    shapes += 1;
+                }
+            }
+            assert_eq!(shapes, 4);
+            assert_ne!(
+                core::slice::from_raw_parts(gpu.buffer_contents(a).cast::<F128>(), 64 << log_d),
+                &init[..]
+            );
+            for x in [a, b, tw, pso_w] {
+                gpu.release(x);
+            }
+            gpu.pool_pop(pool);
         }
     }
 

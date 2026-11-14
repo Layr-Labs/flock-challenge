@@ -1386,6 +1386,7 @@ unsafe fn emit_root_rows_ab_s256(a: *const u8, b: *const u8, dst: *mut u8, ops: 
                 vreinterpretq_u8_u64(r[3]),
             );
             core::arch::asm!(
+                ".p2align 4",
                 "stnp {y0:q}, {y1:q}, [{dst}]",
                 "stnp {y2:q}, {y3:q}, [{dst}, #32]",
                 dst = in(reg) dst,
@@ -1505,6 +1506,7 @@ unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut 
                 vreinterpretq_u8_u64(r[3]),
             );
             core::arch::asm!(
+                ".p2align 4",
                 "stnp {y0:q}, {y1:q}, [{dst}]",
                 "stnp {y2:q}, {y3:q}, [{dst}, #32]",
                 dst = in(reg) dst,
