@@ -292,20 +292,40 @@ fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
     // read; uninit is safe.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = F128::ONE;
+    // The doubling levels run through the two-lane PMULL level kernel
+    // (`expand_eq_table_level`): below the crossover each level is one serial
+    // kernel call instead of a per-entry closure, above it 256-entry `lo`/`hi`
+    // chunk pairs over Rayon instead of per-element parallel zips. The
+    // kernel's `hi[x] = lo[x]·r_i`, `lo[x] = lo[x] + hi[x]` is the same pair
+    // of field operations as the closure it replaces, so the table is
+    // bit-identical. `FLOCK_NO_EQ_KERNEL_RS=1` restores the closure doubling.
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let kernel = !*OFF.get_or_init(|| std::env::var_os("FLOCK_NO_EQ_KERNEL_RS").is_some());
     // Threshold below which rayon dispatch overhead beats the parallel work.
     const PAR_THRESHOLD: usize = 1 << 12;
+    const PAR_CHUNK: usize = 1 << 8;
     for i in 0..n {
         let r_i = r[i];
         let half = 1usize << i;
         let (lo, hi_rest) = t.split_at_mut(half);
         let hi = &mut hi_rest[..half];
         if half < PAR_THRESHOLD {
-            for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
-                let old = *lo_x;
-                let old_r = old * r_i;
-                *hi_x = old_r;
-                *lo_x = old + old_r;
+            if kernel {
+                crate::field::f128_slice::expand_eq_table_level(lo, hi, r_i);
+            } else {
+                for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
+                    let old = *lo_x;
+                    let old_r = old * r_i;
+                    *hi_x = old_r;
+                    *lo_x = old + old_r;
+                }
             }
+        } else if kernel {
+            lo.par_chunks_mut(PAR_CHUNK)
+                .zip(hi.par_chunks_mut(PAR_CHUNK))
+                .for_each(|(lo_chunk, hi_chunk)| {
+                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_i);
+                });
         } else {
             lo.par_iter_mut()
                 .zip(hi.par_iter_mut())
@@ -3897,6 +3917,31 @@ mod tests {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
             }
+        }
+    }
+
+    #[test]
+    fn build_eq_parallel_matches_scalar_doubling() {
+        // The doubling levels route through the PMULL level kernel; the table
+        // must equal the scalar closure doubling at every size.
+        let mut rng = Rng::new(0x5EED_BEEF);
+        for d in 0..=17usize {
+            let r: Vec<F128> = (0..d).map(|_| rng.f128()).collect();
+            let mut expected = crate::alloc_uninit_f128_vec(1usize << d);
+            expected[0] = F128::ONE;
+            for i in 0..d {
+                let r_i = r[i];
+                let half = 1usize << i;
+                let (lo, rest) = expected.split_at_mut(half);
+                let hi = &mut rest[..half];
+                for x in 0..half {
+                    let old = lo[x];
+                    let old_r = old * r_i;
+                    hi[x] = old_r;
+                    lo[x] = old + old_r;
+                }
+            }
+            assert_eq!(build_eq_parallel(&r), expected, "build_eq_parallel d={d}");
         }
     }
 
