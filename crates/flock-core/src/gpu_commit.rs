@@ -764,7 +764,13 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
                 .expect("FLOCK_ZC_AB_GPU_CHUNKS must be a non-negative integer"),
         }
     });
-    if gpu_commit_enabled() { *SHARE } else { 0 }
+    let share = if gpu_commit_enabled() { *SHARE } else { 0 };
+    // Diagnostic run: `tmark::arm()` is 0 in every timed proof.
+    match crate::tmark::arm() {
+        crate::tmark::ARM_D1_OFF => 0,
+        crate::tmark::ARM_D1_X2 => 2 * share,
+        _ => share,
+    }
 }
 
 /// Diagnostic trace for the round-one AB completion arm: the warm-up oracle
@@ -1265,6 +1271,13 @@ pub(crate) fn gpu_keepwarm_enabled() -> bool {
 pub fn gpu_keepwarm_prove_started() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     imp::keepwarm_pause();
+}
+
+/// Diagnostic run: after extra untimed proves, put the keep-warm bridge back
+/// in the state the warm-up prove left it in.
+pub fn gpu_keepwarm_unpause_if_started() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::keepwarm_unpause_if_started();
 }
 
 pub fn gpu_keepwarm_resume() {
@@ -11072,6 +11085,12 @@ kernel void blake3_pow_scan(
     /// the same CPU/GPU balance. `FLOCK_HYBRID_CPU_BLOCKS` remains the exact
     /// split-point override.
     fn hybrid_cpu_sixteenths() -> usize {
+        // Diagnostic run: `tmark::arm()` is 0 in every timed proof, and then
+        // `telem_split` returns its argument.
+        crate::tmark::telem_split(hybrid_cpu_sixteenths_tuned())
+    }
+
+    fn hybrid_cpu_sixteenths_tuned() -> usize {
         if let Some(k) = hybrid_cpu_split_override() {
             return k;
         }
@@ -12257,6 +12276,15 @@ kernel void blake3_pow_scan(
             None => swept,
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        // Diagnostic run: the split this selection publishes without the
+        // fine refinement (exactly the `FLOCK_NO_HYBRID_FINE` selection over
+        // the same samples), recorded for the paired NOFINE arm.
+        let telem_coarse = if tune_fit_enabled() && chosen != 0 {
+            split_from_fit(&fine_samples, false, tune_cb3_launch_latency_ms())
+        } else {
+            None
+        }
+        .unwrap_or(chosen);
         let fit = if tune_fit_enabled() && chosen != 0 {
             split_from_fit(
                 &fine_samples,
@@ -12358,6 +12386,7 @@ kernel void blake3_pow_scan(
                 if verified { chosen } else { 0 },
             );
         }
+        crate::tmark::telem_set_coarse_split(if verified { telem_coarse } else { 0 });
         finish_ranked_exact_contention_tune(params, cpu_tree, if verified { chosen } else { 0 });
     }
 
@@ -12390,6 +12419,15 @@ kernel void blake3_pow_scan(
 
     pub(crate) fn keepwarm_pause() {
         KEEPWARM_PAUSED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Diagnostic run: undo a [`keepwarm_pause`] if, and only if, the bridge
+    /// had been started (never starts it).
+    pub(crate) fn keepwarm_unpause_if_started() {
+        use std::sync::atomic::Ordering;
+        if KEEPWARM_STARTED.load(Ordering::Acquire) {
+            KEEPWARM_PAUSED.store(false, Ordering::Release);
+        }
     }
 
     /// Resume (and lazily spawn) the keep-warm thread. Called only from the
@@ -14758,6 +14796,15 @@ kernel void lc_fold_stripes_factored_b4(
                 // Pair the fold's GPU wall and window wall with the idle-fill
                 // primer's GPU wall at its later drain (see `[zc-idle-fill]`).
                 zc_idle_fill_note_fold(gpu_ms, wall_ms);
+                // Diagnostic run: the C-fold window's slack (submit-to-drain
+                // wall minus the fold's GPU wall, the `[zc-idle-fill]` pair),
+                // as a mark whose distance from "cfold base" is the slack.
+                if crate::tmark::on() {
+                    let t = crate::tmark::now_ns();
+                    let slack_ns = ((wall_ms - gpu_ms).max(0.0) * 1e6) as u64;
+                    crate::tmark::mark_ns("cfold base", t);
+                    crate::tmark::mark_ns("cfold slack", t + slack_ns);
+                }
             }
             if self.arm == FoldArm::Lincheck {
                 // WARMUP RATIO GATE (failed.md §24 — an idle-GPU split
@@ -19281,9 +19328,16 @@ kernel void zc_ab_finish(
         };
         unsafe {
             let waited = std::time::Instant::now();
+            // Diagnostic run: the CPU's wait for the GPU prefix at use.
+            crate::tmark::mark("d1 wait start");
             // The main buffer reads the tables buffer, so it completes after
             // the table build; the table build's status is checked too.
             let ok = gpu.spin_wait_cb(job.cb, 2.0).and_then(|()| gpu.wait_cb(job.cb_tables));
+            crate::tmark::mark("d1 wait end");
+            if ok.is_ok() && crate::tmark::on() {
+                let (s, e) = cb_gpu_interval(gpu, job.cb);
+                crate::tmark::mark_gpu("d1 gpu start", "d1 gpu end", s, e);
+            }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let (tables_ms, gather_ms) = if ok.is_ok() {
                 (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
