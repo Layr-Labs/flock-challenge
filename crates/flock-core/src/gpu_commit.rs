@@ -1527,15 +1527,26 @@ impl Drop for GpuZeroTailLanes {
     }
 }
 
+/// Kill switch for the compacted grid on the s = 8 pass (layers 8..11):
+/// `FLOCK_NO_GPU_ZERO_LANE_S8` (any value) keeps that pass on the dense g4x2
+/// grid. Read once.
+pub(crate) fn gpu_zero_lane_s8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_ZERO_LANE_S8").is_none())
+}
+
 /// True when a mid pass at `(log_d, s)` may run the compacted grid: switch on,
 /// the ranked geometry published, and the s = 12 pass (layers 4..7), whose
-/// blocks hold 4,096 tiles = exactly 968 full compacted groups. (At s = 8 the
-/// last group of a block would be half empty and need per-slot validity
-/// flags; at s = 4 a block's 3.78 live groups still round up to 4.)
+/// blocks hold 4,096 tiles = exactly 968 full compacted groups, or the s = 8
+/// pass (layers 8..11), whose blocks hold 128 tile pairs = 15,488 live
+/// columns = 60.5 groups: 61 groups per block, the last one running only its
+/// first round of 128 columns (the kernel skips a round that starts past the
+/// block's live columns, uniformly per group, so no partial round exists).
+/// At s = 4 a block's 7.56 live rounds still round up to the dense 8.
 #[inline]
 pub(crate) fn gpu_zero_lane_pass(log_d: usize, s: usize) -> bool {
     log_d == 20
-        && s == 12
+        && (s == 12 || (s == 8 && gpu_zero_lane_s8_enabled()))
         && gpu_zero_lane_enabled()
         && GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst) == GPU_ZERO_TAIL_LANES_RANKED
 }
@@ -1545,6 +1556,26 @@ pub(crate) fn gpu_zero_lane_pass(log_d: usize, s: usize) -> bool {
 #[inline]
 pub(crate) const fn zero_lane_groups_per_block(s: usize) -> u64 {
     ((121u64 << s) + 511) >> 9
+}
+
+/// Kill switch for the zero-lane compacted grid of the streamed from-z first
+/// pass (the band kernel): `FLOCK_NO_GPU_ZERO_LANE_BAND` (any value) keeps the
+/// dense grid. Read once.
+pub(crate) fn gpu_zero_lane_band_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_ZERO_LANE_BAND").is_none())
+}
+
+/// True when the from-z first pass may run the compacted grid: switches on,
+/// the ranked shape and the ranked zero geometry published (or assumed, for
+/// the ranked worker's warm-up band warm).
+#[inline]
+pub(crate) fn gpu_zero_lane_band_pass(log_d: usize, assume_ranked: bool) -> bool {
+    log_d == 20
+        && gpu_zero_lane_enabled()
+        && gpu_zero_lane_band_enabled()
+        && (assume_ranked
+            || GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst) == GPU_ZERO_TAIL_LANES_RANKED)
 }
 
 /// Kill switch for the tabled ranked final NTT pass (`ntt_final_t3`):
@@ -1926,10 +1957,12 @@ pub unsafe fn begin_from_z_first_pass_stream(
 /// worker warmup.
 pub const ENV_NO_STREAM_WARM: &str = "FLOCK_NO_STREAM_WARM";
 
-/// Run the streamed first-pass band kernel once over the latched buffers
-/// (see [`ENV_NO_STREAM_WARM`]). Untimed warmup only; a no-op off the ranked
-/// GPU shape, without a latched commit, while staging is leased, or killed.
-pub fn warm_streamed_first_pass(params: &crate::pcs::commit::PcsParams) {
+/// Submit the streamed first-pass band kernel once over the latched buffers
+/// (see [`ENV_NO_STREAM_WARM`]) without waiting, so it overlaps the warmup's
+/// remaining CPU tail; [`warm_streamed_first_pass_end`] waits for it and
+/// returns the staging lease. Untimed warmup only; a no-op off the ranked GPU
+/// shape, without a latched commit, while staging is leased, or killed.
+pub fn warm_streamed_first_pass_begin(params: &crate::pcs::commit::PcsParams) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ON.get_or_init(|| !std::env::var(ENV_NO_STREAM_WARM).is_ok_and(|v| v == "1"));
     if !on
@@ -1940,7 +1973,14 @@ pub fn warm_streamed_first_pass(params: &crate::pcs::commit::PcsParams) {
         return;
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    imp::warm_streamed_first_pass(params.k_code());
+    imp::warm_streamed_first_pass_begin(params.k_code());
+}
+
+/// Wait for a warm submitted by [`warm_streamed_first_pass_begin`] (no-op
+/// when none is pending) and release the staging lease it held.
+pub fn warm_streamed_first_pass_end() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::warm_streamed_first_pass_end();
 }
 
 impl FromZFirstPassStream {
@@ -4002,6 +4042,67 @@ kernel void export_from_z_zero_root_tabs(
         }
     }
 
+    /// The zero-root library as compiled: [`zero_root_msl_source`] plus, when
+    /// the band switches are on, the compacted band kernel
+    /// `ntt_fused_reg4_from_zg4_zero_root_zl` (same library, one compile).
+    pub(crate) fn zero_root_library_source() -> &'static str {
+        static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        if !(super::gpu_zero_lane_enabled() && super::gpu_zero_lane_band_enabled()) {
+            return zero_root_msl_source();
+        }
+        SRC.get_or_init(|| {
+            let base = zero_root_msl_source();
+            match zero_root_zero_lane_kernel(base) {
+                Some(k) => format!("{base}\n{k}"),
+                None => base.to_string(),
+            }
+        })
+    }
+
+    /// The production zero-root band kernel with the zero-lane compacted grid
+    /// of the mid passes (`g4x2_zero_lane_msl_source`): the ranked padding
+    /// keeps lanes 57..63 of every odd position zero in z, and the first pass
+    /// pairs positions an even distance apart, so those columns of every odd
+    /// tile are zero in and out. Each group's four rounds run 64 live
+    /// columns each: column `c` -> tile pair `q = c / 121`, whose first 64
+    /// columns are the even tile's lanes and the next 57 the odd tile's lanes
+    /// 0..56. A band of `r_count` tiles (a multiple of 512) is exactly
+    /// `r_count * 121 / 512` groups. The dead columns are not computed; with
+    /// `P.l != 0` (the first pass has l = 0, so `l` is free as a flag) they
+    /// are still written as the zeros the dense kernel computes for them,
+    /// pair `q`'s 16 x 7 words by the group that holds its first column.
+    /// With `P.l == 0` they are left untouched: only for a staging buffer
+    /// whose dead columns are known zero (see [`DEAD_COLUMNS_ZERO`]). All
+    /// tiles of the first pass share one twiddle set (l = 0), so any column
+    /// order runs the same butterflies over the same tables: bit-identical.
+    /// `None` if an anchor drifted (the dense band kernel stays).
+    pub(crate) fn zero_root_zero_lane_kernel(base: &str) -> Option<String> {
+        let start = base.find("kernel void ntt_fused_reg4_from_zg4_zero_root(\n")?;
+        let end = start + base[start..].find("// Test-only PSO.")?;
+        let mut k = base[start..end].to_string();
+        let reps: [(&str, &str); 3] = [
+            (
+                "kernel void ntt_fused_reg4_from_zg4_zero_root(\n",
+                "kernel void ntt_fused_reg4_from_zg4_zero_root_zl(\n",
+            ),
+            (
+                "    const uint lane = lid & 63u;\n    const uint r_base = tgid << LOG_G;\n    for (uint rr = 0u; rr < (1u << LOG_G); rr++) {\n        const uint r = r_base + rr;\n",
+                "    for (uint rr = 0u; rr < (1u << LOG_G); rr++) {\n        const uint c = (tgid << 8) + (rr << 6) + lid;\n        const uint q = c / 121u;\n        const uint m = c - q * 121u;\n        const uint o = m >= 64u ? 1u : 0u;\n        const uint r = (q << 1) + o;\n        const uint lane = m - (o << 6);\n",
+            ),
+            (
+                "            data[((r + (e << P.s)) << 6) + lane] = elems[e];\n        }\n    }\n}\n",
+                "            data[((r + (e << P.s)) << 6) + lane] = elems[e];\n        }\n    }\n    if (P.l != 0u) {\n        const uint q_lo = ((tgid << 8) + 120u) / 121u;\n        const uint q_hi = ((tgid << 8) + 376u) / 121u;\n        for (uint t = lid; t < (q_hi - q_lo) * 112u; t += 64u) {\n            const uint qd = t / 112u;\n            const uint w = t - qd * 112u;\n            const uint e = w / 7u;\n            const uint ln = 57u + (w - e * 7u);\n            data[(((((q_lo + qd) << 1) + 1u) + (e << P.s)) << 6) + ln] = uint4(0u);\n        }\n    }\n}\n",
+            ),
+        ];
+        for (a, b) in reps {
+            if k.matches(a).count() != 1 {
+                return None;
+            }
+            k = k.replacen(a, b, 1);
+        }
+        Some(k)
+    }
+
     pub(crate) fn zero_root_shl4_bases_source() -> &'static str {
         static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         SRC.get_or_init(|| {
@@ -4156,7 +4257,19 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
             }
             out = out.replacen(a, &b, 1);
         }
-        Some(out)
+        // A block's live columns end at 121 << (s - 1). At s = 12 that is a
+        // whole number of groups (the guard never fires); at s = 8 the last
+        // group's second round starts exactly there and is skipped whole.
+        // The test is uniform per group, so no barrier is split.
+        let round = "    for (uint it = 0; it < 2u; it++) {\n";
+        if out.matches(round).count() != 1 {
+            return None;
+        }
+        Some(out.replacen(
+            round,
+            "    for (uint it = 0; it < 2u; it++) {\n        if ((g << 8) + (it << 7) >= (121u << (P.s - 1u))) { break; }\n",
+            1,
+        ))
     }
 
     const NTT_G4X2_MSL_SOURCE: &str = r#"
@@ -4889,7 +5002,10 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 if super::super::gpu_zero_lane_enabled() {
                     assert!(super::super::gpu_zero_lane_pass(20, 12));
                 }
-                assert!(!super::super::gpu_zero_lane_pass(20, 8), "s = 8 would need validity flags");
+                assert_eq!(
+                    super::super::gpu_zero_lane_pass(20, 8),
+                    super::super::gpu_zero_lane_enabled() && super::super::gpu_zero_lane_s8_enabled()
+                );
                 assert!(!super::super::gpu_zero_lane_pass(20, 4));
                 assert!(!super::super::gpu_zero_lane_pass(18, 12));
                 let _h = super::super::GpuZeroTailLanes::scope(8, 7);
@@ -4969,7 +5085,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 let zl = compile_supplemental_pipeline(gpu, &g4x2_zero_lane_msl_source().unwrap(), "ntt_fused_reg4g4x2_zl").unwrap();
                 let read = || std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec();
                 let load = || std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
-                for l in [4usize] {
+                for l in [4usize, 8] {
                     load();
                     run_pass(gpu, dense, data, tw, l, dense_groups(l));
                     let a = read();
@@ -4984,7 +5100,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 let chain = |use_zl: bool| -> Vec<u8> {
                     load();
                     for l in [4usize, 8, 12] {
-                        if use_zl && l == 4 {
+                        if use_zl && l != 12 {
                             run_pass(gpu, zl, data, tw, l, zl_groups(l));
                         } else {
                             run_pass(gpu, dense, data, tw, l, dense_groups(l));
@@ -5016,6 +5132,116 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
             }
         }
 
+        /// The compacted band kernel vs the dense zero-root band kernel at
+        /// log_d = 14 (1,024 tiles, 512 pairs): full range in one dispatch and
+        /// as two 512-tile bands at buffer offsets, over a staging buffer
+        /// pre-filled with garbage (the dead columns must come out zero).
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn zero_lane_band_matches_dense() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let src = zero_root_library_source();
+            if !src.contains("kernel void ntt_fused_reg4_from_zg4_zero_root_zl(") {
+                return;
+            }
+            unsafe {
+                let pool = gpu.pool_push();
+                let log_d = 14usize;
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let z_pos = 1usize << (log_d - 1);
+                let z_len = z_pos * 64 * 16;
+                let mut x = 0x5EED_0B4Du64;
+                let mut zin: Vec<u8> = (0..z_len / 8)
+                    .flat_map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x.to_le_bytes()
+                    })
+                    .collect();
+                for p in (1..z_pos).step_by(2) {
+                    let o = (p * 64 + 57) * 16;
+                    zin[o..o + 7 * 16].fill(0);
+                }
+                let z = gpu.new_buffer(z_len).unwrap();
+                std::ptr::copy_nonoverlapping(zin.as_ptr(), gpu.buffer_contents(z), z_len);
+                let d_len = (1usize << log_d) * 64 * 16;
+                let data = gpu.new_buffer(d_len).unwrap();
+                let dense = compile_supplemental_pipeline(gpu, src, "ntt_fused_reg4_from_zg4_zero_root").unwrap();
+                let zl = compile_supplemental_pipeline(gpu, src, "ntt_fused_reg4_from_zg4_zero_root_zl").unwrap();
+                let tiles = 1usize << (log_d - 4);
+                // `l_flag` 1: the compacted kernel writes the dead columns
+                // (staging pre-filled with garbage); 0: it must leave them
+                // alone (staging garbage except dead columns pre-zeroed).
+                let run = |pso: Id, ranges: &[(usize, usize)], zl_grid: bool, l_flag: u32| -> Vec<u8> {
+                    std::ptr::write_bytes(gpu.buffer_contents(data), 0xAB, d_len);
+                    if zl_grid && l_flag == 0 {
+                        for p in (1..(1usize << log_d)).step_by(2) {
+                            std::ptr::write_bytes(gpu.buffer_contents(data).add((p * 64 + 57) * 16), 0, 7 * 16);
+                        }
+                    }
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    for &(r0, rc) in ranges {
+                        gpu.set_pipeline(enc, pso);
+                        gpu.set_buffer(enc, data, r0 * 1024, 0);
+                        gpu.set_buffer(enc, tw, 0, 1);
+                        let p = NttParams { log_d: log_d as u32, l: l_flag, f: 4, s: (log_d - 4) as u32 };
+                        let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                        gpu.set_bytes(enc, bytes, 2);
+                        gpu.set_buffer(enc, z, r0 * 1024, 3);
+                        let groups = if zl_grid { rc * 121 / 512 } else { rc / 4 };
+                        gpu.dispatch(enc, groups as u64, 64);
+                    }
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), d_len).to_vec()
+                };
+                let a = run(dense, &[(0, tiles)], false, 0);
+                assert!(!a.chunks(16).any(|c| c == [0xAB; 16]), "dense left an unwritten element");
+                for l_flag in [1u32, 0] {
+                    let b = run(zl, &[(0, tiles)], true, l_flag);
+                    assert!(a == b, "compacted band kernel diverges from dense (full range, l={l_flag})");
+                    let c = run(zl, &[(0, tiles / 2), (tiles / 2, tiles / 2)], true, l_flag);
+                    assert!(a == c, "compacted band kernel diverges from dense (two bands, l={l_flag})");
+                }
+                // l = 0 must not touch the dead columns.
+                std::ptr::write_bytes(gpu.buffer_contents(data), 0xAB, d_len);
+                {
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, zl);
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    let p = NttParams { log_d: log_d as u32, l: 0, f: 4, s: (log_d - 4) as u32 };
+                    let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                    gpu.set_bytes(enc, bytes, 2);
+                    gpu.set_buffer(enc, z, 0, 3);
+                    gpu.dispatch(enc, (tiles * 121 / 512) as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let d = std::slice::from_raw_parts(gpu.buffer_contents(data), d_len);
+                    for p in (1..(1usize << log_d)).step_by(2) {
+                        let o = (p * 64 + 57) * 16;
+                        assert!(d[o..o + 7 * 16].iter().all(|&x| x == 0xAB), "l = 0 wrote a dead column");
+                    }
+                }
+                for p in [dense, zl] {
+                    gpu.release(p);
+                }
+                gpu.release(tw);
+                gpu.release(z);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+
         /// GPU-ms per 1 GiB pass, dense vs compacted, interleaved rounds.
         #[test]
         #[ignore = "timing probe"]
@@ -5036,9 +5262,9 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                     run_pass(gpu, dense, data, tw, 8, dense_groups(8));
                 }
                 let rounds = 11usize;
-                let mut t = vec![vec![Vec::new(); 2]; 1]; // [l index][variant]
+                let mut t = vec![vec![Vec::new(); 2]; 2]; // [l index][variant]
                 for r in 0..rounds {
-                    for (li, l) in [4usize].into_iter().enumerate() {
+                    for (li, l) in [4usize, 8].into_iter().enumerate() {
                         for k in 0..2 {
                             let v = (k + r) % 2;
                             let (pso, g) = if v == 0 { (dense, dense_groups(l)) } else { (zl, zl_groups(l)) };
@@ -5050,7 +5276,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                         }
                     }
                 }
-                for (li, l) in [4usize].into_iter().enumerate() {
+                for (li, l) in [4usize, 8].into_iter().enumerate() {
                     let med = |v: &Vec<f64>| {
                         let mut v = v.clone();
                         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -6938,6 +7164,8 @@ kernel void blake3_pow_scan(
         /// PSO constructs eleven compact tables per group; it never reads a
         /// prebuilt device table.
         pub(crate) pso_ntt4zg4_zero_root: Id,
+        /// Zero-lane compacted band kernel (NIL: dense bands).
+        pub(crate) pso_ntt4zg4_zero_root_zl: Id,
         /// Real-Metal oracle exporter for the shared compact table builder.
         /// `NIL` outside `cfg(test)`.
         #[cfg_attr(not(test), allow(dead_code))]
@@ -7133,9 +7361,10 @@ kernel void blake3_pow_scan(
                 // Keep the embedded incumbent metallib byte-for-byte intact.
                 // The exact rollback skips this supplemental compile and
                 // selects the incumbent pso_ntt4zg4 below.
-                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
+                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs, pso_ntt4zg4_zero_root_zl) =
                     if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
-                        let src = api.nsstring(zero_root_msl_source())?;
+                        let lib_src = zero_root_library_source();
+                        let src = api.nsstring(lib_src)?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -7189,15 +7418,22 @@ kernel void blake3_pow_scan(
                         } else {
                             NIL
                         };
+                        // Compacted band kernel: any failure leaves NIL and
+                        // the bands keep the dense grid.
+                        let zl = if lib_src.contains("kernel void ntt_fused_reg4_from_zg4_zero_root_zl(") {
+                            build("ntt_fused_reg4_from_zg4_zero_root_zl").unwrap_or(NIL)
+                        } else {
+                            NIL
+                        };
                         send!(
                             api,
                             unsafe extern "C" fn(Id, Sel) -> Id,
                             library,
                             c"release"
                         );
-                        (candidate, export)
+                        (candidate, export, zl)
                     } else {
-                        (NIL, NIL)
+                        (NIL, NIL, NIL)
                     };
 
                 // Supplemental leaf+parent3 fuse. Failure → NIL → exact
@@ -7746,6 +7982,7 @@ kernel void blake3_pow_scan(
                     pso_ntt4z,
                     pso_ntt4zg4,
                     pso_ntt4zg4_zero_root,
+                    pso_ntt4zg4_zero_root_zl,
                     pso_export_from_z_zero_root_tabs,
                     pso_ntt4h8,
                     pso_ntt5mix,
@@ -8375,15 +8612,57 @@ kernel void blake3_pow_scan(
     pub(crate) struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
+        /// Zero-lane compacted band kernel (see
+        /// [`zero_root_zero_lane_kernel`]) for ranges it tiles exactly.
+        zero_lane: bool,
+        /// The staging buffer's dead columns are known zero: the compacted
+        /// kernel skips their stores.
+        dead_zero: bool,
     }
+
+    /// Set by the ranked warm-up band warm after its full-range pass wrote
+    /// every dead column of the staging buffer as zero (z's dead columns are
+    /// zero, so both band kernels write zeros there); consumed (cleared) by
+    /// the next streamed first pass, and cleared by every other staging
+    /// lease. Nothing else writes the staging buffer between the warm, the
+    /// last thing call zero does, and the timed prove's stream, whose bands
+    /// then leave the dead columns untouched instead of rewriting zeros.
+    pub(crate) static DEAD_COLUMNS_ZERO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     impl FromZFirstPassPlan {
         pub(crate) fn new(log_d: usize) -> Self {
+            Self::with_zero_lane(log_d, false)
+        }
+
+        /// The ranked worker's warm-up band warm runs after the proof that
+        /// published the zero geometry: select the kernel the timed bands
+        /// will run.
+        pub(crate) fn new_ranked_warm(log_d: usize) -> Self {
+            Self::with_zero_lane(log_d, true)
+        }
+
+        fn with_zero_lane(log_d: usize, assume_ranked: bool) -> Self {
             let grouped = super::pass_tune_enabled();
+            let zero_root = grouped && super::gpu_from_z_zero_root_selected(log_d);
             Self {
                 grouped,
-                zero_root: grouped && super::gpu_from_z_zero_root_selected(log_d),
+                zero_root,
+                zero_lane: zero_root && super::gpu_zero_lane_band_pass(log_d, assume_ranked),
+                dead_zero: false,
             }
+        }
+
+        /// The streamed bands over a staging buffer whose dead columns the
+        /// band warm left zero.
+        pub(crate) fn with_dead_zero(mut self, dead_zero: bool) -> Self {
+            self.dead_zero = dead_zero;
+            self
+        }
+
+        /// True when [`Self::encode_range`] over the full range runs a kernel
+        /// that writes every dead column (as zero).
+        pub(crate) fn writes_dead_columns(self, gpu: &Gpu) -> bool {
+            self.zero_root && !self.dead_zero && (!self.zero_lane || !gpu.pso_ntt4zg4_zero_root_zl.is_null())
         }
 
         pub(crate) unsafe fn encode_range(
@@ -8399,8 +8678,16 @@ kernel void blake3_pow_scan(
         ) {
             debug_assert!(!self.zero_root || self.grouped);
             debug_assert!(!self.grouped || r_count.is_multiple_of(4));
+            // A band of `r_count` tiles is `r_count / 2` (even, odd) pairs of
+            // 121 live columns: whole 256-column groups iff 512 | r_count
+            // (every ranked band and the full range); otherwise dense.
+            let zero_lane = self.zero_lane
+                && !gpu.pso_ntt4zg4_zero_root_zl.is_null()
+                && r_count.is_multiple_of(512);
             unsafe {
-                let pso = if self.zero_root {
+                let pso = if zero_lane {
+                    gpu.pso_ntt4zg4_zero_root_zl
+                } else if self.zero_root {
                     debug_assert!(!gpu.pso_ntt4zg4_zero_root.is_null());
                     gpu.pso_ntt4zg4_zero_root
                 } else if self.grouped {
@@ -8413,7 +8700,9 @@ kernel void blake3_pow_scan(
                 gpu.set_buffer(enc, tw_buf, 0, 1);
                 let p = NttParams {
                     log_d: log_d as u32,
-                    l: 0,
+                    // Compacted kernel only: l != 0 asks for the dead
+                    // columns' zero stores.
+                    l: (zero_lane && !self.dead_zero) as u32,
                     f: 4,
                     s: (log_d - 4) as u32,
                 };
@@ -8423,11 +8712,12 @@ kernel void blake3_pow_scan(
                 );
                 gpu.set_bytes(enc, bytes, 2);
                 gpu.set_buffer(enc, z_buf, byte_offset, 3);
-                gpu.dispatch(
-                    enc,
-                    (r_count >> if self.grouped { 2 } else { 0 }) as u64,
-                    64,
-                );
+                let groups = if zero_lane {
+                    r_count * 121 / 512
+                } else {
+                    r_count >> if self.grouped { 2 } else { 0 }
+                };
+                gpu.dispatch(enc, groups as u64, 64);
             }
         }
     }
@@ -8447,6 +8737,8 @@ kernel void blake3_pow_scan(
             FromZFirstPassPlan {
                 grouped: true,
                 zero_root: true,
+                zero_lane: false,
+                dead_zero: false,
             }
             .encode_range(
                 gpu,
@@ -9171,6 +9463,9 @@ kernel void blake3_pow_scan(
         /// encode-at-finish path.
         early_full: bool,
         early_graph: Option<Id>,
+        /// Consumed [`DEAD_COLUMNS_ZERO`]: the bands skip the dead columns'
+        /// zero stores.
+        dead_zero: bool,
     }
 
     // SAFETY: all captured Metal objects are process-persistent and Metal's
@@ -9244,7 +9539,7 @@ kernel void blake3_pow_scan(
                 let result = (|| -> Result<(Id, Option<DoneSig>), String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
-                    FromZFirstPassPlan::new(self.log_d).encode_range(
+                    FromZFirstPassPlan::new(self.log_d).with_dead_zero(self.dead_zero).encode_range(
                         self.gpu,
                         enc,
                         self.staging,
@@ -9458,9 +9753,18 @@ kernel void blake3_pow_scan(
         }
     }
 
-    /// Body of [`super::warm_streamed_first_pass`]: one full-range dispatch of
-    /// the band kernel over the latched z wrap into the staging buffer.
-    pub(crate) fn warm_streamed_first_pass(log_d: usize) {
+    /// The warm's retained command buffer while it is in flight (as `usize`).
+    static STREAM_WARM_CB: Mutex<usize> = Mutex::new(0);
+
+    /// The in-flight warm writes every dead column of the staging buffer as
+    /// zero (see [`DEAD_COLUMNS_ZERO`]).
+    static STREAM_WARM_MARKS_DEAD_ZERO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Body of [`super::warm_streamed_first_pass_begin`]: one full-range
+    /// dispatch of the band kernel over the latched z wrap into the staging
+    /// buffer, committed without waiting; staging stays leased until
+    /// [`warm_streamed_first_pass_end`].
+    pub(crate) fn warm_streamed_first_pass_begin(log_d: usize) {
         use std::sync::atomic::Ordering;
         let Ok(gpu) = gpu() else { return };
         let latch = latch_lock();
@@ -9474,12 +9778,14 @@ kernel void blake3_pow_scan(
             return;
         }
         let total_r = 1usize << (log_d - 4);
-        unsafe {
+        DEAD_COLUMNS_ZERO.store(false, Ordering::Release);
+        let plan = FromZFirstPassPlan::new_ranked_warm(log_d);
+        let cb = unsafe {
             let pool = gpu.pool_push();
-            let _ = (|| -> Result<(), String> {
+            let cb = (|| -> Result<Id, String> {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                FromZFirstPassPlan::new(log_d).encode_range(
+                plan.encode_range(
                     gpu,
                     enc,
                     state.staging,
@@ -9490,9 +9796,42 @@ kernel void blake3_pow_scan(
                     total_r,
                 );
                 gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
+                let cb = gpu.retain(cb);
+                gpu.commit_async(cb);
+                Ok(cb)
             })();
             gpu.pool_pop(pool);
+            cb
+        };
+        match cb {
+            Ok(cb) => {
+                // Whether the completed warm leaves every dead column zero;
+                // published to the timed stream only after the wait in
+                // [`warm_streamed_first_pass_end`].
+                STREAM_WARM_MARKS_DEAD_ZERO.store(
+                    plan.writes_dead_columns(gpu) && super::gpu_zero_lane_band_pass(log_d, true),
+                    Ordering::Release,
+                );
+                *STREAM_WARM_CB.lock().unwrap_or_else(|e| e.into_inner()) = cb as usize;
+            }
+            Err(_) => STAGING_IN_USE.store(false, Ordering::Release),
+        }
+    }
+
+    /// Body of [`super::warm_streamed_first_pass_end`].
+    pub(crate) fn warm_streamed_first_pass_end() {
+        use std::sync::atomic::Ordering;
+        let cb = std::mem::take(&mut *STREAM_WARM_CB.lock().unwrap_or_else(|e| e.into_inner()));
+        if cb == 0 {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        unsafe {
+            let done = gpu.wait_cb(cb as Id);
+            gpu.release(cb as Id);
+            if done.is_ok() && STREAM_WARM_MARKS_DEAD_ZERO.swap(false, Ordering::AcqRel) {
+                DEAD_COLUMNS_ZERO.store(true, Ordering::Release);
+            }
         }
         STAGING_IN_USE.store(false, Ordering::Release);
     }
@@ -9520,6 +9859,7 @@ kernel void blake3_pow_scan(
         if STAGING_IN_USE.swap(true, Ordering::Acquire) {
             return None;
         }
+        let dead_zero = DEAD_COLUMNS_ZERO.swap(false, Ordering::AcqRel);
 
         let z_bytes = z_len * core::mem::size_of::<F128>();
         let z_addr = z_ptr as usize;
@@ -9576,6 +9916,7 @@ kernel void blake3_pow_scan(
                 && hybrid_cpu_sixteenths() == 0
                 && std::env::var_os("FLOCK_NO_EARLY_GPU_GRAPH").is_none(),
             early_graph: None,
+            dead_zero,
         })
     }
 
@@ -12130,8 +12471,23 @@ kernel void blake3_pow_scan(
         } else {
             key
         };
+        // The compacted s = 8 pass changes the GPU prefix cost as well.
+        let key = if super::gpu_zero_lane_enabled() && super::gpu_g4x2_enabled() && super::gpu_zero_lane_s8_enabled() {
+            key ^ 0x5A4C_414E_455F_5338 // "ZLANE_S8"
+        } else {
+            key
+        };
         let key = if super::gpu_final_leaf_enabled() {
             key ^ fnv1a64(&final_leaf_msl_source()).rotate_left(5) ^ 0x464C_4541_465F_3431
+        } else {
+            key
+        };
+        // The compacted band kernel changes the first pass's GPU cost.
+        let key = if super::gpu_from_z_zero_root_selected(20)
+            && super::gpu_zero_lane_enabled()
+            && super::gpu_zero_lane_band_enabled()
+        {
+            key ^ fnv1a64(zero_root_library_source()).rotate_left(3) ^ 0x5A4C_414E_455F_424E // "ZLANE_BN"
         } else {
             key
         };
@@ -12740,6 +13096,7 @@ kernel void blake3_pow_scan(
         // The staging buffer is the codeword home; if a previous prove's
         // ProverData still holds it, fall back (never happens in the
         // one-prove-at-a-time worker).
+        DEAD_COLUMNS_ZERO.store(false, Ordering::Release);
         if STAGING_IN_USE.swap(true, Ordering::Acquire) {
             if debug_enabled() {
                 eprintln!("[gpu-commit] staging still in use; CPU fallback");

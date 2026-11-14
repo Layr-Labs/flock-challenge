@@ -5152,6 +5152,13 @@ impl Blake3Setup {
         let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger);
         flock_core::cpu_keepalive::pool_spin_release();
         if call == 0 {
+            // Untimed: give the streamed first pass its first production
+            // execution here instead of in the timed prove (see
+            // `gpu_commit::ENV_NO_STREAM_WARM`), overlapping the CPU-only
+            // warmup tail below. Ranked worker only.
+            if crate::seed_pipe::is_ranked_worker() {
+                flock_core::gpu_commit::warm_streamed_first_pass_begin(&self.pcs_params);
+            }
             let (proof, commitment) = warm_publish_path(proof, commitment);
             // Still untimed: prove here, against the wrapper's own warm-up
             // blocks, that both our AoS and word-major generators reproduce
@@ -5170,12 +5177,9 @@ impl Blake3Setup {
                     blocks,
                 );
             }
-            // Untimed: give the streamed first pass its first production
-            // execution here instead of in the timed prove (see
-            // `gpu_commit::ENV_NO_STREAM_WARM`). Ranked worker only.
-            if crate::seed_pipe::is_ranked_worker() {
-                flock_core::gpu_commit::warm_streamed_first_pass(&self.pcs_params);
-            }
+            // The streamed first-pass warm (submitted at the top of this
+            // block) must be complete before the seed pipe can start a prove.
+            flock_core::gpu_commit::warm_streamed_first_pass_end();
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
             // return and only then touches `io::stdin()`, so the splice lands
