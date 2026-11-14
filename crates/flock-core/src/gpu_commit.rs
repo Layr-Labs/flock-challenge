@@ -751,6 +751,39 @@ const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 16;
 
 /// Requested GPU chunk share of the round-one AB completion arm; `0` = off
 /// (kill switch, share 0, or GPU commit disabled).
+/// Kill switch for the calibration share pricing itself
+/// (`FLOCK_NO_ZC_AB_TUNING=1`): the arm still calibrates for admission, but
+/// keeps the promoted 16-chunk share instead of publishing the gated one.
+pub const ENV_NO_ZC_AB_TUNING: &str = "FLOCK_NO_ZC_AB_TUNING";
+
+/// Resolved GPU chunk share for a prove whose AB completion has `hi_size`
+/// chunks: `(chunks, fixed)` where `fixed` is true when an explicit env
+/// share pins the arm (tuning then never republishes). `0` = arm off.
+/// Reads the calibration-published tuned share from the macOS-gated arm
+/// module; on non-Apple builds the arm module publishes nothing and the
+/// share stays at the promoted default (the arm itself is compiled out).
+pub(crate) fn zc_ab_share_for(hi_size: usize) -> (usize, bool) {
+    use std::sync::atomic::Ordering;
+    if !gpu_commit_enabled() {
+        return (0, true);
+    }
+    if let Some(value) = std::env::var_os(ENV_ZC_AB_GPU_CHUNKS) {
+        let v = value
+            .to_str()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .expect("FLOCK_ZC_AB_GPU_CHUNKS must be a non-negative integer");
+        return (v.min(hi_size), true);
+    }
+    let tuned = imp::ZC_AB_TUNED_IMP.load(Ordering::Relaxed);
+    if tuned == 0 {
+        return (0, true);
+    }
+    if tuned == usize::MAX {
+        return (ZC_AB_GPU_DEFAULT_CHUNKS.min(hi_size), false);
+    }
+    (tuned.min(hi_size), false)
+}
+
 pub(crate) fn gpu_zc_ab_completion_share() -> usize {
     static SHARE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         if std::env::var_os(ENV_NO_GPU_ZC_AB_COMPLETION).is_some() {
@@ -8536,6 +8569,46 @@ kernel void blake3_pow_scan(
                     }
                     if std::time::Instant::now() >= deadline {
                         return self.wait_cb(cb);
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+
+        /// Bounded status poll on an already-committed command buffer that
+        /// NEVER falls back to the blocking `wait_cb`: past the deadline it
+        /// returns `Err("gpu wait timeout")` so the caller can degrade to its
+        /// CPU fallback instead of hanging the prove past the harness
+        /// deadline. Poll granularity is one `yield_now` (the callers sit on
+        /// rayon workers, same rationale as `yield_wait_cb_until`); a
+        /// completed buffer is consumed by the first status poll at zero
+        /// cost. Read-only: the buffer is neither mutated nor released here.
+        pub(crate) unsafe fn wait_cb_deadline(
+            &self,
+            cb: Id,
+            deadline: std::time::Instant,
+        ) -> Result<(), String> {
+            unsafe {
+                loop {
+                    let status: u64 = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel) -> u64,
+                        cb,
+                        c"status"
+                    );
+                    if status >= 4 {
+                        if status == 4 {
+                            return Ok(());
+                        }
+                        let err: Id =
+                            send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                        return Err(format!(
+                            "command buffer status {status}: {}",
+                            self.api.error_string(err)
+                        ));
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err("gpu wait timeout".to_string());
                     }
                     std::thread::yield_now();
                 }
@@ -18872,6 +18945,142 @@ kernel void zc_ab_finish(
     const ZC_AB_UNCALIBRATED: u8 = 0;
     const ZC_AB_ADMITTED: u8 = 1;
     const ZC_AB_DISABLED: u8 = 2;
+    /// Wall-clock budget for the round-1 AB completion arm's GPU waits (both
+    /// the gather/finish buffer and the tables buffer). Observed steady-state
+    /// completion is low single-digit milliseconds on the ranked GPU; a stall
+    /// past this budget degrades the trial to the CPU prefix instead of
+    /// hanging the worker into the harness deadline.
+    const ZC_AB_WAIT_BUDGET_MS: u64 = 250;
+
+    /// Tuned GPU chunk share of the round-one AB completion arm, published by
+    /// the calibration oracle in `zc_ab_wait` (same policy as the promoted
+    /// zc-t3/zc-r2 arms): `usize::MAX` = calibrate on the next prove (the
+    /// untimed warm-up), `0` = the gate measured the CPU faster and disabled
+    /// the arm, any other value = the GPU's tuned chunk share. The share only
+    /// re-partitions which chunks the GPU owns; every chunk is computed by
+    /// the same kernels whose math the calibration oracle verifies.
+    pub(crate) static ZC_AB_TUNED_IMP: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    /// Economic share gate for the round-one AB completion arm (port of the
+    /// promoted `zc_t3_gate_share` with ALPHA = 0: an AB GPU chunk replaces a
+    /// CPU chunk entirely, so the balanced split is
+    /// `(hi - g) * u_cpu = g * u_gpu` ⇒ `g* = hi / (ratio + 1)`).
+    /// Same admission floor as zc-t3: a measured ratio above
+    /// [`ZC_AB_MAX_RATIO`] strands the arm at `hi/8` (the promoted default
+    /// share) while the ratio is below [`ZC_AB_FLOOR_MAX_RATIO`], and
+    /// disables it above that.
+    const ZC_AB_MAX_RATIO: f64 = 2.0;
+    const ZC_AB_FLOOR_MAX_RATIO: f64 = 8.0;
+
+    fn zc_ab_gate_share(ratio: f64, hi_size: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return 0;
+        }
+        if ratio > ZC_AB_MAX_RATIO {
+            if ratio < ZC_AB_FLOOR_MAX_RATIO {
+                return hi_size / 8;
+            }
+            return 0;
+        }
+        let g = (hi_size as f64 / (ratio + 1.0)).round();
+        (g as usize).min(hi_size)
+    }
+
+    /// Replay the just-launched AB completion job `replays` more times at the
+    /// same chunk count and return the minimum GPU wall in milliseconds
+    /// (ramp-robust pricing, same policy as the zc-t3/zc-r2 calibrations).
+    /// Every replay re-uses the launch's populated constants buffer and
+    /// cached `ab` view; waits are bounded by [`ZC_AB_WAIT_BUDGET_MS`].
+    unsafe fn zc_ab_replay_walls(
+        gpu: &Gpu,
+        state: &ZcAb,
+        ab_buf: Id,
+        chunks: usize,
+        tops_per_group: usize,
+        groups_per_chunk: usize,
+        bmask: &[u32; 16],
+        replays: usize,
+    ) -> Result<f64, String> {
+        unsafe {
+            #[repr(C)]
+            struct P {
+                tops_per_group: u32,
+                groups_per_chunk: u32,
+                chunk_shift: u32,
+                pad: u32,
+                bmask: [u32; 16],
+            }
+            let params = P {
+                tops_per_group: tops_per_group as u32,
+                groups_per_chunk: groups_per_chunk as u32,
+                chunk_shift: ZC_AB_CHUNK_SHIFT,
+                pad: 0,
+                bmask: *bmask,
+            };
+            let pb = std::slice::from_raw_parts(
+                (&raw const params).cast::<u8>(),
+                core::mem::size_of::<P>(),
+            );
+            let mut w_min = f64::MAX;
+            for _ in 0..replays {
+                let pool = gpu.pool_push();
+                let res = (|| -> Result<Id, String> {
+                    // Same encoder shape as the launch's command buffer 2
+                    // (gather, then finish over the banks it wrote); the
+                    // tables build is not replayed — `tables_buf` and the
+                    // launch-populated constants persist.
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    gpu.set_pipeline(enc, state.gather_pso);
+                    gpu.set_buffer(enc, ab_buf, 0, 0);
+                    gpu.set_buffer(enc, state.tables_buf, 0, 1);
+                    gpu.set_buffer(enc, state.banks_buf, 0, 2);
+                    gpu.set_bytes(enc, pb, 3);
+                    gpu.dispatch(enc, (chunks * groups_per_chunk) as u64, 64);
+                    gpu.set_pipeline(enc, state.finish_pso);
+                    gpu.set_buffer(enc, state.banks_buf, 0, 0);
+                    gpu.set_buffer(enc, state.consts_buf, ZC_AB_EQBOT_OFF * 16, 1);
+                    gpu.set_buffer(enc, state.consts_buf, ZC_AB_EQHI_OFF * 16, 2);
+                    gpu.set_buffer(enc, state.part_buf, 0, 3);
+                    gpu.set_bytes(enc, pb, 4);
+                    gpu.dispatch(enc, chunks as u64, 64);
+                    gpu.end_encoding(enc);
+                    let cb = gpu.retain(cb);
+                    gpu.commit_async(cb);
+                    Ok(cb)
+                })();
+                let cb = match res {
+                    Ok(cb) => cb,
+                    Err(e) => {
+                        gpu.pool_pop(pool);
+                        return Err(e);
+                    }
+                };
+                gpu.pool_pop(pool);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(ZC_AB_WAIT_BUDGET_MS);
+                let ok = gpu.wait_cb_deadline(cb, deadline);
+                let w = if ok.is_ok() {
+                    zc_fold_gpu_wall_ms(gpu, cb)
+                } else {
+                    0.0
+                };
+                gpu.release(cb);
+                if !ok.is_ok() {
+                    return Err("gpu wait timeout (ab share replay)".to_string());
+                }
+                if w > 0.0 {
+                    w_min = w_min.min(w);
+                }
+            }
+            if w_min.is_finite() {
+                Ok(w_min)
+            } else {
+                Err("ab share replay produced no wall".to_string())
+            }
+        }
+    }
     /// Proves whose AB message folded GPU partials (diagnostic receipt).
     static ZC_AB_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -19040,6 +19249,7 @@ kernel void zc_ab_finish(
         /// top' block per threadgroup and threadgroups per chunk.
         tops_per_group: usize,
         groups_per_chunk: usize,
+        bmask: [u32; 16],
         calibration: bool,
         submitted: std::time::Instant,
     }
@@ -19217,6 +19427,7 @@ kernel void zc_ab_finish(
                     chunks,
                     tops_per_group,
                     groups_per_chunk,
+                    bmask: *bmask,
                     calibration: mode == ZC_AB_UNCALIBRATED,
                     submitted: std::time::Instant::now(),
                 }),
@@ -19234,7 +19445,12 @@ kernel void zc_ab_finish(
     /// must hold the CPU's own per-chunk partials of every chunk; the GPU's
     /// `0..chunks` are byte-compared against them and the arm is admitted
     /// only on full equality (disabled for the process otherwise).
-    pub(crate) fn zc_ab_wait(job: ZcAbJob, cpu_partials: &[[F128; 64]], hi_size: usize) -> ZcAbResult {
+    pub(crate) fn zc_ab_wait(
+        job: ZcAbJob,
+        cpu_partials: &[[F128; 64]],
+        cpu_wall_ms: f64,
+        hi_size: usize,
+    ) -> ZcAbResult {
         use std::sync::atomic::Ordering;
         let debug = super::gpu_zc_ab_debug();
         let gpu = match gpu() {
@@ -19248,7 +19464,21 @@ kernel void zc_ab_finish(
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
             // the table build; the table build's status is checked too.
-            let ok = gpu.spin_wait_cb(job.cb, 2.0).and_then(|()| gpu.wait_cb(job.cb_tables));
+            //
+            // Both waits are bounded (this arm's own hardening): a stalled
+            // command buffer used to bottom out in the blocking
+            // `wait_cb` (`waitUntilCompleted`), parking the zerocheck spine
+            // until the harness killed the whole trial. Now a stall past the
+            // budget returns `Err` -> `ZcAbResult::Failed` -> the CPU
+            // recomputes this proof's prefix chunks and the arm is disabled
+            // for the process, so the trial completes with byte-identical
+            // proofs. The budget is ~100x the observed steady-state AB
+            // completion time and ~3600x under the 15-minute trial deadline.
+            let wait_deadline =
+                waited + std::time::Duration::from_millis(ZC_AB_WAIT_BUDGET_MS);
+            let ok = gpu
+                .wait_cb_deadline(job.cb, wait_deadline)
+                .and_then(|()| gpu.wait_cb_deadline(job.cb_tables, wait_deadline));
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let (tables_ms, gather_ms) = if ok.is_ok() {
                 (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
@@ -19282,8 +19512,8 @@ kernel void zc_ab_finish(
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 64]>();
             let out: Vec<[F128; 64]> = std::slice::from_raw_parts(parts, job.chunks).to_vec();
-            drop(state);
             if !job.calibration {
+                drop(state);
                 let fired = ZC_AB_FIRED.fetch_add(1, Ordering::Relaxed) + 1;
                 if debug {
                     eprintln!(
@@ -19325,6 +19555,60 @@ kernel void zc_ab_finish(
                     }
                 }
             }
+            // ---- Share pricing (port of the promoted zc-t3 calibration
+            // gate): replay the oracle-verified job to a wall plateau, price
+            // GPU vs CPU per chunk, publish the balanced share for the timed
+            // prove. ALPHA = 0: an AB GPU chunk replaces a CPU chunk
+            // entirely, so the balanced split is g* = hi/(ratio + 1). Any
+            // pricing failure keeps the promoted default share.
+            let tuned_share = if super::gpu_zc_ab_tuning_enabled()
+                && cpu_wall_ms.is_finite()
+                && cpu_wall_ms > 0.0
+            {
+                let u_cpu = cpu_wall_ms / hi_size.max(1) as f64;
+                let priced = match state.wrap.as_ref().map(|&(_, _, b)| b) {
+                    Some(ab_buf) => unsafe {
+                        zc_ab_replay_walls(
+                            gpu,
+                            &state,
+                            ab_buf,
+                            job.chunks,
+                            job.tops_per_group,
+                            job.groups_per_chunk,
+                            &job.bmask,
+                            2,
+                        )
+                    },
+                    None => Err("no cached ab view for share pricing".to_string()),
+                };
+                match priced {
+                    Ok(w_min) if w_min > 0.0 => {
+                        let u_gpu = w_min / job.chunks as f64;
+                        let share = zc_ab_gate_share(u_gpu / u_cpu, hi_size);
+                        if debug {
+                            eprintln!(
+                                "[zc-ab-gpu] share pricing: u_gpu={u_gpu:.4}ms/chunk \
+                                 u_cpu={u_cpu:.4}ms/chunk -> tuned share {share}/{hi_size} \
+                                 (probe {}/{hi_size} at {w_min:.2}ms)",
+                                job.chunks,
+                            );
+                        }
+                        share
+                    }
+                    _ => {
+                        if debug {
+                            eprintln!(
+                                "[zc-ab-gpu] share pricing failed; keeping {} chunks",
+                                job.chunks
+                            );
+                        }
+                        job.chunks
+                    }
+                }
+            } else {
+                ZC_AB_GPU_DEFAULT_CHUNKS
+            };
+            ZC_AB_TUNED_IMP.store(tuned_share, std::sync::atomic::Ordering::Relaxed);
             ZcAbResult::Calibrated
         }
     }
@@ -21459,6 +21743,12 @@ pub(crate) use imp::{ZcLoopJob, ZcLoopResult, launch_zc_loop_products, zc_loop_w
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 mod imp {
     use super::*;
+
+    /// Stub twin of the macOS arm's tuned-share static: the arm module is
+    /// compiled out on this target, so nothing publishes it and the share
+    /// resolver keeps the promoted default.
+    pub(crate) static ZC_AB_TUNED_IMP: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
 
     pub(crate) fn gpu_recursive_merkle_blake3(
         _data: &[u8],

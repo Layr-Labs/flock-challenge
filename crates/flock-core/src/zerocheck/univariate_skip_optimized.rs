@@ -3750,6 +3750,13 @@ struct AbGpuPrefix {
 }
 
 impl AbGpuPrefix {
+    /// True while this job is the warm-up oracle probe (CPU computes every
+    /// chunk; the GPU's prefix is compared, then discarded).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn is_calibration(&self) -> bool {
+        self.job.is_calibration()
+    }
+
     /// First chunk the CPU drains (0 during the warm-up oracle probe, when
     /// the CPU computes every chunk itself).
     fn cpu_base(&self) -> usize {
@@ -3768,11 +3775,11 @@ impl AbGpuPrefix {
     /// the GPU's partials with the CPU's complete `partials` (verdict kept for
     /// the process) and returns `true`. `false` = the GPU failed after
     /// admission: the caller must CPU-compute `partials[..cpu_base()]`.
-    fn finish(self, partials: &mut [[F128; ELL]]) -> bool {
+    fn finish(self, partials: &mut [[F128; ELL]], cpu_wall_ms: f64) -> bool {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let hi_size = partials.len();
-            match crate::gpu_commit::zc_ab_wait(self.job, partials, hi_size) {
+            match crate::gpu_commit::zc_ab_wait(self.job, partials, cpu_wall_ms, hi_size) {
                 crate::gpu_commit::ZcAbResult::Prefix(gpu) => {
                     partials[..gpu.len()].copy_from_slice(&gpu);
                     true
@@ -3784,6 +3791,7 @@ impl AbGpuPrefix {
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             let _ = partials;
+            let _ = cpu_wall_ms;
             true
         }
     }
@@ -3863,7 +3871,11 @@ fn launch_ab_completion_gpu_prefix(
     n_hi: usize,
     padding: &PaddingSpec,
 ) -> Option<AbGpuPrefix> {
-    let share = crate::gpu_commit::gpu_zc_ab_completion_share();
+    // Share resolution (our piece): the arm's calibration prices the GPU
+    // per chunk against the CPU's and publishes a balanced share; until then
+    // the promoted 16-chunk default runs. `zc_ab_share_for` returns 0 when
+    // the arm is off (kill switch / gate-disabled) and clamps to `hi_size`.
+    let (share, _share_fixed) = crate::gpu_commit::zc_ab_share_for(hi_size);
     if share == 0 {
         return None;
     }
@@ -4108,6 +4120,15 @@ where
                 });
                 partial
             };
+            // Calibration pricing input (our piece): when this prove is the
+            // warm-up oracle probe, accumulate the CPU drain's per-chunk work
+            // so `finish` can price the GPU's share against it. Zero cost on
+            // every timed prove.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let calibrating = gpu_prefix.as_ref().is_some_and(AbGpuPrefix::is_calibration);
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let calibrating = false;
+            let drain_nanos = std::sync::atomic::AtomicU64::new(0);
             let out = crate::epool::run_hetero_chunks_caller_tail(
                 whole + 2 * split,
                 |i| {
@@ -4118,7 +4139,18 @@ where
                         let h = j & 1;
                         (cpu_base + whole + j / 2, h * half_lo..(h + 1) * half_lo)
                     };
+                    let t0 = if calibrating {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let partial = fold_chunk(x_hi, range);
+                    if let Some(t0) = t0 {
+                        drain_nanos.fetch_add(
+                            t0.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     // SAFETY: each queue index owns one disjoint output slot
                     // (whole chunks in `partials`, halves in
                     // `half_partials`) and the synchronous queue join
@@ -4153,7 +4185,21 @@ where
                     // The oracle probe compares against the CPU's complete
                     // per-chunk partials, so reassemble before joining.
                     reassemble(&mut partials);
-                    if !prefix.finish(&mut partials) {
+                    // The drain's wall time, from the accumulated per-chunk
+                    // work over the queue's thread parallelism. Prices the
+                    // share gate during the warm-up probe; zero otherwise.
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    let drain_wall_ms = if calibrating {
+                        let threads = rayon::current_num_threads().max(1) as f64;
+                        drain_nanos.load(std::sync::atomic::Ordering::Relaxed) as f64
+                            / 1_000_000.0
+                            / threads
+                    } else {
+                        0.0
+                    };
+                    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                    let drain_wall_ms = 0.0;
+                    if !prefix.finish(&mut partials, drain_wall_ms) {
                         // GPU failed after admission: CPU computes its chunks
                         // with the same kernel (the arm is now disabled).
                         crate::epool::run_hetero_chunks_caller_tail(
