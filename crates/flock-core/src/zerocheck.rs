@@ -813,6 +813,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
     // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
     // verifier samples ρ_1 after observing this message.
+    crate::tmark::mark("zc r2 start");
     let cpu_r2 = crate::pcs::commit::commit_cpu_ms();
     let t_round2 = std::time::Instant::now();
     let fold_table = UniSkipFoldTable::new(k_skip, z);
@@ -864,6 +865,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         (compact, m1, mi, None)
     };
 
+    crate::tmark::mark("zc r2 end");
     if zc_timing {
         eprintln!(
             "[zc-timing] round2 fused fold: {:.2} ms cpu={:.1}",
@@ -1002,6 +1004,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         let mut a_out = crate::scratch::take_f128_unpinned(n_groups);
         let mut b_out = crate::scratch::take_f128_unpinned(n_groups);
         if use_cascade {
+            crate::tmark::mark("zc k start");
             // Dead-tail-packed K output only when the tri pass, the one
             // reader of that layout, comes next.
             let (m4_1, m4_inf, la5, packed) = multilinear::fold2_compact_and_round45_into_packed(
@@ -1014,6 +1017,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 &mut b_out,
                 tri_steps > 0 && multilinear::zc_k_dead_pack_enabled(),
             );
+            crate::tmark::mark("zc k end");
             if tail_round_timing {
                 eprintln!(
                     "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}, packed={packed}): {:.2} ms",

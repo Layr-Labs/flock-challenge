@@ -1223,6 +1223,197 @@ unsafe fn fold_row_code_q(table_data: *const u8, row: u64) -> core::arch::aarch6
     }
 }
 
+/// Seven-bank layout of a fold table (`W9`): bank 0 holds the XOR sums of
+/// code bits 0..10 (1,024 entries), banks 1..7 those of the nine bits from
+/// `9k + 1` (512 entries each). 4,096 16-byte entries, 64 KiB. A code folds
+/// with seven loads where the byte layout takes eight; every bank is the same
+/// GF(2)-linear map restricted to its bits, so the folded value is the same
+/// field element (see [`crate::zerocheck::multilinear::w9_table_from_bytes`]).
+pub(crate) const W9_ENTRIES: usize = 1024 + 6 * 512;
+/// Byte offset of bank `k` in a `W9` table.
+const fn w9_bank_offset(k: usize) -> usize {
+    if k == 0 { 0 } else { 16 * (1024 + 512 * (k - 1)) }
+}
+/// `0x1ff << 4`: one nine-bit index already multiplied by the entry size.
+const W9_INDEX_MASK: u64 = 0x1ff0;
+
+/// Entry of `W9` bank `K` selected by `row`, as [`bank_load_q`]'s default
+/// form: one index instruction (`ubfiz` for bank 0, `and` with a shifted
+/// register against a mask register otherwise) and one unscaled
+/// register-offset load.
+///
+/// # Safety
+/// `table` must point to a whole `W9` table.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn w9_load_q<const K: usize>(table: *const u8, row: u64) -> core::arch::aarch64::uint64x2_t {
+    let out: core::arch::aarch64::uint64x2_t;
+    // SAFETY: bank 0's index is at most 1023 entries and bank k's at most
+    // 511, so the 16-byte load stays inside the bank; the asm only reads.
+    unsafe {
+        let bank = table.add(w9_bank_offset(K));
+        if K == 0 {
+            core::arch::asm!(
+                "ubfiz {idx}, {row}, #4, #10",
+                "ldr {out:q}, [{bank}, {idx}]",
+                row = in(reg) row,
+                bank = in(reg) bank,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else {
+            // idx = ((row >> (9K + 1)) & 0x1ff) << 4
+            core::arch::asm!(
+                "and {idx}, {mask}, {row}, lsr #{shift}",
+                "ldr {out:q}, [{bank}, {idx}]",
+                // `9K - 3` for every K >= 1 (written mod 64 so the unused
+                // K == 0 instance has a valid immediate).
+                shift = const (9 * K + 61) % 64,
+                mask = in(reg) W9_INDEX_MASK,
+                row = in(reg) row,
+                bank = in(reg) bank,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+    }
+    out
+}
+
+/// One code folded through a `W9` table: seven loads, three `EOR3`s.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn w9_code_q(table: *const u8, code: u64) -> core::arch::aarch64::uint64x2_t {
+    unsafe {
+        let acc = xor3_u64(w9_load_q::<0>(table, code), w9_load_q::<1>(table, code), w9_load_q::<2>(table, code));
+        let acc = xor3_u64(acc, w9_load_q::<3>(table, code), w9_load_q::<4>(table, code));
+        xor3_u64(acc, w9_load_q::<5>(table, code), w9_load_q::<6>(table, code))
+    }
+}
+
+/// `init` XOR one code folded through a `W9` table: seven loads, three
+/// `EOR3`s and an `EOR`, as one asm block with three scratch vectors. The
+/// same operations as intrinsics let the K pass's allocator rotate its
+/// accumulators through a long move chain on the packed instance's general
+/// group path (673 instructions per group, 41 of them vector moves); as one
+/// block that path takes 636 with 4 moves.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn w9_code_acc_q(
+    table: *const u8,
+    code: u64,
+    init: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    let mut acc = init;
+    // SAFETY: as `w9_load_q`: every index stays inside its bank; the asm
+    // only reads the table.
+    unsafe {
+        core::arch::asm!(
+            "ubfiz {i0}, {c}, #4, #10",
+            "ldr {t0:q}, [{b0}, {i0}]",
+            "and {i1}, {m}, {c}, lsr #6",
+            "ldr {t1:q}, [{b1}, {i1}]",
+            "and {i0}, {m}, {c}, lsr #15",
+            "ldr {t2:q}, [{b2}, {i0}]",
+            "eor3 {acc:v}.16b, {acc:v}.16b, {t0:v}.16b, {t1:v}.16b",
+            "and {i1}, {m}, {c}, lsr #24",
+            "ldr {t0:q}, [{b3}, {i1}]",
+            "and {i0}, {m}, {c}, lsr #33",
+            "ldr {t1:q}, [{b4}, {i0}]",
+            "eor3 {acc:v}.16b, {acc:v}.16b, {t2:v}.16b, {t0:v}.16b",
+            "and {i1}, {m}, {c}, lsr #42",
+            "ldr {t2:q}, [{b5}, {i1}]",
+            "and {i0}, {m}, {c}, lsr #51",
+            "ldr {t0:q}, [{b6}, {i0}]",
+            "eor3 {acc:v}.16b, {acc:v}.16b, {t1:v}.16b, {t2:v}.16b",
+            "eor {acc:v}.16b, {acc:v}.16b, {t0:v}.16b",
+            c = in(reg) code,
+            m = in(reg) W9_INDEX_MASK,
+            b0 = in(reg) table.add(w9_bank_offset(0)),
+            b1 = in(reg) table.add(w9_bank_offset(1)),
+            b2 = in(reg) table.add(w9_bank_offset(2)),
+            b3 = in(reg) table.add(w9_bank_offset(3)),
+            b4 = in(reg) table.add(w9_bank_offset(4)),
+            b5 = in(reg) table.add(w9_bank_offset(5)),
+            b6 = in(reg) table.add(w9_bank_offset(6)),
+            acc = inout(vreg) acc,
+            i0 = out(reg) _,
+            i1 = out(reg) _,
+            t0 = out(vreg) _,
+            t1 = out(vreg) _,
+            t2 = out(vreg) _,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    acc
+}
+
+/// Two codes folded through a `W9` table, the chains interleaved bank by
+/// bank as in [`fold_two_row_codes_q`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn w9_two_codes_q(
+    table: *const u8,
+    row0: u64,
+    row1: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        let mut acc0 = w9_load_q::<0>(table, row0);
+        let mut acc1 = w9_load_q::<0>(table, row1);
+        macro_rules! step {
+            ($c0:literal, $c1:literal) => {
+                acc0 = xor3_u64(acc0, w9_load_q::<$c0>(table, row0), w9_load_q::<$c1>(table, row0));
+                acc1 = xor3_u64(acc1, w9_load_q::<$c0>(table, row1), w9_load_q::<$c1>(table, row1));
+            };
+        }
+        step!(1, 2);
+        step!(3, 4);
+        step!(5, 6);
+        (acc0, acc1)
+    }
+}
+
+/// Four codes folded through a `W9` table ([`fold_four_row_codes_q`]'s
+/// order).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn w9_four_codes_q(
+    table: *const u8,
+    row0: u64,
+    row1: u64,
+    row2: u64,
+    row3: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        let mut acc0 = w9_load_q::<0>(table, row0);
+        let mut acc1 = w9_load_q::<0>(table, row1);
+        let mut acc2 = w9_load_q::<0>(table, row2);
+        let mut acc3 = w9_load_q::<0>(table, row3);
+        macro_rules! step {
+            ($c0:literal, $c1:literal) => {
+                acc0 = xor3_u64(acc0, w9_load_q::<$c0>(table, row0), w9_load_q::<$c1>(table, row0));
+                acc1 = xor3_u64(acc1, w9_load_q::<$c0>(table, row1), w9_load_q::<$c1>(table, row1));
+                acc2 = xor3_u64(acc2, w9_load_q::<$c0>(table, row2), w9_load_q::<$c1>(table, row2));
+                acc3 = xor3_u64(acc3, w9_load_q::<$c0>(table, row3), w9_load_q::<$c1>(table, row3));
+            };
+        }
+        step!(1, 2);
+        step!(3, 4);
+        step!(5, 6);
+        (acc0, acc1, acc2, acc3)
+    }
+}
+
 /// Returns `true` iff a 128-bit vector is all-zero.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -1497,7 +1688,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 /// Returns the four folded rows plus whether the b≡1 shortcut was taken.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store(
+unsafe fn r2_pair_fold_and_store<const WIDE: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -1558,14 +1749,21 @@ unsafe fn r2_pair_fold_and_store(
         ));
 
         if degen && (b0_code & b1_code) == u64::MAX {
-            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            let (a0, a1) = if WIDE {
+                w9_two_codes_q(table_data, a0_code, a1_code)
+            } else {
+                fold_two_row_codes_q(table_data, a0_code, a1_code)
+            };
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
             store_delta_a_only_gpr(deltas.add(x_lo * 16), a0_code, a1_code);
             return (a0, a1, b_ones, b_ones, true);
         }
 
-        let (a0, a1, b0, b1) =
-            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+        let (a0, a1, b0, b1) = if WIDE {
+            w9_four_codes_q(table_data, a0_code, a1_code, b0_code, b1_code)
+        } else {
+            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code)
+        };
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
         store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
         (a0, a1, b0, b1, false)
@@ -1578,7 +1776,7 @@ unsafe fn r2_pair_fold_and_store(
 /// and values; the stores take the offset as an immediate.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store_off<const CODE: usize, const ANC: usize>(
+unsafe fn r2_pair_fold_and_store_off<const CODE: usize, const ANC: usize, const WIDE: bool>(
     table_data: *const u8,
     a_row: *const u8,
     b_row: *const u8,
@@ -1600,14 +1798,21 @@ unsafe fn r2_pair_fold_and_store_off<const CODE: usize, const ANC: usize>(
         let b1_code = u64::from_le(core::ptr::read_unaligned(b_row.add(CODE + 8).cast::<u64>()));
 
         if degen && (b0_code & b1_code) == u64::MAX {
-            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            let (a0, a1) = if WIDE {
+                w9_two_codes_q(table_data, a0_code, a1_code)
+            } else {
+                fold_two_row_codes_q(table_data, a0_code, a1_code)
+            };
             store_anchor_pair_nt_off::<ANC>(anchors, a0, b_ones);
             store_delta_a_only_gpr_off::<CODE>(deltas, a0_code, a1_code);
             return (a0, a1, b_ones, b_ones, true);
         }
 
-        let (a0, a1, b0, b1) =
-            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+        let (a0, a1, b0, b1) = if WIDE {
+            w9_four_codes_q(table_data, a0_code, a1_code, b0_code, b1_code)
+        } else {
+            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code)
+        };
         store_anchor_pair_nt_off::<ANC>(anchors, a0, b0);
         store_delta_pair_gpr_off::<CODE>(deltas, a0_code, a1_code, b0_code, b1_code);
         (a0, a1, b0, b1, false)
@@ -1724,6 +1929,10 @@ pub(crate) fn round2_eq_prep(eq_lo: &[F128]) -> Vec<F128> {
 /// products: **32 PMULL per group instead of 38** on every offloaded chunk.
 /// The four `mul_q` row weightings survive because `W0`/`W3`/`W4`/`W5` still
 /// need all four scaled rows.
+///
+/// `wide`, when not null, is the seven-bank `W9` form of the table at
+/// `table_data`; the full sweep on one pointer per stream then folds every
+/// code through it (same values).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
@@ -1731,6 +1940,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const ODD_ON_GPU: bool,
 >(
     table_data: *const u8,
+    wide: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
@@ -1747,8 +1957,26 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     out: *mut F128,
 ) {
     unsafe {
-        if FULL && r2_asm_offsets_enabled() && !eq_prep.is_null() {
-            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, true>(
+        if FULL && r2_asm_offsets_enabled() && !eq_prep.is_null() && !wide.is_null() {
+            fold_round2_compact_chunk_neon_lookahead_8_w9::<FULL, ODD_ON_GPU>(
+                wide,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                eq_prep,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                periodic_padding,
+                skip_dead,
+                out,
+            )
+        } else if FULL && r2_asm_offsets_enabled() && !eq_prep.is_null() {
+            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, true, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -1766,7 +1994,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 out,
             )
         } else {
-            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, false>(
+            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, false, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -1787,6 +2015,52 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     }
 }
 
+/// The one-pointer-per-stream instance of
+/// [`fold_round2_compact_chunk_neon_lookahead_8_impl`] on a `W9` table, a
+/// function of its own so the dispatcher's byte-table instances keep the
+/// register assignment they have without it.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_round2_compact_chunk_neon_lookahead_8_w9<const FULL: bool, const ODD_ON_GPU: bool>(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    eq_prep: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    periodic_padding: bool,
+    skip_dead: bool,
+    out: *mut F128,
+) {
+    unsafe {
+        fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, true, true>(
+            table_data,
+            a_packed,
+            b_packed,
+            anchors,
+            deltas,
+            eq_lo,
+            eq_prep,
+            lo_size,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            degen,
+            periodic_padding,
+            skip_dead,
+            out,
+        )
+    }
+}
+
 /// [`fold_round2_compact_chunk_neon_lookahead_8`]; with `ASM_OFF` the 60 live
 /// groups of each ranked block run on one pointer per stream, and their
 /// weights come prepared from `eq_prep` ([`round2_eq_prep`]: entries `2u`,
@@ -1798,6 +2072,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
     const FULL: bool,
     const ODD_ON_GPU: bool,
     const ASM_OFF: bool,
+    const WIDE: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -1865,7 +2140,11 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
         }
 
         let ones_bytes = [0xFFu8; 8];
-        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
+        let b_ones = if WIDE {
+            w9_code_q(table_data, u64::MAX)
+        } else {
+            fold_row_q(table_data, ones_bytes.as_ptr())
+        };
         let ones_is_one = is_zero_q(veorq_u64(
             b_ones,
             core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
@@ -1891,11 +2170,11 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let rows0 = r2_pair_fold_and_store(
+                let rows0 = r2_pair_fold_and_store::<WIDE>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
                     skip_dead,
                 );
-                let rows1 = r2_pair_fold_and_store(
+                let rows1 = r2_pair_fold_and_store::<WIDE>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
                     skip_dead,
                 );
@@ -2065,10 +2344,10 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                     // Group `u`'s prepared weight pair sits at `eq_prep[2u]`.
                     let mut pe = eq_prep.add(2 * first);
                     for _ in 0..60 {
-                        let rows0 = r2_pair_fold_and_store_off::<0, 0>(
+                        let rows0 = r2_pair_fold_and_store_off::<0, 0, WIDE>(
                             table_data, pa, pb, pn, pd, degen, b_ones,
                         );
-                        let rows1 = r2_pair_fold_and_store_off::<16, 32>(
+                        let rows1 = r2_pair_fold_and_store_off::<16, 32, WIDE>(
                             table_data, pa, pb, pn, pd, degen, b_ones,
                         );
                         let p0 = vld1q_u64(pe.cast::<u64>());
@@ -2862,11 +3141,14 @@ fn r2_ranked_invariants_enabled() -> bool {
 ///
 ///
 ///
+/// `wide`, when not null, is the seven-bank `W9` form of the table at
+/// `table_data`; the ranked loop then folds every code through it.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
     table_data: *const u8,
+    wide: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
     anchors: *mut F128,
@@ -2882,6 +3164,23 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
 ) {
     unsafe {
         match (r2_gpr_delta_enabled(), r2_fixed_pads_enabled()) {
+            (true, true) if r2_asm_offsets_enabled() && r2_ranked_invariants_enabled() && !wide.is_null() => {
+                fold_round2_compact_chunk_neon_prescaled_8_ranked_inv_w9(
+                    wide,
+                    a_packed,
+                    b_packed,
+                    anchors,
+                    deltas,
+                    eq_lo,
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    degen,
+                    skip_dead,
+                    out,
+                )
+            }
             (true, true) if r2_asm_offsets_enabled() && r2_ranked_invariants_enabled() => {
                 fold_round2_compact_chunk_neon_prescaled_8_ranked_inv(
                     table_data,
@@ -2900,7 +3199,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 )
             }
             (true, true) if r2_asm_offsets_enabled() => {
-                fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false>(
+                fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false, false>(
                     table_data,
                     a_packed,
                     b_packed,
@@ -2916,7 +3215,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                     out,
                 )
             }
-            (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false>(
+            (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2931,7 +3230,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (true, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false, false>(
+            (true, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false, false, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2946,7 +3245,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (false, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false, false>(
+            (false, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false, false, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2961,7 +3260,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 skip_dead,
                 out,
             ),
-            (false, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false, false>(
+            (false, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false, false, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -3002,7 +3301,49 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_ranked_inv(
     out: *mut F128,
 ) {
     unsafe {
-        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true>(
+        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true, false>(
+            table_data,
+            a_packed,
+            b_packed,
+            anchors,
+            deltas,
+            eq_lo,
+            lo_size,
+            pair_idx_base,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            degen,
+            skip_dead,
+            out,
+        )
+    }
+}
+
+/// The `RANKED_INV` instance with `table_data` a seven-bank `W9` table
+/// (seven loads per code instead of eight). Same stores and values as
+/// [`fold_round2_compact_chunk_neon_prescaled_8_ranked_inv`] on the byte
+/// table the `W9` table was built from.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[target_feature(enable = "aes")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_round2_compact_chunk_neon_prescaled_8_ranked_inv_w9(
+    table_data: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    skip_dead: bool,
+    out: *mut F128,
+) {
+    unsafe {
+        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true, true>(
             table_data,
             a_packed,
             b_packed,
@@ -3028,6 +3369,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
     const FIXED_PADS: bool,
     const ASM_OFF: bool,
     const RANKED_INV: bool,
+    const WIDE: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -3059,6 +3401,31 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
     }
 
     unsafe {
+        // Code folds through the byte table, or with `WIDE` through the `W9`
+        // table `table_data` then points to (same values).
+        macro_rules! fold1 {
+            ($c:expr) => {
+                if WIDE { w9_code_q(table_data, $c) } else { fold_row_code_q(table_data, $c) }
+            };
+        }
+        macro_rules! fold2 {
+            ($c0:expr, $c1:expr) => {
+                if WIDE {
+                    w9_two_codes_q(table_data, $c0, $c1)
+                } else {
+                    fold_two_row_codes_q(table_data, $c0, $c1)
+                }
+            };
+        }
+        macro_rules! fold_paired {
+            ($c0:expr, $c1:expr) => {
+                if WIDE {
+                    w9_two_codes_q(table_data, $c0, $c1)
+                } else {
+                    fold_two_codes_paired_q(table_data, $c0, $c1)
+                }
+            };
+        }
         let zero = vdupq_n_u64(0);
         let k87 = vdupq_n_u64(0x87);
         let tri_zero = TriNeon {
@@ -3074,7 +3441,11 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
         let mut sum3 = tri_zero;
         let mut sum4 = tri_zero;
         let mut sum5 = tri_zero;
-        let b_ones = fold_row_q(table_data, [0xffu8; 8].as_ptr());
+        let b_ones = if WIDE {
+            w9_code_q(table_data, u64::MAX)
+        } else {
+            fold_row_q(table_data, [0xffu8; 8].as_ptr())
+        };
         let ones_is_one = is_zero_q(veorq_u64(
             b_ones,
             core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
@@ -3145,9 +3516,9 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 };
                                 let deg = degen && (b_even & b_odd) == u64::MAX;
                                 let (a, b) = if deg {
-                                    (fold_row_code_q(table_data, a_even), b_ones)
+                                    (fold1!(a_even), b_ones)
                                 } else {
-                                    fold_two_row_codes_q(table_data, a_even, b_even)
+                                    fold2!(a_even, b_even)
                                 };
                                 store_anchor_pair_nt(anchors.add(2 * x_lo), a, b);
                                 if GPR_DELTA {
@@ -3191,7 +3562,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                         tri_acc_q_crossfused(&mut w3, e_s, e_b);
                                     }
                                 let (o_a, o_b) =
-                                    fold_two_codes_paired_q(table_data, a1c ^ a3c, b1c ^ b3c);
+                                    fold_paired!(a1c ^ a3c, b1c ^ b3c);
                                 let o_s = mul_xb_q(o_a, xb, k87);
                                 if $init && init_first {
                                         tri_set_q(&mut w4, o_s, o_b);
@@ -3235,9 +3606,9 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 let (b_even, b_odd) = load_code_pair_gpr_off::<$code>(pb);
                                 let deg = $degen && (b_even & b_odd) == u64::MAX;
                                 let (a, b) = if deg {
-                                    (fold_row_code_q(table_data, a_even), b_ones)
+                                    (fold1!(a_even), b_ones)
                                 } else {
-                                    fold_two_row_codes_q(table_data, a_even, b_even)
+                                    fold2!(a_even, b_even)
                                 };
                                 store_anchor_pair_nt_off::<$anc>(pn, a, b);
                                 store_delta_pair_gpr_off::<$code>(pd, a_even, a_odd, b_even, b_odd);
@@ -3278,7 +3649,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                         let e_s = mul_xb_q(e_a, xb, $k);
                                         tacc!(&mut w3, e_s, e_b);
                                         let (o_a, o_b) =
-                                            fold_two_codes_paired_q(table_data, a1c ^ a3c, b1c ^ b3c);
+                                            fold_paired!(a1c ^ a3c, b1c ^ b3c);
                                         let o_s = mul_xb_q(o_a, xb, $k);
                                         tacc!(&mut w4, o_s, o_b);
                                         tacc!(&mut w5, veorq_u64(e_s, o_s), veorq_u64(e_b, o_b));
@@ -4328,6 +4699,7 @@ unsafe fn mul_prep_q(
 pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     const DEAD_TAIL: bool,
     const PACK: bool,
+    const WIDE: bool,
 >(
     table_r1: *const u8,
     rho2: F128,
@@ -4358,6 +4730,17 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     }
 
     unsafe {
+        // `init` XOR one delta code folded through `table_r1`: the byte
+        // layout, or with `WIDE` the seven-bank `W9` layout (same values).
+        macro_rules! lookup_acc {
+            ($code:expr, $init:expr) => {
+                if WIDE {
+                    w9_code_acc_q(table_r1, $code, $init)
+                } else {
+                    lookup8_acc_q(table_r1, $code, $init)
+                }
+            };
+        }
         let zero = vdupq_n_u64(0);
         let k87 = vdupq_n_u64(0x87);
         let rho2_q = core::mem::transmute::<F128, uint64x2_t>(rho2);
@@ -4386,8 +4769,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 let da1 = u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>()));
                 let db1 = u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>()));
 
-                let xa0 = lookup8_acc_q(table_r1, da0, anc_a0);
-                let xa1 = lookup8_acc_q(table_r1, da1, anc_a1);
+                let xa0 = lookup_acc!(da0, anc_a0);
+                let xa1 = lookup_acc!(da1, anc_a1);
                 let av = mul_prep_xor1_q(rho2_p0, rho2_p1, veorq_u64(xa0, xa1), k87, one_q, xa0);
                 let bv = if degen && (db0 | db1) == 0 {
                     let bd = veorq_u64(anc_b0, anc_b1);
@@ -4399,8 +4782,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     }
                 } else {
                     $b_flat = false;
-                    let xb0 = lookup8_acc_q(table_r1, db0, anc_b0);
-                    let xb1 = lookup8_acc_q(table_r1, db1, anc_b1);
+                    let xb0 = lookup_acc!(db0, anc_b0);
+                    let xb1 = lookup_acc!(db1, anc_b1);
                     mul_prep_xor1_q(rho2_p0, rho2_p1, veorq_u64(xb0, xb1), k87, one_q, xb0)
                 };
                 (av, bv)
@@ -4507,8 +4890,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 let dp = deltas.add(32 * g);
                 let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
                 let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let xa0 = lookup8_acc_q(table_r1, da0, anc_a0);
-                let xb0 = lookup8_acc_q(table_r1, db0, anc_b0);
+                let xa0 = lookup_acc!(da0, anc_a0);
+                let xb0 = lookup_acc!(db0, anc_b0);
                 let av0 = mul_prep_xor1_q(rho2_p0, rho2_p1, xa0, k87, one_q, xa0);
                 let bv0 = mul_prep_xor1_q(rho2_p0, rho2_p1, xb0, k87, one_q, xb0);
                 if PACK {
@@ -4563,6 +4946,35 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         for (k, v) in sums.into_iter().enumerate() {
             *out.add(k) = v;
         }
+    }
+}
+
+/// The `W9` instances of [`fold2_compact_and_round45_chunk_neon_8_fused_r1`]
+/// (`table_r1` a seven-bank table), each a function of its own. Inlined into
+/// the K pass's chunk closure beside the byte-table instances, the packed
+/// instance's general group path kept every saved lookup but gained a
+/// 37-move vector register rotation per group (682 vs 684 instructions);
+/// on its own the allocator sees only the kernel.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[target_feature(enable = "aes")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_w9<const DEAD_TAIL: bool, const PACK: bool>(
+    table_r1: *const u8,
+    rho2: F128,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_prep: *const F128,
+    out_pairs: usize,
+    degen: bool,
+    out: *mut F128,
+) {
+    unsafe {
+        fold2_compact_and_round45_chunk_neon_8_fused_r1::<DEAD_TAIL, PACK, true>(
+            table_r1, rho2, anchors, deltas, a_out, b_out, eq_prep, out_pairs, degen, out,
+        )
     }
 }
 
@@ -7278,6 +7690,7 @@ mod tests {
                                 } else {
                                     fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                                         table.data.as_ptr().cast::<u8>(),
+                                        core::ptr::null(),
                                         a_packed.as_ptr(),
                                         b_packed.as_ptr(),
                                         anchors.as_mut_ptr(),
@@ -7479,12 +7892,12 @@ mod tests {
                                 unsafe {
                                     let kernel = match variant {
                                         0 => fold_round2_compact_chunk_neon_horner_8_impl::<true, false>,
-                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false, false>,
-                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false, false>,
-                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false, false>,
-                                        4 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false>,
-                                        5 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false>,
-                                        _ => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true>,
+                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false, false, false>,
+                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false, false, false>,
+                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false, false, false>,
+                                        4 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false, false>,
+                                        5 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false, false>,
+                                        _ => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true, false>,
                                     };
                                     kernel(
                                         table.data.as_ptr().cast::<u8>(),
@@ -7607,17 +8020,17 @@ mod tests {
                             match kernel {
                                 0 | 1 => {
                                     let k = if kernel == 0 {
-                                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false>
+                                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false, false>
                                     } else {
-                                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false>
+                                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false, false>
                                     };
                                     k(t, a, b, anc, del, eq, LO_SIZE, base, mask, useful, degen, skip_dead, o)
                                 }
                                 _ => {
                                     let k = if kernel == 2 {
-                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false>
+                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false, false>
                                     } else {
-                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true>
+                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, false>
                                     };
                                     let ep = eq_prep.as_ptr();
                                     k(t, a, b, anc, del, eq, ep, LO_SIZE, base, mask, useful, degen, periodic, skip_dead, o)
@@ -7698,7 +8111,7 @@ mod tests {
                             let k = if new {
                                 fold_round2_compact_chunk_neon_prescaled_8_ranked_inv
                             } else {
-                                fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false>
+                                fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false, false>
                             };
                             unsafe {
                                 k(
@@ -8626,6 +9039,7 @@ mod tests {
             unsafe {
                 fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                     table.as_ptr().cast::<u8>(),
+                    core::ptr::null(),
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
                     anchors.as_mut_ptr(),
@@ -8838,12 +9252,12 @@ mod tests {
                                 deltas.as_ptr(), a.as_mut_ptr(), b.as_mut_ptr(), eq.as_ptr(),
                                 OUT_PAIRS, true, out.as_mut_ptr(),
                             ),
-                            (false, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
+                            (false, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
                                 r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                 out.as_mut_ptr(),
                             ),
-                            (false, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                            (false, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
                                 r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                 out.as_mut_ptr(),
@@ -8926,12 +9340,12 @@ mod tests {
                 let (mut ap, mut bp) = (vec![poison; n_out], vec![poison; n_out]);
                 let (mut o_full, mut o_pack) = ([F128::ZERO; 8], [F128::ZERO; 8]);
                 unsafe {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_full.as_mut_ptr(),
                     );
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         ap.as_mut_ptr(), bp.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_pack.as_mut_ptr(),
@@ -9068,6 +9482,535 @@ mod tests {
                 assert_eq!(si, sc, "packed slots, case {case}");
                 assert_eq!(ai, ac, "packed a outputs, case {case}");
                 assert_eq!(bi, bc, "packed b outputs, case {case}");
+            }
+        }
+    }
+    /// A byte fold table (eight GF(2)-linear 256-entry banks) over the 64
+    /// code-bit weights `w`.
+    fn linear_byte_table(w: &[F128; 64]) -> Vec<F128> {
+        let mut t = vec![F128::ZERO; 8 * 256];
+        for j in 0..8 {
+            for v in 1usize..256 {
+                let low = v & v.wrapping_neg();
+                t[256 * j + v] = t[256 * j + (v ^ low)] + w[8 * j + low.trailing_zeros() as usize];
+            }
+        }
+        t
+    }
+
+    /// Every `W9` bank's index form reads exactly entry `field(row)` of its
+    /// bank, whatever the other 54 or 55 bits hold. The table is random (not
+    /// linear), so a wrong bank, shift or width reads a different value.
+    #[test]
+    fn w9_load_reads_the_indexed_entry() {
+        let mut state = 0x5739_4c4f_4144_0001;
+        let table: Vec<[u64; 2]> =
+            (0..W9_ENTRIES).map(|_| [splitmix64(&mut state), splitmix64(&mut state)]).collect();
+        let t = table.as_ptr().cast::<u8>();
+        macro_rules! check_bank {
+            ($k:literal, $first:expr, $width:expr) => {
+                assert_eq!(w9_bank_offset($k), 16 * [0, 1024, 1536, 2048, 2560, 3072, 3584][$k]);
+                for v in 0..1u64 << $width {
+                    for case in 0..4 {
+                        let other = match case {
+                            0 => 0,
+                            1 => u64::MAX,
+                            _ => splitmix64(&mut state),
+                        };
+                        let field = ((1u64 << $width) - 1) << $first;
+                        let row = (other & !field) | (v << $first);
+                        let got: [u64; 2] = unsafe { core::mem::transmute(w9_load_q::<$k>(t, row)) };
+                        let want = table[w9_bank_offset($k) / 16 + v as usize];
+                        assert_eq!(got, want, "bank {} v {v} row {row:#018x}", $k);
+                    }
+                }
+            };
+        }
+        check_bank!(0, 0, 10);
+        check_bank!(1, 10, 9);
+        check_bank!(2, 19, 9);
+        check_bank!(3, 28, 9);
+        check_bank!(4, 37, 9);
+        check_bank!(5, 46, 9);
+        check_bank!(6, 55, 9);
+        assert_eq!(w9_bank_offset(6) / 16 + 512, W9_ENTRIES);
+    }
+
+    /// A code folds to the same field element through the `W9` table as
+    /// through the byte table it was built from (plain and scaled, the
+    /// production fold table and random linear tables): every single-bit
+    /// code, zero, all-ones and random codes, through every `W9` helper.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn w9_code_folds_match_byte_folds() {
+        use crate::zerocheck::multilinear::{UniSkipFoldTable, w9_table_from_bytes};
+        let mut state = 0x5739_464f_4c44_0002;
+        let f = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let q = |v: F128| unsafe { core::mem::transmute::<F128, uint64x2_t>(v) };
+        let words = |v: uint64x2_t| -> [u64; 2] { unsafe { core::mem::transmute(v) } };
+        for case in 0..4 {
+            let bytes = if case < 2 {
+                UniSkipFoldTable::new(6, f(&mut state)).data
+            } else {
+                let w: [F128; 64] = core::array::from_fn(|_| f(&mut state));
+                linear_byte_table(&w)
+            };
+            let scale = if case % 2 == 0 { None } else { Some(f(&mut state)) };
+            let byte = match scale {
+                None => bytes.clone(),
+                Some(s) => {
+                    let w: [F128; 64] = core::array::from_fn(|i| s * bytes[256 * (i / 8) + (1 << (i % 8))]);
+                    linear_byte_table(&w)
+                }
+            };
+            let w9 = w9_table_from_bytes(&bytes, scale);
+            assert_eq!(w9.len(), W9_ENTRIES);
+            let (bt, wt) = (byte.as_ptr().cast::<u8>(), w9.as_ptr().cast::<u8>());
+            for i in 0..64 {
+                let code = 1u64 << i;
+                let want = byte[256 * (i / 8) + (1 << (i % 8))];
+                assert_eq!(words(unsafe { w9_code_q(wt, code) }), words(q(want)), "bit {i}, case {case}");
+            }
+            for n in 0..4096 {
+                let codes: [u64; 4] = match n {
+                    0 => [0; 4],
+                    1 => [u64::MAX; 4],
+                    2 => [0x3ff, 0x7fc00, 0xff80_0000_0000_0000, 0x007f_c000_0000_0000],
+                    _ => core::array::from_fn(|_| splitmix64(&mut state)),
+                };
+                let init = q(f(&mut state));
+                unsafe {
+                    assert_eq!(words(w9_code_q(wt, codes[0])), words(fold_row_code_q(bt, codes[0])));
+                    assert_eq!(
+                        words(w9_code_acc_q(wt, codes[1], init)),
+                        words(lookup8_acc_q(bt, codes[1], init))
+                    );
+                    let (x, y) = w9_two_codes_q(wt, codes[2], codes[3]);
+                    let (xw, yw) = fold_two_row_codes_q(bt, codes[2], codes[3]);
+                    assert_eq!([words(x), words(y)], [words(xw), words(yw)]);
+                    let (a, b, c, d) = w9_four_codes_q(wt, codes[0], codes[1], codes[2], codes[3]);
+                    let (aw, bw, cw, dw) = fold_four_row_codes_q(bt, codes[0], codes[1], codes[2], codes[3]);
+                    assert_eq!(
+                        [words(a), words(b), words(c), words(d)],
+                        [words(aw), words(bw), words(cw), words(dw)],
+                        "case {case} codes {codes:x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The round-two kernels on a `W9` table write the same anchors and
+    /// deltas and return the same slots as on the byte table it was built
+    /// from: the ranked pre-scaled loop and the lookahead sweep (one pointer
+    /// per stream and the parent loop), ranked and generic geometries,
+    /// degenerate groups, dead stores skipped or not, with and without the
+    /// b == 1 shortcut.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn round2_w9_kernels_match_byte_kernels() {
+        use crate::zerocheck::multilinear::{UniSkipFoldTable, w9_table_from_bytes};
+        let mut state = 0x5739_5232_4b45_0003;
+        let f = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        for lo_size in [128usize, 1024, 4096] {
+            let mut a_packed = vec![0u8; 16 * lo_size];
+            let mut b_packed = vec![0u8; 16 * lo_size];
+            for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+                *byte = splitmix64(&mut state) as u8;
+            }
+            let n_groups = lo_size / 2;
+            for group in [0usize, 1, 2, 7, 15, 16, 29, 30, 31, 32, 33, 59, 60, 61, 63] {
+                for g in [group, group + 64, n_groups - 64 + group] {
+                    if g < n_groups {
+                        b_packed[g * 32..(g + 1) * 32].fill(0xff);
+                    }
+                }
+            }
+            b_packed[34 * 32..44 * 32].fill(0xff);
+            b_packed[5 * 32..5 * 32 + 16].fill(0xff);
+            b_packed[9 * 32 + 16..10 * 32].fill(0xff);
+            let eq_lo: Vec<F128> = (0..lo_size).map(|_| f(&mut state)).collect();
+            let eq_prep = round2_eq_prep(&eq_lo);
+            let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
+            for real in [false, true] {
+                // The production table folds all-ones to one (the b == 1
+                // shortcut); random weights do not.
+                let bytes = if real {
+                    UniSkipFoldTable::new(6, f(&mut state)).data
+                } else {
+                    let w: [F128; 64] = core::array::from_fn(|_| f(&mut state));
+                    linear_byte_table(&w)
+                };
+                let w9 = w9_table_from_bytes(&bytes, None);
+                for (mask, useful, base, periodic) in [
+                    (127, 121, 0, true),
+                    (127, 121, 128, true),
+                    (127, 121, 5 * lo_size, true),
+                    (127, 121, 64, true),
+                    (127, 121, 0, false),
+                    (usize::MAX, usize::MAX, 0, false),
+                ] {
+                    for (degen, skip_dead) in [(false, false), (true, false), (false, true), (true, true)] {
+                        let run = |kernel: usize, wide: bool| {
+                            let mut anchors = vec![poison; 2 * lo_size];
+                            let mut deltas = vec![0xa5u8; 16 * lo_size];
+                            let mut out = [poison; 8];
+                            let t = if wide { w9.as_ptr() } else { bytes.as_ptr() }.cast::<u8>();
+                            let (a, b) = (a_packed.as_ptr(), b_packed.as_ptr());
+                            let (anc, del) = (anchors.as_mut_ptr(), deltas.as_mut_ptr());
+                            let (eq, ep, o) = (eq_lo.as_ptr(), eq_prep.as_ptr(), out.as_mut_ptr());
+                            unsafe {
+                                match (kernel, wide) {
+                                    (0, false) => fold_round2_compact_chunk_neon_prescaled_8_ranked_inv(
+                                        t, a, b, anc, del, eq, lo_size, base, mask, useful, degen, skip_dead, o,
+                                    ),
+                                    (0, true) => fold_round2_compact_chunk_neon_prescaled_8_ranked_inv_w9(
+                                        t, a, b, anc, del, eq, lo_size, base, mask, useful, degen, skip_dead, o,
+                                    ),
+                                    (1, false) => fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, false>(
+                                        t, a, b, anc, del, eq, ep, lo_size, base, mask, useful, degen, periodic,
+                                        skip_dead, o,
+                                    ),
+                                    (1, true) => fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, true>(
+                                        t, a, b, anc, del, eq, ep, lo_size, base, mask, useful, degen, periodic,
+                                        skip_dead, o,
+                                    ),
+                                    (_, false) => fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false, false>(
+                                        t, a, b, anc, del, eq, ep, lo_size, base, mask, useful, degen, periodic,
+                                        skip_dead, o,
+                                    ),
+                                    (_, true) => fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false, true>(
+                                        t, a, b, anc, del, eq, ep, lo_size, base, mask, useful, degen, periodic,
+                                        skip_dead, o,
+                                    ),
+                                }
+                            }
+                            (anchors, deltas, out)
+                        };
+                        for kernel in 0..3 {
+                            let (want, got) = (run(kernel, false), run(kernel, true));
+                            let at = format!(
+                                "kernel {kernel} lo {lo_size} real {real} mask {mask} base {base} periodic {periodic} degen {degen} skip {skip_dead}"
+                            );
+                            assert_eq!(got.0, want.0, "anchors: {at}");
+                            assert_eq!(got.1, want.1, "deltas: {at}");
+                            assert_eq!(got.2, want.2, "slots: {at}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Single-thread timing of the `W9` kernels against their byte-table
+    /// twins, ABBA order, on the ranked geometry (production fold table,
+    /// 121 live pairs per 128, degenerate b rows, dead pairs skipped) over a
+    /// working set larger than the L2, so inputs stream as in the proof.
+    /// Prints per-kernel median ms per pass and the median paired ratio.
+    /// `cargo test --release -p flock-core --lib zc_w9_kernel_timing -- --ignored --nocapture`
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    #[ignore]
+    fn zc_w9_kernel_timing() {
+        use crate::zerocheck::multilinear::{UniSkipFoldTable, w9_table_from_bytes};
+        use crate::zerocheck::univariate_skip::build_eq;
+        use crate::zerocheck::univariate_skip_optimized::medium_challenges_ghash;
+        let reps: usize = std::env::var("W9_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+        let mut state = 0x5739_5449_4d45_0005;
+        let f = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, f(&mut state));
+        let w9 = w9_table_from_bytes(&table.data, None);
+        // Instructions retired by this process (`proc_pid_rusage`, V4+).
+        fn instr() -> u64 {
+            unsafe extern "C" {
+                fn proc_pid_rusage(pid: i32, flavor: i32, buf: *mut u64) -> i32;
+                fn getpid() -> i32;
+            }
+            let mut b = [0u64; 128];
+            unsafe { proc_pid_rusage(getpid(), 6, b.as_mut_ptr()) };
+            b[2 + 29]
+        }
+        let report = |name: &str, a: &[(f64, u64)], b: &[(f64, u64)]| {
+            let ia: Vec<u64> = a.iter().map(|x| x.1).collect();
+            let ib: Vec<u64> = b.iter().map(|x| x.1).collect();
+            let a: Vec<f64> = a.iter().map(|x| x.0).collect();
+            let b: Vec<f64> = b.iter().map(|x| x.0).collect();
+            let (a, b) = (&a[..], &b[..]);
+            let mi = |v: &[u64]| {
+                let mut v = v.to_vec();
+                v.sort();
+                v[v.len() / 2]
+            };
+            eprintln!("[w9-timing] {name}: instructions per pass byte {} w9 {} ({:+.2}%)", mi(&ib), mi(&ia), 100.0 * (mi(&ia) as f64 / mi(&ib) as f64 - 1.0));
+            let med = |v: &[f64]| {
+                let mut v = v.to_vec();
+                v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                v[v.len() / 2]
+            };
+            let ratios: Vec<f64> = a.iter().zip(b).map(|(x, y)| x / y).collect();
+            let wins = ratios.iter().filter(|r| **r < 1.0).count();
+            eprintln!(
+                "[w9-timing] {name}: byte {:.3} ms  w9 {:.3} ms  paired w9/byte median {:.4} ({wins}/{} faster)",
+                med(b), med(a), med(&ratios), ratios.len()
+            );
+        };
+
+        // `W9_THREADS` threads share each pass, chunk c on thread c mod n
+        // (the proof runs these kernels on every performance core).
+        let threads: usize = std::env::var("W9_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        eprintln!("[w9-timing] threads {threads}, reps {reps}");
+        // `W9_QOS=utility`: every pass thread at the efficiency-core QoS class
+        // (the class of `crate::epool`'s helper pool), so the scheduler runs
+        // it on E-cores.
+        let utility = std::env::var("W9_QOS").is_ok_and(|v| v == "utility");
+        eprintln!("[w9-timing] qos {}", if utility { "utility" } else { "default" });
+        let run_chunks = |n: usize, body: &(dyn Fn(usize) + Sync)| {
+            std::thread::scope(|sc| {
+                for t in 0..threads {
+                    sc.spawn(move || {
+                        if utility {
+                            unsafe extern "C" {
+                                fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+                            }
+                            unsafe { pthread_set_qos_class_self_np(0x11, 0) };
+                        }
+                        (t..n).step_by(threads).for_each(body)
+                    });
+                }
+            });
+        };
+        let abba = |pass: &dyn Fn(bool) -> (f64, u64)| {
+            let (mut tw, mut tb) = (Vec::new(), Vec::new());
+            pass(true);
+            pass(false);
+            for rep in 0..reps {
+                if rep % 2 == 0 {
+                    tw.push(pass(true));
+                    tb.push(pass(false));
+                } else {
+                    tb.push(pass(false));
+                    tw.push(pass(true));
+                }
+            }
+            (tw, tb)
+        };
+
+        // Round two: the ranked pre-scaled loop (GPU-shared chunks) and the
+        // full lookahead sweep (CPU-only chunks), as the producer calls them.
+        const LO: usize = 1 << 14;
+        const R2_CHUNKS: usize = 128;
+        let mut r: Vec<F128> = (0..14).map(|_| f(&mut state)).collect();
+        r[2..6].copy_from_slice(&medium_challenges_ghash());
+        let eq_lo = build_eq(&r);
+        let eq_prep_r2 = round2_eq_prep(&eq_lo);
+        let mut a = vec![0u8; 16 * LO * R2_CHUNKS];
+        let mut b = vec![0u8; 16 * LO * R2_CHUNKS];
+        for pair in 0..LO * R2_CHUNKS {
+            if pair & 127 >= 121 {
+                continue;
+            }
+            for byte in a[16 * pair..16 * pair + 16].iter_mut() {
+                *byte = splitmix64(&mut state) as u8;
+            }
+            let ones = splitmix64(&mut state) % 4 == 0;
+            for byte in b[16 * pair..16 * pair + 16].iter_mut() {
+                *byte = if ones { 0xff } else { splitmix64(&mut state) as u8 };
+            }
+        }
+        let mut anchors = vec![F128::ZERO; 2 * LO * R2_CHUNKS];
+        let mut deltas = vec![0u8; 16 * LO * R2_CHUNKS];
+        let (ap0, bp0) = (a.as_ptr() as usize, b.as_ptr() as usize);
+        let (an0, de0) = (anchors.as_mut_ptr() as usize, deltas.as_mut_ptr() as usize);
+        let (tbyte, tw9) = (table.data.as_ptr() as usize, w9.as_ptr() as usize);
+        let (eqp, eqprep) = (eq_lo.as_ptr() as usize, eq_prep_r2.as_ptr() as usize);
+        let r2_pass = |wide: bool| -> (f64, u64) {
+            let i0 = instr();
+            let t = std::time::Instant::now();
+            run_chunks(R2_CHUNKS, &|c| unsafe {
+                let mut out = [F128::ZERO; 8];
+                let (ap, bp) = ((ap0 as *const u8).add(16 * LO * c), (bp0 as *const u8).add(16 * LO * c));
+                let (an, de) = ((an0 as *mut F128).add(2 * LO * c), (de0 as *mut u8).add(16 * LO * c));
+                let eq = eqp as *const F128;
+                if wide {
+                    fold_round2_compact_chunk_neon_prescaled_8_ranked_inv_w9(
+                        tw9 as *const u8, ap, bp, an, de, eq, LO, c * LO, 127, 121, true, true, out.as_mut_ptr(),
+                    )
+                } else {
+                    fold_round2_compact_chunk_neon_prescaled_8_ranked_inv(
+                        tbyte as *const u8, ap, bp, an, de, eq, LO, c * LO, 127, 121, true, true, out.as_mut_ptr(),
+                    )
+                }
+                std::hint::black_box(out);
+            });
+            (t.elapsed().as_secs_f64() * 1e3, instr() - i0)
+        };
+        let (tw, tb) = abba(&r2_pass);
+        report("round2 ranked_inv", &tw, &tb);
+        let la_pass = |wide: bool| -> (f64, u64) {
+            let i0 = instr();
+            let t = std::time::Instant::now();
+            run_chunks(R2_CHUNKS, &|c| unsafe {
+                let mut out = [F128::ZERO; 8];
+                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    tbyte as *const u8,
+                    if wide { tw9 as *const u8 } else { core::ptr::null() },
+                    (ap0 as *const u8).add(16 * LO * c),
+                    (bp0 as *const u8).add(16 * LO * c),
+                    (an0 as *mut F128).add(2 * LO * c),
+                    (de0 as *mut u8).add(16 * LO * c),
+                    eqp as *const F128,
+                    eqprep as *const F128,
+                    LO,
+                    c * LO,
+                    127,
+                    121,
+                    true,
+                    true,
+                    true,
+                    out.as_mut_ptr(),
+                );
+                std::hint::black_box(out);
+            });
+            (t.elapsed().as_secs_f64() * 1e3, instr() - i0)
+        };
+        let (tw, tb) = abba(&la_pass);
+        report("round2 lookahead full", &tw, &tb);
+
+        // K pass, one-table fused kernel, dead-tail packed layout, through
+        // the instances the K pass calls.
+        const K_PAIRS: usize = 8192;
+        const K_CHUNKS: usize = 64;
+        let rho1 = f(&mut state);
+        let rho2 = f(&mut state);
+        let r1 = table.scaled_linear(rho1);
+        let w9r = w9_table_from_bytes(&table.data, Some(rho1));
+        let mut k_anchors: Vec<F128> = (0..8 * K_PAIRS * K_CHUNKS).map(|_| f(&mut state)).collect();
+        let mut k_deltas: Vec<u8> = (0..64 * K_PAIRS * K_CHUNKS).map(|_| splitmix64(&mut state) as u8).collect();
+        for g in 0..4 * K_PAIRS * K_CHUNKS / 2 {
+            if splitmix64(&mut state) % 2 == 0 {
+                k_anchors[4 * g + 1] = F128::ONE;
+                k_anchors[4 * g + 3] = F128::ONE;
+                k_deltas[32 * g + 8..32 * g + 16].fill(0);
+                k_deltas[32 * g + 24..32 * g + 32].fill(0);
+            }
+        }
+        let eq: Vec<F128> = (0..K_PAIRS).map(|_| f(&mut state)).collect();
+        let eq_prep = round2_eq_prep(&eq);
+        let mut ka = vec![F128::ZERO; 2 * K_PAIRS * K_CHUNKS];
+        let mut kb = vec![F128::ZERO; 2 * K_PAIRS * K_CHUNKS];
+        let (kan0, kde0) = (k_anchors.as_ptr() as usize, k_deltas.as_ptr() as usize);
+        let (ka0, kb0) = (ka.as_mut_ptr() as usize, kb.as_mut_ptr() as usize);
+        let (r1p, w9rp, kep) = (r1.as_ptr() as usize, w9r.as_ptr() as usize, eq_prep.as_ptr() as usize);
+        let k_pass = |wide: bool| -> (f64, u64) {
+            let i0 = instr();
+            let t = std::time::Instant::now();
+            run_chunks(K_CHUNKS, &|c| unsafe {
+                let mut out = [F128::ZERO; 8];
+                let an = (kan0 as *const F128).add(8 * K_PAIRS * c);
+                let de = (kde0 as *const u8).add(64 * K_PAIRS * c);
+                let (ap, bp) = ((ka0 as *mut F128).add(2 * K_PAIRS * c), (kb0 as *mut F128).add(2 * K_PAIRS * c));
+                let ep = kep as *const F128;
+                if wide {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1_w9::<true, true>(
+                        w9rp as *const u8, rho2, an, de, ap, bp, ep, K_PAIRS, true, out.as_mut_ptr(),
+                    )
+                } else {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                        r1p as *const u8, rho2, an, de, ap, bp, ep, K_PAIRS, true, out.as_mut_ptr(),
+                    )
+                }
+                std::hint::black_box(out);
+            });
+            (t.elapsed().as_secs_f64() * 1e3, instr() - i0)
+        };
+        let (tw, tb) = abba(&k_pass);
+        report("K pass fused_r1 packed", &tw, &tb);
+    }
+
+    /// The one-table K pass on the `W9` form of `rho1 * T` writes the same
+    /// outputs (full and dead-tail-packed layouts) and the same eight slots
+    /// as on the byte form `scaled_linear(rho1)`.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn k_w9_matches_byte_table() {
+        use crate::zerocheck::multilinear::{UniSkipFoldTable, w9_table_from_bytes};
+        let mut state = 0x5739_4b50_4153_0004;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, rho(&mut state));
+        const OUT_PAIRS: usize = 2 * 16 * 8;
+        for case in 0..6 {
+            let (rho1, rho2) = match case {
+                0 => (F128::ONE, F128::ONE),
+                1 => (rho(&mut state), F128::ZERO),
+                _ => (rho(&mut state), rho(&mut state)),
+            };
+            let r1 = table.scaled_linear(rho1);
+            let w9 = w9_table_from_bytes(&table.data, Some(rho1));
+            let mut anchors: Vec<F128> = (0..8 * OUT_PAIRS).map(|_| rho(&mut state)).collect();
+            let mut deltas: Vec<u8> = (0..64 * OUT_PAIRS).map(|_| splitmix64(&mut state) as u8).collect();
+            let eq: Vec<F128> = (0..OUT_PAIRS).map(|_| rho(&mut state)).collect();
+            let eq_prep = round2_eq_prep(&eq);
+            for g in 0..4 * OUT_PAIRS / 2 {
+                let class = if (g / 4) % 7 == 3 { 1 } else { splitmix64(&mut state) % 5 };
+                match class {
+                    0 => {
+                        anchors[4 * g + 3] = anchors[4 * g + 1];
+                        deltas[32 * g + 8..32 * g + 16].fill(0);
+                        deltas[32 * g + 24..32 * g + 32].fill(0);
+                    }
+                    1 => {
+                        anchors[4 * g + 1] = F128::ONE;
+                        anchors[4 * g + 3] = F128::ONE;
+                        deltas[32 * g + 8..32 * g + 16].fill(0);
+                        deltas[32 * g + 24..32 * g + 32].fill(0);
+                    }
+                    2 => {
+                        deltas[32 * g + 8..32 * g + 16].fill(0);
+                        deltas[32 * g + 24..32 * g + 32].fill(0);
+                    }
+                    _ => {}
+                }
+            }
+            for degen in [false, true] {
+                for layout in 0..3 {
+                    let run = |wide: bool| {
+                        let poison = F128::new(0xdead, 0xbeef);
+                        let mut a = vec![poison; 2 * OUT_PAIRS];
+                        let mut b = vec![poison; 2 * OUT_PAIRS];
+                        let mut out = [F128::ZERO; 8];
+                        let t = if wide { w9.as_ptr() } else { r1.as_ptr() }.cast::<u8>();
+                        let (an, de, ap, bp) = (anchors.as_ptr(), deltas.as_ptr(), a.as_mut_ptr(), b.as_mut_ptr());
+                        let (ep, o) = (eq_prep.as_ptr(), out.as_mut_ptr());
+                        unsafe {
+                            match (layout, wide) {
+                                (0, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
+                                    t, rho2, an, de, ap, bp, ep, OUT_PAIRS, degen, o,
+                                ),
+                                (0, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, true>(
+                                    t, rho2, an, de, ap, bp, ep, OUT_PAIRS, degen, o,
+                                ),
+                                (1, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
+                                    t, rho2, an, de, ap, bp, ep, OUT_PAIRS, degen, o,
+                                ),
+                                (1, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, true>(
+                                    t, rho2, an, de, ap, bp, ep, OUT_PAIRS, degen, o,
+                                ),
+                                (_, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                                    t, rho2, an, de, ap, bp, ep, OUT_PAIRS, degen, o,
+                                ),
+                                (_, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, true>(
+                                    t, rho2, an, de, ap, bp, ep, OUT_PAIRS, degen, o,
+                                ),
+                            }
+                        }
+                        (a, b, out)
+                    };
+                    let (want, got) = (run(false), run(true));
+                    let at = format!("case {case} degen {degen} layout {layout}");
+                    assert_eq!(got.0, want.0, "a outputs: {at}");
+                    assert_eq!(got.1, want.1, "b outputs: {at}");
+                    assert_eq!(got.2, want.2, "slots: {at}");
+                }
             }
         }
     }
