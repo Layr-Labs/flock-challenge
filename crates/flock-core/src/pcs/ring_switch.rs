@@ -2968,6 +2968,26 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     challenger: &mut Ch,
     basis_elidable: bool,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
+    prove_batched_padded_with_owned_canonical_fold8(
+        packed_witness, x_outers, precomputed_s_hat_v, &mut [], padding,
+        challenger, basis_elidable,
+    )
+}
+
+/// Move optional canonical statistics into the proof beside unchanged
+/// Fold8 views. Slots use original claim order. A supplied value must equal
+/// that claim's Fold8 collapse. Missing or wrong-size hints use the current
+/// collapse path; unsupported views leave their hints unused.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    canonical_fold8: &mut [Option<Vec<F128>>],
+    padding: &PaddingSpec,
+    challenger: &mut Ch,
+    basis_elidable: bool,
+) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
     let trace =
         std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
@@ -3110,6 +3130,12 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     let t = std::time::Instant::now();
     let mut dense_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); dense_suffixes.len()];
     let mut sparse_s_hat_v: Vec<Vec<F128>> = vec![Vec::new(); sparse_suffixes.len()];
+    let mut take_canonical = |orig: usize| {
+        if canonical_fold8.len() != n {
+            return None;
+        }
+        canonical_fold8[orig].take().filter(|v| v.len() == n_packed)
+    };
     // Fill precomputed slots first.
     for d in 0..dense_suffixes.len() {
         if let Some(p) = precomputed_s_hat_v.get(dense_to_orig[d]).copied().flatten() {
@@ -3118,7 +3144,8 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     dense_suffixes[d].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
                 );
-                take_collapsed_s_hat_v_fold8(p)
+                take_canonical(dense_to_orig[d])
+                    .or_else(|| take_collapsed_s_hat_v_fold8(p))
                     .unwrap_or_else(|| collapse_s_hat_v_fold8(p, &dense_suffixes[d][..6]))
             } else if p.len() == 16 * n_packed {
                 assert!(
@@ -3148,7 +3175,8 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
                     sparse_suffixes[s].len() >= 6,
                     "sixty-four-bank s_hat_v requires at least six suffix coordinates"
                 );
-                collapse_s_hat_v_fold8(p, &sparse_suffixes[s][..6])
+                take_canonical(sparse_to_orig[s])
+                    .unwrap_or_else(|| collapse_s_hat_v_fold8(p, &sparse_suffixes[s][..6]))
             } else if p.len() == 16 * n_packed {
                 assert!(
                     sparse_suffixes[s].len() >= 4,
@@ -4695,6 +4723,181 @@ mod tests {
             }
         }
         assert_eq!(factored, product_oracle);
+    }
+
+    fn assert_owned_canonical_intake_equal(
+        got: &[(RingSwitchProof, RingSwitchBatchOutput)],
+        want: &[(RingSwitchProof, RingSwitchBatchOutput)],
+        basis_live: bool,
+    ) {
+        assert_eq!(got.len(), want.len());
+        for ((gp, go), (wp, wo)) in got.iter().zip(want) {
+            assert_eq!(gp, wp);
+            assert_eq!(go.sumcheck_claim, wo.sumcheck_claim);
+            assert_eq!(go.rs_eq_ind.len(), wo.rs_eq_ind.len());
+            if basis_live { assert_eq!(go.rs_eq_ind.to_dense(), wo.rs_eq_ind.to_dense()); }
+            assert_eq!(go.direct_fold2.is_some(), wo.direct_fold2.is_some());
+            assert_eq!(go.direct_fold4.is_some(), wo.direct_fold4.is_some());
+            match (&go.direct_fold8, &wo.direct_fold8) {
+                (Some(g), Some(w)) => {
+                    assert_eq!(g.eq_lo, w.eq_lo);
+                    assert_eq!(g.eq_hi, w.eq_hi);
+                    assert_eq!(g.a_state, w.a_state);
+                    assert_eq!(g.w_state, w.w_state);
+                    assert_eq!(g.round0, w.round0);
+                }
+                (None, None) => {}
+                _ => panic!("canonical hint changed direct Fold8 admission"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "uses process-global ring gates and stash; run alone"]
+    fn owned_canonical_fold8_preserves_claim_order_state_and_fallbacks() {
+        use crate::challenger::FsChallenger;
+        use crate::lincheck::canonical_ab_oracle::packed_statistic;
+        const M: usize = 17;
+        let mut rng = Rng::new(0x4f57_4e45_4441_4243);
+        let packed: Vec<_> = (0..1usize << (M - LOG_PACKING)).map(|_| rng.f128()).collect();
+        let mut points: Vec<Vec<F128>> = (0..4).map(|_| (0..M - 6).map(|_| rng.f128()).collect()).collect();
+        for i in [1, 3] { points[i][1..4].fill(F128::ZERO); }
+        let fold8: Vec<_> = points.iter().map(|p| packed_statistic(&packed, &p[1..], 6)).collect();
+        let canonical: Vec<_> = points.iter().map(|p| packed_statistic(&packed, &p[1..], 0)).collect();
+        let padding = PaddingSpec::dense(M);
+        clear_collapsed_s_hat_v_fold8();
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 0, 3, 2]] {
+            let point_refs: Vec<_> = order.iter().map(|&i| points[i].as_slice()).collect();
+            let precomputed: Vec<_> = order.iter().map(|&i| Some(fold8[i].as_slice())).collect();
+            let mut control_ch = FsChallenger::new(b"owned-canonical-order");
+            let (control, gammas) = prove_batched_padded_with_precomputed_elidable(
+                &packed, &point_refs, &precomputed, &padding, &mut control_ch, false,
+            );
+            let next = control_ch.sample_f128();
+            for malformed in [false, true] {
+                let mut hints: Vec<_> = order.iter().map(|&i| Some(canonical[i].clone())).collect();
+                if malformed {
+                    hints[0] = None;
+                    hints[1] = Some(vec![F128::ZERO; 127]);
+                }
+                let pointers: Vec<_> = hints.iter().map(|v| v.as_ref().filter(|v| v.len() == 128).map(|v| v.as_ptr())).collect();
+                let mut ch = FsChallenger::new(b"owned-canonical-order");
+                let (got, got_gammas) = prove_batched_padded_with_owned_canonical_fold8(
+                    &packed, &point_refs, &precomputed, &mut hints, &padding, &mut ch, false,
+                );
+                assert_eq!(got_gammas, gammas);
+                assert_eq!(ch.sample_f128(), next);
+                assert_owned_canonical_intake_equal(&got, &control, true);
+                for (i, ptr) in pointers.into_iter().enumerate() {
+                    assert!(hints[i].is_none());
+                    if let Some(ptr) = ptr { assert_eq!(got[i].0.s_hat_v.as_ptr(), ptr); }
+                }
+            }
+            let mut wrong_count = vec![Some(vec![F128::ONE; 128]); 5];
+            let mut ch = FsChallenger::new(b"owned-canonical-order");
+            let (got, got_gammas) = prove_batched_padded_with_owned_canonical_fold8(
+                &packed, &point_refs, &precomputed, &mut wrong_count, &padding, &mut ch, false,
+            );
+            assert_eq!(got_gammas, gammas);
+            assert_eq!(ch.sample_f128(), next);
+            assert_owned_canonical_intake_equal(&got, &control, true);
+            assert!(wrong_count.iter().all(Option::is_some));
+        }
+
+        // A valid-length hint beside a narrower or missing view is not used.
+        for retain in [0, 2, 4] {
+            let view = packed_statistic(&packed, &points[0][1..], retain);
+            for pre in [Some(view.as_slice()), None] {
+                let mut old_ch = FsChallenger::new(b"owned-canonical-narrow");
+                let (old, old_g) = prove_batched_padded_with_precomputed_elidable(
+                    &packed, &[&points[0]], &[pre], &padding, &mut old_ch, false,
+                );
+                let mut hints = [Some(vec![F128::ONE; 128])];
+                let mut ch = FsChallenger::new(b"owned-canonical-narrow");
+                let (got, g) = prove_batched_padded_with_owned_canonical_fold8(
+                    &packed, &[&points[0]], &[pre], &mut hints, &padding, &mut ch, false,
+                );
+                assert!(hints[0].is_some());
+                assert_eq!(g, old_g);
+                assert_eq!(ch.sample_f128(), old_ch.sample_f128());
+                assert_owned_canonical_intake_equal(&got, &old, true);
+            }
+        }
+
+        // Both dense claims retain the same live factor arrays when basis
+        // elision is allowed. Never read elided coefficient values.
+        let refs = [&points[0][..], &points[2][..]];
+        let pre = [Some(&fold8[0][..]), Some(&fold8[2][..])];
+        for elidable in [false, true] {
+            let mut old_ch = FsChallenger::new(b"owned-canonical-basis");
+            let (old, old_g) = prove_batched_padded_with_precomputed_elidable(
+                &packed, &refs, &pre, &padding, &mut old_ch, elidable,
+            );
+            let mut hints = [Some(canonical[0].clone()), None];
+            let ptr = hints[0].as_ref().unwrap().as_ptr();
+            let mut ch = FsChallenger::new(b"owned-canonical-basis");
+            let (got, g) = prove_batched_padded_with_owned_canonical_fold8(
+                &packed, &refs, &pre, &mut hints, &padding, &mut ch, elidable,
+            );
+            assert!(hints[0].is_none());
+            assert_eq!(got[0].0.s_hat_v.as_ptr(), ptr);
+            assert_eq!(g, old_g);
+            assert_eq!(ch.sample_f128(), old_ch.sample_f128());
+            assert_owned_canonical_intake_equal(&got, &old, !elidable);
+        }
+        clear_collapsed_s_hat_v_fold8();
+    }
+
+    #[test]
+    #[ignore = "uses the process-global C stash; run alone"]
+    fn owned_ab_canonical_hint_keeps_c_stash_separate() {
+        use crate::challenger::FsChallenger;
+        use crate::lincheck::canonical_ab_oracle::packed_statistic;
+        const M: usize = 17;
+        let mut rng = Rng::new(0x4142_4f57_4e45_4443);
+        let packed: Vec<_> = (0..1usize << (M - LOG_PACKING)).map(|_| {
+            let word = rng.f128();
+            F128::new(word.lo & !1, word.hi & !(1 << 63))
+        }).collect();
+        let points: Vec<Vec<_>> = (0..2).map(|_| (0..M - 6).map(|_| rng.f128()).collect()).collect();
+        let wide: Vec<_> = points.iter().map(|p| packed_statistic(&packed, &p[1..], 6)).collect();
+        let canonical: Vec<_> = points.iter().map(|p| packed_statistic(&packed, &p[1..], 0)).collect();
+        assert_eq!(wide[0][0], wide[1][0]);
+        assert_eq!(wide[0][8191], wide[1][8191]);
+        assert_ne!(wide[0], wide[1]);
+        let refs = [&points[0][..], &points[1][..]];
+        let pre = [Some(&wide[0][..]), Some(&wide[1][..])];
+        let padding = PaddingSpec::dense(M);
+        clear_collapsed_s_hat_v_fold8();
+        // A sentinel proves which stash was consumed; this part is an intake
+        // routing check, not a valid proof. The packed-bit oracle is above.
+        let mut sentinel = canonical[1].clone();
+        sentinel[17] += F128::ONE;
+        stash_collapsed_s_hat_v_fold8(&wide[1], &sentinel);
+        let mut old_ch = FsChallenger::new(b"owned-AB-C-stash");
+        let (old, old_g) = prove_batched_padded_with_precomputed_elidable(
+            &packed, &refs, &pre, &padding, &mut old_ch, false,
+        );
+        stash_collapsed_s_hat_v_fold8(&wide[1], &sentinel);
+        let mut hints = [Some(canonical[0].clone()), None];
+        let ptr = hints[0].as_ref().unwrap().as_ptr();
+        let mut ch = FsChallenger::new(b"owned-AB-C-stash");
+        let (got, g) = prove_batched_padded_with_owned_canonical_fold8(
+            &packed, &refs, &pre, &mut hints, &padding, &mut ch, false,
+        );
+        assert_eq!(got[0].0.s_hat_v.as_ptr(), ptr);
+        assert_eq!(got[0].0.s_hat_v, canonical[0]);
+        assert_eq!(got[1].0.s_hat_v, sentinel);
+        assert_eq!(g, old_g);
+        assert_eq!(ch.sample_f128(), old_ch.sample_f128());
+        assert_owned_canonical_intake_equal(&got, &old, true);
+        let mut hints = [Some(canonical[0].clone()), None];
+        let mut ch = FsChallenger::new(b"owned-AB-C-stash");
+        let (next, _) = prove_batched_padded_with_owned_canonical_fold8(
+            &packed, &refs, &pre, &mut hints, &padding, &mut ch, false,
+        );
+        assert_eq!(next[1].0.s_hat_v, canonical[1]);
+        clear_collapsed_s_hat_v_fold8();
     }
 
     /// A caller-proved dead basis may replace only the unobserved equality

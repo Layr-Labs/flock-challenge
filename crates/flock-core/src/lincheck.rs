@@ -1634,7 +1634,8 @@ pub fn prove_padded<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        false,
+        None,
+        None,
         challenger,
     );
     (proof, claim)
@@ -1667,7 +1668,8 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         useful_bits,
         circuit,
         x_ab,
-        true,
+        Some(0),
+        None,
         challenger,
     );
     (
@@ -1675,6 +1677,86 @@ pub fn prove_padded_capture_z_vec<Ch: Challenger>(
         claim,
         captured.expect("capture=true must produce z_vec"),
     )
+}
+
+/// Owned lincheck table with its binding state made explicit.
+pub enum CapturedZVec {
+    PreSumcheck(Vec<F128>),
+    Fold8(Vec<F128>),
+}
+
+/// Capture the first-bound table for the ranked serial Fold8 caller.
+/// Other shapes and parallel sumcheck retain the pre-sumcheck capture.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_fold8_or_z_vec<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, CapturedZVec) {
+    let first_bound = fold8_capture_selected(m, k_log, k_skip, lc_sumcheck_par_min(1 << k_log));
+    prove_padded_capture_with_mode(
+        z_packed, m, k_log, k_skip, useful_bits, circuit, x_ab, first_bound, None, challenger,
+    )
+}
+
+/// Also retain the canonical 128-value table before the final bind when
+/// requested and the ranked first-bound mode is active. The caller must
+/// request this only for RowMajor AB: its first six PCS suffix coordinates
+/// are the six challenges that fold the retained Fold8 banks.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_padded_capture_fold8_with_canonical<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    capture_canonical: bool,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, CapturedZVec, Option<Vec<F128>>) {
+    let first_bound = fold8_capture_selected(m, k_log, k_skip, lc_sumcheck_par_min(1 << k_log));
+    let mut canonical = None;
+    let output = if first_bound && capture_canonical { Some(&mut canonical) } else { None };
+    let (proof, claim, captured) = prove_padded_capture_with_mode(
+        z_packed, m, k_log, k_skip, useful_bits, circuit, x_ab, first_bound, output, challenger,
+    );
+    (proof, claim, captured, canonical)
+}
+
+fn fold8_capture_selected(m: usize, k_log: usize, k_skip: usize, par_min: usize) -> bool {
+    m == 32 && k_log == 14 && k_skip == 6 && par_min == usize::MAX
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_padded_capture_with_mode<Ch: Challenger>(
+    z_packed: &[u8],
+    m: usize,
+    k_log: usize,
+    k_skip: usize,
+    useful_bits: usize,
+    circuit: &dyn LincheckCircuit,
+    x_ab: &QuirkyPoint,
+    first_bound: bool,
+    canonical: Option<&mut Option<Vec<F128>>>,
+    challenger: &mut Ch,
+) -> (LincheckProof, LincheckClaim, CapturedZVec) {
+    let (proof, claim, captured) = prove_padded_inner(
+        z_packed, m, k_log, k_skip, useful_bits, circuit, x_ab,
+        Some(usize::from(first_bound)), canonical, challenger,
+    );
+    let captured = captured.expect("capture mode must produce a table");
+    let captured = if first_bound {
+        CapturedZVec::Fold8(captured)
+    } else {
+        CapturedZVec::PreSumcheck(captured)
+    };
+    (proof, claim, captured)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1686,9 +1768,11 @@ fn prove_padded_inner<Ch: Challenger>(
     useful_bits: usize,
     circuit: &dyn LincheckCircuit,
     x_ab: &QuirkyPoint,
-    capture_z_vec: bool,
+    capture_before_round: Option<usize>,
+    mut canonical: Option<&mut Option<Vec<F128>>>,
     challenger: &mut Ch,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
+    let capture_z_vec = capture_before_round.is_some();
     let k = 1usize << k_log;
     let n_log = m - k_log;
     assert!(m >= k_log);
@@ -1831,7 +1915,11 @@ fn prove_padded_inner<Ch: Challenger>(
             r_rounds.push(r);
             if t + 1 < inner_rest_len {
                 // Fused: bind both tables at r AND compute round (t+1)'s message.
-                let (ne1, neinf) = if let Some(mut dst) = z_bind_dst.take() {
+                // Keep the requested table in its original allocation. Fold8
+                // captures before round 1; the public z_vec API captures before 0.
+                let (ne1, neinf) = if capture_before_round == Some(t)
+                    && let Some(mut dst) = z_bind_dst.take()
+                {
                     let next = sumcheck_bind_both_into_and_eval_next_serial(
                         &mut comb_vec,
                         &z_vec,
@@ -1846,6 +1934,15 @@ fn prove_padded_inner<Ch: Challenger>(
                 e1 = ne1;
                 einf = neinf;
             } else {
+                // Z7 is the canonical AB statistic. Keep the distinct Z1
+                // Fold8 owner intact, and copy before rho7 removes bit 6.
+                if capture_before_round == Some(1)
+                    && captured_z_vec.as_ref().is_some_and(|v| v.len() == 8192)
+                    && z_vec.len() == 128
+                    && let Some(output) = canonical.take()
+                {
+                    *output = Some(z_vec.clone());
+                }
                 // Final round: just fold z_vec to z_partial (comb_vec is dead).
                 sumcheck_bind_top_in_place_par(&mut z_vec, r, par_min);
             }
@@ -2071,6 +2168,80 @@ pub fn verify<Ch: Challenger>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+pub(crate) mod canonical_ab_oracle {
+    use crate::field::F128;
+
+    pub fn mul(a: F128, b: F128) -> F128 {
+        let mut a = u128::from(a.lo) | (u128::from(a.hi) << 64);
+        let mut b = u128::from(b.lo) | (u128::from(b.hi) << 64);
+        let mut out = 0u128;
+        for _ in 0..128 {
+            if b & 1 != 0 { out ^= a; }
+            let carry = a >> 127;
+            a <<= 1;
+            if carry != 0 { a ^= 0x87; }
+            b >>= 1;
+        }
+        F128::new(out as u64, (out >> 64) as u64)
+    }
+
+    pub fn eq(point: &[F128], index: usize) -> F128 {
+        point.iter().enumerate().fold(F128::ONE, |v, (bit, &r)| {
+            mul(v, if index >> bit & 1 == 1 { r } else { F128::ONE + r })
+        })
+    }
+
+    // Read ordinary packed Boolean bits directly. Retain0 is the canonical
+    // vector; retain6 is Fold8. No production eq, bind, or collapse is used.
+    pub fn packed_statistic(packed: &[F128], suffix: &[F128], retain: usize) -> Vec<F128> {
+        assert!(retain <= suffix.len());
+        assert_eq!(packed.len(), 1 << suffix.len());
+        let banks = 1usize << retain;
+        let mut out = vec![F128::ZERO; 128 * banks];
+        for (index, word) in packed.iter().enumerate() {
+            let weight = eq(&suffix[retain..], index >> retain);
+            let bits = u128::from(word.lo) | (u128::from(word.hi) << 64);
+            for bit in 0..128 {
+                if bits >> bit & 1 == 1 {
+                    out[128 * (index & (banks - 1)) + bit] += weight;
+                }
+            }
+        }
+        out
+    }
+
+    pub fn bind(v: &mut Vec<F128>, r: F128) {
+        let half = v.len() / 2;
+        for i in 0..half {
+            let next = v[i] + mul(r, v[i] + v[i + half]);
+            v[i] = next;
+        }
+        v.truncate(half);
+    }
+
+    pub fn lagrange_claim(values: &[F128], z: F128) -> F128 {
+        let nodes = &crate::field::PHI_8_TABLE[..values.len()];
+        let mut out = F128::ZERO;
+        for (i, &value) in values.iter().enumerate() {
+            let (mut num, mut den) = (F128::ONE, F128::ONE);
+            for (j, &node) in nodes.iter().enumerate() {
+                if i != j {
+                    num = mul(num, z + node);
+                    den = mul(den, nodes[i] + node);
+                }
+            }
+            let mut inv = F128::ONE;
+            for bit in (0..128).rev() {
+                inv = mul(inv, inv);
+                if bit != 0 { inv = mul(inv, den); }
+            }
+            out += mul(value, mul(num, inv));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
@@ -2151,6 +2322,336 @@ mod tests {
             let serial = run(usize::MAX);
             assert_eq!(serial, run(0), "k_log={k_log}");
             assert_eq!(serial, run(SUMCHECK_PAR_THRESHOLD), "k_log={k_log}");
+        }
+    }
+
+    #[test]
+    #[ignore = "uses the process-global C stash; run alone"]
+    fn ab_fold8_owner_misses_c_stash_and_c_hit_is_consumed() {
+        use crate::challenger::FsChallenger;
+        use crate::pcs::ring_switch::{
+            clear_collapsed_s_hat_v_fold8, collapse_s_hat_v_fold8,
+            prove_batched_padded_with_precomputed_elidable, stash_collapsed_s_hat_v_fold8,
+        };
+
+        // Intake probe, not a valid witness/proof oracle. Equal length and
+        // endpoints force the stash key to distinguish the live owners by
+        // address. The separate AB oracle checks capture values/transcript.
+        let mut rng = Rng::new(0x4142_4353_5441_5348);
+        let mut ab = Vec::with_capacity(16_384);
+        ab.extend((0..8_192).map(|_| rng.f128()));
+        let mut c = rng.f128_vec(8_192);
+        c[0] = ab[0];
+        c[8_191] = ab[8_191];
+        let (ab_ptr, c_ptr) = (ab.as_ptr(), c.as_ptr());
+        assert_ne!(ab_ptr, c_ptr);
+        let points = [[F128::new(2, 1); 11], [F128::new(3, 1); 11]];
+        let point_refs: [&[F128]; 2] = [&points[0], &points[1]];
+        let precomputed: [Option<&[F128]>; 2] = [Some(&ab), Some(&c)];
+        let expected_ab = collapse_s_hat_v_fold8(&ab, &points[0][1..7]);
+        let expected_c = collapse_s_hat_v_fold8(&c, &points[1][1..7]);
+        let mut sentinel = expected_c.clone();
+        sentinel[17] += F128::ONE;
+        assert_ne!(expected_ab, sentinel);
+        let packed = vec![F128::ZERO; 1 << (17 - crate::pcs::LOG_PACKING)];
+        let padding = crate::zerocheck::PaddingSpec::dense(17);
+
+        clear_collapsed_s_hat_v_fold8();
+        stash_collapsed_s_hat_v_fold8(&c, &sentinel);
+        let mut first_ch = FsChallenger::new(b"AB-owner-C-stash");
+        let (first, _) = prove_batched_padded_with_precomputed_elidable(
+            &packed, &point_refs, &precomputed, &padding, &mut first_ch, false,
+        );
+        // No restage: a consumed C hit must fall back to the ordinary
+        // collapse on the next intake while both owners still live.
+        let mut second_ch = FsChallenger::new(b"AB-owner-C-stash");
+        let (second, _) = prove_batched_padded_with_precomputed_elidable(
+            &packed, &point_refs, &precomputed, &padding, &mut second_ch, false,
+        );
+        clear_collapsed_s_hat_v_fold8();
+
+        assert_eq!(first[0].0.s_hat_v, expected_ab);
+        assert_eq!(first[1].0.s_hat_v, sentinel);
+        assert_eq!(second[0].0.s_hat_v, expected_ab);
+        assert_eq!(second[1].0.s_hat_v, expected_c);
+        assert_eq!(ab.as_ptr(), ab_ptr);
+        assert_eq!(c.as_ptr(), c_ptr);
+        assert_eq!(ab.len(), 8_192);
+        assert!(ab.capacity() >= 16_384);
+    }
+
+    #[test]
+    fn first_bound_capture_gate_and_short_fallbacks_are_exact() {
+        assert!(fold8_capture_selected(32, 14, 6, usize::MAX));
+        for (m, k_log, k_skip, par_min) in [
+            (31, 14, 6, usize::MAX), (32, 13, 6, usize::MAX),
+            (32, 14, 7, usize::MAX), (32, 14, 6, SUMCHECK_PAR_THRESHOLD),
+        ] {
+            assert!(!fold8_capture_selected(m, k_log, k_skip, par_min));
+        }
+        for (m, k_log, k_skip) in [(10usize, 4usize, 4usize), (10, 7, 6)] {
+            let k = 1usize << k_log;
+            let mut rng = Rng::new(0x4642_5348 ^ k_log as u64);
+            let a = random_sparse_matrix(k, 2 * k, &mut rng);
+            let b = random_sparse_matrix(k, 2 * k, &mut rng);
+            let circuit = SparseMatrixCircuit::new(&a, &b);
+            let packed = pack_z_lincheck(&rng.bits(1usize << m), m, k_log);
+            let point = random_quirky_point(m, k_log, k_skip, &mut rng);
+            let mut old_ch = FsChallenger::new(b"fold8-short-fallback");
+            let old = prove_padded_capture_z_vec(
+                &packed, m, k_log, k_skip, k, &circuit, &point, &mut old_ch,
+            );
+            let mut new_ch = FsChallenger::new(b"fold8-short-fallback");
+            let (proof, claim, capture) = prove_padded_capture_fold8_or_z_vec(
+                &packed, m, k_log, k_skip, k, &circuit, &point, &mut new_ch,
+            );
+            assert_eq!(proof, old.0);
+            assert_eq!(claim, old.1);
+            match capture {
+                CapturedZVec::PreSumcheck(table) => assert_eq!(table, old.2),
+                CapturedZVec::Fold8(_) => panic!("short shape selected bound capture"),
+            }
+            let mut canonical_ch = FsChallenger::new(b"fold8-short-fallback");
+            let (cp, cc, capture, hint) = prove_padded_capture_fold8_with_canonical(
+                &packed, m, k_log, k_skip, k, &circuit, &point, true, &mut canonical_ch,
+            );
+            assert!(hint.is_none());
+            assert_eq!(cp, old.0);
+            assert_eq!(cc, old.1);
+            match capture {
+                CapturedZVec::PreSumcheck(table) => assert_eq!(table, old.2),
+                CapturedZVec::Fold8(_) => panic!("short shape selected canonical capture"),
+            }
+            let next = old_ch.sample_f128();
+            assert_eq!(new_ch.sample_f128(), next);
+            assert_eq!(canonical_ch.sample_f128(), next);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires exclusive scratch-pool access and serial sumcheck; run alone"]
+    fn first_bound_capture_matches_fold8_software_and_transcript() {
+        fn software_mul(a: F128, b: F128) -> F128 {
+            let mut a = (a.lo as u128) | ((a.hi as u128) << 64);
+            let mut b = (b.lo as u128) | ((b.hi as u128) << 64);
+            let mut out = 0u128;
+            for _ in 0..128 {
+                if b & 1 != 0 { out ^= a; }
+                let carry = a >> 127;
+                a <<= 1;
+                if carry != 0 { a ^= 0x87; }
+                b >>= 1;
+            }
+            F128::new(out as u64, (out >> 64) as u64)
+        }
+
+        // Keep the ranked inner geometry, with the eight outer rows required
+        // by byte stripes. The private mode exercises the same round-1 handoff.
+        let (m, k_log, k_skip) = (17usize, 14usize, 6usize);
+        let k = 1usize << k_log;
+        assert_eq!(lc_sumcheck_par_min(k), usize::MAX);
+        for sparse in [false, true] {
+            let mut rng = Rng::new(0x464f_4c44_3842_4f55 ^ u64::from(sparse));
+            let a = random_sparse_matrix(k, 2 * k, &mut rng);
+            let b = random_sparse_matrix(k, 2 * k, &mut rng);
+            let circuit = SparseMatrixCircuit::new(&a, &b);
+            let mut z = rng.bits(1usize << m);
+            for (i, value) in z.iter_mut().enumerate() {
+                if i % k >= 15_409 || (sparse && i % 257 != 0) { *value = false; }
+            }
+            let packed = pack_z_lincheck(&z, m, k_log);
+            let point = random_quirky_point(m, k_log, k_skip, &mut rng);
+            let mut old_ch = FsChallenger::new(b"fold8-bound-capture");
+            let (old_proof, old_claim, pre) = prove_padded_capture_z_vec(
+                &packed, m, k_log, k_skip, 15_409, &circuit, &point, &mut old_ch,
+            );
+            let mut new_ch = FsChallenger::new(b"fold8-bound-capture");
+            let (proof, claim, bound) = prove_padded_capture_with_mode(
+                &packed, m, k_log, k_skip, 15_409, &circuit, &point, true, None, &mut new_ch,
+            );
+            let bound = match bound {
+                CapturedZVec::Fold8(bound) => bound,
+                CapturedZVec::PreSumcheck(_) => panic!("private bound mode returned pre-sumcheck"),
+            };
+            assert_eq!(proof, old_proof);
+            assert_eq!(claim, old_claim);
+            assert_eq!(new_ch.sample_f128(), old_ch.sample_f128());
+            assert_eq!(pre.len(), 16_384);
+            assert_eq!(bound.len(), 8_192);
+            assert!(bound.capacity() >= 16_384);
+            let r0 = claim.r_inner_rest[7];
+            for i in 0..8_192 {
+                assert_eq!(bound[i], pre[i] + software_mul(r0, pre[i] + pre[i + 8_192]));
+            }
+            assert_eq!(bound, crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(
+                &pre, &claim.r_inner_rest[1..],
+            ));
+
+            // The public API must preserve its full-table fallback at m != 32.
+            let mut fallback_ch = FsChallenger::new(b"fold8-bound-capture");
+            let (fallback_proof, fallback_claim, fallback) = prove_padded_capture_fold8_or_z_vec(
+                &packed, m, k_log, k_skip, 15_409, &circuit, &point, &mut fallback_ch,
+            );
+            assert_eq!(fallback_proof, old_proof);
+            assert_eq!(fallback_claim, old_claim);
+            match fallback {
+                CapturedZVec::PreSumcheck(table) => assert_eq!(table, pre),
+                CapturedZVec::Fold8(_) => panic!("non-ranked shape selected bound capture"),
+            }
+            let ptr = bound.as_ptr();
+            crate::scratch::give_lincheck_eq(bound);
+            let recycled = crate::scratch::take_lincheck_eq(k);
+            assert_eq!(recycled.as_ptr(), ptr);
+            crate::scratch::give_lincheck_eq(recycled);
+        }
+    }
+
+    #[test]
+    fn canonical_ab_round_identity_and_batch_major_counterexample() {
+        use super::canonical_ab_oracle::{bind, eq, mul};
+        let mut rng = Rng::new(0x4341_4e4f_4e41_4249);
+        for case in 0..3 {
+            let mut rhos = rng.f128_vec(8);
+            if case < 2 { rhos.fill(if case == 0 { F128::ZERO } else { F128::ONE }); }
+            let mut bound = rng.f128_vec(16_384);
+            bind(&mut bound, rhos[0]);
+            let mut s = bound.clone();
+            for &r in &rhos[1..7] { bind(&mut s, r); }
+            let point: Vec<_> = rhos[1..7].iter().rev().copied().collect();
+            for b in 0..128 {
+                let want = (0..64).fold(F128::ZERO, |v, bank| {
+                    v + mul(eq(&point, bank), bound[128 * bank + b])
+                });
+                assert_eq!(s[b], want);
+            }
+            assert_eq!(s, crate::pcs::ring_switch::collapse_s_hat_v_fold8(&bound, &point));
+        }
+
+        // RowMajor bit7 uses rho6=1. BatchMajor's leading outer coordinates
+        // are zero here, so its first six suffix coordinates select bank0.
+        let mut b = vec![F128::ZERO; 8192];
+        b[128] = F128::ONE;
+        let mut s = b.clone();
+        for _ in 0..5 { bind(&mut s, F128::ZERO); }
+        bind(&mut s, F128::ONE);
+        assert_eq!(s[0], F128::ONE);
+        assert_eq!(crate::pcs::ring_switch::collapse_s_hat_v_fold8(&b, &[F128::ZERO; 6])[0], F128::ZERO);
+    }
+
+    #[test]
+    fn canonical_ab_packed_one_hot_address_boundaries() {
+        use super::canonical_ab_oracle::{eq, packed_statistic};
+        let point: Vec<_> = (0..10).map(|i| F128::new(0x101 + 2 * i, 0x8000_0000_0000_0001 + i)).collect();
+        for address in (0..17).flat_map(|bit| [(1usize << bit) - 1, 1usize << bit]) {
+            let mut packed = vec![F128::ZERO; 1024];
+            let bit = address % 128;
+            if bit < 64 { packed[address / 128].lo = 1 << bit; }
+            else { packed[address / 128].hi = 1 << (bit - 64); }
+            let mut want = vec![F128::ZERO; 128];
+            want[bit] = eq(&point, address / 128);
+            let got = packed_statistic(&packed, &point, 0);
+            assert_eq!(got, want, "address={address}");
+            let wide = packed_statistic(&packed, &point, 6);
+            assert_eq!(crate::pcs::ring_switch::collapse_s_hat_v_fold8(&wide, &point[..6]), want);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires exclusive root/scratch state and serial sumcheck; run alone"]
+    fn canonical_ab_capture_matches_packed_bits_and_transcript() {
+        use super::canonical_ab_oracle::{bind, eq, lagrange_claim, packed_statistic};
+        const M: usize = 17;
+        const K_LOG: usize = 14;
+        const K: usize = 1 << K_LOG;
+        const USEFUL: usize = 15_409;
+        fn expand_roots(v: &mut [F128]) {
+            let roots = [v[0], v[1], v[2], v[3]];
+            v.fill(F128::ZERO);
+            for (i, r) in [0, 63, 8191, 15408].into_iter().zip(roots) { v[i] = r; }
+            for (i, a, b) in [(64, 0, 1), (127, 1, 2), (128, 2, 3), (8192, 0, 2), (15407, 1, 3)] {
+                v[i] = roots[a] + roots[b];
+            }
+        }
+        assert_eq!(lc_sumcheck_par_min(K), usize::MAX);
+        for case in 0..3 {
+            let mut rng = Rng::new(0x4341_4e4f_4e42_4954 ^ case);
+            let a = random_sparse_matrix(K, 2 * K, &mut rng);
+            let b = random_sparse_matrix(K, 2 * K, &mut rng);
+            let circuit = SparseMatrixCircuit::new(&a, &b).with_const_pin(Some(0));
+            let mut bits = rng.bits(1 << M);
+            let mut compact = vec![false; bits.len()];
+            for outer in 0..(1 << (M - K_LOG)) {
+                if case == 2 {
+                    let roots: Vec<_> = (0..4).map(|i| bits[outer * K + i]).collect();
+                    bits[outer * K..(outer + 1) * K].fill(false);
+                    for (i, &r) in roots.iter().enumerate() { compact[outer * K + i] = r; }
+                    for (i, &r) in [0, 63, 8191, 15408].into_iter().zip(&roots) { bits[outer * K + i] = r; }
+                    for (i, a, b) in [(64, 0, 1), (127, 1, 2), (128, 2, 3), (8192, 0, 2), (15407, 1, 3)] {
+                        bits[outer * K + i] = roots[a] ^ roots[b];
+                    }
+                } else {
+                    for i in 0..K {
+                        if i >= USEFUL || (case == 1 && i % 257 != 0) { bits[outer * K + i] = false; }
+                    }
+                }
+            }
+            let packed: Vec<_> = bits.chunks_exact(128).map(|chunk| {
+                let word = chunk.iter().enumerate().fold(0u128, |w, (bit, &v)| w | ((v as u128) << bit));
+                F128::new(word as u64, (word >> 64) as u64)
+            }).collect();
+            let full_stripe = pack_z_lincheck(&bits, M, K_LOG);
+            let root_stripe = pack_z_lincheck(&compact, M, K_LOG);
+            let point = random_quirky_point(M, K_LOG, 6, &mut rng);
+            let mut control_ch = FsChallenger::new(b"canonical-AB-capture");
+            let control = prove_padded_capture_with_mode(
+                &full_stripe, M, K_LOG, 6, USEFUL, &circuit, &point, true, None, &mut control_ch,
+            );
+            let guard = (case == 2).then(|| register_root_stripe(
+                &root_stripe, RootStripe { n_roots: 4, expand: expand_roots },
+            ));
+            let stripe = if case == 2 { &root_stripe } else { &full_stripe };
+            let mut candidate_ch = FsChallenger::new(b"canonical-AB-capture");
+            let mut canonical = None;
+            let (proof, claim, capture) = prove_padded_capture_with_mode(
+                stripe, M, K_LOG, 6, USEFUL, &circuit, &point, true,
+                Some(&mut canonical), &mut candidate_ch,
+            );
+            drop(guard);
+            assert_eq!(proof, control.0);
+            assert_eq!(claim, control.1);
+            let next = candidate_ch.sample_f128();
+            assert_eq!(next, control_ch.sample_f128());
+            let (CapturedZVec::Fold8(bound), CapturedZVec::Fold8(control_bound)) = (capture, control.2) else {
+                panic!("fixture must take the actual first-bound handoff");
+            };
+            assert_eq!(bound, control_bound);
+            let s = canonical.expect("the final pre-bind table must be retained");
+            let mut suffix = claim.r_inner_rest[1..].to_vec();
+            suffix.extend_from_slice(&point.x_outer);
+            assert_eq!(s, packed_statistic(&packed, &suffix, 0));
+            assert_eq!(bound, packed_statistic(&packed, &suffix, 6));
+
+            let mut z0 = vec![F128::ZERO; K];
+            for outer in 0..(1 << (M - K_LOG)) {
+                let w = eq(&point.x_outer, outer);
+                for i in 0..K { if bits[outer * K + i] { z0[i] += w; } }
+            }
+            for &r in claim.r_inner_rest[1..].iter().rev() { bind(&mut z0, r); }
+            assert_eq!(s, z0);
+            bind(&mut z0, claim.r_inner_rest[0]);
+            assert_eq!(proof.z_partial, z0);
+            assert_eq!(claim.w, lagrange_claim(&z0, claim.r_inner_skip));
+
+            // A real public gate miss must not return a canonical hint.
+            let mut fallback_ch = FsChallenger::new(b"canonical-AB-capture");
+            let (fp, fc, fallback, hint) = prove_padded_capture_fold8_with_canonical(
+                &full_stripe, M, K_LOG, 6, USEFUL, &circuit, &point, true, &mut fallback_ch,
+            );
+            assert!(hint.is_none());
+            assert!(matches!(fallback, CapturedZVec::PreSumcheck(_)));
+            assert_eq!(fp, proof);
+            assert_eq!(fc, claim);
+            assert_eq!(fallback_ch.sample_f128(), next);
         }
     }
 
