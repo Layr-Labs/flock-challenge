@@ -11894,10 +11894,16 @@ kernel void blake3_pow_scan(
         if let Some(k) = hybrid_cpu_split_override() {
             return k;
         }
-        match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
+        let k = match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
             usize::MAX => DEFAULT_HYBRID_K,
             k => k,
-        }
+        };
+        // One sixteenth less CPU share than the warm-up sweep's pick, when
+        // that is still a storable split (`hybrid_split_valid`): a coarse
+        // part of 0, or a fine split whose coarse part would drop to 0,
+        // keeps the pick. The explicit `FLOCK_HYBRID_CPU_BLOCKS` override
+        // above is used as given.
+        if k % 16 > 0 && hybrid_split_valid(k - 1) { k - 1 } else { k }
     }
 
     /// Promoted fixed default, used when the warmup sweep is disabled or has
