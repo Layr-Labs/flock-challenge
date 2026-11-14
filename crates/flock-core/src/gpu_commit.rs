@@ -1404,6 +1404,15 @@ pub(crate) fn gpu_tw_prefetch_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_TW_PREFETCH").is_none())
 }
 
+/// Kill switch for the byte-table from-z first pass
+/// (`ntt_from_z_zero_root_b8`, `FROM_Z_B8_MSL_SOURCE`):
+/// `FLOCK_NO_GPU_FROM_Z_B8` (any value) keeps the nibble-table
+/// `ntt_fused_reg4_from_zg4_zero_root`. Both write the same bytes.
+pub(crate) fn gpu_from_z_b8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FROM_Z_B8").is_none())
+}
+
 /// Kill switch for the four-bit-shift table bases in the zero-root from-z
 /// library: `FLOCK_NO_ZERO_ROOT_SHL4_BASES` (any value) keeps
 /// `FROM_Z_ZERO_ROOT_MSL_SOURCE` as written. Both write the same bytes.
@@ -3892,6 +3901,171 @@ kernel void export_from_z_zero_root_tabs(
 }
 "#;
 
+    /// The ranked from-z first pass (layers 0..3, zero roots) with byte
+    /// tables: on an M4 GPU the nibble-table kernel is bound by its 32
+    /// threadgroup table loads per product (replacing them by ALU stand-ins
+    /// halves its time); byte tables rebuilt per twiddle (the g4x2 build and
+    /// Horner) need 16. Same grid, bindings, butterflies and field products
+    /// as `ntt_fused_reg4_from_zg4_zero_root`: bit-identical. Its own
+    /// library, so a compile failure keeps the incumbent pipeline.
+    pub(crate) const FROM_Z_B8_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct NttParams {
+    uint log_d;   // log2 of positions
+    uint l;       // first fused layer
+    uint f;       // number of fused layers (1..=4)
+    uint s;       // log_d - l - f
+};
+
+static inline uint4 fzb8_mulx(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 fzb8_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    uint4 r;
+    r.w = (a.w << 16) | (a.z >> 16);
+    r.z = (a.z << 16) | (a.y >> 16);
+    r.y = (a.y << 16) | (a.x >> 16);
+    r.x = (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// The incumbent's compact-to-flat selector (FROM_Z_ZERO_ROOT_MSL_SOURCE).
+static inline uint fzb8_raw_twiddle(uint compact) {
+    return compact == 0u ? 2u : (compact < 4u ? compact + 3u : compact + 4u);
+}
+
+// v * tw over the byte tables of tw (tab[0..256) = b * tw, tab[256..512) =
+// b * (tw * x^8)): the 16-bit-chunk Horner of the g4x2 mid pass, one chain.
+static inline uint4 fzb8_mul(uint4 v, threadgroup const uint4* tab) {
+    uint4 a = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = fzb8_shl16(a);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a ^= tab[h & 255u] ^ tab[256u + (h >> 8)];
+    }
+    return a;
+}
+
+// gf_build_byte16_twl of NTT_G4X2_TWL_MSL_SOURCE: the byte tables of
+// twl[k] (and of its x^8 multiple twl[16 + k]), 64 threads, two barriers.
+static inline void fzb8_build(
+    threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;
+    const uint cc = u >> 2;
+    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = fzb8_mulx(e0), e2 = fzb8_mulx(e1), e3 = fzb8_mulx(e2);
+    uint4 f0 = fzb8_mulx(e3), f1 = fzb8_mulx(f0), f2 = fzb8_mulx(f1), f3 = fzb8_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);
+    const uint o1 = o0 + 16u;
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// ntt_fused_reg4_from_zg4_zero_root with 8 KiB byte tables instead of the
+// eleven 1 KiB nibble tables: 16 threadgroup loads per product instead of 32.
+// Same group (64 threads, four r tiles, one tile per lane at a time), same
+// grid, same z/data indexing, the same 7 zero-selector XOR butterflies and 17
+// table butterflies in the same order within each layer, and each table
+// butterfly computes the same exact GF(2^128) product, so every output byte is
+// identical. Each table is rebuilt per tile (11 builds per tile).
+[[max_total_threads_per_threadgroup(64)]]
+kernel void ntt_from_z_zero_root_b8(
+    device uint4* data             [[buffer(0)]],
+    device const uint4* twiddles   [[buffer(1)]],
+    constant NttParams& P          [[buffer(2)]],
+    device const uint4* z          [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    constexpr uint NF = 16u;
+    constexpr uint LOG_G = 2u;
+    threadgroup uint4 tabB[512u];
+    threadgroup uint4 twl[32u];
+    // Compact twiddles 0..10 and their x^8 multiples; published by the first
+    // table build's leading barrier.
+    if (lid < 11u) {
+        uint4 g = twiddles[fzb8_raw_twiddle(lid)];
+        twl[lid] = g;
+        for (uint m = 0u; m < 8u; m++) { g = fzb8_mulx(g); }
+        twl[16u + lid] = g;
+    }
+    const uint lane = lid & 63u;
+    const uint r_base = tgid << LOG_G;
+    for (uint rr = 0u; rr < (1u << LOG_G); rr++) {
+        const uint r = r_base + rr;
+        uint4 elems[NF];
+        // Layer zero has v=0: load the message half once and duplicate it.
+        for (uint e = 0u; e < NF / 2u; e++) {
+            elems[e] = z[(((e << P.s) + r) << 6) + lane];
+            elems[e + NF / 2u] = elems[e];
+        }
+        #define ZERO_BFLY(EU, EV) elems[EV] ^= elems[EU];
+        #define TAB_BFLY(EU, EV) { \
+            uint4 nu = elems[EU] ^ fzb8_mul(elems[EV], &tabB[0]); \
+            elems[EU] = nu; \
+            elems[EV] ^= nu; \
+        }
+        // Layer one: raw zero selector 1; compact 0 -> raw 2.
+        ZERO_BFLY(0, 4) ZERO_BFLY(1, 5) ZERO_BFLY(2, 6) ZERO_BFLY(3, 7)
+        fzb8_build(tabB, twl, 0u, lid);
+        TAB_BFLY(8, 12) TAB_BFLY(9, 13) TAB_BFLY(10, 14) TAB_BFLY(11, 15)
+        // Layer two: raw zero selector 3; compact 1..3 -> raw 4..6.
+        ZERO_BFLY(0, 2) ZERO_BFLY(1, 3)
+        fzb8_build(tabB, twl, 1u, lid);
+        TAB_BFLY(4, 6) TAB_BFLY(5, 7)
+        fzb8_build(tabB, twl, 2u, lid);
+        TAB_BFLY(8, 10) TAB_BFLY(9, 11)
+        fzb8_build(tabB, twl, 3u, lid);
+        TAB_BFLY(12, 14) TAB_BFLY(13, 15)
+        // Layer three: raw zero selector 7; compact 4..10 -> raw 8..14.
+        ZERO_BFLY(0, 1)
+        fzb8_build(tabB, twl, 4u, lid);  TAB_BFLY(2, 3)
+        fzb8_build(tabB, twl, 5u, lid);  TAB_BFLY(4, 5)
+        fzb8_build(tabB, twl, 6u, lid);  TAB_BFLY(6, 7)
+        fzb8_build(tabB, twl, 7u, lid);  TAB_BFLY(8, 9)
+        fzb8_build(tabB, twl, 8u, lid);  TAB_BFLY(10, 11)
+        fzb8_build(tabB, twl, 9u, lid);  TAB_BFLY(12, 13)
+        fzb8_build(tabB, twl, 10u, lid); TAB_BFLY(14, 15)
+        #undef TAB_BFLY
+        #undef ZERO_BFLY
+        for (uint e = 0u; e < NF; e++) {
+            data[((r + (e << P.s)) << 6) + lane] = elems[e];
+        }
+    }
+}
+"#;
+
     /// The zero-root library source in use: `FROM_Z_ZERO_ROOT_MSL_SOURCE` with
     /// the table bases formed by `bank` four-bit shifts (`gf_shl4_zero_root`)
     /// instead of `4 * bank` single-bit steps, unless
@@ -4974,6 +5148,80 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 gpu.release(zl);
                 gpu.release(tw);
                 gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    /// The byte-table from-z first pass against the nibble-table incumbent,
+    /// both compiled from source, at log_d = 16 (32 MiB z, 64 MiB codeword)
+    /// on random z with the ranked zero columns: the whole codeword byte for
+    /// byte, full grid and a two-band split.
+    #[cfg(test)]
+    mod from_z_b8_tests {
+        use super::*;
+
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn from_z_b8_matches_nibble_first_pass() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let log_d = 16usize;
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let zlen = (64usize << (log_d - 1)) * 16;
+                let z = gpu.new_buffer(zlen).unwrap();
+                let zp = gpu.buffer_contents(z);
+                let mut x = 0xF12B_8E7A_u64;
+                for i in 0..zlen / 8 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    zp.cast::<u64>().add(i).write(x);
+                }
+                for q in (1..(1usize << (log_d - 1))).step_by(2) {
+                    std::ptr::write_bytes(zp.add((q * 64 + 57) * 16), 0, 7 * 16);
+                }
+                let len = (64usize << log_d) * 16;
+                let data = gpu.new_buffer(len).unwrap();
+                let inc = compile_supplemental_pipeline(gpu, zero_root_msl_source(), "ntt_fused_reg4_from_zg4_zero_root").unwrap();
+                let b8 = compile_supplemental_pipeline(gpu, FROM_Z_B8_MSL_SOURCE, "ntt_from_z_zero_root_b8").unwrap();
+                let run = |pso: Id, bands: &[(usize, usize)], fill: u8| -> Vec<u8> {
+                    std::ptr::write_bytes(gpu.buffer_contents(data), fill, len);
+                    let cb = gpu.command_buffer().unwrap();
+                    for &(r0, rn) in bands {
+                        let enc = gpu.compute_encoder(cb).unwrap();
+                        let off = r0 * 64 * 16;
+                        gpu.set_pipeline(enc, pso);
+                        gpu.set_buffer(enc, data, off, 0);
+                        gpu.set_buffer(enc, tw, 0, 1);
+                        let p = NttParams { log_d: log_d as u32, l: 0, f: 4, s: (log_d - 4) as u32 };
+                        let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
+                        gpu.set_bytes(enc, bytes, 2);
+                        gpu.set_buffer(enc, z, off, 3);
+                        gpu.dispatch(enc, (rn >> 2) as u64, 64);
+                        gpu.end_encoding(enc);
+                    }
+                    gpu.commit_and_wait(cb).unwrap();
+                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                };
+                let total_r = 1usize << (log_d - 4);
+                let want = run(inc, &[(0, total_r)], 0xA5);
+                assert!(run(b8, &[(0, total_r)], 0x5A) == want, "b8 first pass differs (full grid)");
+                let split = total_r / 4 + 12;
+                assert!(run(b8, &[(0, split), (split, total_r - split)], 0x3C) == want, "b8 first pass differs (bands)");
+                for p in [inc, b8] {
+                    gpu.release(p);
+                }
+                for b in [tw, z, data] {
+                    gpu.release(b);
+                }
                 gpu.pool_pop(pool);
             }
         }
@@ -7086,6 +7334,65 @@ kernel void blake3_pow_scan(
                             }
                         };
                         let candidate = build("ntt_fused_reg4_from_zg4_zero_root")?;
+                        // Byte-table form of the same pass, its own library:
+                        // any failure keeps the nibble-table candidate.
+                        let candidate = if super::gpu_from_z_b8_enabled() {
+                            match (|| -> Result<Id, String> {
+                                let src = api.nsstring(FROM_Z_B8_MSL_SOURCE)?;
+                                let mut err: Id = NIL;
+                                let lib_b8: Id = send!(
+                                    api,
+                                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                                    device,
+                                    c"newLibraryWithSource:options:error:",
+                                    src,
+                                    NIL,
+                                    &mut err
+                                );
+                                if lib_b8.is_null() {
+                                    return Err(format!("from-z b8 compile failed: {}", api.error_string(err)));
+                                }
+                                let ns = api.nsstring("ntt_from_z_zero_root_b8")?;
+                                let f: Id = send!(api, unsafe extern "C" fn(Id, Sel, Id) -> Id, lib_b8, c"newFunctionWithName:", ns);
+                                if f.is_null() {
+                                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, lib_b8, c"release");
+                                    return Err("from-z b8 kernel not found".into());
+                                }
+                                let mut pso_err: Id = NIL;
+                                let pso: Id = send!(
+                                    api,
+                                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                    device,
+                                    c"newComputePipelineStateWithFunction:error:",
+                                    f,
+                                    &mut pso_err
+                                );
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, lib_b8, c"release");
+                                if pso.is_null() {
+                                    return Err(format!("from-z b8 pipeline: {}", api.error_string(pso_err)));
+                                }
+                                let max_threads: u64 = send!(api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup");
+                                if max_threads < 64 {
+                                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                                    return Err(format!("from-z b8 pipeline allows {max_threads} threads"));
+                                }
+                                Ok(pso)
+                            })() {
+                                Ok(pso) => {
+                                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, candidate, c"release");
+                                    pso
+                                }
+                                Err(e) => {
+                                    if debug_enabled() {
+                                        eprintln!("[gpu-commit] {e}; keeping the nibble-table first pass");
+                                    }
+                                    candidate
+                                }
+                            }
+                        } else {
+                            candidate
+                        };
                         let export = if cfg!(test) {
                             build("export_from_z_zero_root_tabs")?
                         } else {
@@ -11951,6 +12258,9 @@ kernel void blake3_pow_scan(
         let mut key = fnv1a64(MSL_SOURCE);
         if zero_root {
             key ^= fnv1a64(zero_root_msl_source()).rotate_left(1) ^ 0x5A52_4F4F_545F_3131; // "ZROOT_11"
+            if super::gpu_from_z_b8_enabled() {
+                key ^= fnv1a64(FROM_Z_B8_MSL_SOURCE).rotate_left(3) ^ 0x465A_5F42_385F_3031; // "FZ_B8_01"
+            }
         }
         if leaf_vec4 {
             key ^= fnv1a64(LEAF_VEC4_MSL_SOURCE).rotate_left(2) ^ 0x4C45_4146_5F56_3431; // "LEAF_V41"
@@ -12015,11 +12325,14 @@ kernel void blake3_pow_scan(
             let candidate = super::warmup_cache_msl_fnv_for(true, false);
             assert_eq!(incumbent, super::fnv1a64(super::MSL_SOURCE));
             assert_ne!(candidate, incumbent);
+            let b8_term = super::fnv1a64(super::FROM_Z_B8_MSL_SOURCE).rotate_left(3) ^ 0x465A_5F42_385F_3031;
+            assert_ne!(b8_term, 0);
             assert_eq!(
                 candidate,
                 incumbent
                     ^ super::fnv1a64(super::zero_root_msl_source()).rotate_left(1)
                     ^ 0x5A52_4F4F_545F_3131
+                    ^ if super::super::gpu_from_z_b8_enabled() { b8_term } else { 0 }
             );
             // The leaf-vec4 dimension is independent and non-degenerate:
             // candidate and exact-rollback processes never share a latch.
@@ -21100,9 +21413,26 @@ mod tests {
                 !gpu.pso_ntt4zg4_zero_root.is_null(),
                 "current production zero-root PSO must exist"
             );
+            // The production slot holds the byte-table first pass when it is
+            // enabled (8,704 B: 512 table entries + 32 twiddles, no pad), else
+            // the nibble kernel (11,968 B of tables + its 4,096 B pad).
             let production_usage = gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root);
-            assert_eq!(production_usage.0, 16_064, "current residency pad must stay");
+            let expect_production =
+                if crate::gpu_commit::gpu_from_z_b8_enabled() { 8_704 } else { 16_064 };
+            assert_eq!(production_usage.0, expect_production, "production first-pass footprint");
             assert!(production_usage.2 >= 64, "current production group must fit");
+            let nibble = imp::compile_supplemental_pipeline(
+                gpu,
+                imp::zero_root_msl_source(),
+                "ntt_fused_reg4_from_zg4_zero_root",
+            )
+            .unwrap();
+            assert_eq!(
+                gpu.pipeline_resources(nibble).0,
+                16_064,
+                "nibble kernel's residency pad must stay"
+            );
+            gpu.release(nibble);
             let source = imp::zero_root_pair_test_source();
             let paired =
                 imp::compile_supplemental_pipeline(gpu, &source, "export_zero_root_paired")
@@ -21317,10 +21647,12 @@ mod tests {
                 "incumbent first pass mismatch"
             );
             assert_eq!(candidate_first, incumbent_first);
-            // 11,968 B of tables plus the kernel's 4,096 B residency pad.
+            // Byte-table first pass (8,704 B) when enabled, else the nibble
+            // kernel's 11,968 B of tables plus its 4,096 B residency pad. Strict,
+            // so a silent fallback to the nibble kernel fails here.
             assert_eq!(
                 gpu.pipeline_resources(gpu.pso_ntt4zg4_zero_root).0,
-                16_064,
+                if crate::gpu_commit::gpu_from_z_b8_enabled() { 8_704 } else { 16_064 },
                 "candidate static threadgroup footprint"
             );
 
