@@ -8943,7 +8943,32 @@ kernel void blake3_pow_scan(
         den: u64,
     ) {
         unsafe {
-            gpu.set_buffer(enc, data_buf, 0, 0);
+            encode_ntt_passes_prefix_frac_at(
+                gpu, enc, data_buf, 0, tw_buf, log_d, start_layer, l_from, l_to, num, den,
+            );
+        }
+    }
+
+    /// [`encode_ntt_passes_prefix_frac`] with the data buffer bound at byte
+    /// offset `data_off`: the kernels then see the block that starts there as
+    /// block 0, so `tw_buf` must hold that range's twiddles at the block-0
+    /// slots (see `commit_zone_twiddles`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn encode_ntt_passes_prefix_frac_at(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        data_off: usize,
+        tw_buf: Id,
+        log_d: usize,
+        start_layer: usize,
+        l_from: usize,
+        l_to: usize,
+        num: u64,
+        den: u64,
+    ) {
+        unsafe {
+            gpu.set_buffer(enc, data_buf, data_off, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
             let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
                 0usize
@@ -10528,6 +10553,389 @@ kernel void blake3_pow_scan(
         16 * (16 - k) - m
     }
 
+    // -----------------------------------------------------------------------
+    // Closed-loop commit split: an undecided zone next to the boundary.
+    //
+    // The warm-up tuner fixes the CPU/GPU split before the proof, but the
+    // arms do not run at the tuned ratio in every proof (the GPU arm ends
+    // later when the package is warm). The last `zone` 256ths of the GPU's
+    // prefix are therefore left undecided: the GPU prefix buffer runs layers
+    // 4..8 over them (as it does for fine blocks) and nothing more. Whoever
+    // finishes its own part first takes the zone's layers 8..20: the CPU
+    // through the ranged suffix kernels, or the GPU through one more command
+    // buffer that a waiter thread commits the moment the prefix buffer
+    // completes. The zone's leaves are hashed with the CPU suffix's (cb3) in
+    // both cases. Same butterflies, twiddles and order on every position, so
+    // the codeword, the tree and the proof are unchanged.
+    //
+    // `FLOCK_NO_COMMIT_ZONE=1` (exact '1') restores the static split.
+    // -----------------------------------------------------------------------
+
+    /// Zone size in 256ths of the position range, and the size of one step:
+    /// the zone is handed out in steps, the CPU from its end of the zone
+    /// downward, the GPU all the steps that are left when its prefix ends.
+    const COMMIT_ZONE_256: usize = 8;
+    const COMMIT_ZONE_STEP: usize = 2;
+
+    fn commit_zone_256() -> usize {
+        use std::sync::OnceLock;
+        static Z: OnceLock<usize> = OnceLock::new();
+        *Z.get_or_init(|| {
+            if std::env::var_os("FLOCK_NO_COMMIT_ZONE").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                return 0;
+            }
+            std::env::var("FLOCK_COMMIT_ZONE_256")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(COMMIT_ZONE_256)
+        })
+    }
+
+    /// Step size (`FLOCK_COMMIT_ZONE_STEP=n` for local runs; a step as large
+    /// as the zone is the two-position form).
+    fn commit_zone_step() -> usize {
+        use std::sync::OnceLock;
+        static Q: OnceLock<usize> = OnceLock::new();
+        *Q.get_or_init(|| {
+            std::env::var("FLOCK_COMMIT_ZONE_STEP")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|&q: &usize| q > 0)
+                .unwrap_or(COMMIT_ZONE_STEP)
+        })
+    }
+
+    /// Diagnostic owner pin (`FLOCK_COMMIT_ZONE_FORCE=cpu|gpu`): 1 = CPU,
+    /// 2 = GPU, 0 = whoever is first (default).
+    fn commit_zone_force() -> u8 {
+        use std::sync::OnceLock;
+        static F: OnceLock<u8> = OnceLock::new();
+        *F.get_or_init(|| match std::env::var("FLOCK_COMMIT_ZONE_FORCE").as_deref() {
+            Ok("cpu") => 1,
+            Ok("gpu") => 2,
+            _ => 0,
+        })
+    }
+
+    /// Pure zone geometry: 256ths left undecided for split `k_split`.
+    /// Zero for the GPU-only graph, outside the ranked shape, and when the
+    /// boundary sixteenth has no GPU sub-block left to give.
+    fn commit_zone_len_for(k_split: usize, want: usize, log_d: usize, fine_ok: bool) -> usize {
+        let (k, m) = decode_hybrid_split(k_split);
+        if want == 0 || !fine_ok || log_d != 20 || k == 0 || k >= 16 || m >= 15 {
+            return 0;
+        }
+        let room = want.min(15 - m);
+        let step = commit_zone_step().min(room.max(1));
+        room / step * step
+    }
+
+    /// Zone of a real prove. The tuner's sweep samples run the static split,
+    /// so the arms it prices are the ones it has always priced.
+    fn commit_zone_len(k_split: usize, log_d: usize) -> usize {
+        if hybrid_arm_recording() {
+            return 0;
+        }
+        commit_zone_len_for(k_split, commit_zone_256(), log_d, hybrid_gpu_suffix_hash_enabled())
+    }
+
+    #[cfg(test)]
+    mod commit_zone_tests {
+        use super::{commit_zone_len_for, decode_hybrid_split, hybrid_prefix256};
+
+        #[test]
+        fn zone_stays_inside_the_boundary_sixteenth() {
+            assert_eq!(commit_zone_len_for(2, 6, 20, true), 6);
+            assert_eq!(commit_zone_len_for(2 + 16 * 12, 6, 20, true), 2);
+            assert_eq!(commit_zone_len_for(2 + 16 * 15, 6, 20, true), 0);
+            assert_eq!(commit_zone_len_for(0, 6, 20, true), 0);
+            assert_eq!(commit_zone_len_for(2, 0, 20, true), 0);
+            assert_eq!(commit_zone_len_for(2, 6, 18, true), 0);
+            assert_eq!(commit_zone_len_for(2, 6, 20, false), 0);
+            for k in 1..16usize {
+                for m in 0..16usize {
+                    let s = k + 16 * m;
+                    let z = commit_zone_len_for(s, 6, 20, true);
+                    let g = s + 16 * z;
+                    let (kg, mg) = decode_hybrid_split(g);
+                    assert_eq!(kg, k);
+                    assert!(mg < 16);
+                    assert_eq!(hybrid_prefix256(s) - hybrid_prefix256(g), z);
+                    // The zone and the CPU's fine blocks share one sixteenth.
+                    if z > 0 {
+                        assert_eq!(hybrid_prefix256(g) / 16, (hybrid_prefix256(s) - 1) / 16);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Twiddle table for the GPU's zone command buffer: the kernels address
+    /// the block at the bound data offset as block 0, so slot
+    /// `2^L - 1 + x` holds the twiddle of layer `L`, block `(p0 << (L - 8)) + x`
+    /// for every layer 8..log_d and every block of the zone. Built once per
+    /// `(table, p0, zone)` (the split is fixed after the warm-up tune).
+    unsafe fn commit_zone_twiddles(
+        gpu: &Gpu,
+        tw_buf: Id,
+        log_d: usize,
+        p0: usize,
+        zone: usize,
+    ) -> Result<Id, String> {
+        struct Cached(usize, usize, usize, Id);
+        // SAFETY: Metal buffers are thread-safe; the handle is only replaced
+        // under the mutex.
+        unsafe impl Send for Cached {}
+        static ZTW: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+        let mut slot = ZTW.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = slot.as_ref()
+            && c.0 == tw_buf as usize
+            && c.1 == p0
+            && c.2 == zone
+        {
+            return Ok(c.3);
+        }
+        unsafe {
+            let buf = match slot.take() {
+                Some(c) => c.3,
+                None => gpu.new_buffer((1usize << log_d) * 16)?,
+            };
+            let src = gpu.buffer_contents(tw_buf).cast::<F128>();
+            let dst = gpu.buffer_contents(buf).cast::<F128>();
+            for layer in 8..log_d {
+                let base = (1usize << layer) - 1;
+                let first = p0 << (layer - 8);
+                let count = zone << (layer - 8);
+                core::ptr::copy_nonoverlapping(src.add(base + first), dst.add(base), count);
+            }
+            *slot = Some(Cached(tw_buf as usize, p0, zone, buf));
+            Ok(buf)
+        }
+    }
+
+    /// Claim word of one proof's zone: bits 0..8 = steps the CPU has taken
+    /// (from the zone's upper end downward); the flags freeze that count.
+    const ZONE_COUNT_MASK: u32 = 0xff;
+    /// The waiter is committing the GPU's buffer for the steps left.
+    const ZONE_GPU_COMMITTING: u32 = 1 << 8;
+    /// That buffer is committed: the steps below the CPU's are the GPU's.
+    const ZONE_GPU_COMMITTED: u32 = 1 << 9;
+    /// Closed: nothing more may go to the GPU.
+    const ZONE_CLOSED: u32 = 1 << 10;
+
+    struct ZoneMsg {
+        cb2: Id,
+        /// `cbz[j - 1]` runs the zone's first `j` steps.
+        cbz: Vec<Id>,
+        claim: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+    // SAFETY: command buffers are thread-safe Metal objects; each side holds
+    // its own retained reference.
+    unsafe impl Send for ZoneMsg {}
+
+    /// The waiter thread: blocks until the GPU prefix buffer completes, then
+    /// claims every step the CPU has not taken and commits the buffer for
+    /// exactly those, which the serial queue runs next.
+    fn commit_zone_waiter() -> Option<&'static std::sync::Mutex<std::sync::mpsc::Sender<ZoneMsg>>> {
+        use std::sync::OnceLock;
+        use std::sync::atomic::Ordering;
+        static TX: OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<ZoneMsg>>>> =
+            OnceLock::new();
+        TX.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<ZoneMsg>();
+            std::thread::Builder::new()
+                .name("flock-commit-zone".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    crate::set_calling_thread_prover_qos();
+                    let Ok(gpu) = gpu() else { return };
+                    while let Ok(msg) = rx.recv() {
+                        unsafe {
+                            let pool = gpu.pool_push();
+                            if gpu.wait_cb(msg.cb2).is_ok() {
+                                let mut cur = msg.claim.load(Ordering::Acquire);
+                                loop {
+                                    if cur & !ZONE_COUNT_MASK != 0 {
+                                        break;
+                                    }
+                                    match msg.claim.compare_exchange_weak(
+                                        cur,
+                                        cur | ZONE_GPU_COMMITTING,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    ) {
+                                        Ok(_) => {
+                                            let left = msg.cbz.len() - (cur & ZONE_COUNT_MASK) as usize;
+                                            if left > 0 {
+                                                gpu.commit_async(msg.cbz[left - 1]);
+                                            }
+                                            msg.claim.store(cur | ZONE_GPU_COMMITTED, Ordering::Release);
+                                            break;
+                                        }
+                                        Err(now) => cur = now,
+                                    }
+                                }
+                            }
+                            gpu.release(msg.cb2);
+                            for &cb in &msg.cbz {
+                                gpu.release(cb);
+                            }
+                            gpu.pool_pop(pool);
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| std::sync::Mutex::new(tx))
+        })
+        .as_ref()
+    }
+
+    /// One proof's undecided zone. Dropping it settles the claim on every
+    /// path: unclaimed steps can no longer go to the GPU, and a buffer the
+    /// GPU was given is waited for before the references are released.
+    struct ZoneJob<'a> {
+        gpu: &'a Gpu,
+        cbz: Vec<Id>,
+        claim: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        /// First 256th of the zone, 256ths per step.
+        p0: usize,
+        step: usize,
+    }
+
+    impl ZoneJob<'_> {
+        /// Claim the next step for the CPU: `Some(256th range)` of the
+        /// highest step nobody has, or `None` once the zone is exhausted or
+        /// the GPU has the rest (returns only after its buffer is committed).
+        fn claim_cpu_step(&self) -> Option<(usize, usize)> {
+            use std::sync::atomic::Ordering;
+            let n = self.cbz.len() as u32;
+            let mut cur = self.claim.load(Ordering::Acquire);
+            loop {
+                if cur & ZONE_GPU_COMMITTING != 0 {
+                    core::hint::spin_loop();
+                    cur = self.claim.load(Ordering::Acquire);
+                    continue;
+                }
+                // A closed zone (no waiter) is still the CPU's to finish.
+                if cur & ZONE_GPU_COMMITTED != 0 || cur & ZONE_COUNT_MASK == n {
+                    return None;
+                }
+                if commit_zone_force() == 2 && cur & ZONE_CLOSED == 0 {
+                    // Pinned to the GPU: wait for its claim.
+                    core::hint::spin_loop();
+                    cur = self.claim.load(Ordering::Acquire);
+                    continue;
+                }
+                match self.claim.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        let lo = self.p0 + (n - 1 - (cur & ZONE_COUNT_MASK)) as usize * self.step;
+                        return Some((lo, lo + self.step));
+                    }
+                    Err(now) => cur = now,
+                }
+            }
+        }
+    }
+
+    impl Drop for ZoneJob<'_> {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            let mut cur = self.claim.load(Ordering::Acquire);
+            loop {
+                if cur & ZONE_GPU_COMMITTING != 0 {
+                    core::hint::spin_loop();
+                    cur = self.claim.load(Ordering::Acquire);
+                } else if cur & (ZONE_GPU_COMMITTED | ZONE_CLOSED) != 0 {
+                    break;
+                } else {
+                    match self.claim.compare_exchange_weak(
+                        cur,
+                        cur | ZONE_CLOSED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(now) => cur = now,
+                    }
+                }
+            }
+            let cur = self.claim.load(Ordering::Acquire);
+            // SAFETY: our own retained references; a committed buffer is
+            // waited for before any of them is released.
+            unsafe {
+                if cur & ZONE_GPU_COMMITTED != 0 {
+                    let left = self.cbz.len() - (cur & ZONE_COUNT_MASK) as usize;
+                    if left > 0 {
+                        let _ = self.gpu.wait_cb(self.cbz[left - 1]);
+                    }
+                }
+                for &cb in &self.cbz {
+                    self.gpu.release(cb);
+                }
+            }
+        }
+    }
+
+    /// Encode the GPU's zone buffers (layers 8..log_d over the zone's first
+    /// `j` steps, one buffer per `j`, uncommitted) and hand them to the
+    /// waiter with `cb2`. Without a waiter the CPU owns the whole zone.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn commit_zone_start<'a>(
+        gpu: &'a Gpu,
+        cb2: Id,
+        staging: Id,
+        tw_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        p0: usize,
+        len: usize,
+    ) -> Result<ZoneJob<'a>, String> {
+        unsafe {
+            let step = commit_zone_step().min(len);
+            let steps = len / step;
+            debug_assert_eq!(steps * step, len);
+            let ztw = commit_zone_twiddles(gpu, tw_buf, log_d, p0, len)?;
+            // One 256th = n_leaves / 256 leaves of 64 F128 (1 KiB) each.
+            let data_off = p0 * (n_leaves / 256) * 64 * core::mem::size_of::<F128>();
+            let claim = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let mut job = ZoneJob { gpu, cbz: Vec::with_capacity(steps), claim: claim.clone(), p0, step };
+            for j in 1..=steps {
+                let cbz = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cbz)?;
+                encode_ntt_passes_prefix_frac_at(
+                    gpu, enc, staging, data_off, ztw, log_d, 4, 8, log_d, (j * step) as u64, 256,
+                );
+                gpu.end_encoding(enc);
+                job.cbz.push(gpu.retain(cbz));
+            }
+            let sent = commit_zone_force() != 1
+                && commit_zone_waiter().is_some_and(|tx| {
+                    let msg = ZoneMsg {
+                        cb2: gpu.retain(cb2),
+                        cbz: job.cbz.iter().map(|&cb| gpu.retain(cb)).collect(),
+                        claim,
+                    };
+                    match tx.lock().unwrap_or_else(|e| e.into_inner()).send(msg) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            gpu.release(e.0.cb2);
+                            for &cb in &e.0.cbz {
+                                gpu.release(cb);
+                            }
+                            false
+                        }
+                    }
+                });
+            if !sent {
+                // Nobody can commit a zone buffer: the CPU takes every step.
+                job.claim.fetch_or(ZONE_CLOSED, std::sync::atomic::Ordering::AcqRel);
+            }
+            Ok(job)
+        }
+    }
+
     unsafe fn encode_hybrid_prefix_cb2(
         gpu: &Gpu,
         staging: Id,
@@ -10537,6 +10945,10 @@ kernel void blake3_pow_scan(
         n_leaves: usize,
         k_split: usize,
     ) -> Result<Id, String> {
+        // Undecided zone: the GPU's own part ends `zone` 256ths earlier; the
+        // fine encoder already runs layers 4..8 over the whole boundary
+        // sixteenth and the later passes over the GPU's 256ths only.
+        let k_split = k_split + 16 * commit_zone_len(k_split, log_d);
         let (k_cpu16, m) = decode_hybrid_split(k_split);
         debug_assert!((1..16).contains(&k_cpu16) && m < 16);
         if m > 0 {
@@ -10672,7 +11084,18 @@ kernel void blake3_pow_scan(
                         cb2
                     }
                 };
-                let prefix_leaves = hybrid_prefix256(k_split) * (n_leaves / 256);
+                // Undecided zone (0 = static split): the GPU's own prefix and
+                // every Merkle range below use the GPU-side split.
+                let zone = commit_zone_len(k_split, log_d);
+                let k_gpu_split = k_split + 16 * zone;
+                let zone_job = if zone > 0 {
+                    Some(commit_zone_start(
+                        gpu, cb2, staging, tw_buf, log_d, n_leaves, hybrid_prefix256(k_gpu_split), zone,
+                    )?)
+                } else {
+                    None
+                };
+                let prefix_leaves = hybrid_prefix256(k_gpu_split) * (n_leaves / 256);
 
                 // CPU: suffix NTT completion + leaves + subtree parents.
                 // The twiddle table is deterministic per log_d; built once per
@@ -10736,6 +11159,42 @@ kernel void blake3_pow_scan(
                             },
                             |_elem_offset: usize, _chunk: &[F128]| {},
                         )?;
+                    }
+                    if let Some(job) = &zone_job {
+                        // The arm that gets here first takes the zone, a
+                        // step at a time from the CPU's end; the GPU takes
+                        // whatever is left when its prefix buffer ends.
+                        let mut cpu_steps = 0usize;
+                        while let Some((lo, hi)) = job.claim_cpu_step() {
+                            if cpu_steps == 0 {
+                                // Layers 4..8 of the boundary sixteenth are
+                                // the GPU prefix buffer's first encoder.
+                                let ev = gpu.fine_split_event();
+                                let want = FINE_SPLIT_WAIT.load(std::sync::atomic::Ordering::Acquire);
+                                let mut spins = 0u32;
+                                while gpu.event_signaled_value(ev) < want {
+                                    if gpu_cb_failed(gpu, cb2) {
+                                        return Err("commit zone: GPU prefix failed before layer-4 signal".into());
+                                    }
+                                    spins = spins.wrapping_add(1);
+                                    if spins % 64 == 0 {
+                                        std::thread::yield_now();
+                                    } else {
+                                        core::hint::spin_loop();
+                                    }
+                                }
+                            }
+                            ntt.forward_transform_interleaved_ranked_zone(data, 64, lo, hi);
+                            cpu_steps += 1;
+                        }
+                        if crate::tmark::on() {
+                            const MARKS: [&str; 9] = [
+                                "zone cpu steps 0", "zone cpu steps 1", "zone cpu steps 2",
+                                "zone cpu steps 3", "zone cpu steps 4", "zone cpu steps 5",
+                                "zone cpu steps 6", "zone cpu steps 7", "zone cpu steps 8+",
+                            ];
+                            crate::tmark::mark(MARKS[cpu_steps.min(8)]);
+                        }
                     }
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
                     // Same clock as the command buffers' GPU timestamps.
@@ -10801,7 +11260,7 @@ kernel void blake3_pow_scan(
                             (cb3_e - cb2_s) * 1e3
                         );
                     }
-                    if fine_m > 0 {
+                    if fine_m + zone > 0 {
                         // The boundary sixteenth is split between the GPU's
                         // and the suffix's aligned subtrees, so no subtree
                         // spans it: rebuild its four levels above the
@@ -11259,6 +11718,86 @@ kernel void blake3_pow_scan(
         k_split < 16 || (k_split < 256 && k_split % 16 != 0)
     }
 
+    /// CPU-ward bias of the warm-up-tuned commit split, in 256ths of the
+    /// position range (`FLOCK_NO_TUNE_CPU_BIAS=1`, exact '1', kills it;
+    /// `FLOCK_TUNE_CPU_BIAS_256=n` overrides the size for local runs).
+    ///
+    /// Why a bias at all: three official readings of one-sixteenth shifts of
+    /// this split bracket the tuner's pick. One sixteenth toward the GPU cost
+    /// 2.03 +- 0.20 ms of late level (e287836f), one sixteenth toward the CPU
+    /// cost 1.22 +- 0.18 ms (1dba21b9) and took 1.54 +- 0.43 ms off the slow
+    /// stretch. A V with those two arms has its minimum on the CPU side of
+    /// the pick unless a 256th costs the CPU arm less than 0.076 ms, and a
+    /// rival's on-runner phase telemetry (59257514) shows the same: the GPU
+    /// prefix ends 2 ms or more after the CPU part of the commitment NTT.
+    /// Why this size: the GPU arm saves about 0.083 ms per fine 256th
+    /// (0.127 per coarse one times the fine share 0.65); six of them stay on
+    /// the GPU-late side for any CPU cost of 0.14 ms per 256th or more.
+    /// Default 0 (no bias): a joint fit of the official runs reads the
+    /// CPU-ward sixteenth at +0.61 +- 0.13 ms of median, so the closed-loop
+    /// zone alone decides the boundary; `FLOCK_TUNE_CPU_BIAS_256=6` restores
+    /// the biased form.
+    const TUNE_CPU_BIAS_256: usize = 0;
+
+    fn tune_cpu_bias_256() -> usize {
+        use std::sync::OnceLock;
+        static B: OnceLock<usize> = OnceLock::new();
+        *B.get_or_init(|| {
+            if std::env::var_os("FLOCK_NO_TUNE_CPU_BIAS").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                return 0;
+            }
+            std::env::var("FLOCK_TUNE_CPU_BIAS_256")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(TUNE_CPU_BIAS_256)
+        })
+    }
+
+    /// `k_split` moved `bias` 256ths toward the CPU. Unchanged for the
+    /// GPU-only graph (`k = 0`), when the fine split is unavailable, for a
+    /// zero bias, or when the result would leave the splits the tuner's own
+    /// candidates span (`ARM_SPLIT_MAX_K` sixteenths).
+    fn tune_cpu_bias_split(k_split: usize, bias: usize, fine_ok: bool) -> usize {
+        let (k, m) = decode_hybrid_split(k_split);
+        if bias == 0 || k == 0 || !fine_ok || !hybrid_split_valid(k_split) {
+            return k_split;
+        }
+        let cpu256 = 16 * k + m + bias;
+        let (k2, m2) = (cpu256 / 16, cpu256 % 16);
+        if k2 > ARM_SPLIT_MAX_K || (k2 == ARM_SPLIT_MAX_K && m2 != 0) {
+            return k_split;
+        }
+        let biased = k2 + 16 * m2;
+        if hybrid_split_valid(biased) { biased } else { k_split }
+    }
+
+    #[cfg(test)]
+    mod tune_cpu_bias_tests {
+        use super::{decode_hybrid_split, hybrid_prefix256, tune_cpu_bias_split};
+
+        #[test]
+        fn bias_moves_whole_256ths_to_the_cpu_and_respects_the_bounds() {
+            // k = 2 sixteenths, no fine part: six 256ths become the fine part.
+            let s = tune_cpu_bias_split(2, 6, true);
+            assert_eq!(decode_hybrid_split(s), (2, 6));
+            assert_eq!(hybrid_prefix256(2) - hybrid_prefix256(s), 6);
+            // A fine part that overflows carries into the sixteenths.
+            let s = tune_cpu_bias_split(2 + 16 * 12, 6, true);
+            assert_eq!(decode_hybrid_split(s), (3, 2));
+            assert_eq!(hybrid_prefix256(2 + 16 * 12) - hybrid_prefix256(s), 6);
+            let s = tune_cpu_bias_split(2 + 16 * 10, 6, true);
+            assert_eq!(decode_hybrid_split(s), (3, 0));
+            // Unchanged: GPU-only graph, no fine split, zero bias, top of range.
+            assert_eq!(tune_cpu_bias_split(0, 6, true), 0);
+            assert_eq!(tune_cpu_bias_split(2, 6, false), 2);
+            assert_eq!(tune_cpu_bias_split(2, 0, true), 2);
+            assert_eq!(tune_cpu_bias_split(8, 6, true), 8);
+            assert_eq!(tune_cpu_bias_split(7 + 16 * 12, 6, true), 7 + 16 * 12);
+        }
+    }
+
     /// The cheapest sample's `(gpu, cpu)` arms for split `k`.
     fn arm_pair(samples: &[(usize, f64, f64)], k: usize) -> Option<(f64, f64)> {
         samples
@@ -11701,8 +12240,18 @@ kernel void blake3_pow_scan(
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate() {
             walls[i][0] = sample(k)?;
         }
+        // Lean second pass: only the first pass's best candidate and its two
+        // neighbours are sampled again; a candidate further away keeps its one
+        // sample for both slots. The pick is the crossing of lines fitted
+        // through every hybrid sample, so the samples next to it carry the
+        // decision and the far ones only anchor the slopes, which one sample
+        // each still does. Three of the ten graph runs (and their AB replays)
+        // go: less GPU heat right before the proof and a shorter worker
+        // start. `FLOCK_NO_TUNE_LEAN=1` (exact '1') samples every candidate
+        // twice as before.
+        let repeat = lean_second_pass(&walls.iter().map(|w| w[0]).collect::<Vec<f64>>(), tune_lean_enabled());
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate().rev() {
-            walls[i][1] = sample(k)?;
+            walls[i][1] = if repeat[i] { sample(k)? } else { walls[i][0] };
         }
         while extend && walls.len() < RANKED_EXACT_TUNE_CANDIDATES.len() {
             let Some(means) = mean_ranked_exact_samples(&walls) else { break };
@@ -11714,6 +12263,41 @@ kernel void blake3_pow_scan(
             walls.push([sample(k)?, sample(k)?]);
         }
         Ok(walls)
+    }
+
+    fn tune_lean_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_TUNE_LEAN").as_deref() != Some(std::ffi::OsStr::new("1"))
+        })
+    }
+
+    /// Which candidates the second pass samples again: all of them when
+    /// `lean` is off or a first-pass score is unusable, otherwise the best
+    /// first-pass candidate and its neighbours on both sides.
+    fn lean_second_pass(first: &[f64], lean: bool) -> Vec<bool> {
+        if !lean || first.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return vec![true; first.len()];
+        }
+        let Some(best) = (0..first.len()).min_by(|&a, &b| first[a].total_cmp(&first[b])) else {
+            return Vec::new();
+        };
+        (0..first.len()).map(|i| i.abs_diff(best) <= 1).collect()
+    }
+
+    #[cfg(test)]
+    mod tune_lean_tests {
+        use super::lean_second_pass;
+
+        #[test]
+        fn second_pass_keeps_the_best_and_its_neighbours() {
+            assert_eq!(lean_second_pass(&[70.0, 52.0, 50.0, 53.0, 57.0], true), [false, true, true, true, false]);
+            assert_eq!(lean_second_pass(&[50.0, 52.0, 55.0, 58.0, 61.0], true), [true, true, false, false, false]);
+            assert_eq!(lean_second_pass(&[70.0, 60.0, 55.0, 52.0, 50.0], true), [false, false, false, true, true]);
+            assert_eq!(lean_second_pass(&[70.0, 52.0, 50.0, 53.0, 57.0], false), [true; 5]);
+            assert_eq!(lean_second_pass(&[70.0, f64::NAN, 50.0, 53.0, 57.0], true), [true; 5]);
+        }
     }
 
     fn mean_ranked_exact_samples(samples: &[[f64; 2]]) -> Option<Vec<f64>> {
@@ -12273,6 +12857,13 @@ kernel void blake3_pow_scan(
         } else {
             chosen
         };
+        // CPU-ward bias of the tuned split, applied before the verification
+        // run below so the split the timed proof uses is the one compared.
+        let chosen = tune_cpu_bias_split(
+            chosen,
+            tune_cpu_bias_256(),
+            hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled() && params.k_code() == 20,
+        );
         if dbg {
             let rows: Vec<String> = fine_samples
                 .iter()

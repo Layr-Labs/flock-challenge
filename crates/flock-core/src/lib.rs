@@ -148,7 +148,11 @@ pub const ENV_NO_READY_PAUSE: &str = "FLOCK_NO_READY_PAUSE";
 /// proof through readiness to the timed proof runs exactly as it did, so the
 /// pause cannot reach the timed proof. It is a plain sleep, the same in every
 /// worker, and reads nothing but the executable name and the argument count.
-const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1300);
+/// 1.5 s: the slow window's amplitude falls with the pause (official runs of
+/// 11-10, decay constant about 0.6-0.9 s); the extra 0.2 s per trial is paid
+/// for by the lean second pass of the warm-up split sweep (about 0.27 s less
+/// warm-up per worker).
+const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Pure selector: the pause a process takes at start-up, if any.
 fn ranked_start_pause_for(
