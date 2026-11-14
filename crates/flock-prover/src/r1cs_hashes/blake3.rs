@@ -5211,6 +5211,22 @@ impl Blake3Setup {
                     blocks,
                 );
             }
+            // Diagnostic run, quantities with extra proofs only: the in-process
+            // A/B, still before readiness and outside every timed interval
+            // (and before the stream warm-up below, so that everything from
+            // there to the timed proof runs as in a worker without it). A
+            // panic in an extra proof must not take the worker down: the
+            // reading is then reported as never recorded.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.telem_paired_proves(blocks)
+            }))
+            .is_err()
+            {
+                flock_core::tmark::set_arm(0);
+                flock_core::tmark::reset();
+                flock_core::cpu_keepalive::pool_spin_release();
+                flock_core::gpu_commit::gpu_keepwarm_unpause_if_started();
+            }
             // Untimed: give the streamed first pass its first production
             // execution here instead of in the timed prove (see
             // `gpu_commit::ENV_NO_STREAM_WARM`). Ranked worker only.
@@ -5246,6 +5262,83 @@ impl Blake3Setup {
         (proof, commitment, claim)
     }
 
+    /// Diagnostic run (`flock_core::tmark`): when this worker's quantity is a
+    /// pair, prove the warm-up statement once on the quantity's arm
+    /// (unmeasured), then `2 * pairs` more times, the default path (arm 0)
+    /// against the arm in alternating order, and record the median over the
+    /// pairs of `t(arm) - t(default)` over the quantity's part of the proof. Every
+    /// extra proof is serialized and compared with the first one: all prove
+    /// the same statement with the same challenger, so any difference is
+    /// recorded instead of a reading. Runs before readiness; returns at once
+    /// in any other worker.
+    fn telem_paired_proves(&self, blocks: &[Compression]) {
+        use flock_core::tmark;
+        let Some((arm, half, pairs, arm_first)) = tmark::telem_pair() else {
+            return;
+        };
+        let mut diffs: Vec<i64> = Vec::with_capacity(pairs);
+        // One unmeasured proof on the arm first: its one-time costs (code
+        // pages never executed in this process, lazy state) are paid here,
+        // as the warm-up proof paid the default path's. Its bytes are the
+        // reference every later extra proof must equal.
+        let (_, reference) = self.telem_extra_proof(blocks, arm, half);
+        let mut differed = reference.is_empty();
+        for pair in 0..pairs {
+            // ABBA inside the worker; the first order alternates by clock bin.
+            let arm_first = arm_first ^ (pair % 2 == 1);
+            let mut ns = [None; 2];
+            for i in 0..2 {
+                let on_arm = (i == 0) == arm_first;
+                let (part, bytes) = self.telem_extra_proof(blocks, if on_arm { arm } else { 0 }, half);
+                differed |= bytes != reference;
+                ns[on_arm as usize] = part;
+            }
+            if let (Some(on), Some(off)) = (ns[1], ns[0]) {
+                diffs.push(on - off);
+            }
+        }
+        tmark::reset();
+        tmark::telem_pair_record(tmark::telem_median(diffs), differed);
+        flock_core::gpu_commit::gpu_keepwarm_unpause_if_started();
+    }
+
+    /// One extra, untimed proof of the warm-up statement on `arm` (0 = the
+    /// default path), started as the timed proof starts: pool hot (the
+    /// keep-alive the worker runs across its ready -> seed gap), then stopped
+    /// the way the seed-pipe thread stops it. Returns the time of `half` and
+    /// the proof's serialized bytes (empty if serialization failed).
+    fn telem_extra_proof(
+        &self,
+        blocks: &[Compression],
+        arm: u8,
+        half: flock_core::tmark::Half,
+    ) -> (Option<i64>, Vec<u8>) {
+        use flock_core::tmark;
+        flock_core::cpu_keepalive::keepalive_start();
+        let hot = tmark::now_ns();
+        while tmark::now_ns() < hot + 2_000_000 {
+            core::hint::spin_loop();
+        }
+        flock_core::cpu_keepalive::keepalive_signal();
+        flock_core::cpu_keepalive::keepalive_join();
+        tmark::reset();
+        flock_core::gpu_commit::gpu_keepwarm_prove_started();
+        let mut challenger = flock_core::challenger::FsChallenger::with_hash(
+            crate::seed_pipe::BENCH_DOMAIN,
+            HashKind::Blake3,
+        );
+        tmark::set_arm(arm);
+        let t0 = tmark::now_ns();
+        let (proof, commitment, _claim) = self.prove_fast_inner(blocks, &mut challenger);
+        let t1 = tmark::now_ns();
+        tmark::set_arm(0);
+        flock_core::cpu_keepalive::pool_spin_release();
+        let part = tmark::telem_half_of_last_proof(half, t0, t1);
+        let bytes = bincode::serialize(&(&commitment, &proof)).unwrap_or_default();
+        drop((proof, commitment));
+        (part, bytes)
+    }
+
     /// Start the speculative seed pipeline for this setup. No-op outside the
     /// ranked worker and under `FLOCK_NO_SEED_PIPE=1`.
     fn arm_seed_pipe(&self) {
@@ -5278,6 +5371,11 @@ impl Blake3Setup {
         );
         let out = setup.prove_fast_inner(blocks, &mut challenger);
         flock_core::cpu_keepalive::pool_spin_release();
+        // Diagnostic run: this proof returns late, at the time that encodes
+        // the worker's telemetry quantity (`flock_core::tmark`). The seed and
+        // publication code that runs after it is untouched.
+        flock_core::tmark::mark("prove end");
+        flock_core::tmark::telem_hold();
         out
     }
 
