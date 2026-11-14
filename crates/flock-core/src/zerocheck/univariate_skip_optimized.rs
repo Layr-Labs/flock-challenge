@@ -1837,13 +1837,17 @@ fn ab_window_rows_plan() -> AbWindowRows {
     use kernels::aarch64 as k;
     use kernels::aarch64::bstatic_horner_window_rows_impl as rows;
     // The default instances: the main-pool Karatsuba rows and the helper
-    // rows. Every kill switch takes the plain instance (the same bytes).
+    // rows, both with one bounds check per window. Every kill switch takes
+    // the plain instance (the same bytes), except that
+    // `FLOCK_NO_ZC_AB_HZ_HOIST` and `FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` keep the
+    // helper rows with one bounds check per row (the same bytes).
     const MAIN: u32 = k::AB_Z_VARIANT
         | k::ABV_INLINE_WINDOW
         | k::ABV_KARA_XOR16
         | k::ABV_BSTATIC_Z
         | k::ABV_KARA_SLOT
         | k::ABV_HORNER2;
+    const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
     if k::ab_kara_enabled() {
         if k::ab_kara_unscaled_enabled()
             && k::ab_z_enabled()
@@ -1859,7 +1863,11 @@ fn ab_window_rows_plan() -> AbWindowRows {
             rows::<0, false>
         }
     } else if k::ab_hz_helper_enabled() && k::ab_horner2_enabled() {
-        rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>
+        if k::ab_row_setup_hoist_enabled() && k::ab_hz_hoist_enabled() {
+            rows::<HELPER, true>
+        } else {
+            rows::<HELPER, false>
+        }
     } else {
         rows::<0, false>
     }
@@ -1907,8 +1915,8 @@ type AbWindowUnitRun = (AbWindowUnit, [&'static [[u8; 64]; 248]; 2]);
 
 /// The unit form of the window-rows instance `rows`, which runs the same
 /// rows with the same arguments for each chunk. The default instances of
-/// the main-pool workers and of the helper threads have one; `None` keeps
-/// one call per chunk.
+/// the main-pool workers and of the helper threads (either bounds-check form)
+/// have one; `None` keeps one call per chunk.
 #[cfg(target_arch = "aarch64")]
 fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
     use kernels::aarch64::{
@@ -1923,6 +1931,8 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
     const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
     if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
         Some(unit::<MAIN, true>)
+    } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, true> as AbWindowRows) {
+        Some(unit::<HELPER, true>)
     } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, false> as AbWindowRows) {
         Some(unit::<HELPER, false>)
     } else {
@@ -5844,8 +5854,9 @@ mod tests {
     /// The per-worker window-rows plan (`FLOCK_NO_ZC_AB_WINDOW_PLAN`). With
     /// the default switches the resolver returns the instance the per-chunk
     /// chain calls: the hoisted z form with the slot and Horner pieces on a
-    /// thread with the Karatsuba apply, the half-pair form with the Horner
-    /// piece on a `flock-ecore-*` worker and with the Karatsuba apply off.
+    /// thread with the Karatsuba apply, the hoisted half-pair form with the
+    /// Horner piece on a `flock-ecore-*` worker and with the Karatsuba apply
+    /// off.
     /// Whole chunks through `precompute_ab_one_chunk` with a plan write the
     /// bytes of the chain at the ranked layout for both windows, every
     /// representation, three drain instantiations and both Karatsuba states,
@@ -5861,7 +5872,7 @@ mod tests {
 
         const V0: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
         let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 }, true>;
-        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>;
+        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, true>;
         assert!(!core::ptr::fn_addr_eq(main, plain));
         let switches = [
             "FLOCK_NO_ZC_AB_KARA",
@@ -5874,6 +5885,7 @@ mod tests {
             "FLOCK_ZC_AB_Z_MT",
             "FLOCK_NO_ZC_AB_HORNER2",
             "FLOCK_NO_ZC_AB_HZ",
+            "FLOCK_NO_ZC_AB_HZ_HOIST",
             "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN",
         ];
         // The chain's picks with every one of its switches unset.
@@ -6620,6 +6632,7 @@ mod tests {
             ab_window_unit_plan(r).is_some_and(|got| core::ptr::fn_addr_eq(got, u))
         };
         assert!(maps(rows::<MAIN, true>, unit::<MAIN, true>));
+        assert!(maps(rows::<HELPER, true>, unit::<HELPER, true>));
         assert!(maps(rows::<HELPER, false>, unit::<HELPER, false>));
         assert!(ab_window_unit_plan(rows::<V0, true>).is_none());
         assert!(ab_window_unit_plan(rows::<{ k::AB_ROWS_VARIANT }, false>).is_none());
@@ -6634,6 +6647,7 @@ mod tests {
             "FLOCK_ZC_AB_Z_MT",
             "FLOCK_NO_ZC_AB_HORNER2",
             "FLOCK_NO_ZC_AB_HZ",
+            "FLOCK_NO_ZC_AB_HZ_HOIST",
             "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN",
         ];
         if switches.iter().all(|s| std::env::var_os(s).is_none()) {
@@ -7594,11 +7608,12 @@ mod tests {
                         check!(AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16);
                         check!(AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z);
                         check!(AB_HZ_VARIANT);
+                        check!(AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2);
                     }
                 }
             }
         }
-        assert_eq!(cases, 32 * 2 * 2 * 2 * 6);
+        assert_eq!(cases, 32 * 2 * 2 * 2 * 7);
     }
 
     /// The hoisted window check rejects slices that do not hold the

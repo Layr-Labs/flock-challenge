@@ -1848,11 +1848,24 @@ fn evaluate_scaled_basis_inplace(
     }
 
     basis[0] = alpha;
+    // Each doubling level's upper half is exactly the lower half scaled by
+    // `s_at_x`, so the levels run through the prepared-multiplier scale kernel
+    // (`scale_slice_into`, the form the equality-table builders' tensor splits
+    // already use): `out[i] = src[i] * s` is the same field product the scalar
+    // loop issued, over the same slots, so the basis is bit-identical.
+    // `FLOCK_NO_BASIS_SCALE_KERNEL=1` restores the scalar doubling.
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let kernel = !*OFF.get_or_init(|| std::env::var_os("FLOCK_NO_BASIS_SCALE_KERNEL").is_some());
     for k in 0..log_n {
         let s_at_x = sks_at_x[k];
         let current_len = 1 << k;
-        for i in 0..current_len {
-            basis[i + current_len] = s_at_x * basis[i];
+        if kernel {
+            let (low, high) = basis[..2 * current_len].split_at_mut(current_len);
+            crate::field::f128_slice::scale_slice_into(high, low, s_at_x);
+        } else {
+            for i in 0..current_len {
+                basis[i + current_len] = s_at_x * basis[i];
+            }
         }
     }
 }
@@ -1892,11 +1905,23 @@ fn evaluate_scaled_basis_add_final_direct(
     }
 
     lower_basis[0] = alpha;
+    // Same prepared-multiplier scale kernel as `evaluate_scaled_basis_inplace`:
+    // each level's upper half is the lower half scaled by `s_at_x`, and
+    // `scale_slice_into` issues the identical field products over the identical
+    // slots, so the basis is bit-identical. `FLOCK_NO_BASIS_SCALE_KERNEL=1`
+    // restores the scalar doubling.
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let kernel = !*OFF.get_or_init(|| std::env::var_os("FLOCK_NO_BASIS_SCALE_KERNEL").is_some());
     for k in 0..log_n - 1 {
         let s_at_x = sks_at_x[k];
         let current_len = 1 << k;
-        for i in 0..current_len {
-            lower_basis[i + current_len] = s_at_x * lower_basis[i];
+        if kernel {
+            let (low, high) = lower_basis[..2 * current_len].split_at_mut(current_len);
+            crate::field::f128_slice::scale_slice_into(high, low, s_at_x);
+        } else {
+            for i in 0..current_len {
+                lower_basis[i + current_len] = s_at_x * lower_basis[i];
+            }
         }
     }
 
