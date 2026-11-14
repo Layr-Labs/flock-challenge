@@ -747,7 +747,7 @@ pub const ENV_NO_GPU_ZC_AB_COMPLETION: &str = "FLOCK_NO_GPU_ZC_AB_COMPLETION";
 /// `FLOCK_ZC_AB_GPU_CHUNKS=<n>`, `0` = arm off, clamped to the chunk count.
 /// Unset = [`ZC_AB_GPU_DEFAULT_CHUNKS`]. A non-integer value fails loudly.
 pub const ENV_ZC_AB_GPU_CHUNKS: &str = "FLOCK_ZC_AB_GPU_CHUNKS";
-const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 32;
+const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 64;
 
 /// Requested GPU chunk share of the round-one AB completion arm; `0` = off
 /// (kill switch, share 0, or GPU commit disabled).
@@ -791,10 +791,10 @@ pub const ENV_NO_ZC_K_GPU: &str = "FLOCK_NO_ZC_K_GPU";
 
 /// Fixed GPU chunk share of the K pass arm: `FLOCK_ZC_K_GPU_CHUNKS=<n>`
 /// (`0` = off), clamped to the chunk count. Unset = [`ZC_K_GPU_DEFAULT_CHUNKS`]
-/// of the 2048 K chunks of the ranked shape (1/8). A non-integer value fails
+/// of the 2048 K chunks of the ranked shape (3/16). A non-integer value fails
 /// loudly.
 pub const ENV_ZC_K_GPU_CHUNKS: &str = "FLOCK_ZC_K_GPU_CHUNKS";
-const ZC_K_GPU_DEFAULT_CHUNKS: usize = 256;
+const ZC_K_GPU_DEFAULT_CHUNKS: usize = 384;
 
 /// Requested GPU chunk share of the K pass arm; `0` = off (kill switch, share
 /// 0, or GPU commit disabled).
@@ -11894,10 +11894,16 @@ kernel void blake3_pow_scan(
         if let Some(k) = hybrid_cpu_split_override() {
             return k;
         }
-        match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
+        let k = match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
             usize::MAX => DEFAULT_HYBRID_K,
             k => k,
-        }
+        };
+        // One sixteenth less CPU share than the warm-up sweep's pick, when
+        // that is still a storable split (`hybrid_split_valid`): a coarse
+        // part of 0, or a fine split whose coarse part would drop to 0,
+        // keeps the pick. The explicit `FLOCK_HYBRID_CPU_BLOCKS` override
+        // above is used as given.
+        if k % 16 > 0 && hybrid_split_valid(k - 1) { k - 1 } else { k }
     }
 
     /// Promoted fixed default, used when the warmup sweep is disabled or has
