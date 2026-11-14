@@ -10860,8 +10860,31 @@ kernel void blake3_pow_scan(
         }
         match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
             usize::MAX => DEFAULT_HYBRID_K,
-            k => k,
+            k => hybrid_k_bias(k),
         }
+    }
+
+    /// CPU-ward bias of the warmup-tuned split, in sixteenths
+    /// (`FLOCK_HYBRID_K_BIAS=n`, default 1; `FLOCK_NO_HYBRID_K_BIAS` kills).
+    /// The warmup sweep prices the arms while the GPU is cool; on the
+    /// official M3 Max the timed proofs end the commit window on the GPU arm
+    /// (cb2 gpu end ~55.8 ms against cpu ntt done ~45.3 ms), so the tuned
+    /// split leaves the CPU idle at the window's end. Only the sixteenths
+    /// field moves; the fine `m` field and `k = 0` are unchanged.
+    fn hybrid_k_bias(k_split: usize) -> usize {
+        use std::sync::OnceLock;
+        static B: OnceLock<usize> = OnceLock::new();
+        let bias = *B.get_or_init(|| {
+            if std::env::var_os("FLOCK_NO_HYBRID_K_BIAS").is_some() {
+                return 0;
+            }
+            std::env::var("FLOCK_HYBRID_K_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
+        });
+        let (k, m) = decode_hybrid_split(k_split);
+        if bias == 0 || k == 0 || k + bias > ARM_SPLIT_MAX_K {
+            return k_split;
+        }
+        (k + bias) + 16 * m
     }
 
     /// Promoted fixed default, used when the warmup sweep is disabled or has
