@@ -3041,11 +3041,6 @@ fn transpose_forward_ntt_fused_3layer(
 ) {
     use rayon::prelude::*;
 
-    // Read once per group, not per product; an in-process diagnostic can ablate
-    // this fold without changing the transpose schedule or prepared twiddles.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
-    let pmull_fold = std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none();
-
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
     type Twiddle = crate::field::gf2_128::aarch64::ConstPrep;
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
@@ -3066,23 +3061,21 @@ fn transpose_forward_ntt_fused_3layer(
         a: [usize; 2],
         b: [usize; 2],
         tw: [Twiddle; 2],
-        pmull_fold: bool,
     ) {
         use core::arch::aarch64::uint64x2_t;
-        use crate::field::gf2_128::aarch64::{mul_const_pair_prep, mul_const_pair_prep_pmull};
+        use crate::field::gf2_128::aarch64::mul_const_pair_prep;
 
         let bottom = [values[b[0]], values[b[1]]];
         let sums = [values[a[0]] + bottom[0], values[a[1]] + bottom[1]];
         // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
         // layout maps lo/hi to vector lanes 0/1 without padding.
         let products = unsafe {
-            let x0 = core::mem::transmute::<F128, uint64x2_t>(sums[0]);
-            let x1 = core::mem::transmute::<F128, uint64x2_t>(sums[1]);
-            let products = if pmull_fold {
-                mul_const_pair_prep_pmull(tw[0], x0, tw[1], x1)
-            } else {
-                mul_const_pair_prep(tw[0], x0, tw[1], x1)
-            };
+            let products = mul_const_pair_prep(
+                tw[0],
+                core::mem::transmute::<F128, uint64x2_t>(sums[0]),
+                tw[1],
+                core::mem::transmute::<F128, uint64x2_t>(sums[1]),
+            );
             products.map(|p| core::mem::transmute::<uint64x2_t, F128>(p))
         };
         values[a[0]] = sums[0];
@@ -3151,7 +3144,6 @@ fn transpose_forward_ntt_fused_3layer(
                         [4 * half, 4 * half + 2],
                         [4 * half + 1, 4 * half + 3],
                         [tw[3 + 2 * half], tw[4 + 2 * half]],
-                        pmull_fold,
                     );
                 }
                 for half in 0..2 {
@@ -3160,7 +3152,6 @@ fn transpose_forward_ntt_fused_3layer(
                         [4 * half, 4 * half + 1],
                         [4 * half + 2, 4 * half + 3],
                         [tw[1 + half]; 2],
-                        pmull_fold,
                     );
                 }
                 for pair in 0..2 {
@@ -3169,7 +3160,6 @@ fn transpose_forward_ntt_fused_3layer(
                         [2 * pair, 2 * pair + 1],
                         [2 * pair + 4, 2 * pair + 5],
                         [tw[0]; 2],
-                        pmull_fold,
                     );
                 }
             }
@@ -4321,6 +4311,39 @@ fn densify_active_windows_fused_first_3layer(
     log_d: usize,
     prefix_k: usize,
 ) -> Vec<F128> {
+    densify_active_windows_fused_first_3layer_with(
+        ntt, arena, groups, log_d, prefix_k, |tw| tw,
+        |values, tw| {
+            #[inline(always)]
+            fn butterfly(values: &mut [F128; 8], top: usize, bottom: usize, twiddle: F128) {
+                let sum = values[top] + values[bottom];
+                values[top] = sum;
+                values[bottom] = twiddle * sum + values[bottom];
+            }
+
+            for pair in 0..4 {
+                butterfly(values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
+            }
+            for half in 0..2 {
+                butterfly(values, 4 * half, 4 * half + 2, tw[1 + half]);
+                butterfly(values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
+            }
+            for top in 0..4 {
+                butterfly(values, top, top + 4, tw[0]);
+            }
+        },
+    )
+}
+
+fn densify_active_windows_fused_first_3layer_with<C: Copy + Send + Sync>(
+    ntt: &AdditiveNttF128,
+    arena: &[F128],
+    groups: &[ActiveWindow],
+    log_d: usize,
+    prefix_k: usize,
+    prepare: impl Fn([F128; 7]) -> C,
+    row_op: impl Fn(&mut [F128; 8], &C) + Send + Sync,
+) -> Vec<F128> {
     use rayon::prelude::*;
 
     assert!(
@@ -4338,7 +4361,7 @@ fn densify_active_windows_fused_first_3layer(
     debug_assert_eq!(arena.len(), groups.len() * window_len);
 
     let window_to_arena = active_window_to_arena(groups, n_windows);
-    let twiddles: Vec<[F128; 7]> = (0..num_blocks)
+    let twiddles: Vec<C> = (0..num_blocks)
         .map(|block| {
             let mut tw = [F128::ZERO; 7];
             tw[0] = ntt.twiddle(first_layer, block);
@@ -4348,7 +4371,7 @@ fn densify_active_windows_fused_first_3layer(
             for quarter in 0..4 {
                 tw[3 + quarter] = ntt.twiddle(first_layer + 2, 4 * block + quarter);
             }
-            tw
+            prepare(tw)
         })
         .collect();
 
@@ -4388,23 +4411,7 @@ fn densify_active_windows_fused_first_3layer(
                     }
                 });
 
-                #[inline(always)]
-                fn butterfly(values: &mut [F128; 8], top: usize, bottom: usize, twiddle: F128) {
-                    let sum = values[top] + values[bottom];
-                    values[top] = sum;
-                    values[bottom] = twiddle * sum + values[bottom];
-                }
-
-                for pair in 0..4 {
-                    butterfly(&mut values, 2 * pair, 2 * pair + 1, tw[3 + pair]);
-                }
-                for half in 0..2 {
-                    butterfly(&mut values, 4 * half, 4 * half + 2, tw[1 + half]);
-                    butterfly(&mut values, 4 * half + 1, 4 * half + 3, tw[1 + half]);
-                }
-                for top in 0..4 {
-                    butterfly(&mut values, top, top + 4, tw[0]);
-                }
+                row_op(&mut values, tw);
 
                 for (i, value) in values.into_iter().enumerate() {
                     output_ptr
@@ -4422,6 +4429,115 @@ fn densify_active_windows_fused_first_3layer(
         data.set_len(n);
     }
     data
+}
+
+#[inline]
+fn c2_prepared_producer_shape(
+    full_log_d: usize,
+    log_d: usize,
+    prefix_k: usize,
+    drop_log: usize,
+    n_positions: usize,
+) -> bool {
+    prefix_k == 8
+        && matches!((full_log_d, log_d, drop_log, n_positions), (20, 17, 1, 218) | (18, 15, 2, 106))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_C2_PREPARED_PRODUCER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// This seam is used only from the existing C2 lean/fuse_first branch.
+// Other sparse and L2 callers keep the scalar producer above.
+fn densify_c2_windows_fused_first_3layer(
+    ntt: &AdditiveNttF128,
+    arena: &[F128],
+    groups: &[ActiveWindow],
+    log_d: usize,
+    prefix_k: usize,
+    drop_log: usize,
+    n_positions: usize,
+) -> Vec<F128> {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if c2_prepared_producer_shape(ntt.log_domain_size(), log_d, prefix_k, drop_log, n_positions) {
+        #[cfg(test)]
+        TEST_C2_PREPARED_PRODUCER_CALLS.with(|calls| calls.set(calls.get() + 1));
+        return densify_c2_windows_prepared_first_3layer(ntt, arena, groups, log_d, prefix_k);
+    }
+    densify_active_windows_fused_first_3layer(ntt, arena, groups, log_d, prefix_k)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+fn densify_c2_windows_prepared_first_3layer(
+    ntt: &AdditiveNttF128,
+    arena: &[F128],
+    groups: &[ActiveWindow],
+    log_d: usize,
+    prefix_k: usize,
+) -> Vec<F128> {
+    use core::arch::aarch64::uint64x2_t;
+    use crate::field::gf2_128::aarch64::{const_prep, mul_const_pair_prep, ConstPrep};
+
+    #[inline(always)]
+    fn butterfly_pair(
+        values: &mut [F128; 8],
+        a: [usize; 2],
+        b: [usize; 2],
+        tw: [ConstPrep; 2],
+    ) {
+        let bottom = [values[b[0]], values[b[1]]];
+        let sums = [values[a[0]] + bottom[0], values[a[1]] + bottom[1]];
+        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
+        // layout maps lo/hi to vector lanes 0/1 without padding.
+        let products = unsafe {
+            let products = mul_const_pair_prep(
+                tw[0],
+                core::mem::transmute::<F128, uint64x2_t>(sums[0]),
+                tw[1],
+                core::mem::transmute::<F128, uint64x2_t>(sums[1]),
+            );
+            products.map(|p| core::mem::transmute::<uint64x2_t, F128>(p))
+        };
+        values[a[0]] = sums[0];
+        values[a[1]] = sums[1];
+        values[b[0]] = products[0] + bottom[0];
+        values[b[1]] = products[1] + bottom[1];
+    }
+
+    densify_active_windows_fused_first_3layer_with(
+        ntt, arena, groups, log_d, prefix_k,
+        |tw| {
+            // SAFETY: the same AES and limb-layout conditions apply above.
+            unsafe { tw.map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t))) }
+        },
+        |values, tw| {
+            for half in 0..2 {
+                butterfly_pair(
+                    values,
+                    [4 * half, 4 * half + 2],
+                    [4 * half + 1, 4 * half + 3],
+                    [tw[3 + 2 * half], tw[4 + 2 * half]],
+                );
+            }
+            for half in 0..2 {
+                butterfly_pair(
+                    values,
+                    [4 * half, 4 * half + 1],
+                    [4 * half + 2, 4 * half + 3],
+                    [tw[1 + half]; 2],
+                );
+            }
+            for pair in 0..2 {
+                butterfly_pair(
+                    values,
+                    [2 * pair, 2 * pair + 1],
+                    [2 * pair + 4, 2 * pair + 5],
+                    [tw[0]; 2],
+                );
+            }
+        },
+    )
 }
 
 #[inline]
@@ -5342,7 +5458,9 @@ fn transpose_forward_ntt_sparse_retained_with(
         let mut arena = take_c2_window_arena(groups.len() << k);
         transform_active_windows_lean(ntt, &mut arena, &groups, positions, values, k, log_d);
         let data = if fuse_first {
-            densify_active_windows_fused_first_3layer(ntt, &arena, &groups, log_d, k)
+            densify_c2_windows_fused_first_3layer(
+                ntt, &arena, &groups, log_d, k, drop_log, positions.len(),
+            )
         } else {
             densify_active_windows(&arena, &groups, log_d, k)
         };
@@ -5378,6 +5496,201 @@ fn transpose_forward_ntt_sparse_retained_with(
     Some(retained)
 }
 
+/// The same retained row with four multipliers prepared before the row loop.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn l0_factored_final3_prepared_row(
+    values: [F128; 8],
+    constants: [crate::field::gf2_128::aarch64::ConstPrep; 4],
+) -> [F128; 4] {
+    use core::arch::aarch64::uint64x2_t;
+    use crate::field::gf2_128::aarch64::mul_const_prep;
+
+    let mul = |c, x: F128| {
+        // SAFETY: AES is enabled. F128 has two u64 limbs without padding;
+        // little-endian layout maps lo/hi to vector lanes 0/1.
+        unsafe {
+            core::mem::transmute::<uint64x2_t, F128>(mul_const_prep(
+                c,
+                core::mem::transmute::<F128, uint64x2_t>(x),
+            ))
+        }
+    };
+    let [x0, x1, x2, x3, x4, x5, x6, x7] = values;
+    let p0 = x0 + x1;
+    let p1 = x2 + x3;
+    let p2 = x4 + x5;
+    let p3 = x6 + x7;
+    let x = mul(constants[0], p1);
+    let y = mul(constants[2], p3);
+    let z = mul(constants[1], p2);
+    let q3 = x + x3;
+    let q5 = z + x5;
+    let q7 = y + x7;
+    let t0 = p0 + p1;
+    let t1 = x1 + q3;
+    let t2 = p2 + p3;
+    let t3 = q5 + q7;
+
+    [
+        t0 + t2,
+        t1 + t3,
+        p1 + (mul(constants[3], t2) + p3),
+        q3 + (mul(constants[3], t3) + q7),
+    ]
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
+#[inline(always)]
+unsafe fn l0_factored_final3_mul_pair(
+    c_lo: core::arch::aarch64::uint64x2_t,
+    c_hi: core::arch::aarch64::uint64x2_t,
+    c_mid: core::arch::aarch64::uint64x2_t,
+    b_lo: core::arch::aarch64::uint64x2_t,
+    b_hi: core::arch::aarch64::uint64x2_t,
+) -> [core::arch::aarch64::uint64x2_t; 2] {
+    use core::arch::aarch64::*;
+
+    #[inline(always)]
+    fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+        unsafe { veor3q_u64(a, b, c) }
+    }
+
+    unsafe {
+        let b_mid = veorq_u64(b_lo, b_hi);
+        let p0_ll: uint64x2_t;
+        let p0_hh: uint64x2_t;
+        let p0_mm: uint64x2_t;
+        let p1_ll: uint64x2_t;
+        let p1_hh: uint64x2_t;
+        let p1_mm: uint64x2_t;
+        core::arch::asm!(
+            "pmull {ll0:v}.1q, {bl:v}.1d, {cl:v}.1d",
+            "pmull {hh0:v}.1q, {bh:v}.1d, {ch:v}.1d",
+            "pmull {mm0:v}.1q, {bm:v}.1d, {cm:v}.1d",
+            "pmull2 {ll1:v}.1q, {bl:v}.2d, {cl:v}.2d",
+            "pmull2 {hh1:v}.1q, {bh:v}.2d, {ch:v}.2d",
+            "pmull2 {mm1:v}.1q, {bm:v}.2d, {cm:v}.2d",
+            bl = in(vreg) b_lo,
+            bh = in(vreg) b_hi,
+            bm = in(vreg) b_mid,
+            cl = in(vreg) c_lo,
+            ch = in(vreg) c_hi,
+            cm = in(vreg) c_mid,
+            ll0 = out(vreg) p0_ll,
+            hh0 = out(vreg) p0_hh,
+            mm0 = out(vreg) p0_mm,
+            ll1 = out(vreg) p1_ll,
+            hh1 = out(vreg) p1_hh,
+            mm1 = out(vreg) p1_mm,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+
+        let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
+        let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
+
+        // Lane-paired (mul0, mul1) layout for each word position, identical
+        // to `ghash_mul_vec2_neon`:
+        //   r0 = ll_lo
+        //   r1 = ll_hi ^ cross_lo
+        //   r2 = hh_lo ^ cross_hi
+        //   r3 = hh_hi
+        let r0 = vzip1q_u64(p0_ll, p1_ll);
+        let ll_hi = vzip2q_u64(p0_ll, p1_ll);
+        let c_lo = vzip1q_u64(c0, c1);
+        let r1 = veorq_u64(ll_hi, c_lo);
+        let hh_lo = vzip1q_u64(p0_hh, p1_hh);
+        let c_hi = vzip2q_u64(c0, c1);
+        let r2 = veorq_u64(hh_lo, c_hi);
+        let r3 = vzip2q_u64(p0_hh, p1_hh);
+
+        // r3 is the high limb of a 64x64 product. Its bit 63 is zero.
+        let r2 = xor3_u64(r2, vshrq_n_u64::<62>(r3), vshrq_n_u64::<57>(r3));
+        let s1_lo = vshlq_n_u64::<1>(r2);
+        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
+        let s2_lo = vshlq_n_u64::<2>(r2);
+        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
+        let s7_lo = vshlq_n_u64::<7>(r2);
+        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
+
+        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
+        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
+
+        let final_lo = veorq_u64(r0, t_lo);
+        let final_hi = veorq_u64(r1, t_hi);
+
+        [final_lo, final_hi]
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
+#[inline(always)]
+fn l0_factored_final3_pair_constants(
+    constants: L0FactoredFinal3Constants,
+) -> [[core::arch::aarch64::uint64x2_t; 2]; 3] {
+    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, vzip1q_u64, vzip2q_u64};
+    use crate::field::gf2_128::aarch64::const_prep;
+
+    // SAFETY: AES and the little-endian F128 lane layout are required.
+    unsafe {
+        let a = core::mem::transmute::<F128, uint64x2_t>(constants.a);
+        let e = core::mem::transmute::<F128, uint64x2_t>(constants.a_plus_d);
+        let d = const_prep(core::mem::transmute::<F128, uint64x2_t>(constants.d));
+        [
+            [vzip1q_u64(a, e), vzip2q_u64(a, e)],
+            [d.0, d.1],
+            [vdupq_n_u64(constants.b.lo), vdupq_n_u64(constants.b.hi)],
+        ]
+    }
+}
+
+/// The caller owns all eight row addresses. Read them before any retained
+/// store; each other row has disjoint addresses. AES, SHA3 and the F128
+/// little-endian limb layout are required by the compile guard.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
+#[inline(always)]
+unsafe fn l0_factored_final3_pair_row(
+    ptr: *mut F128,
+    row: usize,
+    eighth: usize,
+    constants: [[core::arch::aarch64::uint64x2_t; 2]; 3],
+) {
+    use core::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64, vzip1q_u64, vzip2q_u64};
+    use crate::field::gf2_128::aarch64::mul_const_prep;
+
+    unsafe {
+        let [x0, x1, x2, x3, x4, x5, x6, x7]: [uint64x2_t; 8] =
+            core::array::from_fn(|i| vld1q_u64(ptr.add(row + i * eighth).cast::<u64>()));
+        let p0 = veorq_u64(x0, x1);
+        let p1 = veorq_u64(x2, x3);
+        let p2 = veorq_u64(x4, x5);
+        let p3 = veorq_u64(x6, x7);
+        let t2 = veorq_u64(p2, p3);
+        vst1q_u64(ptr.add(row).cast::<u64>(), veorq_u64(p0, veorq_u64(p1, t2)));
+
+        let z = mul_const_prep((constants[1][0], constants[1][1]), p2);
+        let xy = l0_factored_final3_mul_pair(
+            constants[0][0], constants[0][1], veorq_u64(constants[0][0], constants[0][1]),
+            vzip1q_u64(p1, p3), vzip2q_u64(p1, p3),
+        );
+        let x = vzip1q_u64(xy[0], xy[1]);
+        let y = vzip2q_u64(xy[0], xy[1]);
+        let q3 = veorq_u64(x, x3);
+        let q7 = veorq_u64(y, x7);
+        let t3 = veorq_u64(z, veorq_u64(x5, q7));
+        vst1q_u64(ptr.add(row + eighth).cast::<u64>(), veorq_u64(x1, veorq_u64(q3, t3)));
+
+        let uv = l0_factored_final3_mul_pair(
+            constants[2][0], constants[2][1], veorq_u64(constants[2][0], constants[2][1]),
+            vzip1q_u64(t2, t3), vzip2q_u64(t2, t3),
+        );
+        let u = vzip1q_u64(uv[0], uv[1]);
+        let v = vzip2q_u64(uv[0], uv[1]);
+        vst1q_u64(ptr.add(row + 2 * eighth).cast::<u64>(), veorq_u64(p1, veorq_u64(p3, u)));
+        vst1q_u64(ptr.add(row + 3 * eighth).cast::<u64>(), veorq_u64(q3, veorq_u64(q7, v)));
+    }
+}
+
 fn transpose_forward_ntt_factored_final_3layer_low_half(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
@@ -5402,6 +5715,18 @@ fn transpose_forward_ntt_factored_final_3layer_low_half(
         a_plus_d: layer_2_twiddles[3],
         b: layer_1_twiddles[1],
     };
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
+    let constants = l0_factored_final3_pair_constants(constants);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", not(target_feature = "sha3"), target_endian = "little"))]
+    let constants = {
+        use core::arch::aarch64::uint64x2_t;
+        use crate::field::gf2_128::aarch64::const_prep;
+        // SAFETY: AES and the little-endian F128 lane layout are required.
+        unsafe {
+            [constants.a, constants.d, constants.a_plus_d, constants.b]
+                .map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t)))
+        }
+    };
     let data_ptr = data.as_mut_ptr() as usize;
     (0..eighth)
         .into_par_iter()
@@ -5409,12 +5734,18 @@ fn transpose_forward_ntt_factored_final_3layer_low_half(
         .for_each(|row| {
             unsafe {
                 let ptr = data_ptr as *mut F128;
-                let retained = l0_factored_final3_retained_row(
-                    core::array::from_fn(|i| *ptr.add(row + i * eighth)),
-                    constants,
-                );
-                for (i, value) in retained.into_iter().enumerate() {
-                    *ptr.add(row + i * eighth) = value;
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
+                l0_factored_final3_pair_row(ptr, row, eighth, constants);
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little")))]
+                {
+                    let values = core::array::from_fn(|i| *ptr.add(row + i * eighth));
+                    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+                    let retained = l0_factored_final3_prepared_row(values, constants);
+                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+                    let retained = l0_factored_final3_retained_row(values, constants);
+                    for (i, value) in retained.into_iter().enumerate() {
+                        *ptr.add(row + i * eighth) = value;
+                    }
                 }
             }
         });
@@ -16172,6 +16503,167 @@ mod tests {
     }
 
     #[test]
+    fn c2_prepared_producer_gate_rejects_each_shape_miss() {
+        for shape in [[20usize, 17, 8, 1, 218], [18, 15, 8, 2, 106]] {
+            assert!(c2_prepared_producer_shape(shape[0], shape[1], shape[2], shape[3], shape[4]));
+            for field in 0..shape.len() {
+                let mut changed = shape;
+                changed[field] += 1;
+                assert!(!c2_prepared_producer_shape(
+                    changed[0], changed[1], changed[2], changed[3], changed[4],
+                ));
+            }
+        }
+        assert!(!c2_prepared_producer_shape(20, 17, 8, 1, 0));
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    #[test]
+    fn c2_prepared_fused_producer_matches_scalar_layers() {
+        use crate::challenger::Challenger;
+
+        for (full_log, log_d, nq) in [(20usize, 17usize, 218usize), (18, 15, 106)] {
+            let ntt = AdditiveNttF128::standard(full_log);
+            let n = 1usize << log_d;
+            let k = 8;
+            let first_layer = log_d - k - 3;
+            let blocks = 1usize << first_layer;
+            for case in 0..6 {
+                // Empty; one first block; disjoint first/last blocks; every
+                // block; duplicate inputs that cancel; one last window.
+                let mut positions: Vec<usize> = match case {
+                    0 => Vec::new(),
+                    1 => (0..nq).collect(),
+                    2 => (0..nq).map(|i| {
+                        if i % 2 == 0 { i / 2 } else { n - 256 + i / 2 }
+                    }).collect(),
+                    3 => (0..nq).map(|i| (i % blocks) * 2048 + i / blocks).collect(),
+                    4 => (0..nq).map(|i| ((i / 2) % blocks) * 2048 + (i / 2) / blocks).collect(),
+                    _ => (0..nq).map(|i| n - 256 + i).collect(),
+                };
+                positions.sort_unstable();
+                let mut ch = crate::challenger::RandomChallenger::new(
+                    0xC2_735_82_u64 ^ ((log_d * 31 + case) as u64),
+                );
+                let mut values: Vec<F128> = (0..positions.len()).map(|_| ch.sample_f128()).collect();
+                if case == 4 {
+                    for (positions, pair) in positions.chunks_exact(2).zip(values.chunks_exact_mut(2)) {
+                        assert_eq!(positions[0], positions[1]);
+                        pair[1] = pair[0];
+                    }
+                }
+                let groups = group_sorted_positions(&positions, k);
+                let active_blocks = groups.iter().map(|g| g.window_index >> 3)
+                    .collect::<std::collections::BTreeSet<_>>().len();
+                assert_eq!(active_blocks, [0, 1, 2, blocks, blocks, 1][case]);
+                let mut arena = scatter_active_windows(&groups, &positions, &values, k);
+                transform_active_windows(&ntt, &mut arena, &groups, &positions, &values, k, log_d);
+
+                let mut expected = densify_active_windows(&arena, &groups, log_d, k);
+                // Independent scalar layers: do not call the prepared generic
+                // full3 helper or the producer's row callback for the reference.
+                for layer in (first_layer..first_layer + 3).rev() {
+                    let block_size = 1usize << (log_d - layer);
+                    let half = block_size >> 1;
+                    for (block, chunk) in expected.chunks_mut(block_size).enumerate() {
+                        let twiddle = ntt.twiddle(layer, block);
+                        let (top, bottom) = chunk.split_at_mut(half);
+                        for (a, b) in top.iter_mut().zip(bottom) {
+                            let sum = *a + *b;
+                            *a = sum;
+                            *b += twiddle * sum;
+                        }
+                    }
+                }
+                let scalar = densify_active_windows_fused_first_3layer(&ntt, &arena, &groups, log_d, k);
+                let prepared = densify_c2_windows_prepared_first_3layer(&ntt, &arena, &groups, log_d, k);
+                assert_eq!(scalar, expected, "scalar log_d={log_d} case={case}");
+                assert_eq!(prepared, expected, "prepared log_d={log_d} case={case}");
+                if case == 0 || case == 4 {
+                    assert!(prepared.iter().all(|&v| v == F128::ZERO));
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    #[test]
+    fn c2_prepared_producer_matches_independent_layers() {
+        use crate::challenger::Challenger;
+
+        fn software_mul(a: F128, b: F128) -> F128 {
+            let mut a = (a.lo as u128) | ((a.hi as u128) << 64);
+            let mut b = (b.lo as u128) | ((b.hi as u128) << 64);
+            let mut out = 0u128;
+            for _ in 0..128 {
+                if b & 1 != 0 { out ^= a; }
+                let carry = a >> 127;
+                a <<= 1;
+                if carry != 0 { a ^= 0x87; }
+                b >>= 1;
+            }
+            F128::new(out as u64, (out >> 64) as u64)
+        }
+
+        for (full_log, log_d, k) in [
+            (5usize, 5usize, 2usize), (20, 6, 2), (18, 6, 2),
+            (20, 17, 8), (18, 15, 8),
+        ] {
+            let ntt = AdditiveNttF128::standard(full_log);
+            let n = 1usize << log_d;
+            let window_len = 1usize << k;
+            let first_layer = log_d - k - 3;
+            let masks: Vec<usize> = if k == 8 {
+                vec![255, 128, 1, 0]
+            } else {
+                (0..=255).rev().collect()
+            };
+            for mask in masks {
+                let positions: Vec<usize> = (0..n / window_len)
+                    .filter(|&window| mask & (1 << (window & 7)) != 0)
+                    .map(|window| window * window_len)
+                    .collect();
+                let groups = group_sorted_positions(&positions, k);
+                for case in 0..3 {
+                    let mut ch = crate::challenger::RandomChallenger::new(
+                        0xC2_3350_735 ^ ((full_log * 65537 + log_d * 257 + mask * 3 + case) as u64),
+                    );
+                    let arena: Vec<F128> = (0..groups.len() * window_len).map(|_| match case {
+                        0 => ch.sample_f128(),
+                        1 => F128::ZERO,
+                        _ => F128::new(u64::MAX, u64::MAX),
+                    }).collect();
+                    let mut expected = vec![F128::ZERO; n];
+                    for (index, group) in groups.iter().enumerate() {
+                        let start = group.window_index * window_len;
+                        expected[start..start + window_len].copy_from_slice(
+                            &arena[index * window_len..(index + 1) * window_len],
+                        );
+                    }
+                    // The reference uses separate dense scalar layers. Small
+                    // masks also use a field reduction independent of PMULL.
+                    for layer in (first_layer..first_layer + 3).rev() {
+                        let block_size = 1usize << (log_d - layer);
+                        for (block, chunk) in expected.chunks_mut(block_size).enumerate() {
+                            let twiddle = ntt.twiddle(layer, block);
+                            let (top, bottom) = chunk.split_at_mut(block_size >> 1);
+                            for (a, b) in top.iter_mut().zip(bottom) {
+                                let sum = *a + *b;
+                                *a = sum;
+                                *b += if k == 8 { twiddle * sum } else { software_mul(twiddle, sum) };
+                            }
+                        }
+                    }
+                    let actual = densify_c2_windows_prepared_first_3layer(&ntt, &arena, &groups, log_d, k);
+                    let scalar = densify_active_windows_fused_first_3layer(&ntt, &arena, &groups, log_d, k);
+                    assert_eq!(actual, expected, "prepared48 full={full_log} log_d={log_d} mask={mask} case={case}");
+                    assert_eq!(scalar, expected, "scalar full={full_log} log_d={log_d} mask={mask} case={case}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn c2_lean_windows_retained_transpose_matches_kill_and_full() {
         use crate::challenger::Challenger;
         // Ranked C2 shapes (L0 17/1/218, deep 15/2/106 and 13/3/71), both
@@ -16221,18 +16713,24 @@ mod tests {
                 &ntt, &positions, &values, log_d, false, None, false,
             );
             expected.truncate(1usize << (log_d - drop_log));
+            TEST_C2_PREPARED_PRODUCER_CALLS.with(|calls| calls.set(0));
             let kill = transpose_forward_ntt_sparse_retained_with(
                 &ntt, &positions, &values, log_d, drop_log, false,
             )
             .expect("supported retained geometry");
+            TEST_C2_PREPARED_PRODUCER_CALLS.with(|calls| assert_eq!(calls.get(), 0));
             assert_eq!(kill, expected, "kill log_d={log_d} drop={drop_log} nq={nq}");
             for rep in 0..2u64 {
                 let poison = F128::new(0xA5A5_5A5A_DEAD_BEEF ^ rep, !rep);
                 *C2_WINDOW_ARENA.lock().unwrap() = Some(vec![poison; (nq + 1) << 8]);
+                TEST_C2_PREPARED_PRODUCER_CALLS.with(|calls| calls.set(0));
                 let lean = transpose_forward_ntt_sparse_retained_with(
                     &ntt, &positions, &values, log_d, drop_log, true,
                 )
                 .expect("supported retained geometry");
+                let selected = cfg!(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))
+                    && matches!((full_log, log_d, drop_log, nq), (20, 17, 1, 218) | (18, 15, 2, 106));
+                TEST_C2_PREPARED_PRODUCER_CALLS.with(|calls| assert_eq!(calls.get(), usize::from(selected)));
                 assert_eq!(lean, expected, "lean log_d={log_d} drop={drop_log} nq={nq} rep={rep}");
             }
         }
@@ -16979,6 +17477,173 @@ mod tests {
         assert!(!l0_factored_final3_value_enabled(Some(
             std::ffi::OsStr::new("1")
         )));
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
+    #[test]
+    fn l0_factored_final3_pair_products_match_software() {
+        use crate::field::gf2_128::software;
+        struct Rng(u64);
+        impl Rng {
+            fn new(seed: u64) -> Self {
+                Self(seed)
+            }
+            fn next_u64(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^ (z >> 31)
+            }
+            fn next_f128(&mut self) -> F128 {
+                F128 {
+                    lo: self.next_u64(),
+                    hi: self.next_u64(),
+                }
+            }
+        }
+
+
+        use core::arch::aarch64::{uint64x2_t, veorq_u64, vzip1q_u64, vzip2q_u64};
+
+        let check = |constants: [F128; 2], inputs: [F128; 2]| {
+            // SAFETY: AES and the little-endian F128 lane layout are enabled.
+            let actual = unsafe {
+                let pack = |pair: [F128; 2]| {
+                    let a = core::mem::transmute::<F128, uint64x2_t>(pair[0]);
+                    let b = core::mem::transmute::<F128, uint64x2_t>(pair[1]);
+                    [vzip1q_u64(a, b), vzip2q_u64(a, b)]
+                };
+                let [c_lo, c_hi] = pack(constants);
+                let [b_lo, b_hi] = pack(inputs);
+                let [lo, hi] = l0_factored_final3_mul_pair(
+                    c_lo, c_hi, veorq_u64(c_lo, c_hi), b_lo, b_hi,
+                );
+                [
+                    core::mem::transmute::<uint64x2_t, F128>(vzip1q_u64(lo, hi)),
+                    core::mem::transmute::<uint64x2_t, F128>(vzip2q_u64(lo, hi)),
+                ]
+            };
+            for lane in 0..2 {
+                assert_eq!(actual[lane], software::ghash_mul(constants[lane], inputs[lane]));
+            }
+        };
+        let basis = |bit: usize| {
+            if bit < 64 { F128::new(1 << bit, 0) } else { F128::new(0, 1 << (bit - 64)) }
+        };
+        let constants = [
+            F128::ZERO,
+            F128::ONE,
+            F128::new(1 << 63, 0),
+            F128::new(0, 1),
+            F128::new(0, 1 << 63),
+            F128::new(u64::MAX, u64::MAX),
+            F128::new(0x0123456789abcdef, 0xfedcba9876543210),
+        ];
+        for (i, &c) in constants.iter().enumerate() {
+            let different = [c, constants[(i + 3) % constants.len()]];
+            for bit in 0..128 {
+                let x = [basis(bit), basis(127 - bit)];
+                check(different, x);
+                check([different[1], different[0]], [x[1], x[0]]);
+                check([c; 2], x);
+                check([basis(bit), basis(127 - bit)], [c; 2]);
+            }
+            check(different, [F128::ZERO; 2]);
+            check(different, [F128::ONE; 2]);
+            check(different, [F128::new(u64::MAX, u64::MAX); 2]);
+        }
+        let mut rng = Rng::new(0x434f_4546_5041_4952);
+        for _ in 0..128 {
+            let c = [rng.next_f128(), rng.next_f128()];
+            let x = [rng.next_f128(), rng.next_f128()];
+            check(c, x);
+            check([c[1], c[0]], [x[1], x[0]]);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    #[test]
+    fn l0_factored_final3_prepared_matches_software_butterflies() {
+        use core::arch::aarch64::uint64x2_t;
+        use crate::challenger::Challenger;
+        use crate::field::gf2_128::aarch64::const_prep;
+
+        // Independent bit-serial multiplication, reduced after each shift.
+        fn software_mul(a: F128, b: F128) -> F128 {
+            let mut a = (a.lo as u128) | ((a.hi as u128) << 64);
+            let mut b = (b.lo as u128) | ((b.hi as u128) << 64);
+            let mut out = 0u128;
+            for _ in 0..128 {
+                if b & 1 != 0 { out ^= a; }
+                let carry = a >> 127;
+                a <<= 1;
+                if carry != 0 { a ^= 0x87; }
+                b >>= 1;
+            }
+            F128::new(out as u64, (out >> 64) as u64)
+        }
+        for full_log in [3usize, 20] {
+            let ntt = AdditiveNttF128::standard(full_log);
+            let tw = [ntt.twiddle(2, 1), ntt.twiddle(2, 2), ntt.twiddle(2, 3), ntt.twiddle(1, 1)];
+            let prepared = unsafe {
+                tw.map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t)))
+            };
+            #[cfg(target_feature = "sha3")]
+            let paired = l0_factored_final3_pair_constants(L0FactoredFinal3Constants {
+                a: tw[0], d: tw[1], a_plus_d: tw[2], b: tw[3],
+            });
+            let check = |values: [F128; 8]| {
+                let mut expected = values;
+                for layer in (0..3).rev() {
+                    let block_size = 8 >> layer;
+                    let half = block_size >> 1;
+                    for block in 0..(1 << layer) {
+                        for row in 0..half {
+                            let top = block * block_size + row;
+                            let bottom = top + half;
+                            let sum = expected[top] + expected[bottom];
+                            expected[top] = sum;
+                            expected[bottom] += software_mul(ntt.twiddle(layer, block), sum);
+                        }
+                    }
+                }
+                assert_eq!(l0_factored_final3_prepared_row(values, prepared).as_slice(), &expected[..4]);
+                #[cfg(target_feature = "sha3")]
+                for (eighth, row) in [(1usize, 0usize), (4, 2)] {
+                    let mut actual = vec![F128::new(0xfeed, 0xcafe); 8 * eighth + 2];
+                    for i in 0..8 {
+                        actual[1 + row + i * eighth] = values[i];
+                    }
+                    let mut expected_storage = actual.clone();
+                    for i in 0..4 {
+                        expected_storage[1 + row + i * eighth] = expected[i];
+                    }
+                    unsafe {
+                        l0_factored_final3_pair_row(actual.as_mut_ptr().add(1), row, eighth, paired);
+                    }
+                    assert_eq!(actual, expected_storage, "paired row stride={eighth} row={row}");
+                }
+                let mut selected = values;
+                transpose_forward_ntt_factored_final_3layer_low_half(&ntt, &mut selected, 3);
+                assert_eq!(&selected[..4], &expected[..4], "selected tail route");
+                assert_eq!(&selected[4..], &values[4..], "discarded-half write");
+            };
+            check([F128::ZERO; 8]);
+            check([F128::ONE; 8]);
+            check([F128::new(u64::MAX, u64::MAX); 8]);
+            for slot in 0..8 {
+                for bit in 0..128 {
+                    let mut values = [F128::ZERO; 8];
+                    values[slot] = if bit < 64 { F128::new(1 << bit, 0) } else { F128::new(0, 1 << (bit - 64)) };
+                    check(values);
+                }
+            }
+            let mut challenger = crate::challenger::RandomChallenger::new(0x5043_5354_4149_4c50);
+            for _ in 0..64 {
+                check(core::array::from_fn(|_| challenger.sample_f128()));
+            }
+        }
     }
 
     #[test]

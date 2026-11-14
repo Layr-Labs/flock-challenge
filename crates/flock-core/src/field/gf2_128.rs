@@ -512,20 +512,18 @@ mod tests {
 
         let check = |constants: [F128; 2], inputs: [F128; 2]| {
             // SAFETY: AES and the little-endian F128 lane layout are required.
-            let products = unsafe {
+            let actual = unsafe {
                 let p0 = aarch64::const_prep(core::mem::transmute::<F128, uint64x2_t>(constants[0]));
                 let p1 = aarch64::const_prep(core::mem::transmute::<F128, uint64x2_t>(constants[1]));
-                let x0 = core::mem::transmute::<F128, uint64x2_t>(inputs[0]);
-                let x1 = core::mem::transmute::<F128, uint64x2_t>(inputs[1]);
-                [
-                    aarch64::mul_const_pair_prep(p0, x0, p1, x1),
-                    aarch64::mul_const_pair_prep_pmull(p0, x0, p1, x1),
-                ].map(|pair| pair.map(|v| core::mem::transmute::<uint64x2_t, F128>(v)))
+                aarch64::mul_const_pair_prep(
+                    p0,
+                    core::mem::transmute::<F128, uint64x2_t>(inputs[0]),
+                    p1,
+                    core::mem::transmute::<F128, uint64x2_t>(inputs[1]),
+                ).map(|v| core::mem::transmute::<uint64x2_t, F128>(v))
             };
-            for actual in products {
-                for lane in 0..2 {
-                    assert_eq!(actual[lane], software::ghash_mul(constants[lane], inputs[lane]));
-                }
+            for lane in 0..2 {
+                assert_eq!(actual[lane], software::ghash_mul(constants[lane], inputs[lane]));
             }
         };
         let constants = [

@@ -422,18 +422,6 @@ pub(crate) unsafe fn mul_const_prep(p: ConstPrep, x: uint64x2_t) -> uint64x2_t {
     unsafe { fold_lm(pmull_pair_sum(x, p.0), pmull_pair_sum(x, p.1)) }
 }
 
-/// Two independent prepared products, folding each high limb with PMULL.
-/// This avoids the paired ZIP/shift network when that network limits throughput.
-#[inline(always)]
-pub(crate) unsafe fn mul_const_pair_prep_pmull(
-    p0: ConstPrep,
-    x0: uint64x2_t,
-    p1: ConstPrep,
-    x1: uint64x2_t,
-) -> [uint64x2_t; 2] {
-    unsafe { [mul_const_prep(p0, x0), mul_const_prep(p1, x1)] }
-}
-
 /// Two independent prepared products, with their final folds in paired lanes.
 #[inline(always)]
 pub(crate) unsafe fn mul_const_pair_prep(
