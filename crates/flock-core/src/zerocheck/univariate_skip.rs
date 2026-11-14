@@ -65,27 +65,51 @@ pub fn build_eq_scaled(r: &[F128], root: F128) -> Vec<F128> {
     // every slot in t[0..2^n] is written exactly once before any read.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = root;
+    // The doubling levels run through the two-lane PMULL level kernel
+    // (`expand_eq_table_level`): below the crossover each level is one serial
+    // kernel call instead of a per-entry closure, above it 256-entry `lo`/`hi`
+    // chunk pairs over Rayon instead of per-element parallel zips. The kernel's
+    // `hi[x] = lo[x]·r_i`, `lo[x] = lo[x] + hi[x]` is the same pair of field
+    // operations as the closure it replaces, so the table (root seed included)
+    // is bit-identical. `FLOCK_NO_EQ_KERNEL_SKIP=1` restores the closure
+    // doubling.
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let kernel = !*OFF.get_or_init(|| std::env::var_os("FLOCK_NO_EQ_KERNEL_SKIP").is_some());
     const PAR_THRESHOLD: usize = 1 << 12;
+    const PAR_CHUNK: usize = 1 << 8;
     for i in 0..n {
         let r_i = r[i];
         let half = 1usize << i;
         let (lo, rest) = t.split_at_mut(half);
         let hi = &mut rest[..half];
-        let build_pair = |lo_x: &mut F128, hi_x: &mut F128| {
-            let v = *lo_x;
-            let vr = v * r_i;
-            *hi_x = vr;
-            // v * (1 + r_i) = v + v * r_i in characteristic two.
-            *lo_x = v + vr;
-        };
         if half < PAR_THRESHOLD {
-            lo.iter_mut()
-                .zip(hi.iter_mut())
-                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
+            if kernel {
+                crate::field::f128_slice::expand_eq_table_level(lo, hi, r_i);
+            } else {
+                for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
+                    let v = *lo_x;
+                    let vr = v * r_i;
+                    *hi_x = vr;
+                    // v * (1 + r_i) = v + v * r_i in characteristic two.
+                    *lo_x = v + vr;
+                }
+            }
+        } else if kernel {
+            lo.par_chunks_mut(PAR_CHUNK)
+                .zip(hi.par_chunks_mut(PAR_CHUNK))
+                .for_each(|(lo_chunk, hi_chunk)| {
+                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_i);
+                });
         } else {
             lo.par_iter_mut()
                 .zip(hi.par_iter_mut())
-                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
+                .for_each(|(lo_x, hi_x)| {
+                    let v = *lo_x;
+                    let vr = v * r_i;
+                    *hi_x = vr;
+                    // v * (1 + r_i) = v + v * r_i in characteristic two.
+                    *lo_x = v + vr;
+                });
         }
     }
     t
@@ -716,6 +740,33 @@ mod tests {
         }
         fn f128_vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
+        }
+    }
+
+    #[test]
+    fn build_eq_scaled_matches_scalar_doubling_with_root() {
+        // The doubling levels route through the PMULL level kernel; with a
+        // non-one root seed the table must still equal the scalar closure
+        // doubling at every size.
+        let mut rng = Rng::new(0x5CA1_E5ED);
+        for d in 0..=17usize {
+            let r = rng.f128_vec(d);
+            let root = rng.f128();
+            let mut expected = crate::alloc_uninit_f128_vec(1usize << d);
+            expected[0] = root;
+            for i in 0..d {
+                let r_i = r[i];
+                let half = 1usize << i;
+                let (lo, rest) = expected.split_at_mut(half);
+                let hi = &mut rest[..half];
+                for x in 0..half {
+                    let v = lo[x];
+                    let vr = v * r_i;
+                    hi[x] = vr;
+                    lo[x] = v + vr;
+                }
+            }
+            assert_eq!(build_eq_scaled(&r, root), expected, "build_eq_scaled d={d}");
         }
     }
 
