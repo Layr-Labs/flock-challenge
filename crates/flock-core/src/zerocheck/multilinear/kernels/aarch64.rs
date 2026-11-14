@@ -3052,6 +3052,11 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
             && (pair_idx_base & 127) == 0
             && lo_size.is_multiple_of(128);
         let fixed_pads = FIXED_PADS && aligned_padding;
+        // The ranked loop's deltas of one 32-group window, in stream layout
+        // (group `2 * pos + t` at byte `32 * (2 * pos + t)`), until the
+        // window's two parity passes are done; see the flush below.
+        let mut stash = [0u64; 128];
+        let stash_p = stash.as_mut_ptr().cast::<u8>();
         for first in (0..lo_size / 2).step_by(32) {
             for t in 0..2 {
                 let mut w0 = tri_zero;
@@ -3172,7 +3177,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                         let mut pa = a_packed.add(32 * top).cast::<u64>();
                         let mut pb = b_packed.add(32 * top).cast::<u64>();
                         let mut pn = anchors.add(4 * top);
-                        let mut pd = deltas.add(32 * top);
+                        let mut pd = stash_p.add(32 * (2 * (b_end - 2) + t));
                         // `pair` above for a live pair `CODE` bytes into the
                         // group's rows and deltas, `ANC` bytes into its anchors.
                         macro_rules! pair_off {
@@ -3263,6 +3268,30 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                 } else {
                     for pos in (0..b_end).rev() {
                         group!(pos, generic_pads);
+                    }
+                }
+                if fixed_pads && ASM_OFF && t == 1 {
+                    // Both parity passes of the window have run: write the
+                    // ranked loop's deltas to the stream one 64-byte line
+                    // (groups `2 * pos`, `2 * pos + 1`) at a time, each line
+                    // with two consecutive `stnp q, q`. The even pass stashed
+                    // positions `0..n0`, the odd pass `0..n1` (`n1 <= n0`).
+                    // An even group without its odd neighbour (the padded
+                    // window's last one) is half a line: plain stores, like
+                    // the group stores outside the ranked loop.
+                    let (n0, n1) = if b_end == 16 { (15, 15) } else { (14, 13) };
+                    let line = deltas.add(32 * first);
+                    for pos in 0..n1 {
+                        let src = stash_p.add(64 * pos).cast::<u64>();
+                        let dst = line.add(64 * pos).cast::<F128>();
+                        store_anchor_pair_nt_off::<0>(dst, vld1q_u64(src), vld1q_u64(src.add(2)));
+                        store_anchor_pair_nt_off::<32>(dst, vld1q_u64(src.add(4)), vld1q_u64(src.add(6)));
+                    }
+                    for pos in n1..n0 {
+                        let src = stash_p.add(64 * pos).cast::<u64>();
+                        let dst = line.add(64 * pos).cast::<u64>();
+                        vst1q_u64(dst, vld1q_u64(src));
+                        vst1q_u64(dst.add(2), vld1q_u64(src.add(2)));
                     }
                 }
                 let lambda = vld1q_u64(eq_lo.add(2 * (first + t) + 1).cast::<u64>());

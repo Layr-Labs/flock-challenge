@@ -3088,6 +3088,7 @@ pub(crate) mod witgen_simd {
         even_a: V4,
         even_b: V4,
         direct: bool,
+        primed_boundaries: bool,
         da: *mut u32,
         db: *mut u32,
         qa: [V4; 3],
@@ -3098,7 +3099,37 @@ pub(crate) mod witgen_simd {
         #[inline(always)]
         unsafe fn emit<const WORD: usize>(&mut self, va: V4, vb: V4) {
             unsafe {
-                if self.direct && WORD >= 40 && WORD < 472 {
+                if self.primed_boundaries && WORD >= 36 && WORD < 480 {
+                    if WORD % 4 < 3 {
+                        self.qa[WORD % 4] = va;
+                        if WORD < 472 { self.qb[WORD % 4] = vb; }
+                    } else {
+                        let aa = uint32x4x4_t(self.qa[0], self.qa[1], self.qa[2], va);
+                        let start = WORD & !3;
+                        vst4q_lane_u32::<0>(self.da.add(start), aa);
+                        vst4q_lane_u32::<1>(self.da.add(U32_PER_BLOCK + start), aa);
+                        vst4q_lane_u32::<2>(self.da.add(2 * U32_PER_BLOCK + start), aa);
+                        vst4q_lane_u32::<3>(self.da.add(3 * U32_PER_BLOCK + start), aa);
+                        if WORD < 472 {
+                            let bb = uint32x4x4_t(self.qb[0], self.qb[1], self.qb[2], vb);
+                            vst4q_lane_u32::<0>(self.db.add(start), bb);
+                            vst4q_lane_u32::<1>(self.db.add(U32_PER_BLOCK + start), bb);
+                            vst4q_lane_u32::<2>(self.db.add(2 * U32_PER_BLOCK + start), bb);
+                            vst4q_lane_u32::<3>(self.db.add(3 * U32_PER_BLOCK + start), bb);
+                        }
+                    }
+                } else if self.primed_boundaries && WORD >= 480 {
+                    if WORD == 480 {
+                        self.even_a = va;
+                    } else {
+                        debug_assert_eq!(WORD, LAST_WORD);
+                        let aa = uint32x4x2_t(self.even_a, va);
+                        vst2q_lane_u32::<0>(self.da.add(480), aa);
+                        vst2q_lane_u32::<1>(self.da.add(U32_PER_BLOCK + 480), aa);
+                        vst2q_lane_u32::<2>(self.da.add(2 * U32_PER_BLOCK + 480), aa);
+                        vst2q_lane_u32::<3>(self.da.add(3 * U32_PER_BLOCK + 480), aa);
+                    }
+                } else if self.direct && WORD >= 40 && WORD < 472 {
                     if WORD % 4 < 3 {
                         self.qa[WORD % 4] = va;
                         self.qb[WORD % 4] = vb;
@@ -3271,12 +3302,12 @@ pub(crate) mod witgen_simd {
     /// of de-interleaving the stage a second time: each block's bytes go
     /// out as one sequential stream.  Same bytes.
     ///
-    /// `s0..s1` is the chunk range the scratch receives: every chunk for a
-    /// cold scratch, only the chunks that differ from quad to quad for a
-    /// primed one.  It must cover the published chunks.
+    /// `s0..s1` covers the published chunks. A cold scratch receives every
+    /// chunk. With DIRECT and PRIMED, A's input prefix was flushed before G;
+    /// only output words 8..16 need the stage here.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn dump_dual_copy<const DIRECT: bool>(
+    unsafe fn dump_dual_copy<const DIRECT: bool, const PRIMED: bool>(
         stage: *const V4,
         scratch: *mut u32,
         dst: *mut u32,
@@ -3288,7 +3319,13 @@ pub(crate) mod witgen_simd {
     ) {
         debug_assert!(s0 <= nt0 && nt1 + usize::from(sparse_tail) <= s1);
         unsafe {
-            if DIRECT {
+            if DIRECT && PRIMED {
+                // A's stable prefix was flushed before G. Only the output
+                // words 8..16 need the late stage; B needs no stage reads.
+                if sparse_tail {
+                    dump_range::<false>(stage, scratch, 1, 2);
+                }
+            } else if DIRECT {
                 // Complete chunks 5..59 were emitted directly while building G.
                 dump_range::<false>(stage, scratch, s0, s1.min(5));
                 dump_range::<false>(stage, scratch, s0.max(59), s1);
@@ -3303,15 +3340,27 @@ pub(crate) mod witgen_simd {
             } else {
                 nt1
             };
+            // The copy loop is one asm block whose loop head is pinned to a
+            // 64-byte boundary (`.p2align 6` before the label; the padding
+            // runs once per block, never inside the loop), so its placement
+            // does not depend on the size of code elsewhere in the binary.
+            // Same loads and stores, in the same ascending order.
+            let n = end.saturating_sub(nt0);
             for j in 0..4usize {
                 let src = scratch.add(j * U32_PER_BLOCK);
                 let out = dst.add(j * U32_PER_BLOCK);
-                for g in nt0..end {
+                if n != 0 {
                     core::arch::asm!(
-                        "ldp {a:q}, {b:q}, [{s}]",
+                        ".p2align 6",
+                        "2:",
+                        "ldp {a:q}, {b:q}, [{s}], #32",
                         "stnp {a:q}, {b:q}, [{d}]",
-                        s = in(reg) src.add(8 * g),
-                        d = in(reg) out.add(8 * g),
+                        "add {d}, {d}, #32",
+                        "subs {n}, {n}, #1",
+                        "b.ne 2b",
+                        s = inout(reg) src.add(8 * nt0) => _,
+                        d = inout(reg) out.add(8 * nt0) => _,
+                        n = inout(reg) n => _,
                         a = out(vreg) _,
                         b = out(vreg) _,
                         options(nostack)
@@ -3634,7 +3683,7 @@ pub(crate) mod witgen_simd {
                 vst1q_u32(za.add(w) as *mut u32, cv_v[w]);
             }
             // 32..36 are ever read (the drain starts at chunk 4).
-            if !WZ {
+            if !WZ && !(DIRECT_SCRATCH && PRIMED) {
                 let b0 = if full_scratch {
                     0
                 } else {
@@ -3658,6 +3707,19 @@ pub(crate) mod witgen_simd {
                 vst1q_u32(za.add(16 + k) as *mut u32, w);
             }
 
+            if DIRECT_SCRATCH && PRIMED {
+                // Flush initialized input words before G so their original
+                // vectors need not stay live through the stream. Output
+                // words 8..16 are computed and flushed after G.
+                dump_range::<false>(za, sa, 0, 1);
+                dump_range::<false>(za, sa, 2, 4);
+                let x = vld4q_u32(za.add(32) as *const u32);
+                vst1q_u32(sa.add(32), x.0);
+                vst1q_u32(sa.add(U32_PER_BLOCK + 32), x.1);
+                vst1q_u32(sa.add(2 * U32_PER_BLOCK + 32), x.2);
+                vst1q_u32(sa.add(3 * U32_PER_BLOCK + 32), x.3);
+            }
+
             // ---- G stream ----
             let pending_bit = vshrq_n_u32::<31>(flags);
             let mut wz = W32::at(za, pending_bit);
@@ -3670,6 +3732,7 @@ pub(crate) mod witgen_simd {
                 even_a: zero,
                 even_b: zero,
                 direct: DIRECT_SCRATCH,
+                primed_boundaries: DIRECT_SCRATCH && PRIMED,
                 da: sa,
                 db: sb,
                 qa: [zero; 3],
@@ -3789,8 +3852,10 @@ pub(crate) mod witgen_simd {
                     vst1q_u32(bs.add(ZERO_FILL_WORD + w) as *mut u32, zero);
                 }
             } else if SCRATCH {
-                for w in ZERO_FILL_WORD..8 * ELIDE_ZERO_CHUNK {
-                    vst1q_u32(za.add(w) as *mut u32, zero);
+                if !(DIRECT_SCRATCH && PRIMED) {
+                    for w in ZERO_FILL_WORD..8 * ELIDE_ZERO_CHUNK {
+                        vst1q_u32(za.add(w) as *mut u32, zero);
+                    }
                 }
             } else {
                 // The sparse tail publisher reads words 480..483 only.
@@ -3818,8 +3883,8 @@ pub(crate) mod witgen_simd {
                 } else {
                     (DUMP_CHUNKS, 0, DUMP_CHUNKS)
                 };
-                dump_dual_copy::<DIRECT_SCRATCH>(za, sa, a, 0, a1, 0, RANKED_SPARSE_TAIL_CHUNK, true);
-                dump_dual_copy::<DIRECT_SCRATCH>(
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED>(za, sa, a, 0, a1, 0, RANKED_SPARSE_TAIL_CHUNK, true);
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED>(
                     bs,
                     sb,
                     b,
@@ -6595,216 +6660,146 @@ mod tests {
         assert_eq!(checked, 64 * 2);
     }
 
-    /// The input-in-memory a/b kernel (`build_quad_split_neon_mem`) against
-    /// the register form it replaces, on ranked-shape inputs: word-major
-    /// seeded quads and block inputs (including all-ones, all-zero and
-    /// carry-heavy blocks), cold and primed scratch.  Published a and b
-    /// bytes, the scratch blocks, and the words a primed fill must leave
-    /// alone are compared word for word.
+    /// Compare the memory form with either the register or staged form.
+    /// Each slot gets one complete cold fill, then two different primed
+    /// quads. The full non-elided builder is an independent value oracle.
+    #[cfg(target_arch = "aarch64")]
+    fn check_split_quad_memory_form(staged_reference: bool) {
+        use super::witgen_simd::{self, QuadInput};
+        const GUARD: usize = 16;
+        const PAYLOAD: usize = 4 * (K / 32);
+        const U32S: usize = PAYLOAD + 2 * GUARD;
+        let full = |input: QuadInput<'_>| {
+            let mut z = vec![0u32; PAYLOAD];
+            let mut a = vec![0u32; PAYLOAD];
+            let mut b = vec![0u32; PAYLOAD];
+            unsafe {
+                witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                    input, z.as_mut_ptr(), a.as_mut_ptr(), b.as_mut_ptr(),
+                    false, false, [false; 3], false,
+                );
+            }
+            (a, b)
+        };
+        let mut rng = Rng::new(0x5eed_a2b2_0003);
+        let mut checked = 0usize;
+        for case in 0..96usize {
+            let init = u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32());
+            let seeded: [_; 3] = std::array::from_fn(|phase| {
+                crate::seed_pipe::gen_quad_soa(init, 4 * ((case * 977 + phase) % 65_536))
+            });
+            let mut blocks: [Compression; 4] = std::array::from_fn(|_| {
+                (
+                    std::array::from_fn(|_| rng.next_u32()),
+                    std::array::from_fn(|_| rng.next_u32()),
+                    u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32()),
+                    rng.next_u32(),
+                    rng.next_u32(),
+                )
+            });
+            match case % 4 {
+                1 => blocks[0] = ([u32::MAX; 8], [u32::MAX; 16], u64::MAX, u32::MAX, u32::MAX),
+                2 => blocks[1] = ([0; 8], [0; 16], 0, 0, 0),
+                3 => blocks[2] = ([0x8000_0000; 8], [0x7fff_ffff; 16], 1 << 63, 1 << 31, 1 << 31),
+                _ => {}
+            }
+            let mut block_inputs = [blocks; 3];
+            for lane in 0..4 {
+                block_inputs[0][lane].0[0] ^= 1;
+                block_inputs[2][lane].1[0] ^= 2;
+            }
+            let blocks_before = block_inputs;
+            let seeded_before: [_; 3] = std::array::from_fn(|i| {
+                let s = &seeded[i];
+                (s.cv, s.message, s.counter_lo, s.counter_hi, s.block_len, s.flags)
+            });
+            let stale_a: Vec<u32> = (0..U32S).map(|_| rng.next_u32()).collect();
+            let stale_b: Vec<u32> = (0..U32S).map(|_| rng.next_u32()).collect();
+            for seeded_path in [true, false] {
+                let input = |phase: usize| {
+                    if seeded_path {
+                        QuadInput::Seeded(&seeded[phase])
+                    } else {
+                        QuadInput::Blocks(std::array::from_fn(|j| &block_inputs[phase][j]))
+                    }
+                };
+                let truth: [_; 3] = std::array::from_fn(|phase| full(input(phase)));
+                assert_ne!(truth[0].0, truth[1].0, "cold and primed inputs must differ");
+                assert_ne!(truth[1].0, truth[2].0, "successive primed inputs must differ");
+                let run = |memory: bool| {
+                    let (mut a, mut b) = (stale_a.clone(), stale_b.clone());
+                    let (mut sa, mut sb) = (stale_b.clone(), stale_a.clone());
+                    // Global constant-region receipts require a complete
+                    // prior witness. Scratch is still garbage for phase 0.
+                    a[GUARD..GUARD + PAYLOAD].copy_from_slice(&truth[0].0);
+                    b[GUARD..GUARD + PAYLOAD].copy_from_slice(&truth[0].1);
+                    let mut results = Vec::new();
+                    for phase in 0..3 {
+                        let primed = phase != 0;
+                        unsafe {
+                            let (pa, pb) = (a.as_mut_ptr().add(GUARD), b.as_mut_ptr().add(GUARD));
+                            let (psa, psb) = (sa.as_mut_ptr().add(GUARD), sb.as_mut_ptr().add(GUARD));
+                            match (memory, staged_reference, primed) {
+                                (true, _, true) => witgen_simd::build_quad_split_neon_mem::<true>(
+                                    input(phase), pa, pb, psa, psb,
+                                ),
+                                (true, _, false) => witgen_simd::build_quad_split_neon_mem::<false>(
+                                    input(phase), pa, pb, psa, psb,
+                                ),
+                                (false, true, true) => witgen_simd::build_quad_split_neon_mem_staged::<true>(
+                                    input(phase), pa, pb, psa, psb,
+                                ),
+                                (false, true, false) => witgen_simd::build_quad_split_neon_mem_staged::<false>(
+                                    input(phase), pa, pb, psa, psb,
+                                ),
+                                (false, false, true) => witgen_simd::build_quad_split_neon::<false, true, true, true>(
+                                    input(phase), std::ptr::null_mut(), pa, pb, psa, psb,
+                                ),
+                                (false, false, false) => witgen_simd::build_quad_split_neon::<false, true, false, true>(
+                                    input(phase), std::ptr::null_mut(), pa, pb, psa, psb,
+                                ),
+                            }
+                        }
+                        for (out, expected, stale) in [
+                            (&a, &truth[phase].0, &stale_a),
+                            (&b, &truth[phase].1, &stale_b),
+                            (&sa, &truth[phase].0, &stale_b),
+                            (&sb, &truth[phase].1, &stale_a),
+                        ] {
+                            assert_eq!(&out[GUARD..GUARD + PAYLOAD], expected.as_slice(),
+                                "full oracle case={case} seeded={seeded_path} phase={phase} memory={memory}");
+                            assert_eq!(&out[..GUARD], &stale[..GUARD]);
+                            assert_eq!(&out[GUARD + PAYLOAD..], &stale[GUARD + PAYLOAD..]);
+                        }
+                        results.push((a.clone(), b.clone(), sa.clone(), sb.clone()));
+                    }
+                    results
+                };
+                let old = run(false);
+                let new = run(true);
+                assert_eq!(new, old, "reference case={case} seeded={seeded_path}");
+                checked += 3;
+            }
+            assert_eq!(block_inputs, blocks_before, "block inputs changed");
+            for i in 0..3 {
+                let s = &seeded[i];
+                assert_eq!((s.cv, s.message, s.counter_lo, s.counter_hi, s.block_len, s.flags),
+                    seeded_before[i], "seeded inputs changed");
+            }
+        }
+        assert_eq!(checked, 96 * 2 * 3);
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn split_quad_input_mem_form_matches_register_form() {
-        use super::witgen_simd::{self, QuadInput};
-        const U32S: usize = 4 * (K / 32);
-        let mut rng = Rng::new(0x5eed_a2b2_0003);
-        let mut checked = 0usize;
-        for case in 0..96usize {
-            let init = u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32());
-            let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * (case * 977 % 65_536));
-            let mut blocks: [Compression; 4] = std::array::from_fn(|_| {
-                (
-                    std::array::from_fn(|_| rng.next_u32()),
-                    std::array::from_fn(|_| rng.next_u32()),
-                    u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32()),
-                    rng.next_u32(),
-                    rng.next_u32(),
-                )
-            });
-            match case % 4 {
-                1 => blocks[0] = ([u32::MAX; 8], [u32::MAX; 16], u64::MAX, u32::MAX, u32::MAX),
-                2 => blocks[1] = ([0; 8], [0; 16], 0, 0, 0),
-                3 => blocks[2] = ([0x8000_0000; 8], [0x7fff_ffff; 16], 1 << 63, 1 << 31, 1 << 31),
-                _ => {}
-            }
-            let block_refs: [&Compression; 4] = std::array::from_fn(|j| &blocks[j]);
-            // What an earlier quad left in the destination and in the scratch.
-            let stale_a: Vec<u32> = (0..U32S).map(|_| rng.next_u32()).collect();
-            let stale_b: Vec<u32> = (0..U32S).map(|_| rng.next_u32()).collect();
-            for seeded_path in [true, false] {
-                let input = || {
-                    if seeded_path {
-                        QuadInput::Seeded(&seeded)
-                    } else {
-                        QuadInput::Blocks(block_refs)
-                    }
-                };
-                for primed in [false, true] {
-                    let run = |mem: bool| {
-                        let (mut a, mut b) = (stale_a.clone(), stale_b.clone());
-                        let (mut sa, mut sb) = (stale_b.clone(), stale_a.clone());
-                        unsafe {
-                            match (mem, primed) {
-                                (true, true) => witgen_simd::build_quad_split_neon_mem::<true>(
-                                    input(),
-                                    a.as_mut_ptr(),
-                                    b.as_mut_ptr(),
-                                    sa.as_mut_ptr(),
-                                    sb.as_mut_ptr(),
-                                ),
-                                (true, false) => witgen_simd::build_quad_split_neon_mem::<false>(
-                                    input(),
-                                    a.as_mut_ptr(),
-                                    b.as_mut_ptr(),
-                                    sa.as_mut_ptr(),
-                                    sb.as_mut_ptr(),
-                                ),
-                                (false, true) => {
-                                    witgen_simd::build_quad_split_neon::<false, true, true, true>(
-                                        input(),
-                                        std::ptr::null_mut(),
-                                        a.as_mut_ptr(),
-                                        b.as_mut_ptr(),
-                                        sa.as_mut_ptr(),
-                                        sb.as_mut_ptr(),
-                                    )
-                                }
-                                (false, false) => {
-                                    witgen_simd::build_quad_split_neon::<false, true, false, true>(
-                                        input(),
-                                        std::ptr::null_mut(),
-                                        a.as_mut_ptr(),
-                                        b.as_mut_ptr(),
-                                        sa.as_mut_ptr(),
-                                        sb.as_mut_ptr(),
-                                    )
-                                }
-                            }
-                        }
-                        (a, b, sa, sb)
-                    };
-                    let old = run(false);
-                    let new = run(true);
-                    assert_eq!(new.0, old.0, "a case={case} seeded={seeded_path} primed={primed}");
-                    assert_eq!(new.1, old.1, "b case={case} seeded={seeded_path} primed={primed}");
-                    assert_eq!(new.2, old.2, "a scratch case={case} seeded={seeded_path} primed={primed}");
-                    assert_eq!(new.3, old.3, "b scratch case={case} seeded={seeded_path} primed={primed}");
-                    // Not vacuous: the kernel did overwrite the stale words.
-                    assert_ne!(new.0, stale_a);
-                    assert_ne!(new.2, stale_b);
-                    checked += 1;
-                }
-            }
-            // The inputs are read, never written.
-            let again = crate::seed_pipe::gen_quad_soa(init, 4 * (case * 977 % 65_536));
-            assert_eq!((seeded.cv, seeded.message), (again.cv, again.message));
-        }
-        assert_eq!(checked, 96 * 4);
+        check_split_quad_memory_form(false);
     }
 
-    /// Eliding unread B-stage tail stores preserve every global/scratch word,
-    /// including cold/primed tails and guards, for both input layouts.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn b_stage_tail_matches_incumbent_and_preserves_guards() {
-        use super::witgen_simd::{self, QuadInput};
-        const GUARD: usize = 16;
-        const U32S: usize = 4 * (K / 32) + 2 * GUARD;
-        let mut rng = Rng::new(0x5eed_a2b2_0003);
-        let mut checked = 0usize;
-        for case in 0..96usize {
-            let init = u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32());
-            let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * (case * 977 % 65_536));
-            let mut blocks: [Compression; 4] = std::array::from_fn(|_| {
-                (
-                    std::array::from_fn(|_| rng.next_u32()),
-                    std::array::from_fn(|_| rng.next_u32()),
-                    u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32()),
-                    rng.next_u32(),
-                    rng.next_u32(),
-                )
-            });
-            match case % 4 {
-                1 => blocks[0] = ([u32::MAX; 8], [u32::MAX; 16], u64::MAX, u32::MAX, u32::MAX),
-                2 => blocks[1] = ([0; 8], [0; 16], 0, 0, 0),
-                3 => blocks[2] = ([0x8000_0000; 8], [0x7fff_ffff; 16], 1 << 63, 1 << 31, 1 << 31),
-                _ => {}
-            }
-            let block_refs: [&Compression; 4] = std::array::from_fn(|j| &blocks[j]);
-            // What an earlier quad left in the destination and in the scratch.
-            let stale_a: Vec<u32> = (0..U32S).map(|_| rng.next_u32()).collect();
-            let stale_b: Vec<u32> = (0..U32S).map(|_| rng.next_u32()).collect();
-            for seeded_path in [true, false] {
-                let input = || {
-                    if seeded_path {
-                        QuadInput::Seeded(&seeded)
-                    } else {
-                        QuadInput::Blocks(block_refs)
-                    }
-                };
-                for primed in [false, true] {
-                    let run = |elide_tail: bool| {
-                        let (mut a, mut b) = (stale_a.clone(), stale_b.clone());
-                        let (mut sa, mut sb) = (stale_b.clone(), stale_a.clone());
-                        unsafe {
-                            match (elide_tail, primed) {
-                                (true, true) => witgen_simd::build_quad_split_neon_mem::<true>(
-                                    input(),
-                                    a.as_mut_ptr().add(GUARD),
-                                    b.as_mut_ptr().add(GUARD),
-                                    sa.as_mut_ptr().add(GUARD),
-                                    sb.as_mut_ptr().add(GUARD),
-                                ),
-                                (true, false) => witgen_simd::build_quad_split_neon_mem::<false>(
-                                    input(),
-                                    a.as_mut_ptr().add(GUARD),
-                                    b.as_mut_ptr().add(GUARD),
-                                    sa.as_mut_ptr().add(GUARD),
-                                    sb.as_mut_ptr().add(GUARD),
-                                ),
-                                (false, true) => {
-                                    witgen_simd::build_quad_split_neon_mem_staged::<true>(
-                                        input(),
-                                        a.as_mut_ptr().add(GUARD),
-                                        b.as_mut_ptr().add(GUARD),
-                                        sa.as_mut_ptr().add(GUARD),
-                                        sb.as_mut_ptr().add(GUARD),
-                                    )
-                                }
-                                (false, false) => {
-                                    witgen_simd::build_quad_split_neon_mem_staged::<false>(
-                                        input(),
-                                        a.as_mut_ptr().add(GUARD),
-                                        b.as_mut_ptr().add(GUARD),
-                                        sa.as_mut_ptr().add(GUARD),
-                                        sb.as_mut_ptr().add(GUARD),
-                                    )
-                                }
-                            }
-                        }
-                        (a, b, sa, sb)
-                    };
-                    let old = run(false);
-                    let new = run(true);
-                    assert_eq!(new.0, old.0, "a case={case} seeded={seeded_path} primed={primed}");
-                    assert_eq!(new.1, old.1, "b case={case} seeded={seeded_path} primed={primed}");
-                    assert_eq!(new.2, old.2, "a scratch case={case} seeded={seeded_path} primed={primed}");
-                    assert_eq!(new.3, old.3, "b scratch case={case} seeded={seeded_path} primed={primed}");
-                    for (out, stale) in [(&new.0, &stale_a), (&new.1, &stale_b),
-                        (&new.2, &stale_b), (&new.3, &stale_a)] {
-                        assert_eq!(&out[..GUARD], &stale[..GUARD]);
-                        assert_eq!(&out[U32S - GUARD..], &stale[U32S - GUARD..]);
-                    }
-                    // Not vacuous: the kernel did overwrite the stale words.
-                    assert_ne!(new.0, stale_a);
-                    assert_ne!(new.2, stale_b);
-                    checked += 1;
-                }
-            }
-            // The inputs are read, never written.
-            let again = crate::seed_pipe::gen_quad_soa(init, 4 * (case * 977 % 65_536));
-            assert_eq!((seeded.cv, seeded.message), (again.cv, again.message));
-        }
-        assert_eq!(checked, 96 * 4);
+        check_split_quad_memory_form(true);
     }
 
     /// Alternating whole AB producer-kernel probe; excludes the AB consumer,
