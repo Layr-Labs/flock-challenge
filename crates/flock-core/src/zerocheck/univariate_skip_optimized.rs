@@ -3834,17 +3834,25 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 /// process-wide `OnceLock`, so a launch that arrives first waits for (or
 /// does) the same build; nothing else changes. A no-op when the arm is off.
 /// `FLOCK_NO_ZC_AB_PREWARM=1` builds it lazily as before.
+///
+/// The same thread then builds the K pass GPU arm's two pipelines
+/// (`gpu_commit::zc_k_prewarm`, needed only after round two), unless that arm
+/// is off or `FLOCK_NO_ZC_K_PREWARM=1`.
 pub fn ab_completion_gpu_prewarm() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        if std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() == Some(std::ffi::OsStr::new("1"))
-            || crate::gpu_commit::gpu_zc_ab_completion_share() == 0
-        {
+        let ab = std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1"))
+            && crate::gpu_commit::gpu_zc_ab_completion_share() != 0;
+        let k = crate::gpu_commit::zc_k_prewarm_wanted();
+        if !ab && !k {
             return;
         }
-        let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(|| {
-            if let Some(basis) = ab_completion_convert_basis() {
+        let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(move || {
+            if ab && let Some(basis) = ab_completion_convert_basis() {
                 crate::gpu_commit::zc_ab_prewarm(basis);
+            }
+            if k {
+                crate::gpu_commit::zc_k_prewarm();
             }
         });
     }

@@ -778,6 +778,52 @@ pub(crate) fn gpu_zc_ab_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the zerocheck cascade K pass GPU prefix arm
+/// (`FLOCK_NO_ZC_K_GPU`, any value): the CPU queue folds every K chunk, as
+/// before. With the arm on, the GPU folds a fixed prefix of whole K chunks
+/// (`zc_k_fold` + `zc_k_finish`, built from the embedded metallib) into its
+/// own output buffers and returns eight reduced sums per chunk; the CPU queue
+/// starts after the prefix and the tri pass reads the prefix chunks from the
+/// GPU's buffers. Every output and sum is the same field element as the CPU
+/// kernel's; the first launch of each process is an equality check against
+/// the CPU's complete K pass, and any mismatch keeps the arm off.
+pub const ENV_NO_ZC_K_GPU: &str = "FLOCK_NO_ZC_K_GPU";
+
+/// Fixed GPU chunk share of the K pass arm: `FLOCK_ZC_K_GPU_CHUNKS=<n>`
+/// (`0` = off), clamped to the chunk count. Unset = [`ZC_K_GPU_DEFAULT_CHUNKS`]
+/// of the 2048 K chunks of the ranked shape (1/8). A non-integer value fails
+/// loudly.
+pub const ENV_ZC_K_GPU_CHUNKS: &str = "FLOCK_ZC_K_GPU_CHUNKS";
+const ZC_K_GPU_DEFAULT_CHUNKS: usize = 256;
+
+/// Requested GPU chunk share of the K pass arm; `0` = off (kill switch, share
+/// 0, or GPU commit disabled).
+pub(crate) fn gpu_zc_k_share() -> usize {
+    static SHARE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os(ENV_NO_ZC_K_GPU).is_some() {
+            return 0;
+        }
+        match std::env::var_os(ENV_ZC_K_GPU_CHUNKS) {
+            None => ZC_K_GPU_DEFAULT_CHUNKS,
+            Some(value) => value
+                .to_str()
+                .and_then(|text| text.trim().parse::<usize>().ok())
+                .expect("FLOCK_ZC_K_GPU_CHUNKS must be a non-negative integer"),
+        }
+    });
+    if gpu_commit_enabled() { *SHARE } else { 0 }
+}
+
+/// Diagnostic trace for the K pass arm (`FLOCK_ZC_K_GPU_DEBUG=1`, or any
+/// `FLOCK_PHASE_TIMING` run): the oracle verdict and one line per prove.
+pub(crate) fn gpu_zc_k_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_ZC_K_GPU_DEBUG").is_some()
+            || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+    });
+    *ON
+}
+
 /// Kill switch for the L1 recursive-commit NTT/Merkle-leaf overlap
 /// (`FLOCK_NO_L1_MERKLE_OVERLAP=1`): instead of hashing each finalized NTT
 /// chunk's 128-byte leaves on the GPU while the CPU transform is still
@@ -1594,6 +1640,39 @@ impl Drop for GpuZeroTailLanes {
     fn drop(&mut self) {
         GPU_ZERO_TAIL_LANES.store(self.0, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Kill switch for the dead-lane loads in the dense g4x2 pass and the fused
+/// final-leaf pass: `FLOCK_NO_GPU_DEAD_LANE` (any value) builds both
+/// pipelines from the incumbent sources and binds a dead-lane count of 0
+/// (a word those kernels do not read). Both forms write the same bytes.
+/// Read once.
+pub(crate) fn gpu_dead_lane_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_DEAD_LANE").is_none())
+}
+
+/// Dead tail lanes of odd positions that the dense g4x2 pass (any s) and the
+/// fused final-leaf pass may treat as known zero: the ranked 7 at
+/// `log_d == 20` with the ranked geometry published, else 0 (no skip).
+/// Through layer 18 every butterfly pairs two odd or two even positions, so
+/// an odd position's zero lanes stay zero on entry to and exit from every
+/// mid pass and on entry to the final pass (layer 19 makes them non-zero).
+fn select_gpu_dead_lanes(log_d: usize, zero_lanes: usize, enabled: bool) -> u32 {
+    if enabled && log_d == 20 && zero_lanes == GPU_ZERO_TAIL_LANES_RANKED {
+        GPU_ZERO_TAIL_LANES_RANKED as u32
+    } else {
+        0
+    }
+}
+
+/// [`select_gpu_dead_lanes`] for the published geometry and the switch.
+pub(crate) fn gpu_dead_lanes(log_d: usize) -> u32 {
+    select_gpu_dead_lanes(
+        log_d,
+        GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst),
+        gpu_dead_lane_enabled(),
+    )
 }
 
 /// Kill switch for the compacted grid on the s = 8 pass (layers 8..11):
@@ -3641,6 +3720,233 @@ kernel void parent_hash3(device const uint* children [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------------------
+// Zerocheck cascade K pass GPU prefix arm (`zc_k_fold` + `zc_k_finish`, see
+// `ENV_NO_ZC_K_GPU`). Per output g of the prefix (pairs 2g, 2g+1), the same
+// field values as `fold2_compact_and_round45_chunk_neon_8_fused_r1`:
+//   x_s = anchor_s ^ T(delta_s)        (T = rho1-scaled byte table, s = a0 b0 a1 b1)
+//   a = xa0 ^ rho2 * (xa0 ^ xa1),  b = xb0 ^ rho2 * (xb0 ^ xb1)
+// T is F2-linear per byte, so T_j[v] = T_j[v & 15] ^ T_j[v & 0xF0]: 8 lanes x
+// 32 nibble entries (4 KiB) in threadgroup memory. Group t = outputs 4t..4t+3
+// with weight w_t contributes the eight aggregate terms
+//   [w a1 b1, w(a0+a1)(b0+b1), w a3 b3, w(a2+a3)(b2+b3), w a2 b2,
+//    w(a0+a2)(b0+b2), w(a1+a3)(b1+b3), w(a0+a1+a2+a3)(b0+b1+b2+b3)];
+// each is an exact product, reduced per product (reduction is F2-linear) and
+// XOR-summed, so the per-chunk sums equal the CPU kernel's.
+// ---------------------------------------------------------------------------
+
+static inline ulong zck_clmul32(uint a, uint b) {
+    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
+                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
+    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
+          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
+    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
+          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
+    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
+    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
+    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
+    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
+    return r0 | r1 | r2 | r3;
+}
+
+struct ZckU128 { ulong lo; ulong hi; };
+
+static inline ZckU128 zck_clmul64(ulong a, ulong b) {
+    uint al = uint(a), ah = uint(a >> 32);
+    uint bl = uint(b), bh = uint(b >> 32);
+    ulong p_lo = zck_clmul32(al, bl);
+    ulong p_hi = zck_clmul32(ah, bh);
+    ulong p_mid = zck_clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
+    ZckU128 r;
+    r.lo = p_lo ^ (p_mid << 32);
+    r.hi = p_hi ^ (p_mid >> 32);
+    return r;
+}
+
+// a * b mod x^128 + x^7 + x^2 + x + 1 (Karatsuba product, then reduction).
+static inline uint4 zck_mul(uint4 a, uint4 b) {
+    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
+    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
+    ZckU128 p0 = zck_clmul64(al, bl);
+    ZckU128 p2 = zck_clmul64(ah, bh);
+    ZckU128 pm = zck_clmul64(al ^ ah, bl ^ bh);
+    pm.lo ^= p0.lo ^ p2.lo;
+    pm.hi ^= p0.hi ^ p2.hi;
+    ulong r0 = p0.lo, r1 = p0.hi ^ pm.lo, h0 = p2.lo ^ pm.hi, h1 = p2.hi;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = r0 ^ t0, l1 = r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+// T(code) for one 8-byte delta code (lo = bytes 0..3, hi = bytes 4..7).
+static inline uint4 zck_fold8(uint lo, uint hi, threadgroup const uint4* nib) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 4u; j++) {
+        uint v = (lo >> (8u * j)) & 0xffu;
+        acc ^= nib[j * 32u + (v & 15u)] ^ nib[j * 32u + 16u + (v >> 4u)];
+    }
+    for (uint j = 0u; j < 4u; j++) {
+        uint v = (hi >> (8u * j)) & 0xffu;
+        acc ^= nib[(j + 4u) * 32u + (v & 15u)] ^ nib[(j + 4u) * 32u + 16u + (v >> 4u)];
+    }
+    return acc;
+}
+
+struct ZcKParams {
+    uint sb_per_chunk;
+    uint eq_hi_off;
+    // Compact-state layout (tail-compacted, optionally head-compacted; see
+    // `UniSkipCompactFold::anchor_index` / `delta_offset`): pair p = 128 B + q
+    // of block B. Non-head pairs: [a, b] anchors at a_base + a_stride B +
+    // 2q - a_shift, 16 delta bytes at uint4 d_base + d_stride B + q - d_shift.
+    // Head pairs (hc, q < 8): a anchor at a_base + a_stride B + q, 8 a delta
+    // bytes at byte 16 (d_base + d_stride B) + 8q; b anchor head_b, b delta 0.
+    uint hc;
+    uint a_base;
+    uint a_stride;
+    uint a_shift;
+    uint d_base;
+    uint d_stride;
+    uint d_shift;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+// One threadgroup per 256-output superblock (four dead-tail blocks of 64);
+// thread `lid` = output 64k + i of block B = 4 tg + k (pairs 2i, 2i + 1 of
+// the block). Outputs i = 61..63 are structural zeros (dead pairs): never
+// loaded or stored; output 60 has only its first pair live. The a outputs
+// land in the packed layout (244 per superblock: 60 per block, then the
+// four outputs 60); the b outputs in the b-one-packed layout (56 per block:
+// outputs 4..58, then output 60). The b outputs 0..3 and 59 are not stored:
+// each must be one, and any that is not sets `flag`. `consts[0]` = rho2,
+// `consts[1]` = head_b, `consts[2 + t]` = w_t = eq_lo[2t + 1],
+// `consts[eq_hi_off + c]` = eq_hi[c].
+kernel void zc_k_fold(
+    device const uint4* anchors [[buffer(0)]],
+    device const uint4* deltas  [[buffer(1)]],
+    device const uint4* nib_dev [[buffer(2)]],
+    device const uint4* consts  [[buffer(3)]],
+    device uint4*       out_a   [[buffer(4)]],
+    device uint4*       out_b   [[buffer(5)]],
+    device uint4*       tg_part [[buffer(6)]],
+    constant ZcKParams& p       [[buffer(7)]],
+    device atomic_uint* flag    [[buffer(8)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    ushort sl [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint4 nib[256];
+    threadgroup uint4 sred[8][8];
+    nib[lid] = nib_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint i = lid & 63u;
+    uint k = lid >> 6u;
+    ulong blk = ulong(tg) * 4ul + ulong(k);
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    if (i <= 60u) {
+        uint4 xa0, xb0;
+        uint4 xa1 = uint4(0u);
+        uint4 xb1 = uint4(0u);
+        ulong ab = ulong(p.a_base) + blk * ulong(p.a_stride);
+        ulong db = ulong(p.d_base) + blk * ulong(p.d_stride);
+        if (p.hc != 0u && i < 4u) {
+            uint4 dd = deltas[db + ulong(i)];
+            xa0 = anchors[ab + 2ul * ulong(i)] ^ zck_fold8(dd.x, dd.y, nib);
+            xa1 = anchors[ab + 2ul * ulong(i) + 1ul] ^ zck_fold8(dd.z, dd.w, nib);
+            xb0 = consts[1];
+            xb1 = consts[1];
+        } else {
+            ab += 4ul * ulong(i) - ulong(p.a_shift);
+            db += 2ul * ulong(i) - ulong(p.d_shift);
+            uint4 d0 = deltas[db];
+            xa0 = anchors[ab] ^ zck_fold8(d0.x, d0.y, nib);
+            xb0 = anchors[ab + 1ul] ^ zck_fold8(d0.z, d0.w, nib);
+            if (i < 60u) {
+                uint4 d1 = deltas[db + 1ul];
+                xa1 = anchors[ab + 2ul] ^ zck_fold8(d1.x, d1.y, nib);
+                xb1 = anchors[ab + 3ul] ^ zck_fold8(d1.z, d1.w, nib);
+            }
+        }
+        uint4 rho2 = consts[0];
+        a = xa0 ^ zck_mul(rho2, xa0 ^ xa1);
+        b = xb0 ^ zck_mul(rho2, xb0 ^ xb1);
+        out_a[ulong(tg) * 244ul + ulong(i < 60u ? 60u * k + i : 240u + k)] = a;
+        if (i < 4u || i == 59u) {
+            if (any(b != uint4(1u, 0u, 0u, 0u))) {
+                atomic_fetch_or_explicit(flag, 1u, memory_order_relaxed);
+            }
+        } else {
+            out_b[blk * 56ul + ulong(i == 60u ? 55u : i - 4u)] = b;
+        }
+    }
+    uint t = ((tg % p.sb_per_chunk) * 256u + lid) >> 2u;
+    uint4 aw = zck_mul(consts[2u + t], a);
+    ushort qb = sl & ushort(0xFFFC);
+    uint4 aw0 = simd_shuffle(aw, qb);
+    uint4 aw1 = simd_shuffle(aw, ushort(qb + 1));
+    uint4 aw2 = simd_shuffle(aw, ushort(qb + 2));
+    uint4 aw3 = simd_shuffle(aw, ushort(qb + 3));
+    uint4 b0 = simd_shuffle(b, qb);
+    uint4 b1 = simd_shuffle(b, ushort(qb + 1));
+    uint4 b2 = simd_shuffle(b, ushort(qb + 2));
+    uint4 b3 = simd_shuffle(b, ushort(qb + 3));
+    // Quad lane q owns aggregate slots 2q and 2q + 1.
+    uint q = lid & 3u;
+    uint4 x0, y0, x1, y1;
+    if (q == 0u) {
+        x0 = aw1; y0 = b1; x1 = aw0 ^ aw1; y1 = b0 ^ b1;
+    } else if (q == 1u) {
+        x0 = aw3; y0 = b3; x1 = aw2 ^ aw3; y1 = b2 ^ b3;
+    } else if (q == 2u) {
+        x0 = aw2; y0 = b2; x1 = aw0 ^ aw2; y1 = b0 ^ b2;
+    } else {
+        x0 = aw1 ^ aw3; y0 = b1 ^ b3;
+        x1 = aw0 ^ aw1 ^ aw2 ^ aw3; y1 = b0 ^ b1 ^ b2 ^ b3;
+    }
+    uint4 r0 = zck_mul(x0, y0);
+    uint4 r1 = zck_mul(x1, y1);
+    for (ushort off = 4; off < 32; off <<= 1) {
+        r0 ^= simd_shuffle_xor(r0, off);
+        r1 ^= simd_shuffle_xor(r1, off);
+    }
+    if (sl < 4) {
+        sred[sg][2u * uint(sl)] = r0;
+        sred[sg][2u * uint(sl) + 1u] = r1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 8u) {
+        uint4 s = uint4(0u);
+        for (uint j = 0u; j < 8u; j++) { s ^= sred[j][lid]; }
+        tg_part[ulong(tg) * 8ul + ulong(lid)] = s;
+    }
+}
+
+// One threadgroup per prefix chunk, thread `k` = aggregate slot: the XOR of
+// the chunk's superblock sums, times the chunk's eq_hi weight (the CPU's
+// per-chunk `eq_hi[x_hi] * sum`).
+kernel void zc_k_finish(
+    device const uint4* tg_part [[buffer(0)]],
+    device const uint4* consts  [[buffer(1)]],
+    device uint4*       part    [[buffer(2)]],
+    constant ZcKParams& p       [[buffer(3)]],
+    uint chunk [[threadgroup_position_in_grid]],
+    uint k     [[thread_index_in_threadgroup]])
+{
+    uint4 s = uint4(0u);
+    for (uint j = 0u; j < p.sb_per_chunk; j++) {
+        s ^= tg_part[(ulong(chunk) * ulong(p.sb_per_chunk) + ulong(j)) * 8ul + ulong(k)];
+    }
+    part[ulong(chunk) * 8ul + ulong(k)] = zck_mul(consts[p.eq_hi_off + chunk], s);
+}
 "#;
 
     /// Supplemental leaf+parent3 fuse (kept out of the embedded metallib so a
@@ -4307,6 +4613,67 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
         } else {
             NTT_G4X2_MSL_SOURCE
         }
+    }
+
+    /// The `NttParams` declaration shared by the g4x2 and final-pass
+    /// sources, and the same struct with the dead-lane count the derived
+    /// dense g4x2 and fused final-leaf kernels read (host: `NttParamsZt`).
+    const NTT_PARAMS_TAIL: &str = "    uint s;       // log_d - l - f\n};\n";
+    const NTT_PARAMS_TAIL_ZT: &str =
+        "    uint s;       // log_d - l - f\n    uint zt;      // dead tail lanes of odd positions (0: none)\n};\n";
+
+    /// Replace every anchor exactly once, in order; `None` if any anchor does
+    /// not occur exactly once.
+    fn splice_exact(src: &str, reps: &[(&str, &str)]) -> Option<String> {
+        let mut out = src.to_string();
+        for (a, b) in reps {
+            if out.matches(a).count() != 1 {
+                return None;
+            }
+            out = out.replacen(a, b, 1);
+        }
+        Some(out)
+    }
+
+    /// `src` (either g4x2 source) with the dead-lane loads: the lanes
+    /// `>= 64 - P.zt` of the odd tile `eb` load the element of the last live
+    /// lane `63 - P.zt` of the same row (whose line the group reads anyway)
+    /// and replace it by zero with a select, so no request for their own
+    /// bytes is issued; the last 64-byte line of every odd row (lanes 60..63)
+    /// is then never read. Tile `eb` holds odd positions only (`pb = pa + 1`,
+    /// stride 2^s), and every butterfly of the pass pairs two `eb` entries,
+    /// so for those lanes the tile is zero on entry and on exit: the loads
+    /// they replace would have read zeros. The stores are unchanged (they
+    /// write those zeros). Branch-free on purpose: predicating the loads or
+    /// the stores costs more GPU time than the bytes save. `P.zt = 0` is the
+    /// incumbent kernel. The kernel name is unchanged: the pipeline is built
+    /// from this text in place of the constant (the zero-lane compacted
+    /// kernel keeps deriving from the untouched constant).
+    pub(crate) fn with_g4x2_dead_lanes(src: &str) -> Option<String> {
+        splice_exact(
+            src,
+            &[
+                (NTT_PARAMS_TAIL, NTT_PARAMS_TAIL_ZT),
+                (
+                    "        for (uint e = 0; e < NF; e++) {\n            ea[e] = data[((pa + (e << P.s)) << 6) + lane];\n            eb[e] = data[((pb + (e << P.s)) << 6) + lane];\n        }\n",
+                    "        // Dead lanes of the odd tile: known zero, no load of their own.\n        const bool dead = lane >= 64u - P.zt;\n        const uint lb = dead ? 63u - P.zt : lane;\n        for (uint e = 0; e < NF; e++) {\n            ea[e] = data[((pa + (e << P.s)) << 6) + lane];\n            eb[e] = select(data[((pb + (e << P.s)) << 6) + lb], uint4(0u), bool4(dead));\n        }\n",
+                ),
+            ],
+        )
+    }
+
+    /// The dense g4x2 pipeline's source: [`g4x2_msl_source`] with the
+    /// dead-lane loads unless `FLOCK_NO_GPU_DEAD_LANE` is set or an anchor
+    /// drifted (then the incumbent text, whose kernel ignores the extra
+    /// parameter word).
+    fn g4x2_pipeline_msl_source() -> std::borrow::Cow<'static, str> {
+        let base = g4x2_msl_source();
+        if super::gpu_dead_lane_enabled() {
+            if let Some(s) = with_g4x2_dead_lanes(base) {
+                return std::borrow::Cow::Owned(s);
+            }
+        }
+        std::borrow::Cow::Borrowed(base)
     }
 
     /// `NTT_G4X2_TWL_MSL_SOURCE` with the zero-lane compacted grid
@@ -5106,7 +5473,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
             assert!(!super::super::gpu_zero_lane_pass(20, 12), "guard did not restore");
         }
 
-        unsafe fn zl_fixture(gpu: &Gpu) -> (Id, Id, Vec<u8>, usize) {
+        pub(super) unsafe fn zl_fixture(gpu: &Gpu) -> (Id, Id, Vec<u8>, usize) {
             unsafe {
                 let log_d = 20usize;
                 let ntt = AdditiveNttF128::standard(log_d);
@@ -5278,6 +5645,400 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 }
                 gpu.release(dense);
                 gpu.release(zl);
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
+    /// Dead-lane loads (`FLOCK_NO_GPU_DEAD_LANE`): the dense g4x2 pass and
+    /// the fused final-leaf pass never use the bytes of the zero tail lanes
+    /// of odd positions (they load the last live lane and select zero).
+    #[cfg(test)]
+    mod dead_lane_tests {
+        use super::*;
+
+        #[test]
+        fn dead_lane_splices_apply_and_leave_the_zero_lane_kernel() {
+            for src in [NTT_G4X2_TWL_MSL_SOURCE, NTT_G4X2_MSL_SOURCE] {
+                let d = with_g4x2_dead_lanes(src).expect("g4x2 dead-lane anchors drifted");
+                assert_eq!(d.matches("uint zt;").count(), 1);
+                assert_eq!(d.matches("const bool dead = lane >= 64u - P.zt;").count(), 1);
+                assert_eq!(d.matches("eb[e] = select(data[((pb + (e << P.s)) << 6) + lb], uint4(0u), bool4(dead));").count(), 1);
+                // Stores unchanged: the dead lanes write their zeros.
+                assert_eq!(d.matches("            data[((pb + (e << P.s)) << 6) + lane] = eb[e];\n").count(), 1);
+                assert!(d.contains("kernel void ntt_fused_reg4g4x2("));
+            }
+            let leaf = with_final_leaf_dead_lanes(&final_leaf_msl_source()).expect("final-leaf dead-lane anchors drifted");
+            assert_eq!(leaf.matches("uint zt;").count(), 1);
+            assert_eq!(leaf.matches("const bool dead = P.s == 0u && lane >= 64u - P.zt;").count(), 1);
+            // The plain final-t3 kernel in the same library keeps its loads.
+            assert_eq!(leaf.matches("\n        elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];\n").count(), 1);
+            // The compacted s = 12 / s = 8 kernel still derives from the
+            // untouched constant (its splice returns None on any drift and
+            // the encoders would then silently keep the dense grid).
+            let zl = g4x2_zero_lane_msl_source().expect("zero-lane splice anchors drifted");
+            assert!(!zl.contains("uint zt;"));
+            if super::super::gpu_dead_lane_enabled() {
+                assert_eq!(g4x2_pipeline_msl_source(), with_g4x2_dead_lanes(g4x2_msl_source()).unwrap());
+                assert_eq!(final_leaf_pipeline_msl_source(), leaf);
+            } else {
+                assert_eq!(g4x2_pipeline_msl_source(), g4x2_msl_source());
+                assert_eq!(final_leaf_pipeline_msl_source(), final_leaf_msl_source());
+            }
+            assert_eq!(core::mem::size_of::<NttParamsZt>(), 20);
+        }
+
+        #[test]
+        fn dead_lane_count_is_shape_gated() {
+            assert_eq!(super::super::select_gpu_dead_lanes(20, 7, true), 7);
+            assert_eq!(super::super::select_gpu_dead_lanes(20, 7, false), 0);
+            assert_eq!(super::super::select_gpu_dead_lanes(19, 7, true), 0);
+            assert_eq!(super::super::select_gpu_dead_lanes(16, 7, true), 0);
+            assert_eq!(super::super::select_gpu_dead_lanes(20, 0, true), 0);
+            assert_eq!(super::super::select_gpu_dead_lanes(20, 6, true), 0);
+        }
+
+        /// Every g4x2 and final-leaf pipeline the encoders select is built:
+        /// a NIL `pso_ntt4g4x2_zl` would silently run the s = 12 / s = 8
+        /// passes on the dense grid.
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn ranked_g4x2_and_final_leaf_pipelines_build() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if super::super::gpu_g4x2_enabled() {
+                assert!(!gpu.pso_ntt4g4x2.is_null(), "dense g4x2 pipeline missing");
+                if super::super::gpu_zero_lane_enabled() && super::super::gpu_tw_prefetch_enabled() {
+                    assert!(!gpu.pso_ntt4g4x2_zl.is_null(), "zero-lane g4x2 pipeline missing");
+                }
+            }
+            if super::super::gpu_final_leaf_enabled() {
+                assert!(!gpu.pso_final_leaf.is_null(), "fused final-leaf pipeline missing");
+            }
+        }
+
+        const SENTINEL: u8 = 0xA5;
+
+        unsafe fn run_pass_zt(gpu: &Gpu, pso: Id, data: Id, tw: Id, l: usize, groups: u64, zt: Option<u32>) -> f64 {
+            unsafe {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, data, 0, 0);
+                gpu.set_buffer(enc, tw, 0, 1);
+                set_ntt_params(gpu, enc, NttParams { log_d: 20, l: l as u32, f: 4, s: (16 - l) as u32 }, zt);
+                gpu.dispatch(enc, groups, 64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            }
+        }
+
+        /// Fused final pass + leaves + parents 1..3 over the first
+        /// `positions` positions of a log_d = 20 codeword.
+        unsafe fn run_leaf_zt(gpu: &Gpu, pso: Id, data: Id, tw: Id, tree: Id, positions: usize, zt: Option<u32>) -> f64 {
+            unsafe {
+                let n_leaves = 1usize << 20;
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, data, 0, 0);
+                gpu.set_buffer(enc, tw, 0, 1);
+                set_ntt_params(gpu, enc, NttParams { log_d: 20, l: 16, f: 4, s: 0 }, zt);
+                let w1 = n_leaves;
+                let w2 = w1 + n_leaves / 2;
+                let w3 = w2 + n_leaves / 4;
+                gpu.set_buffer(enc, tree, 0, 3);
+                gpu.set_buffer(enc, tree, w1 * 32, 4);
+                gpu.set_buffer(enc, tree, w2 * 32, 5);
+                gpu.set_buffer(enc, tree, w3 * 32, 6);
+                gpu.dispatch(enc, (positions / 64) as u64, 64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            }
+        }
+
+        /// Overwrite lanes 57..63 of every odd position with the sentinel.
+        unsafe fn poison_dead(gpu: &Gpu, data: Id, positions: usize) {
+            unsafe {
+                let p = gpu.buffer_contents(data).cast::<u8>();
+                for pos in (1..positions).step_by(2) {
+                    std::ptr::write_bytes(p.add((pos * 64 + 57) * 16), SENTINEL, 7 * 16);
+                }
+            }
+        }
+
+        /// Exactness on a 64 MiB position prefix with the ranked zero
+        /// columns: each mid pass alone (dense g4x2 with `zt = 7` against the
+        /// incumbent kernel), the same pass over poisoned dead slots (the
+        /// output is the clean one: the dead lanes never used their own
+        /// bytes), `zt = 0` on unstructured data, and the cb2 chain
+        /// (zero-lane s = 12, s = 8, dense s = 4, fused final leaf) clean,
+        /// with the dead slots poisoned before the s = 4 pass, and poisoned
+        /// before the final leaf: codeword and tree identical.
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn dead_lane_passes_match_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let (tw, data, input, len) = zero_lane_tests::zl_fixture(gpu);
+                let positions = 1usize << 16;
+                let inc = compile_supplemental_pipeline(gpu, NTT_G4X2_TWL_MSL_SOURCE, "ntt_fused_reg4g4x2").unwrap();
+                let dl = compile_supplemental_pipeline(gpu, &with_g4x2_dead_lanes(NTT_G4X2_TWL_MSL_SOURCE).unwrap(), "ntt_fused_reg4g4x2").unwrap();
+                let dl_plain = compile_supplemental_pipeline(gpu, &with_g4x2_dead_lanes(NTT_G4X2_MSL_SOURCE).unwrap(), "ntt_fused_reg4g4x2").unwrap();
+                let zl = compile_supplemental_pipeline(gpu, &g4x2_zero_lane_msl_source().unwrap(), "ntt_fused_reg4g4x2_zl").unwrap();
+                let leaf_inc = compile_supplemental_pipeline(gpu, &final_leaf_msl_source(), "ntt_final_t3_leaf").unwrap();
+                let leaf_dl = compile_supplemental_pipeline(gpu, &with_final_leaf_dead_lanes(&final_leaf_msl_source()).unwrap(), "ntt_final_t3_leaf").unwrap();
+                let tree_len = 2 * (1usize << 20) * 32;
+                let tree = gpu.new_buffer(tree_len).unwrap();
+                let read = || std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec();
+                let read_tree = || std::slice::from_raw_parts(gpu.buffer_contents(tree), tree_len).to_vec();
+                let load = || std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                let dense = |_l: usize| (1u64 << 14) / 16;
+                let zlg = |l: usize| (1u64 << l) * super::super::zero_lane_groups_per_block(16 - l) / 16;
+                for l in [4usize, 8, 12] {
+                    load();
+                    run_pass_zt(gpu, inc, data, tw, l, dense(l), None);
+                    let a = read();
+                    assert!(a != input, "incumbent pass did not run at l={l}");
+                    for pso in [dl, dl_plain] {
+                        load();
+                        run_pass_zt(gpu, pso, data, tw, l, dense(l), Some(7));
+                        assert!(read() == a, "dead-lane g4x2 diverges at l={l}");
+                        load();
+                        poison_dead(gpu, data, positions);
+                        run_pass_zt(gpu, pso, data, tw, l, dense(l), Some(7));
+                        assert!(read() == a, "a poisoned dead slot was read at l={l}");
+                    }
+                }
+                // zt = 0 is the incumbent kernel, also on data whose tail
+                // lanes are not zero.
+                let mut x = 0x0DEA_D1A7_u64;
+                let rough: Vec<u8> = (0..len / 8)
+                    .flat_map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x.to_le_bytes()
+                    })
+                    .collect();
+                for l in [8usize, 12] {
+                    std::ptr::copy_nonoverlapping(rough.as_ptr(), gpu.buffer_contents(data), len);
+                    run_pass_zt(gpu, inc, data, tw, l, dense(l), None);
+                    let a = read();
+                    std::ptr::copy_nonoverlapping(rough.as_ptr(), gpu.buffer_contents(data), len);
+                    run_pass_zt(gpu, dl, data, tw, l, dense(l), Some(0));
+                    assert!(read() == a, "zt = 0 diverges at l={l}");
+                }
+                std::ptr::copy_nonoverlapping(rough.as_ptr(), gpu.buffer_contents(data), len);
+                std::ptr::write_bytes(gpu.buffer_contents(tree), 0, tree_len);
+                run_leaf_zt(gpu, leaf_inc, data, tw, tree, positions, None);
+                let (rd, rt) = (read(), read_tree());
+                std::ptr::copy_nonoverlapping(rough.as_ptr(), gpu.buffer_contents(data), len);
+                std::ptr::write_bytes(gpu.buffer_contents(tree), 0, tree_len);
+                run_leaf_zt(gpu, leaf_dl, data, tw, tree, positions, Some(0));
+                assert!(read() == rd && read_tree() == rt, "final leaf with zt = 0 diverges");
+                // The cb2 chain.
+                // poison: 0 none, 1 before the s = 4 pass, 2 before the leaf.
+                let chain = |dead: bool, poison: u32| -> (Vec<u8>, Vec<u8>) {
+                    load();
+                    std::ptr::write_bytes(gpu.buffer_contents(tree), 0, tree_len);
+                    run_pass_zt(gpu, zl, data, tw, 4, zlg(4), None);
+                    run_pass_zt(gpu, zl, data, tw, 8, zlg(8), None);
+                    if poison == 1 {
+                        poison_dead(gpu, data, positions);
+                    }
+                    if dead {
+                        run_pass_zt(gpu, dl, data, tw, 12, dense(12), Some(7));
+                    } else {
+                        run_pass_zt(gpu, inc, data, tw, 12, dense(12), None);
+                    }
+                    if poison == 2 {
+                        poison_dead(gpu, data, positions);
+                    }
+                    if dead {
+                        run_leaf_zt(gpu, leaf_dl, data, tw, tree, positions, Some(7));
+                    } else {
+                        run_leaf_zt(gpu, leaf_inc, data, tw, tree, positions, None);
+                    }
+                    (read(), read_tree())
+                };
+                let (d0, t0) = chain(false, 0);
+                assert!(t0.iter().any(|&b| b != 0), "no hashes written");
+                for poison in 0..3 {
+                    let (d1, t1) = chain(true, poison);
+                    assert!(d0 == d1 && t0 == t1, "dead-lane cb2 chain diverges (poison {poison})");
+                }
+                for p in [inc, dl, dl_plain, zl, leaf_inc, leaf_dl] {
+                    gpu.release(p);
+                }
+                gpu.release(tree);
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+
+        /// GPU-ms of the s = 4 pass and of the fused final-leaf pass over the
+        /// whole ranked codeword (1 GiB), incumbent vs dead-lane kernels,
+        /// interleaved rounds (best of 5 per round). `DEAD_LANE_PROBE_ZT`
+        /// (default 7) sets the dead-lane count passed to the candidates.
+        #[test]
+        #[ignore = "timing probe"]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn dead_lane_probe() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let zt: u32 = std::env::var("DEAD_LANE_PROBE_ZT").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
+            let rounds: usize = std::env::var("DEAD_LANE_PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(11);
+            unsafe {
+                let pool = gpu.pool_push();
+                let log_d = 20usize;
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let positions = 1usize << log_d;
+                let len = positions * 64 * 16;
+                let data = gpu.new_buffer(len).unwrap();
+                let p = gpu.buffer_contents(data).cast::<u64>();
+                let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+                for i in 0..len / 8 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *p.add(i) = x;
+                }
+                poison_dead(gpu, data, positions);
+                let tree_len = 2 * positions * 32;
+                let tree = gpu.new_buffer(tree_len).unwrap();
+                let inc = compile_supplemental_pipeline(gpu, NTT_G4X2_TWL_MSL_SOURCE, "ntt_fused_reg4g4x2").unwrap();
+                let dl = compile_supplemental_pipeline(gpu, &with_g4x2_dead_lanes(NTT_G4X2_TWL_MSL_SOURCE).unwrap(), "ntt_fused_reg4g4x2").unwrap();
+                let leaf_inc = compile_supplemental_pipeline(gpu, &final_leaf_msl_source(), "ntt_final_t3_leaf").unwrap();
+                let leaf_dl = compile_supplemental_pipeline(gpu, &with_final_leaf_dead_lanes(&final_leaf_msl_source()).unwrap(), "ntt_final_t3_leaf").unwrap();
+                let s4 = |pso: Id, z: Option<u32>| run_pass_zt(gpu, pso, data, tw, 12, 1u64 << 14, z);
+                let leaf = |pso: Id, z: Option<u32>| run_leaf_zt(gpu, pso, data, tw, tree, positions, z);
+                let warm = std::time::Instant::now();
+                while warm.elapsed().as_secs_f64() < 2.0 {
+                    s4(inc, None);
+                    leaf(leaf_inc, None);
+                }
+                // [pass][variant] best-of-5 per round
+                let mut t = vec![vec![Vec::new(); 2]; 2];
+                for r in 0..rounds {
+                    for k in 0..2 {
+                        let v = (k + r) % 2;
+                        let mut b = [f64::MAX; 2];
+                        for _ in 0..5 {
+                            b[0] = b[0].min(if v == 0 { s4(inc, None) } else { s4(dl, Some(zt)) });
+                            b[1] = b[1].min(if v == 0 { leaf(leaf_inc, None) } else { leaf(leaf_dl, Some(zt)) });
+                        }
+                        t[0][v].push(b[0]);
+                        t[1][v].push(b[1]);
+                    }
+                }
+                let med = |v: &Vec<f64>| {
+                    let mut v = v.clone();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    v[v.len() / 2]
+                };
+                for (pi, name) in ["s=4 g4x2", "final leaf"].into_iter().enumerate() {
+                    let mut d: Vec<f64> = t[pi][1].iter().zip(&t[pi][0]).map(|(a, b)| a - b).collect();
+                    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let lower = t[pi][1].iter().zip(&t[pi][0]).filter(|(a, b)| a < b).count();
+                    eprintln!(
+                        "{name} (1 GiB, zt={zt}): incumbent {:.3} ms, dead-lane {:.3} ms, paired {:+.3} ms ({:+.2}%), lower in {lower}/{rounds}",
+                        med(&t[pi][0]),
+                        med(&t[pi][1]),
+                        d[d.len() / 2],
+                        100.0 * d[d.len() / 2] / med(&t[pi][0])
+                    );
+                }
+                for p in [inc, dl, leaf_inc, leaf_dl] {
+                    gpu.release(p);
+                }
+                gpu.release(tree);
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+
+        /// The production encoders under the published ranked geometry: the
+        /// two calls of `encode_hybrid_prefix_tail_with`'s fused branch
+        /// (`encode_ntt_passes_prefix_frac`, `encode_final_leaf_prefix`) over
+        /// the first sixteenth of a log_d = 20 codeword (zero-lane s = 12 /
+        /// s = 8, dense s = 4 with `zt`, fused final leaf with `zt`) against
+        /// the incumbent pipelines run by hand, with the dead slots poisoned
+        /// before the encode. Publishes the process-global geometry.
+        #[test]
+        #[ignore = "publishes the process-global zero-lane geometry; run alone"]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn dead_lane_production_encoders_match_incumbent() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if !super::super::gpu_dead_lane_enabled() || gpu.pso_final_leaf.is_null() || gpu.pso_ntt4g4x2.is_null() {
+                return;
+            }
+            unsafe {
+                let pool = gpu.pool_push();
+                let (tw, data, input, len) = zero_lane_tests::zl_fixture(gpu);
+                let positions = 1usize << 16;
+                let n_leaves = 1usize << 20;
+                let tree_len = 2 * n_leaves * 32;
+                let tree = gpu.new_buffer(tree_len).unwrap();
+                let inc = compile_supplemental_pipeline(gpu, NTT_G4X2_TWL_MSL_SOURCE, "ntt_fused_reg4g4x2").unwrap();
+                let zl = compile_supplemental_pipeline(gpu, &g4x2_zero_lane_msl_source().unwrap(), "ntt_fused_reg4g4x2_zl").unwrap();
+                let leaf_inc = compile_supplemental_pipeline(gpu, &final_leaf_msl_source(), "ntt_final_t3_leaf").unwrap();
+                let zlg = |l: usize| (1u64 << l) * super::super::zero_lane_groups_per_block(16 - l) / 16;
+                std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                std::ptr::write_bytes(gpu.buffer_contents(tree), 0, tree_len);
+                run_pass_zt(gpu, zl, data, tw, 4, zlg(4), None);
+                run_pass_zt(gpu, zl, data, tw, 8, zlg(8), None);
+                run_pass_zt(gpu, inc, data, tw, 12, (1u64 << 14) / 16, None);
+                run_leaf_zt(gpu, leaf_inc, data, tw, tree, positions, None);
+                let d0 = std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec();
+                let t0 = std::slice::from_raw_parts(gpu.buffer_contents(tree), n_leaves * 32 * 15 / 8).to_vec();
+                {
+                    let _g = super::super::GpuZeroTailLanes::scope(64, 7);
+                    assert_eq!(super::super::gpu_dead_lanes(20), 7);
+                    std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                    poison_dead(gpu, data, positions);
+                    std::ptr::write_bytes(gpu.buffer_contents(tree), 0, tree_len);
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    // Passes l = 4.. over 1/16 of the positions; the s = 4
+                    // pass and the final leaf bind zt = 7.
+                    encode_ntt_passes_prefix_frac(gpu, enc, data, tw, 20, 4, 4, 16, 1, 16);
+                    encode_final_leaf_prefix(gpu, enc, data, tw, tree, 20, positions);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                }
+                assert_eq!(super::super::gpu_dead_lanes(20), 0, "guard did not restore");
+                let d1 = std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec();
+                let t1 = std::slice::from_raw_parts(gpu.buffer_contents(tree), n_leaves * 32 * 15 / 8).to_vec();
+                assert!(t0.iter().any(|&b| b != 0), "no hashes written");
+                assert!(d0 == d1, "production dead-lane encoders: codeword diverges");
+                assert!(t0 == t1, "production dead-lane encoders: leaves/parents diverge");
+                for p in [inc, zl, leaf_inc] {
+                    gpu.release(p);
+                }
+                gpu.release(tree);
                 gpu.release(tw);
                 gpu.release(data);
                 gpu.pool_pop(pool);
@@ -6106,6 +6867,43 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
         format!("{}{extra}", final_t3_msl_source())
     }
 
+    /// `src` (a fused final-leaf source) with zero substituted for the loads
+    /// of the dead lanes `>= 64 - P.zt` of the tile's odd positions: they
+    /// load the last live lane's element of the same row and select zero (no
+    /// request for their own bytes, branch-free as in the g4x2 form). At
+    /// s = 0 a tile's positions are `pos_base + e` with `pos_base` a multiple
+    /// of 16, so odd `e` are the odd positions; sub-layers 0..2 (layers
+    /// l..l+2) pair positions 8, 4 and 2 apart, so those lanes would read
+    /// zeros and stay zero until sub-layer 3. Every store stays (sub-layer 3
+    /// makes them non-zero) and the leaf hash reads the same bytes. Applied
+    /// after the byte-table splices to the leaf kernel's load loop only,
+    /// which none of them uses as an anchor.
+    pub(crate) fn with_final_leaf_dead_lanes(src: &str) -> Option<String> {
+        splice_exact(
+            src,
+            &[
+                (NTT_PARAMS_TAIL, NTT_PARAMS_TAIL_ZT),
+                (
+                    "        uint4 elems[NF];\n        for (uint e = 0; e < NF; e++) {\n            elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];\n        }\n",
+                    "        uint4 elems[NF];\n        {\n            // Dead lanes of odd positions: known zero, no load of their own.\n            const bool dead = P.s == 0u && lane >= 64u - P.zt;\n            const uint lo = dead ? 63u - P.zt : lane;\n            for (uint e = 0; e < NF; e++) {\n                if ((e & 1u) != 0u) {\n                    elems[e] = select(data[((pos_base + (e << P.s)) << 6) + lo], uint4(0u), bool4(dead));\n                } else {\n                    elems[e] = data[((pos_base + (e << P.s)) << 6) + lane];\n                }\n            }\n        }\n",
+                ),
+            ],
+        )
+    }
+
+    /// The fused final-leaf pipeline's source: [`final_leaf_msl_source`]
+    /// with the dead-lane loads unless `FLOCK_NO_GPU_DEAD_LANE` is set or an
+    /// anchor drifted (then the incumbent text).
+    pub(crate) fn final_leaf_pipeline_msl_source() -> String {
+        let base = final_leaf_msl_source();
+        if super::gpu_dead_lane_enabled() {
+            if let Some(s) = with_final_leaf_dead_lanes(&base) {
+                return s;
+            }
+        }
+        base
+    }
+
     pub(crate) fn final_leaf_selected(gpu: &Gpu, log_d: usize, n_leaves: usize) -> bool {
         !gpu.pso_final_leaf.is_null()
             && log_d >= 10
@@ -6154,11 +6952,8 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
             let p = NttParams { log_d: log_d as u32, l: l as u32, f: 4, s: 0 };
-            let bytes = core::slice::from_raw_parts(
-                (&p as *const NttParams).cast::<u8>(),
-                core::mem::size_of::<NttParams>(),
-            );
-            gpu.set_bytes(enc, bytes, 2);
+            // The fused final-leaf pipeline also reads the dead-lane count.
+            set_ntt_params(gpu, enc, p, Some(super::gpu_dead_lanes(log_d)));
             let w1 = n_leaves;
             let w2 = w1 + n_leaves / 2;
             let w3 = w2 + n_leaves / 4;
@@ -6200,11 +6995,8 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
             let p = NttParams { log_d: log_d as u32, l: l as u32, f: 4, s: 0 };
-            let bytes = core::slice::from_raw_parts(
-                (&p as *const NttParams).cast::<u8>(),
-                core::mem::size_of::<NttParams>(),
-            );
-            gpu.set_bytes(enc, bytes, 2);
+            // The fused final-leaf pipeline also reads the dead-lane count.
+            set_ntt_params(gpu, enc, p, Some(super::gpu_dead_lanes(log_d)));
             let w1 = n_leaves;
             let w2 = w1 + n_leaves / 2;
             let w3 = w2 + n_leaves / 4;
@@ -7046,7 +7838,7 @@ kernel void blake3_pow_scan(
     const METALLIB: &[u8] = include_bytes!("gpu_shaders.metallib");
 
     /// FNV-1a (64-bit) of `MSL_SOURCE` when `gpu_shaders.metallib` was built.
-    const METALLIB_MSL_FNV1A: u64 = 0x7b23471589b0cbb6;
+    const METALLIB_MSL_FNV1A: u64 = 0x5fb2352f09873ad7;
 
     const fn fnv1a64(s: &str) -> u64 {
         let bytes = s.as_bytes();
@@ -7725,7 +8517,7 @@ kernel void blake3_pow_scan(
                 // `ntt_fused_reg4g4`.
                 let pso_ntt4g4x2 = if super::gpu_g4x2_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(g4x2_msl_source())?;
+                        let src = api.nsstring(&g4x2_pipeline_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -7919,7 +8711,7 @@ kernel void blake3_pow_scan(
                 };
                 let pso_final_leaf = if super::gpu_final_leaf_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(&final_leaf_msl_source())?;
+                        let src = api.nsstring(&final_leaf_pipeline_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -8618,6 +9410,39 @@ kernel void blake3_pow_scan(
         pub(crate) s: u32,
     }
 
+    /// [`NttParams`] plus the dead-lane count (`zt`) read by the derived
+    /// dense g4x2 and fused final-leaf kernels; 20 bytes, bound only where
+    /// one of those two pipelines is selected. A kernel built from an
+    /// incumbent source declares the 16-byte struct and ignores `zt`.
+    #[repr(C)]
+    pub(crate) struct NttParamsZt {
+        pub(crate) p: NttParams,
+        pub(crate) zt: u32,
+    }
+
+    /// Bind `p` (and `zt` when `Some`) at parameter index 2.
+    pub(crate) unsafe fn set_ntt_params(gpu: &Gpu, enc: Id, p: NttParams, zt: Option<u32>) {
+        unsafe {
+            match zt {
+                Some(zt) => {
+                    let q = NttParamsZt { p, zt };
+                    let bytes = core::slice::from_raw_parts(
+                        (&q as *const NttParamsZt).cast::<u8>(),
+                        core::mem::size_of::<NttParamsZt>(),
+                    );
+                    gpu.set_bytes(enc, bytes, 2);
+                }
+                None => {
+                    let bytes = core::slice::from_raw_parts(
+                        (&p as *const NttParams).cast::<u8>(),
+                        core::mem::size_of::<NttParams>(),
+                    );
+                    gpu.set_bytes(enc, bytes, 2);
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     std::thread_local! {
         pub(crate) static TEST_FROM_Z_ZERO_COLUMN_BINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -8835,11 +9660,9 @@ kernel void blake3_pow_scan(
                     f: f as u32,
                     s: s as u32,
                 };
-                let bytes = core::slice::from_raw_parts(
-                    (&p as *const NttParams).cast::<u8>(),
-                    core::mem::size_of::<NttParams>(),
-                );
-                gpu.set_bytes(enc, bytes, 2);
+                // The dense g4x2 pipeline also reads the dead-lane count.
+                let zt = (!pso.is_null() && pso == gpu.pso_ntt4g4x2).then(|| super::gpu_dead_lanes(log_d));
+                set_ntt_params(gpu, enc, p, zt);
                 gpu.dispatch(enc, groups, tpg);
             }
         }
@@ -8913,11 +9736,9 @@ kernel void blake3_pow_scan(
                     f: f as u32,
                     s: s as u32,
                 };
-                let bytes = core::slice::from_raw_parts(
-                    (&p as *const NttParams).cast::<u8>(),
-                    core::mem::size_of::<NttParams>(),
-                );
-                gpu.set_bytes(enc, bytes, 2);
+                // The dense g4x2 pipeline also reads the dead-lane count.
+                let zt = (!pso.is_null() && pso == gpu.pso_ntt4g4x2).then(|| super::gpu_dead_lanes(log_d));
+                set_ntt_params(gpu, enc, p, zt);
                 debug_assert_eq!(groups % 16, 0);
                 gpu.dispatch(enc, groups / 16 * prefix16, tpg);
             }
@@ -8994,11 +9815,9 @@ kernel void blake3_pow_scan(
                     f: f as u32,
                     s: s as u32,
                 };
-                let bytes = core::slice::from_raw_parts(
-                    (&p as *const NttParams).cast::<u8>(),
-                    core::mem::size_of::<NttParams>(),
-                );
-                gpu.set_bytes(enc, bytes, 2);
+                // The dense g4x2 pipeline also reads the dead-lane count.
+                let zt = (!pso.is_null() && pso == gpu.pso_ntt4g4x2).then(|| super::gpu_dead_lanes(log_d));
+                set_ntt_params(gpu, enc, p, zt);
                 debug_assert_eq!(groups % den, 0);
                 gpu.dispatch(enc, groups / den * num, tpg);
             }
@@ -12557,7 +13376,7 @@ kernel void blake3_pow_scan(
             key
         };
         let key = if super::gpu_g4x2_enabled() {
-            key ^ fnv1a64(g4x2_msl_source()).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
+            key ^ fnv1a64(&g4x2_pipeline_msl_source()).rotate_left(4) ^ 0x4734_5832_5F4E_5454 // "G4X2_NTT"
         } else {
             key
         };
@@ -12576,7 +13395,7 @@ kernel void blake3_pow_scan(
             key
         };
         let key = if super::gpu_final_leaf_enabled() {
-            key ^ fnv1a64(&final_leaf_msl_source()).rotate_left(5) ^ 0x464C_4541_465F_3431
+            key ^ fnv1a64(&final_leaf_pipeline_msl_source()).rotate_left(5) ^ 0x464C_4541_465F_3431
         } else {
             key
         };
@@ -19122,6 +19941,9 @@ kernel void zc_ab_finish(
         eq_hi: &[F128],
     ) -> Option<ZcAbJob> {
         use std::sync::atomic::Ordering;
+        // A view handed to the K pass arm never outlives the prove whose
+        // join published it.
+        zc_k_view_clear();
         let debug = super::gpu_zc_ab_debug();
         let mode = ZC_AB_MODE.load(Ordering::Relaxed);
         if mode == ZC_AB_DISABLED {
@@ -19317,6 +20139,12 @@ kernel void zc_ab_finish(
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 64]>();
             let out: Vec<[F128; 64]> = std::slice::from_raw_parts(parts, job.chunks).to_vec();
+            // This prove's launch validated (or created) the cached view of
+            // `ab_inner`, which the cascade donates as the compact deltas:
+            // hand it to the K pass arm of the same prove.
+            if let Some((p, l, buf)) = state.wrap {
+                zc_k_view_publish(gpu, p, l, buf);
+            }
             drop(state);
             if !job.calibration {
                 let fired = ZC_AB_FIRED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -19361,6 +20189,671 @@ kernel void zc_ab_finish(
                 }
             }
             ZcAbResult::Calibrated
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
+    //
+    // The K pass folds round two's compact anchors + deltas at rho1 and rho2
+    // into the round-four tables and eight aggregates per chunk, from a CPU
+    // queue over whole chunks. The GPU takes a FIXED leading prefix of those
+    // chunks: `zc_k_fold` reconstructs each prefix output from the same
+    // anchors and deltas through the nibble form of the same rho1-scaled byte
+    // table, applies the same rho2 fold, writes the packed outputs into this
+    // arm's own process-lifetime buffers and reduces the aggregate terms per
+    // superblock; `zc_k_finish` sums them per chunk. The kernels live in
+    // `MSL_SOURCE` and come from the embedded metallib (no source compile; no
+    // embedded metallib = arm off). Inputs: the anchors prefix through a fresh
+    // read-only no-copy view per prove (released at the join); the deltas
+    // through the round-one arm's view of the same allocation, handed over by
+    // that arm's join in the same prove (a fresh view only when no other view
+    // of the allocation exists). The GPU writes only its own buffers.
+    // -----------------------------------------------------------------------
+
+    /// Process-lifetime Metal state for the K pass GPU prefix arm, sized at
+    /// the first launch for its geometry.
+    struct ZcK {
+        fold_pso: Id,
+        finish_pso: Id,
+        /// 256 nibble entries of the rho1-scaled byte table (per prove).
+        nib_buf: Id,
+        /// rho2, head_b, the group weights w_t, then eq_hi of the prefix
+        /// chunks (per prove).
+        consts_buf: Id,
+        /// Prefix outputs in the K pass's packed layouts (a: 244 per 256
+        /// outputs, b: 56 per 64), read by the tri pass.
+        out_a: Id,
+        out_b: Id,
+        /// Eight reduced sums per superblock, then per chunk.
+        tgp_buf: Id,
+        part_buf: Id,
+        /// Set by the GPU when a b output the b-one pack skips is not one.
+        flag_buf: Id,
+        chunks: usize,
+        per_chunk_a: usize,
+        per_chunk_b: usize,
+        sb_per_chunk: usize,
+        n_weights: usize,
+    }
+
+    /// Compact-state layout of the K pass input (see `ZcKParams` in
+    /// `MSL_SOURCE` and `UniSkipCompactFold::anchor_index` / `delta_offset`).
+    #[derive(Clone, Copy)]
+    pub(crate) struct ZcKLayout {
+        /// Head-compacted (pairs 0..7 of a block keep only their a slots).
+        pub(crate) hc: bool,
+        /// `anchor_index(0)`, anchors per block, non-head rebase.
+        pub(crate) a_base: usize,
+        pub(crate) a_stride: usize,
+        pub(crate) a_shift: usize,
+        /// `delta_offset(0)`, delta bytes per block, non-head rebase (bytes).
+        pub(crate) d_base: usize,
+        pub(crate) d_stride: usize,
+        pub(crate) d_shift: usize,
+    }
+
+    // SAFETY: the Metal handles are only touched under the state mutex;
+    // Metal objects themselves are thread-safe.
+    unsafe impl Send for ZcK {}
+
+    static ZC_K_STATE: std::sync::OnceLock<Option<std::sync::Mutex<ZcK>>> =
+        std::sync::OnceLock::new();
+    /// 0 = uncalibrated (the next launch is the oracle probe), 1 = admitted,
+    /// 2 = disabled for the rest of the process.
+    static ZC_K_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    const ZC_K_UNCALIBRATED: u8 = 0;
+    const ZC_K_ADMITTED: u8 = 1;
+    const ZC_K_DISABLED: u8 = 2;
+    static ZC_K_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// The round-one arm's view of `ab_inner` (ptr, len, retained buffer),
+    /// published by its join and consumed by the next K launch. Cleared at
+    /// every round-one launch, so it never names an earlier prove's view.
+    static ZC_K_DELTA_VIEW: std::sync::Mutex<Option<(usize, usize, usize)>> =
+        std::sync::Mutex::new(None);
+
+    fn zc_k_view_take() -> Option<(usize, usize, Id)> {
+        let mut slot = match ZC_K_DELTA_VIEW.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        slot.take().map(|(p, l, b)| (p, l, b as Id))
+    }
+
+    fn zc_k_view_clear() {
+        if let Some((_, _, buf)) = zc_k_view_take()
+            && let Ok(gpu) = gpu()
+        {
+            unsafe { gpu.release(buf) };
+        }
+    }
+
+    fn zc_k_view_publish(gpu: &Gpu, ptr: usize, len: usize, buf: Id) {
+        zc_k_view_clear();
+        let mut slot = match ZC_K_DELTA_VIEW.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        let held = unsafe { gpu.retain(buf) };
+        *slot = Some((ptr, len, held as usize));
+    }
+
+    /// The K arm's two pipelines (`zc_k_fold`, `zc_k_finish`) and the device
+    /// they were built on, as raw handles. Built once per process, normally by
+    /// the prewarm helper ([`zc_k_prewarm_start`]); `None` = no embedded
+    /// metallib or a pipeline failed (arm off).
+    static ZC_K_PSOS: std::sync::OnceLock<Option<(usize, usize, usize)>> = std::sync::OnceLock::new();
+
+    /// Build the K arm's pipelines on `device` from the embedded metallib (no
+    /// source compile).
+    unsafe fn zc_k_build_psos(api: &Api, device: Id) -> Result<(Id, Id), String> {
+        unsafe {
+            let release = |obj: Id| {
+                if !obj.is_null() {
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> Id, obj, c"release");
+                }
+            };
+            let library = try_embedded_metallib(api, device);
+            if library.is_null() {
+                return Err("embedded metallib unavailable".into());
+            }
+            let pool = (api.pool_push)();
+            let make_pipeline = |name: &str| -> Result<Id, String> {
+                let ns = api.nsstring(name)?;
+                let f: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                    library,
+                    c"newFunctionWithName:",
+                    ns
+                );
+                if f.is_null() {
+                    return Err(format!("{name} kernel not found"));
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                release(f);
+                if pso.is_null() {
+                    return Err(format!("{name} pipeline: {}", api.error_string(perr)));
+                }
+                Ok(pso)
+            };
+            let fold = make_pipeline("zc_k_fold");
+            let finish = make_pipeline("zc_k_finish");
+            (api.pool_pop)(pool);
+            release(library);
+            let (fold_pso, finish_pso) = match (fold, finish) {
+                (Ok(a), Ok(b)) => (a, b),
+                (a, b) => {
+                    let mut err = String::new();
+                    for r in [a, b] {
+                        match r {
+                            Ok(p) => release(p),
+                            Err(e) => err = e,
+                        }
+                    }
+                    return Err(err);
+                }
+            };
+            let query = |pso: Id, sel: &std::ffi::CStr| -> u64 {
+                send!(api, unsafe extern "C" fn(Id, Sel) -> u64, pso, sel)
+            };
+            // The fold kernel's quad and SIMD reductions assume 32-wide SIMD
+            // groups and a 256-thread superblock.
+            if query(fold_pso, c"maxTotalThreadsPerThreadgroup") < 256
+                || query(fold_pso, c"threadExecutionWidth") != 32
+                || query(finish_pso, c"maxTotalThreadsPerThreadgroup") < 8
+            {
+                release(fold_pso);
+                release(finish_pso);
+                return Err("zc-k PSOs cannot run their threadgroup shapes".into());
+            }
+            Ok((fold_pso, finish_pso))
+        }
+    }
+
+    /// Whether the warm-up helper (`ab_completion_gpu_prewarm`) should
+    /// build the K arm's pipelines: the arm is on and `FLOCK_NO_ZC_K_PREWARM`
+    /// is not `1` (which leaves the build to the first launch).
+    pub(crate) fn zc_k_prewarm_wanted() -> bool {
+        super::gpu_zc_k_share() > 0
+            && std::env::var_os("FLOCK_NO_ZC_K_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1"))
+    }
+
+    /// Build the K arm's two pipelines now, on the GPU context's device. Runs
+    /// on the round-one arm's warm-up helper thread, after that arm's own
+    /// build, so the warm-up proof's first K launch only joins the
+    /// `OnceLock` (or waits for the helper if it is still building).
+    pub(crate) fn zc_k_prewarm() {
+        if let Ok(gpu) = gpu() {
+            let _ = ZC_K_PSOS.get_or_init(|| unsafe {
+                zc_k_build_psos(&gpu.api, gpu.device)
+                    .ok()
+                    .map(|(f, g)| (f as usize, g as usize, gpu.device as usize))
+            });
+        }
+    }
+
+    fn zc_k_init(
+        gpu: &'static Gpu,
+        chunks: usize,
+        per_chunk_a: usize,
+        per_chunk_b: usize,
+        sb_per_chunk: usize,
+        n_weights: usize,
+    ) -> Result<ZcK, String> {
+        unsafe {
+            let waited = std::time::Instant::now();
+            let shared = *ZC_K_PSOS.get_or_init(|| {
+                zc_k_build_psos(&gpu.api, gpu.device)
+                    .ok()
+                    .map(|(f, g)| (f as usize, g as usize, gpu.device as usize))
+            });
+            let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
+            // Handles built on another device object cannot run on this
+            // context's queue: build them here instead.
+            let (fold_pso, finish_pso, how) = match shared {
+                Some((f, g, dev)) if dev == gpu.device as usize => (f as Id, g as Id, "shared"),
+                _ => {
+                    let (f, g) = zc_k_build_psos(&gpu.api, gpu.device)?;
+                    (f, g, "built at the launch")
+                }
+            };
+            if super::gpu_zc_k_debug() {
+                eprintln!("[zc-k-gpu] pipelines: {how} (joined after {wait_ms:.2} ms)");
+            }
+            let mut made: Vec<Id> = Vec::with_capacity(7);
+            for len in [
+                256 * 16,
+                (2 + n_weights + chunks) * 16,
+                chunks * per_chunk_a * 16,
+                chunks * per_chunk_b * 16,
+                chunks * sb_per_chunk * 8 * 16,
+                chunks * 8 * 16,
+                16,
+            ] {
+                match gpu.new_buffer(len) {
+                    Ok(b) => made.push(b),
+                    Err(e) => {
+                        for b in made {
+                            gpu.release(b);
+                        }
+                        gpu.release(fold_pso);
+                        gpu.release(finish_pso);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(ZcK {
+                fold_pso,
+                finish_pso,
+                nib_buf: made[0],
+                consts_buf: made[1],
+                out_a: made[2],
+                out_b: made[3],
+                tgp_buf: made[4],
+                part_buf: made[5],
+                flag_buf: made[6],
+                chunks,
+                per_chunk_a,
+                per_chunk_b,
+                sb_per_chunk,
+                n_weights,
+            })
+        }
+    }
+
+    /// An in-flight K pass GPU prefix.
+    pub(crate) struct ZcKJob {
+        cb: Id,
+        /// Views released at the join (the deltas one may be the round-one
+        /// arm's retained view).
+        views: [Id; 2],
+        chunks: usize,
+        per_chunk_a: usize,
+        per_chunk_b: usize,
+        calibration: bool,
+        submitted: std::time::Instant,
+    }
+
+    // SAFETY: the handles are only waited/released by the launching thread;
+    // Metal objects are themselves thread-safe.
+    unsafe impl Send for ZcKJob {}
+
+    impl ZcKJob {
+        /// First chunk the CPU queue folds: zero during the oracle probe (the
+        /// CPU folds every chunk and the GPU's are compared, then dropped).
+        pub(crate) fn cpu_base(&self) -> usize {
+            if self.calibration { 0 } else { self.chunks }
+        }
+
+        pub(crate) fn calibration(&self) -> bool {
+            self.calibration
+        }
+
+        /// GPU prefix length in chunks.
+        pub(crate) fn chunks(&self) -> usize {
+            self.chunks
+        }
+    }
+
+    /// Result of joining the K pass GPU prefix.
+    pub(crate) enum ZcKResult {
+        /// Chunks `0..parts.len()`: the eight eq_hi-weighted sums per chunk
+        /// (the CPU's `partials` slots) and the outputs in the K pass's packed
+        /// layouts, `len_a` / `len_b` entries at `a` / `b` (process-lifetime
+        /// buffers, valid until the next launch). `b_ones` = every b output
+        /// the b-one pack skips was one (else the pass must be rerun unpacked).
+        Prefix {
+            parts: Vec<[F128; 8]>,
+            a: *const F128,
+            b: *const F128,
+            len_a: usize,
+            len_b: usize,
+            b_ones: bool,
+        },
+        /// Metal failed: the caller folds the prefix chunks on the CPU. The
+        /// arm is disabled for the process.
+        Failed,
+    }
+
+    /// Record the oracle verdict of the first launch.
+    pub(crate) fn zc_k_verdict(equal: bool, chunks: usize, hi_size: usize) {
+        use std::sync::atomic::Ordering;
+        ZC_K_MODE.store(if equal { ZC_K_ADMITTED } else { ZC_K_DISABLED }, Ordering::Relaxed);
+        if super::gpu_zc_k_debug() {
+            if equal {
+                eprintln!(
+                    "[zc-k-gpu] oracle: GPU outputs and sums of chunks 0..{chunks} EQUAL the CPU's -> admitted, share {chunks}/{hi_size}"
+                );
+            } else {
+                eprintln!("[zc-k-gpu] oracle MISMATCH -> arm disabled for the process");
+            }
+        }
+    }
+
+    /// Launch the GPU prefix over K chunks `0..chunks`. `None` = the CPU
+    /// queue folds every chunk (arm off or disabled, geometry or view
+    /// declined, no Metal). `anchors` / `deltas` are the complete compact
+    /// state in the tail-compacted `layout`, `table` the rho1-scaled byte
+    /// table (8 x 256), `head_b` the head pairs' b anchor; the group weights
+    /// are `eq_lo[2t + 1]` and chunk `c` takes `eq_hi[c]`. The outputs use the
+    /// packed a layout (`per_chunk_a` entries per chunk) and the b-one-packed
+    /// b layout (`per_chunk_b`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_k_prefix(
+        anchors: &[F128],
+        deltas: &[u8],
+        layout: &ZcKLayout,
+        table: &[F128],
+        rho2: F128,
+        head_b: F128,
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        chunks: usize,
+        per_chunk_a: usize,
+        per_chunk_b: usize,
+    ) -> Option<ZcKJob> {
+        use std::sync::atomic::Ordering;
+        let debug = super::gpu_zc_k_debug();
+        let mode = ZC_K_MODE.load(Ordering::Relaxed);
+        // The round-one view is consumed here whether or not it is used.
+        let ab_view = zc_k_view_take();
+        let release_view = |v: Option<(usize, usize, Id)>| {
+            if let (Some((_, _, b)), Ok(g)) = (v, gpu()) {
+                unsafe { g.release(b) };
+            }
+        };
+        let n_weights = eq_lo.len() / 2;
+        let out_chunk = 4 * n_weights;
+        let blocks = chunks * (out_chunk / 64);
+        // Last uint4 read of the prefix: anchors of pair 120 (b slot) of its
+        // last block, deltas of that pair (the largest index of any block).
+        let a_end = (layout.a_base + layout.a_stride * blocks.max(1) + 4 * 60 + 2)
+            .saturating_sub(layout.a_stride + layout.a_shift);
+        let d_end = (layout.d_base + layout.d_stride * blocks.max(1) + 32 * 60 + 16)
+            .saturating_sub(layout.d_stride + layout.d_shift);
+        let page = 16384usize;
+        let a_bytes = (a_end * 16).div_ceil(page) * page;
+        let d_bytes = d_end.div_ceil(page) * page;
+        if mode == ZC_K_DISABLED
+            || chunks == 0
+            || eq_hi.len() < chunks
+            || table.len() != 8 * 256
+            || out_chunk == 0
+            || !out_chunk.is_multiple_of(256)
+            || per_chunk_a != out_chunk / 256 * 244
+            || per_chunk_b != out_chunk / 64 * 56
+            || !layout.d_base.is_multiple_of(16)
+            || !layout.d_stride.is_multiple_of(16)
+            || !layout.d_shift.is_multiple_of(16)
+            || a_bytes > anchors.len() * 16
+            || d_bytes > deltas.len()
+            || layout.a_base + layout.a_stride * blocks > u32::MAX as usize
+            || layout.d_base / 16 + layout.d_stride / 16 * blocks > u32::MAX as usize
+        {
+            release_view(ab_view);
+            return None;
+        }
+        let sb_per_chunk = out_chunk / 256;
+        let Ok(gpu) = gpu() else {
+            release_view(ab_view);
+            return None;
+        };
+        let state_mutex = ZC_K_STATE
+            .get_or_init(|| match zc_k_init(gpu, chunks, per_chunk_a, per_chunk_b, sb_per_chunk, n_weights) {
+                Ok(s) => Some(std::sync::Mutex::new(s)),
+                Err(e) => {
+                    if debug {
+                        eprintln!("[zc-k-gpu] init failed (arm off): {e}");
+                    }
+                    None
+                }
+            })
+            .as_ref();
+        let Some(state_mutex) = state_mutex else {
+            release_view(ab_view);
+            return None;
+        };
+        let state = match state_mutex.lock() {
+            Ok(s) => s,
+            Err(_) => {
+                note_poisoned_lock("zc-k launch", false);
+                release_view(ab_view);
+                return None;
+            }
+        };
+        if state.chunks != chunks
+            || state.per_chunk_a != per_chunk_a
+            || state.per_chunk_b != per_chunk_b
+            || state.sb_per_chunk != sb_per_chunk
+            || state.n_weights != n_weights
+        {
+            release_view(ab_view);
+            return None;
+        }
+        unsafe {
+            // Anchors: a fresh view of the prefix, over memory this prove owns
+            // until the join releases it. Never a second view over a pinned
+            // (already viewed) allocation.
+            let a_ptr = anchors.as_ptr() as usize;
+            if crate::scratch::f128_range_overlaps_pin(a_ptr, a_bytes) {
+                if debug {
+                    eprintln!("[zc-k-gpu] anchors overlap a pinned view; arm skipped");
+                }
+                release_view(ab_view);
+                return None;
+            }
+            let a_view = match gpu.wrap_buffer(anchors.as_ptr().cast::<u8>().cast_mut(), a_bytes) {
+                Ok(b) => b,
+                Err(e) => {
+                    if debug {
+                        eprintln!("[zc-k-gpu] anchors view failed ({e}); arm skipped");
+                    }
+                    release_view(ab_view);
+                    return None;
+                }
+            };
+            // Deltas: the round-one arm's view of the same allocation when
+            // its join handed one over in this prove; a fresh view only when
+            // no view of the allocation exists.
+            let d_ptr = deltas.as_ptr() as usize;
+            let d_view = match ab_view {
+                Some((p, l, b)) if p == d_ptr && l >= d_bytes => Some(b),
+                other => {
+                    release_view(other);
+                    let viewed = crate::scratch::f128_range_overlaps_pin(d_ptr, d_bytes)
+                        || ZC_AB_STATE.get().and_then(|s| s.as_ref()).is_some_and(|m| match m.lock() {
+                            Ok(s) => s
+                                .wrap
+                                .is_some_and(|(p, l, _)| p < d_ptr + deltas.len() && d_ptr < p + l),
+                            Err(_) => true,
+                        });
+                    if viewed {
+                        None
+                    } else {
+                        gpu.wrap_buffer(deltas.as_ptr().cast_mut(), d_bytes).ok()
+                    }
+                }
+            };
+            let Some(d_view) = d_view else {
+                if debug {
+                    eprintln!("[zc-k-gpu] no view of the deltas; arm skipped");
+                }
+                gpu.release(a_view);
+                return None;
+            };
+            // Per-prove constants (the previous job was joined, so nothing in
+            // flight reads these buffers).
+            let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
+            for j in 0..8 {
+                for n in 0..16 {
+                    *nib.add(j * 32 + n) = table[j * 256 + n];
+                    *nib.add(j * 32 + 16 + n) = table[j * 256 + (n << 4)];
+                }
+            }
+            let consts = gpu.buffer_contents(state.consts_buf).cast::<F128>();
+            *consts = rho2;
+            *consts.add(1) = head_b;
+            for t in 0..n_weights {
+                *consts.add(2 + t) = eq_lo[2 * t + 1];
+            }
+            std::ptr::copy_nonoverlapping(eq_hi.as_ptr(), consts.add(2 + n_weights), chunks);
+            *gpu.buffer_contents(state.flag_buf).cast::<u32>() = 0;
+            #[repr(C)]
+            struct P {
+                sb_per_chunk: u32,
+                eq_hi_off: u32,
+                hc: u32,
+                a_base: u32,
+                a_stride: u32,
+                a_shift: u32,
+                d_base: u32,
+                d_stride: u32,
+                d_shift: u32,
+                pad: [u32; 3],
+            }
+            let params = P {
+                sb_per_chunk: sb_per_chunk as u32,
+                eq_hi_off: (2 + n_weights) as u32,
+                hc: layout.hc as u32,
+                a_base: layout.a_base as u32,
+                a_stride: layout.a_stride as u32,
+                a_shift: layout.a_shift as u32,
+                d_base: (layout.d_base / 16) as u32,
+                d_stride: (layout.d_stride / 16) as u32,
+                d_shift: (layout.d_shift / 16) as u32,
+                pad: [0; 3],
+            };
+            let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
+            let pool = gpu.pool_push();
+            let submitted = (|| -> Result<Id, String> {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, state.fold_pso);
+                gpu.set_buffer(enc, a_view, 0, 0);
+                gpu.set_buffer(enc, d_view, 0, 1);
+                gpu.set_buffer(enc, state.nib_buf, 0, 2);
+                gpu.set_buffer(enc, state.consts_buf, 0, 3);
+                gpu.set_buffer(enc, state.out_a, 0, 4);
+                gpu.set_buffer(enc, state.out_b, 0, 5);
+                gpu.set_buffer(enc, state.tgp_buf, 0, 6);
+                gpu.set_bytes(enc, pb, 7);
+                gpu.set_buffer(enc, state.flag_buf, 0, 8);
+                gpu.dispatch(enc, (chunks * sb_per_chunk) as u64, 256);
+                // Serial dispatches of one encoder: the finish reads the
+                // superblock sums the fold wrote.
+                gpu.set_pipeline(enc, state.finish_pso);
+                gpu.set_buffer(enc, state.tgp_buf, 0, 0);
+                gpu.set_buffer(enc, state.consts_buf, 0, 1);
+                gpu.set_buffer(enc, state.part_buf, 0, 2);
+                gpu.set_bytes(enc, pb, 3);
+                gpu.dispatch(enc, chunks as u64, 8);
+                gpu.end_encoding(enc);
+                let cb = gpu.retain(cb);
+                gpu.commit_async(cb);
+                Ok(cb)
+            })();
+            gpu.pool_pop(pool);
+            match submitted {
+                Ok(cb) => Some(ZcKJob {
+                    cb,
+                    views: [a_view, d_view],
+                    chunks,
+                    per_chunk_a,
+                    per_chunk_b,
+                    calibration: mode == ZC_K_UNCALIBRATED,
+                    submitted: std::time::Instant::now(),
+                }),
+                Err(e) => {
+                    if debug {
+                        eprintln!("[zc-k-gpu] submit failed ({e}); arm skipped");
+                    }
+                    gpu.release(a_view);
+                    gpu.release(d_view);
+                    None
+                }
+            }
+        }
+    }
+
+    /// Join the K pass GPU prefix (after the CPU queue has drained).
+    pub(crate) fn zc_k_wait(job: ZcKJob, hi_size: usize) -> ZcKResult {
+        use std::sync::atomic::Ordering;
+        let debug = super::gpu_zc_k_debug();
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => {
+                ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                return ZcKResult::Failed;
+            }
+        };
+        unsafe {
+            let waited = std::time::Instant::now();
+            let ok = gpu.spin_wait_cb(job.cb, 2.0);
+            let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
+            let gpu_ms = if ok.is_ok() { zc_fold_gpu_wall_ms(gpu, job.cb) } else { 0.0 };
+            gpu.release(job.cb);
+            for v in job.views {
+                gpu.release(v);
+            }
+            if let Err(e) = ok {
+                ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                if debug {
+                    eprintln!("[zc-k-gpu] command buffer failed ({e}); arm disabled, CPU folds the prefix");
+                }
+                return ZcKResult::Failed;
+            }
+            let Some(state_mutex) = ZC_K_STATE.get().and_then(|s| s.as_ref()) else {
+                ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                return ZcKResult::Failed;
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("zc-k wait", false);
+                    ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                    return ZcKResult::Failed;
+                }
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 8]>();
+            let parts: Vec<[F128; 8]> = std::slice::from_raw_parts(parts, job.chunks).to_vec();
+            let a = gpu.buffer_contents(state.out_a).cast::<F128>().cast_const();
+            let b = gpu.buffer_contents(state.out_b).cast::<F128>().cast_const();
+            let b_ones = *gpu.buffer_contents(state.flag_buf).cast::<u32>() == 0;
+            drop(state);
+            if debug && !job.calibration {
+                let fired = ZC_K_FIRED.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[zc-k-gpu] fired: GPU prefix {}/{hi_size} K chunks (CPU folded {}), gpu={gpu_ms:.2}ms \
+                     submit-to-drain={:.2}ms wait={wait_ms:.3}ms fired_proves={fired}",
+                    job.chunks,
+                    hi_size - job.chunks,
+                    job.submitted.elapsed().as_secs_f64() * 1e3,
+                );
+            } else if debug {
+                eprintln!(
+                    "[zc-k-gpu] oracle probe: GPU prefix {} chunks gpu={gpu_ms:.2}ms submit-to-drain={:.2}ms",
+                    job.chunks,
+                    job.submitted.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            ZcKResult::Prefix {
+                parts,
+                a,
+                b,
+                len_a: job.chunks * job.per_chunk_a,
+                len_b: job.chunks * job.per_chunk_b,
+                b_ones,
+            }
         }
     }
 
@@ -21475,6 +22968,13 @@ pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm, zc_ab_wait};
+
+/// Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_prewarm, zc_k_prewarm_wanted, zc_k_verdict,
+    zc_k_wait,
+};
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
