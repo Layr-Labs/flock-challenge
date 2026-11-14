@@ -3340,27 +3340,73 @@ pub(crate) mod witgen_simd {
             } else {
                 nt1
             };
-            // The copy loop is one asm block whose loop head is pinned to a
-            // 64-byte boundary (`.p2align 6` before the label; the padding
-            // runs once per block, never inside the loop), so its placement
-            // does not depend on the size of code elsewhere in the binary.
-            // Same loads and stores, in the same ascending order.
-            let n = end.saturating_sub(nt0);
+            copy_out_imm(scratch, dst, nt0, end);
+        }
+    }
+
+    /// Every dump chunk index, ascending, as a literal.
+    macro_rules! for_each_dump_chunk {
+        ($m:ident) => {
+            $m!(0); $m!(1); $m!(2); $m!(3); $m!(4); $m!(5); $m!(6); $m!(7);
+            $m!(8); $m!(9); $m!(10); $m!(11); $m!(12); $m!(13); $m!(14); $m!(15);
+            $m!(16); $m!(17); $m!(18); $m!(19); $m!(20); $m!(21); $m!(22); $m!(23);
+            $m!(24); $m!(25); $m!(26); $m!(27); $m!(28); $m!(29); $m!(30); $m!(31);
+            $m!(32); $m!(33); $m!(34); $m!(35); $m!(36); $m!(37); $m!(38); $m!(39);
+            $m!(40); $m!(41); $m!(42); $m!(43); $m!(44); $m!(45); $m!(46); $m!(47);
+            $m!(48); $m!(49); $m!(50); $m!(51); $m!(52); $m!(53); $m!(54); $m!(55);
+            $m!(56); $m!(57); $m!(58); $m!(59); $m!(60); $m!(61); $m!(62); $m!(63);
+        };
+    }
+
+    /// The non-temporal copy-out of [`dump_dual_copy`]: chunks `g0..g1` of
+    /// each of the four blocks, block by block, ascending, one `ldp` /
+    /// `stnp` pair per chunk.  Both sides of a block are addressed from one
+    /// base 1 KiB into the block, so every chunk offset `32 g - 1024`
+    /// (`-1024..=992`) is an immediate of the pair: no per-chunk address
+    /// arithmetic and no loop control (`g0`, `g1` are constants at every
+    /// call site).
+    #[inline(always)]
+    pub(super) unsafe fn copy_out_imm(scratch: *const u32, dst: *mut u32, g0: usize, g1: usize) {
+        debug_assert!(g0 <= g1 && g1 <= DUMP_CHUNKS);
+        unsafe {
+            for j in 0..4usize {
+                let src = scratch.add(j * U32_PER_BLOCK + 256);
+                let out = dst.add(j * U32_PER_BLOCK + 256);
+                macro_rules! chunk {
+                    ($g:literal) => {
+                        if g0 <= $g && $g < g1 {
+                            core::arch::asm!(
+                                "ldp {a:q}, {b:q}, [{s}, #{o}]",
+                                "stnp {a:q}, {b:q}, [{d}, #{o}]",
+                                s = in(reg) src,
+                                d = in(reg) out,
+                                o = const 32 * $g - 1024,
+                                a = out(vreg) _,
+                                b = out(vreg) _,
+                                options(nostack)
+                            );
+                        }
+                    };
+                }
+                for_each_dump_chunk!(chunk);
+            }
+        }
+    }
+
+    /// The copy-out loop [`copy_out_imm`] replaced (one address pair per
+    /// chunk), kept as the test reference.
+    #[cfg(test)]
+    pub(super) unsafe fn copy_out_loop(scratch: *const u32, dst: *mut u32, g0: usize, g1: usize) {
+        unsafe {
             for j in 0..4usize {
                 let src = scratch.add(j * U32_PER_BLOCK);
                 let out = dst.add(j * U32_PER_BLOCK);
-                if n != 0 {
+                for g in g0..g1 {
                     core::arch::asm!(
-                        ".p2align 6",
-                        "2:",
-                        "ldp {a:q}, {b:q}, [{s}], #32",
+                        "ldp {a:q}, {b:q}, [{s}]",
                         "stnp {a:q}, {b:q}, [{d}]",
-                        "add {d}, {d}, #32",
-                        "subs {n}, {n}, #1",
-                        "b.ne 2b",
-                        s = inout(reg) src.add(8 * nt0) => _,
-                        d = inout(reg) out.add(8 * nt0) => _,
-                        n = inout(reg) n => _,
+                        s = in(reg) src.add(8 * g),
+                        d = in(reg) out.add(8 * g),
                         a = out(vreg) _,
                         b = out(vreg) _,
                         options(nostack)
@@ -4894,6 +4940,52 @@ pub struct Blake3Setup {
 
 static RANKED_BLAKE3_LINCHECK: Blake3LincheckCircuit = Blake3LincheckCircuit;
 
+// ---- Lincheck comb prestage (ranked tail overlap) ----
+//
+// Registered as the `lincheck::set_comb_prestage_hook` producer while a
+// ranked reverse-lincheck prove is in flight (see the guard in
+// `prove_fast_inner`). Zerocheck's tri tail fires it with the URM fold point
+// and the claim point's inner coords the moment both are complete; the two
+// alpha-free walks below then run on idle pool threads for the rest of the
+// tail, and the lincheck entry reconstructs the fused comb from them
+// (`FLOCK_NO_LC_COMB_PRESTAGE=1` restores the fully inline branch).
+
+fn ranked_comb_walk(alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+    <Blake3LincheckCircuit as flock_core::lincheck::LincheckCircuit>::fold_alpha_batched(
+        &RANKED_BLAKE3_LINCHECK,
+        alpha,
+        eq_inner,
+    )
+}
+
+fn ranked_comb_prestage(z: flock_core::field::F128, inner: &[F128]) {
+    let eq = flock_core::lincheck::build_quirky_eq_table(z, inner, K_SKIP);
+    flock_core::lincheck::stage_comb_walks(z, inner, eq, ranked_comb_walk);
+}
+
+/// RAII unregister for the prestage hook. The speculative seed-pipe proof
+/// can run concurrently with a non-adopting timed proof, so the unregister
+/// only happens when the last registered prove finishes.
+struct CombPrestageGuard;
+
+static COMB_PRESTAGE_REFS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl CombPrestageGuard {
+    fn arm() -> Self {
+        COMB_PRESTAGE_REFS.fetch_add(1, std::sync::atomic::Ordering::Release);
+        flock_core::lincheck::set_comb_prestage_hook(Some(ranked_comb_prestage));
+        CombPrestageGuard
+    }
+}
+
+impl Drop for CombPrestageGuard {
+    fn drop(&mut self) {
+        if COMB_PRESTAGE_REFS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            flock_core::lincheck::set_comb_prestage_hook(None);
+        }
+    }
+}
+
 impl Blake3Setup {
     /// Build a setup for `n_blocks` BLAKE3 compressions with PCS
     /// `log_inv_rate = 1`.
@@ -5272,6 +5364,11 @@ impl Blake3Setup {
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
         let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+        // Lincheck comb prestage: register the producer for the ranked
+        // reverse-lincheck shape so zerocheck's tri tail can stage the two
+        // alpha-free circuit walks (see `ranked_comb_prestage`). The guard
+        // unregisters when the last in-flight prove finishes.
+        let _comb_prestage = self.use_ranked_reverse_lincheck().then(CombPrestageGuard::arm);
         // The padding rows force the same zero columns the CPU suffix skips
         // (`ZeroOddTailLanes`); the GPU commit graph is encoded during
         // witness generation, so publish them for the whole proof.
@@ -6836,6 +6933,47 @@ mod tests {
         check_split_quad_memory_form(false);
     }
 
+    /// The immediate-offset copy-out writes exactly the words the per-chunk
+    /// addressed loop wrote, for the a and b ranges of the copy drain and
+    /// edge ranges, and nothing else; zero, one and all-ones words included.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn copy_out_imm_matches_addressed_loop() {
+        const BLK: usize = K / 32;
+        const GUARD: usize = 16;
+        const W: usize = 4 * BLK + 2 * GUARD;
+        let mut rng = Rng::new(0x5eed_c0f7_0002);
+        let ranges = [(0, 61), (4, 59), (0, 64), (0, 0), (5, 6), (31, 33), (63, 64), (0, 32)];
+        for (round, &(g0, g1)) in ranges.iter().enumerate() {
+            let scratch: Vec<u32> = (0..4 * BLK)
+                .map(|i| match (i + round) % 9 {
+                    0 => 0,
+                    1 => 1,
+                    2 => u32::MAX,
+                    _ => rng.next_u32(),
+                })
+                .collect();
+            let fill = rng.next_u32();
+            let mut want = vec![fill; W];
+            let mut got = vec![fill; W];
+            unsafe {
+                witgen_simd::copy_out_loop(scratch.as_ptr(), want.as_mut_ptr().add(GUARD), g0, g1);
+                witgen_simd::copy_out_imm(scratch.as_ptr(), got.as_mut_ptr().add(GUARD), g0, g1);
+            }
+            assert_eq!(got, want, "chunks {g0}..{g1}");
+            for j in 0..4 {
+                for w in 0..BLK {
+                    let x = got[GUARD + j * BLK + w];
+                    if (8 * g0..8 * g1).contains(&w) {
+                        assert_eq!(x, scratch[j * BLK + w]);
+                    } else {
+                        assert_eq!(x, fill);
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn b_stage_tail_matches_incumbent_and_preserves_guards() {
@@ -7382,6 +7520,43 @@ mod tests {
         let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
         let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
         assert_eq!(expected, got_csc, "CSC fold mismatch");
+    }
+
+    /// The staged alpha-free walks reconstruct the fused comb walk of the
+    /// ranked circuit for random alpha and a real quirky eq table: with
+    /// `w_one = walk(1)`, `w_zero = walk(0)`, the identity
+    /// `walk(alpha) = alpha * (w_one + w_zero) + w_zero` must hold
+    /// column-for-column (exact GF(2^128) arithmetic).
+    #[test]
+    fn lincheck_comb_prestage_reconstructs_walk() {
+        use flock_core::lincheck::LincheckCircuit;
+
+        let mut rng = Rng::new(0x9EED_C0DE);
+        let f128 = |rng: &mut Rng| F128 {
+            lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+            hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+        };
+        for _case in 0..3 {
+            let z = f128(&mut rng);
+            let inner: Vec<F128> = (0..8).map(|_| f128(&mut rng)).collect();
+            let eq = flock_core::lincheck::build_quirky_eq_table(z, &inner, K_SKIP);
+            let w_one = ranked_comb_walk(F128::ONE, &eq);
+            let w_zero = ranked_comb_walk(F128::ZERO, &eq);
+            for _ in 0..4 {
+                let alpha = f128(&mut rng);
+                let expected = ranked_comb_walk(alpha, &eq);
+                let got: Vec<F128> = w_one
+                    .iter()
+                    .zip(w_zero.iter())
+                    .map(|(one, zero)| alpha * (*one + *zero) + *zero)
+                    .collect();
+                assert_eq!(expected, got, "staged reconstruction mismatch");
+            }
+            // The quirky table used by the tail fire is the same table the
+            // lincheck entry would build for these coords.
+            let rebuilt = flock_core::lincheck::build_quirky_eq_table(z, &inner, K_SKIP);
+            assert_eq!(eq, rebuilt, "quirky eq rebuild mismatch");
+        }
     }
 
     /// to `pack_z_lincheck_from_packed(z)`.
