@@ -1837,7 +1837,8 @@ fn ab_window_rows_plan() -> AbWindowRows {
     use kernels::aarch64 as k;
     use kernels::aarch64::bstatic_horner_window_rows_impl as rows;
     // The default instances: the main-pool Karatsuba rows and the helper
-    // rows. Every kill switch takes the plain instance (the same bytes).
+    // rows. Every kill switch takes the window's rows through the generic
+    // h4 kernel (the same bytes; build budget: no plain instance).
     const MAIN: u32 = k::AB_Z_VARIANT
         | k::ABV_INLINE_WINDOW
         | k::ABV_KARA_XOR16
@@ -1856,12 +1857,12 @@ fn ab_window_rows_plan() -> AbWindowRows {
         {
             rows::<MAIN, true>
         } else {
-            rows::<0, false>
+            k::bstatic_horner_window_rows_h4
         }
     } else if k::ab_hz_helper_enabled() && k::ab_horner2_enabled() {
         rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>
     } else {
-        rows::<0, false>
+        k::bstatic_horner_window_rows_h4
     }
 }
 
