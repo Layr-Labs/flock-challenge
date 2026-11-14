@@ -5540,157 +5540,6 @@ fn l0_factored_final3_prepared_row(
     ]
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
-#[inline(always)]
-unsafe fn l0_factored_final3_mul_pair(
-    c_lo: core::arch::aarch64::uint64x2_t,
-    c_hi: core::arch::aarch64::uint64x2_t,
-    c_mid: core::arch::aarch64::uint64x2_t,
-    b_lo: core::arch::aarch64::uint64x2_t,
-    b_hi: core::arch::aarch64::uint64x2_t,
-) -> [core::arch::aarch64::uint64x2_t; 2] {
-    use core::arch::aarch64::*;
-
-    #[inline(always)]
-    fn xor3_u64(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
-        unsafe { veor3q_u64(a, b, c) }
-    }
-
-    unsafe {
-        let b_mid = veorq_u64(b_lo, b_hi);
-        let p0_ll: uint64x2_t;
-        let p0_hh: uint64x2_t;
-        let p0_mm: uint64x2_t;
-        let p1_ll: uint64x2_t;
-        let p1_hh: uint64x2_t;
-        let p1_mm: uint64x2_t;
-        core::arch::asm!(
-            "pmull {ll0:v}.1q, {bl:v}.1d, {cl:v}.1d",
-            "pmull {hh0:v}.1q, {bh:v}.1d, {ch:v}.1d",
-            "pmull {mm0:v}.1q, {bm:v}.1d, {cm:v}.1d",
-            "pmull2 {ll1:v}.1q, {bl:v}.2d, {cl:v}.2d",
-            "pmull2 {hh1:v}.1q, {bh:v}.2d, {ch:v}.2d",
-            "pmull2 {mm1:v}.1q, {bm:v}.2d, {cm:v}.2d",
-            bl = in(vreg) b_lo,
-            bh = in(vreg) b_hi,
-            bm = in(vreg) b_mid,
-            cl = in(vreg) c_lo,
-            ch = in(vreg) c_hi,
-            cm = in(vreg) c_mid,
-            ll0 = out(vreg) p0_ll,
-            hh0 = out(vreg) p0_hh,
-            mm0 = out(vreg) p0_mm,
-            ll1 = out(vreg) p1_ll,
-            hh1 = out(vreg) p1_hh,
-            mm1 = out(vreg) p1_mm,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-
-        let c0 = xor3_u64(p0_mm, p0_ll, p0_hh);
-        let c1 = xor3_u64(p1_mm, p1_ll, p1_hh);
-
-        // Lane-paired (mul0, mul1) layout for each word position, identical
-        // to `ghash_mul_vec2_neon`:
-        //   r0 = ll_lo
-        //   r1 = ll_hi ^ cross_lo
-        //   r2 = hh_lo ^ cross_hi
-        //   r3 = hh_hi
-        let r0 = vzip1q_u64(p0_ll, p1_ll);
-        let ll_hi = vzip2q_u64(p0_ll, p1_ll);
-        let c_lo = vzip1q_u64(c0, c1);
-        let r1 = veorq_u64(ll_hi, c_lo);
-        let hh_lo = vzip1q_u64(p0_hh, p1_hh);
-        let c_hi = vzip2q_u64(c0, c1);
-        let r2 = veorq_u64(hh_lo, c_hi);
-        let r3 = vzip2q_u64(p0_hh, p1_hh);
-
-        // r3 is the high limb of a 64x64 product. Its bit 63 is zero.
-        let r2 = xor3_u64(r2, vshrq_n_u64::<62>(r3), vshrq_n_u64::<57>(r3));
-        let s1_lo = vshlq_n_u64::<1>(r2);
-        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
-        let s2_lo = vshlq_n_u64::<2>(r2);
-        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
-        let s7_lo = vshlq_n_u64::<7>(r2);
-        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
-
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-
-        let final_lo = veorq_u64(r0, t_lo);
-        let final_hi = veorq_u64(r1, t_hi);
-
-        [final_lo, final_hi]
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
-#[inline(always)]
-fn l0_factored_final3_pair_constants(
-    constants: L0FactoredFinal3Constants,
-) -> [[core::arch::aarch64::uint64x2_t; 2]; 3] {
-    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, vzip1q_u64, vzip2q_u64};
-    use crate::field::gf2_128::aarch64::const_prep;
-
-    // SAFETY: AES and the little-endian F128 lane layout are required.
-    unsafe {
-        let a = core::mem::transmute::<F128, uint64x2_t>(constants.a);
-        let e = core::mem::transmute::<F128, uint64x2_t>(constants.a_plus_d);
-        let d = const_prep(core::mem::transmute::<F128, uint64x2_t>(constants.d));
-        [
-            [vzip1q_u64(a, e), vzip2q_u64(a, e)],
-            [d.0, d.1],
-            [vdupq_n_u64(constants.b.lo), vdupq_n_u64(constants.b.hi)],
-        ]
-    }
-}
-
-/// The caller owns all eight row addresses. Read them before any retained
-/// store; each other row has disjoint addresses. AES, SHA3 and the F128
-/// little-endian limb layout are required by the compile guard.
-#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
-#[inline(always)]
-unsafe fn l0_factored_final3_pair_row(
-    ptr: *mut F128,
-    row: usize,
-    eighth: usize,
-    constants: [[core::arch::aarch64::uint64x2_t; 2]; 3],
-) {
-    use core::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64, vzip1q_u64, vzip2q_u64};
-    use crate::field::gf2_128::aarch64::mul_const_prep;
-
-    unsafe {
-        let [x0, x1, x2, x3, x4, x5, x6, x7]: [uint64x2_t; 8] =
-            core::array::from_fn(|i| vld1q_u64(ptr.add(row + i * eighth).cast::<u64>()));
-        let p0 = veorq_u64(x0, x1);
-        let p1 = veorq_u64(x2, x3);
-        let p2 = veorq_u64(x4, x5);
-        let p3 = veorq_u64(x6, x7);
-        let t2 = veorq_u64(p2, p3);
-        vst1q_u64(ptr.add(row).cast::<u64>(), veorq_u64(p0, veorq_u64(p1, t2)));
-
-        let z = mul_const_prep((constants[1][0], constants[1][1]), p2);
-        let xy = l0_factored_final3_mul_pair(
-            constants[0][0], constants[0][1], veorq_u64(constants[0][0], constants[0][1]),
-            vzip1q_u64(p1, p3), vzip2q_u64(p1, p3),
-        );
-        let x = vzip1q_u64(xy[0], xy[1]);
-        let y = vzip2q_u64(xy[0], xy[1]);
-        let q3 = veorq_u64(x, x3);
-        let q7 = veorq_u64(y, x7);
-        let t3 = veorq_u64(z, veorq_u64(x5, q7));
-        vst1q_u64(ptr.add(row + eighth).cast::<u64>(), veorq_u64(x1, veorq_u64(q3, t3)));
-
-        let uv = l0_factored_final3_mul_pair(
-            constants[2][0], constants[2][1], veorq_u64(constants[2][0], constants[2][1]),
-            vzip1q_u64(t2, t3), vzip2q_u64(t2, t3),
-        );
-        let u = vzip1q_u64(uv[0], uv[1]);
-        let v = vzip2q_u64(uv[0], uv[1]);
-        vst1q_u64(ptr.add(row + 2 * eighth).cast::<u64>(), veorq_u64(p1, veorq_u64(p3, u)));
-        vst1q_u64(ptr.add(row + 3 * eighth).cast::<u64>(), veorq_u64(q3, veorq_u64(q7, v)));
-    }
-}
-
 fn transpose_forward_ntt_factored_final_3layer_low_half(
     ntt: &AdditiveNttF128,
     data: &mut [F128],
@@ -5715,9 +5564,7 @@ fn transpose_forward_ntt_factored_final_3layer_low_half(
         a_plus_d: layer_2_twiddles[3],
         b: layer_1_twiddles[1],
     };
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
-    let constants = l0_factored_final3_pair_constants(constants);
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes", not(target_feature = "sha3"), target_endian = "little"))]
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
     let constants = {
         use core::arch::aarch64::uint64x2_t;
         use crate::field::gf2_128::aarch64::const_prep;
@@ -5734,18 +5581,13 @@ fn transpose_forward_ntt_factored_final_3layer_low_half(
         .for_each(|row| {
             unsafe {
                 let ptr = data_ptr as *mut F128;
-                #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
-                l0_factored_final3_pair_row(ptr, row, eighth, constants);
-                #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little")))]
-                {
-                    let values = core::array::from_fn(|i| *ptr.add(row + i * eighth));
-                    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
-                    let retained = l0_factored_final3_prepared_row(values, constants);
-                    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
-                    let retained = l0_factored_final3_retained_row(values, constants);
-                    for (i, value) in retained.into_iter().enumerate() {
-                        *ptr.add(row + i * eighth) = value;
-                    }
+                let values = core::array::from_fn(|i| *ptr.add(row + i * eighth));
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+                let retained = l0_factored_final3_prepared_row(values, constants);
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+                let retained = l0_factored_final3_retained_row(values, constants);
+                for (i, value) in retained.into_iter().enumerate() {
+                    *ptr.add(row + i * eighth) = value;
                 }
             }
         });
@@ -17479,89 +17321,6 @@ mod tests {
         )));
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_feature = "sha3", target_endian = "little"))]
-    #[test]
-    fn l0_factored_final3_pair_products_match_software() {
-        use crate::field::gf2_128::software;
-        struct Rng(u64);
-        impl Rng {
-            fn new(seed: u64) -> Self {
-                Self(seed)
-            }
-            fn next_u64(&mut self) -> u64 {
-                self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
-                let mut z = self.0;
-                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-                z ^ (z >> 31)
-            }
-            fn next_f128(&mut self) -> F128 {
-                F128 {
-                    lo: self.next_u64(),
-                    hi: self.next_u64(),
-                }
-            }
-        }
-
-
-        use core::arch::aarch64::{uint64x2_t, veorq_u64, vzip1q_u64, vzip2q_u64};
-
-        let check = |constants: [F128; 2], inputs: [F128; 2]| {
-            // SAFETY: AES and the little-endian F128 lane layout are enabled.
-            let actual = unsafe {
-                let pack = |pair: [F128; 2]| {
-                    let a = core::mem::transmute::<F128, uint64x2_t>(pair[0]);
-                    let b = core::mem::transmute::<F128, uint64x2_t>(pair[1]);
-                    [vzip1q_u64(a, b), vzip2q_u64(a, b)]
-                };
-                let [c_lo, c_hi] = pack(constants);
-                let [b_lo, b_hi] = pack(inputs);
-                let [lo, hi] = l0_factored_final3_mul_pair(
-                    c_lo, c_hi, veorq_u64(c_lo, c_hi), b_lo, b_hi,
-                );
-                [
-                    core::mem::transmute::<uint64x2_t, F128>(vzip1q_u64(lo, hi)),
-                    core::mem::transmute::<uint64x2_t, F128>(vzip2q_u64(lo, hi)),
-                ]
-            };
-            for lane in 0..2 {
-                assert_eq!(actual[lane], software::ghash_mul(constants[lane], inputs[lane]));
-            }
-        };
-        let basis = |bit: usize| {
-            if bit < 64 { F128::new(1 << bit, 0) } else { F128::new(0, 1 << (bit - 64)) }
-        };
-        let constants = [
-            F128::ZERO,
-            F128::ONE,
-            F128::new(1 << 63, 0),
-            F128::new(0, 1),
-            F128::new(0, 1 << 63),
-            F128::new(u64::MAX, u64::MAX),
-            F128::new(0x0123456789abcdef, 0xfedcba9876543210),
-        ];
-        for (i, &c) in constants.iter().enumerate() {
-            let different = [c, constants[(i + 3) % constants.len()]];
-            for bit in 0..128 {
-                let x = [basis(bit), basis(127 - bit)];
-                check(different, x);
-                check([different[1], different[0]], [x[1], x[0]]);
-                check([c; 2], x);
-                check([basis(bit), basis(127 - bit)], [c; 2]);
-            }
-            check(different, [F128::ZERO; 2]);
-            check(different, [F128::ONE; 2]);
-            check(different, [F128::new(u64::MAX, u64::MAX); 2]);
-        }
-        let mut rng = Rng::new(0x434f_4546_5041_4952);
-        for _ in 0..128 {
-            let c = [rng.next_f128(), rng.next_f128()];
-            let x = [rng.next_f128(), rng.next_f128()];
-            check(c, x);
-            check([c[1], c[0]], [x[1], x[0]]);
-        }
-    }
-
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
     #[test]
     fn l0_factored_final3_prepared_matches_software_butterflies() {
@@ -17589,10 +17348,6 @@ mod tests {
             let prepared = unsafe {
                 tw.map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t)))
             };
-            #[cfg(target_feature = "sha3")]
-            let paired = l0_factored_final3_pair_constants(L0FactoredFinal3Constants {
-                a: tw[0], d: tw[1], a_plus_d: tw[2], b: tw[3],
-            });
             let check = |values: [F128; 8]| {
                 let mut expected = values;
                 for layer in (0..3).rev() {
@@ -17609,25 +17364,6 @@ mod tests {
                     }
                 }
                 assert_eq!(l0_factored_final3_prepared_row(values, prepared).as_slice(), &expected[..4]);
-                #[cfg(target_feature = "sha3")]
-                for (eighth, row) in [(1usize, 0usize), (4, 2)] {
-                    let mut actual = vec![F128::new(0xfeed, 0xcafe); 8 * eighth + 2];
-                    for i in 0..8 {
-                        actual[1 + row + i * eighth] = values[i];
-                    }
-                    let mut expected_storage = actual.clone();
-                    for i in 0..4 {
-                        expected_storage[1 + row + i * eighth] = expected[i];
-                    }
-                    unsafe {
-                        l0_factored_final3_pair_row(actual.as_mut_ptr().add(1), row, eighth, paired);
-                    }
-                    assert_eq!(actual, expected_storage, "paired row stride={eighth} row={row}");
-                }
-                let mut selected = values;
-                transpose_forward_ntt_factored_final_3layer_low_half(&ntt, &mut selected, 3);
-                assert_eq!(&selected[..4], &expected[..4], "selected tail route");
-                assert_eq!(&selected[4..], &values[4..], "discarded-half write");
             };
             check([F128::ZERO; 8]);
             check([F128::ONE; 8]);
