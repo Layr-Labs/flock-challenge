@@ -415,68 +415,10 @@ fn lc_gpu_wake_at2() -> u32 {
     *AT2
 }
 
-/// Lincheck GPU wake off the transcript spine (`FLOCK_NO_LC_WAKE_POST=1`,
-/// exact `1`, kills; read once). Each wake's command-buffer build and commit
-/// ran inline on the zerocheck thread between two tail passes while every
-/// other core waited for the next pass's queue: 0.12 ms for the first wake
-/// (it also pays, in every timed prove, the first-use allocation of the
-/// wake's two scratch buffers) and 0.05 ms for the second (M1 Max tmarks).
-/// A persistent poster thread, spawned by the first arm (the untimed warmup
-/// prove), now runs [`imp::lc_gpu_wake`]; the spine only bumps a counter
-/// and unparks it.
-/// The wake touches no prove buffer and nothing waits on it, so every proof
-/// byte is unchanged: only the thread that submits the one-threadgroup
-/// kernel moves, and its commit lands tens of microseconds later, still
-/// ~1.7 ms (first wake) and ~0.2 ms (second) ahead of the lincheck launch.
-pub const ENV_NO_LC_WAKE_POST: &str = "FLOCK_NO_LC_WAKE_POST";
-
-/// Wakes posted to the poster thread and not yet submitted.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-static LC_WAKE_POSTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// The wake poster thread, or `None` (kill switch, spawn failure), in which
-/// case the wake runs inline as before. A post is one counter increment and
-/// one `unpark`; the poster drains the counter, so a post that races its
-/// `park` is never lost (`unpark` before `park` makes `park` return).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn lc_wake_poster() -> Option<&'static std::thread::Thread> {
-    static POSTER: std::sync::OnceLock<Option<std::thread::Thread>> = std::sync::OnceLock::new();
-    POSTER
-        .get_or_init(|| {
-            if std::env::var(ENV_NO_LC_WAKE_POST).is_ok_and(|v| v == "1") {
-                return None;
-            }
-            std::thread::Builder::new()
-                .name("flock-lc-wake".into())
-                .spawn(|| {
-                    // Same class as the prover's own workers, so a post made
-                    // while every core is busy is scheduled promptly.
-                    crate::set_calling_thread_prover_qos();
-                    loop {
-                        let n = LC_WAKE_POSTED.swap(0, std::sync::atomic::Ordering::AcqRel);
-                        for _ in 0..n {
-                            imp::lc_gpu_wake();
-                        }
-                        if n == 0 {
-                            std::thread::park();
-                        }
-                    }
-                })
-                .ok()
-                .map(|handle| handle.thread().clone())
-        })
-        .as_ref()
-}
-
 /// Arm (or, with `false`, disarm) the lincheck GPU wake for this prove.
 pub fn lc_gpu_wake_arm(on: bool) {
     if !on {
         lc_gpu_wake_fire(100);
-    }
-    // The first arm is the warmup prove's: spawn the poster there, untimed.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if on && lc_gpu_wake_enabled() {
-        let _ = lc_wake_poster();
     }
     LC_GPU_WAKE_ARMED.store(on && lc_gpu_wake_enabled(), std::sync::atomic::Ordering::Relaxed);
     LC_GPU_WAKE_ARMED2.store(
@@ -501,13 +443,7 @@ pub(crate) fn lc_gpu_wake_fire(point: u32) {
     }
     crate::tmark::mark(if first { "lc wake fired" } else { "lc wake2 fired" });
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    match lc_wake_poster() {
-        Some(poster) => {
-            LC_WAKE_POSTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            poster.unpark();
-        }
-        None => imp::lc_gpu_wake(),
-    }
+    imp::lc_gpu_wake();
 }
 
 pub(crate) fn gpu_lincheck_enabled() -> bool {
@@ -1907,40 +1843,6 @@ pub unsafe fn begin_from_z_first_pass_stream(
 ) -> Option<FromZFirstPassStream> {
     unsafe { imp::begin_from_z_first_pass_stream(z_ptr, z_len, params) }
         .map(|inner| FromZFirstPassStream { inner })
-}
-
-/// Streamed first-pass warm (`FLOCK_NO_STREAM_WARM=1`, exact `1`, kills; read
-/// once). The warmup prove runs the commit graph on the latched buffers but
-/// never the streamed first pass (the stream needs the latch, which that
-/// prove is still deciding), so every timed prove, being the first prove of a
-/// fresh worker process, ran its ten witness bands as that pass's first
-/// production execution: on an M1 Max ~24 ms of GPU busy time instead of
-/// ~16 ms, which pushes the commit graph (cb2) ~9-10 ms later. Running the
-/// same band kernel once over the latched z wrap and staging buffer at the
-/// end of the warmup (untimed; the warmup's z and staging hold the warmup's
-/// own values, and every staging position the timed bands read is rewritten
-/// by them first) removes that: root ready -9 ms, proof -4.9 ms median on
-/// the M1 Max (16 pairs), with no change to any proof byte. The effect is
-/// per address range (warming half the range speeds half the bands); GPU
-/// clocks, paging and buffer residency were ruled out. ~25 ms of GPU time per
-/// worker warmup.
-pub const ENV_NO_STREAM_WARM: &str = "FLOCK_NO_STREAM_WARM";
-
-/// Run the streamed first-pass band kernel once over the latched buffers
-/// (see [`ENV_NO_STREAM_WARM`]). Untimed warmup only; a no-op off the ranked
-/// GPU shape, without a latched commit, while staging is leased, or killed.
-pub fn warm_streamed_first_pass(params: &crate::pcs::commit::PcsParams) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| !std::env::var(ENV_NO_STREAM_WARM).is_ok_and(|v| v == "1"));
-    if !on
-        || !gpu_commit_enabled()
-        || !is_ranked_gpu_shape(params)
-        || std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
-    {
-        return;
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    imp::warm_streamed_first_pass(params.k_code());
 }
 
 impl FromZFirstPassStream {
@@ -9456,45 +9358,6 @@ kernel void blake3_pow_scan(
                 STAGING_IN_USE.store(false, std::sync::atomic::Ordering::Release);
             }
         }
-    }
-
-    /// Body of [`super::warm_streamed_first_pass`]: one full-range dispatch of
-    /// the band kernel over the latched z wrap into the staging buffer.
-    pub(crate) fn warm_streamed_first_pass(log_d: usize) {
-        use std::sync::atomic::Ordering;
-        let Ok(gpu) = gpu() else { return };
-        let latch = latch_lock();
-        let LatchState::On(state) = &*latch else {
-            return;
-        };
-        let Some(&(_, _, z_buf)) = state.wraps.first() else {
-            return;
-        };
-        if STAGING_IN_USE.swap(true, Ordering::Acquire) {
-            return;
-        }
-        let total_r = 1usize << (log_d - 4);
-        unsafe {
-            let pool = gpu.pool_push();
-            let _ = (|| -> Result<(), String> {
-                let cb = gpu.command_buffer()?;
-                let enc = gpu.compute_encoder(cb)?;
-                FromZFirstPassPlan::new(log_d).encode_range(
-                    gpu,
-                    enc,
-                    state.staging,
-                    state.tw_buf,
-                    z_buf,
-                    log_d,
-                    0,
-                    total_r,
-                );
-                gpu.end_encoding(enc);
-                gpu.commit_and_wait(cb)
-            })();
-            gpu.pool_pop(pool);
-        }
-        STAGING_IN_USE.store(false, Ordering::Release);
     }
 
     pub(crate) unsafe fn begin_from_z_first_pass_stream(
