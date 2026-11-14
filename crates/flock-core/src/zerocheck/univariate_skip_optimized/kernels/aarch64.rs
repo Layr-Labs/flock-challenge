@@ -2476,6 +2476,32 @@ fn static_a_k1_partial(inv_table: &InvNttTableByteSingleGf8) -> &'static [u8; 64
     })
 }
 
+/// The form a kill-switch instance of [`shift_reduce_inner_mixed_const_b_h4`]
+/// runs instead of its own body (outside the tests): `1` for the Karatsuba
+/// forms the dispatcher reaches only under a switch (`ABV_KARA`,
+/// `ABV_KARA | ABV_KARA_UNSCALED`, `AB_Z_VARIANT`, `AB_Z_VARIANT |
+/// ABV_KARA_XOR16 | ABV_KARA_SLOT | ABV_Z_MT`), `2` for the plain apply, `0`
+/// for every other instance (its own body). Only the dispatcher's two mask
+/// arms without the static K1 A word are concerned: mask `0x03` with the low
+/// A form and mask `0xf0`.
+#[cfg(target_arch = "aarch64")]
+const fn mixed_row_switch_form(one_mask: u8, static_a: bool, a_low5_k: u8, v: u32) -> u8 {
+    let arm = !static_a && ((one_mask == 0x03 && a_low5_k == 0x03) || (one_mask == 0xf0 && a_low5_k == 0));
+    if cfg!(test) || !arm {
+        0
+    } else if v == ABV_KARA
+        || v == ABV_KARA | ABV_KARA_UNSCALED
+        || v == AB_Z_VARIANT
+        || v == AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_KARA_SLOT | ABV_Z_MT
+    {
+        1
+    } else if v == 0 {
+        2
+    } else {
+        0
+    }
+}
+
 /// Horner / scaled-table twin of [`shift_reduce_inner_mixed_const_b`]. Rows
 /// selected by `ONE_MASK` have B = 1 and therefore widen the transformed A
 /// bytes directly; all other rows form the same raw PMULL products as the h4
@@ -2500,6 +2526,29 @@ fn shift_reduce_inner_mixed_const_b_h4<
 ) {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
+
+    // Kill-switch forms of the dispatcher's mixed rows (build budget): the
+    // Karatsuba forms without the full z form (`FLOCK_NO_ZC_AB_KARA_UNSCALED`,
+    // `FLOCK_NO_ZC_AB_Z`, `FLOCK_NO_ZC_AB_KARA_XOR16`, the opt-in
+    // `FLOCK_ZC_AB_Z_MT`) run the production z form `AB_Z_VARIANT |
+    // ABV_KARA_XOR16`, and the plain apply (`FLOCK_NO_ZC_AB_MIXED_HZ`) runs
+    // the half-pair form `ABV_HZ`, each with the same mask and A form: the
+    // same rows, the same bytes, no instance of their own. The tests keep
+    // every form, to compare them.
+    // Each such instance stays a function of its own (its form word passes
+    // an optimisation barrier), so the dispatcher's calls are unchanged.
+    if const { mixed_row_switch_form(ONE_MASK, STATIC_A, A_LOW5_K, V) == 1 } {
+        core::hint::black_box(V);
+        return shift_reduce_inner_mixed_const_b_h4::<ONE_MASK, false, A_LOW5_K, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
+            a_packed, b_packed, inv_table, byte_base_b, a_k1_partial, out, nt_store,
+        );
+    }
+    if const { mixed_row_switch_form(ONE_MASK, STATIC_A, A_LOW5_K, V) == 2 } {
+        core::hint::black_box(V);
+        return shift_reduce_inner_mixed_const_b_h4::<ONE_MASK, false, A_LOW5_K, { ABV_HZ }>(
+            a_packed, b_packed, inv_table, byte_base_b, a_k1_partial, out, nt_store,
+        );
+    }
 
     let plain = inv_table.data_ptr();
     let plain_sw = inv_table.half_swapped_data_ptr();
@@ -3191,6 +3240,17 @@ fn shift_reduce_inner_mixed_const_b<const ONE_MASK: u8>(
 ) {
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
+
+    // The dispatcher reaches this kernel only with `FLOCK_NO_FAST_SHIFT_REDUCE`
+    // (build budget): outside the tests it runs its Horner twin with the
+    // plain apply and no A assumption, the same row bytes, and builds no
+    // body of its own.
+    if const { !cfg!(test) } {
+        core::hint::black_box(ONE_MASK);
+        return shift_reduce_inner_mixed_const_b_h4::<ONE_MASK, false, 0, 0>(
+            a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
+        );
+    }
 
     let table_base = inv_table.data_ptr();
     let half_swapped_table_base = inv_table.half_swapped_data_ptr();

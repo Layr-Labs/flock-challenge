@@ -1123,11 +1123,16 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
     }
 }
 
-/// Per-row entry: runs the Horner static-B body of arm `(w, b_med)` and
-/// returns `true`, or returns `false` when the arm has no plan (the caller
-/// then runs another kernel).
+/// Per-row entry for arm `(w, b_med)`: returns `false` when the arm has no
+/// static-B plan (the caller then runs another kernel), otherwise writes the
+/// row and returns `true`. A planned row reaches this entry only when no
+/// window run covers it, which takes a kill switch
+/// (`FLOCK_NO_ZC_AB_PRE_NT_DIRECT`); it is written by the generic h4 kernel,
+/// whose bytes the Horner body reproduces for any B (build budget: no
+/// per-row Horner instance).
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 pub(crate) fn shift_reduce_inner_ab_bstatic_horner(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -1139,38 +1144,14 @@ pub(crate) fn shift_reduce_inner_ab_bstatic_horner(
     out: &mut [u8; 64],
     nt_store: bool,
 ) -> bool {
-    if w > 1 || b_med >= 16 {
+    // The plans' partials stay an argument of the entry (callers unchanged).
+    core::hint::black_box(partials);
+    if w > 1 || b_med >= 16 || !(3..=28).contains(&(w * 16 + b_med)) {
         return false;
     }
-    match w * 16 + b_med {
-        3 => bstatic_horner_blk::<3, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        4 => bstatic_horner_blk::<4, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        5 => bstatic_horner_blk::<5, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        6 => bstatic_horner_blk::<6, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        7 => bstatic_horner_blk::<7, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        8 => bstatic_horner_blk::<8, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        9 => bstatic_horner_blk::<9, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        10 => bstatic_horner_blk::<10, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        11 => bstatic_horner_blk::<11, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        12 => bstatic_horner_blk::<12, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        13 => bstatic_horner_blk::<13, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        14 => bstatic_horner_blk::<14, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        15 => bstatic_horner_blk::<15, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        16 => bstatic_horner_blk::<16, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        17 => bstatic_horner_blk::<17, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        18 => bstatic_horner_blk::<18, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        19 => bstatic_horner_blk::<19, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        20 => bstatic_horner_blk::<20, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        21 => bstatic_horner_blk::<21, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        22 => bstatic_horner_blk::<22, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        23 => bstatic_horner_blk::<23, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        24 => bstatic_horner_blk::<24, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        25 => bstatic_horner_blk::<25, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        26 => bstatic_horner_blk::<26, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        27 => bstatic_horner_blk::<27, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        28 => bstatic_horner_blk::<28, 0>(a_packed, b_packed, inv_table, chunk_byte_base, partials, core::ptr::null(), out, nt_store),
-        _ => return false,
-    }
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
+    bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, out, nt_store);
     true
 }
 
@@ -1287,6 +1268,35 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u32, const HOIST: bool>(
     }
 }
 
+/// The rows of [`bstatic_horner_window_rows_impl`] (window `w`, rows
+/// [`BSTATIC_HORNER_WINDOW_ROWS`]) through the generic h4 kernel, one call
+/// per row with the row's own bounds check: the same rows and bytes without
+/// the static-B plans. The window-rows plan gives it to the kill-switch arms
+/// of the static-B forms (build budget: no plain window-rows instance).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) fn bstatic_horner_window_rows_h4(
+    w: usize,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    partials: &'static [[u8; 64]; 248],
+    out_outer: &mut [u8],
+    nt_store: bool,
+) {
+    let _ = partials;
+    assert!(w <= 1 && out_outer.len() >= 16 * 64);
+    let (lo, hi) = BSTATIC_HORNER_WINDOW_ROWS[w];
+    for b_med in lo..hi {
+        let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+        assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
+        let dst: &mut [u8; 64] = (&mut out_outer[b_med * 64..(b_med + 1) * 64]).try_into().expect("one row");
+        bstatic_horner_fallback(a_packed, b_packed, inv_table, chunk_byte_base, b_med, dst, nt_store);
+    }
+}
+
 /// Kill switch for the fixed store flavour of the unit window rows: any
 /// value of `FLOCK_NO_ZC_AB_ROWS_NT_CONST` makes every row of a
 /// [`bstatic_horner_window_unit_impl`] call test `nt_store` again. Read
@@ -1305,10 +1315,11 @@ static AB_ROWS_NT_CONST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// `chunk_byte_base + i * 1 KiB` with `partials[w]` and gets the rows, the
 /// checks and the stores of one [`bstatic_horner_window_rows_impl`] call
 /// with those arguments. The table pointer is fetched once per call.
-/// `nt_store` is the same for every row of the call: it picks the instance
-/// of [`bstatic_horner_window_unit_nt`] for that flavour once, or with
-/// `FLOCK_NO_ZC_AB_ROWS_NT_CONST` set every row tests it
-/// ([`bstatic_horner_window_unit_flag`]).
+/// `nt_store` is the same for every row of the call: non-temporal stores
+/// pick the instance of [`bstatic_horner_window_unit_nt`] once; cached
+/// stores (only with `FLOCK_NO_ZC_AB_PRE_NT` set) and
+/// `FLOCK_NO_ZC_AB_ROWS_NT_CONST` take the per-chunk rows, every row testing
+/// it (the bytes of [`bstatic_horner_window_unit_flag`]).
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
@@ -1374,8 +1385,12 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                 )
             }
         }
-        Some(true) => bstatic_horner_window_unit_nt::<V, HOIST, false>(
-            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+        // Cached stores: every caller passes `nt_store = true` unless
+        // `FLOCK_NO_ZC_AB_PRE_NT` is set (kill switch only, build budget).
+        // The per-chunk rows write the same bytes; no cached-store unit
+        // instance.
+        Some(true) => bstatic_horner_window_unit_per_chunk::<V, HOIST>(
+            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, false,
         ),
         Some(false) => bstatic_horner_window_unit_per_chunk::<V, HOIST>(
             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, nt_store,
