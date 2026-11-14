@@ -4940,6 +4940,52 @@ pub struct Blake3Setup {
 
 static RANKED_BLAKE3_LINCHECK: Blake3LincheckCircuit = Blake3LincheckCircuit;
 
+// ---- Lincheck comb prestage (ranked tail overlap) ----
+//
+// Registered as the `lincheck::set_comb_prestage_hook` producer while a
+// ranked reverse-lincheck prove is in flight (see the guard in
+// `prove_fast_inner`). Zerocheck's tri tail fires it with the URM fold point
+// and the claim point's inner coords the moment both are complete; the two
+// alpha-free walks below then run on idle pool threads for the rest of the
+// tail, and the lincheck entry reconstructs the fused comb from them
+// (`FLOCK_NO_LC_COMB_PRESTAGE=1` restores the fully inline branch).
+
+fn ranked_comb_walk(alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+    <Blake3LincheckCircuit as flock_core::lincheck::LincheckCircuit>::fold_alpha_batched(
+        &RANKED_BLAKE3_LINCHECK,
+        alpha,
+        eq_inner,
+    )
+}
+
+fn ranked_comb_prestage(z: flock_core::field::F128, inner: &[F128]) {
+    let eq = flock_core::lincheck::build_quirky_eq_table(z, inner, K_SKIP);
+    flock_core::lincheck::stage_comb_walks(z, inner, eq, ranked_comb_walk);
+}
+
+/// RAII unregister for the prestage hook. The speculative seed-pipe proof
+/// can run concurrently with a non-adopting timed proof, so the unregister
+/// only happens when the last registered prove finishes.
+struct CombPrestageGuard;
+
+static COMB_PRESTAGE_REFS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl CombPrestageGuard {
+    fn arm() -> Self {
+        COMB_PRESTAGE_REFS.fetch_add(1, std::sync::atomic::Ordering::Release);
+        flock_core::lincheck::set_comb_prestage_hook(Some(ranked_comb_prestage));
+        CombPrestageGuard
+    }
+}
+
+impl Drop for CombPrestageGuard {
+    fn drop(&mut self) {
+        if COMB_PRESTAGE_REFS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            flock_core::lincheck::set_comb_prestage_hook(None);
+        }
+    }
+}
+
 impl Blake3Setup {
     /// Build a setup for `n_blocks` BLAKE3 compressions with PCS
     /// `log_inv_rate = 1`.
@@ -5318,6 +5364,11 @@ impl Blake3Setup {
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
         let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+        // Lincheck comb prestage: register the producer for the ranked
+        // reverse-lincheck shape so zerocheck's tri tail can stage the two
+        // alpha-free circuit walks (see `ranked_comb_prestage`). The guard
+        // unregisters when the last in-flight prove finishes.
+        let _comb_prestage = self.use_ranked_reverse_lincheck().then(CombPrestageGuard::arm);
         // The padding rows force the same zero columns the CPU suffix skips
         // (`ZeroOddTailLanes`); the GPU commit graph is encoded during
         // witness generation, so publish them for the whole proof.
@@ -7469,6 +7520,43 @@ mod tests {
         let csc = flock_core::lincheck::CscCircuit::from_matrices(&a_0, &b_0);
         let got_csc = csc.fold_alpha_batched(alpha, &eq_inner);
         assert_eq!(expected, got_csc, "CSC fold mismatch");
+    }
+
+    /// The staged alpha-free walks reconstruct the fused comb walk of the
+    /// ranked circuit for random alpha and a real quirky eq table: with
+    /// `w_one = walk(1)`, `w_zero = walk(0)`, the identity
+    /// `walk(alpha) = alpha * (w_one + w_zero) + w_zero` must hold
+    /// column-for-column (exact GF(2^128) arithmetic).
+    #[test]
+    fn lincheck_comb_prestage_reconstructs_walk() {
+        use flock_core::lincheck::LincheckCircuit;
+
+        let mut rng = Rng::new(0x9EED_C0DE);
+        let f128 = |rng: &mut Rng| F128 {
+            lo: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+            hi: ((rng.next_u32() as u64) << 32) | rng.next_u32() as u64,
+        };
+        for _case in 0..3 {
+            let z = f128(&mut rng);
+            let inner: Vec<F128> = (0..8).map(|_| f128(&mut rng)).collect();
+            let eq = flock_core::lincheck::build_quirky_eq_table(z, &inner, K_SKIP);
+            let w_one = ranked_comb_walk(F128::ONE, &eq);
+            let w_zero = ranked_comb_walk(F128::ZERO, &eq);
+            for _ in 0..4 {
+                let alpha = f128(&mut rng);
+                let expected = ranked_comb_walk(alpha, &eq);
+                let got: Vec<F128> = w_one
+                    .iter()
+                    .zip(w_zero.iter())
+                    .map(|(one, zero)| alpha * (*one + *zero) + *zero)
+                    .collect();
+                assert_eq!(expected, got, "staged reconstruction mismatch");
+            }
+            // The quirky table used by the tail fire is the same table the
+            // lincheck entry would build for these coords.
+            let rebuilt = flock_core::lincheck::build_quirky_eq_table(z, &inner, K_SKIP);
+            assert_eq!(eq, rebuilt, "quirky eq rebuild mismatch");
+        }
     }
 
     /// to `pack_z_lincheck_from_packed(z)`.

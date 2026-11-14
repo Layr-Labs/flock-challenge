@@ -1788,7 +1788,189 @@ fn prove_padded_capture_with_mode<Ch: Challenger>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prove_padded_inner<Ch: Challenger>(
+// ---------------------------------------------------------------------------
+// Comb prestage (ranked tail overlap)
+// ---------------------------------------------------------------------------
+//
+// The lincheck comb branch is `alpha * (A_0^T eq) + (B_0^T eq)` over the
+// quirky eq table of the first `k_log - k_skip` mlv bind challenges. At the
+// ranked shape those challenges are complete right after zerocheck's tri
+// pass 0 lookahead eval (they are bound by the big rounds), while the table
+// itself only needs the URM fold point `z` — both available ~1 ms before
+// the zerocheck tail ends, on a spine where the shrinking tri folds and the
+// serial loop rounds leave most pool threads idle.
+//
+// `alpha`, by contrast, is the first post-zerocheck sample, so the walk
+// itself cannot start early. But the walk is affine in alpha:
+// `walk(alpha_hat) = alpha_hat * u + v` with `u = A_0^T eq`, `v = B_0^T eq`.
+// Staging the two alpha-free evaluations `w_one = u + v` (alpha_hat = 1) and
+// `w_zero = v` (alpha_hat = 0) on idle pool threads lets the lincheck entry
+// reconstruct `comb = alpha * (w_one + w_zero) + w_zero` — bit-identical to
+// the fused walk (GF(2^128) arithmetic is exact) — off the critical path.
+// Every fallback (no staging, key mismatch, walk not finished in time, pool
+// too small, `FLOCK_NO_LC_COMB_PRESTAGE=1`) takes the incumbent branch.
+
+type CombPrestageFn = fn(F128, &[F128]);
+
+static COMB_PRESTAGE_HOOK: std::sync::Mutex<Option<CombPrestageFn>> = std::sync::Mutex::new(None);
+
+/// Kill switch for the staged comb walks (`FLOCK_NO_LC_COMB_PRESTAGE=1`).
+pub fn lc_comb_prestage_enabled() -> bool {
+    std::env::var_os("FLOCK_NO_LC_COMB_PRESTAGE").is_none()
+}
+
+/// Register the circuit-specific prestage producer. Called by the ranked
+/// BLAKE3 driver around each prove; `None` unregisters.
+pub fn set_comb_prestage_hook(f: Option<CombPrestageFn>) {
+    if let Ok(mut guard) = COMB_PRESTAGE_HOOK.lock() {
+        *guard = f;
+    }
+}
+
+/// Fire the registered prestage producer, if any (zerocheck tail).
+pub(crate) fn fire_comb_prestage(z: F128, inner: &[F128]) {
+    if !lc_comb_prestage_enabled() {
+        return;
+    }
+    if let Ok(guard) = COMB_PRESTAGE_HOOK.lock() {
+        if let Some(f) = *guard {
+            f(z, inner);
+        }
+    }
+}
+
+struct CombStashState {
+    w_one: Option<Vec<F128>>,
+    w_zero: Option<Vec<F128>>,
+}
+
+struct CombStash {
+    z: F128,
+    inner: Vec<F128>,
+    eq: Vec<F128>,
+    state: std::sync::Mutex<CombStashState>,
+    cv: std::sync::Condvar,
+}
+
+static COMB_STASH: std::sync::Mutex<Option<std::sync::Arc<CombStash>>> =
+    std::sync::Mutex::new(None);
+
+/// Stage the two alpha-free comb walks against `eq` (already built for
+/// `(z, inner)`), spawned as two pool tasks. Returns false when staging is
+/// disabled or the pool has too few threads to run both walks beside the
+/// blocked consumer (the consumer occupies one worker while waiting).
+pub fn stage_comb_walks(
+    z: F128,
+    inner: &[F128],
+    eq: Vec<F128>,
+    walk: fn(F128, &[F128]) -> Vec<F128>,
+) -> bool {
+    if !lc_comb_prestage_enabled() {
+        return false;
+    }
+    // The consumer blocks one worker on the condvar; both walks need two
+    // more. Below four threads the staging could stall the pool's progress.
+    if rayon::current_num_threads() < 4 {
+        return false;
+    }
+    let cell = std::sync::Arc::new(CombStash {
+        z,
+        inner: inner.to_vec(),
+        eq,
+        state: std::sync::Mutex::new(CombStashState { w_one: None, w_zero: None }),
+        cv: std::sync::Condvar::new(),
+    });
+    let mut stash = match COMB_STASH.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    *stash = Some(cell.clone());
+    drop(stash);
+    let one = cell.clone();
+    rayon::spawn(move || {
+        let w = walk(F128::ONE, &one.eq);
+        let mut g = one.state.lock().unwrap();
+        g.w_one = Some(w);
+        drop(g);
+        one.cv.notify_all();
+    });
+    let zero = cell.clone();
+    rayon::spawn(move || {
+        let w = walk(F128::ZERO, &zero.eq);
+        let mut g = zero.state.lock().unwrap();
+        g.w_zero = Some(w);
+        drop(g);
+        zero.cv.notify_all();
+    });
+    true
+}
+
+/// Bound on how long the lincheck entry may wait for the staged walks. The
+/// walks are single-thread circuit evaluations (a few ms even on slow
+/// cores); the bound only guards against a pathological scheduler stall,
+/// after which the incumbent branch recomputes exactly.
+const COMB_STASH_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Take the staged comb walks if their key matches this lincheck invocation.
+/// Returns `(comb_vec, eq_inner)` with `comb[i] = alpha * (w_one[i] +
+/// w_zero[i]) + w_zero[i]`, plus the staged eq table (bit-identical to
+/// `build_quirky_eq_table(z, inner, k_skip)` by construction).
+pub(crate) fn take_staged_comb(
+    alpha: F128,
+    z: F128,
+    inner: &[F128],
+    expected_eq_len: usize,
+) -> Option<(Vec<F128>, Vec<F128>)> {
+    if !lc_comb_prestage_enabled() {
+        return None;
+    }
+    let cell = match COMB_STASH.lock() {
+        Ok(mut guard) => guard.take()?,
+        Err(_) => return None,
+    };
+    if cell.z != z
+        || cell.inner.as_slice() != inner
+        || cell.eq.len() != expected_eq_len
+    {
+        return None;
+    }
+    let mut g = match cell.state.lock() {
+        Ok(g) => g,
+        Err(_) => return None,
+    };
+    let start = std::time::Instant::now();
+    loop {
+        if g.w_one.is_some() && g.w_zero.is_some() {
+            break;
+        }
+        let elapsed = start.elapsed();
+        if elapsed >= COMB_STASH_WAIT {
+            return None;
+        }
+        match cell.cv.wait_timeout(g, COMB_STASH_WAIT - elapsed) {
+            Ok((ng, _)) => g = ng,
+            Err(_) => return None,
+        }
+    }
+    let w_one = g.w_one.take().expect("checked Some above");
+    let w_zero = g.w_zero.take().expect("checked Some above");
+    drop(g);
+    let full_len = w_zero.len();
+    let mut comb = w_one;
+    // comb = alpha * (w_one + w_zero) + w_zero; addition is XOR in char 2.
+    for (c, v0) in comb.iter_mut().zip(w_zero.iter()) {
+        *c = alpha * (*c + *v0) + *v0;
+    }
+    crate::scratch::give_lincheck_acc(w_zero, full_len);
+    // The spawned tasks usually finished (and dropped their Arc clones)
+    // before the consumer wakes; unwrap moves the table without a copy.
+    let eq = std::sync::Arc::try_unwrap(cell)
+        .map(|c| c.eq)
+        .unwrap_or_else(|arc| arc.eq.clone());
+    Some((comb, eq))
+}
+
+fn prove_padded_inner<C: Challenger>(
     z_packed: &[u8],
     m: usize,
     k_log: usize,
@@ -1798,7 +1980,7 @@ fn prove_padded_inner<Ch: Challenger>(
     x_ab: &QuirkyPoint,
     capture_before_round: Option<usize>,
     canonical: Option<&mut Option<Vec<F128>>>,
-    challenger: &mut Ch,
+    challenger: &mut C,
 ) -> (LincheckProof, LincheckClaim, Option<Vec<F128>>) {
     prove_padded_inner_with_round0(
         z_packed, m, k_log, k_skip, useful_bits, circuit, x_ab,
@@ -1856,24 +2038,30 @@ fn prove_padded_inner_with_round0<Ch: Challenger>(
         } else {
             None
         };
-        let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+        // Staged alpha-free walks from the zerocheck tail (see
+        // `stage_comb_walks`): if the key matches, reconstruct the fused
+        // walk's result from `w_one`/`w_zero` instead of re-walking the
+        // circuit. Bit-identical by exactness of the affine split.
+        let (mut comb_vec, eq_inner) =
+            match take_staged_comb(alpha, x_ab.z_skip, &x_ab.x_inner_rest, circuit.n_cols()) {
+                Some((comb, eq)) => (comb, eq),
+                None => {
+                    let eq_inner = build_quirky_eq_table(x_ab.z_skip, &x_ab.x_inner_rest, k_skip);
+                    if let Some(t) = t {
+                        eprintln!(
+                            "[lc] {:<26} {:>7.2} ms",
+                            "build_quirky_eq",
+                            t.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    let comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
+                    (comb_vec, eq_inner)
+                }
+            };
         if let Some(t) = t {
             eprintln!(
                 "[lc] {:<26} {:>7.2} ms",
-                "build_quirky_eq",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        let t = if trace {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut comb_vec = circuit.fold_alpha_batched(alpha, &eq_inner);
-        if let Some(t) = t {
-            eprintln!(
-                "[lc] {:<26} {:>7.2} ms",
-                "fold_alpha_batched",
+                "comb branch (staged or walk)",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -2305,6 +2493,46 @@ pub(crate) mod canonical_ab_oracle {
 mod tests {
     use super::*;
     use crate::challenger::FsChallenger;
+
+    /// Affine stand-in walk for the prestage machinery test:
+    /// `f(alpha) = alpha * u + v` with `u = e^2`, `v = e`.
+    fn affine_test_walk(alpha: F128, eq: &[F128]) -> Vec<F128> {
+        eq.iter().map(|e| alpha * (*e * *e) + *e).collect()
+    }
+
+    /// The staged alpha-free walks reconstruct the fused walk for any alpha,
+    /// with the key checks rejecting mismatches. Staging requires a pool with
+    /// at least four threads; on smaller hosts this covers only the fallback
+    /// (the rig's 10-thread worker gates exercise the staged path).
+    #[test]
+    fn staged_comb_reconstructs_fused_walk() {
+        let mut rng = Rng::new(0xC0FF_EE11);
+        for case in 0..4 {
+            let z = rng.f128();
+            let inner: Vec<F128> = (0..8).map(|_| rng.f128()).collect();
+            let eq = build_quirky_eq_table(z, &inner, 6);
+            let staged = stage_comb_walks(z, &inner, eq.clone(), affine_test_walk);
+            let alpha = rng.f128();
+            let expected = affine_test_walk(alpha, &eq);
+            if staged {
+                let (comb, eq_back) =
+                    take_staged_comb(alpha, z, &inner, eq.len()).expect("key must match");
+                assert_eq!(eq_back, eq, "eq roundtrip case {case}");
+                assert_eq!(comb, expected, "staged comb mismatch case {case}");
+                // A second take finds the stash consumed.
+                assert!(take_staged_comb(alpha, z, &inner, eq.len()).is_none());
+                // Key mismatch rejects: wrong z, wrong inner.
+                stage_comb_walks(z, &inner, eq.clone(), affine_test_walk);
+                assert!(take_staged_comb(alpha, rng.f128(), &inner, eq.len()).is_none());
+                stage_comb_walks(z, &inner, eq.clone(), affine_test_walk);
+                let mut bad_inner = inner.clone();
+                bad_inner[7] = bad_inner[7] + F128::ONE;
+                assert!(take_staged_comb(alpha, z, &bad_inner, eq.len()).is_none());
+            } else {
+                assert!(take_staged_comb(alpha, z, &inner, eq.len()).is_none());
+            }
+        }
+    }
 
     /// SplitMix64 PRNG, deterministic.
     struct Rng(u64);
