@@ -99,6 +99,21 @@ pub trait Challenger: Send {
     {
         None
     }
+
+    /// Build-time dispatch key, no transcript effect: `true` only for
+    /// [`FsChallenger`], whose [`Self::as_fs_challenger`] then returns
+    /// `Some(self)`. A generic prover entry can branch on this constant to
+    /// hand the Fiat-Shamir challenger to ONE non-generic instance compiled in
+    /// its own crate; the generic arm is then unreachable for `FsChallenger`
+    /// after monomorphization and is never collected, so a downstream crate
+    /// (the benchmark worker) stops re-instantiating the whole generic prover
+    /// below that entry.
+    const IS_FS: bool = false;
+
+    /// `Some(self)` exactly when [`Self::IS_FS`] (see there).
+    fn as_fs_challenger(&mut self) -> Option<&mut FsChallenger> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +394,12 @@ impl FsChallenger {
 }
 
 impl Challenger for FsChallenger {
+    const IS_FS: bool = true;
+
+    fn as_fs_challenger(&mut self) -> Option<&mut FsChallenger> {
+        Some(self)
+    }
+
     fn observe_label(&mut self, label: &[u8]) {
         self.absorb_tagged(OP_LABEL, label);
     }
