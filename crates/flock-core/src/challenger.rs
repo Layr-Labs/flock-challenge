@@ -510,7 +510,11 @@ impl Challenger for FsChallenger {
         // Chunk partition does not affect the emitted nonce: chunks are
         // scanned/`find_first`ed in ascending order and each returns its
         // smallest match, so the result stays the globally smallest.
-        const GRIND_CHUNK: u64 = 960;
+        // 480 with the grind pack (`FLOCK_NO_GRIND_CHUNK480`), else 960; both
+        // are whole 48-nonce batches.
+        let grind_chunk: u64 = if crate::gpu_commit::grind_chunk480_enabled() { 480 } else { 960 };
+        #[allow(non_snake_case)]
+        let GRIND_CHUNK: u64 = grind_chunk;
         let cpu_scan = || {
             if bits == 0 {
                 0
@@ -1094,7 +1098,10 @@ fn cpu_race_scan(
 ) -> Option<u64> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    const CHUNK: u64 = 960;
+    // 480 with the grind pack (`FLOCK_NO_GRIND_CHUNK480`), else 960.
+    let chunk: u64 = if crate::gpu_commit::grind_chunk480_enabled() { 480 } else { 960 };
+    #[allow(non_snake_case)]
+    let CHUNK: u64 = chunk;
     const PENDING: u64 = u64::MAX;
     const NO_MATCH: u64 = u64::MAX - 1;
     // Two 48-nonce kernel batches per stop check.
