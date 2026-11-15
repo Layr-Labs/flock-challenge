@@ -510,10 +510,18 @@ impl Challenger for FsChallenger {
         // Chunk partition does not affect the emitted nonce: chunks are
         // scanned/`find_first`ed in ascending order and each returns its
         // smallest match, so the result stays the globally smallest.
-        const GRIND_CHUNK: u64 = 960;
+        // 480 with the grind pack (`FLOCK_NO_GRIND_CHUNK480`), else 960; both
+        // are whole 48-nonce batches.
+        let grind_chunk: u64 = if crate::gpu_commit::grind_chunk480_enabled() { 480 } else { 960 };
+        #[allow(non_snake_case)]
+        let GRIND_CHUNK: u64 = grind_chunk;
         let cpu_scan = || {
             if bits == 0 {
                 0
+            } else if grind_spawn_drain_applies(bits) {
+                // Grind pack 2: the calling thread scans at once while the
+                // main pool joins asynchronously (see `cpu_grind_spawned`).
+                cpu_grind_spawned(&state_digest, bits, kind)
             } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
                 // Sequential search: scan ascending blocks until a nonce lands.
                 // `pow_scan` returns the smallest match within the block it is
@@ -1094,7 +1102,10 @@ fn cpu_race_scan(
 ) -> Option<u64> {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    const CHUNK: u64 = 960;
+    // 480 with the grind pack (`FLOCK_NO_GRIND_CHUNK480`), else 960.
+    let chunk: u64 = if crate::gpu_commit::grind_chunk480_enabled() { 480 } else { 960 };
+    #[allow(non_snake_case)]
+    let CHUNK: u64 = chunk;
     const PENDING: u64 = u64::MAX;
     const NO_MATCH: u64 = u64::MAX - 1;
     // Two 48-nonce kernel batches per stop check.
@@ -1175,6 +1186,114 @@ fn cpu_race_scan(
             }
         }
         start = start.saturating_add(block);
+    }
+}
+
+/// Smallest and largest grind (in bits, inclusive) that the spawned drain
+/// takes: from 8 bits up it beats the sequential scan (below, the scan ends
+/// before a pool thread joins), and up to 16 bits, the largest CPU-only
+/// grind, it also beats the blocking two-pool drain. Larger grinds race
+/// the GPU or keep the two-pool drain.
+const GRIND_SPAWN_MIN_BITS: u32 = 8;
+const GRIND_SPAWN_MAX_BITS: u32 = 16;
+
+fn grind_spawn_range() -> (u32, u32) {
+    (GRIND_SPAWN_MIN_BITS, GRIND_SPAWN_MAX_BITS)
+}
+
+fn grind_spawn_drain_applies(bits: u32) -> bool {
+    let (lo, hi) = grind_spawn_range();
+    (lo..=hi).contains(&bits) && crate::gpu_commit::grind_spawn_drain_enabled()
+}
+
+/// Spawned small-grind drain (grind pack 2, `FLOCK_NO_GRIND_SPAWN_DRAIN=1`
+/// keeps the sequential scan). The calling thread starts scanning ascending
+/// 96-nonce chunks at once, while one job posted to the main pool fans out to
+/// every pool thread, each of which claims chunks from the same atomic cursor
+/// as soon as it runs. The caller never parks on a pool latch: a pool thread
+/// that wakes late finds the cursor exhausted (or past the bound) and claims
+/// nothing, so the kickoff costs the caller one job post, and a grind never
+/// waits for a pool thread that has not started.
+///
+/// Determinism: the same lowest-chunk match rule as the parallel grind.
+/// Chunk indices are handed out in ascending order and a claimed chunk is
+/// always scanned in full: a claimant skips chunk `c` only when the bound is
+/// already below `c`, i.e. a lower chunk holds a match. The caller walks the
+/// chunks in order and waits on any chunk still in flight, so it returns the
+/// match of the lowest chunk holding one, with every lower chunk scanned and
+/// empty: the smallest qualifying nonce, as the sequential scan finds it.
+/// Windows of `2^(bits+1)` nonces are walked in ascending order (a window
+/// with no match moves the search to the next one).
+fn cpu_grind_spawned(state_digest: &[u8; 32], bits: u32, kind: HashKind) -> u64 {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    // Two 48-nonce kernel batches.
+    const CHUNK: u64 = 96;
+    const PENDING: u64 = u64::MAX;
+    const NO_MATCH: u64 = u64::MAX - 1;
+    struct Drain {
+        digest: [u8; 32],
+        bits: u32,
+        kind: HashKind,
+        base: u64,
+        results: Box<[AtomicU64]>,
+        next: AtomicUsize,
+        bound: AtomicUsize,
+    }
+    impl Drain {
+        fn work(&self) {
+            let n_chunks = self.results.len();
+            loop {
+                let c = self.next.fetch_add(1, Ordering::Relaxed);
+                if c >= n_chunks || c >= self.bound.load(Ordering::Relaxed) {
+                    break;
+                }
+                let start = self.base.saturating_add(c as u64 * CHUNK);
+                match pow_scan(&self.digest, start, CHUNK, self.bits, self.kind) {
+                    Some(n) => {
+                        self.results[c].store(n, Ordering::Release);
+                        self.bound.fetch_min(c, Ordering::Relaxed);
+                    }
+                    None => self.results[c].store(NO_MATCH, Ordering::Release),
+                }
+            }
+        }
+    }
+    let window: u64 = 1u64 << (bits.min(24) + 1);
+    let n_chunks = usize::try_from(window.div_ceil(CHUNK)).expect("chunk count");
+    let helpers = rayon::current_num_threads();
+    let mut base = 0u64;
+    loop {
+        let drain = Arc::new(Drain {
+            digest: *state_digest,
+            bits,
+            kind,
+            base,
+            results: (0..n_chunks).map(|_| AtomicU64::new(PENDING)).collect(),
+            next: AtomicUsize::new(0),
+            bound: AtomicUsize::new(n_chunks),
+        });
+        {
+            let drain = Arc::clone(&drain);
+            rayon::spawn(move || {
+                use rayon::prelude::*;
+                (0..helpers).into_par_iter().with_max_len(1).for_each(|_| drain.work());
+            });
+        }
+        drain.work();
+        // Every chunk below the first match was claimed (the cursor is
+        // ascending) and is scanned in full, so each one reaches NO_MATCH or
+        // a nonce; wait out the ones still in flight on a pool thread.
+        for r in drain.results.iter() {
+            loop {
+                match r.load(Ordering::Acquire) {
+                    NO_MATCH => break,
+                    PENDING => std::hint::spin_loop(),
+                    n => return n,
+                }
+            }
+        }
+        base = base.saturating_add(window);
     }
 }
 
@@ -1899,6 +2018,52 @@ mod tests {
             };
             assert_eq!(nonce, expect, "kind={kind:?}");
         }
+    }
+
+    /// Grind pack 2: the spawned drain returns the sequential scan's nonce
+    /// (smallest qualifying nonce from 0) for every bit count it can take and
+    /// beyond, for both hash kinds and many transcript states, including
+    /// grinds whose first window holds no match.
+    #[test]
+    fn grind_spawned_drain_matches_sequential_scan() {
+        let mut window_misses = 0;
+        for kind in KINDS {
+            for d in 0u8..24 {
+                let digest: [u8; 32] =
+                    core::array::from_fn(|i| (i as u8).wrapping_mul(71).wrapping_add(d.wrapping_mul(13)));
+                for bits in [1u32, 4, 7, 8, 9, 10, 11, 12, 13] {
+                    let got = cpu_grind_spawned(&digest, bits, kind);
+                    let mut start = 0u64;
+                    let want = loop {
+                        if let Some(n) = pow_scan(&digest, start, 1000, bits, kind) {
+                            break n;
+                        }
+                        start += 1000;
+                    };
+                    assert_eq!(got, want, "kind={kind:?} digest={d} bits={bits}");
+                    window_misses += usize::from(want >= 1u64 << (bits + 1));
+                }
+            }
+        }
+        assert!(window_misses > 0, "no grind left its first window");
+        for kind in KINDS {
+            let digest = [0xA5u8; 32];
+            for bits in [14u32, 16] {
+                let got = cpu_grind_spawned(&digest, bits, kind);
+                let mut start = 0u64;
+                let want = loop {
+                    if let Some(n) = pow_scan(&digest, start, 4096, bits, kind) {
+                        break n;
+                    }
+                    start += 4096;
+                };
+                assert_eq!(got, want, "kind={kind:?} bits={bits}");
+            }
+        }
+        // The production range: the drain covers every CPU-only grind
+        // from 8 bits up to the GPU floor.
+        assert_eq!(grind_spawn_range(), (8, 16));
+        assert!(GRIND_SPAWN_MAX_BITS < GPU_GRIND_WIDE_MIN_BITS);
     }
 
     /// Prover-side PoW grinding produces a nonce that the verifier-side
