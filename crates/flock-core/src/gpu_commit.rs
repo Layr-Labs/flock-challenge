@@ -785,6 +785,23 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
 /// own. Read once per process.
 pub const ENV_NO_ZC_R2_CS: &str = "FLOCK_NO_ZC_R2_CS";
 
+/// Kill switch for pricing R2-CS by measurement (`FLOCK_NO_ZC_R2_CS_MEASURE`,
+/// any value): the R2-CS ratio is then the incumbent kernel's calibrated
+/// ratio times the fixed `ZC_R2_CS_PRICE`. With it on, the calibration
+/// replays the R2-CS kernel once on its calibration chunks after the
+/// incumbent kernel's replays (on a ramped GPU clock) and takes the lower of
+/// that wall and the calibration dispatch's as R2-CS's measured cost: the
+/// R2-CS ratio is the larger of the priced and the measured one (its share
+/// never rises above the priced share), and R2-CS stays off for the process
+/// when the measured cost exceeds twice the price (an M1 Max measures ~10.8x
+/// the incumbent kernel's per-chunk time: R2-CS at its priced share left the
+/// GPU 140-150 ms late there).
+pub(crate) fn zc_r2_cs_measure_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_CS_MEASURE").is_none());
+    *ON
+}
+
 pub(crate) fn zc_r2_cs_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_R2_CS).is_none());
@@ -20147,6 +20164,8 @@ kernel void zc_r2_horner_oracle(
     /// The R2-CS ratio `r_cs` of the calibration (f64 bits), kept for the
     /// R2-CS verdict, which republishes the share at its balance point.
     static ZC_R2_CS_RATIO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// The R2-CS calibration dispatch's GPU wall (f64 bits; 0 = none).
+    static ZC_R2_CS_CAL_WALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     /// R2-CS pricing: the R2-CS kernel's per-chunk GPU cost in units of the
     /// incumbent Horner kernel's (two more products per pair and the compact
     /// stores). The R2-CS ratio
@@ -20155,6 +20174,10 @@ kernel void zc_r2_horner_oracle(
     /// kernel's does not (the warm-up GPU clock), and no extra warm-up
     /// replays are spent on it.
     const ZC_R2_CS_PRICE: f64 = 1.75;
+    /// Measured R2-CS cost (x the incumbent kernel's per chunk) past which
+    /// R2-CS stays off for the process (`zc_r2_cs_measure_enabled`): twice
+    /// the fixed price. An M1 Max measures ~10.8.
+    const ZC_R2_CS_PRICE_LIMIT: f64 = 2.0 * ZC_R2_CS_PRICE;
 
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
@@ -21551,6 +21574,8 @@ kernel void zc_r2_horner_oracle(
                 None
             } else {
                 let ok = gpu.wait_cb(job.cs_cb).is_ok();
+                let w = if ok { zc_fold_gpu_wall_ms(gpu, job.cs_cb) } else { 0.0 };
+                ZC_R2_CS_CAL_WALL.store(w.to_bits(), Ordering::Relaxed);
                 gpu.release(job.cs_cb);
                 Some(ok.then(|| merge(state.cs_part_buf, 8)))
             };
@@ -21653,6 +21678,44 @@ kernel void zc_r2_horner_oracle(
                     break;
                 }
             }
+            // Measured R2-CS price (`FLOCK_NO_ZC_R2_CS_MEASURE` kills): one
+            // replay of the R2-CS kernel on its calibration chunks into the
+            // same scratch state (identical bytes), now on the clock the
+            // incumbent's replays ramped; the price is the lower of its wall
+            // and the calibration dispatch's.
+            let mut cs_wall = f64::INFINITY;
+            if super::zc_r2_cs_measure_enabled()
+                && let Some(layout) = job.cs
+                && ZC_R2_CS_MODE.load(Ordering::Relaxed) != ZC_R2_CS_DISABLED
+                && !state.cs_a_buf.is_null()
+                && !state.cs_d_buf.is_null()
+            {
+                let first = f64::from_bits(ZC_R2_CS_CAL_WALL.load(Ordering::Relaxed));
+                if first > 0.0 {
+                    cs_wall = first;
+                }
+                let bind = ZcR2CsBind { layout, anchors: state.cs_a_buf, deltas: state.cs_d_buf };
+                if let Ok(cb2) = zc_r2_submit(
+                    gpu,
+                    &state,
+                    job.a_buf,
+                    job.b_buf,
+                    job.chunks,
+                    job.lo_size,
+                    job.mask,
+                    job.useful,
+                    job.horner,
+                    Some(&bind),
+                ) {
+                    if gpu.wait_cb(cb2).is_ok() {
+                        let w = zc_fold_gpu_wall_ms(gpu, cb2);
+                        if w > 0.0 {
+                            cs_wall = cs_wall.min(w);
+                        }
+                    }
+                    gpu.release(cb2);
+                }
+            }
             drop(state);
             let u_gpu = if n_walls > 0 && w_min < f64::MAX {
                 w_min / job.chunks as f64
@@ -21668,11 +21731,35 @@ kernel void zc_r2_horner_oracle(
                 // R2-CS ratio itself). The share published here is the
                 // incumbent split's; the R2-CS verdict (`zc_r2_cs_verdict`)
                 // republishes it once R2-CS is admitted.
-                let r_cs = zc_r2_forced_ratio().unwrap_or(ZC_R2_CS_PRICE * measured);
+                let priced = ZC_R2_CS_PRICE * measured;
+                let cs_measured = (cs_wall.is_finite() && cs_wall > 0.0)
+                    .then(|| cs_wall / job.chunks as f64 / u_cpu);
+                // Never cheaper than the fixed price (the share only ever
+                // falls below the priced one), and R2-CS stays off when its
+                // measured cost is past ZC_R2_CS_PRICE_LIMIT x the incumbent's.
+                // `FLOCK_ZC_R2_CS_PRICE_LIMIT=<f64>`: local test knob for the limit.
+                let limit = std::env::var("FLOCK_ZC_R2_CS_PRICE_LIMIT")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(ZC_R2_CS_PRICE_LIMIT);
+                let pathological = cs_measured.is_some_and(|m| m > limit * measured);
+                if pathological {
+                    ZC_R2_CS_MODE.store(ZC_R2_CS_DISABLED, Ordering::Relaxed);
+                }
+                let r_cs = zc_r2_forced_ratio().unwrap_or(cs_measured.map_or(priced, |m| m.max(priced)));
                 if job.cs.is_some() {
                     ZC_R2_CS_RATIO.store(r_cs.to_bits(), Ordering::Relaxed);
                 }
                 let g = zc_r2_gate_share(ratio, hi_size);
+                if super::gpu_zc_r2_debug() && cs_measured.is_some() {
+                    eprintln!(
+                        "[zc-r2] R2-CS measured: {:.1} us/chunk ({:.2}x the incumbent kernel; priced {:.2}x) -> r_cs {r_cs:.3}{}",
+                        cs_wall * 1e3 / job.chunks as f64,
+                        cs_wall / job.chunks as f64 / u_gpu,
+                        ZC_R2_CS_PRICE,
+                        if pathological { " (past the price limit: R2-CS off)" } else { "" },
+                    );
+                }
                 if super::gpu_zc_r2_debug() {
                     eprintln!("[zc-r2] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
