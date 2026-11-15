@@ -584,6 +584,16 @@ pub(super) fn ab_completion_pair16_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_COMPLETION_PAIR16").is_none())
 }
 
+/// Kill switch for hoisting the fourteen table-row bases across one ranked
+/// completion table window: any value of
+/// `FLOCK_NO_ZC_AB_COMPLETION_TABLE_HOIST` restores per-index base formation.
+/// Read once per process; both arms read the same table entries.
+#[cfg(target_arch = "aarch64")]
+pub(super) fn ab_completion_table_hoist_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_COMPLETION_TABLE_HOIST").is_none())
+}
+
 /// The seeded calls the fourteen-row form serves: spans of exactly seven row
 /// pairs with the unscaled table loads. The scaled-load form keeps the
 /// general kernel: with plain scaled loads the sixteen accumulators and the
