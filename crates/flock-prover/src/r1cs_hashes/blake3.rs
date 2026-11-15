@@ -3340,31 +3340,48 @@ pub(crate) mod witgen_simd {
             } else {
                 nt1
             };
-            // The copy loop is one asm block whose loop head is pinned to a
-            // 64-byte boundary (`.p2align 6` before the label; the padding
-            // runs once per block, never inside the loop), so its placement
-            // does not depend on the size of code elsewhere in the binary.
-            // Same loads and stores, in the same ascending order.
+            // Keep the aligned copy loop within one cache line, but copy
+            // two ascending chunks per branch. Loads and stores retain their
+            // original order. An odd final chunk is copied once afterward.
             let n = end.saturating_sub(nt0);
             for j in 0..4usize {
                 let src = scratch.add(j * U32_PER_BLOCK);
                 let out = dst.add(j * U32_PER_BLOCK);
                 if n != 0 {
-                    core::arch::asm!(
-                        ".p2align 6",
-                        "2:",
-                        "ldp {a:q}, {b:q}, [{s}], #32",
-                        "stnp {a:q}, {b:q}, [{d}]",
-                        "add {d}, {d}, #32",
-                        "subs {n}, {n}, #1",
-                        "b.ne 2b",
-                        s = inout(reg) src.add(8 * nt0) => _,
-                        d = inout(reg) out.add(8 * nt0) => _,
-                        n = inout(reg) n => _,
-                        a = out(vreg) _,
-                        b = out(vreg) _,
-                        options(nostack)
-                    );
+                    let mut src = src.add(8 * nt0);
+                    let mut out = out.add(8 * nt0);
+                    let pairs = n / 2;
+                    if pairs != 0 {
+                        core::arch::asm!(
+                            ".p2align 6",
+                            "2:",
+                            "ldp {a:q}, {b:q}, [{s}]",
+                            "stnp {a:q}, {b:q}, [{d}]",
+                            "ldp {a:q}, {b:q}, [{s}, #32]",
+                            "stnp {a:q}, {b:q}, [{d}, #32]",
+                            "add {s}, {s}, #64",
+                            "add {d}, {d}, #64",
+                            "subs {n}, {n}, #1",
+                            "b.ne 2b",
+                            s = inout(reg) src,
+                            d = inout(reg) out,
+                            n = inout(reg) pairs => _,
+                            a = out(vreg) _,
+                            b = out(vreg) _,
+                            options(nostack)
+                        );
+                    }
+                    if n & 1 != 0 {
+                        core::arch::asm!(
+                            "ldp {a:q}, {b:q}, [{s}]",
+                            "stnp {a:q}, {b:q}, [{d}]",
+                            s = in(reg) src,
+                            d = in(reg) out,
+                            a = out(vreg) _,
+                            b = out(vreg) _,
+                            options(nostack)
+                        );
+                    }
                 }
             }
         }
