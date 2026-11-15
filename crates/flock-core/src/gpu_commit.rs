@@ -1809,6 +1809,41 @@ pub(crate) fn gpu_dead_store_enabled() -> bool {
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 static GPU_DEAD_STORE_ADMITTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Fastest full-range from-z first pass this process has run (the untimed
+/// warm-up and tuner run it on the latched buffers), in GPU picoseconds per
+/// position tile; 0 until one has completed. Witness pacing
+/// (`FLOCK_NO_WITGEN_PACE`) sizes its band lead and producer width from it.
+static FIRST_PASS_PS_PER_TILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn note_first_pass_gpu_time(seconds: f64, tiles: usize) {
+    if !(seconds > 0.0) || tiles == 0 {
+        return;
+    }
+    let ps = ((seconds * 1e12) / tiles as f64).round() as u64;
+    if ps == 0 {
+        return;
+    }
+    let cell = &FIRST_PASS_PS_PER_TILE;
+    let mut cur = cell.load(std::sync::atomic::Ordering::Relaxed);
+    while cur == 0 || ps < cur {
+        match cell.compare_exchange_weak(cur, ps, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(x) => cur = x,
+        }
+    }
+}
+
+/// GPU time per first-pass position tile measured in this process's
+/// untimed full-range passes (fastest run), in picoseconds.
+#[doc(hidden)]
+pub fn first_pass_ps_per_tile() -> Option<u64> {
+    match FIRST_PASS_PS_PER_TILE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        ps => Some(ps),
+    }
+}
+
 /// First sixteenth whose dead-lane zeros (lanes 57..63 of odd rows) the
 /// compact first pass must still store; 0 stores all of them (the
 /// incumbent). `k_split = k + 16 * m` as in `decode_hybrid_split`: the CPU
@@ -2345,7 +2380,35 @@ pub fn warm_streamed_first_pass(params: &crate::pcs::commit::PcsParams) {
     imp::warm_streamed_first_pass(params.k_code());
 }
 
+/// Lock-free view of a streamed first pass's committed bands and how many of
+/// them the GPU has completed, counted in commit order (the serial queue's
+/// execution order). Witness-generation pacing (`FLOCK_NO_WITGEN_PACE`)
+/// polls it from producer threads between slabs. Valid only while the
+/// stream that produced it is alive and unfinished: the band command
+/// buffers it polls are retained by the stream until `finish` drains them,
+/// and the witness drain that polls it returns before the stream is moved
+/// into `finish`.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct BandPaceProbe {
+    inner: std::sync::Arc<imp::BandProgress>,
+}
+
+impl BandPaceProbe {
+    /// `(bands committed, bands the GPU has completed)`.
+    #[doc(hidden)]
+    pub fn poll(&self) -> (usize, usize) {
+        imp::band_progress_poll(&self.inner)
+    }
+}
+
 impl FromZFirstPassStream {
+    /// Pacing probe for this stream (`None` off the Metal target).
+    #[doc(hidden)]
+    pub fn pace_probe(&self) -> Option<BandPaceProbe> {
+        self.inner.pace_probe().map(|inner| BandPaceProbe { inner })
+    }
+
     /// Publish `r_start..r_start+r_count` (in position tiles). Ranges must be
     /// contiguous, ordered, and multiples of four for the tuned g4 kernel.
     #[doc(hidden)]
@@ -11068,8 +11131,82 @@ kernel void blake3_pow_scan(
         }
     }
 
+    /// Band slots a pacing probe tracks (a streamed first pass commits at
+    /// most a dozen bands; later bands, if any, are simply not tracked).
+    const BAND_PROGRESS_SLOTS: usize = 64;
+
+    /// Shared, lock-free record of the committed first-pass bands (see
+    /// [`super::BandPaceProbe`]). Written only by the stream's submit path
+    /// (serialized by `&mut`), read by any thread.
+    pub(crate) struct BandProgress {
+        gpu: &'static Gpu,
+        cb: [std::sync::atomic::AtomicUsize; BAND_PROGRESS_SLOTS],
+        ev: [std::sync::atomic::AtomicUsize; BAND_PROGRESS_SLOTS],
+        v: [std::sync::atomic::AtomicU64; BAND_PROGRESS_SLOTS],
+        submitted: std::sync::atomic::AtomicUsize,
+        done: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BandProgress {
+        fn new(gpu: &'static Gpu) -> Self {
+            use std::sync::atomic::{AtomicU64, AtomicUsize};
+            Self {
+                gpu,
+                cb: [const { AtomicUsize::new(0) }; BAND_PROGRESS_SLOTS],
+                ev: [const { AtomicUsize::new(0) }; BAND_PROGRESS_SLOTS],
+                v: [const { AtomicU64::new(0) }; BAND_PROGRESS_SLOTS],
+                submitted: AtomicUsize::new(0),
+                done: AtomicUsize::new(0),
+            }
+        }
+
+        /// Record one committed band (submit path only).
+        fn record(&self, cb: Id, sig: Option<&DoneSig>) {
+            use std::sync::atomic::Ordering;
+            let i = self.submitted.load(Ordering::Relaxed);
+            if i >= BAND_PROGRESS_SLOTS {
+                return;
+            }
+            let (ev, v) = sig.map_or((0, 0), |s| (s.ev, s.v));
+            self.cb[i].store(cb as usize, Ordering::Relaxed);
+            self.ev[i].store(ev, Ordering::Relaxed);
+            self.v[i].store(v, Ordering::Relaxed);
+            self.submitted.store(i + 1, Ordering::Release);
+        }
+    }
+
+    /// `(committed, completed)` band counts; completion is the armed signal
+    /// or a terminal buffer status, scanned in commit order from the last
+    /// observed prefix.
+    pub(crate) fn band_progress_poll(p: &BandProgress) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        let s = p.submitted.load(Ordering::Acquire);
+        let d0 = p.done.load(Ordering::Acquire);
+        let mut d = d0;
+        while d < s {
+            let cb = p.cb[d].load(Ordering::Relaxed) as Id;
+            let ev = p.ev[d].load(Ordering::Relaxed);
+            let v = p.v[d].load(Ordering::Relaxed);
+            // SAFETY: the stream retains every recorded buffer until its
+            // finish/drop, which happens only after the polling drain.
+            let fin = unsafe {
+                (ev != 0 && p.gpu.event_signaled_value(ev as Id) >= v) || p.gpu.cb_status(cb) >= 4
+            };
+            if !fin {
+                break;
+            }
+            d += 1;
+        }
+        if d > d0 {
+            p.done.fetch_max(d, Ordering::AcqRel);
+        }
+        (s, d)
+    }
+
     pub(crate) struct FromZFirstPassStream {
         gpu: &'static Gpu,
+        /// Lock-free committed/completed band record for witgen pacing.
+        progress: std::sync::Arc<BandProgress>,
         z_buf: Id,
         staging: Id,
         tw_buf: Id,
@@ -11135,6 +11272,10 @@ kernel void blake3_pow_scan(
                 return;
             }
             self.submit_validated_range(r_start, r_count);
+        }
+
+        pub(crate) fn pace_probe(&self) -> Option<std::sync::Arc<BandProgress>> {
+            Some(std::sync::Arc::clone(&self.progress))
         }
 
         pub(crate) fn submit_ready_range_unordered(&mut self, r_start: usize, r_count: usize) {
@@ -11208,6 +11349,7 @@ kernel void blake3_pow_scan(
             };
             match result {
                 Ok(cb) => {
+                    self.progress.record(cb.0, cb.1.as_ref());
                     self.pending.push(cb);
                     self.next_r += r_count;
                 }
@@ -11513,6 +11655,7 @@ kernel void blake3_pow_scan(
         }
         Some(FromZFirstPassStream {
             gpu,
+            progress: std::sync::Arc::new(BandProgress::new(gpu)),
             z_buf,
             staging: state.staging,
             tw_buf: state.tw_buf,
@@ -11998,7 +12141,7 @@ kernel void blake3_pow_scan(
                 1usize << (log_d - 4),
             );
             gpu.end_encoding(enc);
-            if super::gpu_wait_help_enabled() && rayon::current_thread_index().is_some() {
+            let r = if super::gpu_wait_help_enabled() && rayon::current_thread_index().is_some() {
                 // The exact-contention tuner re-primes inside its graph arm
                 // beside the AB replay: help that replay exactly as the timed
                 // commit arm helps the AB arm while its first pass streams,
@@ -12008,7 +12151,12 @@ kernel void blake3_pow_scan(
                 gpu.wait_cb(cb1)
             } else {
                 gpu.commit_and_wait(cb1)
+            };
+            if r.is_ok() {
+                let (s, e) = cb_gpu_interval(gpu, cb1);
+                super::note_first_pass_gpu_time(e - s, 1usize << (log_d - 4));
             }
+            r
         }
     }
 
@@ -24144,7 +24292,17 @@ mod imp {
 
     pub(crate) struct FromZFirstPassStream;
 
+    pub(crate) struct BandProgress;
+
+    pub(crate) fn band_progress_poll(_p: &BandProgress) -> (usize, usize) {
+        (0, 0)
+    }
+
     impl FromZFirstPassStream {
+        pub(crate) fn pace_probe(&self) -> Option<std::sync::Arc<BandProgress>> {
+            None
+        }
+
         pub(crate) fn submit_ready_range(&mut self, _r_start: usize, _r_count: usize) {}
 
         pub(crate) fn submit_ready_range_unordered(&mut self, _r_start: usize, _r_count: usize) {}
