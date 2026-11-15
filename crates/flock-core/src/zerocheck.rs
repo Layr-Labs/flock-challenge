@@ -534,6 +534,25 @@ fn prove_packed_padded_inner<C: Challenger>(
     }
     r[k_skip + N_INNER..].copy_from_slice(&r_outer);
 
+    // R2-CS (`gpu_commit::ENV_NO_ZC_R2_CS`), a timed prove with R2-CS
+    // admitted: round two's compact anchors are taken here and the K pass
+    // arm's view over them is premapped now (the predicate is `use_lookahead`
+    // below, all of whose inputs are fixed), so the mapping overlaps round one
+    // instead of the R2-CS command buffer that binds the view. Every other
+    // prove keeps round two taking and premapping them itself.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let early_anchors = if (m == 32 || cfg!(test))
+        && n_mlv >= 6
+        && r[k_skip + 1] != F128::ZERO
+        && !lookahead_off()
+    {
+        crate::zerocheck::multilinear::round2_anchors_premapped_early(m, k_skip)
+    } else {
+        None
+    };
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let early_anchors: Option<Vec<F128>> = None;
+
     // ---- 3. Round 1: URM (extract_c, parallel) ----
     //
     // The optimized URM drops a `C_s = φ_8(0x1C)` scalar from its accumulators
@@ -848,9 +867,16 @@ fn prove_packed_padded_inner<C: Challenger>(
             padding,
             compact_deltas,
             use_cascade,
+            early_anchors,
         );
         (compact, m1, mi, Some(la))
     } else {
+        // (Taken early only on this predicate; never the case here.)
+        if let Some(anchors) = early_anchors {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            crate::gpu_commit::zc_k_premap(&[], 0);
+            crate::scratch::give_f128(anchors);
+        }
         let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             a_packed,
             b_packed,
