@@ -972,6 +972,14 @@ mod grind_worker {
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
+        // Wide block of the race: may go out segmented, and is cancelled
+        // through this flag once the CPU side has answered.
+        wide: Option<Arc<AtomicBool>>,
+        // Pre-commit (`gpu_commit::ENV_NO_GRIND_PRECOMMIT`): the parked scan
+        // the caller already released for this grind, and the next grind's
+        // shape `(bits, len)` to park while this one runs.
+        fired: Option<crate::gpu_commit::GrindFired>,
+        park_next: Option<(u32, u32)>,
         done: Sender<Result<Option<u64>, String>>,
     }
 
@@ -990,13 +998,38 @@ mod grind_worker {
             std::thread::Builder::new()
                 .name("flock-grind-dispatch".into())
                 .spawn(move || {
-                    while let Ok(job) = rx.recv() {
-                        let res = crate::gpu_commit::gpu_blake3_pow_scan(
-                            &job.digest,
-                            job.start,
-                            job.len,
-                            job.bits,
-                        );
+                    while let Ok(mut job) = rx.recv() {
+                        let res = if let Some(fired) = job.fired.take() {
+                            // Already released by the caller: spin it home
+                            // even when cancelled (it is running).
+                            let idle = AtomicBool::new(false);
+                            crate::gpu_commit::gpu_blake3_pow_scan_fired(
+                                fired,
+                                job.wide.as_deref().unwrap_or(&idle),
+                                job.park_next,
+                            )
+                        } else if let Some(cancel) = job.wide.as_deref() {
+                            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                // Cancelled before it started.
+                                Ok(None)
+                            } else {
+                                crate::gpu_commit::gpu_blake3_pow_scan_wide(
+                                    &job.digest,
+                                    job.start,
+                                    job.len,
+                                    job.bits,
+                                    cancel,
+                                    job.park_next,
+                                )
+                            }
+                        } else {
+                            crate::gpu_commit::gpu_blake3_pow_scan(
+                                &job.digest,
+                                job.start,
+                                job.len,
+                                job.bits,
+                            )
+                        };
                         if job.abort && matches!(&res, Ok(Some(_))) {
                             job.stop.store(true, std::sync::atomic::Ordering::Release);
                         }
@@ -1026,6 +1059,9 @@ mod grind_worker {
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
+        wide: Option<Arc<AtomicBool>>,
+        fired: Option<crate::gpu_commit::GrindFired>,
+        park_next: Option<(u32, u32)>,
     ) -> Option<Receiver<Result<Option<u64>, String>>> {
         let w = worker()?;
         let (done_tx, done_rx) = channel();
@@ -1036,6 +1072,9 @@ mod grind_worker {
             bits,
             stop,
             abort,
+            wide,
+            fired,
+            park_next,
             done: done_tx,
         };
         if w.tx.send(job).is_err() {
@@ -1321,6 +1360,20 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
     // GPU result is used. The CPU bails as soon as the GPU reports a hit.
     if wide && grind_race_enabled() && rayon::current_num_threads() > 1 {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Pre-commit (`gpu_commit::ENV_NO_GRIND_PRECOMMIT`): release the scan
+        // parked for this grind, if any, before anything else; and have the
+        // dispatch thread park the next grind's scan when it is a GPU grind.
+        let precommit = crate::gpu_commit::grind_precommit_enabled();
+        let fired = if precommit {
+            crate::gpu_commit::grind_fire_parked(state_digest, bits, block_len)
+        } else {
+            None
+        };
+        let park_next = (precommit && bits > gpu_grind_floor_bits()).then(|| {
+            let next = bits - 1;
+            (next, 1u32 << (next + GPU_GRIND_WIDE_EXTRA_BITS).min(24))
+        });
         if let Some(done_rx) = grind_worker::dispatch_async(
             state_digest,
             0,
@@ -1328,6 +1381,11 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             bits,
             std::sync::Arc::clone(&stop),
             true,
+            // With the switch off the job is the incumbent single dispatch,
+            // never cancelled.
+            crate::gpu_commit::grind_seg_enabled().then(|| std::sync::Arc::clone(&cancel)),
+            fired,
+            park_next,
         ) {
             let t_iter = grind_trace_enabled().then(std::time::Instant::now);
             if let Some(n) = cpu_race_scan(state_digest, bits, &stop) {
@@ -1338,7 +1396,9 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                     );
                 }
                 // The abandoned GPU scan finishes on its worker; its result
-                // goes to the dropped receiver.
+                // goes to the dropped receiver. A segmented scan is told to
+                // drop its remaining segments.
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 drop(done_rx);
                 return Ok(n);
             }
@@ -1400,6 +1460,9 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             bits,
             std::sync::Arc::clone(&stop),
             abort,
+            None,
+            None,
+            None,
         ) {
             Some(done_rx) => {
                 if grind_prefetch_overlap_enabled() {
