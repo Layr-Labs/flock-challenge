@@ -120,7 +120,8 @@ pub(crate) fn help_guest_until(
     }
 }
 
-/// Post-drain linger (`FLOCK_NO_EPOOL_LINGER=1` kills; window
+/// Post-drain linger, opt-in (`FLOCK_EPOOL_LINGER=1` enables it;
+/// `FLOCK_NO_EPOOL_LINGER=1` still forces it off; window
 /// `FLOCK_EPOOL_LINGER_US`, default 200). Between back-to-back hetero queues
 /// separated by a short serial stretch (the opening's recursive levels) the
 /// main-pool workers fall asleep in Rayon's
@@ -145,7 +146,9 @@ static LINGER_PHASE: AtomicBool = AtomicBool::new(false);
 fn linger_window_ns() -> u64 {
     static NS: OnceLock<u64> = OnceLock::new();
     *NS.get_or_init(|| {
-        if std::env::var("FLOCK_NO_EPOOL_LINGER").is_ok_and(|v| v == "1") {
+        if std::env::var("FLOCK_NO_EPOOL_LINGER").is_ok_and(|v| v == "1")
+            || !std::env::var("FLOCK_EPOOL_LINGER").is_ok_and(|v| v == "1")
+        {
             return 0;
         }
         std::env::var("FLOCK_EPOOL_LINGER_US")
