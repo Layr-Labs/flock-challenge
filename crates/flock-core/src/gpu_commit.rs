@@ -1558,6 +1558,28 @@ pub(crate) fn grind_spawn_drain_enabled() -> bool {
     *ON.get_or_init(|| gpack2_enabled() && !env_is_one(ENV_NO_GRIND_SPAWN_DRAIN))
 }
 
+/// unchanged.
+pub const ENV_NO_GPACK3: &str = "FLOCK_NO_GPACK3";
+
+pub const ENV_NO_RACE_CALLER_SCAN: &str = "FLOCK_NO_RACE_CALLER_SCAN";
+
+pub const ENV_NO_SUBTREE_DRAIN: &str = "FLOCK_NO_SUBTREE_DRAIN";
+
+pub(crate) fn gpack3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !env_is_one(ENV_NO_GPACK3))
+}
+
+pub(crate) fn race_caller_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpack3_enabled() && !env_is_one(ENV_NO_RACE_CALLER_SCAN))
+}
+
+pub(crate) fn subtree_drain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpack3_enabled() && !env_is_one(ENV_NO_SUBTREE_DRAIN))
+}
+
 /// BLAKE3 state for the grind compression after round zero's seven
 /// nonce-independent quarter-rounds. The message is `state || nonce_lo ||
 /// nonce_hi || 0^6` (sixteen words), and the chaining value, counter and

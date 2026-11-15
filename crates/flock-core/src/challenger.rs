@@ -1189,6 +1189,131 @@ fn cpu_race_scan(
     }
 }
 
+///
+fn cpu_race_scan_caller(
+    state_digest: &[u8; 32],
+    bits: u32,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<u64> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    const PENDING: u64 = u64::MAX;
+    const NO_MATCH: u64 = u64::MAX - 1;
+    const FINE_SUB: u64 = 96;
+    struct Window {
+        digest: [u8; 32],
+        bits: u32,
+        chunk: u64,
+        fine_stop: bool,
+        base: u64,
+        results: Box<[AtomicU64]>,
+        next: AtomicUsize,
+        bound: AtomicUsize,
+        stop: Arc<AtomicBool>,
+    }
+    impl Window {
+        fn work(&self) {
+            let n_chunks = self.results.len();
+            loop {
+                if self.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let c = self.next.fetch_add(1, Ordering::Relaxed);
+                if c >= n_chunks || c >= self.bound.load(Ordering::Relaxed) {
+                    return;
+                }
+                let base = self.base.saturating_add(c as u64 * self.chunk);
+                let found = if self.fine_stop {
+                    let mut off = 0u64;
+                    loop {
+                        if off >= self.chunk {
+                            break Some(None);
+                        }
+                        if off > 0 && self.stop.load(Ordering::Relaxed) {
+                            break None;
+                        }
+                        let len = FINE_SUB.min(self.chunk - off);
+                        if let Some(n) = pow_scan(
+                            &self.digest,
+                            base.saturating_add(off),
+                            len,
+                            self.bits,
+                            HashKind::Blake3,
+                        ) {
+                            break Some(Some(n));
+                        }
+                        off += len;
+                    }
+                } else {
+                    Some(pow_scan(&self.digest, base, self.chunk, self.bits, HashKind::Blake3))
+                };
+                match found {
+                    Some(Some(n)) => {
+                        self.results[c].store(n, Ordering::Release);
+                        self.bound.fetch_min(c, Ordering::Relaxed);
+                    }
+                    Some(None) => self.results[c].store(NO_MATCH, Ordering::Release),
+                    None => return,
+                }
+            }
+        }
+    }
+    // 480 with the grind pack (`FLOCK_NO_GRIND_CHUNK480`), else 960.
+    let chunk: u64 = if crate::gpu_commit::grind_chunk480_enabled() { 480 } else { 960 };
+    let fine_stop = grind_race_fine_stop_enabled();
+    let block: u64 = 1 << (bits.min(24) + 1);
+    let n_chunks = usize::try_from(block.div_ceil(chunk)).ok()?;
+    let helpers = rayon::current_num_threads().saturating_sub(1).max(1);
+    let mut start = 0u64;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let window = Arc::new(Window {
+            digest: *state_digest,
+            bits,
+            chunk,
+            fine_stop,
+            base: start,
+            results: (0..n_chunks).map(|_| AtomicU64::new(PENDING)).collect(),
+            next: AtomicUsize::new(0),
+            bound: AtomicUsize::new(n_chunks),
+            stop: Arc::clone(stop),
+        });
+        {
+            let window = Arc::clone(&window);
+            rayon::spawn(move || {
+                use rayon::prelude::*;
+                (0..helpers).into_par_iter().with_max_len(1).for_each(|_| window.work());
+            });
+        }
+        if let Some(ep) = crate::epool::epool() {
+            let window = Arc::clone(&window);
+            ep.spawn_broadcast(move |_| window.work());
+        }
+        window.work();
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        // Every chunk below the first match was claimed (the cursor is
+        for r in window.results.iter() {
+            loop {
+                match r.load(Ordering::Acquire) {
+                    NO_MATCH => break,
+                    PENDING => {
+                        if stop.load(Ordering::Acquire) {
+                            return None;
+                        }
+                        std::hint::spin_loop();
+                    }
+                    n => return Some(n),
+                }
+            }
+        }
+        start = start.saturating_add(block);
+    }
+}
+
 /// Smallest and largest grind (in bits, inclusive) that the spawned drain
 /// takes: from 8 bits up it beats the sequential scan (below, the scan ends
 /// before a pool thread joins), and up to 16 bits, the largest CPU-only
@@ -1330,7 +1455,12 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             true,
         ) {
             let t_iter = grind_trace_enabled().then(std::time::Instant::now);
-            if let Some(n) = cpu_race_scan(state_digest, bits, &stop) {
+            let cpu = if crate::gpu_commit::race_caller_scan_enabled() {
+                cpu_race_scan_caller(state_digest, bits, &stop)
+            } else {
+                cpu_race_scan(state_digest, bits, &stop)
+            };
+            if let Some(n) = cpu {
                 if let Some(t) = t_iter {
                     eprintln!(
                         "[grind] bits={bits} race: cpu won wall={:.3} ms",
@@ -2781,5 +2911,52 @@ mod tests {
             c2.observe_f128(F128::ONE);
             assert_ne!(c1.sample_f128(), c2.sample_f128());
         }
+    }
+}
+
+#[cfg(test)]
+mod gpack3_tests {
+    use super::*;
+
+    #[test]
+    fn race_caller_scan_matches_sequential_scan() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let want_of = |digest: &[u8; 32], bits: u32| {
+            let mut start = 0u64;
+            loop {
+                if let Some(n) = pow_scan(digest, start, 4096, bits, HashKind::Blake3) {
+                    break n;
+                }
+                start += 4096;
+            }
+        };
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
+        let mut window_misses = 0;
+        for d in 0u8..16 {
+            let digest: [u8; 32] =
+                core::array::from_fn(|i| (i as u8).wrapping_mul(53).wrapping_add(d.wrapping_mul(29)));
+            for bits in [1u32, 6, 9, 12, 14, 17] {
+                let want = want_of(&digest, bits);
+                let stop = Arc::new(AtomicBool::new(false));
+                assert_eq!(
+                    cpu_race_scan_caller(&digest, bits, &stop),
+                    Some(want),
+                    "digest={d} bits={bits}"
+                );
+                let in_pool = pool.install(|| cpu_race_scan_caller(&digest, bits, &stop));
+                assert_eq!(in_pool, Some(want), "pool digest={d} bits={bits}");
+                assert_eq!(cpu_race_scan(&digest, bits, &stop), Some(want), "two-pool digest={d} bits={bits}");
+                window_misses += usize::from(want >= 1u64 << (bits + 1));
+            }
+        }
+        assert!(window_misses > 0, "no race scan left its first window");
+        for rep in 0..40u8 {
+            let digest = [rep.wrapping_mul(7) ^ 0x3C; 32];
+            let stop = Arc::new(AtomicBool::new(false));
+            assert_eq!(cpu_race_scan_caller(&digest, 18, &stop), Some(want_of(&digest, 18)), "rep={rep}");
+        }
+        let stop = Arc::new(AtomicBool::new(true));
+        assert_eq!(cpu_race_scan_caller(&[9u8; 32], 17, &stop), None);
     }
 }
