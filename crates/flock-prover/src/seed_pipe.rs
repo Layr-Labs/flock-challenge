@@ -803,12 +803,14 @@ fn ranked_proof_path() -> Option<PathBuf> {
         .clone()
 }
 
-/// Kill switch for the hot parked-arm wait: `FLOCK_NO_PARK_KEEPALIVE=1` (exact
-/// '1') restores the blocking wait with the keep-alive started after `arm`.
+/// The hot parked-arm wait, opt-in: `FLOCK_PARK_KEEPALIVE=1` (exact '1') turns
+/// it on; `FLOCK_NO_PARK_KEEPALIVE=1` still forces it off. Off: the blocking
+/// wait with the keep-alive started after `arm`.
 pub(crate) fn park_keepalive_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("FLOCK_NO_PARK_KEEPALIVE").as_deref() != Some(OsStr::new("1"))
+        std::env::var_os("FLOCK_PARK_KEEPALIVE").as_deref() == Some(OsStr::new("1"))
+            && std::env::var_os("FLOCK_NO_PARK_KEEPALIVE").as_deref() != Some(OsStr::new("1"))
     })
 }
 

@@ -2086,6 +2086,249 @@ fn build_block_witness_ab_stream_into(
     }
 }
 
+/// Adaptive witness-generation pacing for the streamed first pass
+/// (`FLOCK_NO_WITGEN_PACE=1` kills; read once per process).
+///
+/// The commit window's first pass is GPU-bound, and full-width witness
+/// production (every main worker plus the efficiency helpers, writing the
+/// witness at full memory bandwidth) slows the GPU's band kernel while they
+/// overlap. Witness generation needs only a fraction of its width to stay
+/// ahead of the GPU, so once the GPU has enough bands queued, the extra
+/// producers park between slabs and rejoin when the queue runs short.
+///
+/// Between slabs a producer polls how many committed bands the GPU has not
+/// completed (the band lead, `BandPaceProbe`). At a lead of `hi` bands the
+/// efficiency helpers and all main producers beyond `m` park (condvar wait
+/// with a short tick, no spinning) until the lead falls to `lo` or the last
+/// slab has been claimed. Both are sized per machine: `m` is the fewest main
+/// producers whose slab rate keeps up with the GPU's band consumption (the
+/// median main-worker slab time of this drain's first slabs against the
+/// GPU's per-tile time from the untimed warm-up's full-range first pass),
+/// and `lo` covers producing a whole band at full width plus one park tick,
+/// in GPU time.
+///
+/// Scheduling only: every slab is claimed exactly once from the same queue
+/// and written by the same code, the bands are committed by the same
+/// accounting, and no byte of the witness or the proof changes.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) struct WitgenPacer {
+    probe: flock_core::gpu_commit::BandPaceProbe,
+    n_slabs: usize,
+    main_n: usize,
+    /// GPU nanoseconds per position tile (warm-up first pass).
+    tile_ns: f64,
+    tiles_per_slab: f64,
+    tiles_per_band: f64,
+    entered: std::sync::atomic::AtomicUsize,
+    parked_main: std::sync::atomic::AtomicUsize,
+    /// The first `PACE_SAMPLES` main-worker slab times (ns).
+    slab_ns: [std::sync::atomic::AtomicU64; PACE_SAMPLES],
+    slab_n: std::sync::atomic::AtomicUsize,
+    sample_slot: std::sync::atomic::AtomicUsize,
+    /// (hi, lo, max parked main producers), fixed once enough slabs are timed.
+    plan: std::sync::OnceLock<(usize, usize, usize)>,
+    lock: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+/// Park tick: the longest a parked producer sleeps between lead checks.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const PACE_TICK: std::time::Duration = std::time::Duration::from_micros(100);
+/// Main-worker slabs timed (median) before the plan is fixed.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const PACE_SAMPLES: usize = 16;
+
+/// Diagnostic: `FLOCK_WITGEN_PACE_TRACE=1` prints each drain's pacing plan.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn witgen_pace_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_WITGEN_PACE_TRACE").is_some())
+}
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn witgen_pace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FLOCK_NO_WITGEN_PACE").is_ok_and(|v| v == "1"))
+}
+
+/// Pacing plan `(hi, lo, m)` from a main-worker slab time and the GPU's
+/// per-tile time (both in ns): `m` is the fewest main producers whose slab
+/// rate keeps up with the GPU (clamped to `2..=main_n`); `lo` is the band lead that
+/// covers producing one whole band at full main width plus one park tick,
+/// in GPU time (at least one band); producers park at `hi = lo + 1`.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn witgen_pace_plan(
+    slab_ns: f64,
+    tile_ns: f64,
+    tiles_per_slab: f64,
+    tiles_per_band: f64,
+    main_n: usize,
+) -> Option<(usize, usize, usize)> {
+    let slab_gpu_ns = tiles_per_slab * tile_ns;
+    let band_gpu_ns = tiles_per_band * tile_ns;
+    if !(slab_ns > 0.0 && slab_gpu_ns > 0.0 && band_gpu_ns > 0.0) || main_n < 2 {
+        return None;
+    }
+    let m = ((slab_ns / slab_gpu_ns).ceil() as usize).clamp(2, main_n);
+    let band_full_ns = (tiles_per_band / tiles_per_slab) * slab_ns / main_n as f64;
+    let lo = (((band_full_ns + PACE_TICK.as_nanos() as f64) / band_gpu_ns).ceil() as usize).max(1);
+    Some((lo + 1, lo, m))
+}
+
+#[cfg(test)]
+mod witgen_pace_tests {
+    use super::witgen_pace_plan;
+
+    /// Main producers that each make a slab in 60 us against a GPU at 110 ns
+    /// per tile (128-tile slabs, 8192-tile bands, ten main workers): 4.3
+    /// producers match the GPU, so 5 are kept, and a whole band
+    /// at full width (0.38 ms) plus a tick fits in one band of GPU time
+    /// (0.9 ms): park at a lead of 2, rejoin at 1.
+    #[test]
+    fn plan_matches_the_measured_machine() {
+        assert_eq!(witgen_pace_plan(60_000.0, 110.0, 128.0, 8192.0, 10), Some((2, 1, 5)));
+    }
+
+    /// Slower producers need more of them and a deeper lead; the width never
+    /// exceeds the pool and never drops below two.
+    #[test]
+    fn plan_scales_and_clamps() {
+        let (hi, lo, m) = witgen_pace_plan(200_000.0, 110.0, 128.0, 8192.0, 10).unwrap();
+        assert_eq!(m, 10);
+        assert!(lo >= 2 && hi == lo + 1);
+        assert_eq!(witgen_pace_plan(1_000.0, 110.0, 128.0, 8192.0, 10).map(|p| p.2), Some(2));
+        assert_eq!(witgen_pace_plan(60_000.0, 0.0, 128.0, 8192.0, 10), None);
+        assert_eq!(witgen_pace_plan(60_000.0, 110.0, 128.0, 8192.0, 1), None);
+    }
+}
+
+/// The pacer for one streamed drain, or `None` when killed, off the Metal
+/// stream, or before any warm-up first pass has been timed.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn witgen_pacer(
+    stream: &flock_core::gpu_commit::FromZFirstPassStream,
+    n_slabs: usize,
+    tiles_per_slab: usize,
+    tiles_per_band: usize,
+) -> Option<WitgenPacer> {
+    if !witgen_pace_enabled() {
+        return None;
+    }
+    let ps = flock_core::gpu_commit::first_pass_ps_per_tile()?;
+    let probe = stream.pace_probe()?;
+    let main_n = rayon::current_num_threads();
+    if main_n < 2 {
+        return None;
+    }
+    Some(WitgenPacer {
+        probe,
+        n_slabs,
+        main_n,
+        tile_ns: ps as f64 / 1000.0,
+        tiles_per_slab: tiles_per_slab as f64,
+        tiles_per_band: tiles_per_band as f64,
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        parked_main: std::sync::atomic::AtomicUsize::new(0),
+        slab_ns: [const { std::sync::atomic::AtomicU64::new(0) }; PACE_SAMPLES],
+        slab_n: std::sync::atomic::AtomicUsize::new(0),
+        sample_slot: std::sync::atomic::AtomicUsize::new(0),
+        plan: std::sync::OnceLock::new(),
+        lock: std::sync::Mutex::new(()),
+        cv: std::sync::Condvar::new(),
+    })
+}
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+impl WitgenPacer {
+    /// Called as a producer starts a slab: counts claims, and the claim of
+    /// the last slab wakes every parked producer (the drain's join then
+    /// never waits out a tick).
+    #[inline]
+    fn enter(&self) {
+        if self.entered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == self.n_slabs {
+            let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.cv.notify_all();
+        }
+    }
+
+    #[inline]
+    fn lead(&self) -> usize {
+        let (committed, completed) = self.probe.poll();
+        committed.saturating_sub(completed)
+    }
+
+    fn plan(&self) -> Option<(usize, usize, usize)> {
+        use std::sync::atomic::Ordering;
+        if let Some(&p) = self.plan.get() {
+            return Some(p);
+        }
+        if self.slab_n.load(Ordering::Acquire) < PACE_SAMPLES {
+            return None;
+        }
+        let mut t: [u64; PACE_SAMPLES] = std::array::from_fn(|i| self.slab_ns[i].load(Ordering::Relaxed));
+        t.sort_unstable();
+        let slab_ns = (t[PACE_SAMPLES / 2 - 1] + t[PACE_SAMPLES / 2]) as f64 / 2.0;
+        let (hi, lo, m) =
+            witgen_pace_plan(slab_ns, self.tile_ns, self.tiles_per_slab, self.tiles_per_band, self.main_n)?;
+        Some(*self.plan.get_or_init(|| {
+            if witgen_pace_trace() {
+                eprintln!(
+                    "[witgen-pace] slab {slab_ns:.0} ns, tile {:.4} ns: m {m} of {}, lead hi {hi} lo {lo}",
+                    self.tile_ns, self.main_n
+                );
+            }
+            (hi, lo, self.main_n - m)
+        }))
+    }
+
+    /// Called as a producer finishes a slab (after its band accounting).
+    fn point(&self, slab_start: std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        let helper = rayon::current_num_threads() != self.main_n;
+        if !helper && self.slab_n.load(Ordering::Relaxed) < PACE_SAMPLES {
+            // Claim a sample slot first, publish the time, then count it, so
+            // the plan reads only completed samples.
+            let i = self.sample_slot.fetch_add(1, Ordering::Relaxed);
+            if i < PACE_SAMPLES {
+                self.slab_ns[i].store(slab_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                self.slab_n.fetch_add(1, Ordering::Release);
+            }
+        }
+        if self.entered.load(Ordering::Relaxed) >= self.n_slabs {
+            return;
+        }
+        let Some((hi, lo, max_parked_main)) = self.plan() else {
+            return;
+        };
+        if self.lead() < hi {
+            return;
+        }
+        if !helper {
+            let mut p = self.parked_main.load(Ordering::Relaxed);
+            loop {
+                if p >= max_parked_main {
+                    return;
+                }
+                match self.parked_main.compare_exchange_weak(p, p + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(x) => p = x,
+                }
+            }
+        }
+        let mut g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while self.entered.load(Ordering::Relaxed) < self.n_slabs {
+            g = self.cv.wait_timeout(g, PACE_TICK).unwrap_or_else(|e| e.into_inner()).0;
+            if self.lead() <= lo {
+                break;
+            }
+        }
+        drop(g);
+        if !helper {
+            self.parked_main.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // W-H2: SIMD-lockstep witness materialization (aarch64). Derivation and
 // pricing: notes/witgen-simd.md. Four compressions run in u32-lane lockstep
@@ -4346,12 +4589,22 @@ pub(crate) mod witgen_simd {
                 // strictly in band order. `FLOCK_NO_BAND_ANY_ORDER=1` restores
                 // the in-order sequencer.
                 let any_order = std::env::var_os("FLOCK_NO_BAND_ANY_ORDER").is_none();
+                let pacer = crate::r1cs_hashes::blake3::witgen_pacer(
+                    stream,
+                    slab_band.len(),
+                    16 * SLAB / SEGMENTS,
+                    16 * schedule.iter().copied().max().unwrap_or(SLAB),
+                );
                 let seq = std::sync::Mutex::new(SubmitSeq {
                     next: 0,
                     submitted: vec![false; n_bands],
                     stream,
                 });
                 let slab_fn = |s: usize| {
+                    let slab_start = pacer.as_ref().map(|p| {
+                        p.enter();
+                        std::time::Instant::now()
+                    });
                     let g0 = slab_g0[s] as usize;
                     for g in g0..g0 + SLAB {
                         process_group(g);
@@ -4401,6 +4654,9 @@ pub(crate) mod witgen_simd {
                                     .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             }
                         }
+                    }
+                    if let (Some(p), Some(t)) = (&pacer, slab_start) {
+                        p.point(t);
                     }
                 };
                 super::super::common::drain_witgen_slabs(slab_band.len(), &slab_fn);
@@ -6901,6 +7157,44 @@ mod tests {
     /// The immediate-offset copy-out writes exactly the words the per-chunk
     /// addressed loop wrote, for the a and b ranges of the copy drain and
     /// edge ranges, and nothing else; zero, one and all-ones words included.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn copy_out_imm_matches_addressed_loop() {
+        const BLK: usize = K / 32;
+        const GUARD: usize = 16;
+        const W: usize = 4 * BLK + 2 * GUARD;
+        let mut rng = Rng::new(0x5eed_c0f7_0002);
+        let ranges = [(0, 61), (4, 59), (0, 64), (0, 0), (5, 6), (31, 33), (63, 64), (0, 32)];
+        for (round, &(g0, g1)) in ranges.iter().enumerate() {
+            let scratch: Vec<u32> = (0..4 * BLK)
+                .map(|i| match (i + round) % 9 {
+                    0 => 0,
+                    1 => 1,
+                    2 => u32::MAX,
+                    _ => rng.next_u32(),
+                })
+                .collect();
+            let fill = rng.next_u32();
+            let mut want = vec![fill; W];
+            let mut got = vec![fill; W];
+            unsafe {
+                witgen_simd::copy_out_loop(scratch.as_ptr(), want.as_mut_ptr().add(GUARD), g0, g1);
+                witgen_simd::copy_out_imm(scratch.as_ptr(), got.as_mut_ptr().add(GUARD), g0, g1);
+            }
+            assert_eq!(got, want, "chunks {g0}..{g1}");
+            for j in 0..4 {
+                for w in 0..BLK {
+                    let x = got[GUARD + j * BLK + w];
+                    if (8 * g0..8 * g1).contains(&w) {
+                        assert_eq!(x, scratch[j * BLK + w]);
+                    } else {
+                        assert_eq!(x, fill);
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn copy_out_imm_matches_addressed_loop() {
