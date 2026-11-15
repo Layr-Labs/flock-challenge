@@ -802,7 +802,18 @@ pub struct Round1AbInner {
     /// of the allocation only on such a hit (allocation identity), and
     /// re-wraps otherwise. Never read by any CPU computation.
     provenance_hit: bool,
+    /// Lane abpc: first 1 KiB window (`x_outer`) stored PRECONVERTED, i.e.
+    /// as the 64-lane `V[lane] = XOR_{materialized b} convert[b*256 + byte]`
+    /// instead of the raw 16x64 transform bytes. Windows below it are raw.
+    /// Equal to the window count when nothing was converted (every caller
+    /// except the ranked lincheck-C prove). Set once by the producer; every
+    /// raw-byte consumer either stays below it or calls `assert_raw`.
+    preconverted_from_window: usize,
 }
+
+/// Bytes of one round-one AB transform window (`16` medium rows of 64 bytes),
+/// and of one preconverted window (64 F128 lanes).
+const AB_WINDOW_BYTES: usize = (1 << N_MEDIUM) * 64;
 
 /// Representation carried with the large round-one AB transform backing.
 /// An omitted buffer is a residual component and must never reach a consumer
@@ -849,6 +860,28 @@ impl Round1AbInner {
     /// Resident scratch bytes retained until the challenge-weighted finish.
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
+    }
+
+    /// Number of 1 KiB windows in the backing.
+    #[inline]
+    fn n_windows(&self) -> usize {
+        self.len_bytes() / AB_WINDOW_BYTES
+    }
+
+    /// Whether any window was stored preconverted.
+    #[inline]
+    fn has_preconverted(&self) -> bool {
+        self.preconverted_from_window < self.n_windows()
+    }
+
+    /// Consumers that decode raw transform bytes everywhere must never see a
+    /// preconverted window.
+    #[inline]
+    fn assert_raw(&self, consumer: &str) {
+        assert!(
+            !self.has_preconverted(),
+            "{consumer} cannot consume a preconverted AB transform"
+        );
     }
 
     #[inline]
@@ -986,6 +1019,7 @@ pub fn precompute_round1_ab_inner_packed_padded(
         padding,
         identity_prefix,
         None,
+        false,
     )
 }
 
@@ -1005,8 +1039,9 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
     padding: &PaddingSpec,
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
     tail: Option<&(dyn Fn() + Sync)>,
+    preconvert: bool,
 ) -> Round1AbInner {
-    precompute_round1_ab_inner_packed_padded_body(
+    precompute_round1_ab_inner_packed_padded_body_with(
         a_packed,
         b_packed,
         m,
@@ -1020,6 +1055,7 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
         tail,
         None,
         None,
+        preconvert,
     )
 }
 
@@ -1091,6 +1127,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Round1AbProducer<'_>,
+    preconvert: bool,
 ) -> Round1AbInner {
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     let total_bytes = (1usize << m) / 8;
@@ -1109,7 +1146,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
             core::slice::from_raw_parts(b_packed, total_bytes),
         )
     };
-    precompute_round1_ab_inner_packed_padded_body(
+    precompute_round1_ab_inner_packed_padded_body_with(
         a_packed,
         b_packed,
         m,
@@ -1123,6 +1160,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
         tail,
         fused.then_some(producer),
         None,
+        preconvert,
     )
 }
 
@@ -1278,6 +1316,45 @@ fn precompute_round1_ab_inner_packed_padded_body(
     producer: Option<Round1AbProducer<'_>>,
     backing: Option<ExactTuneBacking>,
 ) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_body_with(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        nt,
+        compact,
+        use_provenance,
+        identity_prefix,
+        tail,
+        producer,
+        backing,
+        false,
+    )
+}
+
+/// [`precompute_round1_ab_inner_packed_padded_body`] with the lane-abpc
+/// request: `preconvert` asks for the CPU-owned windows to be stored
+/// preconverted (see [`ab_preconvert_from_window`]); it is honoured only on
+/// the ranked hetero queue and otherwise ignored (the result stays raw).
+#[allow(clippy::too_many_arguments)]
+fn precompute_round1_ab_inner_packed_padded_body_with(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+    compact: bool,
+    use_provenance: bool,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
+    producer: Option<Round1AbProducer<'_>>,
+    backing: Option<ExactTuneBacking>,
+    preconvert: bool,
+) -> Round1AbInner {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -1304,6 +1381,14 @@ fn precompute_round1_ab_inner_packed_padded_body(
     };
 
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    let n_windows = total_bytes / AB_WINDOW_BYTES;
+    // Lane abpc: decided once here and stored with the result; the
+    // completion never recomputes it.
+    let preconvert_from = if preconvert && zc_ab_pre_hetero_enabled() {
+        ab_preconvert_from_window(m, k_skip, padding).unwrap_or(n_windows)
+    } else {
+        n_windows
+    };
     // The BLAKE3 R1CS has two 8192-bit windows per 16384-bit block. Besides
     // the full all-ones B rows at b_med 0/1 and the single-K0 tail, two mixed
     // rows have fixed one-valued K subsets: K0..1 at first-window b_med 2 and
@@ -1404,6 +1489,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     out_bytes,
                     tail,
                     producer,
+                    preconvert_from,
                 );
             } else {
                 precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
@@ -1421,6 +1507,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     out_bytes,
                     tail,
                     producer,
+                    preconvert_from,
                 );
             }
         } else {
@@ -1439,12 +1526,14 @@ fn precompute_round1_ab_inner_packed_padded_body(
                 out_bytes,
                 tail,
                 producer,
+                preconvert_from,
             );
         }
         return Round1AbInner {
             storage,
             representation,
             provenance_hit,
+            preconverted_from_window: preconvert_from,
         };
     }
 
@@ -1483,10 +1572,173 @@ fn precompute_round1_ab_inner_packed_padded_body(
         storage,
         representation,
         provenance_hit,
+        preconverted_from_window: n_windows,
     }
 }
 
 /// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
+/// Lane abpc (preconverted CPU-band AB windows): ranked geometry the
+/// conversion is admitted for. The completion re-asserts the same values.
+const AB_PRECONVERT_N_LO: usize = 12;
+const AB_PRECONVERT_N_HI: usize = 7;
+const AB_PRECONVERT_BANK_BITS: usize = 7;
+
+/// First window stored preconverted, or `None` (keep every window raw).
+///
+/// Admitted only on macOS/aarch64 at the ranked BLAKE3 shape (`m = 32`,
+/// `k_log = 14`, 15,409 useful bits) whose completion takes the folded drain
+/// with 128 banks (`n_lo = 12`, `n_hi = 7`, `bank_bits = 7`, all from the
+/// same cached process configuration the completion reads). The leading
+/// `share.min(hi_size)` chunks — the round-one AB GPU arm's cached requested
+/// prefix — stay raw so the GPU, its warm-up oracle and the CPU redo read the
+/// bytes they always read; the GPU launch is additionally capped to this
+/// boundary. Challenge-independent: config only.
+fn ab_preconvert_from_window(m: usize, k_skip: usize, padding: &PaddingSpec) -> Option<usize> {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return None;
+    }
+    if m != 32 || k_skip != K_SKIP || padding.k_log != 14 || padding.useful_bits_per_block != 15_409 {
+        return None;
+    }
+    let n_outer = m - k_skip - N_INNER;
+    let n_hi = fold4_n_hi_from_env().min(n_outer);
+    let n_lo = n_outer - n_hi;
+    if n_hi != AB_PRECONVERT_N_HI
+        || n_lo != AB_PRECONVERT_N_LO
+        || ab_eq_fold_from_env().bank_bits(n_lo) != Some(AB_PRECONVERT_BANK_BITS)
+    {
+        return None;
+    }
+    let hi_size = 1usize << n_hi;
+    let raw_chunks = crate::gpu_commit::gpu_zc_ab_completion_share().min(hi_size);
+    Some(raw_chunks << n_lo)
+}
+
+/// Lane abpc: overwrite every window `x_outer` of `range` with
+/// `x_outer >= from` by its preconverted form
+/// `V[lane] = XOR_{b in [first, end)} convert[b * 256 + row_b[lane]]`, the
+/// unscaled image of exactly the rows the folded completion would gather
+/// (identity/output omissions and dead windows included: a window with no
+/// materialized row becomes zero). The window's raw rows are read through a
+/// shared view, the 64 lanes are formed in a local array, and only then is
+/// the window written, so no reference aliases the store.
+///
+/// # Safety
+/// `out_base` is the AB backing; every window in `range` is complete, owned
+/// by the calling job and not accessed by any other thread during the call.
+unsafe fn preconvert_ab_windows(
+    out_base: *mut u8,
+    range: std::ops::Range<usize>,
+    from: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    representation: Round1AbRepresentation,
+) {
+    // SAFETY: in place: the source window is the destination window, read
+    // completely before it is written (caller contract as above).
+    unsafe {
+        preconvert_ab_windows_from(
+            out_base,
+            0,
+            out_base,
+            range,
+            from,
+            within_outer_mask,
+            b_med_counts,
+            representation,
+        );
+    }
+}
+
+/// [`preconvert_ab_windows`] reading the raw rows of window `x_outer` at
+/// `src + (x_outer - src_first) * 1 KiB` (the backing itself, or a worker's
+/// unit scratch) and writing its preconverted lanes once to the backing
+/// window `out_base + x_outer * 1 KiB`. Only the materialized rows
+/// `[first, end)` of a source window are read.
+///
+/// # Safety
+/// For every converted `x_outer`: the source window is readable, its rows
+/// `[first, end)` are initialized and hold that window's raw transform, and
+/// it is F128-aligned; the destination window lies in the backing and is
+/// owned by the calling job. A source and destination window are either the
+/// same window or disjoint.
+#[allow(clippy::too_many_arguments)]
+unsafe fn preconvert_ab_windows_from(
+    src: *const u8,
+    src_first: usize,
+    out_base: *mut u8,
+    range: std::ops::Range<usize>,
+    from: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    representation: Round1AbRepresentation,
+) {
+    let start = range.start.max(from);
+    if start >= range.end {
+        return;
+    }
+    debug_assert!(src_first <= start);
+    let convert = convert_table();
+    let unscaled = zc_ab_unscaled_enabled();
+    for x_outer in start..range.end {
+        // SAFETY: caller contract; windows are 1 KiB apart.
+        let (source, window) = unsafe {
+            (
+                src.add((x_outer - src_first) * AB_WINDOW_BYTES),
+                out_base.add(x_outer * AB_WINDOW_BYTES),
+            )
+        };
+        let w = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[w] as usize;
+        let mut v = [F128::ZERO; ELL];
+        if n_b_med != 0 {
+            let first = representation.first_materialized_b_med(w);
+            let end = representation.materialized_b_med_end(w, n_b_med);
+            // SAFETY: see above; the view ends before the store below.
+            let rows = unsafe { &*source.cast::<[[u8; 64]; 1 << N_MEDIUM]>() };
+            if unscaled {
+                kernels::accumulate_convert_ab_nomul::<false, true>(rows, first, end, convert, &mut v);
+            } else {
+                kernels::accumulate_convert_ab_nomul::<false, false>(rows, first, end, convert, &mut v);
+            }
+        }
+        // SAFETY: as above; `[F128; 64]` is exactly one window.
+        unsafe { window.cast::<[F128; ELL]>().write(v) };
+    }
+}
+
+/// Lane abpc: the folded completion of one preconverted chunk range.
+/// `partial = eq_hi * sum_t eq_top_scaled[t] * sum_u eq_bot[u] * V[t*128+u]`,
+/// i.e. the staged scaled gathers regrouped by distributivity
+/// (`T_t = convert * eq_top_scaled[t]`, `eq_top_scaled` carrying `D^-1`).
+fn fold_preconverted_ab_range(
+    storage: &[F128],
+    x_hi: usize,
+    lo_range: std::ops::Range<usize>,
+    eq_bot: &[F128; 128],
+    eq_top_scaled: &[F128],
+    eq_hi_val: F128,
+) -> [F128; ELL] {
+    const BANKS: usize = 1 << AB_PRECONVERT_BANK_BITS;
+    assert!(lo_range.start.is_multiple_of(BANKS) && lo_range.end.is_multiple_of(BANKS));
+    assert!(lo_range.end <= 1 << AB_PRECONVERT_N_LO);
+    let mut partial = [F128::ZERO; ELL];
+    for t in lo_range.start / BANKS..lo_range.end / BANKS {
+        let first_window = (x_hi << AB_PRECONVERT_N_LO) + t * BANKS;
+        let block = &storage[first_window * ELL..(first_window + BANKS) * ELL];
+        let mut folded = [F128::ZERO; ELL];
+        crate::field::f128_slice::fold_bank_major_128x64_rows2(eq_bot, block, &mut folded);
+        let scale = eq_top_scaled[t];
+        for (out, value) in partial.iter_mut().zip(folded) {
+            *out += scale * value;
+        }
+    }
+    for value in &mut partial {
+        *value *= eq_hi_val;
+    }
+    partial
+}
+
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
     n_chunks.div_ceil(2048).max(1)
@@ -1566,6 +1818,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     out_bytes: &mut [u8],
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Option<Round1AbProducer<'_>>,
+    preconvert_from: usize,
 ) {
     // This is a private specialization contract, but keep it checked in
     // release builds so a future caller cannot accidentally select
@@ -1614,21 +1867,34 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             nt,
             representation,
         );
+        // Lane abss: units wholly at or above the preconvert boundary are
+        // transformed into a worker-local unit buffer (one unit, `unit_bytes`
+        // of output: 8 KiB at the ranked shape) with cached stores, then
+        // converted and written to the backing once. Allocated zeroed, so
+        // every byte a reference spans is initialized; only materialized
+        // rows written by this unit's transform are read back.
+        let any_converted = preconvert_from < n_chunks;
         crate::epool::run_hetero_chunks_stateful_with_tail(
             n_jobs,
             || {
                 #[cfg(target_arch = "aarch64")]
                 kernels::aarch64::ab_kara_note_worker();
                 let window_plan = ab_window_rows_worker_plan();
+                let unit_out: Vec<F128> = if any_converted {
+                    vec![F128::ZERO; unit_chunks * ELL]
+                } else {
+                    Vec::new()
+                };
                 (
                     [F8::ZERO; ELL],
                     [F8::ZERO; ELL],
                     AbUnitScratch::new(unit_bytes),
                     window_plan,
                     ab_window_unit_worker_plan(window_plan).zip(window_runs),
+                    unit_out,
                 )
             },
-            |(a_col, b_col, scratch, window_plan, window_unit), job| {
+            |(a_col, b_col, scratch, window_plan, window_unit, unit_out), job| {
                 let window_plan = *window_plan;
                 let window_unit = *window_unit;
                 let unit_start = job * units_per_job;
@@ -1636,6 +1902,50 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 for unit in unit_start..unit_end {
                     let (a_unit, b_unit) =
                         scratch.fill(unit, |a, b, primed| (producer.produce)(unit, a, b, primed));
+                    let first_window = unit * unit_chunks;
+                    if first_window >= preconvert_from {
+                        debug_assert_eq!(unit_out.len(), unit_chunks * ELL);
+                        let local = unit_out.as_mut_ptr().cast::<u8>();
+                        // SAFETY: `local` is this worker's own initialized,
+                        // F128-aligned `unit_chunks * 1 KiB` buffer; the
+                        // transform writes it with plain cached stores
+                        // (`nt = false`, no direct stores), the same thread
+                        // then reads its materialized rows, and the converted
+                        // lanes go to this job's own backing windows.
+                        unsafe {
+                            precompute_ab_unit::<FAST_POLICY, false>(
+                                a_unit,
+                                b_unit,
+                                inv_table,
+                                within_outer_mask,
+                                b_med_counts,
+                                blake3_static_layout,
+                                static_b_context,
+                                false,
+                                compact,
+                                representation,
+                                first_window,
+                                unit_chunks,
+                                0,
+                                local,
+                                a_col,
+                                b_col,
+                                window_plan,
+                                window_unit,
+                            );
+                            preconvert_ab_windows_from(
+                                local,
+                                first_window,
+                                out_base.ptr(),
+                                first_window..first_window + unit_chunks,
+                                preconvert_from,
+                                within_outer_mask,
+                                b_med_counts,
+                                representation,
+                            );
+                        }
+                        continue;
+                    }
                     // SAFETY: this job owns the output of its units.
                     unsafe {
                         precompute_ab_unit::<FAST_POLICY, FORCE_DIRECT>(
@@ -1657,6 +1967,17 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                             b_col,
                             window_plan,
                             window_unit,
+                        );
+                        // Lane abpc: a unit straddling the boundary (not at
+                        // the ranked shape) converts its CPU-owned windows in
+                        // place, as before; raw units convert nothing.
+                        preconvert_ab_windows(
+                            out_base.ptr(),
+                            unit * unit_chunks..(unit + 1) * unit_chunks,
+                            preconvert_from,
+                            within_outer_mask,
+                            b_med_counts,
+                            representation,
                         );
                     }
                 }
@@ -1727,6 +2048,20 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     a_col,
                     b_col,
                     window_plan,
+                );
+            }
+            // Lane abpc: convert this slab's CPU-owned windows in the job
+            // that just wrote them.
+            // SAFETY: the slab `chunk_start..chunk_end` is this job's
+            // disjoint output and is complete.
+            unsafe {
+                preconvert_ab_windows(
+                    out_base.ptr(),
+                    chunk_start..chunk_end,
+                    preconvert_from,
+                    within_outer_mask,
+                    b_med_counts,
+                    representation,
                 );
             }
         },
@@ -3878,8 +4213,11 @@ fn launch_ab_completion_gpu_prefix(
     n_lo: usize,
     n_hi: usize,
     padding: &PaddingSpec,
+    raw_chunks: usize,
 ) -> Option<AbGpuPrefix> {
-    let share = crate::gpu_commit::gpu_zc_ab_completion_share();
+    // Lane abpc: the GPU reads raw transform bytes, so it is capped to the
+    // stored raw prefix (`raw_chunks == hi_size` when nothing was converted).
+    let share = crate::gpu_commit::gpu_zc_ab_completion_share().min(raw_chunks);
     if share == 0 {
         return None;
     }
@@ -3937,6 +4275,7 @@ fn launch_ab_completion_gpu_prefix(
     _n_lo: usize,
     _n_hi: usize,
     _padding: &PaddingSpec,
+    _raw_chunks: usize,
 ) -> Option<AbGpuPrefix> {
     None
 }
@@ -3951,6 +4290,7 @@ enum AbCompletionSetup {
         eq: SplitEqGhash,
         bank_bits: usize,
         eq_bot: Vec<F128>,
+        eq_top_scaled: Vec<F128>,
         tables: Vec<F128>,
         bank_deferred: bool,
     },
@@ -3984,10 +4324,26 @@ where
     let n_hi = fold4_n_hi.min(r_outer.len());
     let n_lo = r_outer.len() - n_hi;
     let bank_bits = fold.bank_bits(n_lo);
+    // Lane abpc: chunks `raw_chunks..` were stored preconverted by the
+    // producer (boundary stored with the backing, never recomputed). Only the
+    // folded 128-bank geometry it was produced for may consume them.
+    let raw_chunks = if ab_inner.has_preconverted() {
+        assert!(
+            bank_bits == Some(AB_PRECONVERT_BANK_BITS)
+                && n_lo == AB_PRECONVERT_N_LO
+                && n_hi == AB_PRECONVERT_N_HI
+                && ab_inner.preconverted_from_window.is_multiple_of(1 << n_lo),
+            "preconverted AB windows reached a completion geometry they were not produced for"
+        );
+        ab_inner.preconverted_from_window >> n_lo
+    } else {
+        1usize << n_hi
+    };
     // GPU prefix arm (`FLOCK_NO_GPU_ZC_AB_COMPLETION` kills): submitted first
     // so the GPU starts while the CPU builds its tables. Folded drain only.
+    // It reads raw bytes, so it never covers a preconverted chunk.
     let gpu_prefix = if bank_bits.is_some() && n_hi > 0 {
-        launch_ab_completion_gpu_prefix(ab_inner, r_outer, n_lo, n_hi, padding)
+        launch_ab_completion_gpu_prefix(ab_inner, r_outer, n_lo, n_hi, padding, raw_chunks)
     } else {
         None
     };
@@ -4020,6 +4376,7 @@ where
                 eq,
                 bank_bits,
                 eq_bot,
+                eq_top_scaled,
                 tables,
                 bank_deferred,
             }
@@ -4047,6 +4404,7 @@ where
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let tail_out = match setup {
         AbCompletionSetup::Plain { eq, eq_lo_scaled } => {
+            ab_inner.assert_raw("the plain AB completion");
             crate::epool::run_hetero_chunks_caller_tail(
                 hi_size,
                 |x_hi| {
@@ -4077,6 +4435,7 @@ where
             eq,
             bank_bits,
             eq_bot,
+            eq_top_scaled,
             tables,
             bank_deferred,
         } => {
@@ -4097,6 +4456,20 @@ where
             let mut half_partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(2 * split);
             let half_base = crate::epool::SyncPtr(half_partials.as_mut_ptr());
             let fold_chunk = |x_hi: usize, range: std::ops::Range<usize>| -> [F128; ELL] {
+                if x_hi >= raw_chunks {
+                    let eq_bot: &[F128; 128] = eq_bot
+                        .as_slice()
+                        .try_into()
+                        .expect("preconverted fold has exactly 128 bank weights");
+                    return fold_preconverted_ab_range(
+                        &ab_inner.storage,
+                        x_hi,
+                        range,
+                        eq_bot,
+                        &eq_top_scaled,
+                        eq.hi[x_hi],
+                    );
+                }
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
@@ -5290,6 +5663,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let mask_tables = build_c_mask_tables(&eq_lo_scaled);
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    ab_inner.assert_raw("the extract-C AB completion");
     let ab_inner_bytes = ab_inner.as_bytes();
     let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
     let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
@@ -5478,6 +5852,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
     let c_table_ms = t_c_table.elapsed().as_secs_f64() * 1e3;
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    ab_inner.assert_raw("the extract-C AB completion");
     let ab_inner_bytes = ab_inner.as_bytes();
 
     let timing_cpu_ns: [std::sync::atomic::AtomicU64; 3] =
@@ -6706,6 +7081,7 @@ mod tests {
                                     out,
                                     None,
                                     producer,
+                                    usize::MAX,
                                 )
                             };
                         }
@@ -7128,6 +7504,7 @@ mod tests {
                         None,
                         None,
                         producer,
+                        false,
                     )
                 }
             } else {
