@@ -88,6 +88,10 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
+#[cfg(target_arch = "aarch64")]
+#[path = "blake3_witness_const.rs"]
+mod witness_const;
+
 use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
@@ -98,6 +102,10 @@ use flock_core::pcs::{Commitment, PcsParams};
 use flock_core::proof::R1csClaim;
 use flock_core::r1cs::{BlockR1cs, SparseBinaryMatrix};
 use flock_core::verifier;
+
+#[cfg(target_arch = "aarch64")]
+#[path = "blake3_producer_const.rs"]
+mod producer_const;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -241,6 +249,8 @@ pub(crate) struct DeferredAb<'a> {
     /// the whole kernel (default); `FLOCK_NO_WITGEN_AB_INPUT_MEM=1` restores
     /// the register form.  Copy-drain forms only.
     input_mem: bool,
+    /// Preserve token-owned constant words inside the boundary dump chunks.
+    producer_const: bool,
     /// Regenerate a word-major quad in place (`gen_quad_soa_into`, default)
     /// instead of by value; `FLOCK_NO_AB_SEED_INPUT_REUSE` restores the
     /// latter.
@@ -290,6 +300,12 @@ impl DeferredAb<'_> {
                     witgen_simd::build_quad_split_neon::<false, false, false, false>(
                         input, none, a, b, none, none,
                     );
+                } else if self.producer_const {
+                    if primed {
+                        witgen_simd::build_quad_split_neon_mem_const::<true>(input, a, b, sa, sb)
+                    } else {
+                        witgen_simd::build_quad_split_neon_mem_const::<false>(input, a, b, sa, sb)
+                    }
                 } else {
                     match (primed, self.copy_drain) {
                         (true, true) if self.input_mem => {
@@ -2086,6 +2102,249 @@ fn build_block_witness_ab_stream_into(
     }
 }
 
+/// Adaptive witness-generation pacing for the streamed first pass
+/// (`FLOCK_NO_WITGEN_PACE=1` kills; read once per process).
+///
+/// The commit window's first pass is GPU-bound, and full-width witness
+/// production (every main worker plus the efficiency helpers, writing the
+/// witness at full memory bandwidth) slows the GPU's band kernel while they
+/// overlap. Witness generation needs only a fraction of its width to stay
+/// ahead of the GPU, so once the GPU has enough bands queued, the extra
+/// producers park between slabs and rejoin when the queue runs short.
+///
+/// Between slabs a producer polls how many committed bands the GPU has not
+/// completed (the band lead, `BandPaceProbe`). At a lead of `hi` bands the
+/// efficiency helpers and all main producers beyond `m` park (condvar wait
+/// with a short tick, no spinning) until the lead falls to `lo` or the last
+/// slab has been claimed. Both are sized per machine: `m` is the fewest main
+/// producers whose slab rate keeps up with the GPU's band consumption (the
+/// median main-worker slab time of this drain's first slabs against the
+/// GPU's per-tile time from the untimed warm-up's full-range first pass),
+/// and `lo` covers producing a whole band at full width plus one park tick,
+/// in GPU time.
+///
+/// Scheduling only: every slab is claimed exactly once from the same queue
+/// and written by the same code, the bands are committed by the same
+/// accounting, and no byte of the witness or the proof changes.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) struct WitgenPacer {
+    probe: flock_core::gpu_commit::BandPaceProbe,
+    n_slabs: usize,
+    main_n: usize,
+    /// GPU nanoseconds per position tile (warm-up first pass).
+    tile_ns: f64,
+    tiles_per_slab: f64,
+    tiles_per_band: f64,
+    entered: std::sync::atomic::AtomicUsize,
+    parked_main: std::sync::atomic::AtomicUsize,
+    /// The first `PACE_SAMPLES` main-worker slab times (ns).
+    slab_ns: [std::sync::atomic::AtomicU64; PACE_SAMPLES],
+    slab_n: std::sync::atomic::AtomicUsize,
+    sample_slot: std::sync::atomic::AtomicUsize,
+    /// (hi, lo, max parked main producers), fixed once enough slabs are timed.
+    plan: std::sync::OnceLock<(usize, usize, usize)>,
+    lock: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
+}
+
+/// Park tick: the longest a parked producer sleeps between lead checks.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const PACE_TICK: std::time::Duration = std::time::Duration::from_micros(100);
+/// Main-worker slabs timed (median) before the plan is fixed.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const PACE_SAMPLES: usize = 16;
+
+/// Diagnostic: `FLOCK_WITGEN_PACE_TRACE=1` prints each drain's pacing plan.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn witgen_pace_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_WITGEN_PACE_TRACE").is_some())
+}
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn witgen_pace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FLOCK_NO_WITGEN_PACE").is_ok_and(|v| v == "1"))
+}
+
+/// Pacing plan `(hi, lo, m)` from a main-worker slab time and the GPU's
+/// per-tile time (both in ns): `m` is the fewest main producers whose slab
+/// rate keeps up with the GPU (clamped to `2..=main_n`); `lo` is the band lead that
+/// covers producing one whole band at full main width plus one park tick,
+/// in GPU time (at least one band); producers park at `hi = lo + 1`.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn witgen_pace_plan(
+    slab_ns: f64,
+    tile_ns: f64,
+    tiles_per_slab: f64,
+    tiles_per_band: f64,
+    main_n: usize,
+) -> Option<(usize, usize, usize)> {
+    let slab_gpu_ns = tiles_per_slab * tile_ns;
+    let band_gpu_ns = tiles_per_band * tile_ns;
+    if !(slab_ns > 0.0 && slab_gpu_ns > 0.0 && band_gpu_ns > 0.0) || main_n < 2 {
+        return None;
+    }
+    let m = ((slab_ns / slab_gpu_ns).ceil() as usize).clamp(2, main_n);
+    let band_full_ns = (tiles_per_band / tiles_per_slab) * slab_ns / main_n as f64;
+    let lo = (((band_full_ns + PACE_TICK.as_nanos() as f64) / band_gpu_ns).ceil() as usize).max(1);
+    Some((lo + 1, lo, m))
+}
+
+#[cfg(test)]
+mod witgen_pace_tests {
+    use super::witgen_pace_plan;
+
+    /// Main producers that each make a slab in 60 us against a GPU at 110 ns
+    /// per tile (128-tile slabs, 8192-tile bands, ten main workers): 4.3
+    /// producers match the GPU, so 5 are kept, and a whole band
+    /// at full width (0.38 ms) plus a tick fits in one band of GPU time
+    /// (0.9 ms): park at a lead of 2, rejoin at 1.
+    #[test]
+    fn plan_matches_the_measured_machine() {
+        assert_eq!(witgen_pace_plan(60_000.0, 110.0, 128.0, 8192.0, 10), Some((2, 1, 5)));
+    }
+
+    /// Slower producers need more of them and a deeper lead; the width never
+    /// exceeds the pool and never drops below two.
+    #[test]
+    fn plan_scales_and_clamps() {
+        let (hi, lo, m) = witgen_pace_plan(200_000.0, 110.0, 128.0, 8192.0, 10).unwrap();
+        assert_eq!(m, 10);
+        assert!(lo >= 2 && hi == lo + 1);
+        assert_eq!(witgen_pace_plan(1_000.0, 110.0, 128.0, 8192.0, 10).map(|p| p.2), Some(2));
+        assert_eq!(witgen_pace_plan(60_000.0, 0.0, 128.0, 8192.0, 10), None);
+        assert_eq!(witgen_pace_plan(60_000.0, 110.0, 128.0, 8192.0, 1), None);
+    }
+}
+
+/// The pacer for one streamed drain, or `None` when killed, off the Metal
+/// stream, or before any warm-up first pass has been timed.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn witgen_pacer(
+    stream: &flock_core::gpu_commit::FromZFirstPassStream,
+    n_slabs: usize,
+    tiles_per_slab: usize,
+    tiles_per_band: usize,
+) -> Option<WitgenPacer> {
+    if !witgen_pace_enabled() {
+        return None;
+    }
+    let ps = flock_core::gpu_commit::first_pass_ps_per_tile()?;
+    let probe = stream.pace_probe()?;
+    let main_n = rayon::current_num_threads();
+    if main_n < 2 {
+        return None;
+    }
+    Some(WitgenPacer {
+        probe,
+        n_slabs,
+        main_n,
+        tile_ns: ps as f64 / 1000.0,
+        tiles_per_slab: tiles_per_slab as f64,
+        tiles_per_band: tiles_per_band as f64,
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        parked_main: std::sync::atomic::AtomicUsize::new(0),
+        slab_ns: [const { std::sync::atomic::AtomicU64::new(0) }; PACE_SAMPLES],
+        slab_n: std::sync::atomic::AtomicUsize::new(0),
+        sample_slot: std::sync::atomic::AtomicUsize::new(0),
+        plan: std::sync::OnceLock::new(),
+        lock: std::sync::Mutex::new(()),
+        cv: std::sync::Condvar::new(),
+    })
+}
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+impl WitgenPacer {
+    /// Called as a producer starts a slab: counts claims, and the claim of
+    /// the last slab wakes every parked producer (the drain's join then
+    /// never waits out a tick).
+    #[inline]
+    fn enter(&self) {
+        if self.entered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 == self.n_slabs {
+            let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.cv.notify_all();
+        }
+    }
+
+    #[inline]
+    fn lead(&self) -> usize {
+        let (committed, completed) = self.probe.poll();
+        committed.saturating_sub(completed)
+    }
+
+    fn plan(&self) -> Option<(usize, usize, usize)> {
+        use std::sync::atomic::Ordering;
+        if let Some(&p) = self.plan.get() {
+            return Some(p);
+        }
+        if self.slab_n.load(Ordering::Acquire) < PACE_SAMPLES {
+            return None;
+        }
+        let mut t: [u64; PACE_SAMPLES] = std::array::from_fn(|i| self.slab_ns[i].load(Ordering::Relaxed));
+        t.sort_unstable();
+        let slab_ns = (t[PACE_SAMPLES / 2 - 1] + t[PACE_SAMPLES / 2]) as f64 / 2.0;
+        let (hi, lo, m) =
+            witgen_pace_plan(slab_ns, self.tile_ns, self.tiles_per_slab, self.tiles_per_band, self.main_n)?;
+        Some(*self.plan.get_or_init(|| {
+            if witgen_pace_trace() {
+                eprintln!(
+                    "[witgen-pace] slab {slab_ns:.0} ns, tile {:.4} ns: m {m} of {}, lead hi {hi} lo {lo}",
+                    self.tile_ns, self.main_n
+                );
+            }
+            (hi, lo, self.main_n - m)
+        }))
+    }
+
+    /// Called as a producer finishes a slab (after its band accounting).
+    fn point(&self, slab_start: std::time::Instant) {
+        use std::sync::atomic::Ordering;
+        let helper = rayon::current_num_threads() != self.main_n;
+        if !helper && self.slab_n.load(Ordering::Relaxed) < PACE_SAMPLES {
+            // Claim a sample slot first, publish the time, then count it, so
+            // the plan reads only completed samples.
+            let i = self.sample_slot.fetch_add(1, Ordering::Relaxed);
+            if i < PACE_SAMPLES {
+                self.slab_ns[i].store(slab_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                self.slab_n.fetch_add(1, Ordering::Release);
+            }
+        }
+        if self.entered.load(Ordering::Relaxed) >= self.n_slabs {
+            return;
+        }
+        let Some((hi, lo, max_parked_main)) = self.plan() else {
+            return;
+        };
+        if self.lead() < hi {
+            return;
+        }
+        if !helper {
+            let mut p = self.parked_main.load(Ordering::Relaxed);
+            loop {
+                if p >= max_parked_main {
+                    return;
+                }
+                match self.parked_main.compare_exchange_weak(p, p + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(x) => p = x,
+                }
+            }
+        }
+        let mut g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        while self.entered.load(Ordering::Relaxed) < self.n_slabs {
+            g = self.cv.wait_timeout(g, PACE_TICK).unwrap_or_else(|e| e.into_inner()).0;
+            if self.lead() <= lo {
+                break;
+            }
+        }
+        drop(g);
+        if !helper {
+            self.parked_main.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // W-H2: SIMD-lockstep witness materialization (aarch64). Derivation and
 // pricing: notes/witgen-simd.md. Four compressions run in u32-lane lockstep
@@ -2133,7 +2392,8 @@ pub(crate) mod witgen_simd {
     // contain the right bytes and their dump chunks are skipped. Skips are
     // dump-chunk (32 B/block) granular and stay strictly INSIDE the
     // constant regions: z/a's zero tail skips words 488..512 (chunk 60 still
-    // carries data words 480/481 and is always written), while b can skip
+    // carries data words 480/481; the compact z form publishes just its
+    // first half and preserves the certified zero second half), while b can skip
     // from word 472 because its remaining lin-id/output bits are fixed ones
     // before the zero padding. b's prefix skips words 0..32 (chunk 4 carries
     // data words 36..39 and the residual constant words 32..35, always
@@ -2159,7 +2419,7 @@ pub(crate) mod witgen_simd {
     const RANKED_SPARSE_TAIL_WORD: usize = 8 * RANKED_SPARSE_TAIL_CHUNK;
     const ZERO_FILL_WORD: usize = USEFUL_BITS.div_ceil(32);
     const BLOCK_BYTES: usize = U32_PER_BLOCK * 4; // 2048
-    const ZERO_TAIL_BYTE: usize = ELIDE_ZERO_CHUNK * 32; // 1952
+    const ZERO_TAIL_BYTE: usize = ZERO_FILL_WORD * 4; // 1928
     const B_TAIL_BYTE: usize = ELIDE_B_TAIL_CHUNK * 32; // 1888
     const B_FULL_ONES_END_BYTE: usize = USEFUL_BITS / 8; // 1926
     const B_LAST_BYTE_VALUE: u8 = (1u8 << (USEFUL_BITS % 8)) - 1; // 0x01
@@ -2195,7 +2455,7 @@ pub(crate) mod witgen_simd {
 
     /// Provenance-tag layout version: bump on ANY change to the witness
     /// block layout or to the elision geometry above.
-    const WITGEN_SCRATCH_LAYOUT_V: u64 = 2;
+    const WITGEN_SCRATCH_LAYOUT_V: u64 = 3;
     pub(crate) const ROLE_Z: u64 = 1;
     pub(crate) const ROLE_A: u64 = 2;
     pub(crate) const ROLE_B: u64 = 3;
@@ -2473,17 +2733,37 @@ pub(crate) mod witgen_simd {
     /// stream offset (USED), the straddle back-shift (BACK), and — when it
     /// completes a word — the ABSOLUTE word index (WORD), so completed words
     /// go straight to the stage with immediate store offsets. There is no
-    /// runtime writer state besides `pending` — the vector analogue of the
-    /// scalar builder's fully-unrolled writer.
-    struct W32 {
+    /// runtime cursor besides `pending` — the vector analogue of the scalar
+    /// builder's fully-unrolled writer. The compact form also retains the
+    /// penultimate word for direct tail publication.
+    struct W32<const CONST_TAIL: bool> {
         pending: V4,
+        tail: V4,
         stage: *mut V4, // 512 block-lane words for this buffer's quad
     }
 
-    impl W32 {
+    impl<const CONST_TAIL: bool> W32<CONST_TAIL> {
         #[inline(always)]
         fn at(stage: *mut V4, pending: V4) -> Self {
-            Self { pending, stage }
+            Self { pending, tail: pending, stage }
+        }
+
+        #[inline(always)]
+        unsafe fn emit<const WORD: usize>(&mut self, value: V4) {
+            unsafe {
+                if CONST_TAIL && WORD == RANKED_SPARSE_TAIL_WORD {
+                    self.tail = value;
+                } else {
+                    vst1q_u32(self.stage.add(WORD) as *mut u32, value);
+                }
+            }
+        }
+
+        /// The final live words are still in registers. The caller holds a
+        /// complete-witness token, so the padding left untouched is zero.
+        #[inline(always)]
+        unsafe fn finish_const_tail(&self, dst: *mut u32) {
+            unsafe { super::witness_const::store_tail_nt(self.tail, self.pending, dst) }
         }
 
         /// Push the low WIDTH bits of `v` at stream offset ≡ USED (mod 32).
@@ -2517,7 +2797,7 @@ pub(crate) mod witgen_simd {
                 // the next `vsli #31` overwrites it exactly.
                 if USED == 0 {
                     if WIDTH == 32 {
-                        vst1q_u32(self.stage.add(WORD) as *mut u32, v);
+                        self.emit::<WORD>(v);
                         self.pending = vdupq_n_u32(0);
                     } else {
                         self.pending = v;
@@ -2526,7 +2806,7 @@ pub(crate) mod witgen_simd {
                     self.pending = vsliq_n_u32::<USED>(self.pending, v);
                 } else {
                     let out = vsliq_n_u32::<USED>(self.pending, v);
-                    vst1q_u32(self.stage.add(WORD) as *mut u32, out);
+                    self.emit::<WORD>(out);
                     if USED + WIDTH == 32 {
                         self.pending = vdupq_n_u32(0);
                     } else {
@@ -2887,9 +3167,9 @@ pub(crate) mod witgen_simd {
             // Writers start at u32 word 36 with one pending bit (flags>>31
             // for z/a, 1 for b) — the scalar writer's u64-word-18 state.
             let pending_bit = vshrq_n_u32::<31>(flags);
-            let mut wz = W32::at(zs, pending_bit);
-            let mut wa = W32::at(ast, pending_bit);
-            let mut wb = W32::at(bs, one);
+            let mut wz = W32::<false>::at(zs, pending_bit);
+            let mut wa = W32::<false>::at(ast, pending_bit);
+            let mut wb = W32::<false>::at(bs, one);
 
             macro_rules! g {
                 ($g:expr, $la:literal, $lb:literal, $lc:literal, $ld:literal,
@@ -3307,7 +3587,7 @@ pub(crate) mod witgen_simd {
     /// only output words 8..16 need the stage here.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn dump_dual_copy<const DIRECT: bool, const PRIMED: bool>(
+    unsafe fn dump_dual_copy<const DIRECT: bool, const PRIMED: bool, const CONST: bool>(
         stage: *const V4,
         scratch: *mut u32,
         dst: *mut u32,
@@ -3331,6 +3611,18 @@ pub(crate) mod witgen_simd {
                 dump_range::<false>(stage, scratch, s0.max(59), s1);
             } else {
                 dump_range::<false>(stage, scratch, s0, s1);
+            }
+            if CONST {
+                // The global allocations retain the complete layout constants;
+                // only the variable words of the boundary chunks need copying.
+                if sparse_tail {
+                    debug_assert_eq!((nt0, nt1), (0, RANKED_SPARSE_TAIL_CHUNK));
+                    super::producer_const::publish::<true>(scratch, dst);
+                } else {
+                    debug_assert_eq!((nt0, nt1), (ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK));
+                    super::producer_const::publish::<false>(scratch, dst);
+                }
+                return;
             }
             // In a complete stage the sparse tail chunk is words 480..483
             // followed by four zero words, which is what the scratch holds.
@@ -3401,10 +3693,21 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false, false, false>(inputs, z, a, b, sa, sb)
             } else {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false, false>(inputs, z, a, b, sa, sb)
             }
+        }
+    }
+
+    /// z-only split form with the certified padding omitted from its tail.
+    /// Safety requirements are identical to the z-only split form above.
+    pub(crate) unsafe fn build_quad_witness_const(inputs: QuadInput<'_>, z: *mut u32) {
+        unsafe {
+            build_quad_split_neon_impl::<true, false, false, false, false, true, true, false, true, false>(
+                inputs, z, core::ptr::null_mut(), core::ptr::null_mut(),
+                core::ptr::null_mut(), core::ptr::null_mut(),
+            );
         }
     }
 
@@ -3414,7 +3717,7 @@ pub(crate) mod witgen_simd {
     /// from the G stream): any value of `FLOCK_NO_WITGEN_AB_REBUILD` keeps
     /// the incumbent per-word stage stores and the full scratch copy. Read
     /// once per process. Same z, a, b and scratch bytes either way.
-    fn ab_rebuild_enabled() -> bool {
+    pub(super) fn ab_rebuild_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_AB_REBUILD").is_none())
     }
@@ -3442,7 +3745,7 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3451,7 +3754,7 @@ pub(crate) mod witgen_simd {
                     sb,
                 )
             } else {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3460,6 +3763,23 @@ pub(crate) mod witgen_simd {
                     sb,
                 )
             }
+        }
+    }
+
+    /// Copy-drain form that preserves the token-owned constants in the two
+    /// boundary chunks. Its selector is resolved when the handle is created.
+    /// Safety: the same complete-layout token contract as the split builder.
+    pub(crate) unsafe fn build_quad_split_neon_mem_const<const PRIMED: bool>(
+        inputs: QuadInput<'_>,
+        a: *mut u32,
+        b: *mut u32,
+        sa: *mut u32,
+        sb: *mut u32,
+    ) {
+        unsafe {
+            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false, true>(
+                inputs, core::ptr::null_mut(), a, b, sa, sb,
+            )
         }
     }
 
@@ -3473,7 +3793,7 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false>(
+            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false, false, false>(
                 inputs, core::ptr::null_mut(), a, b, sa, sb,
             )
         }
@@ -3511,6 +3831,8 @@ pub(crate) mod witgen_simd {
         const ELIDE_B_STAGE_TAIL: bool,
         const PAIR_STAGE_STORES: bool,
         const DIRECT_SCRATCH: bool,
+        const CONST_Z_TAIL: bool,
+        const CONST_PUBLISH: bool,
     >(
         inputs: QuadInput<'_>,
         z: *mut u32,
@@ -3522,7 +3844,9 @@ pub(crate) mod witgen_simd {
         const {
             assert!(!MEM || (!WZ && SCRATCH && COPY));
             assert!(!DIRECT_SCRATCH || (!WZ && SCRATCH && COPY));
+            assert!(!CONST_PUBLISH || (!WZ && SCRATCH && COPY && DIRECT_SCRATCH));
             assert!(!(WZ && SCRATCH));
+            assert!(!CONST_Z_TAIL || WZ);
             assert!(SCRATCH || !PRIMED);
             assert!(SCRATCH || !COPY);
             assert!(RANKED_SPARSE_TAIL_CHUNK.is_multiple_of(2));
@@ -3722,7 +4046,7 @@ pub(crate) mod witgen_simd {
 
             // ---- G stream ----
             let pending_bit = vshrq_n_u32::<31>(flags);
-            let mut wz = W32::at(za, pending_bit);
+            let mut wz = W32::<CONST_Z_TAIL>::at(za, pending_bit);
             let mut wab = W32Pair {
                 pa: pending_bit,
                 pb: one,
@@ -3835,7 +4159,9 @@ pub(crate) mod witgen_simd {
             oh!(6);
             oh!(7);
             if WZ {
-                wz.finish();
+                if !CONST_Z_TAIL {
+                    wz.finish();
+                }
             } else {
                 wab.finish();
             }
@@ -3857,7 +4183,7 @@ pub(crate) mod witgen_simd {
                         vst1q_u32(za.add(w) as *mut u32, zero);
                     }
                 }
-            } else {
+            } else if !CONST_Z_TAIL {
                 // The sparse tail publisher reads words 480..483 only.
                 vst1q_u32(za.add(ZERO_FILL_WORD) as *mut u32, zero);
                 vst1q_u32(za.add(ZERO_FILL_WORD + 1) as *mut u32, zero);
@@ -3872,7 +4198,11 @@ pub(crate) mod witgen_simd {
             // ---- drain ----
             if WZ {
                 dump_range_lines_nt(za, z, 0, RANKED_SPARSE_TAIL_CHUNK);
-                dump_ranked_sparse_tail_nt(za, z);
+                if CONST_Z_TAIL {
+                    wz.finish_const_tail(z);
+                } else {
+                    dump_ranked_sparse_tail_nt(za, z);
+                }
             } else if SCRATCH && COPY {
                 // Copy drain.  The scratch receives every chunk when it is
                 // cold and only the quad-dependent chunks when it is primed
@@ -3883,8 +4213,8 @@ pub(crate) mod witgen_simd {
                 } else {
                     (DUMP_CHUNKS, 0, DUMP_CHUNKS)
                 };
-                dump_dual_copy::<DIRECT_SCRATCH, PRIMED>(za, sa, a, 0, a1, 0, RANKED_SPARSE_TAIL_CHUNK, true);
-                dump_dual_copy::<DIRECT_SCRATCH, PRIMED>(
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED, CONST_PUBLISH>(za, sa, a, 0, a1, 0, RANKED_SPARSE_TAIL_CHUNK, true);
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED, CONST_PUBLISH>(
                     bs,
                     sb,
                     b,
@@ -3923,7 +4253,7 @@ pub(crate) mod witgen_simd {
     /// ([`super::DeferredAb`]); `FLOCK_NO_WITGEN_DEFER_AB` keeps the
     /// incumbent three-stream kernel.
     #[allow(clippy::type_complexity)]
-    fn generate_impl<'a>(
+    fn generate_impl<'a, const WITNESS_CONST: bool>(
         blocks: &'a [Compression],
         n_blocks_log: usize,
         stream_params: Option<&flock_core::pcs::PcsParams>,
@@ -4067,14 +4397,18 @@ pub(crate) mod witgen_simd {
             // SAFETY: the caller passes its own quad's block slots.
             unsafe {
                 if defer_ab {
-                    build_quad_split_neon::<true, false, false, false>(
-                        input,
-                        z,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    );
+                    if WITNESS_CONST {
+                        build_quad_witness_const(input, z);
+                    } else {
+                        build_quad_split_neon::<true, false, false, false>(
+                            input,
+                            z,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        );
+                    }
                 } else {
                     build_quad_witness_ab_stream_neon_elide(
                         input,
@@ -4300,12 +4634,22 @@ pub(crate) mod witgen_simd {
                 // strictly in band order. `FLOCK_NO_BAND_ANY_ORDER=1` restores
                 // the in-order sequencer.
                 let any_order = std::env::var_os("FLOCK_NO_BAND_ANY_ORDER").is_none();
+                let pacer = crate::r1cs_hashes::blake3::witgen_pacer(
+                    stream,
+                    slab_band.len(),
+                    16 * SLAB / SEGMENTS,
+                    16 * schedule.iter().copied().max().unwrap_or(SLAB),
+                );
                 let seq = std::sync::Mutex::new(SubmitSeq {
                     next: 0,
                     submitted: vec![false; n_bands],
                     stream,
                 });
                 let slab_fn = |s: usize| {
+                    let slab_start = pacer.as_ref().map(|p| {
+                        p.enter();
+                        std::time::Instant::now()
+                    });
                     let g0 = slab_g0[s] as usize;
                     for g in g0..g0 + SLAB {
                         process_group(g);
@@ -4355,6 +4699,9 @@ pub(crate) mod witgen_simd {
                                     .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             }
                         }
+                    }
+                    if let (Some(p), Some(t)) = (&pacer, slab_start) {
+                        p.point(t);
                     }
                 };
                 super::super::common::drain_witgen_slabs(slab_band.len(), &slab_fn);
@@ -4488,6 +4835,10 @@ pub(crate) mod witgen_simd {
         // The a/b tokens staged above describe the buffers once the handle
         // has produced every quad, which the prover guarantees before it
         // gives them back.
+        // Resolve the control once, outside every per-quad ablation dispatch.
+        // Reading it directly adds no deferred initialization to a proof.
+        let producer_const = std::env::var_os("FLOCK_NO_PRODUCER_CONST").as_deref()
+            != Some(std::ffi::OsStr::new("1"));
         let deferred = defer_ab.then(|| super::DeferredAb {
             blocks,
             spec_init,
@@ -4498,6 +4849,10 @@ pub(crate) mod witgen_simd {
             primed_scratch: ab_primed_scratch_enabled(),
             copy_drain: ab_copy_drain_enabled(),
             input_mem: ab_input_mem_enabled(),
+            producer_const: producer_const
+                && ab_copy_drain_enabled()
+                && ab_input_mem_enabled()
+                && ab_rebuild_enabled(),
             seed_in_place,
         });
         (z, a, b, z_lincheck, stream, deferred)
@@ -4543,7 +4898,7 @@ pub(crate) mod witgen_simd {
         n_blocks_log: usize,
     ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<u8>) {
         let (z, a, b, stripe, stream, deferred) =
-            generate_impl(blocks, n_blocks_log, None, false, false);
+            generate_impl::<false>(blocks, n_blocks_log, None, false, false);
         debug_assert!(stream.is_none() && deferred.is_none());
         (
             z,
@@ -4568,7 +4923,7 @@ pub(crate) mod witgen_simd {
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
     ) {
         let (z, a, b, stripe, stream, deferred) =
-            generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe, false);
+            generate_impl::<false>(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe, false);
         debug_assert!(deferred.is_none());
         (z, a, b, stripe, stream)
     }
@@ -4590,7 +4945,12 @@ pub(crate) mod witgen_simd {
         Option<flock_core::gpu_commit::FromZFirstPassStream>,
         Option<super::DeferredAb<'a>>,
     ) {
-        generate_impl(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe, true)
+        // Select the whole driver once; the quad loop has no ablation branch.
+        if super::witness_const::enabled() {
+            generate_impl::<true>(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe, true)
+        } else {
+            generate_impl::<false>(blocks, n_blocks_log, Some(pcs_params), defer_ranked_stripe, true)
+        }
     }
 }
 
@@ -6582,6 +6942,11 @@ mod tests {
                 assert_eq!(z, truth.0, "z case={case} seeded={seeded_path}");
                 assert_eq!(a, pa, "z form touched a");
                 assert_eq!(b, pb, "z form touched b");
+                let mut compact_z = pz.clone();
+                unsafe {
+                    witgen_simd::build_quad_witness_const(input(), compact_z.as_mut_ptr());
+                }
+                assert_eq!(compact_z, truth.0, "compact tail case={case} seeded={seeded_path}");
 
                 // a/b form without scratch: completes the same buffers.
                 unsafe {
@@ -6958,6 +7323,7 @@ mod tests {
                 primed_scratch: true,
                 copy_drain: true,
                 input_mem,
+                producer_const: false,
                 seed_in_place: true,
             };
             for q in 0..n_quads {
@@ -7002,6 +7368,7 @@ mod tests {
                 primed_scratch: true,
                 copy_drain: true,
                 input_mem,
+                producer_const: false,
                 seed_in_place: in_place,
             };
             for q in 0..n_quads {
