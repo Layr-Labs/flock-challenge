@@ -1617,6 +1617,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             nt,
             representation,
         );
+        let _tailsafe = crate::epool::TailsafeScope::new();
         crate::epool::run_hetero_chunks_stateful_with_tail(
             n_jobs,
             || {
@@ -4176,6 +4177,7 @@ where
                 });
                 partial
             };
+            let _tailsafe = crate::epool::TailsafeScope::new();
             let out = crate::epool::run_hetero_chunks_caller_tail(
                 whole + 2 * split,
                 |i| {
