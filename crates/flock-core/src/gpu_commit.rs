@@ -913,6 +913,12 @@ pub(crate) fn zc_k_v2_enabled() -> bool {
     *ON
 }
 
+pub(crate) fn zc_k_v3_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_K_V3").is_none());
+    *ON
+}
+
 /// Whether [`gpu_zc_k_share`] is the faster kernel's default share (no
 /// explicit `FLOCK_ZC_K_GPU_CHUNKS`).
 pub(crate) fn zc_k_share_is_v2_default() -> bool {
@@ -4499,6 +4505,163 @@ kernel void zc_k_fold_v2(
 }
 
 "#;
+
+    const ZC_K_V3_FOLD_ENTRIES: usize = 10 * 64 + 16;
+
+    /// superblock partials unchanged.
+    const ZC_K_V3_MSL_TAIL: &str = r#"
+// The rho1-scaled delta table T is F2-linear in the 64 bits of a delta code
+// (each byte bank is built by XOR composition over its set bits), so T(code)
+// is the XOR of U_p[piece_p(code)] over any partition of the 64 bits into
+// pieces, where U_p[v] is the XOR of T(bit) over the set bits of v: the same
+// field element for every partition (v2's nibble tables are the partition
+// into sixteen 4-bit pieces). Pieces here: bits 6j..6j+5 of the low half
+// (tables 0..4) and of the high half (tables 5..9), j < 5; then bits 30, 31
+// of the low half and 30, 31 of the high half as one 4-bit piece (table 10).
+// 10 x 64 + 16 = 656 entries, built on the host per prove; 11 lookups per
+// code instead of 16.
+#define ZCK3_E 656u
+
+static inline uint4 zck_fold6(uint lo, uint hi, threadgroup const uint4* tab) {
+    uint4 acc = uint4(0u);
+    for (uint j = 0u; j < 5u; j++) {
+        acc ^= tab[j * 64u + ((lo >> (6u * j)) & 63u)];
+        acc ^= tab[(5u + j) * 64u + ((hi >> (6u * j)) & 63u)];
+    }
+    acc ^= tab[640u + ((lo >> 30u) | ((hi >> 28u) & 12u))];
+    return acc;
+}
+
+// Same thread layout, outputs, rho2 table and aggregate as `zc_k_fold_v2`;
+// only the delta codes are read through `zck_fold6` (44 threadgroup lookups
+// per interior output for the four codes instead of 64). `tab_dev` holds the
+// 656-entry delta table, then the 512-entry rho2 nibble table of v2.
+kernel void zc_k_fold_v3(
+    device const uint4* anchors [[buffer(0)]],
+    device const uint4* deltas  [[buffer(1)]],
+    device const uint4* tab_dev [[buffer(2)]],
+    device const uint4* consts  [[buffer(3)]],
+    device uint4*       out_a   [[buffer(4)]],
+    device uint4*       out_b   [[buffer(5)]],
+    device uint4*       tg_part [[buffer(6)]],
+    constant ZcKParams& p       [[buffer(7)]],
+    device atomic_uint* flag    [[buffer(8)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    ushort sl [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint4 tab[ZCK3_E];
+    threadgroup uint4 rtab[512];
+    threadgroup uint4 sred[8][8];
+    for (uint e = lid; e < ZCK3_E; e += 256u) { tab[e] = tab_dev[e]; }
+    rtab[lid] = tab_dev[ZCK3_E + lid];
+    rtab[256u + lid] = tab_dev[ZCK3_E + 256u + lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint i = lid & 63u;
+    uint k = lid >> 6u;
+    ulong blk = ulong(tg) * 4ul + ulong(k);
+    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    if (i <= 60u) {
+        uint4 xa0, xb0;
+        uint4 xa1 = uint4(0u);
+        uint4 xb1 = uint4(0u);
+        ulong ab = ulong(p.a_base) + blk * ulong(p.a_stride);
+        ulong db = ulong(p.d_base) + blk * ulong(p.d_stride);
+        if (p.hc != 0u && i < 4u) {
+            uint4 dd = deltas[db + ulong(i)];
+            xa0 = anchors[ab + 2ul * ulong(i)] ^ zck_fold6(dd.x, dd.y, tab);
+            xa1 = anchors[ab + 2ul * ulong(i) + 1ul] ^ zck_fold6(dd.z, dd.w, tab);
+            xb0 = consts[1];
+            xb1 = consts[1];
+        } else {
+            ab += 4ul * ulong(i) - ulong(p.a_shift);
+            db += 2ul * ulong(i) - ulong(p.d_shift);
+            uint4 d0 = deltas[db];
+            xa0 = anchors[ab] ^ zck_fold6(d0.x, d0.y, tab);
+            xb0 = anchors[ab + 1ul] ^ zck_fold6(d0.z, d0.w, tab);
+            if (i < 60u) {
+                uint4 d1 = deltas[db + 1ul];
+                xa1 = anchors[ab + 2ul] ^ zck_fold6(d1.x, d1.y, tab);
+                xb1 = anchors[ab + 3ul] ^ zck_fold6(d1.z, d1.w, tab);
+            }
+        }
+        a = xa0 ^ zck_mulc(xa0 ^ xa1, rtab);
+        b = xb0 ^ zck_mulc(xb0 ^ xb1, rtab);
+        out_a[ulong(tg) * 244ul + ulong(i < 60u ? 60u * k + i : 240u + k)] = a;
+        if (i < 4u || i == 59u) {
+            if (any(b != uint4(1u, 0u, 0u, 0u))) {
+                atomic_fetch_or_explicit(flag, 1u, memory_order_relaxed);
+            }
+        } else {
+            out_b[blk * 56ul + ulong(i == 60u ? 55u : i - 4u)] = b;
+        }
+    }
+    uint t = ((tg % p.sb_per_chunk) * 256u + lid) >> 2u;
+    uint4 aw = zck_mul(consts[2u + t], a);
+    ushort qb = sl & ushort(0xFFFC);
+    uint4 aw0 = simd_shuffle(aw, qb);
+    uint4 aw1 = simd_shuffle(aw, ushort(qb + 1));
+    uint4 aw2 = simd_shuffle(aw, ushort(qb + 2));
+    uint4 aw3 = simd_shuffle(aw, ushort(qb + 3));
+    uint4 b0 = simd_shuffle(b, qb);
+    uint4 b1 = simd_shuffle(b, ushort(qb + 1));
+    uint4 b2 = simd_shuffle(b, ushort(qb + 2));
+    uint4 b3 = simd_shuffle(b, ushort(qb + 3));
+    // Quad lane q owns aggregate slots 2q and 2q + 1.
+    uint q = lid & 3u;
+    uint4 x0, y0, x1, y1;
+    if (q == 0u) {
+        x0 = aw1; y0 = b1; x1 = aw0 ^ aw1; y1 = b0 ^ b1;
+    } else if (q == 1u) {
+        x0 = aw3; y0 = b3; x1 = aw2 ^ aw3; y1 = b2 ^ b3;
+    } else if (q == 2u) {
+        x0 = aw2; y0 = b2; x1 = aw0 ^ aw2; y1 = b0 ^ b2;
+    } else {
+        x0 = aw1 ^ aw3; y0 = b1 ^ b3;
+        x1 = aw0 ^ aw1 ^ aw2 ^ aw3; y1 = b0 ^ b1 ^ b2 ^ b3;
+    }
+    uint4 r0 = zck_mul(x0, y0);
+    uint4 r1 = zck_mul(x1, y1);
+    for (ushort off = 4; off < 32; off <<= 1) {
+        r0 ^= simd_shuffle_xor(r0, off);
+        r1 ^= simd_shuffle_xor(r1, off);
+    }
+    if (sl < 4) {
+        sred[sg][2u * uint(sl)] = r0;
+        sred[sg][2u * uint(sl) + 1u] = r1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 8u) {
+        uint4 s = uint4(0u);
+        for (uint j = 0u; j < 8u; j++) { s ^= sred[j][lid]; }
+        tg_part[ulong(tg) * 8ul + ulong(lid)] = s;
+    }
+}
+"#;
+
+    ///
+    /// # Safety
+    unsafe fn zc_k_v3_fill(dst: *mut F128, table: &[F128]) {
+        debug_assert_eq!(table.len(), 8 * 256);
+        let bit = |b: usize| table[(b / 8) * 256 + (1usize << (b % 8))];
+        let piece = |base: usize, bits: &[usize]| unsafe {
+            *dst.add(base) = F128::ZERO;
+            for v in 1..(1usize << bits.len()) {
+                let low = v & v.wrapping_neg();
+                *dst.add(base + v) = *dst.add(base + (v ^ low)) + bit(bits[low.trailing_zeros() as usize]);
+            }
+        };
+        for half in 0..2usize {
+            for j in 0..5usize {
+                let bits: [usize; 6] = core::array::from_fn(|i| 32 * half + 6 * j + i);
+                piece((5 * half + j) * 64, &bits);
+            }
+        }
+        piece(640, &[30, 31, 62, 63]);
+    }
 
     /// Supplemental leaf+parent3 fuse (kept out of the embedded metallib so a
     /// missing kernel cannot force a full main-library rebuild). Compiled at
@@ -22557,8 +22720,8 @@ kernel void zc_ab_finish(
     /// metallib or a pipeline failed (arm off).
     static ZC_K_PSOS: std::sync::OnceLock<Option<(usize, usize, usize)>> = std::sync::OnceLock::new();
     /// Whether the fold pipeline last built is `zc_k_fold_v2` (it then reads
-    /// the rho2 nibble table after the byte-table nibbles in `nib_buf`).
     static ZC_K_V2_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ZC_K_V3_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Build the K arm's pipelines on `device` from the embedded metallib; the
     /// faster fold (`zc_k_fold_v2`, see [`super::zc_k_v2_enabled`]) from
@@ -22606,11 +22769,11 @@ kernel void zc_ab_finish(
             let finish = make_pipeline("zc_k_finish");
             // The faster fold (`FLOCK_NO_ZC_K_V2` kills): compiled
             // from source here (the prewarm thread); on any failure the
-            // embedded kernel stays.
             ZC_K_V2_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+            ZC_K_V3_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
             if super::zc_k_v2_enabled() && fold.is_ok() {
-                let v2 = (|| -> Result<Id, String> {
-                    let src = api.nsstring(ZC_K_V2_MSL_SOURCE)?;
+                let compile = |msl: &str, name: &str| -> Result<Id, String> {
+                    let src = api.nsstring(msl)?;
                     let mut err: Id = NIL;
                     let lib: Id = send!(
                         api,
@@ -22622,13 +22785,13 @@ kernel void zc_ab_finish(
                         &mut err
                     );
                     if lib.is_null() {
-                        return Err(format!("zc-k v2 compile: {}", api.error_string(err)));
+                        return Err(format!("{name} compile: {}", api.error_string(err)));
                     }
-                    let ns = api.nsstring("zc_k_fold_v2")?;
+                    let ns = api.nsstring(name)?;
                     let f: Id = send!(api, unsafe extern "C" fn(Id, Sel, Id) -> Id, lib, c"newFunctionWithName:", ns);
                     if f.is_null() {
                         release(lib);
-                        return Err("zc_k_fold_v2 not found".into());
+                        return Err(format!("{name} not found"));
                     }
                     let mut perr: Id = NIL;
                     let pso: Id = send!(
@@ -22642,10 +22805,32 @@ kernel void zc_ab_finish(
                     release(f);
                     release(lib);
                     if pso.is_null() {
-                        return Err(format!("zc_k_fold_v2 pipeline: {}", api.error_string(perr)));
+                        return Err(format!("{name} pipeline: {}", api.error_string(perr)));
                     }
                     Ok(pso)
-                })();
+                };
+                let v3 = if super::zc_k_v3_enabled() {
+                    let built = match ZC_K_V2_MSL_SOURCE.split_once("kernel void zc_k_fold_v2(") {
+                        Some((helpers, _)) => compile(&format!("{helpers}{ZC_K_V3_MSL_TAIL}"), "zc_k_fold_v3"),
+                        None => Err("zc_k_fold_v3: helper source boundary missing".into()),
+                    };
+                    match built {
+                        Ok(pso) => Some(pso),
+                        Err(e) => {
+                            if super::gpu_zc_k_debug() {
+                                eprintln!("[zc-k-gpu] v3 fold unavailable ({e}); trying v2");
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let is_v3 = v3.is_some();
+                let v2 = match v3 {
+                    Some(pso) => Ok(pso),
+                    None => compile(ZC_K_V2_MSL_SOURCE, "zc_k_fold_v2"),
+                };
                 match v2 {
                     Ok(pso) => {
                         if let Ok(old) = fold {
@@ -22653,6 +22838,11 @@ kernel void zc_ab_finish(
                         }
                         fold = Ok(pso);
                         ZC_K_V2_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                        ZC_K_V3_ACTIVE.store(is_v3, std::sync::atomic::Ordering::Relaxed);
+                        if super::gpu_zc_k_debug() {
+                            let name = if is_v3 { "zc_k_fold_v3" } else { "zc_k_fold_v2" };
+                            eprintln!("[zc-k-gpu] fold kernel: {name}");
+                        }
                     }
                     Err(e) => {
                         if super::gpu_zc_k_debug() {
@@ -22762,7 +22952,7 @@ kernel void zc_ab_finish(
             }
             let mut made: Vec<Id> = Vec::with_capacity(8);
             for len in [
-                (256 + 512) * 16,
+                (ZC_K_V3_FOLD_ENTRIES + 512) * 16,
                 (2 + n_weights + chunks) * 16,
                 chunks * per_chunk_a * 16,
                 chunks * per_chunk_b * 16,
@@ -23257,12 +23447,18 @@ kernel void zc_ab_finish(
             // Per-prove constants (the previous job was joined, so nothing in
             // flight reads these buffers).
             let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
-            for j in 0..8 {
-                for n in 0..16 {
-                    *nib.add(j * 32 + n) = table[j * 256 + n];
-                    *nib.add(j * 32 + 16 + n) = table[j * 256 + (n << 4)];
+            let rho2_at = if ZC_K_V3_ACTIVE.load(Ordering::Relaxed) {
+                zc_k_v3_fill(nib, table);
+                ZC_K_V3_FOLD_ENTRIES
+            } else {
+                for j in 0..8 {
+                    for n in 0..16 {
+                        *nib.add(j * 32 + n) = table[j * 256 + n];
+                        *nib.add(j * 32 + 16 + n) = table[j * 256 + (n << 4)];
+                    }
                 }
-            }
+                256
+            };
             if ZC_K_V2_ACTIVE.load(Ordering::Relaxed) {
                 // rho2 * (v << 4k) for the 32 nibbles k of the other factor.
                 for k in 0..32usize {
@@ -23272,7 +23468,7 @@ kernel void zc_ab_finish(
                         } else {
                             F128::new(0, v << (4 * (k - 16)))
                         };
-                        *nib.add(256 + 16 * k + v as usize) = rho2 * x;
+                        *nib.add(rho2_at + 16 * k + v as usize) = rho2 * x;
                     }
                 }
             }
@@ -23406,18 +23602,25 @@ kernel void zc_ab_finish(
             let b = gpu.buffer_contents(state.out_b).cast::<F128>().cast_const();
             let b_ones = *gpu.buffer_contents(state.flag_buf).cast::<u32>() == 0;
             drop(state);
+            let fold = if ZC_K_V3_ACTIVE.load(Ordering::Relaxed) {
+                "v3"
+            } else if ZC_K_V2_ACTIVE.load(Ordering::Relaxed) {
+                "v2"
+            } else {
+                "v1"
+            };
             if debug && !job.calibration {
                 let fired = ZC_K_FIRED.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!(
                     "[zc-k-gpu] fired: GPU prefix {}/{hi_size} K chunks (CPU folded {}), gpu={gpu_ms:.2}ms \
-                     submit-to-drain={:.2}ms wait={wait_ms:.3}ms fired_proves={fired}",
+                     submit-to-drain={:.2}ms wait={wait_ms:.3}ms fired_proves={fired} fold={fold}",
                     job.chunks,
                     hi_size - job.chunks,
                     job.submitted.elapsed().as_secs_f64() * 1e3,
                 );
             } else if debug {
                 eprintln!(
-                    "[zc-k-gpu] oracle probe: GPU prefix {} chunks gpu={gpu_ms:.2}ms submit-to-drain={:.2}ms",
+                    "[zc-k-gpu] oracle probe: GPU prefix {} chunks gpu={gpu_ms:.2}ms submit-to-drain={:.2}ms fold={fold}",
                     job.chunks,
                     job.submitted.elapsed().as_secs_f64() * 1e3,
                 );

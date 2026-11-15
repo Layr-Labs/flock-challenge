@@ -4092,6 +4092,134 @@ unsafe fn ab_kara_ninth_pair(
     (a, b)
 }
 
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_KARA_LANEZ: u32 = 1 << 19;
+
+/// per process. The rows written are byte-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_kara_lanez_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_LANEZ").is_none_or(|v| v != *"1"))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_kara_lanez(
+    kara: *const u8,
+    word: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    const { assert!(AB_KARA_NINTH == 8 << 12) };
+    unsafe {
+        let u = word ^ (word >> 16);
+        let s = word ^ (word >> 32);
+        let v = s ^ (s >> 16);
+        let ld = |base: *const u8, off: usize| vld1q_u8(base.add(off));
+        let at = |i: usize| -> *const u8 {
+            let a: usize;
+            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) kara, i = in(reg) i,
+                options(pure, nomem, nostack, preserves_flags));
+            a as *const u8
+        };
+        let a = at(ab_z_idx::<0, 7>(v));
+        let (l0, l1, l2, l3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
+        let a = at(ab_z_idx::<1, 7>(v));
+        let (h0, h1, h2, h3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
+        let a = at(ab_z_idx::<2, 7>(s));
+        let (m01, m23) = (ld(a, 64), ld(a, 80));
+        let a = at(ab_z_idx::<3, 7>(s));
+        let (mo01, mo23) = (ld(a, 64), ld(a, 80));
+        let a = at(ab_z_idx::<4, 7>(u));
+        let (n02, n13) = (ld(a, 96), ld(a, 112));
+        let a = at(ab_z_idx::<5, 7>(u));
+        let (no02, no13) = (ld(a, 96), ld(a, 112));
+        let ninth: *const u8 = {
+            let a: usize;
+            core::arch::asm!(
+                "add {a}, {b}, #8, lsl #12 // {w}",
+                a = lateout(reg) a,
+                b = in(reg) kara,
+                w = in(reg) word,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            a as *const u8
+        };
+        let g = ld(ninth, ab_z_idx::<6, 4>(word));
+        let go = ld(ninth, ab_z_idx::<7, 4>(word));
+        let gg = veorq_u8(g, vextq_u8::<8>(go, go));
+        let e0 = xor3_u8(l0, m01, n02);
+        let e1 = xor3_u8(l1, m01, n13);
+        let e2 = xor3_u8(l2, m23, n02);
+        let e3 = xor3_u8(l3, m23, n13);
+        let o0 = xor3_u8(h0, mo01, no02);
+        let o1 = xor3_u8(h1, mo01, no13);
+        let o2 = xor3_u8(h2, mo23, no02);
+        let o3 = xor3_u8(h3, mo23, no13);
+        (
+            xor3_u8(e0, vextq_u8::<8>(o0, o0), gg),
+            xor3_u8(e1, vextq_u8::<8>(o1, o1), gg),
+            xor3_u8(e2, vextq_u8::<8>(o2, o2), gg),
+            xor3_u8(e3, vextq_u8::<8>(o3, o3), gg),
+        )
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_kara_lanez_apply_matches_kara_and_plain() {
+    use crate::ntt::AdditiveNttGf8;
+    use core::arch::aarch64::*;
+    const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_KARA_SLOT;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let kara = ab_kara_tables(&table);
+    let bytes = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| {
+        let mut out = [0u8; 64];
+        // SAFETY: four 16-byte stores into a 64-byte array.
+        unsafe {
+            vst1q_u8(out.as_mut_ptr(), v.0);
+            vst1q_u8(out.as_mut_ptr().add(16), v.1);
+            vst1q_u8(out.as_mut_ptr().add(32), v.2);
+            vst1q_u8(out.as_mut_ptr().add(48), v.3);
+        }
+        out
+    };
+    let mut x = 0x6A09_E667_F3BC_C908u64;
+    for i in 0..20000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let w = match i {
+            0 => 0,
+            1 => u64::MAX,
+            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
+            _ => x,
+        };
+        for scaled in [false, true] {
+            let (t, sw, k) = if scaled {
+                (table.scaled_x4_data_ptr(), table.scaled_x4_half_swapped_data_ptr(), kara.wrapping_add(AB_KARA_IMAGE_BYTES))
+            } else {
+                (table.data_ptr(), table.half_swapped_data_ptr(), kara)
+            };
+            // SAFETY: the applies read inside the table images only.
+            let (lanez, slot, plain) = unsafe {
+                (
+                    bytes(apply_word_kara_lanez(k, w)),
+                    bytes(apply_word_kara::<V0, true>(k, w)),
+                    bytes(apply_word_into_4_regs(t, sw, w)),
+                )
+            };
+            assert_eq!(lanez, slot, "w={w:016x} scaled={scaled}");
+            assert_eq!(lanez, plain, "w={w:016x} scaled={scaled}");
+        }
+    }
+}
+
 /// [`apply_word_into_4_regs`] out of one image of [`ab_kara_tables`]
 /// (`kara` points at the image's first entry).
 #[cfg(target_arch = "aarch64")]
@@ -4107,6 +4235,9 @@ unsafe fn apply_word_kara<const V: u32, const SCALED: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
+        if SCALED && V & ABV_KARA_LANEZ != 0 {
+            return apply_word_kara_lanez(kara, word);
+        }
         // Bytes 0,1 / 4,5 of `u`: W0^W1 / W2^W3. Bytes 0..4 of `s`: W0^W2,
         // W1^W3. Bytes 0,1 of `v`: W0^W1^W2^W3.
         let u = word ^ (word >> 16);
@@ -5701,7 +5832,9 @@ pub(crate) fn ab_mixed_row_guarded(
     // takes the incumbent form `V0`; the unfused H2 instance is kept for
     // the tests only, so the binary carries no extra mixed-row instance.
     const VF: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE;
+    const VL: u32 = VF | ABV_KARA_LANEZ;
     let fuse = ab_mixed_h2_enabled() && ab_mixed_fuse_enabled();
+    let lanez = ab_kara_lanez_enabled();
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
     let word = |packed: &[u8], k: usize| -> u64 {
@@ -5715,7 +5848,11 @@ pub(crate) fn ab_mixed_row_guarded(
         {
             return false;
         }
-        if fuse {
+        if fuse && lanez {
+            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VL>(
+                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
+            );
+        } else if fuse {
             shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VF>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
@@ -5734,7 +5871,11 @@ pub(crate) fn ab_mixed_row_guarded(
         if word(b_packed, 4) & word(b_packed, 5) & word(b_packed, 6) & word(b_packed, 7) != u64::MAX {
             return false;
         }
-        if fuse {
+        if fuse && lanez {
+            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VL>(
+                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
+            );
+        } else if fuse {
             shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VF>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
@@ -5843,6 +5984,13 @@ fn ab_mixed_fuse_matches_h2_and_incumbent() {
             }
             assert_eq!(h2, inc, "h2 case {case} w0={w0} nt={nt}");
             assert_eq!(got, h2, "fuse case {case} w0={w0} nt={nt}");
+            let mut lz = [0u8; 64];
+            if w0 {
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { VF | ABV_KARA_LANEZ }>(&a, &b, &table, 0, None, &mut lz, nt);
+            } else {
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { VF | ABV_KARA_LANEZ }>(&a, &b, &table, 0, None, &mut lz, nt);
+            }
+            assert_eq!(lz, got, "lane z case {case} w0={w0} nt={nt}");
         }
     }
 }
