@@ -2648,6 +2648,10 @@ fn commit_with_round1_ab_precompute(
     stripe_help: Option<&(dyn Fn() + Sync)>,
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
     after_ab: Option<&(dyn Fn() + Sync)>,
+    // Lane abpc: the AB backing feeds the ranked lincheck-C completion, which
+    // can consume preconverted CPU-band windows (the precompute still keeps
+    // every window raw unless its own ranked geometry checks pass).
+    ab_preconvert: bool,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -2684,6 +2688,7 @@ fn commit_with_round1_ab_precompute(
                     identity_prefix_contract,
                     stripe_help,
                     producer,
+                    ab_preconvert,
                 )
             };
         }
@@ -2696,6 +2701,7 @@ fn commit_with_round1_ab_precompute(
             padding,
             identity_prefix_contract,
             stripe_help,
+            ab_preconvert,
         )
     };
     // Replay output backing, zeroed once before the sweep and reused by
@@ -2921,6 +2927,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             stripe_help,
             producer,
             after_ab,
+            ranked_lincheck_c_reuse_enabled(r1cs),
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -3513,6 +3520,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         None,
         None,
         None,
+        false,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
