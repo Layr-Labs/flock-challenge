@@ -1493,6 +1493,276 @@ pub(crate) fn grind_spawn_drain_enabled() -> bool {
     *ON.get_or_init(|| gpack2_enabled() && !env_is_one(ENV_NO_GRIND_SPAWN_DRAIN))
 }
 
+/// Grind pack 3 (`FLOCK_NO_GPACK3=1`, exact, turns off both pieces below).
+/// Each piece changes only which thread runs a piece of work, or when it
+/// starts: every grind still returns the smallest qualifying nonce of the
+/// same ascending search, and every Merkle node is computed by the same
+/// kernels into the same slots, so the transcript and the proof bytes are
+/// unchanged.
+pub const ENV_NO_GPACK3: &str = "FLOCK_NO_GPACK3";
+
+/// Race caller scan (`FLOCK_NO_RACE_CALLER_SCAN=1`, exact, keeps the
+/// blocking two-pool race drain): in the CPU arm of the Metal/CPU grind race
+/// the calling thread scans chunks itself while the main pool and the
+/// efficiency-core helpers join asynchronously, and it returns as soon as the
+/// answer is definitive or the Metal arm has hit. Read once.
+pub const ENV_NO_RACE_CALLER_SCAN: &str = "FLOCK_NO_RACE_CALLER_SCAN";
+
+/// Opening subtree drain (`FLOCK_NO_SUBTREE_DRAIN=1`, exact, keeps the
+/// one-subtree-after-another loop): the 32 subtrees of the opening's
+/// 2^10-leaf recursive Merkle tree go through the caller-first chunk drain
+/// (`epool::run_caller_first_chunks`). Read once.
+pub const ENV_NO_SUBTREE_DRAIN: &str = "FLOCK_NO_SUBTREE_DRAIN";
+
+pub(crate) fn gpack3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !env_is_one(ENV_NO_GPACK3))
+}
+
+pub(crate) fn race_caller_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpack3_enabled() && !env_is_one(ENV_NO_RACE_CALLER_SCAN))
+}
+
+pub(crate) fn subtree_drain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpack3_enabled() && !env_is_one(ENV_NO_SUBTREE_DRAIN))
+}
+
+/// Race grind latency (`FLOCK_NO_GRIND_LAT=1`, exact, keeps the dispatch
+/// worker's Metal scan): the calling thread of a Metal/CPU grind race
+/// launches the Metal scan itself, on per-launch result slots, and a
+/// one-thread tail dispatch behind the scan publishes the scan's result word
+/// with a system-coherent store, which the calling thread polls between its
+/// own CPU sub-blocks. The scan kernel, its block and its smallest-match rule
+/// are unchanged, so every grind returns the same nonce. Read once. The tail
+/// is its own small library, built on the warm-up's pipeline-build helper
+/// thread ([`gpu_pow_race_tail_prewarm`]); with the switch set it is never
+/// compiled. Until it is built, when its source is rejected, and once the
+/// launch path has failed, the race keeps the dispatch worker's scan.
+pub const ENV_NO_GRIND_LAT: &str = "FLOCK_NO_GRIND_LAT";
+
+pub(crate) fn grind_lat_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !env_is_one(ENV_NO_GRIND_LAT))
+}
+
+/// Whether this process builds the race tail: the item and everything the
+/// launched race needs (the Metal grind, the fixed-grid scan, the
+/// caller-first race scan) are on.
+pub(crate) fn pow_race_tail_wanted() -> bool {
+    gpu_grind_enabled() && grind_lat_enabled() && grind_scan_v2_enabled() && race_caller_scan_enabled()
+}
+
+/// Build the race tail's library and pipeline and the result slots now, on
+/// the calling thread. Called last on the warm-up's pipeline-build helper
+/// thread (`ab_completion_gpu_prewarm`), so the compile never sits on the
+/// path to ready; a launch only reads the outcome and never waits for it.
+pub(crate) fn gpu_pow_race_tail_prewarm() {
+    if !pow_race_tail_wanted() {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::pow_race_tail_prewarm();
+}
+
+/// Race grind result slots (see [`gpu_pow_race_launch`]).
+pub(crate) const POW_RACE_SLOTS: usize = 4;
+
+/// Per slot: a [`PowRaceJob`] handle on the slot is alive. A launch never
+/// takes a held slot, so a handle's word is never reused while it can still
+/// be read.
+static POW_RACE_HELD: [std::sync::atomic::AtomicBool; POW_RACE_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; POW_RACE_SLOTS];
+
+/// Per slot: retired (a launch on it stayed unpublished past
+/// [`POW_RACE_STUCK`]). A retired slot never takes another launch, so a scan
+/// that is still queued or running there can never meet a new one.
+static POW_RACE_RETIRED: [std::sync::atomic::AtomicBool; POW_RACE_SLOTS] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; POW_RACE_SLOTS];
+
+/// The launch path is off for the rest of the process: a launch's command
+/// buffer failed or completed without its word (the path would fail the
+/// same way again), or every slot is retired.
+static POW_RACE_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Age past which an unpublished launch counts as stuck and retires its
+/// slot: some forty times the longest launch-to-publish time measured for a
+/// race scan (blocks with and without a match, and a launch queued behind an
+/// abandoned scan of a block without one), so contention never reaches it.
+pub(crate) const POW_RACE_STUCK: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn pow_race_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_GRIND_TRACE").is_some())
+}
+
+/// Turn the launch path off for the process (see [`POW_RACE_OFF`]).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn pow_race_off(status: u64) {
+    if !POW_RACE_OFF.swap(true, std::sync::atomic::Ordering::Relaxed) && pow_race_trace() {
+        eprintln!("[grind] lat: launch path off (command buffer status {status})");
+    }
+}
+
+/// Retire `slot` (see [`POW_RACE_RETIRED`]); with no slot left, the launch
+/// path is off.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn pow_race_retire(slot: usize) {
+    use std::sync::atomic::Ordering;
+    if !POW_RACE_RETIRED[slot].swap(true, Ordering::Relaxed) && pow_race_trace() {
+        eprintln!("[grind] lat: slot {slot} retired (unpublished past the bound)");
+    }
+    if POW_RACE_RETIRED.iter().all(|r| r.load(Ordering::Relaxed)) {
+        POW_RACE_OFF.store(true, Ordering::Relaxed);
+    }
+}
+
+/// What a status check of an unpublished launch found (see
+/// [`PowRaceJob::check`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PowRaceCheck {
+    /// Queued or running, within [`POW_RACE_STUCK`].
+    Running,
+    /// Its command buffer completed and the word carries this launch's tag:
+    /// the same answer as [`PowRaceJob::poll`].
+    Published(Option<u64>),
+    /// It can no longer answer: its slot is retired, or the launch path is
+    /// off.
+    Dead,
+}
+
+/// Pure verdict behind [`PowRaceJob::check`] and the launch's slot check:
+/// an unpublished launch whose command buffer has `status` and age `age`;
+/// `published` = its word carries its tag after the status was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) enum PowRaceVerdict {
+    Running,
+    Published,
+    /// Failed (status 5), or completed (4) without its word: path off.
+    Off,
+    /// Unpublished past the bound: retire the slot.
+    Retire,
+}
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn pow_race_verdict(status: u64, published: bool, age: std::time::Duration) -> PowRaceVerdict {
+    match status {
+        4 if published => PowRaceVerdict::Published,
+        4.. => PowRaceVerdict::Off,
+        _ if age > POW_RACE_STUCK => PowRaceVerdict::Retire,
+        _ => PowRaceVerdict::Running,
+    }
+}
+
+/// The answer in a slot's result word `w` for the launch tagged `tag` over
+/// `[start, ..)`: `None` while it carries another tag.
+#[inline]
+fn pow_race_word(w: u32, tag: u32, start: u64) -> Option<Option<u64>> {
+    if w >> 24 != tag {
+        return None;
+    }
+    let code = w & POW_RACE_NO_MATCH;
+    Some((code != POW_RACE_NO_MATCH).then(|| start + u64::from(code)))
+}
+
+/// A race grind's Metal scan launched by [`gpu_pow_race_launch`]. It holds
+/// its result slot until it is dropped; the scan itself may still run after
+/// that (a CPU win), and the slot is reused only once its tail has also
+/// published.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) struct PowRaceJob {
+    /// The slot's result word in shared storage: `tag << 24 | code`, where
+    /// `code` is the smallest matching offset of the block, or `0xFF_FFFF`
+    /// for a block without a match.
+    word: *const u32,
+    tag: u32,
+    start: u64,
+    slot: usize,
+    /// The launch's command buffer (retained by its slot until the slot's
+    /// next launch) and its commit time.
+    cb: usize,
+    launched: std::time::Instant,
+}
+
+impl Drop for PowRaceJob {
+    fn drop(&mut self) {
+        POW_RACE_HELD[self.slot].store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl PowRaceJob {
+    /// `None` while this launch's tail has not published its word yet;
+    /// `Some(Some(nonce))` with the block's smallest qualifying nonce, or
+    /// `Some(None)` when the block holds no match. A word carrying another
+    /// launch's tag is never taken.
+    #[inline]
+    pub(crate) fn poll(&self) -> Option<Option<u64>> {
+        // SAFETY: `word` points into a slot buffer that lives as long as the
+        // process-wide GPU context; it is aligned and only read here.
+        pow_race_word(unsafe { self.word.read_volatile() }, self.tag, self.start)
+    }
+
+    /// Status check of a launch whose word is not published yet, for a
+    /// caller that polls the word and checks at a lower rate. A command
+    /// buffer that completed makes all its writes visible, so its word is
+    /// re-read and taken now (a device that shows the word only at
+    /// completion still answers here); one that failed, or completed without
+    /// its word, turns the launch path off; one unpublished past
+    /// [`POW_RACE_STUCK`] retires its slot. Never waits.
+    pub(crate) fn check(&self) -> PowRaceCheck {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            imp::pow_race_check(self)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            PowRaceCheck::Dead
+        }
+    }
+}
+
+/// Result-word code of a race scan whose block holds no match.
+pub(crate) const POW_RACE_NO_MATCH: u32 = 0x00FF_FFFF;
+
+/// Encode the next race launch's command buffer ahead of it (see
+/// [`gpu_pow_race_launch`]); nothing when the item is off.
+pub(crate) fn gpu_pow_race_prepare() {
+    if !gpu_grind_enabled() || !grind_lat_enabled() || POW_RACE_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::gpu_pow_race_prepare();
+}
+
+/// Launch one race grind scan of `[start, start + len)` from the calling
+/// thread (see [`ENV_NO_GRIND_LAT`]). `None` when the item is off, the tail
+/// is not built (yet, or rejected), the launch path is off, the block is
+/// outside the fixed-grid range (`2^16 <= len < 2^24`), no result slot is
+/// free, or the slots are busy with a concurrent launch; the caller then
+/// takes the dispatch worker's scan. Never waits.
+pub(crate) fn gpu_pow_race_launch(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u32,
+    bits: u32,
+) -> Option<PowRaceJob> {
+    if !gpu_grind_enabled() || !grind_lat_enabled() || POW_RACE_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        imp::gpu_pow_race_launch(state_digest, start, len, bits)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (state_digest, start, len, bits);
+        None
+    }
+}
+
 /// BLAKE3 state for the grind compression after round zero's seven
 /// nonce-independent quarter-rounds. The message is `state || nonce_lo ||
 /// nonce_hi || 0^6` (sixteen words), and the chaining value, counter and
@@ -8684,6 +8954,45 @@ kernel void blake3_pow_scan_v2(
 }
 "#;
 
+    // Race grind latency (`ENV_NO_GRIND_LAT`): its own small library, built
+    // by `pow_race_tail_prewarm` off the path to ready; the grind library
+    // stays `POW_MSL_SOURCE` alone. One thread runs the tail behind
+    // `blake3_pow_scan_v2` in the same serial compute encoder, so it starts
+    // only once the whole scan dispatch has finished: it reads the block's
+    // final smallest match, re-arms `best` for the slot's next launch, and
+    // publishes `tag << 24 | code` (code = the match offset, or 0xFFFFFF for
+    // none) with a system-coherent store and a system-scope fence, so the CPU
+    // sees the word as soon as it is written rather than at the end-of-buffer
+    // completion. `coherent(system)` and the system thread scope (3) need the
+    // internals pragma; if this source does not compile, the race keeps the
+    // dispatch worker's scan.
+    const POW_RACE_TAIL_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#pragma METAL internals : enable
+constant constexpr thread_scope POW_RACE_SCOPE_SYSTEM = static_cast<thread_scope>(3);
+
+struct PowParams {
+    uint start_lo;
+    uint start_hi;
+    uint len;
+    uint bits;
+};
+
+kernel void blake3_pow_race_tail(
+    device atomic_uint* best              [[buffer(1)]],
+    constant PowParams& params            [[buffer(2)]],
+    volatile coherent(system) device uint* word [[buffer(3)]],
+    constant uint& tag                    [[buffer(4)]])
+{
+    uint b = atomic_load_explicit(best, memory_order_relaxed);
+    atomic_store_explicit(best, 0xffffffffu, memory_order_relaxed);
+    word[0] = (tag << 24u) | (b < params.len ? b : 0xffffffu);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, POW_RACE_SCOPE_SYSTEM);
+}
+"#;
+
     // -----------------------------------------------------------------------
     // Embedded precompiled metallib.
     //
@@ -8848,6 +9157,9 @@ kernel void blake3_pow_scan_v2(
         pub(crate) pow_lock: std::sync::Mutex<()>,
         /// `pso_pow` is `blake3_pow_scan_v2` (see `ENV_NO_GRIND_SCAN_V2`).
         pub(crate) pow_v2: bool,
+        /// Race grind result slots and tail pipeline (see `ENV_NO_GRIND_LAT`),
+        /// filled by `pow_race_tail_prewarm`.
+        pub(crate) pow_race: std::sync::Mutex<PowRaceSlots>,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -9677,6 +9989,7 @@ kernel void blake3_pow_scan_v2(
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
                     pow_v2,
+                    pow_race: std::sync::Mutex::new(PowRaceSlots::EMPTY),
                 })
             })();
             pool_pop(pool);
@@ -15459,6 +15772,400 @@ kernel void blake3_pow_scan_v2(
         }
     }
 
+    /// Result slots of the race grind's Metal scans (see `ENV_NO_GRIND_LAT`).
+    /// Slot `i` owns `POW_RACE_ARGS_STRIDE` bytes of `args` (the round-zero
+    /// state at 0, the scan parameters at 256, the launch tag at 512) and one
+    /// word of `best` and of `word`, `POW_RACE_WORD_STRIDE` bytes apart. A
+    /// slot takes a new launch only once the handle of its previous launch is
+    /// dropped and that launch's tail has published its word: by then the
+    /// scan and the tail are done with the slot, the tail has re-armed its
+    /// `best`, and nothing reads the old word any more. A retired slot never
+    /// takes another launch. The CPU writes only `args` (read by the GPU)
+    /// after setup. A slot keeps its last committed command buffer (retained,
+    /// for the status check) and may hold its next one, encoded ahead of its
+    /// launch (`gpu_pow_race_prepare`) and retained until the launch commits
+    /// it.
+    pub(crate) struct PowRaceSlots {
+        /// `blake3_pow_race_tail` (`pow_race_tail_prewarm`), else NIL.
+        tail: Id,
+        args: Id,
+        best: Id,
+        word: Id,
+        /// Tag of each slot's last launch (1..=255; 0 = never launched).
+        tags: [u32; POW_RACE_SLOTS],
+        /// Each slot's last committed command buffer (retained) and its
+        /// commit time.
+        cbs: [Id; POW_RACE_SLOTS],
+        launched: [Option<std::time::Instant>; POW_RACE_SLOTS],
+        /// Encoded, uncommitted command buffer per slot (retained), or NIL.
+        pending: [Id; POW_RACE_SLOTS],
+        next: usize,
+    }
+
+    // SAFETY: the Metal objects are thread-safe; the slot bookkeeping is only
+    // touched under `Gpu::pow_race`.
+    unsafe impl Send for PowRaceSlots {}
+
+    const POW_RACE_ARGS_STRIDE: usize = 768;
+    const POW_RACE_WORD_STRIDE: usize = 256;
+
+    /// Set once by `pow_race_tail_prewarm`: `true` when the tail pipeline and
+    /// the slots are ready. Launches only `get` it, so they never wait for
+    /// the build.
+    static POW_RACE_TAIL: OnceLock<bool> = OnceLock::new();
+
+    impl PowRaceSlots {
+        pub(crate) const EMPTY: Self = Self {
+            tail: NIL,
+            args: NIL,
+            best: NIL,
+            word: NIL,
+            tags: [0; POW_RACE_SLOTS],
+            cbs: [NIL; POW_RACE_SLOTS],
+            launched: [None; POW_RACE_SLOTS],
+            pending: [NIL; POW_RACE_SLOTS],
+            next: 0,
+        };
+
+        unsafe fn word_ptr(&self, gpu: &Gpu, slot: usize) -> *const u32 {
+            unsafe { gpu.buffer_contents(self.word).cast::<u32>().add(slot * POW_RACE_WORD_STRIDE / 4) }
+        }
+
+        /// Whether `slot` (neither held nor retired) can take a launch: never
+        /// launched, or its last launch published. A launch that has not
+        /// published gets the polled launch's check (`pow_race_check_of`): a
+        /// completed buffer whose word now carries the tag frees the slot; a
+        /// failed one, or one that completed without the word, turns the
+        /// launch path off; past the bound, the slot is retired.
+        unsafe fn free(&self, gpu: &Gpu, slot: usize) -> bool {
+            let tag = self.tags[slot];
+            if tag == 0 {
+                return true;
+            }
+            let word = unsafe { self.word_ptr(gpu, slot) };
+            let read = || pow_race_word(unsafe { word.read_volatile() }, tag, 0);
+            if read().is_some() {
+                return true;
+            }
+            let age = self.launched[slot].map_or(std::time::Duration::ZERO, |t| t.elapsed());
+            let status = unsafe { gpu.cb_status(self.cbs[slot]) };
+            matches!(pow_race_check_of(status, read, age, slot), super::PowRaceCheck::Published(_))
+        }
+
+        /// Encode slot `slot`'s race command buffer (autoreleased, not
+        /// committed): `blake3_pow_scan_v2` on the fixed grid over the
+        /// slot's state, `best` and parameters, then the one-thread tail over
+        /// the slot's result word and tag. Every launch of the slot encodes
+        /// the same commands; only the slot's `args` change.
+        unsafe fn encode(&self, gpu: &Gpu, slot: usize) -> Option<Id> {
+            const POW_V2_TG: u64 = 256;
+            const POW_V2_GRID: u64 = 1 << 16;
+            let a = slot * POW_RACE_ARGS_STRIDE;
+            let w = slot * POW_RACE_WORD_STRIDE;
+            unsafe {
+                let cb = gpu.command_buffer().ok()?;
+                let enc = gpu.compute_encoder(cb).ok()?;
+                gpu.set_pipeline(enc, gpu.pso_pow);
+                gpu.set_buffer(enc, self.args, a, 0);
+                gpu.set_buffer(enc, self.best, w, 1);
+                gpu.set_buffer(enc, self.args, a + 256, 2);
+                gpu.dispatch(enc, POW_V2_GRID / POW_V2_TG, POW_V2_TG);
+                gpu.set_pipeline(enc, self.tail);
+                gpu.set_buffer(enc, self.word, w, 3);
+                gpu.set_buffer(enc, self.args, a + 512, 4);
+                gpu.dispatch(enc, 1, 1);
+                gpu.end_encoding(enc);
+                Some(cb)
+            }
+        }
+
+        unsafe fn setup(&mut self, gpu: &Gpu) -> Option<()> {
+            unsafe {
+                let args = gpu.new_buffer(POW_RACE_SLOTS * POW_RACE_ARGS_STRIDE).ok()?;
+                let Ok(best) = gpu.new_buffer(POW_RACE_SLOTS * POW_RACE_WORD_STRIDE) else {
+                    gpu.release(args);
+                    return None;
+                };
+                let Ok(word) = gpu.new_buffer(POW_RACE_SLOTS * POW_RACE_WORD_STRIDE) else {
+                    gpu.release(args);
+                    gpu.release(best);
+                    return None;
+                };
+                let best_words = gpu.buffer_contents(best).cast::<u32>();
+                let result_words = gpu.buffer_contents(word).cast::<u32>();
+                for i in 0..POW_RACE_SLOTS {
+                    best_words.add(i * POW_RACE_WORD_STRIDE / 4).write_volatile(u32::MAX);
+                    result_words.add(i * POW_RACE_WORD_STRIDE / 4).write_volatile(0);
+                }
+                self.args = args;
+                self.best = best;
+                self.word = word;
+                Some(())
+            }
+        }
+    }
+
+    /// The check of an unpublished launch of `slot` from its command
+    /// buffer's `status` and its `age` (see `super::PowRaceJob::check`);
+    /// `read` re-reads its word after the status. Applies the verdict: off
+    /// turns the launch path off, retire retires the slot.
+    fn pow_race_check_of(
+        status: u64,
+        read: impl Fn() -> Option<Option<u64>>,
+        age: std::time::Duration,
+        slot: usize,
+    ) -> super::PowRaceCheck {
+        // A completed (or failed) buffer's writes are visible once its status
+        // says so: read the word only after the status.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let word = if status >= 4 { read() } else { None };
+        match super::pow_race_verdict(status, word.is_some(), age) {
+            super::PowRaceVerdict::Running => super::PowRaceCheck::Running,
+            super::PowRaceVerdict::Published => super::PowRaceCheck::Published(word.flatten()),
+            super::PowRaceVerdict::Off => {
+                super::pow_race_off(status);
+                super::PowRaceCheck::Dead
+            }
+            super::PowRaceVerdict::Retire => {
+                super::pow_race_retire(slot);
+                super::PowRaceCheck::Dead
+            }
+        }
+    }
+
+    /// See `super::PowRaceJob::check`.
+    pub(crate) fn pow_race_check(job: &super::PowRaceJob) -> super::PowRaceCheck {
+        let Ok(gpu) = gpu() else {
+            return super::PowRaceCheck::Dead;
+        };
+        let status = unsafe { gpu.cb_status(job.cb as Id) };
+        pow_race_check_of(status, || job.poll(), job.launched.elapsed(), job.slot)
+    }
+
+    /// The slots without waiting: a lock held elsewhere (a concurrent launch
+    /// or prepare, or the tail build) gives `None`.
+    fn pow_race_try_lock(gpu: &Gpu) -> Option<std::sync::MutexGuard<'_, PowRaceSlots>> {
+        match gpu.pow_race.try_lock() {
+            Ok(race) => Some(race),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Build the race tail's library and pipeline, then the result slots,
+    /// and publish them to the launches (`POW_RACE_TAIL`). Once per process,
+    /// on the thread that calls it (see `super::gpu_pow_race_tail_prewarm`);
+    /// a rejected source leaves the race on the dispatch worker's scan.
+    pub(crate) fn pow_race_tail_prewarm() {
+        let _ = POW_RACE_TAIL.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let ready = pow_race_tail_build().is_some();
+            if super::pow_race_trace() {
+                eprintln!(
+                    "[grind] lat: tail {} after {:.1} ms",
+                    if ready { "ready" } else { "unavailable" },
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            ready
+        });
+    }
+
+    fn pow_race_tail_build() -> Option<()> {
+        let gpu = gpu().ok()?;
+        if !gpu.pow_v2 || gpu.pso_pow.is_null() {
+            return None;
+        }
+        unsafe {
+            let api = &gpu.api;
+            let pool = gpu.pool_push();
+            let tail = (|| -> Option<Id> {
+                let src = api.nsstring(POW_RACE_TAIL_MSL_SOURCE).ok()?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return None;
+                }
+                let mut pso: Id = NIL;
+                if let Ok(ns) = api.nsstring("blake3_pow_race_tail") {
+                    let function: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if !function.is_null() {
+                        let mut pso_err: Id = NIL;
+                        pso = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            gpu.device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        gpu.release(function);
+                    }
+                }
+                gpu.release(library);
+                (!pso.is_null()).then_some(pso)
+            })();
+            gpu.pool_pop(pool);
+            let tail = tail?;
+            let mut race = gpu.pow_race.lock().unwrap_or_else(|e| e.into_inner());
+            if race.setup(gpu).is_none() {
+                gpu.release(tail);
+                return None;
+            }
+            race.tail = tail;
+            Some(())
+        }
+    }
+
+    /// Launch one race grind scan from the calling thread: the unchanged
+    /// `blake3_pow_scan_v2` dispatch on the fixed grid, then the one-thread
+    /// `blake3_pow_race_tail`, in one serial compute encoder, committed
+    /// without a wait. See `super::gpu_pow_race_launch`.
+    pub(crate) fn gpu_pow_race_launch(
+        state_digest: &[u8; 32],
+        start: u64,
+        len: u32,
+        bits: u32,
+    ) -> Option<super::PowRaceJob> {
+        use std::sync::atomic::Ordering;
+        const POW_V2_GRID: u64 = 1 << 16;
+        if !(1..=32).contains(&bits) || u64::from(len) < POW_V2_GRID || len >= super::POW_RACE_NO_MATCH {
+            return None;
+        }
+        if POW_RACE_TAIL.get() != Some(&true) {
+            return None;
+        }
+        let gpu = gpu().ok()?;
+        let mut race = pow_race_try_lock(gpu)?;
+        unsafe {
+            // Every slot that is neither held nor retired is checked before
+            // one is chosen, so a launch that failed or completed without its
+            // word is caught here even when the CPU won its race before any
+            // check (normally one word read per slot).
+            let free: [bool; POW_RACE_SLOTS] = core::array::from_fn(|i| {
+                !super::POW_RACE_HELD[i].load(Ordering::Acquire)
+                    && !super::POW_RACE_RETIRED[i].load(Ordering::Relaxed)
+                    && race.free(gpu, i)
+            });
+            if super::POW_RACE_OFF.load(Ordering::Relaxed) {
+                return None;
+            }
+            let slot = (0..POW_RACE_SLOTS).map(|k| (race.next + k) % POW_RACE_SLOTS).find(|&i| free[i])?;
+            let tag = race.tags[slot] % 255 + 1;
+            let args = gpu.buffer_contents(race.args).add(slot * POW_RACE_ARGS_STRIDE);
+            let pre = super::pow_round0_pre(state_digest);
+            core::ptr::copy_nonoverlapping(pre.as_ptr(), args.cast::<u32>(), pre.len());
+            let params = [start as u32, (start >> 32) as u32, len, bits];
+            core::ptr::copy_nonoverlapping(params.as_ptr(), args.add(256).cast::<u32>(), params.len());
+            args.add(512).cast::<u32>().write(tag);
+            let pending = core::mem::replace(&mut race.pending[slot], NIL);
+            let cb = if pending.is_null() {
+                let pool = gpu.pool_push();
+                let cb = race.encode(gpu, slot).map(|cb| {
+                    gpu.commit_async(cb);
+                    gpu.retain(cb)
+                });
+                gpu.pool_pop(pool);
+                cb?
+            } else {
+                gpu.commit_async(pending);
+                pending
+            };
+            let launched = std::time::Instant::now();
+            gpu.release(core::mem::replace(&mut race.cbs[slot], cb));
+            race.launched[slot] = Some(launched);
+            race.tags[slot] = tag;
+            race.next = (slot + 1) % POW_RACE_SLOTS;
+            super::POW_RACE_HELD[slot].store(true, Ordering::Relaxed);
+            Some(super::PowRaceJob {
+                word: race.word_ptr(gpu, slot),
+                tag,
+                start,
+                slot,
+                cb: cb as usize,
+                launched,
+            })
+        }
+    }
+
+    /// Test diagnostics: the tail pipeline and the slots are ready.
+    #[cfg(test)]
+    pub(crate) fn pow_race_tail_ready() -> bool {
+        POW_RACE_TAIL.get() == Some(&true)
+    }
+
+    /// Test diagnostics: per slot, held and retired flags, last tag,
+    /// published word and last command buffer status.
+    #[cfg(test)]
+    pub(crate) fn pow_race_slot_dump() -> String {
+        let Ok(gpu) = gpu() else { return "no gpu".into() };
+        let race = gpu.pow_race.lock().unwrap_or_else(|e| e.into_inner());
+        if race.word.is_null() {
+            return "no slots".into();
+        }
+        (0..POW_RACE_SLOTS)
+            .map(|i| {
+                let w = unsafe { race.word_ptr(gpu, i).read_volatile() };
+                let cb = race.cbs[i];
+                let (status, error) = if cb.is_null() {
+                    (0, String::new())
+                } else {
+                    unsafe {
+                        let status = gpu.cb_status(cb);
+                        let err: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                        (status, if err.is_null() { String::new() } else { gpu.api.error_string(err) })
+                    }
+                };
+                format!(
+                    "slot{i}: held={} retired={} tag={} word_tag={} pending={} last_cb_status={status} error={error:?}",
+                    super::POW_RACE_HELD[i].load(std::sync::atomic::Ordering::Acquire),
+                    super::POW_RACE_RETIRED[i].load(std::sync::atomic::Ordering::Acquire),
+                    race.tags[i],
+                    w >> 24,
+                    !race.pending[i].is_null()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Encode the command buffer of the slot the next race launch tries
+    /// first, if it has none, so that launch only writes its arguments and
+    /// commits. Encoding touches no slot memory, so it may run while the
+    /// slot's previous launch is still in flight. Never waits.
+    pub(crate) fn gpu_pow_race_prepare() {
+        if POW_RACE_TAIL.get() != Some(&true) {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        let Some(mut race) = pow_race_try_lock(gpu) else { return };
+        let slot = race.next;
+        if !race.pending[slot].is_null() || super::POW_RACE_RETIRED[slot].load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        unsafe {
+            let pool = gpu.pool_push();
+            if let Some(cb) = race.encode(gpu, slot) {
+                race.pending[slot] = gpu.retain(cb);
+            }
+            gpu.pool_pop(pool);
+        }
+    }
+
     pub(crate) fn gpu_blake3_pow_scan(
         state_digest: &[u8; 32],
         start: u64,
@@ -19993,6 +20700,8 @@ kernel void zc_r2_products_horner_cs(
 }
 "#;
 
+    include!("gpu_commit/r2cs_fast.rs");
+
     /// Host mirror of the probe kernel's `ZcR2CsLayout` (see
     /// `UniSkipCompactFold::anchor_index` / `delta_offset`): anchors and
     /// delta bytes of block 0 (`anchor_index(0)`, `delta_offset(0)`), per
@@ -20422,7 +21131,7 @@ kernel void zc_r2_horner_oracle(
             let pool = gpu.pool_push();
             let built = (|| -> Result<Id, String> {
                 let mut source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled()).into_owned();
-                source.push_str(ZC_R2_CS_MSL_SOURCE);
+                source.push_str(&r2cs_fast::source(ZC_R2_CS_MSL_SOURCE));
                 let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
@@ -30222,3 +30931,140 @@ kernel void gl2_write(device uint4* d [[buffer(0)]], uint gid [[thread_position_
 }
 #[allow(dead_code)]
 const GAUNTLET_REDRAW_359349b9_20261111T014954Z: u8 = 0;
+
+/// Race grind latency item (`ENV_NO_GRIND_LAT`): launch, tail and slot tests.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod grind_lat_tests {
+    use super::*;
+
+    fn cpu_smallest(digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<u64> {
+        fn leading_zero_bits(bytes: &[u8; 32], bits: u32) -> bool {
+            let full = (bits / 8) as usize;
+            let extra = bits % 8;
+            bytes[..full].iter().all(|&byte| byte == 0) && (extra == 0 || bytes[full] >> (8 - extra) == 0)
+        }
+        (start..start + u64::from(len)).find(|&nonce| {
+            let mut preimage = [0u8; 64];
+            preimage[..32].copy_from_slice(digest);
+            preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
+            leading_zero_bits(blake3::hash(&preimage).as_bytes(), bits)
+        })
+    }
+
+    /// Builds the race tail (as the warm-up's helper thread does); `false`
+    /// only when this process has no Metal device or the item is switched
+    /// off. With Metal and the item on, a tail that does not build fails.
+    fn tail_available() -> bool {
+        if let Err(e) = imp::gpu() {
+            eprintln!("skipping race tail test: {e}");
+            return false;
+        }
+        if !pow_race_tail_wanted() {
+            eprintln!("skipping race tail test: item switched off");
+            return false;
+        }
+        gpu_pow_race_tail_prewarm();
+        assert!(imp::pow_race_tail_ready(), "race tail did not build");
+        true
+    }
+
+    /// Stall diagnostics for a failure message: the slots, and a plain Metal
+    /// scan of a small block run on a side thread (waited for at most two
+    /// seconds).
+    fn stall_report(what: &str) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(gpu_blake3_pow_scan(&[3u8; 32], 0, 1 << 16, 8));
+        });
+        let plain = rx.recv_timeout(std::time::Duration::from_secs(2));
+        format!("race tail test: {what} [{}] plain scan: {plain:?}", imp::pow_race_slot_dump())
+    }
+
+    /// A launch, waiting for a free slot. Other tests in the process hold
+    /// slots only briefly and never while waiting for another one.
+    fn launch(digest: &[u8; 32], start: u64, len: u32, bits: u32) -> PowRaceJob {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(job) = gpu_pow_race_launch(digest, start, len, bits) {
+                return job;
+            }
+            assert!(std::time::Instant::now() < deadline, "{}", stall_report("no slot freed up in 10 s"));
+            std::thread::yield_now();
+        }
+    }
+
+    fn wait(job: &PowRaceJob) -> Option<u64> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(r) = job.poll() {
+                return r;
+            }
+            assert!(std::time::Instant::now() < deadline, "{}", stall_report("tail not published in 10 s"));
+            std::hint::spin_loop();
+        }
+    }
+
+    /// The published word is the scan's smallest match (or none) for blocks
+    /// with many matches per wave (low bit counts), blocks without a match,
+    /// back-to-back launches that queue behind each other and reuse slots
+    /// across bit counts (the tail re-arms `best`), with and without the
+    /// command buffer encoded ahead; and it equals `gpu_blake3_pow_scan`.
+    #[test]
+    fn race_launch_publishes_the_scan_minimum() {
+        if !tail_available() {
+            return;
+        }
+        let shapes: [(u32, u32); 8] = [
+            (1 << 16, 1),
+            (1 << 16, 4),
+            (1 << 17, 9),
+            (1 << 18, 12),
+            (1 << 19, 14),
+            (1 << 21, 17),
+            (1 << 16, 30),
+            (1 << 20, 6),
+        ];
+        for d in 0u8..10 {
+            let digest: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(71).wrapping_add(d.wrapping_mul(13)));
+            for (k, &(len, bits)) in shapes.iter().enumerate() {
+                if (usize::from(d) + k) % 2 == 0 {
+                    gpu_pow_race_prepare();
+                }
+                let want = cpu_smallest(&digest, 0, len, bits);
+                let job = launch(&digest, 0, len, bits);
+                assert_eq!(wait(&job), want, "digest={d} len={len} bits={bits}");
+                assert_eq!(job.poll(), Some(want), "sticky digest={d} bits={bits}");
+                assert_eq!(gpu_blake3_pow_scan(&digest, 0, len, bits), Ok(want), "scan digest={d} bits={bits}");
+            }
+        }
+        // Back to back: four launches in flight at once (every slot, each
+        // queued behind the previous one), read in reverse order, with bit
+        // counts shifting every round so each slot goes from a low `best`
+        // to a high one and back. While all four handles live, no slot is
+        // free.
+        for round in 0u8..8 {
+            let mut jobs = Vec::new();
+            for j in 0u8..4 {
+                let digest = [round.wrapping_mul(31) ^ j.wrapping_mul(7) ^ 0x5A; 32];
+                let (len, bits) = shapes[(usize::from(round) + usize::from(j)) % shapes.len()];
+                if j == 2 {
+                    gpu_pow_race_prepare();
+                }
+                jobs.push((digest, len, bits, launch(&digest, 0, len, bits)));
+            }
+            for (digest, len, bits, job) in jobs.iter().rev() {
+                assert_eq!(wait(job), cpu_smallest(digest, 0, *len, *bits), "round={round} bits={bits}");
+            }
+            assert!(gpu_pow_race_launch(&[round; 32], 0, 1 << 16, 8).is_none(), "a held slot was taken");
+        }
+        // A block starting past the 32-bit carry, and blocks outside the
+        // fixed-grid range, which the launch declines.
+        let digest = [0xA7u8; 32];
+        let start = u64::from(u32::MAX) - 30_000;
+        let job = launch(&digest, start, 1 << 16, 10);
+        assert_eq!(wait(&job), cpu_smallest(&digest, start, 1 << 16, 10), "carry");
+        assert!(gpu_pow_race_launch(&digest, 0, (1 << 16) - 1, 10).is_none());
+        assert!(gpu_pow_race_launch(&digest, 0, POW_RACE_NO_MATCH, 10).is_none());
+        assert!(gpu_pow_race_launch(&digest, 0, 1 << 16, 0).is_none());
+    }
+}
