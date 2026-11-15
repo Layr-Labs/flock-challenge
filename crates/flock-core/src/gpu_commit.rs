@@ -20849,8 +20849,10 @@ kernel void zc_ab_finish(
     /// Result of joining the round-one AB completion GPU prefix.
     pub(crate) enum ZcAbResult {
         /// Admitted prove: the GPU's per-chunk 64-lane partials of chunks
-        /// `0..chunks`, eq_hi-weighted exactly like the CPU's.
-        Prefix(Vec<[F128; 64]>),
+        /// `0..n` (eq_hi-weighted exactly like the CPU's) were copied into
+        /// the caller's `cpu_partials[..n]` under the arm's state lock; the
+        /// suffix `cpu_partials[n..]` is untouched.
+        Prefix(usize),
         /// Warm-up oracle probe compared (verdict recorded for the process);
         /// the caller's CPU partials are authoritative.
         Calibrated,
@@ -21026,8 +21028,15 @@ kernel void zc_ab_finish(
     /// Join the GPU prefix. During the warm-up oracle probe, `cpu_partials`
     /// must hold the CPU's own per-chunk partials of every chunk; the GPU's
     /// `0..chunks` are byte-compared against them and the arm is admitted
-    /// only on full equality (disabled for the process otherwise).
-    pub(crate) fn zc_ab_wait(job: ZcAbJob, cpu_partials: &[[F128; 64]], hi_size: usize) -> ZcAbResult {
+    /// only on full equality (disabled for the process otherwise) and
+    /// `cpu_partials` is only read. On an admitted prove the GPU prefix is
+    /// written straight into `cpu_partials[..chunks]`; every `Failed` return
+    /// leaves `cpu_partials` unwritten for the caller's CPU redo.
+    pub(crate) fn zc_ab_wait(
+        job: ZcAbJob,
+        cpu_partials: &mut [[F128; 64]],
+        hi_size: usize,
+    ) -> ZcAbResult {
         use std::sync::atomic::Ordering;
         let debug = super::gpu_zc_ab_debug();
         let gpu = match gpu() {
@@ -21065,6 +21074,12 @@ kernel void zc_ab_finish(
                     return ZcAbResult::Failed;
                 }
             };
+            // The admitted prove writes `0..chunks` of the caller's buffer:
+            // bound it before the lock and before any write.
+            if !job.calibration && cpu_partials.len() < job.chunks {
+                ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
+                return ZcAbResult::Failed;
+            }
             let state = match state_mutex.lock() {
                 Ok(s) => s,
                 Err(_) => {
@@ -21074,7 +21089,17 @@ kernel void zc_ab_finish(
                 }
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 64]>();
-            let out: Vec<[F128; 64]> = std::slice::from_raw_parts(parts, job.chunks).to_vec();
+            let gpu_parts = std::slice::from_raw_parts(parts, job.chunks);
+            // Oracle probe: snapshot the GPU partials and compare after the
+            // unlock below; `cpu_partials` stays the untouched reference.
+            // Admitted prove: copy them straight into the caller's prefix
+            // while the state lock still guards the buffer.
+            let out: Vec<[F128; 64]> = if job.calibration {
+                gpu_parts.to_vec()
+            } else {
+                cpu_partials[..job.chunks].copy_from_slice(gpu_parts);
+                Vec::new()
+            };
             // This prove's launch validated (or created) the cached view of
             // `ab_inner`, which the cascade donates as the compact deltas:
             // hand it to the K pass arm of the same prove.
@@ -21097,7 +21122,7 @@ kernel void zc_ab_finish(
                         job.submitted.elapsed().as_secs_f64() * 1e3,
                     );
                 }
-                return ZcAbResult::Prefix(out);
+                return ZcAbResult::Prefix(job.chunks);
             }
             // ---- Warm-up oracle: GPU partials must equal the CPU's own ----
             let mismatch = if cpu_partials.len() < job.chunks {

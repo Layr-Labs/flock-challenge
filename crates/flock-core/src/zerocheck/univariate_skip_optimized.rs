@@ -3772,9 +3772,11 @@ impl AbGpuPrefix {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let hi_size = partials.len();
+            let cpu_base = self.cpu_base();
             match crate::gpu_commit::zc_ab_wait(self.job, partials, hi_size) {
-                crate::gpu_commit::ZcAbResult::Prefix(gpu) => {
-                    partials[..gpu.len()].copy_from_slice(&gpu);
+                // The GPU prefix was written into `partials[..cpu_base]` in place.
+                crate::gpu_commit::ZcAbResult::Prefix(n) => {
+                    debug_assert_eq!(n, cpu_base);
                     true
                 }
                 crate::gpu_commit::ZcAbResult::Calibrated => true,
