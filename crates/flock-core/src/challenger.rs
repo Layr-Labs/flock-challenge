@@ -972,6 +972,14 @@ mod grind_worker {
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
+        // Wide block of the race: may go out segmented, and is cancelled
+        // through this flag once the CPU side has answered.
+        wide: Option<Arc<AtomicBool>>,
+        // Pre-commit (`gpu_commit::ENV_NO_GRIND_PRECOMMIT`): the parked scan
+        // the caller already released for this grind, and the next grind's
+        // shape `(bits, len)` to park while this one runs.
+        fired: Option<crate::gpu_commit::GrindFired>,
+        park_next: Option<(u32, u32)>,
         done: Sender<Result<Option<u64>, String>>,
     }
 
@@ -990,13 +998,38 @@ mod grind_worker {
             std::thread::Builder::new()
                 .name("flock-grind-dispatch".into())
                 .spawn(move || {
-                    while let Ok(job) = rx.recv() {
-                        let res = crate::gpu_commit::gpu_blake3_pow_scan(
-                            &job.digest,
-                            job.start,
-                            job.len,
-                            job.bits,
-                        );
+                    while let Ok(mut job) = rx.recv() {
+                        let res = if let Some(fired) = job.fired.take() {
+                            // Already released by the caller: spin it home
+                            // even when cancelled (it is running).
+                            let idle = AtomicBool::new(false);
+                            crate::gpu_commit::gpu_blake3_pow_scan_fired(
+                                fired,
+                                job.wide.as_deref().unwrap_or(&idle),
+                                job.park_next,
+                            )
+                        } else if let Some(cancel) = job.wide.as_deref() {
+                            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                // Cancelled before it started.
+                                Ok(None)
+                            } else {
+                                crate::gpu_commit::gpu_blake3_pow_scan_wide(
+                                    &job.digest,
+                                    job.start,
+                                    job.len,
+                                    job.bits,
+                                    cancel,
+                                    job.park_next,
+                                )
+                            }
+                        } else {
+                            crate::gpu_commit::gpu_blake3_pow_scan(
+                                &job.digest,
+                                job.start,
+                                job.len,
+                                job.bits,
+                            )
+                        };
                         if job.abort && matches!(&res, Ok(Some(_))) {
                             job.stop.store(true, std::sync::atomic::Ordering::Release);
                         }
@@ -1010,13 +1043,6 @@ mod grind_worker {
                 })
         })
         .as_ref()
-    }
-
-    /// Whether the persistent worker runs. The race exists only with it
-    /// (`FLOCK_NO_GRIND_WORKER=1` keeps the serial Metal walk), also when the
-    /// calling thread launches the race's scan itself.
-    pub(super) fn available() -> bool {
-        worker().is_some()
     }
 
     /// Dispatch one GPU grind scan through the persistent worker without
@@ -1033,6 +1059,9 @@ mod grind_worker {
         bits: u32,
         stop: Arc<AtomicBool>,
         abort: bool,
+        wide: Option<Arc<AtomicBool>>,
+        fired: Option<crate::gpu_commit::GrindFired>,
+        park_next: Option<(u32, u32)>,
     ) -> Option<Receiver<Result<Option<u64>, String>>> {
         let w = worker()?;
         let (done_tx, done_rx) = channel();
@@ -1043,6 +1072,9 @@ mod grind_worker {
             bits,
             stop,
             abort,
+            wide,
+            fired,
+            park_next,
             done: done_tx,
         };
         if w.tx.send(job).is_err() {
@@ -1196,320 +1228,6 @@ fn cpu_race_scan(
     }
 }
 
-/// Caller-first race scan (grind pack 3, `FLOCK_NO_RACE_CALLER_SCAN=1` keeps
-/// [`cpu_race_scan`]). Same windows of `2^(bits+1)` nonces, same chunks, the
-/// same fine stop and the same lowest-chunk match rule as [`cpu_race_scan`];
-/// only the hand-off changes. The calling thread posts one job to the main
-/// pool (fanned out over every pool thread but one, whose core the caller
-/// takes) and one broadcast to the efficiency-core helpers, then claims
-/// chunks from the same atomic cursor itself. It never parks on a pool latch
-/// or a helper gate: once its own claims run out it walks the window's chunk
-/// results in ascending order, waits (spinning) only for chunks another
-/// thread has already claimed, and returns at the first chunk holding a
-/// match. It returns `None` as soon as `stop` is set, i.e. once the Metal
-/// arm has hit (its nonce is the same global minimum). The window state is
-/// shared through a reference count, so a pool thread or helper that starts
-/// after the grind returned finds the cursor exhausted, past the bound, or
-/// `stop` set, claims nothing and drops its reference.
-///
-/// Determinism: chunk indices are handed out in ascending order, once each;
-/// a claimant skips chunk `c` only when the bound is already below `c` (a
-/// lower chunk holds a match), and a claimed chunk is scanned in full unless
-/// `stop` fires, which leaves it pending and makes the CPU answer
-/// non-definitive. So when the walk reaches a match, every lower chunk of
-/// every earlier window was scanned in full and empty: the smallest
-/// qualifying nonce, the one [`cpu_race_scan`] and the Metal scan return.
-fn cpu_race_scan_caller(
-    state_digest: &[u8; 32],
-    bits: u32,
-    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Option<u64> {
-    cpu_race_scan_caller_until(state_digest, bits, stop, &mut || false, &mut || {})
-}
-
-/// [`cpu_race_scan_caller`] with a Metal poll (grind latency item, see
-/// [`race_with_launched_scan`]). `gpu_hit` is called by the calling thread
-/// alone: at every chunk claim, between its sub-blocks, while it waits on
-/// another thread's chunk and before each window. Once it reports the Metal
-/// hit, the scan sets `stop` (so the pool threads and helpers retire as on a
-/// Metal hit from the worker) and returns `None`. `posted` runs once on the
-/// calling thread, right after the first window's pool job and helper
-/// broadcast are posted and before the calling thread claims its first
-/// chunk.
-fn cpu_race_scan_caller_until(
-    state_digest: &[u8; 32],
-    bits: u32,
-    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    gpu_hit: &mut dyn FnMut() -> bool,
-    posted: &mut dyn FnMut(),
-) -> Option<u64> {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    const PENDING: u64 = u64::MAX;
-    const NO_MATCH: u64 = u64::MAX - 1;
-    // Two 48-nonce kernel batches per stop check, as in `cpu_race_scan`.
-    const FINE_SUB: u64 = 96;
-    struct Window {
-        digest: [u8; 32],
-        bits: u32,
-        chunk: u64,
-        fine_stop: bool,
-        base: u64,
-        results: Box<[AtomicU64]>,
-        next: AtomicUsize,
-        bound: AtomicUsize,
-        stop: Arc<AtomicBool>,
-    }
-    impl Window {
-        fn work(&self) {
-            self.work_until(|| false);
-        }
-
-        /// [`Self::work`] that also stops once `gpu_hit` reports.
-        fn work_until(&self, mut gpu_hit: impl FnMut() -> bool) {
-            let n_chunks = self.results.len();
-            loop {
-                if self.stop.load(Ordering::Relaxed) || gpu_hit() {
-                    return;
-                }
-                let c = self.next.fetch_add(1, Ordering::Relaxed);
-                if c >= n_chunks || c >= self.bound.load(Ordering::Relaxed) {
-                    return;
-                }
-                let base = self.base.saturating_add(c as u64 * self.chunk);
-                // As in `cpu_race_scan`: ascending sub-blocks with a stop
-                // check between them; the first sub-block holding a match
-                // gives the chunk's smallest match.
-                let found = if self.fine_stop {
-                    let mut off = 0u64;
-                    loop {
-                        if off >= self.chunk {
-                            break Some(None);
-                        }
-                        if off > 0 && (self.stop.load(Ordering::Relaxed) || gpu_hit()) {
-                            break None;
-                        }
-                        let len = FINE_SUB.min(self.chunk - off);
-                        if let Some(n) = pow_scan(
-                            &self.digest,
-                            base.saturating_add(off),
-                            len,
-                            self.bits,
-                            HashKind::Blake3,
-                        ) {
-                            break Some(Some(n));
-                        }
-                        off += len;
-                    }
-                } else {
-                    Some(pow_scan(&self.digest, base, self.chunk, self.bits, HashKind::Blake3))
-                };
-                match found {
-                    Some(Some(n)) => {
-                        self.results[c].store(n, Ordering::Release);
-                        self.bound.fetch_min(c, Ordering::Relaxed);
-                    }
-                    Some(None) => self.results[c].store(NO_MATCH, Ordering::Release),
-                    // Abandoned on stop: the chunk stays pending.
-                    None => return,
-                }
-            }
-        }
-    }
-    // 480 with the grind pack (`FLOCK_NO_GRIND_CHUNK480`), else 960.
-    let chunk: u64 = if crate::gpu_commit::grind_chunk480_enabled() { 480 } else { 960 };
-    let fine_stop = grind_race_fine_stop_enabled();
-    let block: u64 = 1 << (bits.min(24) + 1);
-    let n_chunks = usize::try_from(block.div_ceil(chunk)).ok()?;
-    let helpers = rayon::current_num_threads().saturating_sub(1).max(1);
-    let mut gpu_stop = || {
-        let hit = gpu_hit();
-        if hit {
-            stop.store(true, Ordering::Release);
-        }
-        hit
-    };
-    let mut posted = Some(posted);
-    let mut start = 0u64;
-    loop {
-        if stop.load(Ordering::Acquire) || gpu_stop() {
-            return None;
-        }
-        let window = Arc::new(Window {
-            digest: *state_digest,
-            bits,
-            chunk,
-            fine_stop,
-            base: start,
-            results: (0..n_chunks).map(|_| AtomicU64::new(PENDING)).collect(),
-            next: AtomicUsize::new(0),
-            bound: AtomicUsize::new(n_chunks),
-            stop: Arc::clone(stop),
-        });
-        {
-            let window = Arc::clone(&window);
-            rayon::spawn(move || {
-                use rayon::prelude::*;
-                (0..helpers).into_par_iter().with_max_len(1).for_each(|_| window.work());
-            });
-        }
-        if let Some(ep) = crate::epool::epool() {
-            let window = Arc::clone(&window);
-            ep.spawn_broadcast(move |_| window.work());
-        }
-        if let Some(posted) = posted.take() {
-            posted();
-        }
-        window.work_until(&mut gpu_stop);
-        if stop.load(Ordering::Acquire) {
-            return None;
-        }
-        // Every chunk below the first match was claimed (the cursor is
-        // ascending) and is scanned in full unless `stop` fires; wait out the
-        // ones still in flight on another thread.
-        for r in window.results.iter() {
-            loop {
-                match r.load(Ordering::Acquire) {
-                    NO_MATCH => break,
-                    PENDING => {
-                        if stop.load(Ordering::Acquire) || gpu_stop() {
-                            return None;
-                        }
-                        std::hint::spin_loop();
-                    }
-                    n => return Some(n),
-                }
-            }
-        }
-        start = start.saturating_add(block);
-    }
-}
-
-/// Unpublished polls of a launched race scan's word per status check of the
-/// launch (`PowRaceJob::check`). The calling thread polls at every chunk
-/// claim and between sub-blocks, so a check comes every dozen or so
-/// sub-blocks, and more often while it waits on other threads' chunks.
-const RACE_LAUNCH_CHECK_EVERY: u32 = 16;
-
-/// The Metal/CPU race with the Metal scan launched by the calling thread
-/// (grind latency item, `FLOCK_NO_GRIND_LAT=1` keeps the dispatch worker's
-/// scan). `job` covers the same block from nonce 0 as the worker's scan
-/// would; its result word is published by the tail dispatch behind the scan
-/// (see `gpu_commit::gpu_pow_race_launch`). The calling thread runs the
-/// caller-first CPU scan and polls the word itself: a Metal hit stops the
-/// CPU arm and is returned; a block without a match leaves the CPU arm
-/// running to its definitive answer. Right after posting the CPU arm it
-/// encodes the next launch's command buffer (`gpu_pow_race_prepare`). Both
-/// arms report the smallest qualifying nonce, so the winner never changes
-/// the nonce. See [`race_with_launch_polls`] for the launch checks and the
-/// fallback.
-fn race_with_launched_scan(
-    state_digest: &[u8; 32],
-    bits: u32,
-    block_len: u32,
-    job: &crate::gpu_commit::PowRaceJob,
-) -> Option<u64> {
-    race_with_launch_polls(state_digest, bits, block_len, &mut || job.poll(), &mut || job.check())
-}
-
-/// [`race_with_launched_scan`] over a launch's `poll` and `check`. Every
-/// [`RACE_LAUNCH_CHECK_EVERY`]th unpublished poll also runs `check`, which
-/// never waits: a completed launch answers there (its word re-read after the
-/// status), and a launch found dead (failed, completed without its word, or
-/// unpublished past the bound) is dropped and the race continues as today's
-/// race from that point: the dispatch worker scans the same block with the
-/// same `stop`, setting it on a hit, while the CPU arm keeps running. The
-/// worker's answer is received only after it stopped the CPU arm, so the
-/// calling thread never waits on a scan. `None` only if no arm produced a
-/// nonce (the CPU scan could not size its windows); the caller then runs
-/// today's race.
-fn race_with_launch_polls(
-    state_digest: &[u8; 32],
-    bits: u32,
-    block_len: u32,
-    poll: &mut dyn FnMut() -> Option<Option<u64>>,
-    check: &mut dyn FnMut() -> crate::gpu_commit::PowRaceCheck,
-) -> Option<u64> {
-    use crate::gpu_commit::PowRaceCheck;
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let t_iter = grind_trace_enabled().then(std::time::Instant::now);
-    let mut gpu = None;
-    // The launch is polled until it published or was found dead.
-    let mut live = true;
-    let mut polls = 0u32;
-    let mut fallback = None;
-    let mut fell_back = false;
-    let cpu = cpu_race_scan_caller_until(
-        state_digest,
-        bits,
-        &stop,
-        &mut || {
-            if !live {
-                return false;
-            }
-            let mut answer = poll();
-            if answer.is_none() {
-                polls = polls.wrapping_add(1);
-                if polls % RACE_LAUNCH_CHECK_EVERY == 0 {
-                    match check() {
-                        PowRaceCheck::Running => {}
-                        PowRaceCheck::Published(r) => answer = Some(r),
-                        PowRaceCheck::Dead => {
-                            live = false;
-                            fell_back = true;
-                            fallback = grind_worker::dispatch_async(
-                                state_digest,
-                                0,
-                                block_len,
-                                bits,
-                                std::sync::Arc::clone(&stop),
-                                true,
-                            );
-                            return false;
-                        }
-                    }
-                }
-            }
-            match answer {
-                Some(Some(n)) => {
-                    gpu = Some(n);
-                    live = false;
-                    true
-                }
-                Some(None) => {
-                    live = false;
-                    false
-                }
-                None => false,
-            }
-        },
-        // The next race launch's command buffer is encoded here, once the
-        // CPU arm is posted: off the Metal arm's path and ahead of the
-        // calling thread's own chunks.
-        &mut crate::gpu_commit::gpu_pow_race_prepare,
-    );
-    let won = match (cpu, gpu) {
-        (Some(n), _) | (None, Some(n)) => Some(n),
-        // Stopped by the worker's hit: it sends its answer right after
-        // setting `stop`.
-        (None, None) => match fallback.take() {
-            Some(rx) if stop.load(std::sync::atomic::Ordering::Acquire) => {
-                grind_worker::recv(rx).ok().flatten()
-            }
-            _ => None,
-        },
-    };
-    if let Some(t) = t_iter {
-        let wall = t.elapsed().as_secs_f64() * 1e3;
-        let how = if fell_back { "launched fallback" } else { "launched" };
-        match cpu {
-            Some(_) => eprintln!("[grind] bits={bits} race: cpu won {how} wall={wall:.3} ms"),
-            None => eprintln!("[grind] bits={bits} race: gpu won hit={} {how} wall={wall:.3} ms", won.is_some()),
-        }
-    }
-    won
-}
-
 /// Smallest and largest grind (in bits, inclusive) that the spawned drain
 /// takes: from 8 bits up it beats the sequential scan (below, the scan ends
 /// before a pool thread joins), and up to 16 bits, the largest CPU-only
@@ -1641,19 +1359,21 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
     // same nonce the GPU returns — so proofs are identical; otherwise the
     // GPU result is used. The CPU bails as soon as the GPU reports a hit.
     if wide && grind_race_enabled() && rayon::current_num_threads() > 1 {
-        // Grind latency item: the calling thread launches the Metal scan and
-        // polls its result word from the caller-first CPU scan (which it
-        // needs, so `FLOCK_NO_GPACK3=1` or `FLOCK_NO_RACE_CALLER_SCAN=1` also
-        // keep the worker's scan). No launch (item off, tail unavailable, no
-        // free slot) keeps the worker's race below.
-        if crate::gpu_commit::race_caller_scan_enabled()
-            && grind_worker::available()
-            && let Some(job) = crate::gpu_commit::gpu_pow_race_launch(state_digest, 0, block_len, bits)
-            && let Some(n) = race_with_launched_scan(state_digest, bits, block_len, &job)
-        {
-            return Ok(n);
-        }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Pre-commit (`gpu_commit::ENV_NO_GRIND_PRECOMMIT`): release the scan
+        // parked for this grind, if any, before anything else; and have the
+        // dispatch thread park the next grind's scan when it is a GPU grind.
+        let precommit = crate::gpu_commit::grind_precommit_enabled();
+        let fired = if precommit {
+            crate::gpu_commit::grind_fire_parked(state_digest, bits, block_len)
+        } else {
+            None
+        };
+        let park_next = (precommit && bits > gpu_grind_floor_bits()).then(|| {
+            let next = bits - 1;
+            (next, 1u32 << (next + GPU_GRIND_WIDE_EXTRA_BITS).min(24))
+        });
         if let Some(done_rx) = grind_worker::dispatch_async(
             state_digest,
             0,
@@ -1661,16 +1381,14 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             bits,
             std::sync::Arc::clone(&stop),
             true,
+            // With the switch off the job is the incumbent single dispatch,
+            // never cancelled.
+            crate::gpu_commit::grind_seg_enabled().then(|| std::sync::Arc::clone(&cancel)),
+            fired,
+            park_next,
         ) {
             let t_iter = grind_trace_enabled().then(std::time::Instant::now);
-            // Grind pack 3: the caller-first race scan (see
-            // `cpu_race_scan_caller`); same answer, same stop rule.
-            let cpu = if crate::gpu_commit::race_caller_scan_enabled() {
-                cpu_race_scan_caller(state_digest, bits, &stop)
-            } else {
-                cpu_race_scan(state_digest, bits, &stop)
-            };
-            if let Some(n) = cpu {
+            if let Some(n) = cpu_race_scan(state_digest, bits, &stop) {
                 if let Some(t) = t_iter {
                     eprintln!(
                         "[grind] bits={bits} race: cpu won wall={:.3} ms",
@@ -1678,7 +1396,9 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
                     );
                 }
                 // The abandoned GPU scan finishes on its worker; its result
-                // goes to the dropped receiver.
+                // goes to the dropped receiver. A segmented scan is told to
+                // drop its remaining segments.
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 drop(done_rx);
                 return Ok(n);
             }
@@ -1740,6 +1460,9 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
             bits,
             std::sync::Arc::clone(&stop),
             abort,
+            None,
+            None,
+            None,
         ) {
             Some(done_rx) => {
                 if grind_prefetch_overlap_enabled() {
@@ -3120,216 +2843,6 @@ mod tests {
             c1.observe_f128(F128::ONE);
             c2.observe_f128(F128::ONE);
             assert_ne!(c1.sample_f128(), c2.sample_f128());
-        }
-    }
-}
-
-/// Grind pack 3 race scan tests (their own module, next to `tests`).
-#[cfg(test)]
-mod gpack3_tests {
-    use super::*;
-
-    /// Grind pack 3: the caller-first race scan returns the smallest
-    /// qualifying nonce (the ascending scan's answer) whenever `stop` stays
-    /// clear, from a plain thread and from inside a pool, including grinds
-    /// that leave their first window; with `stop` set it returns `None`.
-    #[test]
-    fn race_caller_scan_matches_sequential_scan() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-        let want_of = |digest: &[u8; 32], bits: u32| {
-            let mut start = 0u64;
-            loop {
-                if let Some(n) = pow_scan(digest, start, 4096, bits, HashKind::Blake3) {
-                    break n;
-                }
-                start += 4096;
-            }
-        };
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
-        let mut window_misses = 0;
-        for d in 0u8..16 {
-            let digest: [u8; 32] =
-                core::array::from_fn(|i| (i as u8).wrapping_mul(53).wrapping_add(d.wrapping_mul(29)));
-            for bits in [1u32, 6, 9, 12, 14, 17] {
-                let want = want_of(&digest, bits);
-                let stop = Arc::new(AtomicBool::new(false));
-                assert_eq!(
-                    cpu_race_scan_caller(&digest, bits, &stop),
-                    Some(want),
-                    "digest={d} bits={bits}"
-                );
-                let in_pool = pool.install(|| cpu_race_scan_caller(&digest, bits, &stop));
-                assert_eq!(in_pool, Some(want), "pool digest={d} bits={bits}");
-                assert_eq!(cpu_race_scan(&digest, bits, &stop), Some(want), "two-pool digest={d} bits={bits}");
-                window_misses += usize::from(want >= 1u64 << (bits + 1));
-            }
-        }
-        assert!(window_misses > 0, "no race scan left its first window");
-        for rep in 0..40u8 {
-            let digest = [rep.wrapping_mul(7) ^ 0x3C; 32];
-            let stop = Arc::new(AtomicBool::new(false));
-            assert_eq!(cpu_race_scan_caller(&digest, 18, &stop), Some(want_of(&digest, 18)), "rep={rep}");
-        }
-        let stop = Arc::new(AtomicBool::new(true));
-        assert_eq!(cpu_race_scan_caller(&[9u8; 32], 17, &stop), None);
-    }
-}
-
-/// Race grind latency item (`FLOCK_NO_GRIND_LAT`) tests.
-#[cfg(test)]
-mod grind_lat_tests {
-    use super::*;
-    use crate::gpu_commit::PowRaceCheck;
-
-    fn want_of(digest: &[u8; 32], bits: u32) -> u64 {
-        let mut start = 0u64;
-        loop {
-            if let Some(n) = pow_scan(digest, start, 4096, bits, HashKind::Blake3) {
-                break n;
-            }
-            start += 4096;
-        }
-    }
-
-    fn block_len(bits: u32) -> u32 {
-        1u32 << (bits + GPU_GRIND_WIDE_EXTRA_BITS)
-    }
-
-    /// A launch, waiting for a free result slot (this test holds at most one
-    /// at a time; other tests in the process may hold the rest briefly).
-    fn launch(digest: &[u8; 32], bits: u32) -> Option<crate::gpu_commit::PowRaceJob> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if let Some(job) = crate::gpu_commit::gpu_pow_race_launch(digest, 0, block_len(bits), bits) {
-                return Some(job);
-            }
-            if std::time::Instant::now() > deadline {
-                return None;
-            }
-            std::thread::yield_now();
-        }
-    }
-
-    /// The race with the Metal scan launched by the calling thread returns
-    /// the ascending scan's smallest qualifying nonce whichever arm answers
-    /// first, from a plain thread and from inside a pool, through
-    /// `gpu_blake3_pow_nonce`, and when the Metal block holds no match (the
-    /// CPU arm then answers alone). With Metal and the item on, the tail
-    /// must build and launches must succeed.
-    #[test]
-    fn launched_race_matches_sequential_scan() {
-        if crate::gpu_commit::gpu_blake3_pow_scan(&[1u8; 32], 0, 1 << 16, 30).is_err()
-            || !crate::gpu_commit::pow_race_tail_wanted()
-        {
-            eprintln!("skipping launched race test: no Metal grind or item off");
-            return;
-        }
-        crate::gpu_commit::gpu_pow_race_tail_prewarm();
-        let launch = |digest: &[u8; 32], bits: u32| launch(digest, bits).expect("no race launch in 10 s");
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
-        for d in 0u8..12 {
-            let digest: [u8; 32] =
-                core::array::from_fn(|i| (i as u8).wrapping_mul(59).wrapping_add(d.wrapping_mul(17)));
-            for bits in [14u32, 15, 17, 18, 19] {
-                let want = want_of(&digest, bits);
-                let job = launch(&digest, bits);
-                assert_eq!(
-                    race_with_launched_scan(&digest, bits, block_len(bits), &job),
-                    Some(want),
-                    "digest={d} bits={bits}"
-                );
-                // Release the slot before the next launch: a test that holds
-                // slots while it waits for another can starve a concurrent one.
-                drop(job);
-                let in_pool = pool.install(|| {
-                    race_with_launched_scan(&digest, bits, block_len(bits), &launch(&digest, bits))
-                });
-                assert_eq!(in_pool, Some(want), "pool digest={d} bits={bits}");
-                assert_eq!(gpu_blake3_pow_nonce(&digest, bits), Ok(want), "nonce digest={d} bits={bits}");
-            }
-        }
-        // Metal misses: digests whose smallest 14-bit nonce lies past the
-        // 2^16-nonce Metal block.
-        let mut misses = 0;
-        for d in 0u16..4000 {
-            if misses == 4 {
-                break;
-            }
-            let digest: [u8; 32] = core::array::from_fn(|i| (d as u8) ^ ((d >> 8) as u8).wrapping_add(i as u8).wrapping_mul(3));
-            let want = want_of(&digest, 14);
-            if want < 1 << 16 {
-                continue;
-            }
-            misses += 1;
-            let job = launch(&digest, 14);
-            assert_eq!(race_with_launched_scan(&digest, 14, block_len(14), &job), Some(want), "miss digest={d}");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while job.poll().is_none() {
-                assert!(std::time::Instant::now() < deadline, "race tail not published in 10 s");
-            }
-            assert_eq!(job.poll(), Some(None), "miss digest={d}");
-            assert_eq!(gpu_blake3_pow_nonce(&digest, 14), Ok(want), "miss nonce digest={d}");
-        }
-        assert!(misses > 0, "no digest missed the Metal block");
-    }
-
-    /// Launches that never publish: found dead at a check (the race then
-    /// continues as today's race, the dispatch worker scanning the block),
-    /// never found dead (the CPU arm answers), or answering only at a check
-    /// (a word seen only at completion). Every case returns the ascending
-    /// scan's smallest nonce, from a plain thread and inside a pool.
-    #[test]
-    fn launch_checks_and_fallback_keep_the_nonce() {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
-        for d in 0u8..6 {
-            let digest: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(29) ^ d.wrapping_mul(101));
-            for bits in [14u32, 17, 19] {
-                let want = want_of(&digest, bits);
-                let len = block_len(bits);
-                let gpu_answer = (want < u64::from(len)).then_some(want);
-                for dead_after in [1u32, 3] {
-                    let mut checks = 0;
-                    let got = race_with_launch_polls(&digest, bits, len, &mut || None, &mut || {
-                        checks += 1;
-                        if checks >= dead_after { PowRaceCheck::Dead } else { PowRaceCheck::Running }
-                    });
-                    assert_eq!(got, Some(want), "dead digest={d} bits={bits} after={dead_after}");
-                    let got = pool.install(|| {
-                        race_with_launch_polls(&digest, bits, len, &mut || None, &mut || PowRaceCheck::Dead)
-                    });
-                    assert_eq!(got, Some(want), "pool dead digest={d} bits={bits}");
-                }
-                let got = race_with_launch_polls(&digest, bits, len, &mut || None, &mut || PowRaceCheck::Running);
-                assert_eq!(got, Some(want), "running digest={d} bits={bits}");
-                let mut checks = 0;
-                let got = race_with_launch_polls(&digest, bits, len, &mut || None, &mut || {
-                    checks += 1;
-                    if checks >= 2 { PowRaceCheck::Published(gpu_answer) } else { PowRaceCheck::Running }
-                });
-                assert_eq!(got, Some(want), "published at check digest={d} bits={bits}");
-            }
-        }
-    }
-
-    /// The check verdict: a completed buffer answers only with its word, a
-    /// failed or wordless one turns the path off, and the age bound retires
-    /// only a buffer still in flight.
-    #[test]
-    fn launch_check_verdicts() {
-        use crate::gpu_commit::{POW_RACE_STUCK, PowRaceVerdict, pow_race_verdict};
-        let young = std::time::Duration::ZERO;
-        let old = POW_RACE_STUCK + std::time::Duration::from_micros(1);
-        for status in 0..4 {
-            assert_eq!(pow_race_verdict(status, false, young), PowRaceVerdict::Running);
-            assert_eq!(pow_race_verdict(status, false, POW_RACE_STUCK), PowRaceVerdict::Running);
-            assert_eq!(pow_race_verdict(status, false, old), PowRaceVerdict::Retire);
-        }
-        for age in [young, old] {
-            assert_eq!(pow_race_verdict(4, true, age), PowRaceVerdict::Published);
-            assert_eq!(pow_race_verdict(4, false, age), PowRaceVerdict::Off);
-            assert_eq!(pow_race_verdict(5, true, age), PowRaceVerdict::Off);
-            assert_eq!(pow_race_verdict(5, false, age), PowRaceVerdict::Off);
         }
     }
 }
