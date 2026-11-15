@@ -4035,27 +4035,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     };
 
     let mut s = [F128::ZERO; 26];
-    if hi_size == 1 {
-        // No repeated reductions to eliminate for the single-chunk tail.
-        for (x_hi, outv) in partials.iter().enumerate() {
-            let eq_h = eq_hi[x_hi];
-            for (slot, &v) in s.iter_mut().zip(outv.iter()) {
-                *slot += eq_h * v;
-            }
-        }
-    } else {
-        // Reduction modulo the binary field polynomial is XOR-linear.
-        // Accumulate each weighted column in 256 bits, then reduce once:
-        // 26 * hi_size reductions become 26, with identical field values.
-        let mut unreduced = [F256Unreduced::ZERO; 26];
-        for (x_hi, outv) in partials.iter().enumerate() {
-            let eq_h = eq_hi[x_hi];
-            for (acc, &v) in unreduced.iter_mut().zip(outv.iter()) {
-                *acc ^= eq_h.mul_unreduced(v);
-            }
-        }
-        for (slot, acc) in s.iter_mut().zip(unreduced) {
-            *slot = acc.reduce();
+    for (x_hi, outv) in partials.iter().enumerate() {
+        let eq_h = eq_hi[x_hi];
+        for (slot, &v) in s.iter_mut().zip(outv.iter()) {
+            *slot += eq_h * v;
         }
     }
     tri_finish(&s, r_next)
@@ -6415,11 +6398,16 @@ mod tests {
                 if sparse.tail_compact {
                     // Nothing is written in front of or past the compacted blocks.
                     let lo = sparse.delta_offset(0);
-                    let per_block = if sparse.head_compact {
-                        kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK
-                    } else {
-                        kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK
-                    };
+                    // The compacted layouts exist only in the aarch64 kernels.
+                    #[cfg(target_arch = "aarch64")]
+                    let (hc_bpb, tc_bpb) = (
+                        kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK,
+                        kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK,
+                    );
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let (hc_bpb, tc_bpb): (usize, usize) =
+                        unreachable!("tail compaction is an aarch64-only layout");
+                    let per_block = if sparse.head_compact { hc_bpb } else { tc_bpb };
                     let hi = sparse.delta_offset(n_pairs - 128) + per_block;
                     assert!(sparse.deltas[..lo].chunks_exact(16).all(|c| c == &poison_bytes[..]));
                     assert!(sparse.deltas[hi..].chunks_exact(16).all(|c| c == &poison_bytes[..]));
@@ -7215,10 +7203,14 @@ mod tests {
         }
 
         fn qos() {
-            unsafe extern "C" {
-                fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
+            // macOS-only call: elsewhere (aarch64 Linux test runs) a no-op.
+            #[cfg(target_os = "macos")]
+            {
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
+                }
+                unsafe { pthread_set_qos_class_self_np(0x21, 0) };
             }
-            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
         }
 
         fn lq(v: &mut [f64]) -> (f64, f64) {
