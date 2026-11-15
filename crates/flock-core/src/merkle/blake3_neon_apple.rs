@@ -513,10 +513,26 @@ pub(crate) fn pow_scan_reg(
     debug_assert!((1..=32).contains(&bits));
     let fx = pow_fixed(state_digest);
     let mask = word0_mask(bits);
-    unsafe { pow_scan_reg_inner(&fx, start, len, mask) }
+    unsafe { pow_scan_reg_inner::<false>(&fx, start, len, mask, None) }
 }
 
-unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> Option<u64> {
+/// Cancellable specialization; the ordered scanner has no cancellation load.
+pub(crate) fn pow_scan_reg_until(
+    state_digest: &[u8; 32], start: u64, len: u64, bits: u32,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Option<u64> {
+    if len == 0 || stop.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    debug_assert!((1..=32).contains(&bits));
+    let fx = pow_fixed(state_digest);
+    unsafe { pow_scan_reg_inner::<true>(&fx, start, len, word0_mask(bits), Some(stop)) }
+}
+
+unsafe fn pow_scan_reg_inner<const CANCEL: bool>(
+    fx: &PowFixed, start: u64, len: u64, mask: u32,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<u64> {
     unsafe {
         // Broadcast the grind-invariant state once; these stay live across
         // every attempt in the scan.
@@ -528,6 +544,9 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
         let end = start.saturating_add(len);
         let mut base = start;
         while base + 12 <= end {
+            if CANCEL && stop.unwrap().load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
             #[cfg(feature = "hash-count")]
             crate::challenger::fs_count::POW_SHA256
                 .fetch_add(12, std::sync::atomic::Ordering::Relaxed);

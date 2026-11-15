@@ -460,6 +460,8 @@ fn blake3_hash_many_parents(data: &[u8], out: &mut [Hash]) {
 /// bits. See `blake3_neon_apple::pow_scan_reg`.
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub(crate) use blake3_neon_apple::pow_scan_reg as blake3_pow_scan_reg;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub(crate) use blake3_neon_apple::pow_scan_reg_until as blake3_pow_scan_reg_until;
 
 /// Batched BLAKE3 PoW grind blocks: `data` is `out.len()` contiguous
 /// 64-byte single-chunk pre-images, hashed with `CHUNK_START | CHUNK_END |
