@@ -199,6 +199,13 @@ pub fn stage_f128_release_token(buf: &[F128], tag: u64, probes: Vec<ReleaseProbe
     });
 }
 
+/// Change the representation receipt of an allocation still owned by the
+/// caller. Remove the previous address receipt before staging the new tag.
+pub fn replace_f128_release_token(buf: &[F128], tag: u64, probes: Vec<ReleaseProbe>) {
+    purge_staged_addr(buf.as_ptr() as usize);
+    stage_f128_release_token(buf, tag, probes);
+}
+
 /// Retire any staged token naming `addr` — called whenever a take hands out
 /// (or freshly allocates) a buffer at that address, so a stale stage can
 /// never be matched by a later give of a *different* allocation that
@@ -289,6 +296,27 @@ const MAX_POOLED: usize = 48;
 /// (same contract as [`crate::alloc_uninit_vec`]).
 pub fn take_f128(n: usize) -> Vec<F128> {
     take_f128_with_token_inner(n, None).0
+}
+
+/// Take either packed representation, preserving pinned-slot precedence.
+/// The third result identifies an exact alternate-layout receipt.
+pub fn take_f128_with_alternate_token(n: usize, tag: u64, alternate: u64) -> (Vec<F128>, bool, bool) {
+    STAGED.lock().unwrap().retain(|s| s.tag != tag && s.tag != alternate);
+    if let Some((v, token)) = try_take_pinned_f128(n).or_else(|| try_take_pinned2_f128(n)) {
+        purge_staged_addr(v.as_ptr() as usize);
+        return (v, token == Some(tag) || token == Some(alternate), token == Some(alternate));
+    }
+    {
+        let mut pool = POOL.lock().unwrap();
+        if let Some(i) = pool.iter().position(|e| e.token == Some(alternate) && e.buf.len() == n) {
+            let entry = pool.swap_remove(i);
+            drop(pool);
+            purge_staged_addr(entry.buf.as_ptr() as usize);
+            return (entry.buf, true, true);
+        }
+    }
+    let (v, hit) = take_f128_with_token(n, tag);
+    (v, hit, false)
 }
 
 /// [`take_f128`] variant carrying a provenance-token request: returns the
@@ -891,9 +919,25 @@ pub struct ScratchBytes {
 enum ScratchBytesBacking {
     U8(Vec<u8>),
     F128(Vec<F128>),
+    Produced { owner: crate::zerocheck::delta_planes::Owner, reservation: Box<ScratchBytes> },
 }
 
 impl ScratchBytes {
+    pub(crate) fn adopt_produced(self, owner: crate::zerocheck::delta_planes::Owner) -> Self {
+        assert!(self.fully_initialized);
+        assert_eq!(self.len(), owner.storage.len() * core::mem::size_of::<F128>());
+        let mut reservation = self;
+        // The donor already contains valid bytes from its joined producer.
+        // Its receipt certifies initialization, not a particular payload.
+        reservation.release_ready = true;
+        Self { backing: ScratchBytesBacking::Produced { owner, reservation: Box::new(reservation) },
+            fully_initialized: true, release_tag: None, release_ready: false }
+    }
+
+    pub(crate) fn is_preproduced(&self) -> bool {
+        matches!(self.backing, ScratchBytesBacking::Produced { .. })
+    }
+
     /// Take ordinary byte storage from the byte pool.
     pub fn take(n: usize) -> Self {
         Self {
@@ -969,6 +1013,7 @@ impl ScratchBytes {
         match &self.backing {
             ScratchBytesBacking::U8(v) => v.len(),
             ScratchBytesBacking::F128(v) => v.len() * core::mem::size_of::<F128>(),
+            ScratchBytesBacking::Produced { owner, .. } => owner.storage.len() * core::mem::size_of::<F128>(),
         }
     }
 
@@ -985,6 +1030,8 @@ impl ScratchBytes {
         match &mut self.backing {
             ScratchBytesBacking::U8(v) => v.as_mut_ptr(),
             ScratchBytesBacking::F128(v) => v.as_mut_ptr().cast::<u8>(),
+            // Used only for address arithmetic by store-free R2 instances.
+            ScratchBytesBacking::Produced { owner, .. } => owner.storage.as_mut_ptr().cast::<u8>(),
         }
     }
 
@@ -1027,6 +1074,10 @@ impl ScratchBytes {
     pub fn recycle(mut self) {
         let release_tag = self.release_tag.take();
         match self.backing {
+            ScratchBytesBacking::Produced { owner, reservation } => {
+                reservation.recycle();
+                owner.recycle();
+            }
             ScratchBytesBacking::U8(v) => give_u8(v),
             ScratchBytesBacking::F128(v) => {
                 if self.fully_initialized
@@ -1053,6 +1104,9 @@ impl Deref for ScratchBytes {
             "ScratchBytes full-overwrite backing read before initialization"
         );
         match &self.backing {
+            ScratchBytesBacking::Produced { owner, .. } => unsafe {
+                core::slice::from_raw_parts(owner.storage.as_ptr().cast::<u8>(), owner.storage.len() * 16)
+            },
             ScratchBytesBacking::U8(v) => v,
             ScratchBytesBacking::F128(v) => {
                 // SAFETY: F128 consists of two u64s, has no padding, and every
@@ -1076,6 +1130,7 @@ impl DerefMut for ScratchBytes {
             "ScratchBytes full-overwrite backing borrowed before initialization"
         );
         match &mut self.backing {
+            ScratchBytesBacking::Produced { .. } => panic!("preproduced deltas are read-only"),
             ScratchBytesBacking::U8(v) => v,
             ScratchBytesBacking::F128(v) => {
                 // SAFETY: same representation argument as `Deref`; the
@@ -1093,6 +1148,27 @@ impl DerefMut for ScratchBytes {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delta_planes_alternate_receipt_does_not_certify_original_constants() {
+        let _serial = SCRATCH_TEST_LOCK.lock().unwrap();
+        const N: usize = 2048;
+        const ORDINARY: u64 = 0xD317_7E57_0000_0002;
+        const PLANES: u64 = 0xD317_7E57_0000_0003;
+        clear();
+        let v = vec![F128::ONE; N]; let ptr = v.as_ptr();
+        stage_f128_release_token(&v, ORDINARY, vec![ReleaseProbe { byte_off: 0, len: 16, value: 0xff }]);
+        replace_f128_release_token(&v, PLANES, Vec::new());
+        give_f128(v);
+        let ordinary = take_f128_with_token(N, ORDINARY);
+        assert!(!ordinary.1); assert_ne!(ordinary.0.as_ptr(), ptr);
+        let (v, hit, planes) = take_f128_with_alternate_token(N, ORDINARY, PLANES);
+        assert!(hit && planes); assert_eq!(v.as_ptr(), ptr);
+        give_f128(v);
+        let (_, hit, planes) = take_f128_with_alternate_token(N, ORDINARY, PLANES);
+        assert!(!hit && !planes);
+        give_f128(ordinary.0); clear();
+    }
+
     use super::*;
 
     // Every test below mutates the same process-global pools. Serialize them

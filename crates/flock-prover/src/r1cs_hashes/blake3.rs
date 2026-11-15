@@ -221,7 +221,10 @@ impl Blake3IdentityPrefixWitness {
 /// The handle is minted only by the SIMD driver's exact ranked dead-stage
 /// arm (complete shape, all three provenance tokens, live Metal stream),
 /// so every skipped constant chunk of a and b is already in place.
+/// The tagged E/D arm instead writes every retained byte from ordinary local
+/// scratch; it also admits the same complete streamed shape in a service.
 pub(crate) struct DeferredAb<'a> {
+    delta_planes: bool,
     blocks: &'a [Compression],
     spec_init: Option<u64>,
     gen_ilp: bool,
@@ -286,7 +289,19 @@ impl DeferredAb<'_> {
                 let (sa, sb) = (a_scratch.cast::<u32>(), b_scratch.cast::<u32>());
                 let none = std::ptr::null_mut::<u32>();
                 let primed = scratch_primed && self.primed_scratch;
-                if a_scratch.is_null() {
+                if self.delta_planes && !a_scratch.is_null() {
+                    if primed { witgen_simd::delta_planes::build_quad_delta_planes::<true>(input, a, b, sa, sb); }
+                    else { witgen_simd::delta_planes::build_quad_delta_planes::<false>(input, a, b, sa, sb); }
+                } else if self.delta_planes {
+                    // Explicit ordinary-layout fallback when the fused consumer is absent.
+                    let mut local_a = [0u32; Self::UNIT_BYTES / 4];
+                    let mut local_b = [0u32; Self::UNIT_BYTES / 4];
+                    let la = local_a.as_mut_ptr();
+                    let lb = local_b.as_mut_ptr();
+                    witgen_simd::build_quad_split_neon_mem::<false>(input, la, lb, la, lb);
+                    core::ptr::copy_nonoverlapping(la, a, words);
+                    core::ptr::copy_nonoverlapping(lb, b, words);
+                } else if a_scratch.is_null() {
                     witgen_simd::build_quad_split_neon::<false, false, false, false>(
                         input, none, a, b, none, none,
                     );
@@ -2103,6 +2118,10 @@ fn build_block_witness_ab_stream_into(
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod witgen_simd {
+    pub(crate) mod delta_planes {
+        use super::*;
+        include!("blake3/delta_planes.rs");
+    }
     use super::{
         BLAKE3_IV, Compression, G_STRIDE, GS_BASE, K, N_G, OUT_HI_BASE, REC_C0, REC_C1, REC_C2,
         REC_C3, REC_C4, REC_C5, REC_LIN0, REC_LIN1, USEFUL_BITS,
@@ -3307,7 +3326,7 @@ pub(crate) mod witgen_simd {
     /// only output words 8..16 need the stage here.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn dump_dual_copy<const DIRECT: bool, const PRIMED: bool>(
+    unsafe fn dump_dual_copy<const DIRECT: bool, const PRIMED: bool, const PUBLISH: bool>(
         stage: *const V4,
         scratch: *mut u32,
         dst: *mut u32,
@@ -3340,27 +3359,73 @@ pub(crate) mod witgen_simd {
             } else {
                 nt1
             };
-            // The copy loop is one asm block whose loop head is pinned to a
-            // 64-byte boundary (`.p2align 6` before the label; the padding
-            // runs once per block, never inside the loop), so its placement
-            // does not depend on the size of code elsewhere in the binary.
-            // Same loads and stores, in the same ascending order.
-            let n = end.saturating_sub(nt0);
+            if PUBLISH { copy_out_imm(scratch, dst, nt0, end); }
+        }
+    }
+
+    /// Every dump chunk index, ascending, as a literal.
+    macro_rules! for_each_dump_chunk {
+        ($m:ident) => {
+            $m!(0); $m!(1); $m!(2); $m!(3); $m!(4); $m!(5); $m!(6); $m!(7);
+            $m!(8); $m!(9); $m!(10); $m!(11); $m!(12); $m!(13); $m!(14); $m!(15);
+            $m!(16); $m!(17); $m!(18); $m!(19); $m!(20); $m!(21); $m!(22); $m!(23);
+            $m!(24); $m!(25); $m!(26); $m!(27); $m!(28); $m!(29); $m!(30); $m!(31);
+            $m!(32); $m!(33); $m!(34); $m!(35); $m!(36); $m!(37); $m!(38); $m!(39);
+            $m!(40); $m!(41); $m!(42); $m!(43); $m!(44); $m!(45); $m!(46); $m!(47);
+            $m!(48); $m!(49); $m!(50); $m!(51); $m!(52); $m!(53); $m!(54); $m!(55);
+            $m!(56); $m!(57); $m!(58); $m!(59); $m!(60); $m!(61); $m!(62); $m!(63);
+        };
+    }
+
+    /// The non-temporal copy-out of [`dump_dual_copy`]: chunks `g0..g1` of
+    /// each of the four blocks, block by block, ascending, one `ldp` /
+    /// `stnp` pair per chunk.  Both sides of a block are addressed from one
+    /// base 1 KiB into the block, so every chunk offset `32 g - 1024`
+    /// (`-1024..=992`) is an immediate of the pair: no per-chunk address
+    /// arithmetic and no loop control (`g0`, `g1` are constants at every
+    /// call site).
+    #[inline(always)]
+    pub(super) unsafe fn copy_out_imm(scratch: *const u32, dst: *mut u32, g0: usize, g1: usize) {
+        debug_assert!(g0 <= g1 && g1 <= DUMP_CHUNKS);
+        unsafe {
+            for j in 0..4usize {
+                let src = scratch.add(j * U32_PER_BLOCK + 256);
+                let out = dst.add(j * U32_PER_BLOCK + 256);
+                macro_rules! chunk {
+                    ($g:literal) => {
+                        if g0 <= $g && $g < g1 {
+                            core::arch::asm!(
+                                "ldp {a:q}, {b:q}, [{s}, #{o}]",
+                                "stnp {a:q}, {b:q}, [{d}, #{o}]",
+                                s = in(reg) src,
+                                d = in(reg) out,
+                                o = const 32 * $g - 1024,
+                                a = out(vreg) _,
+                                b = out(vreg) _,
+                                options(nostack)
+                            );
+                        }
+                    };
+                }
+                for_each_dump_chunk!(chunk);
+            }
+        }
+    }
+
+    /// The copy-out loop [`copy_out_imm`] replaced (one address pair per
+    /// chunk), kept as the test reference.
+    #[cfg(test)]
+    pub(super) unsafe fn copy_out_loop(scratch: *const u32, dst: *mut u32, g0: usize, g1: usize) {
+        unsafe {
             for j in 0..4usize {
                 let src = scratch.add(j * U32_PER_BLOCK);
                 let out = dst.add(j * U32_PER_BLOCK);
-                if n != 0 {
+                for g in g0..g1 {
                     core::arch::asm!(
-                        ".p2align 6",
-                        "2:",
-                        "ldp {a:q}, {b:q}, [{s}], #32",
+                        "ldp {a:q}, {b:q}, [{s}]",
                         "stnp {a:q}, {b:q}, [{d}]",
-                        "add {d}, {d}, #32",
-                        "subs {n}, {n}, #1",
-                        "b.ne 2b",
-                        s = inout(reg) src.add(8 * nt0) => _,
-                        d = inout(reg) out.add(8 * nt0) => _,
-                        n = inout(reg) n => _,
+                        s = in(reg) src.add(8 * g),
+                        d = in(reg) out.add(8 * g),
                         a = out(vreg) _,
                         b = out(vreg) _,
                         options(nostack)
@@ -3401,9 +3466,9 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false, false>(inputs, z, a, b, sa, sb)
             } else {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false>(inputs, z, a, b, sa, sb)
             }
         }
     }
@@ -3442,7 +3507,7 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3451,7 +3516,7 @@ pub(crate) mod witgen_simd {
                     sb,
                 )
             } else {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3473,7 +3538,7 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false>(
+            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false, false>(
                 inputs, core::ptr::null_mut(), a, b, sa, sb,
             )
         }
@@ -3511,6 +3576,7 @@ pub(crate) mod witgen_simd {
         const ELIDE_B_STAGE_TAIL: bool,
         const PAIR_STAGE_STORES: bool,
         const DIRECT_SCRATCH: bool,
+        const PLANES: bool,
     >(
         inputs: QuadInput<'_>,
         z: *mut u32,
@@ -3873,6 +3939,13 @@ pub(crate) mod witgen_simd {
             if WZ {
                 dump_range_lines_nt(za, z, 0, RANKED_SPARSE_TAIL_CHUNK);
                 dump_ranked_sparse_tail_nt(za, z);
+            } else if PLANES {
+                let (a1, b0, b1) = if PRIMED {
+                    (ELIDE_ZERO_CHUNK, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK)
+                } else { (DUMP_CHUNKS, 0, DUMP_CHUNKS) };
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED, false>(za, sa, a, 0, a1, 0, RANKED_SPARSE_TAIL_CHUNK, true);
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED, false>(bs, sb, b, b0, b1, ELIDE_B_PREFIX_CHUNKS, ELIDE_B_TAIL_CHUNK, false);
+                flock_core::zerocheck::delta_planes::publish(sa.cast(), sb.cast(), a.cast(), b.cast(), 4 * U32_PER_BLOCK * 4);
             } else if SCRATCH && COPY {
                 // Copy drain.  The scratch receives every chunk when it is
                 // cold and only the quad-dependent chunks when it is primed
@@ -3883,8 +3956,8 @@ pub(crate) mod witgen_simd {
                 } else {
                     (DUMP_CHUNKS, 0, DUMP_CHUNKS)
                 };
-                dump_dual_copy::<DIRECT_SCRATCH, PRIMED>(za, sa, a, 0, a1, 0, RANKED_SPARSE_TAIL_CHUNK, true);
-                dump_dual_copy::<DIRECT_SCRATCH, PRIMED>(
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED, true>(za, sa, a, 0, a1, 0, RANKED_SPARSE_TAIL_CHUNK, true);
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED, true>(
                     bs,
                     sb,
                     b,
@@ -3987,7 +4060,14 @@ pub(crate) mod witgen_simd {
         };
         let (mut z, elide_z) = take(ROLE_Z);
         let (mut a, elide_a) = take(ROLE_A);
-        let (mut b, elide_b) = take(ROLE_B);
+        let (mut b, b_initialized, b_was_planes) = if !elide_off && flock_core::zerocheck::delta_planes::enabled() {
+            flock_core::scratch::take_f128_with_alternate_token(total_f128,
+                witgen_scratch_tag(ROLE_B, n_blocks_log),
+                flock_core::zerocheck::delta_planes::b_storage_tag(n_blocks_log))
+        } else {
+            let (v, hit) = take(ROLE_B); (v, hit, false)
+        };
+        let elide_b = b_initialized && !b_was_planes;
         let elide = [elide_z, elide_a, elide_b];
         WITGEN_ELIDE_HITS.store(
             u8::from(elide_z) | (u8::from(elide_a) << 1) | (u8::from(elide_b) << 2),
@@ -4060,7 +4140,15 @@ pub(crate) mod witgen_simd {
         // returned below.  Tied to the ranked dead-stage arm, whose gate
         // (all tokens, NT stores, live stream, deferred stripe, complete
         // shape) is exactly what the split kernels assume.
-        let defer_ab = allow_defer_ab && ranked_dead_stage && defer_ab_enabled();
+        let delta_planes = allow_defer_ab
+            && defer_ab_enabled()
+            && flock_core::zerocheck::delta_planes::enabled()
+            && flock_core::zerocheck::univariate_skip_optimized::zc_ab_producer_fused_active()
+            && ab_copy_drain_enabled() && ab_input_mem_enabled()
+            && select_ranked_dead_stage(true, n_blocks == n_total, n_blocks_log,
+                stream_params, live_stream, defer_ranked_stripe, z_nt, nt,
+                [elide_z, true, true]);
+        let defer_ab = delta_planes || (allow_defer_ab && ranked_dead_stage && defer_ab_enabled());
         debug_assert!(!defer_ab || (stripe_base.is_none() && n_blocks == n_total));
         // One quad through the selected kernel.
         let emit_quad = |input: QuadInput<'_>, z: *mut u32, a: *mut u32, b: *mut u32| {
@@ -4489,6 +4577,7 @@ pub(crate) mod witgen_simd {
         // has produced every quad, which the prover guarantees before it
         // gives them back.
         let deferred = defer_ab.then(|| super::DeferredAb {
+            delta_planes,
             blocks,
             spec_init,
             gen_ilp,
@@ -5352,6 +5441,8 @@ impl Blake3Setup {
                             a_packed_f128.len() * std::mem::size_of::<F128>()
                         );
                         Some(flock_core::zerocheck::univariate_skip_optimized::Round1AbProducer {
+                            delta_planes: deferred.delta_planes,
+                            replay: None,
                             unit_bytes: DeferredAb::UNIT_BYTES,
                             produce: &ab_produce,
                         })
@@ -5364,9 +5455,10 @@ impl Blake3Setup {
                 };
                 if phase_timing {
                     eprintln!(
-                        "[phase-timing] deferred a/b: handle={} producer={}",
+                        "[phase-timing] deferred a/b: handle={} producer={} delta_planes={}",
                         deferred_ab.is_some(),
-                        ab_producer.is_some()
+                        ab_producer.is_some(),
+                        ab_producer.is_some_and(|p| p.delta_planes)
                     );
                 }
                 // Witness work is all handed out; the hot pool spin (ready→seed
@@ -6852,6 +6944,47 @@ mod tests {
         check_split_quad_memory_form(false);
     }
 
+    /// The immediate-offset copy-out writes exactly the words the per-chunk
+    /// addressed loop wrote, for the a and b ranges of the copy drain and
+    /// edge ranges, and nothing else; zero, one and all-ones words included.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn copy_out_imm_matches_addressed_loop() {
+        const BLK: usize = K / 32;
+        const GUARD: usize = 16;
+        const W: usize = 4 * BLK + 2 * GUARD;
+        let mut rng = Rng::new(0x5eed_c0f7_0002);
+        let ranges = [(0, 61), (4, 59), (0, 64), (0, 0), (5, 6), (31, 33), (63, 64), (0, 32)];
+        for (round, &(g0, g1)) in ranges.iter().enumerate() {
+            let scratch: Vec<u32> = (0..4 * BLK)
+                .map(|i| match (i + round) % 9 {
+                    0 => 0,
+                    1 => 1,
+                    2 => u32::MAX,
+                    _ => rng.next_u32(),
+                })
+                .collect();
+            let fill = rng.next_u32();
+            let mut want = vec![fill; W];
+            let mut got = vec![fill; W];
+            unsafe {
+                witgen_simd::copy_out_loop(scratch.as_ptr(), want.as_mut_ptr().add(GUARD), g0, g1);
+                witgen_simd::copy_out_imm(scratch.as_ptr(), got.as_mut_ptr().add(GUARD), g0, g1);
+            }
+            assert_eq!(got, want, "chunks {g0}..{g1}");
+            for j in 0..4 {
+                for w in 0..BLK {
+                    let x = got[GUARD + j * BLK + w];
+                    if (8 * g0..8 * g1).contains(&w) {
+                        assert_eq!(x, scratch[j * BLK + w]);
+                    } else {
+                        assert_eq!(x, fill);
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn b_stage_tail_matches_incumbent_and_preserves_guards() {
@@ -6949,6 +7082,7 @@ mod tests {
             let mut scratch = vec![0x3333_3333u32; 2 * U32S];
             let mut scratches = Vec::new();
             let handle = super::DeferredAb {
+            delta_planes: false,
                 blocks: &blocks,
                 spec_init,
                 gen_ilp: true,
@@ -6993,6 +7127,7 @@ mod tests {
             let mut scratch = vec![0x3333_3333u32; 2 * U32S];
             let mut scratches = Vec::new();
             let handle = super::DeferredAb {
+            delta_planes: false,
                 blocks: &blocks,
                 spec_init: Some(init),
                 gen_ilp: true,
@@ -7975,3 +8110,7 @@ mod chain_e2e_tests {
         );
     }
 }
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[path = "blake3/delta_planes_tests.rs"]
+mod delta_planes_tests;

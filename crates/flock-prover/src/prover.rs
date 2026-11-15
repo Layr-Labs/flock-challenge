@@ -2705,6 +2705,24 @@ fn commit_with_round1_ab_precompute(
         Option<zerocheck::univariate_skip_optimized::ExactTuneBacking>,
     > = std::sync::Mutex::new(None);
     let precompute_ab_replay = || {
+        if let Some(producer) = ab_producer.filter(|p| p.delta_planes) {
+            let producer = zerocheck::univariate_skip_optimized::Round1AbProducer {
+                produce: producer.replay.unwrap_or(producer.produce), ..producer
+            };
+            // Replay includes the same local production and dense publication.
+            // Retained input readers have joined before this callback starts.
+            let backing = replay_backing.lock().unwrap().take().unwrap_or_else(||
+                zerocheck::univariate_skip_optimized::ExactTuneBacking::zeroed(pcs_params.m));
+            let backing = unsafe {
+                zerocheck::univariate_skip_optimized::precompute_round1_ab_produced_for_exact_tune_into(
+                    a_packed, b_packed, pcs_params.m, k_skip, inv_table, padding,
+                    identity_prefix_contract, producer, backing)
+            };
+            if std::env::var_os("FLOCK_NO_TUNE_REPLAY_BACKING").is_none() {
+                *replay_backing.lock().unwrap() = Some(backing);
+            }
+            return;
+        }
         let reuse = replay_backing.lock().unwrap().take();
         if let Some(b) = reuse {
             let b = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune_into(
@@ -2888,7 +2906,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     pcs_params: &PcsParams,
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
-    b_packed_f128: Vec<F128>,
+    mut b_packed_f128: Vec<F128>,
     z_packed_lincheck: LincheckStripeInput,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
@@ -3113,6 +3131,8 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     tail_fill_hook,
                     None,
                     Some(zerocheck::univariate_skip_optimized::Round1AbProducer {
+                        delta_planes: base.delta_planes,
+                        replay: base.replay.or(Some(base.produce)),
                         unit_bytes: base.unit_bytes,
                         produce: &produce,
                     }),
@@ -3205,7 +3225,17 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             (pre, stripe)
         }
     };
-    let (commitment, prover_data, ab_inner) = pre_zerocheck;
+    let (commitment, prover_data, mut ab_inner) = pre_zerocheck;
+    let b_addr = b_packed_f128.as_ptr() as usize;
+    let b_bytes = b_packed_f128.len() * core::mem::size_of::<F128>();
+    let delta_return = if ab_inner.uses_delta_planes() {
+        // Complete producer join precedes this representation receipt.
+        flock_core::scratch::replace_f128_release_token(&b_packed_f128,
+            zerocheck::delta_planes::b_storage_tag(r1cs.m - 14), Vec::new());
+        let (owner, returned) = zerocheck::delta_planes::Owner::new(core::mem::take(&mut b_packed_f128));
+        ab_inner.attach_delta_owner(owner);
+        Some(returned)
+    } else { None };
     bind_statement(challenger, r1cs, &commitment);
     flock_core::tmark::mark("zc start");
     // Lincheck GPU wake (see `flock_core::gpu_commit::ENV_NO_LC_GPU_WAKE`):
@@ -3233,10 +3263,13 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 a_packed_f128.len() * core::mem::size_of::<F128>(),
             )
         };
+        // The owner is either held here or moved into ab_inner and compact
+        // storage. Neither move changes its allocation; all readers join
+        // before compact recycling returns that owner to delta_return.
         let b_packed: &[u8] = unsafe {
             std::slice::from_raw_parts(
-                b_packed_f128.as_ptr() as *const u8,
-                b_packed_f128.len() * core::mem::size_of::<F128>(),
+                b_addr as *const u8,
+                b_bytes,
             )
         };
         let c_packed: &[u8] = unsafe {
@@ -3273,6 +3306,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
+    if let Some(returned) = delta_return { b_packed_f128 = returned.take(); }
     flock_core::scratch::give_f128(a_packed_f128);
     flock_core::scratch::give_f128(b_packed_f128);
 

@@ -21,6 +21,7 @@ use crate::ntt::InvNttTableByteSingleGf8;
 use serde::{Deserialize, Serialize};
 
 pub mod multilinear;
+pub mod delta_planes;
 pub mod univariate_skip;
 pub mod univariate_skip_deg4;
 pub mod univariate_skip_deg4_optimized;
@@ -498,6 +499,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     c_lincheck: Option<&[u8]>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
+    let delta_planes = precomputed_ab.as_ref().is_some_and(|ab| ab.uses_delta_planes());
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
     assert!(
@@ -587,7 +589,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 if r2_stage_wanted {
                     crate::zerocheck::multilinear::stage_round2_gpu_window_from_r1_challenges(
-                        a_packed, b_packed, m, k_skip, &r, padding,
+                        a_packed, b_packed, m, k_skip, &r, padding, delta_planes,
                     );
                 }
             };
@@ -1004,20 +1006,16 @@ fn prove_packed_padded_inner<C: Challenger>(
         if use_cascade {
             // Dead-tail-packed K output only when the tri pass, the one
             // reader of that layout, comes next.
-            // `k_prefix`: the K pass GPU prefix arm's outputs, which the tri
-            // pass below reads in place of the leading entries.
-            let (m4_1, m4_inf, la5, packed, bpacked, k_prefix) =
-                multilinear::fold2_compact_and_round45_into_packed_gpu(
-                    &compact_mlv,
-                    &fold_table,
-                    mlv_rhos[0],
-                    mlv_rhos[1],
-                    &r_next4,
-                    &mut a_out,
-                    &mut b_out,
-                    tri_steps > 0 && multilinear::zc_k_dead_pack_enabled(),
-                    true,
-                );
+            let (m4_1, m4_inf, la5, packed, bpacked) = multilinear::fold2_compact_and_round45_into_packed(
+                &compact_mlv,
+                &fold_table,
+                mlv_rhos[0],
+                mlv_rhos[1],
+                &r_next4,
+                &mut a_out,
+                &mut b_out,
+                tri_steps > 0 && multilinear::zc_k_dead_pack_enabled(),
+            );
             if tail_round_timing {
                 eprintln!(
                     "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}, tail_compact={}, head_compact={}, packed={packed}, bpacked={bpacked}): {:.2} ms",
@@ -1054,15 +1052,11 @@ fn prove_packed_padded_inner<C: Challenger>(
             if tri_steps > 0 {
                 let main = if packed { n_groups / 256 * 244 } else { n_groups };
                 let main_b = if bpacked { n_groups / 64 * 56 } else { main };
-                // SAFETY: the prefix buffers are rewritten only by the next K
-                // pass.
-                let prefix = k_prefix.as_ref().map(|p| unsafe { p.slices() });
-                let (m6_1, m6_inf, la7, la8) = multilinear::fold_cascade_t_into_packed_prefix(
+                let (m6_1, m6_inf, la7, la8) = multilinear::fold_cascade_t_into_packed(
                     &a_out[..main],
                     &b_out[..main_b],
                     packed,
                     bpacked,
-                    prefix,
                     &mut a2_out,
                     &mut b2_out,
                     &mlv_rhos[2..4],

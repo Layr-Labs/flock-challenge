@@ -1496,7 +1496,7 @@ pub(crate) unsafe fn fold_round2_chunk_neon_unchecked_8(
 /// `a1 · b1` degenerates to `a1`. Value-forced, therefore bit-exact.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8<const PLANES: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -1543,7 +1543,9 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
         for x_lo in 0..lo_size {
             if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
                 store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                store_delta_pair_gpr(deltas.add(x_lo * 16), 0, 0, 0, 0);
+                if !PLANES {
+                    store_delta_pair_gpr(deltas.add(x_lo * 16), 0, 0, 0, 0);
+                }
                 continue;
             }
 
@@ -1557,13 +1559,17 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
             let a1_code = u64::from_le(core::ptr::read_unaligned(a1_ptr.cast::<u64>()));
             let b0_code = u64::from_le(core::ptr::read_unaligned(b0_ptr.cast::<u64>()));
             let b1_code = u64::from_le(core::ptr::read_unaligned(b1_ptr.cast::<u64>()));
+        let (a0_code, a1_code, b0_code, b1_code) =
+            crate::zerocheck::delta_planes::decode::<PLANES>(a0_code, a1_code, b0_code, b1_code);
 
             if degen && (b0_code & b1_code) == u64::MAX {
                 // b ≡ 1 pair: b0 = b1 = fold(all-ones) = 1. Skip the 16
                 // b-table lookups; `b0 + b1 = 0` zeroes the G(∞) term.
                 let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
                 store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-                store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, 0, 0);
+                if !PLANES {
+                    store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, 0, 0);
+                }
 
                 let g1 = if ones_is_one { a1 } else { mul_q(a1, b_ones) };
                 let eq_l = vld1q_u64(eq_lo.add(x_lo).cast::<u64>());
@@ -1575,7 +1581,9 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
                 fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
 
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-            store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+            if !PLANES {
+                store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+            }
 
             let g1 = mul_q(a1, b1);
             let g_inf = mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1));
@@ -1601,7 +1609,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_unchecked_8(
 /// `fold(all-ones) == fold(b0_code)` when `b0_code` is all-ones, and its
 /// delta lanes are `[a0^a1, 0] == [a0^a1, b0^b1]`).
 #[cfg(target_arch = "aarch64")]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8<const PLANES: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -1632,7 +1640,9 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
         for x_lo in 0..lo_size {
             if ((pair_idx_base + x_lo) & pair_in_block_mask) >= useful_pairs_inclusive {
                 store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                store_delta_pair_gpr(deltas.add(x_lo * 16), 0, 0, 0, 0);
+                if !PLANES {
+                    store_delta_pair_gpr(deltas.add(x_lo * 16), 0, 0, 0, 0);
+                }
                 continue;
             }
             let row0 = 2 * x_lo;
@@ -1649,9 +1659,13 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
             let b1_code = u64::from_le(core::ptr::read_unaligned(
                 b_packed.add(row1 * 8).cast::<u64>(),
             ));
+        let (a0_code, a1_code, b0_code, b1_code) =
+            crate::zerocheck::delta_planes::decode::<PLANES>(a0_code, a1_code, b0_code, b1_code);
             let (a0, b0) = fold_two_row_codes_q(table_data, a0_code, b0_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-            store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+            if !PLANES {
+                store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+            }
         }
     }
 }
@@ -1668,7 +1682,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 /// Returns the four folded rows plus whether the b≡1 shortcut was taken.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store(
+unsafe fn r2_pair_fold_and_store<const PLANES: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -1708,7 +1722,9 @@ unsafe fn r2_pair_fold_and_store(
             // zeros and never reads their slots, so the zero stores are dead.
             if !skip_dead {
                 store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                if !PLANES {
+                    vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                }
             }
             return (zero, zero, zero, zero, false);
         }
@@ -1727,18 +1743,24 @@ unsafe fn r2_pair_fold_and_store(
         let b1_code = u64::from_le(core::ptr::read_unaligned(
             b_packed.add(row1 * 8).cast::<u64>(),
         ));
+        let (a0_code, a1_code, b0_code, b1_code) =
+            crate::zerocheck::delta_planes::decode::<PLANES>(a0_code, a1_code, b0_code, b1_code);
 
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            store_delta_a_only_gpr(deltas.add(x_lo * 16), a0_code, a1_code);
+            if !PLANES {
+                store_delta_a_only_gpr(deltas.add(x_lo * 16), a0_code, a1_code);
+            }
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+        if !PLANES {
+            store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+        }
         (a0, a1, b0, b1, false)
     }
 }
@@ -1749,7 +1771,7 @@ unsafe fn r2_pair_fold_and_store(
 /// and values; the stores take the offset as an immediate.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store_off<const CODE: usize, const ANC: usize>(
+unsafe fn r2_pair_fold_and_store_off<const CODE: usize, const ANC: usize, const PLANES: bool>(
     table_data: *const u8,
     a_row: *const u8,
     b_row: *const u8,
@@ -1769,18 +1791,24 @@ unsafe fn r2_pair_fold_and_store_off<const CODE: usize, const ANC: usize>(
         let a1_code = u64::from_le(core::ptr::read_unaligned(a_row.add(CODE + 8).cast::<u64>()));
         let b0_code = u64::from_le(core::ptr::read_unaligned(b_row.add(CODE).cast::<u64>()));
         let b1_code = u64::from_le(core::ptr::read_unaligned(b_row.add(CODE + 8).cast::<u64>()));
+        let (a0_code, a1_code, b0_code, b1_code) =
+            crate::zerocheck::delta_planes::decode::<PLANES>(a0_code, a1_code, b0_code, b1_code);
 
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
             store_anchor_pair_nt_off::<ANC>(anchors, a0, b_ones);
-            store_delta_a_only_gpr_off::<CODE>(deltas, a0_code, a1_code);
+            if !PLANES {
+                store_delta_a_only_gpr_off::<CODE>(deltas, a0_code, a1_code);
+            }
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt_off::<ANC>(anchors, a0, b0);
-        store_delta_pair_gpr_off::<CODE>(deltas, a0_code, a1_code, b0_code, b1_code);
+        if !PLANES {
+            store_delta_pair_gpr_off::<CODE>(deltas, a0_code, a1_code, b0_code, b1_code);
+        }
         (a0, a1, b0, b1, false)
     }
 }
@@ -1901,6 +1929,7 @@ pub(crate) fn round2_eq_prep(eq_lo: &[F128]) -> Vec<F128> {
 pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
     const FULL: bool,
     const ODD_ON_GPU: bool,
+    const PLANES: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -1922,7 +1951,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 ) {
     unsafe {
         if FULL && r2_asm_offsets_enabled() && !eq_prep.is_null() {
-            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, true>(
+            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, true, PLANES>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -1942,7 +1971,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 out,
             )
         } else {
-            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, false>(
+            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, false, PLANES>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -1976,6 +2005,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
     const FULL: bool,
     const ODD_ON_GPU: bool,
     const ASM_OFF: bool,
+    const PLANES: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -2071,9 +2101,13 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                     let x_lo0 = 2 * $u;
                     let x_lo1 = x_lo0 + 1;
                     store_anchor_pair_nt(anchors.add(2 * x_lo0), zero, zero);
-                    vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                    if !PLANES {
+                        vst1q_u64(deltas.add(x_lo0 * 16).cast::<u64>(), zero);
+                    }
                     store_anchor_pair_nt(anchors.add(2 * x_lo1), zero, zero);
-                    vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                    if !PLANES {
+                        vst1q_u64(deltas.add(x_lo1 * 16).cast::<u64>(), zero);
+                    }
                 }
             }};
         }
@@ -2085,11 +2119,11 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let rows0 = r2_pair_fold_and_store(
+                let rows0 = r2_pair_fold_and_store::<PLANES>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
                     skip_dead,
                 );
-                let rows1 = r2_pair_fold_and_store(
+                let rows1 = r2_pair_fold_and_store::<PLANES>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
                     skip_dead,
                 );
@@ -2259,10 +2293,10 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                 let first = block * 64;
                 if head {
                     anchors = anchors0.wrapping_sub(HC_ANCHOR_GAP * block + HC_ANCHOR_SHIFT);
-                    deltas = deltas0.wrapping_sub(HC_DELTA_GAP * block + HC_DELTA_SHIFT);
+                    if !PLANES { deltas = deltas0.wrapping_sub(HC_DELTA_GAP * block + HC_DELTA_SHIFT); }
                 } else if tail_compact {
                     anchors = anchors0.wrapping_sub(TC_ANCHOR_GAP * block);
-                    deltas = deltas0.wrapping_sub(TC_DELTA_GAP * block);
+                    if !PLANES { deltas = deltas0.wrapping_sub(TC_DELTA_GAP * block); }
                 }
                 if ASM_OFF {
                     // One pointer per stream at group `first`, stepped once per
@@ -2281,7 +2315,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                     for t in 0..30 {
                         let i0 = 2 * t;
                         let (rows0, rows1) = if head && i0 < HC_HEAD_PAIRS / 2 {
-                            let (r0, r1, ones) = r2_head_group_fold_and_store(
+                            let (r0, r1, ones) = r2_head_group_fold_and_store::<PLANES>(
                                 table_data,
                                 pa,
                                 pb,
@@ -2294,10 +2328,10 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                             (r0, r1)
                         } else {
                             (
-                                r2_pair_fold_and_store_off::<0, 0>(
+                                r2_pair_fold_and_store_off::<0, 0, PLANES>(
                                     table_data, pa, pb, pn, pd, degen, b_ones,
                                 ),
-                                r2_pair_fold_and_store_off::<16, 32>(
+                                r2_pair_fold_and_store_off::<16, 32, PLANES>(
                                     table_data, pa, pb, pn, pd, degen, b_ones,
                                 ),
                             )
@@ -2307,7 +2341,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                         process_group!(prepared rows0, rows1, p0, p1);
                         let i1 = i0 + 1;
                         let (rows0, rows1) = if head && i1 < HC_HEAD_PAIRS / 2 {
-                            let (r0, r1, ones) = r2_head_group_fold_and_store(
+                            let (r0, r1, ones) = r2_head_group_fold_and_store::<PLANES>(
                                 table_data,
                                 pa.wrapping_add(32),
                                 pb.wrapping_add(32),
@@ -2320,10 +2354,10 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                             (r0, r1)
                         } else {
                             (
-                                r2_pair_fold_and_store_off::<32, 64>(
+                                r2_pair_fold_and_store_off::<32, 64, PLANES>(
                                     table_data, pa, pb, pn, pd, degen, b_ones,
                                 ),
-                                r2_pair_fold_and_store_off::<48, 96>(
+                                r2_pair_fold_and_store_off::<48, 96, PLANES>(
                                     table_data, pa, pb, pn, pd, degen, b_ones,
                                 ),
                             )
@@ -2411,7 +2445,7 @@ fn r2_fixed_pads_enabled() -> bool {
 /// later group is unchanged. Outputs are bit-identical for both values.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "aes")]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SHIFT: bool>(
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SHIFT: bool, const PLANES: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -2430,7 +2464,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
 ) {
     unsafe {
         if r2_gpr_delta_enabled() {
-            fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, true>(
+            fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, true, PLANES>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2448,7 +2482,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_horner_8<const SKIP_FIRST_SH
                 out,
             )
         } else {
-            fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, false>(
+            fold_round2_compact_chunk_neon_horner_8_impl::<SKIP_FIRST_SHIFT, false, PLANES>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -2685,6 +2719,7 @@ unsafe fn store_anchor_pair_nt_off<const OFF: usize>(
 unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
     const SKIP_FIRST_SHIFT: bool,
     const GPR_DELTA: bool,
+    const PLANES: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -2902,7 +2937,7 @@ unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
             let (anchors, deltas) = if tail_compact {
                 (
                     anchors.wrapping_sub(TC_ANCHOR_GAP * (first / 64)),
-                    deltas.wrapping_sub(TC_DELTA_GAP * (first / 64)),
+                    if PLANES { deltas } else { deltas.wrapping_sub(TC_DELTA_GAP * (first / 64)) },
                 )
             } else {
                 (anchors, deltas)
@@ -2925,9 +2960,13 @@ unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
                     for b in (b_end..16).rev() {
                         let x_lo = 2 * (first + 2 * b + t);
                         store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                        if !PLANES {
+                            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                        }
                         store_anchor_pair_nt(anchors.add(2 * (x_lo + 1)), zero, zero);
-                        vst1q_u64(deltas.add((x_lo + 1) * 16).cast::<u64>(), zero);
+                        if !PLANES {
+                            vst1q_u64(deltas.add((x_lo + 1) * 16).cast::<u64>(), zero);
+                        }
                     }
                 }
                 // One group at Horner position `$b`. `$shift` is false only
@@ -2951,7 +2990,9 @@ unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
                                 if pad {
                                     if !skip_dead {
                                         store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                                        if !PLANES {
+                                            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                                        }
                                     }
                                     return (zero, zero, 0u64, 0u64, false);
                                 }
@@ -2969,6 +3010,7 @@ unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
                                         u64::from_le(core::ptr::read_unaligned(b_row.add(1))),
                                     )
                                 };
+                                let (a_even, a_odd, b_even, b_odd) = crate::zerocheck::delta_planes::decode::<PLANES>(a_even, a_odd, b_even, b_odd);
                                 let deg = degen && (b_even & b_odd) == u64::MAX;
                                 let (a, b) = if deg {
                                     (fold_row_code_q(table_data, a_even), b_ones)
@@ -2977,19 +3019,21 @@ unsafe fn fold_round2_compact_chunk_neon_horner_8_impl<
                                 };
                                 store_anchor_pair_nt(anchors.add(2 * x_lo), a, b);
                                 if GPR_DELTA {
-                                    store_delta_pair_gpr(
+                                    if !PLANES { store_delta_pair_gpr(
                                         deltas.add(x_lo * 16),
                                         a_even,
                                         a_odd,
                                         b_even,
                                         b_odd,
-                                    );
+                                    ); }
                                 } else {
                                     let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
                                         a_even ^ a_odd,
                                         b_even ^ b_odd,
                                     ]);
-                                    vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+                                    if !PLANES {
+                                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+                                    }
                                 }
                                 (a, b, a_odd, b_odd, deg)
                             };
@@ -3166,7 +3210,7 @@ fn r2_ranked_invariants_enabled() -> bool {
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8<const PLANES: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -3186,7 +3230,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
     unsafe {
         match (r2_gpr_delta_enabled(), r2_fixed_pads_enabled()) {
             (true, true) if r2_asm_offsets_enabled() && r2_ranked_invariants_enabled() => {
-                fold_round2_compact_chunk_neon_prescaled_8_ranked_inv(
+                fold_round2_compact_chunk_neon_prescaled_8_ranked_inv::<PLANES>(
                     table_data,
                     a_packed,
                     b_packed,
@@ -3205,7 +3249,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 )
             }
             (true, true) if r2_asm_offsets_enabled() => {
-                fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false>(
+                fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false, PLANES>(
                     table_data,
                     a_packed,
                     b_packed,
@@ -3223,7 +3267,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                     out,
                 )
             }
-            (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false>(
+            (true, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false, PLANES>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -3240,7 +3284,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 head_fail,
                 out,
             ),
-            (true, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false, false>(
+            (true, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false, false, PLANES>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -3257,7 +3301,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 head_fail,
                 out,
             ),
-            (false, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false, false>(
+            (false, true) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false, false, PLANES>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -3274,7 +3318,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
                 head_fail,
                 out,
             ),
-            (false, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false, false>(
+            (false, false) => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false, false, PLANES>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -3301,7 +3345,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_prescaled_8(
 #[target_feature(enable = "aes")]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_round2_compact_chunk_neon_prescaled_8_ranked_inv(
+unsafe fn fold_round2_compact_chunk_neon_prescaled_8_ranked_inv<const PLANES: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -3319,7 +3363,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_ranked_inv(
     out: *mut F128,
 ) {
     unsafe {
-        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true>(
+        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true, PLANES>(
             table_data,
             a_packed,
             b_packed,
@@ -3347,6 +3391,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
     const FIXED_PADS: bool,
     const ASM_OFF: bool,
     const RANKED_INV: bool,
+    const PLANES: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -3430,12 +3475,12 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
             let (anchors, deltas) = if head {
                 (
                     anchors.wrapping_sub(HC_ANCHOR_GAP * (first / 64) + HC_ANCHOR_SHIFT),
-                    deltas.wrapping_sub(HC_DELTA_GAP * (first / 64) + HC_DELTA_SHIFT),
+                    if PLANES { deltas } else { deltas.wrapping_sub(HC_DELTA_GAP * (first / 64) + HC_DELTA_SHIFT) },
                 )
             } else if tail_compact {
                 (
                     anchors.wrapping_sub(TC_ANCHOR_GAP * (first / 64)),
-                    deltas.wrapping_sub(TC_DELTA_GAP * (first / 64)),
+                    if PLANES { deltas } else { deltas.wrapping_sub(TC_DELTA_GAP * (first / 64)) },
                 )
             } else {
                 (anchors, deltas)
@@ -3455,9 +3500,13 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                     for pos in (b_end..16).rev() {
                         let x_lo = 2 * (first + 2 * pos + t);
                         store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                        if !PLANES {
+                            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                        }
                         store_anchor_pair_nt(anchors.add(2 * (x_lo + 1)), zero, zero);
-                        vst1q_u64(deltas.add((x_lo + 1) * 16).cast::<u64>(), zero);
+                        if !PLANES {
+                            vst1q_u64(deltas.add((x_lo + 1) * 16).cast::<u64>(), zero);
+                        }
                     }
                 }
                 let mut xb = vdupq_n_u64(1u64 << (b_end - 1));
@@ -3478,7 +3527,9 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 if pad {
                                     if !skip_dead {
                                         store_anchor_pair_nt(anchors.add(2 * x_lo), zero, zero);
-                                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                                        if !PLANES {
+                                            vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), zero);
+                                        }
                                     }
                                     return (zero, zero, 0u64, 0u64, false);
                                 }
@@ -3496,6 +3547,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                         u64::from_le(core::ptr::read_unaligned(b_row.add(1))),
                                     )
                                 };
+                                let (a_even, a_odd, b_even, b_odd) = crate::zerocheck::delta_planes::decode::<PLANES>(a_even, a_odd, b_even, b_odd);
                                 let deg = degen && (b_even & b_odd) == u64::MAX;
                                 let (a, b) = if deg {
                                     (fold_row_code_q(table_data, a_even), b_ones)
@@ -3504,19 +3556,21 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                 };
                                 store_anchor_pair_nt(anchors.add(2 * x_lo), a, b);
                                 if GPR_DELTA {
-                                    store_delta_pair_gpr(
+                                    if !PLANES { store_delta_pair_gpr(
                                         deltas.add(x_lo * 16),
                                         a_even,
                                         a_odd,
                                         b_even,
                                         b_odd,
-                                    );
+                                    ); }
                                 } else {
                                     let delta_pair = core::mem::transmute::<[u64; 2], uint64x2_t>([
                                         a_even ^ a_odd,
                                         b_even ^ b_odd,
                                     ]);
-                                    vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+                                    if !PLANES {
+                                        vst1q_u64(deltas.add(x_lo * 16).cast::<u64>(), delta_pair);
+                                    }
                                 }
                                 (a, b, a_odd, b_odd, deg)
                             };
@@ -3586,6 +3640,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                             ($code:literal, $anc:literal, $degen:expr) => {{
                                 let (a_even, a_odd) = load_code_pair_gpr_off::<$code>(pa);
                                 let (b_even, b_odd) = load_code_pair_gpr_off::<$code>(pb);
+                                let (a_even, a_odd, b_even, b_odd) = crate::zerocheck::delta_planes::decode::<PLANES>(a_even, a_odd, b_even, b_odd);
                                 let deg = $degen && (b_even & b_odd) == u64::MAX;
                                 let (a, b) = if deg {
                                     (fold_row_code_q(table_data, a_even), b_ones)
@@ -3593,7 +3648,9 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                     fold_two_row_codes_q(table_data, a_even, b_even)
                                 };
                                 store_anchor_pair_nt_off::<$anc>(pn, a, b);
-                                store_delta_pair_gpr_off::<$code>(pd, a_even, a_odd, b_even, b_odd);
+                                if !PLANES {
+                                    store_delta_pair_gpr_off::<$code>(pd, a_even, a_odd, b_even, b_odd);
+                                }
                                 (a, b, a_odd, b_odd, deg)
                             }};
                         }
@@ -3641,6 +3698,7 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                                 let a_odd = u64::from_le(core::ptr::read_unaligned(pa8.add(code + 8).cast::<u64>()));
                                                 let b_even = u64::from_le(core::ptr::read_unaligned(pb8.add(code).cast::<u64>()));
                                                 let b_odd = u64::from_le(core::ptr::read_unaligned(pb8.add(code + 8).cast::<u64>()));
+                                                let (a_even, a_odd, b_even, b_odd) = crate::zerocheck::delta_planes::decode::<PLANES>(a_even, a_odd, b_even, b_odd);
                                                 let ones = (b_even & b_odd) == u64::MAX;
                                                 let deg = $degen && ones;
                                                 let (a, b) = if deg {
@@ -3657,13 +3715,13 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_impl<
                                                 r0.0,
                                                 r1.0,
                                             );
-                                            store_delta_pair_gpr(
+                                            if !PLANES { store_delta_pair_gpr(
                                                 deltas0.add(HC_DELTA_BYTES_PER_BLOCK * (first / 64) + 16 * u_in),
                                                 a_even0,
                                                 r0.2,
                                                 a_even1,
                                                 r1.2,
-                                            );
+                                            ); }
                                             head_ok &= ones0 & ones1;
                                             (r0, r1)
                                         } else {
@@ -4814,6 +4872,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     tail_compact: bool,
     head_compact: bool,
     head_b: F128,
+    // Producer-owned deltas retain their dense stride even with compact anchors.
+    dense_deltas: bool,
 ) -> bool {
     const { assert!(DEAD_TAIL || !PACK) };
     use core::arch::aarch64::*;
@@ -4878,7 +4938,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     // Head lane `g % 64` (pairs `2 (g % 64)`, `+ 1`): a only.
                     let gi = g & 63;
                     let hp = head_a.add(2 * gi).cast::<u64>();
-                    let hd = head_d.add(16 * gi);
+                    let hd = if dense_deltas { deltas0.add(32 * g) } else { head_d.add(16 * gi) };
+                    let delta_step = if dense_deltas { 16 } else { 8 };
                     (
                         vld1q_u64(hp),
                         head_b_q,
@@ -4886,7 +4947,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                         head_b_q,
                         u64::from_le(core::ptr::read_unaligned(hd.cast::<u64>())),
                         0u64,
-                        u64::from_le(core::ptr::read_unaligned(hd.add(8).cast::<u64>())),
+                        u64::from_le(core::ptr::read_unaligned(hd.add(delta_step).cast::<u64>())),
                         0u64,
                     )
                 } else {
@@ -5029,12 +5090,12 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 }
                 if head_compact {
                     anchors = anchors0.wrapping_sub(HC_ANCHOR_GAP * blk + HC_ANCHOR_SHIFT);
-                    deltas = deltas0.wrapping_sub(HC_DELTA_GAP * blk + HC_DELTA_SHIFT);
+                    if !dense_deltas { deltas = deltas0.wrapping_sub(HC_DELTA_GAP * blk + HC_DELTA_SHIFT); }
                     head_a = anchors0.add(HC_ANCHORS_PER_BLOCK * blk);
                     head_d = deltas0.add(HC_DELTA_BYTES_PER_BLOCK * blk);
                 } else if tail_compact {
                     anchors = anchors0.wrapping_sub(TC_ANCHOR_GAP * blk);
-                    deltas = deltas0.wrapping_sub(TC_DELTA_GAP * blk);
+                    if !dense_deltas { deltas = deltas0.wrapping_sub(TC_DELTA_GAP * blk); }
                 }
                 if allfused {
                     // Two groups per trip (seven pairs and one more): the
@@ -5187,7 +5248,7 @@ pub(crate) fn r2_head_compact_supported() -> bool {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::type_complexity)]
-unsafe fn r2_head_group_fold_and_store(
+unsafe fn r2_head_group_fold_and_store<const PLANES: bool>(
     table_data: *const u8,
     a_row: *const u8,
     b_row: *const u8,
@@ -5218,6 +5279,7 @@ unsafe fn r2_head_group_fold_and_store(
             let a1_code = u64::from_le(core::ptr::read_unaligned(a_row.add(code + 8).cast::<u64>()));
             let b0_code = u64::from_le(core::ptr::read_unaligned(b_row.add(code).cast::<u64>()));
             let b1_code = u64::from_le(core::ptr::read_unaligned(b_row.add(code + 8).cast::<u64>()));
+            let (a0_code, a1_code, b0_code, b1_code) = crate::zerocheck::delta_planes::decode::<PLANES>(a0_code, a1_code, b0_code, b1_code);
             let ones = (b0_code & b1_code) == u64::MAX;
             let rows = if degen && ones {
                 let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
@@ -5238,7 +5300,7 @@ unsafe fn r2_head_group_fold_and_store(
             b = in(vreg) r1.0,
             options(nostack, preserves_flags),
         );
-        store_delta_pair_gpr(head_d, a00, a01, a10, a11);
+        if !PLANES { store_delta_pair_gpr(head_d, a00, a01, a10, a11); }
         (r0, r1, ones0 & ones1)
     }
 }
@@ -7325,6 +7387,7 @@ mod tri_fused_fold_probe {
 
 #[cfg(all(test, target_arch = "aarch64", target_feature = "aes"))]
 mod tests {
+    mod delta_planes_tests { use super::*; include!("delta_planes_tests.rs"); }
     use super::*;
     use core::arch::aarch64::uint64x2_t;
 
@@ -7892,7 +7955,7 @@ mod tests {
                 for c in 0..R2_CHUNKS {
                     let mut out = [F128::ZERO; 8];
                     unsafe {
-                        fold_round2_compact_chunk_neon_horner_8::<true>(
+                        fold_round2_compact_chunk_neon_horner_8::<true, false>(
                             table.data.as_ptr().cast::<u8>(),
                             a.as_ptr().add(16 * LO * c),
                             b.as_ptr().add(16 * LO * c),
@@ -8075,7 +8138,7 @@ mod tests {
                             let mut out = [poison; 8];
                             unsafe {
                                 if horner {
-                                    fold_round2_compact_chunk_neon_horner_8::<true>(
+                                    fold_round2_compact_chunk_neon_horner_8::<true, false>(
                                         table.data.as_ptr().cast::<u8>(),
                                         a_packed.as_ptr(),
                                         b_packed.as_ptr(),
@@ -8093,7 +8156,7 @@ mod tests {
                                         out.as_mut_ptr(),
                                     );
                                 } else {
-                                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                    fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
                                         table.data.as_ptr().cast::<u8>(),
                                         a_packed.as_ptr(),
                                         b_packed.as_ptr(),
@@ -8174,10 +8237,10 @@ mod tests {
                             let mut out = [poison; 8];
                             unsafe {
                                 let kernel = match (gpr, peel) {
-                                    (true, true) => fold_round2_compact_chunk_neon_horner_8_impl::<true, true>,
-                                    (false, true) => fold_round2_compact_chunk_neon_horner_8_impl::<true, false>,
-                                    (true, false) => fold_round2_compact_chunk_neon_horner_8_impl::<false, true>,
-                                    (false, false) => fold_round2_compact_chunk_neon_horner_8_impl::<false, false>,
+                                    (true, true) => fold_round2_compact_chunk_neon_horner_8_impl::<true, true, false>,
+                                    (false, true) => fold_round2_compact_chunk_neon_horner_8_impl::<true, false, false>,
+                                    (true, false) => fold_round2_compact_chunk_neon_horner_8_impl::<false, true, false>,
+                                    (false, false) => fold_round2_compact_chunk_neon_horner_8_impl::<false, false, false>,
                                 };
                                 kernel(
                                     table.data.as_ptr().cast::<u8>(),
@@ -8299,13 +8362,13 @@ mod tests {
                                 let mut out = [poison; 8];
                                 unsafe {
                                     let kernel = match variant {
-                                        0 => fold_round2_compact_chunk_neon_horner_8_impl::<true, false>,
-                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false, false>,
-                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false, false>,
-                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false, false>,
-                                        4 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false>,
-                                        5 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false>,
-                                        _ => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true>,
+                                        0 => fold_round2_compact_chunk_neon_horner_8_impl::<true, false, false>,
+                                        1 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, false, false, false, false>,
+                                        2 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, false, false, false, false>,
+                                        3 => fold_round2_compact_chunk_neon_prescaled_8_impl::<false, true, false, false, false>,
+                                        4 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false, false>,
+                                        5 => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false, false>,
+                                        _ => fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true, false>,
                                     };
                                     kernel(
                                         table.data.as_ptr().cast::<u8>(),
@@ -8430,17 +8493,17 @@ mod tests {
                             match kernel {
                                 0 | 1 => {
                                     let k = if kernel == 0 {
-                                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false>
+                                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, false, false, false>
                                     } else {
-                                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false>
+                                        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false, false>
                                     };
                                     k(t, a, b, anc, del, eq, LO_SIZE, base, mask, useful, degen, skip_dead, false, core::ptr::null(), o)
                                 }
                                 _ => {
                                     let k = if kernel == 2 {
-                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false>
+                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false, false>
                                     } else {
-                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true>
+                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, false>
                                     };
                                     let ep = eq_prep.as_ptr();
                                     k(t, a, b, anc, del, eq, ep, LO_SIZE, base, mask, useful, degen, periodic, skip_dead, false, core::ptr::null(), o)
@@ -8517,9 +8580,9 @@ mod tests {
                         let mut out = [poison; 8];
                         unsafe {
                             let k = if trips {
-                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true>
+                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, false>
                             } else {
-                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false>
+                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false, false>
                             };
                             k(
                                 table.as_ptr().cast::<u8>(),
@@ -8612,9 +8675,9 @@ mod tests {
                             let mut deltas = vec![0xa5u8; 16 * lo_size];
                             let mut out = [poison; 8];
                             let k = if new {
-                                fold_round2_compact_chunk_neon_prescaled_8_ranked_inv
+                                fold_round2_compact_chunk_neon_prescaled_8_ranked_inv::<false>
                             } else {
-                                fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false>
+                                fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, false, false>
                             };
                             unsafe {
                                 k(
@@ -8668,9 +8731,9 @@ mod tests {
     ) {
         unsafe {
             let kernel = if skip {
-                fold_round2_compact_chunk_neon_horner_8::<true>
+                fold_round2_compact_chunk_neon_horner_8::<true, false>
             } else {
-                fold_round2_compact_chunk_neon_horner_8::<false>
+                fold_round2_compact_chunk_neon_horner_8::<false, false>
             };
             kernel(
                 table.as_ptr().cast::<u8>(),
@@ -8876,7 +8939,7 @@ mod tests {
         out: *mut F128,
     ) {
         unsafe {
-            fold_round2_compact_chunk_neon_horner_8::<true>(
+            fold_round2_compact_chunk_neon_horner_8::<true, false>(
                 table_data, a_packed, b_packed, anchors, deltas, eq_lo, lo_size, pair_idx_base,
                 pair_in_block_mask, useful_pairs_inclusive, degen, skip_dead, false, core::ptr::null(), out,
             )
@@ -9570,7 +9633,7 @@ mod tests {
             let mut deltas = vec![0xa5u8; 2 * LO_SIZE * N_CHUNKS];
             let mut out = [poison; 8];
             unsafe {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                fold_round2_compact_chunk_neon_lookahead_8::<true, false, false>(
                     table.as_ptr().cast::<u8>(),
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
@@ -9833,14 +9896,14 @@ mod tests {
                                 fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
-                                    out.as_mut_ptr(), false, false, false, F128::ONE,
+                                    out.as_mut_ptr(), false, false, false, F128::ONE, false,
                                 );
                             }
                             (false, true) => {
                                 fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
-                                    out.as_mut_ptr(), false, false, false, F128::ONE,
+                                    out.as_mut_ptr(), false, false, false, F128::ONE, false,
                                 );
                             }
                         }
@@ -9924,12 +9987,12 @@ mod tests {
                     fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
-                        o_full.as_mut_ptr(), false, false, false, F128::ONE,
+                        o_full.as_mut_ptr(), false, false, false, F128::ONE, false,
                     );
                     fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         ap.as_mut_ptr(), bp.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
-                        o_pack.as_mut_ptr(), false, false, false, F128::ONE,
+                        o_pack.as_mut_ptr(), false, false, false, F128::ONE, false,
                     );
                 }
                 assert_eq!(o_pack, o_full, "slots, case {case}, degen {degen}");
@@ -10013,7 +10076,7 @@ mod tests {
                         fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
                             r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                             a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
-                            o.as_mut_ptr(), bpack, false, false, F128::ONE,
+                            o.as_mut_ptr(), bpack, false, false, F128::ONE, false,
                         )
                     };
                     (a, b, o, ok)
@@ -10082,20 +10145,19 @@ mod tests {
             }
             let (ap_in, bp_in) = (pack(&a), pack(&b));
             let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
-            let ep = round2_eq_prep(&eq);
             let (ra, rb) = (rho(&mut state), rho(&mut state));
             for nt in [false, true] {
                 let (mut ao, mut bo) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
                 let (mut ap, mut bp) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
                 let (packed, bone) = if nt {
                     (
-                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq, &ep),
-                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq, &ep),
+                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq, &round2_eq_prep(&eq)),
+                        fold_tri_and_message_packed_aarch64::<true>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq, &round2_eq_prep(&eq)),
                     )
                 } else {
                     (
-                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq, &ep),
-                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq, &ep),
+                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bp_in, &mut ao, &mut bo, ra, rb, &eq, &round2_eq_prep(&eq)),
+                        fold_tri_and_message_packed_aarch64::<false>(&ap_in, &bb, &mut ap, &mut bp, ra, rb, &eq, &round2_eq_prep(&eq)),
                     )
                 };
                 assert_eq!(bone, packed, "slots, case {case}, nt {nt}");

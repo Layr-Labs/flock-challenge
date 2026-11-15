@@ -771,6 +771,8 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon_regs(
 /// Provenance class for the large compact-AB backing after round two has
 /// overwritten every byte and its final reader immediately recycles it. The
 /// tag vouches only for full object initialization, never for byte values.
+/// A preproduced delta owner retains this initialized donor as a reservation
+/// and returns it at the same compact-consumer boundary.
 const AB_COMPACT_R2_FULL_INIT_TAG: u64 = 0xA8F1_2002_0000_0001;
 static AB_COMPACT_BACKING_TOKEN_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -793,6 +795,8 @@ pub fn ab_compact_backing_token_counts() -> (usize, usize) {
 /// in a separate scratch allocation is intentional: round 2 still needs the
 /// original A and B tables after the round-1 transcript challenge is sampled.
 pub struct Round1AbInner {
+    packed_delta_planes: bool,
+    delta_owner: Option<super::delta_planes::Owner>,
     storage: Vec<F128>,
     representation: Round1AbRepresentation,
     /// The storage came back through the scratch pool's provenance-token
@@ -836,6 +840,11 @@ impl Round1AbRepresentation {
 }
 
 impl Round1AbInner {
+    pub fn uses_delta_planes(&self) -> bool { self.packed_delta_planes }
+    pub fn attach_delta_owner(&mut self, owner: super::delta_planes::Owner) {
+        assert!(self.packed_delta_planes && self.delta_owner.is_none());
+        self.delta_owner = Some(owner);
+    }
     #[inline]
     fn as_bytes(&self) -> &[u8] {
         unsafe {
@@ -878,10 +887,12 @@ impl Round1AbInner {
         // allocation after a prior full R2 overwrite. R2 may read slices on
         // portable targets, but cannot mint the next token until its complete
         // overwrite has joined and called `mark_fully_initialized`.
-        crate::scratch::ScratchBytes::from_initialized_f128_for_full_overwrite(
-            core::mem::take(&mut self.storage),
-            AB_COMPACT_R2_FULL_INIT_TAG,
-        )
+        let reservation = crate::scratch::ScratchBytes::from_initialized_f128_for_full_overwrite(
+            core::mem::take(&mut self.storage), AB_COMPACT_R2_FULL_INIT_TAG);
+        match self.delta_owner.take() {
+            Some(owner) => reservation.adopt_produced(owner),
+            None => { assert!(!self.packed_delta_planes); reservation }
+        }
     }
 }
 
@@ -1043,8 +1054,15 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
 /// buffers are complete for every later reader (zerocheck round two).  On
 /// the fused path the transform of a unit reads the scratch copy, which is
 /// still in L1, instead of streaming the rows back from DRAM.
+/// With `delta_planes`, only the retained output changes to interleaved
+/// even codes and XOR deltas. Local scratch stays ordinary A/B. This form
+/// requires the fused queue and an owning handoff before round two.
 #[derive(Clone, Copy)]
 pub struct Round1AbProducer<'a> {
+    /// The retained output is E/D; local scratch remains ordinary A/B.
+    pub delta_planes: bool,
+    /// Optional producer without stripe publication, for input-only replays.
+    pub replay: Option<&'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync)>,
     pub unit_bytes: usize,
     pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync),
 }
@@ -1097,6 +1115,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
     assert!(producer.unit_bytes > 0 && producer.unit_bytes.is_multiple_of(OUTER_BYTES));
     assert!(total_bytes.is_multiple_of(producer.unit_bytes));
     let fused = zc_ab_producer_fused_enabled() && zc_ab_pre_hetero_enabled();
+    assert!(!producer.delta_planes || fused, "delta planes require local producer scratch");
     if !fused {
         produce_all_ab_units(producer, total_bytes / producer.unit_bytes);
     }
@@ -1109,7 +1128,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
             core::slice::from_raw_parts(b_packed, total_bytes),
         )
     };
-    precompute_round1_ab_inner_packed_padded_body(
+    let mut result = precompute_round1_ab_inner_packed_padded_body(
         a_packed,
         b_packed,
         m,
@@ -1123,7 +1142,9 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
         tail,
         fused.then_some(producer),
         None,
-    )
+    );
+    result.packed_delta_planes = producer.delta_planes;
+    result
 }
 
 /// Produce every deferred A/B unit without a scratch copy (the non-fused
@@ -1237,6 +1258,26 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune_into(
         None,
         Some(backing),
     );
+    ExactTuneBacking(core::mem::take(&mut inner.storage))
+}
+
+/// Reuse the transform backing while replaying the same local producer.
+/// Its retained E/D output is never interpreted as ordinary A/B.
+///
+/// # Safety
+/// The producer exclusively owns the retained input ranges during this call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn precompute_round1_ab_produced_for_exact_tune_into(
+    a: &[u8], b: &[u8], m: usize, k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8, padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    producer: Round1AbProducer<'_>, backing: ExactTuneBacking,
+) -> ExactTuneBacking {
+    assert!(zc_ab_producer_fused_active());
+    let mut inner = precompute_round1_ab_inner_packed_padded_body(
+        a, b, m, k_skip, inv_table, padding, ab_pre_nt_enabled(),
+        ab_compact_store_enabled(), false, identity_prefix, None,
+        Some(producer), Some(backing));
     ExactTuneBacking(core::mem::take(&mut inner.storage))
 }
 
@@ -1442,6 +1483,8 @@ fn precompute_round1_ab_inner_packed_padded_body(
             );
         }
         return Round1AbInner {
+            packed_delta_planes: false,
+            delta_owner: None,
             storage,
             representation,
             provenance_hit,
@@ -1480,6 +1523,8 @@ fn precompute_round1_ab_inner_packed_padded_body(
         );
 
     Round1AbInner {
+        packed_delta_planes: false,
+        delta_owner: None,
         storage,
         representation,
         provenance_hit,
@@ -3795,7 +3840,7 @@ impl AbGpuPrefix {
 /// (`convert[b][v] = mul_by_x(convert[b - 1][v])`) — the GPU arm expands its
 /// pre-scaled row 0 from the basis and derives rows 1..15 by multiplication
 /// by `x`, so it runs only when both identities reproduce the table.
-pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
+fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
     static BASIS: OnceLock<Option<[F128; 128]>> = OnceLock::new();
     BASIS
         .get_or_init(|| {
@@ -3834,25 +3879,17 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 /// process-wide `OnceLock`, so a launch that arrives first waits for (or
 /// does) the same build; nothing else changes. A no-op when the arm is off.
 /// `FLOCK_NO_ZC_AB_PREWARM=1` builds it lazily as before.
-///
-/// The same thread then builds the K pass GPU arm's two pipelines
-/// (`gpu_commit::zc_k_prewarm`, needed only after round two), unless that arm
-/// is off or `FLOCK_NO_ZC_K_PREWARM=1`.
 pub fn ab_completion_gpu_prewarm() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        let ab = std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1"))
-            && crate::gpu_commit::gpu_zc_ab_completion_share() != 0;
-        let k = crate::gpu_commit::zc_k_prewarm_wanted();
-        if !ab && !k {
+        if std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() == Some(std::ffi::OsStr::new("1"))
+            || crate::gpu_commit::gpu_zc_ab_completion_share() == 0
+        {
             return;
         }
-        let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(move || {
-            if ab && let Some(basis) = ab_completion_convert_basis() {
+        let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(|| {
+            if let Some(basis) = ab_completion_convert_basis() {
                 crate::gpu_commit::zc_ab_prewarm(basis);
-            }
-            if k {
-                crate::gpu_commit::zc_k_prewarm();
             }
         });
     }
@@ -6622,6 +6659,15 @@ mod tests {
     /// packed buffers, and leaves them complete.
     #[test]
     fn ab_precompute_producer_matches_plain() {
+        ab_precompute_producer_case(false);
+    }
+
+    #[test]
+    fn delta_planes_ab_precompute_producer_matches_plain() {
+        ab_precompute_producer_case(true);
+    }
+
+    fn ab_precompute_producer_case(delta_planes: bool) {
         use crate::zerocheck::univariate_skip::pack_bits;
         use std::sync::atomic::{AtomicU32, Ordering};
         const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
@@ -6742,16 +6788,14 @@ mod tests {
                             // `unit_bytes` long by the producer contract.
                             unsafe {
                                 let (src_a, src_b) = (&a_p[range.clone()], &b_p[range.clone()]);
-                                core::ptr::copy_nonoverlapping(
-                                    src_a.as_ptr(),
-                                    a_dst.ptr().add(range.start),
-                                    unit_bytes,
-                                );
-                                core::ptr::copy_nonoverlapping(
-                                    src_b.as_ptr(),
-                                    b_dst.ptr().add(range.start),
-                                    unit_bytes,
-                                );
+                                if delta_planes {
+                                    crate::zerocheck::delta_planes::publish(
+                                        src_a.as_ptr(), src_b.as_ptr(),
+                                        a_dst.ptr().add(range.start), b_dst.ptr().add(range.start), unit_bytes);
+                                } else {
+                                    core::ptr::copy_nonoverlapping(src_a.as_ptr(), a_dst.ptr().add(range.start), unit_bytes);
+                                    core::ptr::copy_nonoverlapping(src_b.as_ptr(), b_dst.ptr().add(range.start), unit_bytes);
+                                }
                                 core::ptr::copy_nonoverlapping(src_a.as_ptr(), a_scratch, unit_bytes);
                                 core::ptr::copy_nonoverlapping(src_b.as_ptr(), b_scratch, unit_bytes);
                             }
@@ -6763,6 +6807,8 @@ mod tests {
                             &[],
                             &mut produced,
                             Some(Round1AbProducer {
+            delta_planes,
+            replay: None,
                                 unit_bytes,
                                 produce: &produce,
                             }),
@@ -6772,8 +6818,17 @@ mod tests {
                             "m={m} repr={representation:?} fast={fast} direct={direct} nt={nt} unit={unit_bytes}"
                         );
                         assert!(calls.iter().all(|c| c.load(Ordering::Relaxed) == 1));
-                        assert_eq!(a_t, a_p);
-                        assert_eq!(b_t, b_p);
+                        if delta_planes {
+                            let mut e = vec![0u8; total];
+                            let mut d = vec![0u8; total];
+                            unsafe { crate::zerocheck::delta_planes::publish(
+                                a_p.as_ptr(), b_p.as_ptr(), e.as_mut_ptr(), d.as_mut_ptr(), total); }
+                            assert_eq!(a_t, e);
+                            assert_eq!(b_t, d);
+                        } else {
+                            assert_eq!(a_t, a_p);
+                            assert_eq!(b_t, b_p);
+                        }
                         checked += 1;
                     }
                 }
@@ -7103,6 +7158,8 @@ mod tests {
                 }
             };
             let producer = Round1AbProducer {
+            delta_planes: false,
+            replay: None,
                 unit_bytes,
                 produce: &produce,
             };

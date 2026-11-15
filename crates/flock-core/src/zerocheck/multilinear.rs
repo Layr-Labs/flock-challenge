@@ -242,6 +242,7 @@ pub(crate) fn stage_round2_gpu_window_from_r1_challenges(
     k_skip: usize,
     r: &[F128],
     padding: &PaddingSpec,
+    delta_planes: bool,
 ) {
     if k_skip != 6 || m <= k_skip + 1 || r.len() != m {
         return;
@@ -263,6 +264,7 @@ pub(crate) fn stage_round2_gpu_window_from_r1_challenges(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        delta_planes,
     );
     // The upload above copies eq.lo/eq.hi into persistent GPU buffers, so the
     // CPU-side tables are free to be re-used by the round-two sweep.
@@ -946,6 +948,7 @@ pub struct UniSkipCompactFold {
     /// (deltas, `TC_DELTA_BYTES_PER_BLOCK` = 1984 bytes per block), so the K
     /// pass streams 92 instead of 96 lines per block. Only the one-table
     /// fused K kernel reads it. See [`zc_r2_tail_compact_enabled`].
+    /// Adopted producer deltas stay dense; this flag then describes anchors only.
     pub tail_compact: bool,
     /// With `tail_compact`: the compacted blocks start this many blocks'
     /// worth of shortfall (12 anchors and 64 delta bytes per block) into the
@@ -958,6 +961,7 @@ pub struct UniSkipCompactFold {
     /// only their a anchors and a deltas: 59 + 30 lines per block instead of
     /// 61 + 31). Their b anchor is `head_b` (the fold of the all-ones row)
     /// and their b delta zero. See [`zc_r2_head_compact_enabled`].
+    /// With adopted deltas, only the anchors omit the constant B head slots.
     pub head_compact: bool,
     /// The b anchor of every head pair of a head-compacted state.
     pub head_b: F128,
@@ -996,8 +1000,10 @@ impl UniSkipCompactFold {
 
     /// Byte offset in `deltas` of pair `p`'s sixteen delta bytes (a live
     /// pair in the tail-compacted layout). In the head-compacted layout a
-    /// head pair has only its eight a delta bytes here.
+    /// head pair has only its eight a delta bytes here, unless the backing
+    /// was adopted from the producer and retains all sixteen bytes.
     pub fn delta_offset(&self, p: usize) -> usize {
+        if self.deltas.is_preproduced() { return 16 * p; }
         #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
         if self.head_compact {
             use kernels::aarch64::{HC_DELTA_BYTES_PER_BLOCK, HC_DELTA_GAP, HC_DELTA_SHIFT, HC_HEAD_PAIRS};
@@ -1061,80 +1067,71 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     padding: &PaddingSpec,
     deltas_backing: Option<ScratchBytes>,
 ) -> (UniSkipCompactFold, F128, F128) {
-    assert_eq!(
-        k_skip, 6,
-        "optimized compact fold-and-round_pair variant is k_skip=6 only"
-    );
-    assert_eq!(table.n_chunks, 8);
-    let n_chunks = table.n_chunks;
-    let n_out = 1usize << (m - k_skip);
-    let n_pairs = n_out / 2;
-    assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
-    assert_eq!(mlv_challenges.len(), m - k_skip);
+    if deltas_backing.as_ref().is_some_and(ScratchBytes::is_preproduced) {
+        uni_skip_fold_and_round_pair_compact_padded_with_deltas_layout::<true>(a_packed, b_packed, m, k_skip, table, mlv_challenges, padding, deltas_backing)
+    } else {
+        uni_skip_fold_and_round_pair_compact_padded_with_deltas_layout::<false>(a_packed, b_packed, m, k_skip, table, mlv_challenges, padding, deltas_backing)
+    }
+}
 
-    let deltas_len = 2 * n_pairs * n_chunks;
-    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take_full_overwrite(deltas_len));
-    assert_eq!(
-        deltas.len(),
-        deltas_len,
-        "donated compact delta backing has the wrong byte length"
-    );
-    let mut compact = UniSkipCompactFold {
-        anchors: crate::scratch::take_f128(2 * n_pairs),
-        deltas,
-        dead_tail: false,
-        tail_compact: false,
-        tail_base_blocks: 0,
-        head_compact: false,
-        head_b: F128::ZERO,
-    };
+// Calibration owns its temporary inputs until the GPU has joined. Ordinary
+// compacted deltas cannot be reinterpreted as a dense producer plane.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct Round2PlaneProbe {
+    even: Vec<u8>,
+    dense_deltas: Option<Vec<u8>>,
+}
 
-    let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
-    let lo_size = 1usize << eq.n_lo;
-    let hi_size = 1usize << eq.n_hi;
-    assert_eq!(lo_size * hi_size, n_pairs);
-    let eq_hi = &eq.hi;
-    let eq_lo = &eq.lo;
-    let anchor_chunk_size = 2 * lo_size;
-    let delta_chunk_size = 2 * lo_size * n_chunks;
-    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
-    #[cfg(target_arch = "aarch64")]
-    let degen = r2_degen_enabled();
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Round2PlaneProbe {
+    fn new(a: &[u8], b: &[u8], chunks: usize, compacted: bool) -> Self {
+        assert_eq!(a.len(), b.len());
+        assert!(chunks > 0 && a.len().is_multiple_of(16 * chunks));
+        let mut even = crate::alloc_uninit_vec::<u8>(a.len());
+        let mut dense_deltas = compacted.then(|| crate::alloc_uninit_vec::<u8>(a.len()));
+        let e = crate::epool::SyncPtr(even.as_mut_ptr());
+        let d = dense_deltas.as_mut().map(|v| crate::epool::SyncPtr(v.as_mut_ptr()));
+        let bytes = a.len() / chunks;
+        crate::epool::run_hetero_chunks(chunks, |c| {
+            let start = c * bytes;
+            // SAFETY: each queue job owns a disjoint, complete output range.
+            unsafe {
+                if let Some(d) = d {
+                    crate::zerocheck::delta_planes::publish(a.as_ptr().add(start), b.as_ptr().add(start),
+                        e.ptr().add(start), d.ptr().add(start), bytes);
+                    // Publish non-temporal stores before the queue's join.
+                    core::arch::asm!("dmb ishst", options(nostack, preserves_flags));
+                } else {
+                    for i in (start..start + bytes).step_by(16) {
+                        core::ptr::copy_nonoverlapping(a.as_ptr().add(i), e.ptr().add(i), 8);
+                        core::ptr::copy_nonoverlapping(b.as_ptr().add(i), e.ptr().add(i + 8), 8);
+                    }
+                }
+            }
+        });
+        Self { even, dense_deltas }
+    }
+}
 
-    // GPU round-two products arm (see `ENV_NO_GPU_ZC_R2`): a measured
-    // prefix of the hi-chunks gets its message products computed on the
-    // otherwise-idle GPU while the CPU writes those chunks' anchors and
-    // deltas through the anchors-only sibling kernel (byte-identical
-    // stores). Partials for prefix chunks are merged after the join; the
-    // XOR reduce below is order-independent, so the output is bit-identical
-    // to the all-CPU sweep. `None` = the exact incumbent path.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
-        a_packed,
-        b_packed,
-        &table.data,
-        eq_lo,
-        eq_hi,
-        lo_size,
-        hi_size,
-        pair_in_block_mask,
-        useful_pairs_inclusive,
-    );
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let t_cpu_sweep = std::time::Instant::now();
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for Round2PlaneProbe {
+    fn drop(&mut self) {
+        crate::gpu_commit::zc_r2_release_temporary_view(&self.even);
+        if let Some(d) = &self.dense_deltas {
+            crate::gpu_commit::zc_r2_release_temporary_view(d);
+        }
+    }
+}
 
-    // Chunks drain through the hetero queue so the idle efficiency cores add
-    // throughput without an equal-band barrier penalty (see `epool`). Each
-    // chunk writes only its own anchors/deltas ranges and partials slot; the
-    // XOR reduce below is order-independent, so output is bit-identical to
-    // the rayon map-reduce.
-    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
-    let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
-    let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
-    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+#[allow(clippy::too_many_arguments)]
+fn round2_compact_cpu_sweep<const PLANES: bool>(
+    a_packed: &[u8], b_packed: &[u8], table: &UniSkipFoldTable,
+    eq_lo: &[F128], eq_hi: &[F128], n_chunks: usize, lo_size: usize, hi_size: usize,
+    anchor_chunk_size: usize, delta_chunk_size: usize,
+    pair_in_block_mask: usize, useful_pairs_inclusive: usize, degen: bool,
+    anchors_base: crate::epool::SyncPtr<F128>, deltas_base: crate::epool::SyncPtr<u8>,
+    partials_base: crate::epool::SyncPtr<(F128, F128)>, cpu_prefix: usize,
+) {
     crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
         // exclusively owns its anchors/deltas ranges and partials[x_hi]. The
@@ -1155,9 +1152,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             // deltas, skip the products (the GPU partial replaces this
             // chunk's slot after the join).
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            if x_hi < gpu_prefix {
+            if x_hi < cpu_prefix {
                 unsafe {
-                    fold_round2_compact_chunk_neon_anchors_only_8(
+                    fold_round2_compact_chunk_neon_anchors_only_8::<PLANES>(
                         table.data.as_ptr().cast::<u8>(),
                         a_packed.as_ptr().add(row_base * n_chunks),
                         b_packed.as_ptr().add(row_base * n_chunks),
@@ -1174,7 +1171,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
 
             #[cfg(target_arch = "aarch64")]
             let (p1, pinf) = unsafe {
-                fold_round2_compact_chunk_neon_unchecked_8(
+                fold_round2_compact_chunk_neon_unchecked_8::<PLANES>(
                     table.data.as_ptr().cast::<u8>(),
                     a_packed.as_ptr().add(row_base * n_chunks),
                     b_packed.as_ptr().add(row_base * n_chunks),
@@ -1247,6 +1244,324 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             }
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn round2_lookahead_cpu_sweep<const PLANES: bool>(
+    a_packed: &[u8], b_packed: &[u8], table: &UniSkipFoldTable,
+    eq_lo: &[F128], eq_hi: &[F128], n_chunks: usize, lo_size: usize, hi_size: usize,
+    anchor_chunk_stride: usize, delta_chunk_stride: usize,
+    pair_in_block_mask: usize, useful_pairs_inclusive: usize, degen: bool,
+    anchors_base: crate::epool::SyncPtr<F128>, deltas_base: crate::epool::SyncPtr<u8>,
+    partials_base: crate::epool::SyncPtr<(F128, F128)>, la_base: crate::epool::SyncPtr<[F128; 6]>,
+    eq_prep_addr: usize, kappa: F128, periodic_padding: bool, skip_dead: bool,
+    tail_compact: bool, head_fail_addr: usize,
+    horner_weights: bool, horner_prescale: bool, horner_skip_first: bool,
+    cpu_prefix: usize, odd_on_gpu: bool,
+) {
+    #[cfg(not(target_arch = "aarch64"))]
+    let anchor_chunk_size = 2 * lo_size;
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
+        // exclusively owns its anchors/deltas ranges and both partial slots.
+        let (anchors, deltas) = unsafe {
+            (
+                anchors_base.ptr().add(x_hi * anchor_chunk_stride),
+                deltas_base.ptr().add(x_hi * delta_chunk_stride),
+            )
+        };
+        let pair_idx_base = x_hi * lo_size;
+        let row_base = pair_idx_base * 2;
+        let mut out = [F128::ZERO; 8];
+        let head_fail_ptr = head_fail_addr as *const std::sync::atomic::AtomicBool;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let full = x_hi >= cpu_prefix;
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let full = true;
+            unsafe {
+                let t = table.data.as_ptr().cast::<u8>();
+                let ap = a_packed.as_ptr().add(row_base * n_chunks);
+                let bp = b_packed.as_ptr().add(row_base * n_chunks);
+                if full {
+                    fold_round2_compact_chunk_neon_lookahead_8::<true, false, PLANES>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        eq_prep_addr as *const F128,
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        skip_dead,
+                        tail_compact,
+                        head_fail_ptr,
+                        out.as_mut_ptr(),
+                    );
+                } else if odd_on_gpu && horner_weights {
+                    if horner_prescale {
+                        #[cfg(target_feature = "sha3")]
+                        fold_round2_compact_chunk_neon_prescaled_8::<PLANES>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            tail_compact,
+                            head_fail_ptr,
+                            out.as_mut_ptr(),
+                        );
+                    } else if horner_skip_first {
+                        fold_round2_compact_chunk_neon_horner_8::<true, PLANES>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            tail_compact,
+                            head_fail_ptr,
+                            out.as_mut_ptr(),
+                        );
+                    } else {
+                        fold_round2_compact_chunk_neon_horner_8::<false, PLANES>(
+                            t,
+                            ap,
+                            bp,
+                            anchors,
+                            deltas,
+                            eq_lo.as_ptr(),
+                            lo_size,
+                            pair_idx_base,
+                            pair_in_block_mask,
+                            useful_pairs_inclusive,
+                            degen,
+                            skip_dead,
+                            tail_compact,
+                            head_fail_ptr,
+                            out.as_mut_ptr(),
+                        );
+                    }
+                    let eq_h = eq_hi[x_hi];
+                    *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
+                    *la_base.ptr().add(x_hi) = [
+                        F128::ZERO,
+                        F128::ZERO,
+                        eq_h * out[4],
+                        eq_h * out[5],
+                        eq_h * out[6],
+                        eq_h * out[7],
+                    ];
+                    return;
+                } else if odd_on_gpu {
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, true, PLANES>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        core::ptr::null(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        skip_dead,
+                        tail_compact,
+                        head_fail_ptr,
+                        out.as_mut_ptr(),
+                    );
+                } else {
+                    fold_round2_compact_chunk_neon_lookahead_8::<false, false, PLANES>(
+                        t,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        core::ptr::null(),
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        skip_dead,
+                        tail_compact,
+                        head_fail_ptr,
+                        out.as_mut_ptr(),
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let anchors = unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
+            out = round2_lookahead_chunk_scalar(
+                a_packed,
+                b_packed,
+                table,
+                anchors,
+                deltas,
+                eq_lo,
+                lo_size,
+                row_base,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+            );
+        }
+
+        let eq_h = eq_hi[x_hi];
+        // `out[0..2]` carry the even lane on the odd lane's weight; κ restores
+        // `eq₂(2y)` exactly (field arithmetic, no rounding).
+        let p1 = kappa * out[0] + out[2];
+        let pinf = kappa * out[1] + out[3];
+        // SAFETY: exclusive owner of both partial slots (see above).
+        unsafe {
+            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            *la_base.ptr().add(x_hi) = [
+                eq_h * out[2],
+                eq_h * out[3],
+                eq_h * out[4],
+                eq_h * out[5],
+                eq_h * out[6],
+                eq_h * out[7],
+            ];
+        }
+    });
+}
+
+fn uni_skip_fold_and_round_pair_compact_padded_with_deltas_layout<const PLANES: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+) -> (UniSkipCompactFold, F128, F128) {
+    assert!(!PLANES || cfg!(target_arch = "aarch64"));
+    assert_eq!(
+        k_skip, 6,
+        "optimized compact fold-and-round_pair variant is k_skip=6 only"
+    );
+    assert_eq!(table.n_chunks, 8);
+    let n_chunks = table.n_chunks;
+    let n_out = 1usize << (m - k_skip);
+    let n_pairs = n_out / 2;
+    assert_eq!(a_packed.len(), n_out * n_chunks);
+    assert_eq!(b_packed.len(), n_out * n_chunks);
+    assert_eq!(mlv_challenges.len(), m - k_skip);
+
+    let deltas_len = 2 * n_pairs * n_chunks;
+    let deltas = deltas_backing.unwrap_or_else(|| ScratchBytes::take_full_overwrite(deltas_len));
+    assert_eq!(
+        deltas.len(),
+        deltas_len,
+        "donated compact delta backing has the wrong byte length"
+    );
+    let mut compact = UniSkipCompactFold {
+        anchors: crate::scratch::take_f128(2 * n_pairs),
+        deltas,
+        dead_tail: false,
+        tail_compact: false,
+        tail_base_blocks: 0,
+        head_compact: false,
+        head_b: F128::ZERO,
+    };
+
+    let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
+    let lo_size = 1usize << eq.n_lo;
+    let hi_size = 1usize << eq.n_hi;
+    assert_eq!(lo_size * hi_size, n_pairs);
+    let eq_hi = &eq.hi;
+    let eq_lo = &eq.lo;
+    let anchor_chunk_size = 2 * lo_size;
+    let delta_chunk_size = 2 * lo_size * n_chunks;
+    let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
+    #[cfg(target_arch = "aarch64")]
+    let degen = r2_degen_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let degen = false;
+
+    // GPU round-two products arm (see `ENV_NO_GPU_ZC_R2`): a measured
+    // prefix of the hi-chunks gets its message products computed on the
+    // otherwise-idle GPU while the CPU writes those chunks' anchors and
+    // deltas through the anchors-only sibling kernel (byte-identical
+    // stores). Partials for prefix chunks are merged after the join; the
+    // XOR reduce below is order-independent, so the output is bit-identical
+    // to the all-CPU sweep. `None` = the exact incumbent path.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut gpu_job = crate::gpu_commit::launch_zc_r2_products(
+        a_packed,
+        b_packed,
+        &table.data,
+        eq_lo,
+        eq_hi,
+        lo_size,
+        hi_size,
+        pair_in_block_mask,
+        useful_pairs_inclusive,
+        PLANES,
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let gpu_prefix = 0;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut t_cpu_sweep = std::time::Instant::now();
+
+    // Chunks drain through the hetero queue so the idle efficiency cores add
+    // throughput without an equal-band barrier penalty (see `epool`). Each
+    // chunk writes only its own anchors/deltas ranges and partials slot; the
+    // XOR reduce below is order-independent, so output is bit-identical to
+    // the rayon map-reduce.
+    let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+    let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
+    let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
+    let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+    let run_cpu_sweep = |cpu_prefix: usize| round2_compact_cpu_sweep::<PLANES>(
+            a_packed, b_packed, table, eq_lo, eq_hi, n_chunks, lo_size, hi_size,
+            anchor_chunk_size, delta_chunk_size, pair_in_block_mask, useful_pairs_inclusive,
+            degen, anchors_base, deltas_base, partials_base, cpu_prefix);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if PLANES {
+        if let Some(job) = gpu_job.as_mut().filter(|j| j.is_calibration()) {
+            // Price the actual GPU-owned CPU work; the full sweep overwrites
+            // all temporary sums and restores the same live anchors.
+            let started = std::time::Instant::now();
+            run_cpu_sweep(hi_size);
+            job.set_planes_cpu_gpu_ms(started.elapsed().as_secs_f64() * 1e3);
+        }
+        t_cpu_sweep = std::time::Instant::now();
+    }
+    run_cpu_sweep(gpu_prefix);
+
     // Drain the GPU products arm: merge prefix partials (timed proves),
     // finish calibration (untimed warmup), or CPU-redo the skipped prefix
     // products on any post-admission Metal failure.
@@ -1287,7 +1602,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
                     let (p1, pinf) = unsafe {
-                        fold_round2_compact_chunk_neon_unchecked_8(
+                        fold_round2_compact_chunk_neon_unchecked_8::<PLANES>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
@@ -1313,7 +1628,41 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
     // SAFETY: the hetero queue and optional GPU-prefix fallback above have
     // joined; their pairwise-disjoint x_hi ranges cover exactly
     // `0..compact.deltas.len()`, including padding rows.
+    // Adopted planes were initialized before entry and stayed read-only.
     unsafe { compact.deltas.mark_fully_initialized() };
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if !PLANES && crate::zerocheck::delta_planes::enabled()
+        && m == 32 && padding.k_log == 14 && padding.useful_bits_per_block == 15_409
+        && crate::gpu_commit::zc_r2_planes_tuning_needed(false)
+    {
+        // Joined ordinary deltas already have the dense plane layout. Only
+        // the even rows need publication; calibration partials are discarded.
+        let inputs = Round2PlaneProbe::new(a_packed, b_packed, hi_size, false);
+        if let Some(mut job) = crate::gpu_commit::launch_zc_r2_products_for(
+            &inputs.even, &compact.deltas, &table.data, eq_lo, eq_hi, lo_size, hi_size,
+            pair_in_block_mask, useful_pairs_inclusive, true, false)
+        {
+            let mut probe = vec![(F128::ZERO, F128::ZERO); hi_size];
+            let probe_partials = crate::epool::SyncPtr(probe.as_mut_ptr());
+            let sweep = |cpu_prefix: usize| round2_compact_cpu_sweep::<true>(
+                &inputs.even, &compact.deltas, table, eq_lo, eq_hi, n_chunks, lo_size, hi_size,
+                anchor_chunk_size, delta_chunk_size, pair_in_block_mask, useful_pairs_inclusive,
+                degen, anchors_base, deltas_base, probe_partials, cpu_prefix);
+            let started = std::time::Instant::now();
+            sweep(hi_size);
+            job.set_planes_cpu_gpu_ms(started.elapsed().as_secs_f64() * 1e3);
+            let started = std::time::Instant::now();
+            sweep(0);
+            let full_ms = started.elapsed().as_secs_f64() * 1e3;
+            let _ = crate::gpu_commit::zc_r2_wait(job, Some(&probe), None, full_ms, hi_size);
+        }
+        crate::gpu_commit::zc_r2_release_temporary_view(&compact.deltas);
+        crate::gpu_commit::zc_r2_finish_planes_tuning(false);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if PLANES && m == 32 { crate::gpu_commit::zc_r2_finish_planes_tuning(false); }
 
     let (sum1, sum_inf) = partials
         .iter()
@@ -1671,6 +2020,8 @@ pub fn fold_compact_and_compute_round_pair(
     };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let gpu_prefix = 0;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let t_cpu_sweep = std::time::Instant::now();
 
@@ -1936,6 +2287,25 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     deltas_backing: Option<ScratchBytes>,
     k_pass_only: bool,
 ) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
+    if deltas_backing.as_ref().is_some_and(ScratchBytes::is_preproduced) {
+        uni_skip_fold_and_round_pair_compact_padded_lookahead_for_layout::<true>(a_packed, b_packed, m, k_skip, table, mlv_challenges, padding, deltas_backing, k_pass_only)
+    } else {
+        uni_skip_fold_and_round_pair_compact_padded_lookahead_for_layout::<false>(a_packed, b_packed, m, k_skip, table, mlv_challenges, padding, deltas_backing, k_pass_only)
+    }
+}
+
+fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for_layout<const PLANES: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    deltas_backing: Option<ScratchBytes>,
+    k_pass_only: bool,
+) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
+    assert!(!PLANES || cfg!(target_arch = "aarch64"));
     assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
     let n_chunks = table.n_chunks;
@@ -1982,6 +2352,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let (pair_in_block_mask, useful_pairs_inclusive) = round2_pair_skip(padding, k_skip);
     #[cfg(target_arch = "aarch64")]
     let degen = r2_degen_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    let degen = false;
     #[cfg(target_arch = "aarch64")]
     let periodic_padding = r2_periodic_padding_enabled();
     // Dead-pair skip. The K pass substitutes zeros for pairs 121..128 of
@@ -2021,6 +2393,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let horner_prescale = r2_prescale_enabled();
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let horner_prescale = false;
+    #[cfg(not(target_arch = "aarch64"))]
+    let (periodic_padding, horner_weights, horner_prescale, horner_skip_first) = (false, false, false, false);
 
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
@@ -2028,7 +2402,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+    let mut gpu_job = crate::gpu_commit::launch_zc_r2_products_for(
         a_packed,
         b_packed,
         &table.data,
@@ -2038,9 +2412,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        PLANES,
+        true,
     );
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let gpu_prefix = 0;
     // The GPU arm now returns its round-two products parity-split, so on an
     // offloaded chunk the CPU can skip the odd-parity pair as well as the even
     // one instead of recomputing the odd half for `W1`/`W2`. The kill switch
@@ -2050,7 +2428,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let odd_on_gpu = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let t_cpu_sweep = std::time::Instant::now();
+    let mut t_cpu_sweep = std::time::Instant::now();
 
     let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
@@ -2063,6 +2441,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep_addr = eq_prep.as_ptr() as usize;
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let eq_prep_addr = 0usize;
+    #[cfg(not(target_arch = "aarch64"))]
     let eq_prep_addr = 0usize;
     // Tail-compacted layout: the dead-pair skip is on, every chunk's
     // producer runs its ranked periodic walk (the lookahead, prescaled and
@@ -2081,16 +2461,21 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // two ranked walks that write it (the full lookahead walk, or the
     // prescaled ranked-invariant walk on GPU-offloaded chunks).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_used = gpu_prefix > 0;
+    let gpu_used = gpu_prefix > 0
+        || (PLANES && gpu_job.as_ref().is_some_and(|j| j.is_calibration()));
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     let gpu_used = false;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let layout_odd_on_gpu = odd_on_gpu || (PLANES && gpu_used && zc_r2_odd_offload_enabled());
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let layout_odd_on_gpu = false;
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let head_compact = tail_compact
         && zc_r2_head_compact_enabled()
         && kernels::aarch64::r2_head_compact_supported()
         && degen
         && table.fold_one_row(&[0xFF; 8]) == F128::ONE
-        && (!gpu_used || (odd_on_gpu && horner_weights && horner_prescale));
+        && (!gpu_used || (layout_odd_on_gpu && horner_weights && horner_prescale));
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let head_compact = {
         let _ = gpu_used;
@@ -2127,202 +2512,30 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let (anchor_chunk_stride, delta_chunk_stride, anchor_base, delta_base) =
         (anchor_chunk_size, delta_chunk_size, 0usize, 0usize);
+    let (delta_chunk_stride, delta_base) = if PLANES { (delta_chunk_size, 0) } else { (delta_chunk_stride, delta_base) };
     let anchors_base = crate::epool::SyncPtr(unsafe { compact.anchors.as_mut_ptr().add(anchor_base) });
     let deltas_base = crate::epool::SyncPtr(unsafe { compact.deltas.full_overwrite_ptr().add(delta_base) });
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
-        // exclusively owns its anchors/deltas ranges and both partial slots.
-        let (anchors, deltas) = unsafe {
-            (
-                anchors_base.ptr().add(x_hi * anchor_chunk_stride),
-                deltas_base.ptr().add(x_hi * delta_chunk_stride),
-            )
-        };
-        let pair_idx_base = x_hi * lo_size;
-        let row_base = pair_idx_base * 2;
-        let mut out = [F128::ZERO; 8];
-        let head_fail_ptr = head_fail_addr as *const std::sync::atomic::AtomicBool;
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let full = x_hi >= gpu_prefix;
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            let full = true;
-            unsafe {
-                let t = table.data.as_ptr().cast::<u8>();
-                let ap = a_packed.as_ptr().add(row_base * n_chunks);
-                let bp = b_packed.as_ptr().add(row_base * n_chunks);
-                if full {
-                    fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        eq_prep_addr as *const F128,
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        skip_dead,
-                        tail_compact,
-                        head_fail_ptr,
-                        out.as_mut_ptr(),
-                    );
-                } else if odd_on_gpu && horner_weights {
-                    if horner_prescale {
-                        #[cfg(target_feature = "sha3")]
-                        fold_round2_compact_chunk_neon_prescaled_8(
-                            t,
-                            ap,
-                            bp,
-                            anchors,
-                            deltas,
-                            eq_lo.as_ptr(),
-                            lo_size,
-                            pair_idx_base,
-                            pair_in_block_mask,
-                            useful_pairs_inclusive,
-                            degen,
-                            skip_dead,
-                            tail_compact,
-                            head_fail_ptr,
-                            out.as_mut_ptr(),
-                        );
-                    } else if horner_skip_first {
-                        fold_round2_compact_chunk_neon_horner_8::<true>(
-                            t,
-                            ap,
-                            bp,
-                            anchors,
-                            deltas,
-                            eq_lo.as_ptr(),
-                            lo_size,
-                            pair_idx_base,
-                            pair_in_block_mask,
-                            useful_pairs_inclusive,
-                            degen,
-                            skip_dead,
-                            tail_compact,
-                            head_fail_ptr,
-                            out.as_mut_ptr(),
-                        );
-                    } else {
-                        fold_round2_compact_chunk_neon_horner_8::<false>(
-                            t,
-                            ap,
-                            bp,
-                            anchors,
-                            deltas,
-                            eq_lo.as_ptr(),
-                            lo_size,
-                            pair_idx_base,
-                            pair_in_block_mask,
-                            useful_pairs_inclusive,
-                            degen,
-                            skip_dead,
-                            tail_compact,
-                            head_fail_ptr,
-                            out.as_mut_ptr(),
-                        );
-                    }
-                    let eq_h = eq_hi[x_hi];
-                    *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
-                    *la_base.ptr().add(x_hi) = [
-                        F128::ZERO,
-                        F128::ZERO,
-                        eq_h * out[4],
-                        eq_h * out[5],
-                        eq_h * out[6],
-                        eq_h * out[7],
-                    ];
-                    return;
-                } else if odd_on_gpu {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, true>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        core::ptr::null(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        skip_dead,
-                        tail_compact,
-                        head_fail_ptr,
-                        out.as_mut_ptr(),
-                    );
-                } else {
-                    fold_round2_compact_chunk_neon_lookahead_8::<false, false>(
-                        t,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        core::ptr::null(),
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        skip_dead,
-                        tail_compact,
-                        head_fail_ptr,
-                        out.as_mut_ptr(),
-                    );
-                }
-            }
+    let run_cpu_sweep = |cpu_prefix: usize, odd_on_gpu: bool| round2_lookahead_cpu_sweep::<PLANES>(
+            a_packed, b_packed, table, eq_lo, eq_hi, n_chunks, lo_size, hi_size,
+            anchor_chunk_stride, delta_chunk_stride, pair_in_block_mask, useful_pairs_inclusive,
+            degen, anchors_base, deltas_base, partials_base, la_base, eq_prep_addr, kappa,
+            periodic_padding, skip_dead, tail_compact, head_fail_addr,
+            horner_weights, horner_prescale, horner_skip_first, cpu_prefix, odd_on_gpu);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if PLANES {
+        if let Some(job) = gpu_job.as_mut().filter(|j| j.is_calibration()) {
+            // Price the actual GPU-owned CPU work; the full sweep overwrites
+            // all temporary sums and restores the same live anchors.
+            let started = std::time::Instant::now();
+            run_cpu_sweep(hi_size, zc_r2_odd_offload_enabled());
+            job.set_planes_cpu_gpu_ms(started.elapsed().as_secs_f64() * 1e3);
         }
+        t_cpu_sweep = std::time::Instant::now();
+    }
+    run_cpu_sweep(gpu_prefix, odd_on_gpu);
 
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let anchors = unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
-            out = round2_lookahead_chunk_scalar(
-                a_packed,
-                b_packed,
-                table,
-                anchors,
-                deltas,
-                eq_lo,
-                lo_size,
-                row_base,
-                pair_idx_base,
-                pair_in_block_mask,
-                useful_pairs_inclusive,
-            );
-        }
-
-        let eq_h = eq_hi[x_hi];
-        // `out[0..2]` carry the even lane on the odd lane's weight; κ restores
-        // `eq₂(2y)` exactly (field arithmetic, no rounding).
-        let p1 = kappa * out[0] + out[2];
-        let pinf = kappa * out[1] + out[3];
-        // SAFETY: exclusive owner of both partial slots (see above).
-        unsafe {
-            *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
-            *la_base.ptr().add(x_hi) = [
-                eq_h * out[2],
-                eq_h * out[3],
-                eq_h * out[4],
-                eq_h * out[5],
-                eq_h * out[6],
-                eq_h * out[7],
-            ];
-        }
-    });
 
     // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
     // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
@@ -2373,7 +2586,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
                     unsafe {
-                        fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                        fold_round2_compact_chunk_neon_lookahead_8::<true, false, PLANES>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
@@ -2407,6 +2620,66 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if !PLANES && crate::zerocheck::delta_planes::enabled()
+        && m == 32 && padding.k_log == 14 && padding.useful_bits_per_block == 15_409
+        && crate::gpu_commit::zc_r2_planes_tuning_needed(true)
+    {
+        // Keep the proof's compacted D intact. Reconstruct a dense probe D
+        // only when compaction removed bytes; both inputs die after the join.
+        let inputs = Round2PlaneProbe::new(a_packed, b_packed, hi_size, tail_compact);
+        // All ordinary writers have joined, so the dense fallback is readable.
+        unsafe { compact.deltas.mark_fully_initialized() };
+        let delta = inputs.dense_deltas.as_deref().unwrap_or(&compact.deltas);
+        if let Some(mut job) = crate::gpu_commit::launch_zc_r2_products_for(
+            &inputs.even, delta, &table.data, eq_lo, eq_hi, lo_size, hi_size,
+            pair_in_block_mask, useful_pairs_inclusive, true, true)
+        {
+            let mut probe = vec![(F128::ZERO, F128::ZERO); hi_size];
+            let mut probe_la = vec![[F128::ZERO; 6]; hi_size];
+            let probe_partials = crate::epool::SyncPtr(probe.as_mut_ptr());
+            let probe_la_base = crate::epool::SyncPtr(probe_la.as_mut_ptr());
+            let probe_delta = crate::epool::SyncPtr(delta.as_ptr().cast_mut());
+            // The light sweep must support the same anchor layout as the
+            // full sweep. A cold ordinary sweep may have allowed more packing.
+            let probe_head = head_compact && zc_r2_odd_offload_enabled() && horner_weights && horner_prescale;
+            let (probe_stride, probe_anchor) = if head_compact && !probe_head {
+                #[cfg(target_feature = "sha3")]
+                {
+                    let base = compact.tail_base_blocks * kernels::aarch64::TC_ANCHOR_GAP;
+                    (lo_size / 128 * kernels::aarch64::TC_ANCHORS_PER_BLOCK,
+                        crate::epool::SyncPtr(unsafe { compact.anchors.as_mut_ptr().add(base) }))
+                }
+                #[cfg(not(target_feature = "sha3"))]
+                { (anchor_chunk_stride, anchors_base) }
+            } else { (anchor_chunk_stride, anchors_base) };
+            let sweep = |cpu_prefix: usize, odd_on_gpu: bool| round2_lookahead_cpu_sweep::<true>(
+                &inputs.even, delta, table, eq_lo, eq_hi, n_chunks, lo_size, hi_size,
+                probe_stride, delta_chunk_size, pair_in_block_mask, useful_pairs_inclusive,
+                degen, probe_anchor, probe_delta, probe_partials, probe_la_base, eq_prep_addr, kappa,
+                periodic_padding, skip_dead, tail_compact, if probe_head { head_fail_addr } else { 0 },
+                horner_weights, horner_prescale, horner_skip_first, cpu_prefix, odd_on_gpu);
+            let started = std::time::Instant::now();
+            sweep(hi_size, zc_r2_odd_offload_enabled());
+            job.set_planes_cpu_gpu_ms(started.elapsed().as_secs_f64() * 1e3);
+            let started = std::time::Instant::now();
+            sweep(0, false);
+            let full_ms = started.elapsed().as_secs_f64() * 1e3;
+            let _ = crate::gpu_commit::zc_r2_wait(job, Some(&probe), Some(&probe_la), full_ms, hi_size);
+            if probe_head != head_compact {
+                // Restore the ordinary proof's layout before its head check.
+                run_cpu_sweep(0, false);
+            }
+        }
+        if inputs.dense_deltas.is_none() {
+            crate::gpu_commit::zc_r2_release_temporary_view(&compact.deltas);
+        }
+        crate::gpu_commit::zc_r2_finish_planes_tuning(true);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if PLANES && m == 32 { crate::gpu_commit::zc_r2_finish_planes_tuning(true); }
+
     // A head pair whose b rows are not all ones: the head-compacted state
     // cannot hold its b anchor and delta, so rewrite the whole state (anchors
     // and deltas only; the products above stand, they do not depend on the
@@ -2418,7 +2691,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         let a_base = unsafe { compact.anchors.as_mut_ptr().add(compact.anchor_index(0)) };
         let d_base = unsafe { compact.deltas.full_overwrite_ptr().add(compact.delta_offset(0)) };
         let a_stride = lo_size / 128 * kernels::aarch64::TC_ANCHORS_PER_BLOCK;
-        let d_stride = lo_size / 128 * kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK;
+        let d_stride = if PLANES { delta_chunk_size } else { lo_size / 128 * kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK };
         // Serial: this path never runs at the ranked shape, and a plain loop
         // adds no queue instantiation to the build.
         for x_hi in 0..hi_size {
@@ -2427,7 +2700,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
             let mut out = [F128::ZERO; 8];
             // SAFETY: chunk x_hi's anchor and delta ranges, one chunk at a time.
             unsafe {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                fold_round2_compact_chunk_neon_lookahead_8::<true, false, PLANES>(
                     table.data.as_ptr().cast::<u8>(),
                     a_packed.as_ptr().add(row_base * n_chunks),
                     b_packed.as_ptr().add(row_base * n_chunks),
@@ -2456,6 +2729,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // SAFETY: the lookahead writer has the same complete delta-store contract
     // as the standard writer. All hetero workers and the optional GPU-prefix
     // fallback have joined, covering every byte including padding rows.
+    // Adopted planes were initialized before entry and stayed read-only.
     unsafe { compact.deltas.mark_fully_initialized() };
 
     let (sum1, sum_inf) = partials
@@ -2807,7 +3081,6 @@ pub(crate) fn zc_k_bone_pack_enabled() -> bool {
 /// (the first `n_groups / 64 * 56` entries of `b_out`, see
 /// [`zc_k_bone_pack_enabled`]).
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fold2_compact_and_round45_into_packed(
     compact: &UniSkipCompactFold,
     table: &UniSkipFoldTable,
@@ -2818,62 +3091,15 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
     b_out: &mut [F128],
     pack: bool,
 ) -> (F128, F128, Round3Lookahead, bool, bool) {
-    let (m1, minf, la, packed, bpacked, _) = fold2_compact_and_round45_into_packed_gpu(
-        compact, table, rho1, rho2, r_next4, a_out, b_out, pack, false,
-    );
-    (m1, minf, la, packed, bpacked)
-}
-
-/// Outputs of the leading K chunks that the K pass GPU prefix arm folded (see
-/// `gpu_commit::ENV_NO_ZC_K_GPU`): `len_a` / `len_b` entries of the packed a
-/// and b-one-packed b layouts, held in the arm's process-lifetime buffers.
-/// The same entries of `a_out` / `b_out` were not written; the tri pass reads
-/// them from here. Valid until the next K pass.
-pub(crate) struct KGpuPrefix {
-    a: *const F128,
-    b: *const F128,
-    len_a: usize,
-    len_b: usize,
-}
-
-impl KGpuPrefix {
-    /// SAFETY: call before the next K pass of the process (which rewrites
-    /// the buffers).
-    pub(crate) unsafe fn slices<'a>(&self) -> (&'a [F128], &'a [F128]) {
-        unsafe {
-            (
-                std::slice::from_raw_parts(self.a, self.len_a),
-                std::slice::from_raw_parts(self.b, self.len_b),
-            )
-        }
-    }
-}
-
-/// [`fold2_compact_and_round45_into_packed`] with the K pass GPU prefix arm
-/// when `gpu` is set (b-one-packed tail-compacted pass only). Also returns the
-/// GPU prefix the tri pass must read in place of the leading entries of
-/// `a_out` / `b_out`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold2_compact_and_round45_into_packed_gpu(
-    compact: &UniSkipCompactFold,
-    table: &UniSkipFoldTable,
-    rho1: F128,
-    rho2: F128,
-    r_next4: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    pack: bool,
-    gpu: bool,
-) -> (F128, F128, Round3Lookahead, bool, bool, Option<KGpuPrefix>) {
     let bpack = pack && zc_k_bone_pack_enabled();
     if bpack {
-        if let Some(r) =
-            fold2_compact_and_round45_into_packed_b(compact, table, rho1, rho2, r_next4, a_out, b_out, pack, true, gpu)
+        if let Some((m1, minf, la, packed, bpacked)) =
+            fold2_compact_and_round45_into_packed_b(compact, table, rho1, rho2, r_next4, a_out, b_out, pack, true)
         {
-            return r;
+            return (m1, minf, la, packed, bpacked);
         }
     }
-    fold2_compact_and_round45_into_packed_b(compact, table, rho1, rho2, r_next4, a_out, b_out, pack, false, false)
+    fold2_compact_and_round45_into_packed_b(compact, table, rho1, rho2, r_next4, a_out, b_out, pack, false)
         .expect("a K pass without the b-one pack always completes")
 }
 
@@ -2891,9 +3117,7 @@ fn fold2_compact_and_round45_into_packed_b(
     b_out: &mut [F128],
     pack: bool,
     bpack: bool,
-    gpu: bool,
-) -> Option<(F128, F128, Round3Lookahead, bool, bool, Option<KGpuPrefix>)> {
-    let _ = gpu;
+) -> Option<(F128, F128, Round3Lookahead, bool, bool)> {
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
     assert!(n_groups >= 4 && n_groups.is_power_of_two());
@@ -2988,52 +3212,7 @@ fn fold2_compact_and_round45_into_packed_b(
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let b_block = 61;
     let b_failed = std::sync::atomic::AtomicBool::new(false);
-    // K pass GPU prefix arm (`FLOCK_NO_ZC_K_GPU` kills): the GPU folds the
-    // fixed leading chunks `0..cpu_base` into its own buffers, submitted
-    // before the CPU queue, which starts at `cpu_base`. Only on the
-    // tail-compacted b-one-packed pass (the arm's layouts). During the arm's
-    // first launch (oracle probe) `cpu_base == 0` and the queue is exactly the
-    // incumbent one.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    let gpu_job = {
-        let share = crate::gpu_commit::gpu_zc_k_share().min(hi_size);
-        if gpu && bpack && compact.tail_compact && share > 0 {
-            let hc = compact.head_compact;
-            let layout = crate::gpu_commit::ZcKLayout {
-                hc,
-                a_base: compact.anchor_index(0),
-                a_stride: if hc { kernels::aarch64::HC_ANCHORS_PER_BLOCK } else { kernels::aarch64::TC_ANCHORS_PER_BLOCK },
-                a_shift: if hc { kernels::aarch64::HC_ANCHOR_SHIFT } else { 0 },
-                d_base: compact.delta_offset(0),
-                d_stride: if hc {
-                    kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK
-                } else {
-                    kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK
-                },
-                d_shift: if hc { kernels::aarch64::HC_DELTA_SHIFT } else { 0 },
-            };
-            crate::gpu_commit::launch_zc_k_prefix(
-                &compact.anchors,
-                &compact.deltas,
-                &layout,
-                &table_l1,
-                rho2,
-                compact.head_b,
-                eq_lo,
-                eq_hi,
-                share,
-                out_chunk / 256 * 244,
-                out_chunk / 64 * b_block,
-            )
-        } else {
-            None
-        }
-    };
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    let cpu_base = gpu_job.as_ref().map_or(0, crate::gpu_commit::ZcKJob::cpu_base);
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3")))]
-    let cpu_base = 0usize;
-    let chunk_body = |x_hi: usize| {
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them. Packed: each of a
         // chunk's `out_chunk / 256` superblocks takes 244 entries.
@@ -3081,7 +3260,7 @@ fn fold2_compact_and_round45_into_packed_b(
                 (true, true) if one_table && pack => {
                     let ok = fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
-                        compact.tail_compact, compact.head_compact, compact.head_b,
+                        compact.tail_compact, compact.head_compact, compact.head_b, compact.deltas.is_preproduced(),
                     );
                     if !ok {
                         b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3091,14 +3270,14 @@ fn fold2_compact_and_round45_into_packed_b(
                 (true, true) if one_table => {
                     fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
-                        compact.tail_compact, compact.head_compact, compact.head_b,
+                        compact.tail_compact, compact.head_compact, compact.head_b, compact.deltas.is_preproduced(),
                     );
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => {
                     fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
-                        false, false, F128::ZERO,
+                        false, false, F128::ZERO, compact.deltas.is_preproduced(),
                     );
                 }
                 #[cfg(target_feature = "sha3")]
@@ -3132,50 +3311,7 @@ fn fold2_compact_and_round45_into_packed_b(
         unsafe {
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
-    };
-    crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
-
-    // Join the GPU prefix (it was submitted first and is normally done).
-    #[allow(unused_mut)]
-    let mut gpu_prefix: Option<KGpuPrefix> = None;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    if let Some(job) = gpu_job {
-        let calibration = job.calibration();
-        let chunks = job.chunks();
-        match crate::gpu_commit::zc_k_wait(job, hi_size) {
-            crate::gpu_commit::ZcKResult::Prefix { parts, a, b, len_a, len_b, b_ones } => {
-                if !b_ones {
-                    // A b output of the GPU's chunks that the pack skips is
-                    // not one: the pass reruns without the b-one pack, as
-                    // for the CPU's chunks.
-                    b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                } else if calibration {
-                    // Oracle probe: the CPU folded every chunk; the GPU's
-                    // outputs and weighted sums must equal the CPU's.
-                    if !b_failed.load(std::sync::atomic::Ordering::Relaxed) {
-                        // SAFETY: the joined job's buffers hold `len_a` / `len_b` entries.
-                        let (ga, gb) = unsafe {
-                            (std::slice::from_raw_parts(a, len_a), std::slice::from_raw_parts(b, len_b))
-                        };
-                        let equal = len_a <= a_out.len()
-                            && len_b <= b_out.len()
-                            && ga == &a_out[..len_a]
-                            && gb == &b_out[..len_b]
-                            && parts.as_slice() == &partials[..chunks];
-                        crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
-                    }
-                } else {
-                    partials[..chunks].copy_from_slice(&parts);
-                    gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
-                }
-            }
-            crate::gpu_commit::ZcKResult::Failed => {
-                // The GPU failed after admission: the CPU folds the prefix
-                // chunks with the same kernel (the arm is now disabled).
-                crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
-            }
-        }
-    }
+    });
     if b_failed.into_inner() {
         return None;
     }
@@ -3201,7 +3337,7 @@ fn fold2_compact_and_round45_into_packed_b(
         c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
     };
 
-    Some((r_next4[0] * sum1, sum_inf, la5, pack, bpack, gpu_prefix))
+    Some((r_next4[0] * sum1, sum_inf, la5, pack, bpack))
 }
 
 /// Portable reference for one cascade K chunk (non-AArch64 builds). Same
@@ -3858,38 +3994,6 @@ pub(crate) fn fold_cascade_t_into_packed(
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
-    fold_cascade_t_into_packed_prefix(a, b, packed, bpacked, None, a_out, b_out, rhos, r_next)
-}
-
-/// Entries `lo..hi` of an input whose leading `pre.len()` entries come from
-/// `pre` instead of `main` (a range across the boundary is assembled).
-fn prefixed_input<'a>(main: &'a [F128], pre: &'a [F128], lo: usize, hi: usize) -> std::borrow::Cow<'a, [F128]> {
-    let p = pre.len();
-    if hi <= p {
-        pre[lo..hi].into()
-    } else if lo >= p {
-        main[lo..hi].into()
-    } else {
-        [&pre[lo..], &main[p..hi]].concat().into()
-    }
-}
-
-/// [`fold_cascade_t_into_packed`] whose leading input entries come from
-/// `prefix = Some((pa, pb))` (the K pass GPU prefix, [`KGpuPrefix`]): entries
-/// `0..pa.len()` of `a` and `0..pb.len()` of `b` are read there, not in `a` /
-/// `b`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold_cascade_t_into_packed_prefix(
-    a: &[F128],
-    b: &[F128],
-    packed: bool,
-    bpacked: bool,
-    prefix: Option<(&[F128], &[F128])>,
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rhos: &[F128],
-    r_next: &[F128],
-) -> (F128, F128, Round3Lookahead, Lookahead2) {
     let depth = rhos.len();
     assert!(depth == 2 || depth == 3);
     let bpacked = packed && bpacked;
@@ -3942,12 +4046,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     };
     // The packed tri kernel tells the b layout from the slice length.
     let per_chunk_b = if bpacked { chunk_in / 64 * 56 } else { per_chunk };
-    let (pre_a, pre_b) = prefix.unwrap_or((&[], &[]));
-    assert!(pre_a.len() <= a.len() && pre_b.len() <= b.len());
-    let inputs = |x_hi: usize| -> (std::borrow::Cow<'_, [F128]>, std::borrow::Cow<'_, [F128]>) {
+    let inputs = |x_hi: usize| -> (&[F128], &[F128]) {
         (
-            prefixed_input(a, pre_a, x_hi * per_chunk, (x_hi + 1) * per_chunk),
-            prefixed_input(b, pre_b, x_hi * per_chunk_b, (x_hi + 1) * per_chunk_b),
+            &a[x_hi * per_chunk..(x_hi + 1) * per_chunk],
+            &b[x_hi * per_chunk_b..(x_hi + 1) * per_chunk_b],
         )
     };
     let chunk = |a_in: &[F128], b_in: &[F128], a_o: &mut [F128], b_o: &mut [F128]| -> [F128; 26] {
@@ -3997,7 +4099,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
                 )
             };
             let (a_in, b_in) = inputs(x_hi);
-            let outv = chunk(&a_in, &b_in, a_o, b_o);
+            let outv = chunk(a_in, b_in, a_o, b_o);
             // SAFETY: exclusive owner of partials[x_hi].
             unsafe {
                 *partials_base.ptr().add(x_hi) = outv;
@@ -4006,7 +4108,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
         partials
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
-        vec![chunk(&a_in, &b_in, a_out, b_out)]
+        vec![chunk(a_in, b_in, a_out, b_out)]
     } else {
         use rayon::prelude::*;
         a_out
@@ -4015,7 +4117,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
             .enumerate()
             .map(|(x_hi, (a_o, b_o))| {
                 let (a_in, b_in) = inputs(x_hi);
-                chunk(&a_in, &b_in, a_o, b_o)
+                chunk(a_in, b_in, a_o, b_o)
             })
             .collect()
     };
@@ -4986,6 +5088,8 @@ pub fn uni_skip_fold_and_round_pair_optimized(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "aarch64")]
+    include!("multilinear/delta_planes_tests.rs");
     use super::*;
 
     #[test]
@@ -5095,8 +5199,8 @@ mod tests {
         let mut b2 = vec![F128::ZERO; n_groups / 4];
         let mut run = |bpack: bool| {
             let t = std::time::Instant::now();
-            let (m1, minf, la, packed, bpacked, _) = fold2_compact_and_round45_into_packed_b(
-                &compact, &table, rho1, rho2, &r_next4, &mut a_out, &mut b_out, true, bpack, false,
+            let (m1, minf, la, packed, bpacked) = fold2_compact_and_round45_into_packed_b(
+                &compact, &table, rho1, rho2, &r_next4, &mut a_out, &mut b_out, true, bpack,
             )
             .expect("ranked b == 1 pairs");
             let k_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -5205,8 +5309,8 @@ mod tests {
         let mut b_out = vec![F128::ZERO; n_groups];
         let mut run = |c: &UniSkipCompactFold| {
             let t = std::time::Instant::now();
-            let (m1, minf, la, _, _, _) = fold2_compact_and_round45_into_packed_b(
-                c, &table, rho1, rho2, &r_next4, &mut a_out, &mut b_out, true, true, false,
+            let (m1, minf, la, _, _) = fold2_compact_and_round45_into_packed_b(
+                c, &table, rho1, rho2, &r_next4, &mut a_out, &mut b_out, true, true,
             )
             .expect("ranked b == 1 pairs");
             let k_ms = t.elapsed().as_secs_f64() * 1e3;
