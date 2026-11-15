@@ -19993,6 +19993,8 @@ kernel void zc_r2_products_horner_cs(
 }
 "#;
 
+    include!("gpu_commit/r2cs_fast.rs");
+
     /// Host mirror of the probe kernel's `ZcR2CsLayout` (see
     /// `UniSkipCompactFold::anchor_index` / `delta_offset`): anchors and
     /// delta bytes of block 0 (`anchor_index(0)`, `delta_offset(0)`), per
@@ -20422,7 +20424,7 @@ kernel void zc_r2_horner_oracle(
             let pool = gpu.pool_push();
             let built = (|| -> Result<Id, String> {
                 let mut source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled()).into_owned();
-                source.push_str(ZC_R2_CS_MSL_SOURCE);
+                source.push_str(&r2cs_fast::source(ZC_R2_CS_MSL_SOURCE));
                 let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
