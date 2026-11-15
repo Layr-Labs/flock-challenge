@@ -1493,6 +1493,42 @@ pub(crate) fn grind_spawn_drain_enabled() -> bool {
     *ON.get_or_init(|| gpack2_enabled() && !env_is_one(ENV_NO_GRIND_SPAWN_DRAIN))
 }
 
+/// Grind pack 3 (`FLOCK_NO_GPACK3=1`, exact, turns off both pieces below).
+/// Each piece changes only which thread runs a piece of work, or when it
+/// starts: every grind still returns the smallest qualifying nonce of the
+/// same ascending search, and every Merkle node is computed by the same
+/// kernels into the same slots, so the transcript and the proof bytes are
+/// unchanged.
+pub const ENV_NO_GPACK3: &str = "FLOCK_NO_GPACK3";
+
+/// Race caller scan (`FLOCK_NO_RACE_CALLER_SCAN=1`, exact, keeps the
+/// blocking two-pool race drain): in the CPU arm of the Metal/CPU grind race
+/// the calling thread scans chunks itself while the main pool and the
+/// efficiency-core helpers join asynchronously, and it returns as soon as the
+/// answer is definitive or the Metal arm has hit. Read once.
+pub const ENV_NO_RACE_CALLER_SCAN: &str = "FLOCK_NO_RACE_CALLER_SCAN";
+
+/// Opening subtree drain (`FLOCK_NO_SUBTREE_DRAIN=1`, exact, keeps the
+/// one-subtree-after-another loop): the 32 subtrees of the opening's
+/// 2^10-leaf recursive Merkle tree go through the caller-first chunk drain
+/// (`epool::run_caller_first_chunks`). Read once.
+pub const ENV_NO_SUBTREE_DRAIN: &str = "FLOCK_NO_SUBTREE_DRAIN";
+
+pub(crate) fn gpack3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !env_is_one(ENV_NO_GPACK3))
+}
+
+pub(crate) fn race_caller_scan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpack3_enabled() && !env_is_one(ENV_NO_RACE_CALLER_SCAN))
+}
+
+pub(crate) fn subtree_drain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpack3_enabled() && !env_is_one(ENV_NO_SUBTREE_DRAIN))
+}
+
 /// BLAKE3 state for the grind compression after round zero's seven
 /// nonce-independent quarter-rounds. The message is `state || nonce_lo ||
 /// nonce_hi || 0^6` (sixteen words), and the chaining value, counter and
