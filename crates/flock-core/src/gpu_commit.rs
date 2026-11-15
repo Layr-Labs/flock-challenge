@@ -21353,7 +21353,7 @@ kernel void zc_r2_horner_oracle(
 
     /// R2-CS share for the R2-CS ratio `r_cs`: the CPU skips every GPU
     /// chunk, so the balance point is `hi / (r_cs + 1)` (alpha 0), clamped
-    /// to `[hi/8, 0.37·hi]`. The incumbent's ratio
+    /// to `[hi/8, 0.42·hi]`. The incumbent's ratio
     /// limit [`ZC_R2_MAX_RATIO`] doubles for the R2-CS ratio; past it the
     /// incumbent's floor share and cut-off apply.
     fn zc_r2_cs_gate_share(ratio: f64, hi_size: usize) -> usize {
@@ -21369,7 +21369,7 @@ kernel void zc_r2_horner_oracle(
 
     /// The largest prefix R2-CS is ever handed (the share clamp's ceiling).
     fn zc_r2_cs_max_share(hi_size: usize) -> usize {
-        hi_size * 37 / 100
+        hi_size * 42 / 100
     }
 
     /// R2-CS admission once the calibration prove's sweep has joined: `ok` =
