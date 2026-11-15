@@ -3763,18 +3763,35 @@ impl AbGpuPrefix {
         }
     }
 
+    /// The CPU's handle on the GPU range (CPU/GPU split), when on.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn steal(&self) -> Option<crate::gpu_commit::ZcAbSteal> {
+        self.job.steal()
+    }
+
     /// Join the GPU. Admitted prove: writes the GPU's partials into
-    /// `partials[..cpu_base()]` and returns `true`. Oracle probe: compares
+    /// `partials[..cpu_base()]`, except the chunks the CPU took (`taken`),
+    /// and returns `true`. Oracle probe: compares
     /// the GPU's partials with the CPU's complete `partials` (verdict kept for
     /// the process) and returns `true`. `false` = the GPU failed after
     /// admission: the caller must CPU-compute `partials[..cpu_base()]`.
-    fn finish(self, partials: &mut [[F128; ELL]]) -> bool {
+    fn finish(self, partials: &mut [[F128; ELL]], taken: &[std::sync::atomic::AtomicBool]) -> bool {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let hi_size = partials.len();
             match crate::gpu_commit::zc_ab_wait(self.job, partials, hi_size) {
                 crate::gpu_commit::ZcAbResult::Prefix(gpu) => {
-                    partials[..gpu.len()].copy_from_slice(&gpu);
+                    let mut n_taken = 0usize;
+                    for (c, part) in gpu.iter().enumerate() {
+                        if taken.get(c).is_some_and(|t| t.load(std::sync::atomic::Ordering::Relaxed)) {
+                            n_taken += 1;
+                        } else {
+                            partials[c] = *part;
+                        }
+                    }
+                    if !taken.is_empty() && crate::gpu_commit::gpu_zc_ab_debug() {
+                        eprintln!("[zc-ab-gpu] split: CPU took {n_taken} of the GPU's {} chunks", gpu.len());
+                    }
                     true
                 }
                 crate::gpu_commit::ZcAbResult::Calibrated => true,
@@ -3783,7 +3800,7 @@ impl AbGpuPrefix {
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = partials;
+            let _ = (partials, taken);
             true
         }
     }
@@ -4116,9 +4133,42 @@ where
                 });
                 partial
             };
+            // CPU/GPU split (`FLOCK_NO_ZC_AB_STEAL` kills): after its own
+            // chunks the queue takes GPU-range chunks from the top down while
+            // the GPU has not started them; the first refusal ends it.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let steal = gpu_prefix.as_ref().and_then(AbGpuPrefix::steal);
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let steal_n = steal.map_or(0, |_| cpu_base);
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let steal_n = 0usize;
+            let taken: Vec<std::sync::atomic::AtomicBool> =
+                (0..steal_n).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+            let steal_stop = std::sync::atomic::AtomicBool::new(false);
+            let own_n = whole + 2 * split;
             let out = crate::epool::run_hetero_chunks_caller_tail(
-                whole + 2 * split,
+                own_n + steal_n,
                 |i| {
+                    if i >= own_n {
+                        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                        if let Some(h) = steal.as_ref() {
+                            use std::sync::atomic::Ordering;
+                            if steal_stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            let c = cpu_base - 1 - (i - own_n);
+                            if !h.try_take(c) {
+                                steal_stop.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                            taken[c].store(true, Ordering::Relaxed);
+                            let partial = fold_chunk(c, 0..big_lo_size);
+                            // SAFETY: chunk `c` is this index's alone (the
+                            // claim word), and the join publishes the write.
+                            unsafe { *partials_base.ptr().add(c) = partial };
+                        }
+                        return;
+                    }
                     let (x_hi, range) = if i < whole {
                         (cpu_base + i, 0..big_lo_size)
                     } else {
@@ -4161,7 +4211,7 @@ where
                     // The oracle probe compares against the CPU's complete
                     // per-chunk partials, so reassemble before joining.
                     reassemble(&mut partials);
-                    if !prefix.finish(&mut partials) {
+                    if !prefix.finish(&mut partials, &taken) {
                         // GPU failed after admission: CPU computes its chunks
                         // with the same kernel (the arm is now disabled).
                         crate::epool::run_hetero_chunks_caller_tail(
