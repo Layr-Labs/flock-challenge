@@ -13201,12 +13201,17 @@ kernel void blake3_pow_scan(
     /// chunk before eviction. `FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP=1` restores the
     /// original all-layer streaming suffix plus separate leaf-hash pass for an
     /// exact same-binary comparison.
-    /// S1 kill switch: `FLOCK_NO_HYBRID_GPU_SUFFIX_HASH=1` restores the CPU
-    /// suffix leaf/parent hashing.
+    /// S1 (the GPU hashes the CPU suffix's leaves and parents) is opt-in:
+    /// `FLOCK_HYBRID_GPU_SUFFIX_HASH=1` enables it. By default, and always
+    /// with `FLOCK_NO_HYBRID_GPU_SUFFIX_HASH=1`, the CPU hashes its own suffix
+    /// leaves and parents.
     fn hybrid_gpu_suffix_hash_enabled() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_GPU_SUFFIX_HASH").is_none())
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_HYBRID_GPU_SUFFIX_HASH").is_none()
+                && std::env::var("FLOCK_HYBRID_GPU_SUFFIX_HASH").is_ok_and(|v| v == "1")
+        })
     }
 
     fn hybrid_cpu_suffix_deep_pipeline_enabled() -> bool {
