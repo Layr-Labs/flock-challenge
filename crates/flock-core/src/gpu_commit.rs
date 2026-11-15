@@ -1412,6 +1412,112 @@ pub(crate) fn gpu_grind_enabled() -> bool {
     })
 }
 
+/// Grind pack (`FLOCK_NO_GPACK=1`, exact, turns off both pieces below): the
+/// Metal grind scan runs `blake3_pow_scan_v2` and the CPU grinds claim
+/// 480-nonce chunks. Neither changes which nonce a grind returns: every scan
+/// still reports the smallest qualifying nonce of its range, in the same
+/// ascending block order, so the transcript and the proof bytes are
+/// unchanged.
+pub const ENV_NO_GPACK: &str = "FLOCK_NO_GPACK";
+
+/// Metal grind scan v2 (`FLOCK_NO_GRIND_SCAN_V2=1`, exact, keeps
+/// `blake3_pow_scan`): round zero's seven nonce-independent quarter-rounds
+/// are computed once on the host (`pow_round0_pre`), and a fixed grid of
+/// 256-thread groups strides through the block in ascending order, each
+/// thread stopping once its next nonce cannot beat the best match so far, so
+/// a dispatch no longer launches and retires one thread per nonce of its
+/// block. Read once per process (at pipeline creation).
+pub const ENV_NO_GRIND_SCAN_V2: &str = "FLOCK_NO_GRIND_SCAN_V2";
+
+/// CPU grind chunks of 480 nonces (`FLOCK_NO_GRIND_CHUNK480=1`, exact, keeps
+/// 960): ten 48-nonce kernel batches per claim instead of twenty, which
+/// halves the ragged tail of the parallel grind drains. Chunking never
+/// changes the emitted nonce (lowest-chunk match rule).
+pub const ENV_NO_GRIND_CHUNK480: &str = "FLOCK_NO_GRIND_CHUNK480";
+
+fn env_is_one(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| v == "1")
+}
+
+pub(crate) fn gpack_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !env_is_one(ENV_NO_GPACK))
+}
+
+pub(crate) fn grind_scan_v2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpack_enabled() && !env_is_one(ENV_NO_GRIND_SCAN_V2))
+}
+
+pub(crate) fn grind_chunk480_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpack_enabled() && !env_is_one(ENV_NO_GRIND_CHUNK480))
+}
+
+/// Grind pack 2 (`FLOCK_NO_GPACK2=1`, exact, turns the whole item off). It
+/// changes only where a CPU grind's work runs; every grind still returns the
+/// smallest qualifying nonce of the same ascending search, so the transcript
+/// and the proof bytes are unchanged.
+pub const ENV_NO_GPACK2: &str = "FLOCK_NO_GPACK2";
+
+/// Spawned grind drain (`FLOCK_NO_GRIND_SPAWN_DRAIN=1`, exact, keeps the
+/// sequential scan and the two-pool block search): the CPU-only grinds in the
+/// spawned-drain bit range run on the calling thread plus the main pool,
+/// which joins asynchronously. Read once.
+pub const ENV_NO_GRIND_SPAWN_DRAIN: &str = "FLOCK_NO_GRIND_SPAWN_DRAIN";
+
+pub(crate) fn gpack2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !env_is_one(ENV_NO_GPACK2))
+}
+
+pub(crate) fn grind_spawn_drain_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gpack2_enabled() && !env_is_one(ENV_NO_GRIND_SPAWN_DRAIN))
+}
+
+/// BLAKE3 state for the grind compression after round zero's seven
+/// nonce-independent quarter-rounds. The message is `state || nonce_lo ||
+/// nonce_hi || 0^6` (sixteen words), and the chaining value, counter and
+/// flags are fixed, so the column step (message words 0..7) and three of the
+/// four diagonal quarter-rounds (message words 10..15, all zero) do not depend
+/// on the nonce. Words `0..16` are `v` after those seven quarter-rounds, with
+/// `v[0], v[5], v[10], v[15]` still holding their values before the one
+/// diagonal quarter-round that reads the nonce; words `16..24` are the state
+/// words, which the later rounds' message schedule reads.
+pub(crate) fn pow_round0_pre(state_digest: &[u8; 32]) -> [u32; 24] {
+    const IV: [u32; 8] = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+    ];
+    let m: [u32; 8] = core::array::from_fn(|i| {
+        u32::from_le_bytes(state_digest[4 * i..4 * i + 4].try_into().expect("4-byte word"))
+    });
+    let mut v: [u32; 16] = [
+        IV[0], IV[1], IV[2], IV[3], IV[4], IV[5], IV[6], IV[7], IV[0], IV[1], IV[2], IV[3], 0, 0, 64, 11,
+    ];
+    let mut g = |a: usize, b: usize, c: usize, d: usize, x: u32, y: u32| {
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+        v[d] = (v[d] ^ v[a]).rotate_right(16);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(12);
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+        v[d] = (v[d] ^ v[a]).rotate_right(8);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(7);
+    };
+    g(0, 4, 8, 12, m[0], m[1]);
+    g(1, 5, 9, 13, m[2], m[3]);
+    g(2, 6, 10, 14, m[4], m[5]);
+    g(3, 7, 11, 15, m[6], m[7]);
+    g(1, 6, 11, 12, 0, 0);
+    g(2, 7, 8, 13, 0, 0);
+    g(3, 4, 9, 14, 0, 0);
+    let mut out = [0u32; 24];
+    out[..16].copy_from_slice(&v);
+    out[16..].copy_from_slice(&m);
+    out
+}
+
 pub(crate) fn gpu_keepwarm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_KEEPWARM).is_none())
@@ -8493,6 +8599,72 @@ kernel void blake3_pow_scan(
         atomic_fetch_min_explicit(best, id, memory_order_relaxed);
     }
 }
+
+// pow_compress0 with round zero's seven nonce-independent quarter-rounds
+// done on the host (`pow_round0_pre`): pre[0..16) is v after them, with
+// v0, v5, v10, v15 still before the diagonal quarter-round that reads the
+// nonce words; pre[16..24) are the state words. The remaining six rounds are
+// pow_compress0's, over the same two-buffer message schedule.
+static inline uint pow_compress0_pre(constant uint* pre, uint nonce_lo, uint nonce_hi) {
+    uint v[16];
+    uint m[16];
+    uint mm[16];
+    for (uint i = 0u; i < 16u; i++) v[i] = pre[i];
+    #define POW_G(a,b,c,d,x,y) \
+        v[a] = v[a] + v[b] + x; v[d] = rotate(v[d]^v[a], 16u); \
+        v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 20u); \
+        v[a] = v[a] + v[b] + y; v[d] = rotate(v[d]^v[a], 24u); \
+        v[c] = v[c] + v[d];     v[b] = rotate(v[b]^v[c], 25u);
+    #define POW_ROUND(buf) \
+        POW_G(0,4,8,12,  buf[0], buf[1]);  POW_G(1,5,9,13,  buf[2], buf[3]); \
+        POW_G(2,6,10,14, buf[4], buf[5]);  POW_G(3,7,11,15, buf[6], buf[7]); \
+        POW_G(0,5,10,15, buf[8], buf[9]);  POW_G(1,6,11,12, buf[10], buf[11]); \
+        POW_G(2,7,8,13,  buf[12], buf[13]); POW_G(3,4,9,14,  buf[14], buf[15]);
+    POW_G(0,5,10,15, nonce_lo, nonce_hi);
+    // Round one reads PERM of the original message.
+    for (uint i = 0u; i < 8u; i++) mm[i] = pre[16u + i];
+    mm[8] = nonce_lo;
+    mm[9] = nonce_hi;
+    for (uint i = 10u; i < 16u; i++) mm[i] = 0u;
+    for (uint i = 0u; i < 16u; i++) m[i] = mm[POW_PERM[i]];
+    // Rounds one to six: (m, mm) three times; each gather is one PERM.
+    for (uint round = 1u; round < 7u; round += 2u) {
+        POW_ROUND(m)
+        for (uint i = 0u; i < 16u; i++) mm[i] = m[POW_PERM[i]];
+        POW_ROUND(mm)
+        if (round + 2u < 7u) {
+            for (uint i = 0u; i < 16u; i++) m[i] = mm[POW_PERM[i]];
+        }
+    }
+    #undef POW_ROUND
+    #undef POW_G
+    return v[0] ^ v[8u];
+}
+
+// blake3_pow_scan's block scan on a fixed grid: thread t visits offsets
+// t, t + T, t + 2T, ... (T = threads in the grid) in ascending order and
+// stops at its first match or once its next offset cannot beat `best`. The
+// smallest matching offset m is still found: no match below m exists, so
+// `best` never drops below m and m's thread reaches it.
+kernel void blake3_pow_scan_v2(
+    constant uint* pre         [[buffer(0)]],
+    device atomic_uint* best   [[buffer(1)]],
+    constant PowParams& params [[buffer(2)]],
+    uint t [[thread_position_in_grid]],
+    uint grid [[threads_per_grid]])
+{
+    for (uint id = t; id < params.len; id += grid) {
+        if (id >= atomic_load_explicit(best, memory_order_relaxed)) return;
+        uint nonce_lo = params.start_lo + id;
+        uint carry = nonce_lo < params.start_lo ? 1u : 0u;
+        uint nonce_hi = params.start_hi + carry;
+        uint cv0 = pow_compress0_pre(pre, nonce_lo, nonce_hi);
+        if (pow_has_leading_zero_bits(cv0, params.bits)) {
+            atomic_fetch_min_explicit(best, id, memory_order_relaxed);
+            return;
+        }
+    }
+}
 "#;
 
     // -----------------------------------------------------------------------
@@ -8657,6 +8829,8 @@ kernel void blake3_pow_scan(
         pub(crate) pso_pow: Id,
         pub(crate) pow_out: Id,
         pub(crate) pow_lock: std::sync::Mutex<()>,
+        /// `pso_pow` is `blake3_pow_scan_v2` (see `ENV_NO_GRIND_SCAN_V2`).
+        pub(crate) pow_v2: bool,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -9108,6 +9282,7 @@ kernel void blake3_pow_scan(
                     (NIL, NIL)
                 };
 
+                let pow_v2 = super::grind_scan_v2_enabled();
                 let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
                     // This optimization is supplemental: a compile/pipeline/
                     // allocation failure must not poison the already-valid
@@ -9131,7 +9306,7 @@ kernel void blake3_pow_scan(
                                 api.error_string(err)
                             ));
                         }
-                        let ns = api.nsstring("blake3_pow_scan")?;
+                        let ns = api.nsstring(if pow_v2 { "blake3_pow_scan_v2" } else { "blake3_pow_scan" })?;
                         let function: Id = send!(
                             api,
                             unsafe extern "C" fn(Id, Sel, Id) -> Id,
@@ -9484,6 +9659,7 @@ kernel void blake3_pow_scan(
                     pso_pow,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
+                    pow_v2,
                 })
             })();
             pool_pop(pool);
@@ -15301,6 +15477,27 @@ kernel void blake3_pow_scan(
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
                 gpu.set_pipeline(enc, gpu.pso_pow);
+                if gpu.pow_v2 {
+                    // v2: round zero precomputed here; a fixed grid of
+                    // 256-thread groups strides the block (at most
+                    // POW_V2_GRID threads, never more than the block needs).
+                    const POW_V2_TG: u64 = 256;
+                    const POW_V2_GRID: u64 = 1 << 16;
+                    let pre = super::pow_round0_pre(state_digest);
+                    let pre_bytes = core::slice::from_raw_parts(
+                        pre.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(&pre),
+                    );
+                    gpu.set_bytes(enc, pre_bytes, 0);
+                    gpu.set_buffer(enc, gpu.pow_out, 0, 1);
+                    gpu.set_bytes(enc, params_bytes, 2);
+                    let groups = u64::from(len).div_ceil(POW_V2_TG).min(POW_V2_GRID / POW_V2_TG);
+                    gpu.dispatch(enc, groups, POW_V2_TG);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_spin(cb, 4.0)?;
+                    let offset = out.read_volatile();
+                    return Ok((offset != u32::MAX).then(|| start + u64::from(offset)));
+                }
                 gpu.set_bytes(enc, state_digest, 0);
                 gpu.set_buffer(enc, gpu.pow_out, 0, 1);
                 gpu.set_bytes(enc, params_bytes, 2);
@@ -21700,8 +21897,6 @@ kernel void zc_ab_finish(
 }
 "#;
 
-    include!("gpu_commit/ab_mul9.rs");
-
     /// Chunk geometry the kernel is built for: 4096 `x_lo` rows of 1 KiB.
     const ZC_AB_CHUNK_SHIFT: u32 = 22;
     const ZC_AB_MAX_CHUNKS: usize = 128;
@@ -21768,8 +21963,7 @@ kernel void zc_ab_finish(
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<(Id, Id, Id), String> {
-                let source = ab_mul9::source(ZC_AB_MSL_SOURCE);
-                let src = gpu.api.nsstring(&source)?;
+                let src = gpu.api.nsstring(ZC_AB_MSL_SOURCE)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
                     gpu.api,
@@ -26025,6 +26219,70 @@ mod tests {
                 None => return,
             };
             assert_eq!(got, expected, "start={start} len={len} bits={bits}");
+        }
+        // More digests, blocks wider than the v2 grid, a block start just
+        // below the 32-bit carry, a hit-free block, and a 1-nonce block.
+        for d in 0u8..6 {
+            let digest: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(53).wrapping_add(d.wrapping_mul(29)));
+            for (start, len, bits) in [
+                (0u64, 1u32 << 18, 14u32),
+                (7, (1u32 << 17) + 5, 13u32),
+                (u64::from(u32::MAX) - 1_000, 1u32 << 16, 9u32),
+                (12_345, 1u32 << 10, 30u32),
+                (3, 1, 1u32),
+            ] {
+                let expected = cpu(&digest, start, len, bits);
+                let got = match gpu_or_skip(gpu_blake3_pow_scan(&digest, start, len, bits)) {
+                    Some(result) => result,
+                    None => return,
+                };
+                assert_eq!(got, expected, "digest={d} start={start} len={len} bits={bits}");
+            }
+        }
+    }
+
+    /// `pow_round0_pre` reproduces BLAKE3: finishing the compression from it
+    /// on the CPU gives the first word of `blake3(state || nonce || 0^24)`.
+    #[test]
+    fn pow_round0_pre_matches_blake3() {
+        const PERM: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+        fn g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, x: u32, y: u32) {
+            v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+            v[d] = (v[d] ^ v[a]).rotate_right(16);
+            v[c] = v[c].wrapping_add(v[d]);
+            v[b] = (v[b] ^ v[c]).rotate_right(12);
+            v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+            v[d] = (v[d] ^ v[a]).rotate_right(8);
+            v[c] = v[c].wrapping_add(v[d]);
+            v[b] = (v[b] ^ v[c]).rotate_right(7);
+        }
+        for d in 0u8..4 {
+            let digest: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(97).wrapping_add(d));
+            let pre = super::pow_round0_pre(&digest);
+            for nonce in [0u64, 1, 0xFFFF_FFFF, 0x1_0000_0000, 0x1234_5678_9ABC] {
+                let mut v: [u32; 16] = pre[..16].try_into().unwrap();
+                g(&mut v, 0, 5, 10, 15, nonce as u32, (nonce >> 32) as u32);
+                let mut msg = [0u32; 16];
+                msg[..8].copy_from_slice(&pre[16..]);
+                msg[8] = nonce as u32;
+                msg[9] = (nonce >> 32) as u32;
+                for _ in 1..7 {
+                    msg = core::array::from_fn(|i| msg[PERM[i]]);
+                    g(&mut v, 0, 4, 8, 12, msg[0], msg[1]);
+                    g(&mut v, 1, 5, 9, 13, msg[2], msg[3]);
+                    g(&mut v, 2, 6, 10, 14, msg[4], msg[5]);
+                    g(&mut v, 3, 7, 11, 15, msg[6], msg[7]);
+                    g(&mut v, 0, 5, 10, 15, msg[8], msg[9]);
+                    g(&mut v, 1, 6, 11, 12, msg[10], msg[11]);
+                    g(&mut v, 2, 7, 8, 13, msg[12], msg[13]);
+                    g(&mut v, 3, 4, 9, 14, msg[14], msg[15]);
+                }
+                let mut preimage = [0u8; 64];
+                preimage[..32].copy_from_slice(&digest);
+                preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
+                let want = u32::from_le_bytes(blake3::hash(&preimage).as_bytes()[..4].try_into().unwrap());
+                assert_eq!(v[0] ^ v[8], want, "digest={d} nonce={nonce}");
+            }
         }
     }
 
