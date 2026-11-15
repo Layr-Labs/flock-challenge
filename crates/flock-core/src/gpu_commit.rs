@@ -809,10 +809,10 @@ pub const ENV_NO_ZC_K_GPU: &str = "FLOCK_NO_ZC_K_GPU";
 
 /// Fixed GPU chunk share of the K pass arm: `FLOCK_ZC_K_GPU_CHUNKS=<n>`
 /// (`0` = off), clamped to the chunk count. Unset = [`ZC_K_GPU_DEFAULT_CHUNKS`]
-/// of the 2048 K chunks of the ranked shape (3/16). A non-integer value fails
+/// of the 2048 K chunks of the ranked shape (1/4). A non-integer value fails
 /// loudly.
 pub const ENV_ZC_K_GPU_CHUNKS: &str = "FLOCK_ZC_K_GPU_CHUNKS";
-const ZC_K_GPU_DEFAULT_CHUNKS: usize = 384;
+const ZC_K_GPU_DEFAULT_CHUNKS: usize = 512;
 
 /// Kill switch for mapping the K pass arm's anchors view during round two
 /// (`FLOCK_NO_ZC_K_PREMAP`, any value): the K launch then creates the view
