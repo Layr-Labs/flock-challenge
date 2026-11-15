@@ -808,6 +808,26 @@ pub(crate) fn zc_k_handover_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for R2-CS's wide share (any value): the R2-CS share stays
+/// clamped to `0.37·hi`, and the K pass arm's early premap keeps its own
+/// length, as before. With it on, a process whose R2-CS balance point lies
+/// at or above that clamp takes the larger of the clamp and the share at
+/// which the GPU's modelled finish is 85 % of the CPU's, at the price
+/// `ZC_R2_CS_WIDE_PRICE` and at most `hi/2`. The K arm's anchors view that a
+/// timed round two binds is then made with the length of that share's dense
+/// anchors prefix when it is longer than the K arm's: the view the K pass
+/// keeps for the next prove (`ENV_NO_ZC_K_HANDOVER`) and the one the early
+/// step makes before round one, both bound by the touch dispatch on the
+/// second queue. A timed prefix never takes more chunks than its view
+/// covers. A share below the clamp is the record's. Read once per process.
+pub const ENV_NO_ZC_R2_CS_WIDE: &str = "FLOCK_NO_ZC_R2_CS_WIDE";
+
+pub(crate) fn zc_r2_cs_wide_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_R2_CS_WIDE).is_none());
+    *ON
+}
+
 /// Kill switch for the round-one AB completion GPU prefix arm (any value
 /// restores the exact CPU-only completion). With the arm on, the GPU computes
 /// the per-chunk 64-lane partials of a leading prefix of the 128 `x_hi`
@@ -20014,6 +20034,12 @@ kernel void zc_r2_products_horner_cs(
             (16 * (self.a_base + blocks * self.a_stride), self.d_base + blocks * self.d_stride)
         }
 
+        /// The most whole chunks of `blocks_per_chunk` blocks whose anchors
+        /// stores end within `view_bytes` (the inverse of [`Self::ends`]).
+        fn chunks_within(&self, view_bytes: usize, blocks_per_chunk: usize) -> usize {
+            (view_bytes / 16).saturating_sub(self.a_base) / self.a_stride.max(1) / blocks_per_chunk.max(1)
+        }
+
         /// Scratch bytes (anchors, deltas) covering `blocks` 128-pair blocks,
         /// whole pages.
         fn scratch_bytes(&self, blocks: usize) -> (usize, usize) {
@@ -20172,6 +20198,17 @@ kernel void zc_r2_horner_oracle(
     /// kernel's does not (the warm-up GPU clock), and no extra warm-up
     /// replays are spent on it.
     const ZC_R2_CS_PRICE: f64 = 1.75;
+    /// R2-CS wide share (`super::ENV_NO_ZC_R2_CS_WIDE`): the price above the
+    /// clamp, the R2-CS kernel's cost per chunk over the incumbent kernel's
+    /// at the same clock (both in one process's warm-up). Products alone
+    /// would give 69,664 / 33,040 = 2.11 per chunk; both kernels also make
+    /// the same 991,232 threadgroup lookups and read the same 495,616 bytes,
+    /// and only the R2-CS kernel stores the compact state (about 0.72 MB).
+    const ZC_R2_CS_WIDE_PRICE: f64 = 1.9;
+    /// The wide share's bound: the GPU's modelled finish at most this
+    /// fraction of the CPU's, so a GPU up to 1/0.85 - 1 = 17.6 % slower than
+    /// modelled still finishes before the CPU.
+    const ZC_R2_CS_WIDE_MARGIN: f64 = 0.85;
 
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
@@ -21042,6 +21079,36 @@ kernel void zc_r2_horner_oracle(
         if chunks == 0 {
             return None;
         }
+        // R2-CS wide share (`super::ENV_NO_ZC_R2_CS_WIDE`): a timed prefix past
+        // the clamp never takes more chunks than this prove's anchors view
+        // covers. The view is made before round two (the early step, or the
+        // previous prove's K pass) with the share's length; were it shorter,
+        // the prefix falls back to the chunks it covers, which include the
+        // clamp's, instead of a new view. Below the clamp, or with no view,
+        // nothing changes.
+        let chunks = match (cs_layout, cs_live) {
+            (Some(l), Some((a_ptr, _, _)))
+                if !calibration
+                    && super::zc_r2_cs_wide_enabled()
+                    && chunks > zc_r2_cs_max_share(hi_size)
+                    && lo_size.is_multiple_of(128)
+                    && ZC_R2_CS_MODE.load(Ordering::Relaxed) == ZC_R2_CS_ADMITTED =>
+            {
+                let covered = zc_k_premap_len(a_ptr).map_or(0, |len| l.chunks_within(len, lo_size / 128));
+                if covered < chunks && covered >= zc_r2_cs_max_share(hi_size) {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-r2] R2-CS: the anchors view covers {covered} of the share's {chunks} chunks; \
+                             prefix {covered}"
+                        );
+                    }
+                    covered
+                } else {
+                    chunks
+                }
+            }
+            _ => chunks,
+        };
         let horner =
             super::gpu_zc_r2_horner_enabled() && super::zc_r2_horner_weights(eq_lo, lo_size);
         let gpu = gpu().ok()?;
@@ -21181,13 +21248,18 @@ kernel void zc_r2_horner_oracle(
                     // +1 references of this prove's existing views, both
                     // starting at their allocation's base (no view is made
                     // here: two no-copy views may never overlap).
+                    let mut d_view_len = 0usize;
                     let views = ZcR2CsViews([
                         zc_k_premap_peek(gpu, a_ptr, need_a).unwrap_or(NIL),
                         match zc_k_view_peek(gpu, d_ptr, d_len, need_d) {
-                            Ok(Some((_, v))) => v,
+                            Ok(Some((dl, v))) => {
+                                d_view_len = dl;
+                                v
+                            }
                             _ => NIL,
                         },
                     ]);
+                    let touch = if super::gpu_zc_r2_debug() { zc_k_premap_touch_take() } else { None };
                     if views.0.iter().any(|v| v.is_null()) {
                         if super::gpu_zc_r2_debug() {
                             eprintln!(
@@ -21196,6 +21268,19 @@ kernel void zc_r2_horner_oracle(
                             );
                         }
                         return None;
+                    }
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-r2] R2-CS views: {chunks} chunks; anchors {need_a} B in the premapped view{}; \
+                             deltas {need_d} B in round one's view ({d_view_len} B)",
+                            match touch {
+                                Some((done, ms, len)) => format!(
+                                    " ({len} B, its touch {} {ms:.2} ms after commit)",
+                                    if done { "completed" } else { "NOT completed" }
+                                ),
+                                None => String::new(),
+                            },
+                        );
                     }
                     let bind = ZcR2CsBind { layout: l, anchors: views.0[0], deltas: views.0[1] };
                     Some((bind, views))
@@ -21372,8 +21457,10 @@ kernel void zc_r2_horner_oracle(
     /// chunk, so the balance point is `hi / (r_cs + 1)` (alpha 0), clamped
     /// to `[hi/8, 0.37·hi]`. The incumbent's ratio
     /// limit [`ZC_R2_MAX_RATIO`] doubles for the R2-CS ratio; past it the
-    /// incumbent's floor share and cut-off apply.
-    fn zc_r2_cs_gate_share(ratio: f64, hi_size: usize) -> usize {
+    /// incumbent's floor share and cut-off apply. A balance point at or
+    /// above the clamp's ceiling takes the wide share instead when it is
+    /// larger ([`zc_r2_cs_wide_share`], `super::ENV_NO_ZC_R2_CS_WIDE`).
+    pub(crate) fn zc_r2_cs_gate_share(ratio: f64, hi_size: usize) -> usize {
         if !ratio.is_finite() || ratio <= 0.0 {
             return 0;
         }
@@ -21381,12 +21468,46 @@ kernel void zc_r2_horner_oracle(
             return if ratio < ZC_R2_FLOOR_MAX_RATIO { hi_size / 8 } else { 0 };
         }
         let g = (hi_size as f64 / (ratio + 1.0)).round() as usize;
-        g.clamp(hi_size / 8, zc_r2_cs_max_share(hi_size))
+        let cap = zc_r2_cs_max_share(hi_size);
+        if g >= cap && super::zc_r2_cs_wide_enabled() {
+            return cap.max(zc_r2_cs_wide_share(ratio, hi_size));
+        }
+        g.clamp(hi_size / 8, cap)
     }
 
-    /// The largest prefix R2-CS is ever handed (the share clamp's ceiling).
+    /// The clamp's ceiling: the largest prefix R2-CS is handed with the wide
+    /// share off, or when its balance point lies below it.
     fn zc_r2_cs_max_share(hi_size: usize) -> usize {
         hi_size * 37 / 100
+    }
+
+    /// The wide share for the R2-CS ratio `ratio` (at `ZC_R2_CS_PRICE`):
+    /// rescaled to `ZC_R2_CS_WIDE_PRICE`, the smaller of the balance point
+    /// `hi / (r + 1)` and the share `0.85·hi / (r + 0.85)` whose GPU finish
+    /// is 0.85 of the CPU's (always the smaller), and at most `hi/2`.
+    fn zc_r2_cs_wide_share(ratio: f64, hi_size: usize) -> usize {
+        let r = ratio * (ZC_R2_CS_WIDE_PRICE / ZC_R2_CS_PRICE);
+        let hi = hi_size as f64;
+        let balance = (hi / (r + 1.0)).round();
+        let bound = (ZC_R2_CS_WIDE_MARGIN * hi / (r + ZC_R2_CS_WIDE_MARGIN)).floor();
+        (balance.min(bound) as usize).min(hi_size / 2)
+    }
+
+    /// R2-CS wide share (`super::ENV_NO_ZC_R2_CS_WIDE`): the chunks of this
+    /// process's admitted R2-CS share when it exceeds the clamp, which the K
+    /// view made for a timed round two (kept by the previous prove's K pass,
+    /// [`zc_k_handover_keep`], or made by the early step, [`zc_k_premap`])
+    /// must also cover; 0 otherwise (that view keeps the K arm's length).
+    pub(crate) fn zc_r2_cs_wide_chunks(hi_size: usize) -> usize {
+        use std::sync::atomic::Ordering;
+        if !super::zc_r2_cs_wide_enabled() || ZC_R2_CS_MODE.load(Ordering::Relaxed) != ZC_R2_CS_ADMITTED {
+            return 0;
+        }
+        match ZC_R2_TUNED.load(Ordering::Relaxed) {
+            0 | usize::MAX => 0,
+            g if g > zc_r2_cs_max_share(hi_size) => g.min(hi_size),
+            _ => 0,
+        }
     }
 
     /// R2-CS admission once the calibration prove's sweep has joined: `ok` =
@@ -21433,10 +21554,17 @@ kernel void zc_r2_horner_oracle(
             if admitted {
                 eprintln!(
                     "[zc-r2] R2-CS oracle: products, lookahead partials and compact bytes EQUAL \
-                     ({chunks} chunks) -> active, share {share}/{hi_size} (r_cs {:.3}, clamp [{}, {}])",
+                     ({chunks} chunks) -> active, share {share}/{hi_size} (r_cs {:.3}, clamp [{}, {}], wide {})",
                     f64::from_bits(ZC_R2_CS_RATIO.load(Ordering::Relaxed)),
                     hi_size / 8,
                     zc_r2_cs_max_share(hi_size),
+                    if !super::zc_r2_cs_wide_enabled() {
+                        "off".to_string()
+                    } else if share > zc_r2_cs_max_share(hi_size) {
+                        format!("{share} past the clamp, the K view made before round two covers it")
+                    } else {
+                        "not taken".to_string()
+                    },
                 );
             } else {
                 eprintln!("[zc-r2] R2-CS not admitted -> disabled for the process (incumbent split)");
@@ -21475,9 +21603,11 @@ kernel void zc_r2_horner_oracle(
             // (first status poll, zero cost) or within a hair of it — a
             // bounded spin dodges the ~0.3-0.5 ms `waitUntilCompleted` park
             // once per timed prove.
+            let t_wait = job.submitted.map(|_| std::time::Instant::now());
             if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
                 return poison(job.cb);
             }
+            let wait_ms = t_wait.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e3);
             let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
             let state_mutex = match zc_r2_state() {
                 Some(s) => s,
@@ -21540,7 +21670,7 @@ kernel void zc_r2_horner_oracle(
                 if let Some(submitted) = job.submitted {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
-                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}{}",
+                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms wait={wait_ms:.3}ms horner={}{}",
                         job.chunks,
                         hi_size,
                         submitted.elapsed().as_secs_f64() * 1e3,
@@ -22885,6 +23015,28 @@ kernel void zc_ab_finish(
         slot.take().map(|(p, l, v)| (p, l, v as Id))
     }
 
+    /// Debug only (`FLOCK_ZC_R2_GPU_DEBUG`): the latest premap's touch
+    /// command buffer (+1), its commit instant and the view's length.
+    static ZC_K_PREMAP_TOUCH: std::sync::Mutex<Option<(usize, std::time::Instant, usize)>> =
+        std::sync::Mutex::new(None);
+
+    /// Debug only: takes the latest premap's touch, returning (completed,
+    /// ms since its commit, view length) and releasing it.
+    fn zc_k_premap_touch_take() -> Option<(bool, f64, usize)> {
+        let taken = match ZC_K_PREMAP_TOUCH.lock() {
+            Ok(mut s) => s.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        let (cb, at, len) = taken?;
+        let gpu = gpu().ok()?;
+        unsafe {
+            // MTLCommandBufferStatusCompleted = 4.
+            let done = gpu.cb_status(cb as Id) == 4;
+            gpu.release(cb as Id);
+            Some((done, at.elapsed().as_secs_f64() * 1e3, len))
+        }
+    }
+
     /// Releases a premapped view the K launch did not use.
     struct ZcKPremap(Option<(usize, usize, Id)>);
 
@@ -23034,12 +23186,36 @@ kernel void zc_ab_finish(
                     }
                     Err(_) => false,
                 };
+            if ok && super::gpu_zc_r2_debug() {
+                // Debug only: R2-CS reports whether this touch completed
+                // before its launch binds the view (the latest one is kept).
+                let mut slot = match ZC_K_PREMAP_TOUCH.lock() {
+                    Ok(s) => s,
+                    Err(p) => p.into_inner(),
+                };
+                if let Some((stale, _, _)) = slot.replace((gpu.retain(cb) as usize, std::time::Instant::now(), len)) {
+                    gpu.release(stale as Id);
+                }
+            }
             gpu.pool_pop(pool);
             if !ok {
                 gpu.release(view);
                 return None;
             }
             Some((ptr, len, view as usize))
+        }
+    }
+
+    /// R2-CS wide share: the byte length of this prove's premapped anchors
+    /// view when it starts at `ptr`.
+    fn zc_k_premap_len(ptr: usize) -> Option<usize> {
+        let slot = match ZC_K_PREMAP.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        match *slot {
+            Some((p, l, _)) if p == ptr => Some(l),
+            _ => None,
         }
     }
 
@@ -25546,6 +25722,7 @@ pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 pub(crate) use imp::{
     ZcR2CsLayout, launch_zc_r2_products_cs, zc_k_handover_keep, zc_k_handover_take, zc_r2_cs_oracle,
     zc_r2_cs_premap_early, zc_r2_cs_prewarm, zc_r2_cs_prewarm_wanted, zc_r2_cs_verdict,
+    zc_r2_cs_wide_chunks,
 };
 
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
@@ -28388,6 +28565,33 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
         assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
         assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn zc_r2_cs_gate_share_policy() {
+        use imp::zc_r2_cs_gate_share;
+        if std::env::var_os(super::ENV_NO_ZC_R2_CS_WIDE).is_some() {
+            return;
+        }
+        // Balance point below the clamp's ceiling (757 of 2048): unchanged.
+        assert_eq!(zc_r2_cs_gate_share(2.126, 2048), 655); // 2048/3.126
+        assert_eq!(zc_r2_cs_gate_share(1.92, 2048), 701);
+        assert_eq!(zc_r2_cs_gate_share(1.71, 2048), 756);
+        assert_eq!(zc_r2_cs_gate_share(3.5, 2048), 455);
+        // At or above it, never below the ceiling...
+        assert_eq!(zc_r2_cs_gate_share(1.705, 2048), 757);
+        assert_eq!(zc_r2_cs_gate_share(1.4, 2048), 757); // bound 734
+        // ...and the 0.85 bound at price 1.9 where it is larger: incumbent
+        // ratio 0.57 (r_cs 0.9975) and 0.5; at most hi/2 from ratio 0.447.
+        assert_eq!(zc_r2_cs_gate_share(0.9975, 2048), 900);
+        assert_eq!(zc_r2_cs_gate_share(0.875, 2048), 967);
+        assert_eq!(zc_r2_cs_gate_share(0.21875, 2048), 1024);
+        assert_eq!(zc_r2_cs_gate_share(0.2, 2048), 1024);
+        // Floor and cut-off as before.
+        assert_eq!(zc_r2_cs_gate_share(4.01, 2048), 256);
+        assert_eq!(zc_r2_cs_gate_share(8.0, 2048), 0);
+        assert_eq!(zc_r2_cs_gate_share(f64::NAN, 2048), 0);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
