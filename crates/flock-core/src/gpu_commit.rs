@@ -735,6 +735,22 @@ fn zc_r2_horner_weights(eq_lo: &[F128], lo_size: usize) -> bool {
     true
 }
 
+/// Kill switch for the round-two GPU arm's 16-bit carry-less pieces
+/// (`FLOCK_NO_GPU_ZC_R2_CLMUL16`, any value): the record's two-level
+/// Karatsuba over radix-16 planes (nine 32x32 -> 64 products per 32x32
+/// carry-less product). With it on, each 32x32 carry-less product is one
+/// Karatsuba step over 16-bit halves, each half product from nine native
+/// 32-bit products of bit-position-mod-3 parts (no carry reaches a kept bit;
+/// no 64-bit multiplies): ~3x less GPU time per chunk on an M1 Max, and the
+/// gate's measured ratio raises the share accordingly. Same products.
+pub const ENV_NO_GPU_ZC_R2_CLMUL16: &str = "FLOCK_NO_GPU_ZC_R2_CLMUL16";
+
+fn gpu_zc_r2_clmul16_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2_CLMUL16).is_none());
+    *ON
+}
+
 pub(crate) fn gpu_zc_r2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2).is_none());
@@ -783,6 +799,23 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
         }
     });
     if gpu_commit_enabled() { *SHARE } else { 0 }
+}
+
+/// Kill switch for submitting the round-one AB completion arm as one command
+/// buffer (`FLOCK_NO_ZC_AB_SCHED`, any value, read once per process): the
+/// table build is committed as its own command buffer ahead of the gather and
+/// finish, as before. With the switch unset, the table build, the gather and
+/// the finish are encoded into a single command buffer (the table build's
+/// encoder first, then the gather and finish encoder), so no other work on the
+/// queue can be scheduled between the build and the gather, and the arm pays
+/// one command buffer's start instead of two. The kernels, their inputs,
+/// their order and every output are the same.
+pub const ENV_NO_ZC_AB_SCHED: &str = "FLOCK_NO_ZC_AB_SCHED";
+
+pub(crate) fn gpu_zc_ab_one_cb_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_AB_SCHED).is_none());
+    *ON
 }
 
 /// Diagnostic trace for the round-one AB completion arm: the warm-up oracle
@@ -19041,9 +19074,27 @@ static inline ulong clmul_plane_pair(uint a0, uint a1, uint b0, uint b1) {
 
 // Two Karatsuba levels use nine integer products rather than sixteen.
 // The aligned inputs occupy bits 0,4,...,28; the final product ends at bit 62.
+// 16x16 carry-less product from 9 native 32-bit products of bit-position-
+// mod-3 parts (at most 6 terms per result bit: no carry reaches a kept bit).
+static inline uint clmul16_m3(uint a, uint b) {
+    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
+    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
+    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
+    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
+    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+    return r0 | r1 | r2;
+}
+
 static inline ulong clmul32(uint a, uint b) {
 #ifdef FLOCK_ZC_R2_CLMUL_INCUMBENT
     return clmul32_incumbent(a, b);
+#elif defined(FLOCK_ZC_R2_CLMUL16)
+    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
+    uint lo = clmul16_m3(al, bl);
+    uint hi = clmul16_m3(ah, bh);
+    uint mid = clmul16_m3(al ^ ah, bl ^ bh) ^ lo ^ hi;
+    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
 #else
     const uint MASK = 0x11111111u;
     uint a0 = a & MASK, a1 = (a >> 1) & MASK;
@@ -19239,9 +19290,12 @@ static inline uint4 zc_r2_fold(uint lo, uint hi, threadgroup const uint4* nib) {
 
 template <bool PL>
 static inline U256k zc_r2_mul(uint4 a, uint4 b) {
+#ifndef FLOCK_ZC_R2_CLMUL16
     if (PL) {
         return clmul128_pl(a, b);
     }
+#endif
+    // With FLOCK_ZC_R2_CLMUL16, clmul128's clmul32 is the 16-bit form.
     return clmul128(a, b);
 }
 
@@ -19431,11 +19485,22 @@ kernel void zc_r2_products_horner(
             std::borrow::Cow::Owned(format!(
                 "#define FLOCK_ZC_R2_CLMUL_INCUMBENT 1\n{ZC_R2_MSL_SOURCE}"
             ))
-        } else if super::gpu_zc_r2_planes_enabled() {
-            // The Horner kernel's plane-sharing form (`ENV_NO_ZC_R2_PLANES`).
-            std::borrow::Cow::Owned(format!("#define FLOCK_ZC_R2_PLANES 1\n{ZC_R2_MSL_SOURCE}"))
         } else {
-            std::borrow::Cow::Borrowed(ZC_R2_MSL_SOURCE)
+            // The Horner kernel's plane-sharing fold and product
+            // (`ENV_NO_ZC_R2_PLANES`) and the 16-bit carry-less pieces
+            // (`ENV_NO_GPU_ZC_R2_CLMUL16`, which then also take the product).
+            let mut defs = String::new();
+            if super::gpu_zc_r2_planes_enabled() {
+                defs.push_str("#define FLOCK_ZC_R2_PLANES 1\n");
+            }
+            if super::gpu_zc_r2_clmul16_enabled() {
+                defs.push_str("#define FLOCK_ZC_R2_CLMUL16 1\n");
+            }
+            if defs.is_empty() {
+                std::borrow::Cow::Borrowed(ZC_R2_MSL_SOURCE)
+            } else {
+                std::borrow::Cow::Owned(format!("{defs}{ZC_R2_MSL_SOURCE}"))
+            }
         }
     }
 
@@ -20823,7 +20888,9 @@ kernel void zc_ab_finish(
     /// An in-flight round-one AB completion GPU prefix.
     pub(crate) struct ZcAbJob {
         /// Table build, then gather + finish (same queue, in order; the
-        /// second reads the tables the first wrote, hazard-tracked).
+        /// second reads the tables the first wrote, hazard-tracked). With the
+        /// one-buffer submission (`ENV_NO_ZC_AB_SCHED`) `cb_tables` is NIL and
+        /// `cb` holds all three kernels.
         cb_tables: Id,
         cb: Id,
         chunks: usize,
@@ -20967,9 +21034,12 @@ kernel void zc_ab_finish(
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let pool = gpu.pool_push();
+            // One command buffer for the whole arm (`ENV_NO_ZC_AB_SCHED`):
+            // the table build's encoder, then the gather and finish encoder.
+            let one_cb = super::gpu_zc_ab_one_cb_enabled();
             let submitted = (|| -> Result<(Id, Id), String> {
                 // Command buffer 1: the table build (own GPU wall in the
-                // diagnostics).
+                // diagnostics), or the arm's only command buffer.
                 let cb_tables = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb_tables)?;
                 gpu.set_pipeline(enc, state.tables_pso);
@@ -20978,9 +21048,11 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.tables_buf, 0, 2);
                 gpu.dispatch(enc, ZC_AB_TOPS as u64, 256);
                 gpu.end_encoding(enc);
-                // Command buffer 2: gather, then finish (serial dispatches of
-                // one encoder: the finish reads the banks the gather wrote).
-                let cb = gpu.command_buffer()?;
+                // Command buffer 2 (or the same one): gather, then finish
+                // (serial dispatches of one encoder: the finish reads the banks
+                // the gather wrote; the encoder after the table build's reads
+                // the tables it wrote).
+                let cb = if one_cb { cb_tables } else { gpu.command_buffer()? };
                 let enc = gpu.compute_encoder(cb)?;
                 gpu.set_pipeline(enc, state.gather_pso);
                 gpu.set_buffer(enc, ab_buf, 0, 0);
@@ -20996,6 +21068,11 @@ kernel void zc_ab_finish(
                 gpu.set_bytes(enc, pb, 4);
                 gpu.dispatch(enc, chunks as u64, 64);
                 gpu.end_encoding(enc);
+                if one_cb {
+                    let cb = gpu.retain(cb);
+                    gpu.commit_async(cb);
+                    return Ok((NIL, cb));
+                }
                 let cb_tables = gpu.retain(cb_tables);
                 let cb = gpu.retain(cb);
                 gpu.commit_async(cb_tables);
@@ -21040,16 +21117,26 @@ kernel void zc_ab_finish(
         unsafe {
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
-            // the table build; the table build's status is checked too.
-            let ok = gpu.spin_wait_cb(job.cb, 2.0).and_then(|()| gpu.wait_cb(job.cb_tables));
+            // the table build; the table build's status is checked too (a
+            // one-buffer job has no separate table buffer).
+            let ok = gpu.spin_wait_cb(job.cb, 2.0).and_then(|()| {
+                if job.cb_tables.is_null() { Ok(()) } else { gpu.wait_cb(job.cb_tables) }
+            });
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
+            // With one buffer its wall covers the table build as well and is
+            // reported as gather+finish (tables 0).
             let (tables_ms, gather_ms) = if ok.is_ok() {
-                (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
+                (
+                    if job.cb_tables.is_null() { 0.0 } else { zc_fold_gpu_wall_ms(gpu, job.cb_tables) },
+                    zc_fold_gpu_wall_ms(gpu, job.cb),
+                )
             } else {
                 (0.0, 0.0)
             };
             let gpu_ms = tables_ms + gather_ms;
-            gpu.release(job.cb_tables);
+            if !job.cb_tables.is_null() {
+                gpu.release(job.cb_tables);
+            }
             gpu.release(job.cb);
             if let Err(e) = ok {
                 ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
