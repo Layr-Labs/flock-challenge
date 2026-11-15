@@ -741,7 +741,7 @@ pub(crate) fn merkle_tree_into_subtrees(
     kind: HashKind,
     sub_log: usize,
 ) -> Vec<Hash> {
-    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, false)
+    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, SubtreeMode::Hetero)
 }
 
 pub(crate) fn merkle_tree_into_subtrees_serial(
@@ -751,7 +751,44 @@ pub(crate) fn merkle_tree_into_subtrees_serial(
     kind: HashKind,
     sub_log: usize,
 ) -> Vec<Hash> {
-    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, true)
+    merkle_tree_into_subtrees_drain(
+        tree,
+        data,
+        num_leaves,
+        kind,
+        sub_log,
+        crate::gpu_commit::subtree_drain_enabled(),
+    )
+}
+
+/// The "serial" subtree build with its subtree loop either on the calling
+/// thread alone (`drain = false`, the incumbent) or through the caller-first
+/// chunk drain (`drain = true`, grind pack 3, `FLOCK_NO_SUBTREE_DRAIN`): the
+/// caller starts on subtree 0 at once and pool threads claim the next
+/// subtrees as they arrive. Every subtree is still built by exactly one
+/// claimant with the same kernels into its own disjoint node ranges, and the
+/// shared top is finished afterwards on the caller, so the tree is
+/// byte-identical.
+pub(crate) fn merkle_tree_into_subtrees_drain(
+    tree: Vec<Hash>,
+    data: &[u8],
+    num_leaves: usize,
+    kind: HashKind,
+    sub_log: usize,
+    drain: bool,
+) -> Vec<Hash> {
+    let mode = if drain { SubtreeMode::CallerFirst } else { SubtreeMode::Serial };
+    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, mode)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubtreeMode {
+    /// P+E chunk queue.
+    Hetero,
+    /// One subtree after another on the calling thread.
+    Serial,
+    /// Caller-first chunk drain over the main pool.
+    CallerFirst,
 }
 
 fn merkle_tree_into_subtrees_impl(
@@ -760,7 +797,7 @@ fn merkle_tree_into_subtrees_impl(
     num_leaves: usize,
     kind: HashKind,
     sub_log: usize,
-    serial: bool,
+    mode: SubtreeMode,
 ) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert_eq!(data.len() % num_leaves, 0);
@@ -818,12 +855,14 @@ fn merkle_tree_into_subtrees_impl(
     // Same P+E chunk queue as the level-by-level leaf/parent passes: the
     // efficiency cores carry a real share of the hashing (a main-pool-only
     // split measured ~1.7x slower at 2^16 leaves on the M4).
-    if serial {
-        for s in 0..n_sub {
-            build(s);
+    match mode {
+        SubtreeMode::Serial => {
+            for s in 0..n_sub {
+                build(s);
+            }
         }
-    } else {
-        crate::epool::run_hetero_chunks(n_sub, build);
+        SubtreeMode::CallerFirst => crate::epool::run_caller_first_chunks(n_sub, &build),
+        SubtreeMode::Hetero => crate::epool::run_hetero_chunks(n_sub, build),
     }
     merkle_tree_from_prehashed_level(tree, num_leaves, kind, sub_log)
 }
@@ -1314,6 +1353,41 @@ mod tests {
                     sub_log,
                 );
                 assert_eq!(got_serial, want, "serial log_n={log_n} sub_log={sub_log}");
+                for drain in [false, true] {
+                    let got_drain = merkle_tree_into_subtrees_drain(
+                        crate::alloc_uninit_vec(2 * n - 1),
+                        &data,
+                        n,
+                        HashKind::Blake3,
+                        sub_log,
+                        drain,
+                    );
+                    assert_eq!(got_drain, want, "drain={drain} log_n={log_n} sub_log={sub_log}");
+                }
+            }
+        }
+        // Grind pack 3 subtree drain: the caller-first drain inside a real
+        // pool (the path the opening takes), many repetitions so late and
+        // early pool threads both occur, against the serial subtree loop.
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
+        for log_n in [6usize, 10, 12] {
+            let n = 1usize << log_n;
+            let data = random_data(n, 128, 300 + log_n as u64);
+            let want = merkle_tree(&data, n, HashKind::Blake3);
+            for sub_log in [1usize, 3, 5] {
+                for rep in 0..40 {
+                    let got = pool.install(|| {
+                        merkle_tree_into_subtrees_drain(
+                            crate::alloc_uninit_vec(2 * n - 1),
+                            &data,
+                            n,
+                            HashKind::Blake3,
+                            sub_log,
+                            true,
+                        )
+                    });
+                    assert_eq!(got, want, "pool drain log_n={log_n} sub_log={sub_log} rep={rep}");
+                }
             }
         }
         let data = random_data(1024, 64, 9);
