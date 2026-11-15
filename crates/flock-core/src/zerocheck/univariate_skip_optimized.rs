@@ -1841,31 +1841,56 @@ type AbWindowRows =
     fn(usize, &[u8], &[u8], &InvNttTableByteSingleGf8, usize, &'static [[u8; 64]; 248], &mut [u8], bool);
 
 /// The window-rows instance the switch chain in [`precompute_ab_one_chunk`]
-/// calls on this thread: the same checks in the same order. Every input is
-/// a per-process switch except the per-thread plain flag of
-/// `ab_kara_enabled`, which `ab_kara_note_worker` sets before a worker's
-/// first job, so a worker resolves this right after that call. The chain's
-/// `bstatic_horner_window_rows_hoisted::<V>` and
-/// `bstatic_horner_window_rows::<V>` call `rows::<V, true>` and
-/// `rows::<V, false>`.
+/// calls on this thread: [`ab_window_rows_plan_with_trim`] with the
+/// process's `FLOCK_NO_TRANSFORM_TRIM` switch, so a worker's plan and the
+/// chain pick the same instance. Out of line: the chain is a switch-only
+/// arm of the drain bodies, which keep one call there.
 #[cfg(target_arch = "aarch64")]
+#[inline(never)]
 fn ab_window_rows_plan() -> AbWindowRows {
+    ab_window_rows_plan_with_trim(ab_transform_trim_enabled())
+}
+
+/// `FLOCK_NO_TRANSFORM_TRIM=1` (exactly "1", as [`precompute_ab_hetero`]
+/// reads it) turns the complemented static-B basis off; read once per
+/// process for the per-chunk chain.
+#[cfg(target_arch = "aarch64")]
+fn ab_transform_trim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// The window-rows instance for this thread: the same checks in the same
+/// order as the switch chain. Every input is a per-process switch except the
+/// per-thread plain flag of `ab_kara_enabled`, which `ab_kara_note_worker`
+/// sets before a worker's first job, so a worker resolves this right after
+/// that call. The chain's `bstatic_horner_window_rows_hoisted::<V>` and
+/// `bstatic_horner_window_rows::<V>` call `rows::<V, true>` and
+/// `rows::<V, false>`. `trim` selects the complemented static-B basis
+/// ([`kernels::aarch64::ABV_TRANSFORM_TRIM`]) of the two default instances;
+/// without it they take the plain instance, which writes the same rows.
+#[cfg(target_arch = "aarch64")]
+fn ab_window_rows_plan_with_trim(trim: bool) -> AbWindowRows {
     use kernels::aarch64 as k;
     use kernels::aarch64::bstatic_horner_window_rows_impl as rows;
     // The default instances: the main-pool Karatsuba rows and the helper
-    // rows, both with one bounds check per window. Every kill switch takes
-    // the plain instance (the same bytes), except that
-    // `FLOCK_NO_ZC_AB_HZ_HOIST` and `FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` keep the
-    // helper rows with one bounds check per row (the same bytes).
+    // rows, both with one bounds check per window and the complemented
+    // static-B basis. Every kill switch, `FLOCK_NO_TRANSFORM_TRIM` included,
+    // takes the plain instance (the same bytes): only these two forms of the
+    // main-pool and helper rows exist.
     const MAIN: u32 = k::AB_Z_VARIANT
         | k::ABV_INLINE_WINDOW
         | k::ABV_KARA_XOR16
         | k::ABV_BSTATIC_Z
         | k::ABV_KARA_SLOT
-        | k::ABV_HORNER2;
-    const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
+        | k::ABV_HORNER2
+        | k::ABV_TRANSFORM_TRIM;
+    const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2 | k::ABV_TRANSFORM_TRIM;
     if k::ab_kara_enabled() {
-        if k::ab_kara_unscaled_enabled()
+        if trim
+            && k::ab_kara_unscaled_enabled()
             && k::ab_z_enabled()
             && k::ab_kara_xor16_enabled()
             && k::ab_bstatic_z_enabled()
@@ -1879,10 +1904,10 @@ fn ab_window_rows_plan() -> AbWindowRows {
             rows::<0, false>
         }
     } else if k::ab_hz_helper_enabled() && k::ab_horner2_enabled() {
-        // Lean (build budget): only the hoisted helper instance is compiled;
-        // its kill switches take the plain instance, which writes the same
-        // rows, as every other AB kill switch does.
-        if k::ab_row_setup_hoist_enabled() && k::ab_hz_hoist_enabled() {
+        // Lean: only the hoisted helper instance exists; its kill switches
+        // take the plain instance, which writes the same rows, as every other
+        // AB kill switch does.
+        if trim && k::ab_row_setup_hoist_enabled() && k::ab_hz_hoist_enabled() {
             rows::<HELPER, true>
         } else {
             rows::<0, false>
@@ -1894,38 +1919,16 @@ fn ab_window_rows_plan() -> AbWindowRows {
 
 /// A worker's `window_plan` for [`precompute_ab_one_chunk`], resolved on the
 /// worker thread after `ab_kara_note_worker`; `None` (the per-chunk chain)
-/// with [`ENV_NO_ZC_AB_WINDOW_PLAN`] set.
-fn ab_window_rows_worker_plan() -> Option<AbWindowRows> {
+/// with [`ENV_NO_ZC_AB_WINDOW_PLAN`] set. `trim` as in
+/// [`ab_window_rows_plan_with_trim`], resolved once per drain.
+fn ab_window_rows_worker_plan_with_trim(trim: bool) -> Option<AbWindowRows> {
     #[cfg(target_arch = "aarch64")]
     if ab_window_plan_enabled() {
-        return Some(ab_window_rows_plan());
-    }
-    None
-}
-
-/// Select the complemented static-B basis once per worker. The original
-/// function instances remain the rollback, including their row policies.
-fn ab_window_rows_worker_plan_with_trim(trim: bool) -> Option<AbWindowRows> {
-    let plan = ab_window_rows_worker_plan();
-    #[cfg(target_arch = "aarch64")]
-    if trim {
-        use kernels::aarch64::{self as k, bstatic_horner_window_rows_impl as rows};
-        const MAIN: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16
-            | k::ABV_BSTATIC_Z | k::ABV_KARA_SLOT | k::ABV_HORNER2;
-        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
-        return plan.map(|rows_fn| {
-            if core::ptr::fn_addr_eq(rows_fn, rows::<MAIN, true> as AbWindowRows) {
-                rows::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows
-            } else if core::ptr::fn_addr_eq(rows_fn, rows::<HELPER, true> as AbWindowRows) {
-                rows::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows
-            } else {
-                rows_fn
-            }
-        });
+        return Some(ab_window_rows_plan_with_trim(trim));
     }
     #[cfg(not(target_arch = "aarch64"))]
     let _ = trim;
-    plan
+    None
 }
 
 /// Kill switch for the unit window-rows call: any value of
@@ -1959,8 +1962,8 @@ type AbWindowUnitRun = (AbWindowUnit, [&'static [[u8; 64]; 248]; 2]);
 
 /// The unit form of the window-rows instance `rows`, which runs the same
 /// rows with the same arguments for each chunk. The default instances of
-/// the main-pool workers and of the helper threads (either bounds-check form)
-/// have one; `None` keeps one call per chunk.
+/// the main-pool workers and of the helper threads (the complemented
+/// static-B basis) have one; `None` keeps one call per chunk.
 #[cfg(target_arch = "aarch64")]
 fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
     use kernels::aarch64::{
@@ -1977,10 +1980,6 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
         Some(unit::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true>)
     } else if core::ptr::fn_addr_eq(rows, per_chunk::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows) {
         Some(unit::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true>)
-    } else if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
-        Some(unit::<MAIN, true>)
-    } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, true> as AbWindowRows) {
-        Some(unit::<HELPER, true>)
     } else {
         None
     }
@@ -3869,7 +3868,9 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 ///
 /// The same thread then builds the K pass GPU arm's two pipelines
 /// (`gpu_commit::zc_k_prewarm`, needed only after round two), unless that arm
-/// is off or `FLOCK_NO_ZC_K_PREWARM=1`.
+/// is off or `FLOCK_NO_ZC_K_PREWARM=1`, and last the race grind tail
+/// (`gpu_commit::gpu_pow_race_tail_prewarm`, see `ENV_NO_GRIND_LAT`), which
+/// nothing waits for.
 ///
 /// The 5+6 GPU arm's kernel is compiled later, after the warm-up commit's
 /// split retune ([`t56_prewarm_after_tune`]).
@@ -3883,13 +3884,17 @@ pub fn ab_completion_gpu_prewarm() {
         let ab = std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1"))
             && crate::gpu_commit::gpu_zc_ab_completion_share() != 0;
         let k = crate::gpu_commit::zc_k_prewarm_wanted();
-        if ab || k {
+        let tail = crate::gpu_commit::pow_race_tail_wanted();
+        if ab || k || tail {
             let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(move || {
                 if ab && let Some(basis) = ab_completion_convert_basis() {
                     crate::gpu_commit::zc_ab_prewarm(basis);
                 }
                 if k {
                     crate::gpu_commit::zc_k_prewarm();
+                }
+                if tail {
+                    crate::gpu_commit::gpu_pow_race_tail_prewarm();
                 }
             });
         }
@@ -6167,7 +6172,8 @@ mod tests {
     /// chain calls: the hoisted z form with the slot and Horner pieces on a
     /// thread with the Karatsuba apply, the hoisted half-pair form with the
     /// Horner piece on a `flock-ecore-*` worker and with the Karatsuba apply
-    /// off.
+    /// off, both with the complemented static-B basis; without the basis
+    /// (`FLOCK_NO_TRANSFORM_TRIM=1`) every pick is the plain instance.
     /// Whole chunks through `precompute_ab_one_chunk` with a plan write the
     /// bytes of the chain at the ranked layout for both windows, every
     /// representation, three drain instantiations and both Karatsuba states,
@@ -6182,10 +6188,29 @@ mod tests {
         let _serial = AB_KARA_FORCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         const V0: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
-        let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 }, true>;
-        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, true>;
+        const TRIM: u32 = k::ABV_TRANSFORM_TRIM;
+        let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 | TRIM }, true>;
+        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 | TRIM }, true>;
         assert!(!core::ptr::fn_addr_eq(main, plain));
+        // Without the complemented basis every thread takes the plain rows.
+        let untrimmed: AbWindowRows = rows::<0, false>;
+        for kara in [true, false] {
+            k::ab_kara_force(kara);
+            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan_with_trim(false), untrimmed));
+        }
+        k::ab_kara_force(true);
+        let helper_untrimmed = std::thread::Builder::new()
+            .name("flock-ecore-x".into())
+            .spawn(|| {
+                k::ab_kara_note_worker();
+                ab_window_rows_plan_with_trim(false)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(core::ptr::fn_addr_eq(helper_untrimmed, untrimmed));
         let switches = [
+            "FLOCK_NO_TRANSFORM_TRIM",
             "FLOCK_NO_ZC_AB_KARA",
             "FLOCK_NO_ZC_AB_KARA_UNSCALED",
             "FLOCK_NO_ZC_AB_Z",
@@ -6219,7 +6244,7 @@ mod tests {
             assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(), plain));
             k::ab_kara_force(true);
         }
-        let worker_plan = ab_window_rows_worker_plan();
+        let worker_plan = ab_window_rows_worker_plan_with_trim(ab_transform_trim_enabled());
         assert_eq!(worker_plan.is_some(), std::env::var_os(ENV_NO_ZC_AB_WINDOW_PLAN).is_none());
         if let Some(plan) = worker_plan {
             assert!(core::ptr::fn_addr_eq(plan, ab_window_rows_plan()));
@@ -6917,7 +6942,8 @@ mod tests {
 
     /// The unit window-rows call (`FLOCK_NO_ZC_AB_WINDOW_UNIT_CALL`). The
     /// default window-rows instances of the main-pool workers and of the
-    /// helper threads map to their own unit forms, other instances to none.
+    /// helper threads (the complemented static-B basis) map to their own
+    /// unit forms, other instances to none.
     /// Whole units through `precompute_ab_unit` with and without the unit
     /// call write the same bytes at the ranked layout: a unit of eight chunks
     /// and one of three that starts in window 1, three representations,
@@ -6937,19 +6963,25 @@ mod tests {
         let _serial = AB_KARA_FORCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         const V0: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
-        const MAIN: u32 = V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2;
-        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
+        const TRIM: u32 = k::ABV_TRANSFORM_TRIM;
+        const MAIN: u32 = V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 | TRIM;
+        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2 | TRIM;
         let maps = |r: AbWindowRows, u: AbWindowUnit| {
             ab_window_unit_plan(r).is_some_and(|got| core::ptr::fn_addr_eq(got, u))
         };
         assert!(maps(rows::<MAIN, true>, unit::<MAIN, true>));
         assert!(maps(rows::<HELPER, true>, unit::<HELPER, true>));
         // Lean: the unhoisted helper instance has no unit form (its kill
-        // switches take the plain rows instead).
+        // switches take the plain rows instead), nor have the forms without
+        // the complemented basis (`FLOCK_NO_TRANSFORM_TRIM` takes the plain
+        // rows too).
         assert!(ab_window_unit_plan(rows::<HELPER, false>).is_none());
+        assert!(ab_window_unit_plan(rows::<{ MAIN & !TRIM }, true>).is_none());
+        assert!(ab_window_unit_plan(rows::<{ HELPER & !TRIM }, true>).is_none());
         assert!(ab_window_unit_plan(rows::<V0, true>).is_none());
         assert!(ab_window_unit_plan(rows::<{ k::AB_ROWS_VARIANT }, false>).is_none());
         let switches = [
+            "FLOCK_NO_TRANSFORM_TRIM",
             "FLOCK_NO_ZC_AB_KARA",
             "FLOCK_NO_ZC_AB_KARA_UNSCALED",
             "FLOCK_NO_ZC_AB_Z",
@@ -7927,6 +7959,80 @@ mod tests {
             }
         }
         assert_eq!(cases, 32 * 2 * 2 * 2 * 7);
+    }
+
+    /// The default window rows of the main-pool workers and of the helper
+    /// threads with the complemented static-B basis write the bytes of the
+    /// plain instance, which every arm without the basis
+    /// (`FLOCK_NO_TRANSFORM_TRIM=1`) runs: random A rows, B rows that satisfy
+    /// the static masks and rows that do not (fallback), both windows, both
+    /// store flavours.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_window_rows_trim_matches_plain() {
+        use kernels::aarch64::{self as k, bstatic_horner_window_rows_impl as rows};
+        const MAIN: u32 = k::AB_Z_VARIANT
+            | k::ABV_INLINE_WINDOW
+            | k::ABV_KARA_XOR16
+            | k::ABV_BSTATIC_Z
+            | k::ABV_KARA_SLOT
+            | k::ABV_HORNER2
+            | k::ABV_TRANSFORM_TRIM;
+        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2 | k::ABV_TRANSFORM_TRIM;
+        let table = make_inv_table();
+        let mut rng = Rng::new(0xAB5A_71C0_F457_0079);
+        let context = k::prepare_static_b_context_with_policy(&table, true, false, false)
+            .expect("enabled static-B context");
+        let k::StaticBContext::Prepared { partials, .. } = context else {
+            unreachable!("prepared static-B context");
+        };
+        const N: usize = 1024;
+        let mut cases = 0usize;
+        for case in 0..32usize {
+            let a: Vec<u8> = (0..N)
+                .map(|_| match case % 4 {
+                    0 => 0,
+                    1 => 0xff,
+                    _ => (rng.next_u64() >> 11 & 0xff) as u8,
+                })
+                .collect();
+            let b: Vec<u8> = (0..N).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
+            for w in 0..2usize {
+                let (lo, hi) = k::BSTATIC_HORNER_WINDOW_ROWS[w];
+                for satisfied in [true, false] {
+                    let mut bb = b.clone();
+                    if satisfied {
+                        for b_med in lo..hi {
+                            let blk = w * (1 << N_MEDIUM) + b_med;
+                            for kk in 0..N_CHUNKS {
+                                let off = b_med * N_CHUNKS * 8 + kk * N_CHUNKS;
+                                let (mask, expected) = k::BSTATIC_MASKS[blk][kk];
+                                let word = u64::from_le_bytes(bb[off..off + 8].try_into().unwrap());
+                                bb[off..off + 8]
+                                    .copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                            }
+                        }
+                    }
+                    for nt in [false, true] {
+                        let mut want = vec![0x5au8; 16 * 64];
+                        rows::<0, false>(w, &a, &bb, &table, 0, partials, &mut want, nt);
+                        assert!(want.iter().any(|&x| x != 0x5a));
+                        let trimmed: [(AbWindowRows, &str); 2] =
+                            [(rows::<MAIN, true>, "main"), (rows::<HELPER, true>, "helper")];
+                        for (form, name) in trimmed {
+                            let mut got = vec![0x5au8; 16 * 64];
+                            form(w, &a, &bb, &table, 0, partials, &mut got, nt);
+                            assert_eq!(
+                                got, want,
+                                "{name} rows differ (case={case}, w={w}, satisfied={satisfied}, nt={nt})"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 32 * 2 * 2 * 2 * 2);
     }
 
     /// The hoisted window check rejects slices that do not hold the
