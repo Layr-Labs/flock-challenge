@@ -735,6 +735,36 @@ fn zc_r2_horner_weights(eq_lo: &[F128], lo_size: usize) -> bool {
     true
 }
 
+/// Kill switch for the round-two GPU arm's 16-bit carry-less pieces
+/// (`FLOCK_NO_GPU_ZC_R2_CLMUL16`, any value): the record's two-level
+/// Karatsuba over radix-16 planes (nine 32x32 -> 64 products per 32x32
+/// carry-less product). With it on, each 32x32 carry-less product is one
+/// Karatsuba step over 16-bit halves, each half product from nine native
+/// 32-bit products of bit-position-mod-3 parts (no carry reaches a kept bit;
+/// no 64-bit multiplies): ~3x less GPU time per chunk on an M1 Max, and the
+/// gate's measured ratio raises the share accordingly. Same products.
+pub const ENV_NO_GPU_ZC_R2_CLMUL16: &str = "FLOCK_NO_GPU_ZC_R2_CLMUL16";
+
+/// Kill switch for the round-two arm's per-machine product-form pick
+/// (`FLOCK_NO_ZC_R2_FORM_PICK`, any value): the 16-bit form whenever
+/// [`ENV_NO_GPU_ZC_R2_CLMUL16`] is unset. With it on, the warm-up gate also
+/// builds the record's plane-sharing form, replays both on this GPU (each
+/// checked against the CPU's partials) and keeps the faster for the process.
+/// The two forms compute the same products; which is faster depends on the
+/// GPU (16-bit pieces: 3.4x faster on an M1 Max; the plane-sharing form was
+/// tuned on an M3-class GPU).
+fn gpu_zc_r2_form_pick_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_R2_FORM_PICK").is_none());
+    *ON
+}
+
+fn gpu_zc_r2_clmul16_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2_CLMUL16).is_none());
+    *ON
+}
+
 pub(crate) fn gpu_zc_r2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ZC_R2).is_none());
@@ -19041,9 +19071,27 @@ static inline ulong clmul_plane_pair(uint a0, uint a1, uint b0, uint b1) {
 
 // Two Karatsuba levels use nine integer products rather than sixteen.
 // The aligned inputs occupy bits 0,4,...,28; the final product ends at bit 62.
+// 16x16 carry-less product from 9 native 32-bit products of bit-position-
+// mod-3 parts (at most 6 terms per result bit: no carry reaches a kept bit).
+static inline uint clmul16_m3(uint a, uint b) {
+    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
+    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
+    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
+    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
+    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+    return r0 | r1 | r2;
+}
+
 static inline ulong clmul32(uint a, uint b) {
 #ifdef FLOCK_ZC_R2_CLMUL_INCUMBENT
     return clmul32_incumbent(a, b);
+#elif defined(FLOCK_ZC_R2_CLMUL16)
+    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
+    uint lo = clmul16_m3(al, bl);
+    uint hi = clmul16_m3(ah, bh);
+    uint mid = clmul16_m3(al ^ ah, bl ^ bh) ^ lo ^ hi;
+    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
 #else
     const uint MASK = 0x11111111u;
     uint a0 = a & MASK, a1 = (a >> 1) & MASK;
@@ -19239,9 +19287,12 @@ static inline uint4 zc_r2_fold(uint lo, uint hi, threadgroup const uint4* nib) {
 
 template <bool PL>
 static inline U256k zc_r2_mul(uint4 a, uint4 b) {
+#ifndef FLOCK_ZC_R2_CLMUL16
     if (PL) {
         return clmul128_pl(a, b);
     }
+#endif
+    // With FLOCK_ZC_R2_CLMUL16, clmul128's clmul32 is the 16-bit form.
     return clmul128(a, b);
 }
 
@@ -19427,15 +19478,31 @@ kernel void zc_r2_products_horner(
 "#;
 
     fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
+        zc_r2_msl_source_form(incumbent, super::gpu_zc_r2_clmul16_enabled())
+    }
+
+    /// [`zc_r2_msl_source`] with the 16-bit pieces chosen explicitly.
+    fn zc_r2_msl_source_form(incumbent: bool, clmul16: bool) -> std::borrow::Cow<'static, str> {
         if incumbent {
             std::borrow::Cow::Owned(format!(
                 "#define FLOCK_ZC_R2_CLMUL_INCUMBENT 1\n{ZC_R2_MSL_SOURCE}"
             ))
-        } else if super::gpu_zc_r2_planes_enabled() {
-            // The Horner kernel's plane-sharing form (`ENV_NO_ZC_R2_PLANES`).
-            std::borrow::Cow::Owned(format!("#define FLOCK_ZC_R2_PLANES 1\n{ZC_R2_MSL_SOURCE}"))
         } else {
-            std::borrow::Cow::Borrowed(ZC_R2_MSL_SOURCE)
+            // The Horner kernel's plane-sharing fold and product
+            // (`ENV_NO_ZC_R2_PLANES`) and the 16-bit carry-less pieces
+            // (`ENV_NO_GPU_ZC_R2_CLMUL16`, which then also take the product).
+            let mut defs = String::new();
+            if super::gpu_zc_r2_planes_enabled() {
+                defs.push_str("#define FLOCK_ZC_R2_PLANES 1\n");
+            }
+            if clmul16 {
+                defs.push_str("#define FLOCK_ZC_R2_CLMUL16 1\n");
+            }
+            if defs.is_empty() {
+                std::borrow::Cow::Borrowed(ZC_R2_MSL_SOURCE)
+            } else {
+                std::borrow::Cow::Owned(format!("{defs}{ZC_R2_MSL_SOURCE}"))
+            }
         }
     }
 
@@ -19497,6 +19564,10 @@ kernel void zc_r2_horner_oracle(
         horner_pso: Id,
         /// This PSO's static shared bytes, SIMD width and thread capacity.
         horner_resources: (u64, u64, u64),
+        /// The other product form's Horner PSO and resources, raced against
+        /// `horner_pso` once in the warm-up gate (`NIL` when not built).
+        horner_alt_pso: Id,
+        horner_alt_resources: (u64, u64, u64),
         /// Persistent small buffers: nibble table (4 KiB), eq_lo, eq_hi,
         /// reduced partials. Sized on first use for the ranked shape.
         nib_buf: Id,
@@ -19737,11 +19808,46 @@ kernel void zc_r2_horner_oracle(
                 gpu.release(pso);
                 return Err("zc-r2 Horner PSO cannot run 256 threads".into());
             }
+            // The other product form (the record's plane-sharing product), raced
+            // against this one in the warm-up gate; any failure leaves NIL.
+            let t_alt = std::time::Instant::now();
+            let (horner_alt_pso, horner_alt_resources) = if super::gpu_zc_r2_karatsuba_enabled()
+                && super::gpu_zc_r2_clmul16_enabled()
+                && super::gpu_zc_r2_form_pick_enabled()
+            {
+                match zc_r2_build_horner(gpu, &zc_r2_msl_source_form(false, false)) {
+                    Ok(alt) => {
+                        let res = zc_r2_pso_resources(gpu, alt);
+                        if res.2 >= 256 {
+                            (alt, res)
+                        } else {
+                            gpu.release(alt);
+                            (NIL, (0, 0, 0))
+                        }
+                    }
+                    Err(e) => {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!("[zc-r2] alternative product form unavailable ({e})");
+                        }
+                        (NIL, (0, 0, 0))
+                    }
+                }
+            } else {
+                (NIL, (0, 0, 0))
+            };
+            if super::gpu_zc_r2_debug() && !horner_alt_pso.is_null() {
+                eprintln!(
+                    "[zc-r2] alternative product form built in {:.2} ms",
+                    t_alt.elapsed().as_secs_f64() * 1e3
+                );
+            }
             let nib_buf = gpu.new_buffer(256 * 16)?;
             Ok(ZcR2 {
                 pso,
                 horner_pso,
                 horner_resources,
+                horner_alt_pso,
+                horner_alt_resources,
                 nib_buf,
                 eq_lo_buf: NIL,
                 eq_lo_cap: 0,
@@ -19752,6 +19858,63 @@ kernel void zc_r2_horner_oracle(
                 wraps: Vec::new(),
                 prefetch_cb: NIL,
             })
+        }
+    }
+
+    /// Static threadgroup bytes, SIMD width and thread capacity of `pso`.
+    unsafe fn zc_r2_pso_resources(gpu: &Gpu, pso: Id) -> (u64, u64, u64) {
+        unsafe {
+            (
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"staticThreadgroupMemoryLength"),
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"threadExecutionWidth"),
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup"),
+            )
+        }
+    }
+
+    /// The Horner PSO of the round-two library compiled from `source`.
+    unsafe fn zc_r2_build_horner(gpu: &Gpu, source: &str) -> Result<Id, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = (|| -> Result<Id, String> {
+                let src = gpu.api.nsstring(source)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!("zc-r2 alt compile failed: {}", gpu.api.error_string(err)));
+                }
+                let ns = gpu.api.nsstring("zc_r2_products_horner")?;
+                let f: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel, Id) -> Id, library, c"newFunctionWithName:", ns);
+                if f.is_null() {
+                    gpu.release(library);
+                    return Err("zc_r2_products_horner not found".into());
+                }
+                let mut perr: Id = NIL;
+                let pso: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newComputePipelineStateWithFunction:error:",
+                    f,
+                    &mut perr
+                );
+                gpu.release(f);
+                gpu.release(library);
+                if pso.is_null() {
+                    return Err(format!("zc-r2 alt pipeline: {}", gpu.api.error_string(perr)));
+                }
+                Ok(pso)
+            })();
+            gpu.pool_pop(pool);
+            r
         }
     }
 
@@ -20259,7 +20422,8 @@ kernel void zc_r2_horner_oracle(
                 Some(s) => s,
                 None => return poison(job.cb),
             };
-            let state = match state_mutex.lock() {
+            #[allow(unused_mut)]
+            let mut state = match state_mutex.lock() {
                 Ok(s) => s,
                 Err(_) => {
                     // The launching section is not unwind-atomic (see the
@@ -20368,6 +20532,87 @@ kernel void zc_r2_horner_oracle(
                 w_min = w_min.min(w);
                 if n_walls >= 3 && w > 0.95 * prev_min {
                     break;
+                }
+            }
+            // Per-machine product form (`FLOCK_NO_ZC_R2_FORM_PICK` kills): race
+            // the other form's Horner PSO on the same probe, each replay's
+            // partials checked against the CPU's exactly as the probe was;
+            // keep the faster for the process.
+            if job.horner && !state.horner_alt_pso.is_null() && w_min < f64::MAX {
+                {
+                    let st = &mut *state;
+                    std::mem::swap(&mut st.horner_pso, &mut st.horner_alt_pso);
+                    std::mem::swap(&mut st.horner_resources, &mut st.horner_alt_resources);
+                }
+                let mut alt_min = f64::MAX;
+                let mut alt_ok = true;
+                let mut n_alt = 0usize;
+                // At most 3 replays (job-wall budget); one that is clearly
+                // slower (2x the incumbent's best) ends the race at once.
+                while n_alt < 3 {
+                    let Ok(cb2) = zc_r2_submit(
+                        gpu,
+                        &state,
+                        job.a_buf,
+                        job.b_buf,
+                        job.chunks,
+                        job.lo_size,
+                        job.mask,
+                        job.useful,
+                        job.horner,
+                    ) else {
+                        alt_ok = false;
+                        break;
+                    };
+                    let w = if gpu.wait_cb(cb2).is_ok() { zc_fold_gpu_wall_ms(gpu, cb2) } else { 0.0 };
+                    gpu.release(cb2);
+                    if w <= 0.0 {
+                        alt_ok = false;
+                        break;
+                    }
+                    let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
+                    for c in 0..job.chunks {
+                        let mut merged = [F128::ZERO; 4];
+                        for group in 0..4 {
+                            for lane in 0..4 {
+                                merged[lane] += *parts.add((c * 4 + group) * 4 + lane);
+                            }
+                        }
+                        let summed = (merged[0] + merged[2], merged[1] + merged[3]);
+                        let split_ok =
+                            cpu_la.is_none_or(|la| la[c][0] == merged[2] && la[c][1] == merged[3]);
+                        if summed != cpu_all[c] || !split_ok {
+                            alt_ok = false;
+                            break;
+                        }
+                    }
+                    if !alt_ok {
+                        break;
+                    }
+                    n_alt += 1;
+                    let prev = alt_min;
+                    alt_min = alt_min.min(w);
+                    if alt_min > 2.0 * w_min || (n_alt >= 2 && w > 0.95 * prev) {
+                        break;
+                    }
+                }
+                // `FLOCK_ZC_R2_FORM_FORCE_ALT` (local test knob): keep the
+                // plane-sharing form whenever its partials check out.
+                let keep_alt = alt_ok
+                    && (alt_min < w_min || std::env::var_os("FLOCK_ZC_R2_FORM_FORCE_ALT").is_some());
+                if super::gpu_zc_r2_debug() {
+                    eprintln!(
+                        "[zc-r2] product form race: 16-bit {w_min:.3} ms, plane-sharing {} -> {}",
+                        if alt_ok { format!("{alt_min:.3} ms") } else { "rejected".to_string() },
+                        if keep_alt { "plane-sharing" } else { "16-bit" }
+                    );
+                }
+                if keep_alt {
+                    w_min = alt_min;
+                } else {
+                    let st = &mut *state;
+                    std::mem::swap(&mut st.horner_pso, &mut st.horner_alt_pso);
+                    std::mem::swap(&mut st.horner_resources, &mut st.horner_alt_resources);
                 }
             }
             drop(state);
@@ -21000,6 +21245,7 @@ kernel void zc_ab_finish(
                 let cb = gpu.retain(cb);
                 gpu.commit_async(cb_tables);
                 gpu.commit_async(cb);
+                crate::tmark::mark("ab gpu committed");
                 Ok((cb_tables, cb))
             })();
             gpu.pool_pop(pool);
@@ -21048,6 +21294,13 @@ kernel void zc_ab_finish(
             } else {
                 (0.0, 0.0)
             };
+            if ok.is_ok() && crate::tmark::on() {
+                let (s, e) = cb_gpu_interval(gpu, job.cb_tables);
+                crate::tmark::mark_gpu("ab tables gpu start", "ab tables gpu end", s, e);
+                let (s, e) = cb_gpu_interval(gpu, job.cb);
+                crate::tmark::mark_gpu("ab gather gpu start", "ab gather gpu end", s, e);
+                crate::tmark::mark("ab joined");
+            }
             let gpu_ms = tables_ms + gather_ms;
             gpu.release(job.cb_tables);
             gpu.release(job.cb);
