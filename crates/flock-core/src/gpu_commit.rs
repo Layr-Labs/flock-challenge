@@ -20603,6 +20603,8 @@ kernel void zc_ab_finish(
 }
 "#;
 
+    include!("gpu_commit/ab_mul9.rs");
+
     /// Chunk geometry the kernel is built for: 4096 `x_lo` rows of 1 KiB.
     const ZC_AB_CHUNK_SHIFT: u32 = 22;
     const ZC_AB_MAX_CHUNKS: usize = 128;
@@ -20669,7 +20671,8 @@ kernel void zc_ab_finish(
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<(Id, Id, Id), String> {
-                let src = gpu.api.nsstring(ZC_AB_MSL_SOURCE)?;
+                let source = ab_mul9::source(ZC_AB_MSL_SOURCE);
+                let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
                     gpu.api,
