@@ -861,7 +861,7 @@ fn merkle_tree_into_subtrees_impl(
                 build(s);
             }
         }
-        SubtreeMode::CallerFirst => crate::epool::run_caller_first_chunks(n_sub, &build),
+        SubtreeMode::CallerFirst => crate::epool::run_chunks_caller_first(n_sub, &build),
         SubtreeMode::Hetero => crate::epool::run_hetero_chunks(n_sub, build),
     }
     merkle_tree_from_prehashed_level(tree, num_leaves, kind, sub_log)
