@@ -108,15 +108,9 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
             ($blk:literal, $k:literal, [$(($j0:literal, $j1:literal)),*], [$($js:literal),*]) => {{
                 let pp = pbase.add(($blk * 8 + $k) * 64);
                 #[allow(unused_mut)]
-                let mut db0 = vld1q_u8(pp);
-                #[allow(unused_mut)]
-                let mut db1 = vld1q_u8(pp.add(16));
-                #[allow(unused_mut)]
-                let mut db2 = vld1q_u8(pp.add(32));
-                #[allow(unused_mut)]
-                let mut db3 = vld1q_u8(pp.add(48));
+                let (mut db0, mut db1, mut db2, mut db3) = transform_partial_seed::<V>(pp);
                 #[allow(unused_variables)]
-                let b_word = bw!($k);
+                let b_word = transform_partial_word::<V>(bw!($k));
                 if V & ABV_NOSW != 0 {
                     $(xor_vary_ext::<$j0, $j1>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
                     $(xor_vary_ext::<$js, 8>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
@@ -147,12 +141,15 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
             ($blk:literal, $k:literal, $nb:literal, $inc:expr) => {{
                 if V & ABV_BSTATIC_Z != 0 {
                     let pp = pbase.add(($blk * 8 + $k) * 64);
-                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(plain, kplain, bw!($k));
+                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(
+                        plain, kplain, transform_partial_word::<V>(bw!($k)),
+                    );
+                    let (d0, d1, d2, d3) = transform_partial_seed::<V>(pp);
                     (
-                        veorq_u8(vld1q_u8(pp), z0),
-                        veorq_u8(vld1q_u8(pp.add(16)), z1),
-                        veorq_u8(vld1q_u8(pp.add(32)), z2),
-                        veorq_u8(vld1q_u8(pp.add(48)), z3),
+                        veorq_u8(d0, z0),
+                        veorq_u8(d1, z1),
+                        veorq_u8(d2, z2),
+                        veorq_u8(d3, z3),
                     )
                 } else {
                     $inc
@@ -1339,7 +1336,7 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
     // at its stored value.
     match AB_ROWS_NT_CONST.get() {
         Some(true) if nt_store => {
-            if const { V == AB_UNIT_MAIN && HOIST } {
+            if const { V & !ABV_TRANSFORM_TRIM == AB_UNIT_MAIN && HOIST } {
                 // The main-pool instance with non-temporal stores runs the
                 // rows with the z-basis applies in the [`ABV_Z_OUT3`] form;
                 // `FLOCK_NO_ZC_AB_Z_EOR3` takes the per-chunk rows. On top,
@@ -1348,9 +1345,15 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                 if ab_z_out3_enabled() {
                     const BASE: u32 = AB_UNIT_MAIN | ABV_Z_OUT3;
                     if ab_fuse_enabled() {
-                        bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM }, true, true>(
-                            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
-                        )
+                        if const { V & ABV_TRANSFORM_TRIM != 0 } {
+                            bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM | ABV_TRANSFORM_TRIM }, true, true>(
+                                x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                            )
+                        } else {
+                            bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM }, true, true>(
+                                x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                            )
+                        }
                     } else {
                         // Kill switch only (build budget): the per-chunk rows
                         // write the same bytes; no separate unit instance.
@@ -1365,14 +1368,20 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                         x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, true,
                     )
                 }
-            } else if const { V == AB_UNIT_HELPER } {
+            } else if const { V & !ABV_TRANSFORM_TRIM == AB_UNIT_HELPER } {
                 // The helper threads' half-pair z rows with the fused
                 // products ([`ABV_FUSE`], `FLOCK_NO_ZC_AB_FUSE_E` kills), with
                 // the same bounds checks (`HOIST`: one per window).
                 if ab_fuse_e_enabled() {
-                    bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM }, HOIST, true>(
-                        x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
-                    )
+                    if const { V & ABV_TRANSFORM_TRIM != 0 } {
+                        bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM | ABV_TRANSFORM_TRIM }, HOIST, true>(
+                            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                        )
+                    } else {
+                        bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM }, HOIST, true>(
+                            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                        )
+                    }
                 } else {
                     // Kill switch only (build budget): the per-chunk rows
                     // write the same bytes; no separate unit instance.

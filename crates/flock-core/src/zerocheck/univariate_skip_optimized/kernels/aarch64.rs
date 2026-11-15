@@ -5119,6 +5119,7 @@ pub(crate) enum StaticBContext {
 }
 
 include!("aarch64_bstatic_gen.rs");
+include!("aarch64_transform_trim.rs");
 include!("aarch64_bstatic_horner_gen.rs");
 
 fn bstatic_legacy_enabled() -> bool {
