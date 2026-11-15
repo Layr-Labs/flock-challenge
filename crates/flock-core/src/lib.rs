@@ -103,6 +103,8 @@ pub fn micro_stack_enabled() -> bool {
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    zerocheck::multilinear::init_r2_memory_paths();
     // Before anything exists: the ranked worker's one idle pause.
     ranked_start_pause();
     let n = std::env::var("RAYON_NUM_THREADS")

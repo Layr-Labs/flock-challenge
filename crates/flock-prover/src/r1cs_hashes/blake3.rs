@@ -7582,6 +7582,8 @@ mod tests {
 
         const RANKED_N_BLOCKS: usize = 1 << 18;
         const EXPECTED_PROOF_BYTES: usize = 437_551;
+        let ordered_pow = std::env::var_os("FLOCK_NO_POW_FIRST_HIT").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
         let mut setup = Blake3Setup::new(RANKED_N_BLOCKS);
         setup.pcs_params.merkle_hash = HashKind::Blake3;
         assert!(
@@ -7611,7 +7613,9 @@ mod tests {
             proof: proof.clone(),
         }
         .to_bytes();
-        assert_eq!(proof_bytes.len(), EXPECTED_PROOF_BYTES);
+        if ordered_pow {
+            assert_eq!(proof_bytes.len(), EXPECTED_PROOF_BYTES);
+        }
         // Cross-process gate A/B anchor: several gates are process-cached
         // (OnceLock/LazyLock), so toggling them requires separate test
         // processes. Each run prints this digest of the deterministic-input
@@ -7636,7 +7640,9 @@ mod tests {
         // A second identical prove takes the witness allocations back
         // through their provenance tokens (warm pool), so its witgen runs
         // with the constant-region skips active. It must produce
-        // byte-identical proof bytes and verify. The hit mask proves the
+        // valid proof bytes and verify. Ordered PoW also preserves byte
+        // identity; first-hit PoW can choose different valid nonces.
+        // The hit mask proves the
         // elision path was actually exercised (bit0 z, bit1 a, bit2 b).
         #[cfg(target_arch = "aarch64")]
         let first_hits = witgen_simd::last_elide_hits();
@@ -7649,10 +7655,12 @@ mod tests {
         .to_bytes();
         assert_eq!(claim2, claim);
         assert_eq!(commitment2.root, commitment.root, "commitment root changed");
-        assert_eq!(
-            proof_bytes, proof2_bytes,
-            "second (token-hit) ranked prove diverged from the first"
-        );
+        if ordered_pow {
+            assert_eq!(
+                proof_bytes, proof2_bytes,
+                "second (token-hit) ranked prove diverged from the first"
+            );
+        }
         let mut verifier2 = FsChallenger::with_hash(b"flock-bench-v0", HashKind::Blake3);
         let verified2 = setup
             .verify(&commitment2, &proof2, &mut verifier2)
