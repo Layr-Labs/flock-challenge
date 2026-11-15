@@ -2229,6 +2229,17 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let eq_prep_addr = eq_prep.as_ptr() as usize;
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let eq_prep_addr = 0usize;
+    // The fold table in seven pieces (`FLOCK_NO_R2_FOLD7`), for the full
+    // chunks' ranked walks on the performance-core workers: one lookup fewer
+    // per row, the same folded rows (none when a byte bank is not linear).
+    #[cfg(target_arch = "aarch64")]
+    let fold7 = if kernels::aarch64::r2_fold7_enabled() {
+        kernels::aarch64::r2_fold7_table(&table.data)
+    } else {
+        None
+    };
+    #[cfg(target_arch = "aarch64")]
+    let fold7_addr = fold7.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
     // Tail-compacted layout: the dead-pair skip is on, every chunk's
     // producer runs its ranked periodic walk (the lookahead, prescaled and
     // Horner producers all rebase per block there) and the one-table fused
@@ -2357,7 +2368,28 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
-                if full {
+                if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                    kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
+                        t,
+                        fold7_addr as *const u8,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        eq_prep_addr as *const F128,
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        skip_dead,
+                        tail_compact,
+                        head_fail_ptr,
+                        out.as_mut_ptr(),
+                    );
+                } else if full {
                     fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                         t,
                         ap,
@@ -3316,6 +3348,17 @@ fn fold2_compact_and_round45_into_packed_b(
     // prepared form, one table shared by every chunk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
+    // The scaled table in seven pieces (`FLOCK_NO_ZC_K_FOLD7`) for the packed
+    // chunks on the performance-core workers: one lookup fewer per tree, the
+    // same values (none when a byte bank is not linear).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let fold7 = if one_table && pack && kernels::aarch64::zc_k_fold7_enabled() {
+        kernels::aarch64::r2_fold7_table(&table_l1)
+    } else {
+        None
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let fold7_addr = fold7.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
     // b-one pack (packed outputs only): each 64-output block's b takes
     // `B_PACK_BLOCK` entries; a kernel that meets a skipped b output that is
     // not one says so, and the whole pass is rerun without it.
@@ -3417,24 +3460,31 @@ fn fold2_compact_and_round45_into_packed_b(
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
-                    let ok = fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
-                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
-                        compact.tail_compact, compact.head_compact, compact.head_b,
-                    );
+                    let ok = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                        kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+                            fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
+                            degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                    } else {
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                            compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                    };
                     if !ok {
                         b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                         compact.tail_compact, compact.head_compact, compact.head_b,
                     );
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                         false, false, F128::ZERO,
                     );
