@@ -1400,7 +1400,20 @@ pub(crate) fn gpu_blake3_pow_scan(
     if !gpu_grind_enabled() {
         return Err("GPU grind disabled".into());
     }
-    imp::gpu_blake3_pow_scan(state_digest, start, len, bits)
+    imp::gpu_blake3_pow_scan(state_digest, start, len, bits, false)
+}
+
+/// Unordered scanner; calibration and the ordered policy keep their kernel.
+pub(crate) fn gpu_blake3_pow_scan_first(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u32,
+    bits: u32,
+) -> Result<Option<u64>, String> {
+    if !gpu_grind_enabled() {
+        return Err("GPU grind disabled".into());
+    }
+    imp::gpu_blake3_pow_scan(state_digest, start, len, bits, true)
 }
 
 /// Env var that disables this round's NTT pass tuning (the g4 shared-table +
@@ -8450,6 +8463,24 @@ kernel void blake3_pow_scan(
         atomic_fetch_min_explicit(best, id, memory_order_relaxed);
     }
 }
+
+kernel void blake3_pow_scan_first(
+    constant uint* state_words [[buffer(0)]],
+    device atomic_uint* best   [[buffer(1)]],
+    constant PowParams& params [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= params.len || atomic_load_explicit(best, memory_order_relaxed) != 0xffffffffu) return;
+    uint nonce_lo = params.start_lo + id;
+    uint carry = nonce_lo < params.start_lo ? 1u : 0u;
+    uint cv0 = pow_compress0(state_words, nonce_lo, params.start_hi + carry);
+    if (pow_has_leading_zero_bits(cv0, params.bits)) {
+        uint expected = 0xffffffffu;
+        while (expected == 0xffffffffu &&
+               !atomic_compare_exchange_weak_explicit(best, &expected, id,
+                   memory_order_relaxed, memory_order_relaxed)) {}
+    }
+}
 "#;
 
     // -----------------------------------------------------------------------
@@ -8612,6 +8643,7 @@ kernel void blake3_pow_scan(
         /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
         /// shared result word is protected because `Gpu` itself is global.
         pub(crate) pso_pow: Id,
+        pub(crate) pso_pow_first: Id,
         pub(crate) pow_out: Id,
         pub(crate) pow_lock: std::sync::Mutex<()>,
     }
@@ -9065,12 +9097,12 @@ kernel void blake3_pow_scan(
                     (NIL, NIL)
                 };
 
-                let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
+                let (pso_pow, pso_pow_first, pow_out) = if super::gpu_grind_enabled() {
                     // This optimization is supplemental: a compile/pipeline/
                     // allocation failure must not poison the already-valid
                     // ranked commitment GPU.  The grind gate will see NIL and
                     // permanently retain the exact CPU implementation.
-                    (|| -> Result<(Id, Id), String> {
+                    (|| -> Result<(Id, Id, Id), String> {
                         let src = api.nsstring(POW_MSL_SOURCE)?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
@@ -9120,6 +9152,28 @@ kernel void blake3_pow_scan(
                             function,
                             c"release"
                         );
+                        // Both pipelines are prepared at initialization. A
+                        // missing supplemental pipeline leaves CPU fallback.
+                        let pso_first = if crate::challenger::pow_first_hit_enabled() && !pso.is_null() {
+                            let name = api.nsstring("blake3_pow_scan_first")?;
+                            let first_fn: Id = send!(
+                                api, unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                library, c"newFunctionWithName:", name
+                            );
+                            if first_fn.is_null() {
+                                NIL
+                            } else {
+                                let first_pso: Id = send!(
+                                    api, unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                    device, c"newComputePipelineStateWithFunction:error:",
+                                    first_fn, &mut pso_err
+                                );
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, first_fn, c"release");
+                                first_pso
+                            }
+                        } else {
+                            NIL
+                        };
                         send!(
                             api,
                             unsafe extern "C" fn(Id, Sel) -> Id,
@@ -9142,13 +9196,16 @@ kernel void blake3_pow_scan(
                         );
                         if out.is_null() {
                             send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                            if !pso_first.is_null() {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso_first, c"release");
+                            }
                             return Err("PCS grind result buffer allocation failed".into());
                         }
-                        Ok((pso, out))
+                        Ok((pso, pso_first, out))
                     })()
-                    .unwrap_or((NIL, NIL))
+                    .unwrap_or((NIL, NIL, NIL))
                 } else {
-                    (NIL, NIL)
+                    (NIL, NIL, NIL)
                 };
                 // Supplemental two-tiles-per-thread g4 NTT pass, its own
                 // library. Any failure, or a pipeline that cannot run a
@@ -9439,6 +9496,7 @@ kernel void blake3_pow_scan(
                     pso_ntt5t3,
                     pso_final_leaf,
                     pso_pow,
+                    pso_pow_first,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
                 })
@@ -15228,12 +15286,14 @@ kernel void blake3_pow_scan(
         start: u64,
         len: u32,
         bits: u32,
+        first_hit: bool,
     ) -> Result<Option<u64>, String> {
         if len == 0 || !(1..=32).contains(&bits) {
             return Err(format!("invalid GPU grind block len={len} bits={bits}"));
         }
         let gpu = gpu()?;
-        if gpu.pso_pow.is_null() || gpu.pow_out.is_null() {
+        let pipeline = if first_hit { gpu.pso_pow_first } else { gpu.pso_pow };
+        if pipeline.is_null() || gpu.pow_out.is_null() {
             return Err("GPU grind pipeline unavailable".into());
         }
         // Poison-tolerant: the guarded state is `()` (pure exclusion over
@@ -15257,7 +15317,7 @@ kernel void blake3_pow_scan(
                 );
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, gpu.pso_pow);
+                gpu.set_pipeline(enc, pipeline);
                 gpu.set_bytes(enc, state_digest, 0);
                 gpu.set_buffer(enc, gpu.pow_out, 0, 1);
                 gpu.set_bytes(enc, params_bytes, 2);
@@ -20603,6 +20663,8 @@ kernel void zc_ab_finish(
 }
 "#;
 
+    include!("gpu_commit/ab_mul9.rs");
+
     /// Chunk geometry the kernel is built for: 4096 `x_lo` rows of 1 KiB.
     const ZC_AB_CHUNK_SHIFT: u32 = 22;
     const ZC_AB_MAX_CHUNKS: usize = 128;
@@ -20669,7 +20731,8 @@ kernel void zc_ab_finish(
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<(Id, Id, Id), String> {
-                let src = gpu.api.nsstring(ZC_AB_MSL_SOURCE)?;
+                let source = ab_mul9::source(ZC_AB_MSL_SOURCE);
+                let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
                     gpu.api,
@@ -24219,6 +24282,7 @@ mod imp {
         _start: u64,
         _len: u32,
         _bits: u32,
+        _first_hit: bool,
     ) -> Result<Option<u64>, String> {
         Err("GPU grind is only available on macOS/aarch64".into())
     }
