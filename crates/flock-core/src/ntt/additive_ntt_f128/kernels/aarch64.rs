@@ -1150,6 +1150,63 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
     }
 }
 
+/// All `eighth` row groups of one block of the deep subtree's radix-8 lead:
+/// the tile loop of [`butterfly_fused_3layer_zero_root_rows`] when
+/// `zero_root`, else that of [`butterfly_fused_3layer_rows`], with the same
+/// per-row kernels. A function of its own (never inlined), so the existing
+/// callers of those two loops compile as before.
+///
+/// # Safety
+/// As [`butterfly_fused_3layer_rows`] over rows `0..eighth`; with
+/// `zero_root`, also `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
+#[target_feature(enable = "aes")]
+#[inline(never)]
+pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let ld = |i: usize| vld1q_u64((&raw const twiddles[i]).cast::<u64>());
+        if zero_root {
+            debug_assert_eq!(twiddles[0], F128::ZERO);
+            debug_assert_eq!(twiddles[1], F128::ZERO);
+            debug_assert_eq!(twiddles[3], F128::ZERO);
+            let (t2, t4, t5, t6) = (ld(2), ld(4), ld(5), ld(6));
+            for r in 0..eighth {
+                butterfly_fused_3layer_zero_root_row_with_q(
+                    ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
+                );
+            }
+        } else {
+            let t = [ld(0), ld(1), ld(2), ld(3), ld(4), ld(5), ld(6)];
+            if use_three_const_fold() {
+                let prepared = [
+                    three_coeffs(t[0]),
+                    three_coeffs(t[1]),
+                    three_coeffs(t[2]),
+                    three_coeffs(t[3]),
+                    three_coeffs(t[4]),
+                    three_coeffs(t[5]),
+                    three_coeffs(t[6]),
+                ];
+                for r in 0..eighth {
+                    butterfly_fused_3layer_row_with_const_q(
+                        ptr, eighth, num_ntts, num_ntts, r, &prepared,
+                    );
+                }
+            } else {
+                for r in 0..eighth {
+                    butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
+                }
+            }
+        }
+    }
+}
+
 /// Two low-constant products with everything held in q registers: product
 /// `i` is `v_i · t_i` where `t_i.hi == 0` and `ts_i` holds `t_i.lo` in both
 /// lanes. Same unreduced-word layout and shift-fold reduction as

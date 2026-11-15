@@ -2229,6 +2229,17 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let eq_prep_addr = eq_prep.as_ptr() as usize;
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let eq_prep_addr = 0usize;
+    // The fold table in seven pieces (`FLOCK_NO_R2_FOLD7`), for the full
+    // chunks' ranked walks on the performance-core workers: one lookup fewer
+    // per row, the same folded rows (none when a byte bank is not linear).
+    #[cfg(target_arch = "aarch64")]
+    let fold7 = if kernels::aarch64::r2_fold7_enabled() {
+        kernels::aarch64::r2_fold7_table(&table.data)
+    } else {
+        None
+    };
+    #[cfg(target_arch = "aarch64")]
+    let fold7_addr = fold7.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
     // Tail-compacted layout: the dead-pair skip is on, every chunk's
     // producer runs its ranked periodic walk (the lookahead, prescaled and
     // Horner producers all rebase per block there) and the one-table fused
@@ -2357,7 +2368,28 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
-                if full {
+                if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                    kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
+                        t,
+                        fold7_addr as *const u8,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        eq_prep_addr as *const F128,
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        skip_dead,
+                        tail_compact,
+                        head_fail_ptr,
+                        out.as_mut_ptr(),
+                    );
+                } else if full {
                     fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                         t,
                         ap,
@@ -3316,6 +3348,17 @@ fn fold2_compact_and_round45_into_packed_b(
     // prepared form, one table shared by every chunk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
+    // The scaled table in seven pieces (`FLOCK_NO_ZC_K_FOLD7`) for the packed
+    // chunks on the performance-core workers: one lookup fewer per tree, the
+    // same values (none when a byte bank is not linear).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let fold7 = if one_table && pack && kernels::aarch64::zc_k_fold7_enabled() {
+        kernels::aarch64::r2_fold7_table(&table_l1)
+    } else {
+        None
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let fold7_addr = fold7.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
     // b-one pack (packed outputs only): each 64-output block's b takes
     // `B_PACK_BLOCK` entries; a kernel that meets a skipped b output that is
     // not one says so, and the whole pass is rerun without it.
@@ -3417,24 +3460,31 @@ fn fold2_compact_and_round45_into_packed_b(
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
-                    let ok = fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
-                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
-                        compact.tail_compact, compact.head_compact, compact.head_b,
-                    );
+                    let ok = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                        kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+                            fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
+                            degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                    } else {
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                            compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                    };
                     if !ok {
                         b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                         compact.tail_compact, compact.head_compact, compact.head_b,
                     );
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                         false, false, F128::ZERO,
                     );
@@ -4240,6 +4290,101 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     (m1, minf, la, la2)
 }
 
+/// Caller-first main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, any value,
+/// restores the rayon `par_chunks_mut` collect). The tri passes below the
+/// hetero floor (ranked: passes 1 and 2, 128 and 16 chunks) run through
+/// [`crate::epool::run_chunks_caller_first`]: the calling thread starts on
+/// chunk 0 at once and never parks on a pool latch, which matters here
+/// because zerocheck arms no post-drain linger. Same `x_hi` chunk grid and
+/// chunk closure as both other arms; each chunk writes its own output range
+/// and its own `partials[x_hi]`, and the combine below walks the partials in
+/// index order, so bytes are identical. Read once per process.
+fn zc_tri_caller_first_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TRI_CF").is_none());
+    *ON
+}
+
+/// Tri pass 0's claim queue with the GPU arm (see
+/// `gpu_commit::ENV_NO_ZC_T0_GPU`). `hi_size` claims, one per queue job,
+/// each under one mutex: `(g0, g1)` = (next chunk to take from the GPU,
+/// lowest chunk the CPU has taken), always `g0 < g1` before a claim, so each
+/// chunk is claimed once. A claim takes `g0` from the GPU when its encoder
+/// has signalled completion (the job's `chunk_ready`), else folds `g1 - 1`
+/// on the CPU and publishes that boundary so the GPU skips it. A GPU chunk's
+/// outputs are copied into its output ranges and its 26 slots into its
+/// partial row, exactly what `body` writes for it. At the arm's first
+/// launch (oracle) the CPU folds every chunk and the GPU's outputs and
+/// slots of every offered chunk must equal the CPU's. `FLOCK_ZC_T0_FORCE`
+/// (test hook) keeps chunks below it for the GPU and waits for them.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn tri0_gpu_queue(
+    job: crate::gpu_commit::ZcT0Job,
+    hi_size: usize,
+    chunk_out: usize,
+    a_base: crate::epool::SyncPtr<F128>,
+    b_base: crate::epool::SyncPtr<F128>,
+    partials_base: crate::epool::SyncPtr<[F128; 26]>,
+    body: &(dyn Fn(usize) + Sync),
+) {
+    let calibration = job.calibration();
+    let force = if calibration { 0 } else { crate::gpu_commit::gpu_zc_t0_force().min(job.offer()) };
+    let claims = std::sync::Mutex::new((0usize, hi_size, 0usize));
+    crate::epool::run_hetero_chunks(hi_size, |_| {
+        let (x_hi, from_gpu) = {
+            let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(g.0 < g.1, "tri pass 0 claim queue overrun");
+            if !calibration && job.chunk_ready(g.0) {
+                g.0 += 1;
+                g.2 += 1;
+                (g.0 - 1, true)
+            } else if !calibration && g.1 <= force {
+                // Test hook: the rest is the GPU's; wait for it.
+                g.0 += 1;
+                if job.wait_chunk(g.0 - 1) {
+                    g.2 += 1;
+                    (g.0 - 1, true)
+                } else {
+                    (g.0 - 1, false)
+                }
+            } else {
+                g.1 -= 1;
+                if !calibration {
+                    job.set_cut(g.1);
+                }
+                (g.1, false)
+            }
+        };
+        if from_gpu {
+            let (ga, gb, slots) = job.chunk_out(x_hi);
+            // SAFETY: exclusive owner of chunk `x_hi`'s output ranges and
+            // partial slot (claimed above); the queue join publishes them.
+            unsafe {
+                std::ptr::copy_nonoverlapping(ga.as_ptr(), a_base.ptr().add(x_hi * chunk_out), chunk_out);
+                std::ptr::copy_nonoverlapping(gb.as_ptr(), b_base.ptr().add(x_hi * chunk_out), chunk_out);
+                *partials_base.ptr().add(x_hi) = slots;
+            }
+        } else {
+            body(x_hi);
+        }
+    });
+    let taken = claims.into_inner().unwrap_or_else(|e| e.into_inner()).2;
+    if calibration {
+        let equal = job.wait_all()
+            && (0..job.offer()).all(|c| {
+                let (ga, gb, slots) = job.chunk_out(c);
+                // SAFETY: the queue has drained; no other access.
+                unsafe {
+                    std::slice::from_raw_parts(a_base.ptr().add(c * chunk_out).cast_const(), chunk_out) == ga
+                        && std::slice::from_raw_parts(b_base.ptr().add(c * chunk_out).cast_const(), chunk_out) == gb
+                        && *partials_base.ptr().add(c) == slots
+                }
+            });
+        crate::gpu_commit::zc_t0_verdict(equal, job.offer());
+    }
+    job.finish(taken, hi_size);
+}
+
 /// [`fold_cascade_t_into_packed_prefix`] with the 5+6 GPU prefix arm when
 /// `gpu` is set (see `gpu_commit::ENV_NO_ZC_T56_GPU`): on the ranked packed
 /// b-one-packed depth-two pass whose `prefix` is the K arm's, the GPU folds
@@ -4258,6 +4403,37 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     b_out: &mut [F128],
     rhos: &[F128],
     r_next: &[F128],
+    gpu: bool,
+) -> (F128, F128, Round3Lookahead, Lookahead2, Option<KGpuPrefix>) {
+    fold_cascade_t_into_packed_prefix_arm(
+        a,
+        b,
+        packed,
+        bpacked,
+        prefix,
+        a_out,
+        b_out,
+        rhos,
+        r_next,
+        zc_tri_caller_first_enabled(),
+        gpu,
+    )
+}
+
+/// [`fold_cascade_t_into_packed_prefix_gpu`] with the caller-first arm
+/// explicit (`false` = the rayon collect), so tests can compare both.
+#[allow(clippy::too_many_arguments)]
+fn fold_cascade_t_into_packed_prefix_arm(
+    a: &[F128],
+    b: &[F128],
+    packed: bool,
+    bpacked: bool,
+    prefix: Option<(&[F128], &[F128])>,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+    caller_first: bool,
     gpu: bool,
 ) -> (F128, F128, Round3Lookahead, Lookahead2, Option<KGpuPrefix>) {
     let _ = gpu;
@@ -4409,7 +4585,33 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
         };
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let t_cpu = std::time::Instant::now();
-        crate::epool::run_hetero_chunks(hi_size - cpu_base, &body);
+        // Tri pass 0 GPU arm (`FLOCK_NO_ZC_T0_GPU` kills): this pass's
+        // leading inputs are the 5+6 arm's buffers; the GPU folds the chunks
+        // wholly inside them from chunk 0 up while the queue claims from the
+        // top, and the queue takes a chunk from the GPU only once its encoder
+        // has signalled (see `tri0_gpu_queue`).
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let t0_job = match prefix {
+            Some((pa, pb))
+                if depth == 3
+                    && !packed
+                    && cpu_base == 0
+                    && crate::gpu_commit::gpu_zc_t0_enabled()
+                    && hi_size == crate::gpu_commit::T0_HI
+                    && chunk_out == crate::gpu_commit::T0_OUT
+                    && chunk_in == crate::gpu_commit::T0_IN =>
+            {
+                crate::gpu_commit::zc_t0_fire(pa, pb, [rhos[0], rhos[1], rhos[2]], eq_lo)
+            }
+            _ => None,
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let t0_job: Option<()> = None;
+        match t0_job {
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            Some(job) => tri0_gpu_queue(job, hi_size, chunk_out, a_base, b_base, partials_base, &body),
+            _ => crate::epool::run_hetero_chunks(hi_size - cpu_base, &body),
+        }
         // Join the GPU prefix (submitted first; normally done).
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(job) = gpu_job {
@@ -4429,6 +4631,13 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                             && gb == &b_out[..len]
                             && parts.as_slice() == &partials[..chunks];
                         crate::gpu_commit::zc_t56_verdict(equal, chunks, hi_size);
+                        // With the tri pass 0 arm on, an admitted oracle hands
+                        // its buffers (byte-equal to the CPU's outputs above)
+                        // to pass 0, so that arm's own first launch, its
+                        // oracle, chains on them in this prove too.
+                        if equal && crate::gpu_commit::gpu_zc_t0_enabled() {
+                            gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
+                        }
                     } else {
                         partials[..chunks].copy_from_slice(&parts);
                         gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
@@ -4446,6 +4655,31 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
         vec![chunk(&a_in, &b_in, a_out, b_out)]
+    } else if caller_first {
+        // The `par_chunks_mut(chunk_out)` grid below: `hi_size` chunks
+        // (`2 * lo_size * hi_size == out_n`, asserted above).
+        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_caller_first(hi_size, &|x_hi| {
+            // SAFETY: the drain runs each `x_hi` exactly once; its output
+            // ranges are disjoint per chunk, and the drain publishes every
+            // write before the combine below reads them.
+            let (a_o, b_o) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let (a_in, b_in) = inputs(x_hi);
+            let outv = chunk(&a_in, &b_in, a_o, b_o);
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = outv;
+            }
+        });
+        partials
     } else {
         use rayon::prelude::*;
         a_out
@@ -7455,6 +7689,48 @@ mod tests {
             g_via_sum += eq_remaining[x_prime] * a_x * b_x;
         }
         assert_eq!(g_via_poly, g_via_sum);
+    }
+
+    /// Caller-first tri passes (`FLOCK_NO_ZC_TRI_CF`): the caller-first arm
+    /// writes the same folded outputs and returns the same messages and
+    /// lookaheads, byte for byte, as the rayon arm, for both depths on chunk
+    /// grids of 4..128 `x_hi` chunks (ranked passes 1 and 2: 128 and 16), in
+    /// a multi-thread pool and inline in a single-thread pool.
+    #[test]
+    fn tri_pass_caller_first_matches_rayon_arm() {
+        let mut rng = Rng::new(0x7121_0C1F);
+        for threads in [4usize, 1] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("test pool");
+            for depth in [2usize, 3] {
+                for log_out in [11usize, 12, 13, 14, 16] {
+                    let n = 1usize << (log_out + depth);
+                    let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+                    let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+                    let rhos: Vec<F128> = (0..depth).map(|_| rng.f128()).collect();
+                    let mut r_next = vec![F128::ONE; log_out];
+                    for s in r_next[1..].iter_mut() {
+                        *s = rng.f128();
+                    }
+                    let run = |caller_first: bool| {
+                        let mut a_o = vec![LA_POISON; n >> depth];
+                        let mut b_o = vec![LA_POISON; n >> depth];
+                        let out = pool.install(|| {
+                            let (m1, minf, la, la2, _) = fold_cascade_t_into_packed_prefix_arm(
+                                &a, &b, false, false, None, &mut a_o, &mut b_o, &rhos, &r_next,
+                                caller_first, false,
+                            );
+                            (m1, minf, la, la2)
+                        });
+                        (out, a_o, b_o)
+                    };
+                    let (cf, rb) = (run(true), run(false));
+                    assert!(cf == rb, "threads {threads} depth {depth} log_out {log_out}");
+                }
+            }
+        }
     }
 
     #[test]
