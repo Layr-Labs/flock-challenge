@@ -1928,6 +1928,23 @@ fn zc_k_premap_bytes(n_pairs: usize) -> usize {
     prefix_pairs * 32
 }
 
+/// R2-CS wide share (`gpu_commit::ENV_NO_ZC_R2_CS_WIDE`): the dense anchors
+/// prefix in bytes of this process's R2-CS share when it exceeds the clamp
+/// (0 otherwise), over a compact state of `n_pairs` pairs in the lookahead
+/// sweep's chunks. At the ranked shape the dense prefix of `g >= 2` chunks
+/// covers every compacted layout's prefix of `g` chunks (a compacted layout
+/// starts `tail_base_blocks` gaps, plus 8 slots, past the dense start and
+/// saves one gap per block); the launch still checks the view's length.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn r2_cs_wide_premap_bytes(n_pairs: usize) -> usize {
+    if n_pairs < 16 {
+        return 0;
+    }
+    let hi = 1usize << lookahead_n_hi(n_pairs.trailing_zeros() as usize);
+    let chunks = crate::gpu_commit::zc_r2_cs_wide_chunks(hi);
+    chunks.min(hi) * (n_pairs / hi) * 32
+}
+
 /// R2-CS (`gpu_commit::ENV_NO_ZC_R2_CS`): before round one of a prove whose
 /// round two runs the lookahead sweep, take that sweep's compact anchors and
 /// premap the K pass arm's view over them ([`crate::gpu_commit::zc_k_premap`])
@@ -1944,6 +1961,11 @@ pub(crate) fn round2_anchors_premapped_early(m: usize, k_skip: usize) -> Option<
     if bytes == 0 {
         return None;
     }
+    // R2-CS wide share (`gpu_commit::ENV_NO_ZC_R2_CS_WIDE`): the same view
+    // also covers the dense anchors prefix of an R2-CS share past the K
+    // arm's, so the sweep's launch finds it long enough. Round two's own
+    // premap keeps the K arm's length.
+    let bytes = bytes.max(r2_cs_wide_premap_bytes(n_pairs));
     let anchors = crate::scratch::take_f128(2 * n_pairs);
     crate::gpu_commit::zc_k_premap(&anchors, bytes);
     Some(anchors)
