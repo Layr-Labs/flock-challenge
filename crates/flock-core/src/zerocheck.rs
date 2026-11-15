@@ -1053,7 +1053,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }
-            compact_mlv.recycle();
+            compact_mlv.recycle_after_k();
             multilinear_msgs.push((m4_1, m4_inf));
             challenger.observe_f128(m4_1);
             challenger.observe_f128(m4_inf);

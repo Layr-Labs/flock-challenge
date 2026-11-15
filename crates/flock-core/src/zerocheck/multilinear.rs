@@ -1020,6 +1020,26 @@ impl UniSkipCompactFold {
         crate::scratch::give_f128(anchors);
         deltas.recycle();
     }
+
+    /// [`Self::recycle`] after the cascade K pass: the anchors may instead be
+    /// kept, with their K view mapped, for the next prove's round two
+    /// (`gpu_commit::ENV_NO_ZC_K_HANDOVER`, once per process).
+    pub fn recycle_after_k(self) {
+        let Self { anchors, deltas, .. } = self;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let anchors = {
+            let bytes = zc_k_premap_bytes(anchors.len() / 2);
+            match crate::gpu_commit::zc_k_handover_keep(anchors, bytes) {
+                Some(anchors) => anchors,
+                None => {
+                    deltas.recycle();
+                    return;
+                }
+            }
+        };
+        crate::scratch::give_f128(anchors);
+        deltas.recycle();
+    }
 }
 
 /// Compact counterpart of
@@ -1943,6 +1963,12 @@ pub(crate) fn round2_anchors_premapped_early(m: usize, k_skip: usize) -> Option<
     let bytes = zc_k_premap_bytes(n_pairs);
     if bytes == 0 {
         return None;
+    }
+    // K view hand-over (`gpu_commit::ENV_NO_ZC_K_HANDOVER`): the anchors the
+    // previous prove's K pass kept, with their view already mapped and now
+    // published as this prove's premap.
+    if let Some(anchors) = crate::gpu_commit::zc_k_handover_take(2 * n_pairs, bytes) {
+        return Some(anchors);
     }
     let anchors = crate::scratch::take_f128(2 * n_pairs);
     crate::gpu_commit::zc_k_premap(&anchors, bytes);
