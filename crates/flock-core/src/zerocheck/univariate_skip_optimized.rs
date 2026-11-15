@@ -1583,6 +1583,9 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // distributes independent slabs dynamically.
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+    // Resolve the rollback once before worker/row dispatch; no table setup.
+    let transform_trim = std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref()
+        != Some(std::ffi::OsStr::new("1"));
     if let Some(producer) = producer {
         // Deferred A/B rows: each job produces its units one at a time into
         // a worker-local scratch and transforms them from there, so the
@@ -1619,7 +1622,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             || {
                 #[cfg(target_arch = "aarch64")]
                 kernels::aarch64::ab_kara_note_worker();
-                let window_plan = ab_window_rows_worker_plan();
+                let window_plan = ab_window_rows_worker_plan_with_trim(transform_trim);
                 (
                     [F8::ZERO; ELL],
                     [F8::ZERO; ELL],
@@ -1671,7 +1674,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         || {
             #[cfg(target_arch = "aarch64")]
             kernels::aarch64::ab_kara_note_worker();
-            ([F8::ZERO; ELL], [F8::ZERO; ELL], ab_window_rows_worker_plan())
+            ([F8::ZERO; ELL], [F8::ZERO; ELL], ab_window_rows_worker_plan_with_trim(transform_trim))
         },
         |(a_col, b_col, window_plan), job| {
             let window_plan = *window_plan;
@@ -1900,6 +1903,31 @@ fn ab_window_rows_worker_plan() -> Option<AbWindowRows> {
     None
 }
 
+/// Select the complemented static-B basis once per worker. The original
+/// function instances remain the rollback, including their row policies.
+fn ab_window_rows_worker_plan_with_trim(trim: bool) -> Option<AbWindowRows> {
+    let plan = ab_window_rows_worker_plan();
+    #[cfg(target_arch = "aarch64")]
+    if trim {
+        use kernels::aarch64::{self as k, bstatic_horner_window_rows_impl as rows};
+        const MAIN: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16
+            | k::ABV_BSTATIC_Z | k::ABV_KARA_SLOT | k::ABV_HORNER2;
+        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
+        return plan.map(|rows_fn| {
+            if core::ptr::fn_addr_eq(rows_fn, rows::<MAIN, true> as AbWindowRows) {
+                rows::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows
+            } else if core::ptr::fn_addr_eq(rows_fn, rows::<HELPER, true> as AbWindowRows) {
+                rows::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows
+            } else {
+                rows_fn
+            }
+        });
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = trim;
+    plan
+}
+
 /// Kill switch for the unit window-rows call: any value of
 /// `FLOCK_NO_ZC_AB_WINDOW_UNIT_CALL` makes every chunk of a producer unit
 /// call its static-B window rows itself again. Read once per process. The
@@ -1945,7 +1973,11 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
         | k::ABV_KARA_SLOT
         | k::ABV_HORNER2;
     const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
-    if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
+    if core::ptr::fn_addr_eq(rows, per_chunk::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows) {
+        Some(unit::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true>)
+    } else if core::ptr::fn_addr_eq(rows, per_chunk::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows) {
+        Some(unit::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true>)
+    } else if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
         Some(unit::<MAIN, true>)
     } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, true> as AbWindowRows) {
         Some(unit::<HELPER, true>)
