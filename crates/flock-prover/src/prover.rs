@@ -2813,6 +2813,9 @@ fn commit_with_round1_ab_precompute(
             precompute_ab_replay,
         );
         drop(replay_backing.lock().unwrap().take());
+        // The 5+6 GPU arm's kernel compiles now, after the split retune, so
+        // it never runs beside this warm-up commit or its retune.
+        zerocheck::univariate_skip_optimized::t56_prewarm_after_tune();
     }
     result
 }
