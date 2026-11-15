@@ -108,15 +108,9 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
             ($blk:literal, $k:literal, [$(($j0:literal, $j1:literal)),*], [$($js:literal),*]) => {{
                 let pp = pbase.add(($blk * 8 + $k) * 64);
                 #[allow(unused_mut)]
-                let mut db0 = vld1q_u8(pp);
-                #[allow(unused_mut)]
-                let mut db1 = vld1q_u8(pp.add(16));
-                #[allow(unused_mut)]
-                let mut db2 = vld1q_u8(pp.add(32));
-                #[allow(unused_mut)]
-                let mut db3 = vld1q_u8(pp.add(48));
+                let (mut db0, mut db1, mut db2, mut db3) = transform_partial_seed::<V>(pp);
                 #[allow(unused_variables)]
-                let b_word = bw!($k);
+                let b_word = transform_partial_word::<V>(bw!($k));
                 if V & ABV_NOSW != 0 {
                     $(xor_vary_ext::<$j0, $j1>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
                     $(xor_vary_ext::<$js, 8>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
@@ -140,6 +134,32 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                 }
             }};
         }
+        // Five or six varying low bytes with a guarded all-one tail. The
+        // selected worker instance removes the constant table terms; other
+        // instances retain the existing word/partial apply unchanged.
+        macro_rules! bimg_tail {
+            ($blk:literal, $k:literal, $nb:literal, $pairs:tt, $singles:tt) => {{
+                if V & ABV_TRANSFORM_CONST != 0 && V & ABV_Z != 0 && V & ABV_Z_REC != 0
+                    && V & (ABV_Z_MT | ABV_Z_SCALED) == 0
+                {
+                    apply_word_z_fixed_tail::<$nb>(plain, kplain, bw!($k))
+                } else if V & ABV_TRANSFORM_CONST != 0 && V & ABV_HZ != 0 && V & ABV_KARA == 0 {
+                    let pp = pbase.add(($blk * 8 + $k) * 64);
+                    let (z0, z1, z2, z3) = apply_word_hz_low::<$nb>(
+                        plain, kplain, transform_partial_word::<V>(bw!($k)),
+                    );
+                    let (d0, d1, d2, d3) = transform_partial_seed::<V>(pp);
+                    (
+                        veorq_u8(d0, z0),
+                        veorq_u8(d1, z1),
+                        veorq_u8(d2, z2),
+                        veorq_u8(d3, z3),
+                    )
+                } else {
+                    bimg_sk!($blk, $k, $pairs, $singles)
+                }
+            }};
+        }
         // A static b word whose varying bytes are exactly bytes 0..NB: under
         // `ABV_BSTATIC_Z` its partial image plus the varying bytes' z-form
         // image; otherwise the incumbent form `$inc`.
@@ -147,12 +167,15 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
             ($blk:literal, $k:literal, $nb:literal, $inc:expr) => {{
                 if V & ABV_BSTATIC_Z != 0 {
                     let pp = pbase.add(($blk * 8 + $k) * 64);
-                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(plain, kplain, bw!($k));
+                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(
+                        plain, kplain, transform_partial_word::<V>(bw!($k)),
+                    );
+                    let (d0, d1, d2, d3) = transform_partial_seed::<V>(pp);
                     (
-                        veorq_u8(vld1q_u8(pp), z0),
-                        veorq_u8(vld1q_u8(pp.add(16)), z1),
-                        veorq_u8(vld1q_u8(pp.add(32)), z2),
-                        veorq_u8(vld1q_u8(pp.add(48)), z3),
+                        veorq_u8(d0, z0),
+                        veorq_u8(d1, z1),
+                        veorq_u8(d2, z2),
+                        veorq_u8(d3, z3),
                     )
                 } else {
                     $inc
@@ -219,7 +242,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(3, 5, [(5, 6)], [7]));
                     horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                     let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(3, 4, [(0, 1), (2, 3), (4, 5)], []));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_tail!(3, 4, 6, [(0, 1), (2, 3), (4, 5)], []));
                     horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                     acc
                 } else {
@@ -233,7 +256,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_s!(3, 5, [(5, 6)], [7]));
                     fuse_absorb_k1(&mut acc, &o1, &o5);
                     let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                    let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_sk!(3, 4, [(0, 1), (2, 3), (4, 5)], []));
+                    let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_tail!(3, 4, 6, [(0, 1), (2, 3), (4, 5)], []));
                     fuse_absorb_k0(&mut acc, &o0, &o4);
                     acc
                 }
@@ -253,8 +276,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_s!(4, 1, [(5, 6)], [7]));
                     let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(4, 5, [(4, 5), (6, 7)], []));
                     horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
-                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(4, 0, [(0, 1), (2, 3), (4, 5)], []));
-                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(4, 4, [(0, 1), (2, 3)], [4]));
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_tail!(4, 0, 6, [(0, 1), (2, 3), (4, 5)], []));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_tail!(4, 4, 5, [(0, 1), (2, 3)], [4]));
                     horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                     acc
                 } else {
@@ -267,8 +290,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_s!(4, 1, [(5, 6)], [7]));
                     let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_sk!(4, 5, [(4, 5), (6, 7)], []));
                     fuse_absorb_k1(&mut acc, &o1, &o5);
-                    let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_sk!(4, 0, [(0, 1), (2, 3), (4, 5)], []));
-                    let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_sk!(4, 4, [(0, 1), (2, 3)], [4]));
+                    let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_tail!(4, 0, 6, [(0, 1), (2, 3), (4, 5)], []));
+                    let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_tail!(4, 4, 5, [(0, 1), (2, 3)], [4]));
                     fuse_absorb_k0(&mut acc, &o0, &o4);
                     acc
                 }
@@ -385,7 +408,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                 }
                 if V & ABV_FUSE == 0 {
                     let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(8, 7, [(0, 1), (2, 3), (4, 5)], []));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_tail!(8, 7, 6, [(0, 1), (2, 3), (4, 5)], []));
                     let mut acc = seed!(lo3, hi3);
                     let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
                     let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
@@ -399,7 +422,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     acc
                 } else {
                     let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_g!(3));
-                    let o7 = opnds!(scaled, scaled_sw, kscaled, 7, bimg_sk!(8, 7, [(0, 1), (2, 3), (4, 5)], []));
+                    let o7 = opnds!(scaled, scaled_sw, kscaled, 7, bimg_tail!(8, 7, 6, [(0, 1), (2, 3), (4, 5)], []));
                     let mut acc = fuse_seed(&o3, &o7);
                     let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_g!(2));
                     let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
@@ -419,8 +442,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     return;
                 }
                 if V & ABV_FUSE == 0 {
-                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_sk!(9, 3, [(0, 1), (2, 3)], [4]));
-                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(9, 7, [(0, 1), (2, 3)], [4]));
+                    let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_tail!(9, 3, 5, [(0, 1), (2, 3)], [4]));
+                    let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_tail!(9, 7, 5, [(0, 1), (2, 3)], [4]));
                     let mut acc = seed!(lo3, hi3);
                     let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_g!(2));
                     let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
@@ -433,8 +456,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                     acc
                 } else {
-                    let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_sk!(9, 3, [(0, 1), (2, 3)], [4]));
-                    let o7 = opnds!(scaled, scaled_sw, kscaled, 7, bimg_sk!(9, 7, [(0, 1), (2, 3)], [4]));
+                    let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_tail!(9, 3, 5, [(0, 1), (2, 3)], [4]));
+                    let o7 = opnds!(scaled, scaled_sw, kscaled, 7, bimg_tail!(9, 7, 5, [(0, 1), (2, 3)], [4]));
                     let mut acc = fuse_seed(&o3, &o7);
                     let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_g!(2));
                     let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
@@ -597,8 +620,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let lo3 = prods!(plain, plain_sw, kplain, 3, bimg_s!(14, 3, [(5, 6)], [7]));
                     let hi3 = prods!(scaled, scaled_sw, kscaled, 7, bimg_sk!(14, 7, [(4, 5), (6, 7)], []));
                     let mut acc = seed!(lo3, hi3);
-                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(14, 2, [(0, 1), (2, 3), (4, 5)], []));
-                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(14, 6, [(0, 1), (2, 3)], [4]));
+                    let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_tail!(14, 2, 6, [(0, 1), (2, 3), (4, 5)], []));
+                    let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_tail!(14, 6, 5, [(0, 1), (2, 3)], [4]));
                     horner_absorb_first(&mut acc, &lo2, &hi2);
                     let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_g!(1));
                     let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
@@ -611,8 +634,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_s!(14, 3, [(5, 6)], [7]));
                     let o7 = opnds!(scaled, scaled_sw, kscaled, 7, bimg_sk!(14, 7, [(4, 5), (6, 7)], []));
                     let mut acc = fuse_seed(&o3, &o7);
-                    let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_sk!(14, 2, [(0, 1), (2, 3), (4, 5)], []));
-                    let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_sk!(14, 6, [(0, 1), (2, 3)], [4]));
+                    let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_tail!(14, 2, 6, [(0, 1), (2, 3), (4, 5)], []));
+                    let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_tail!(14, 6, 5, [(0, 1), (2, 3)], [4]));
                     fuse_absorb_first(&mut acc, &o2, &o6);
                     let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_g!(1));
                     let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
@@ -775,8 +798,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_s!(19, 2, [(5, 6)], [7]));
                     let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_s!(19, 6, [(5, 6)], [7]));
                     horner_absorb_first(&mut acc, &lo2, &hi2);
-                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(19, 1, [(0, 1), (2, 3), (4, 5)], []));
-                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(19, 5, [(0, 1), (2, 3), (4, 5)], []));
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_tail!(19, 1, 6, [(0, 1), (2, 3), (4, 5)], []));
+                    let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_tail!(19, 5, 6, [(0, 1), (2, 3), (4, 5)], []));
                     horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                     let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
                     let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
@@ -789,8 +812,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_s!(19, 2, [(5, 6)], [7]));
                     let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_s!(19, 6, [(5, 6)], [7]));
                     fuse_absorb_first(&mut acc, &o2, &o6);
-                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_sk!(19, 1, [(0, 1), (2, 3), (4, 5)], []));
-                    let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_sk!(19, 5, [(0, 1), (2, 3), (4, 5)], []));
+                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_tail!(19, 1, 6, [(0, 1), (2, 3), (4, 5)], []));
+                    let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_tail!(19, 5, 6, [(0, 1), (2, 3), (4, 5)], []));
                     fuse_absorb_k1(&mut acc, &o1, &o5);
                     let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_g!(0));
                     let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_g!(4));
@@ -810,7 +833,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let lo2 = prods!(plain, plain_sw, kplain, 2, bimg_sk!(20, 2, [(4, 5), (6, 7)], []));
                     let hi2 = prods!(scaled, scaled_sw, kscaled, 6, bimg_sk!(20, 6, [(3, 4), (5, 6)], [7]));
                     horner_absorb_first(&mut acc, &lo2, &hi2);
-                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(20, 1, [(0, 1), (2, 3)], [4]));
+                    let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_tail!(20, 1, 5, [(0, 1), (2, 3)], [4]));
                     let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_lz!(20, 5, 4, bimg_sk!(20, 5, [(0, 1), (2, 3)], [])));
                     horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                     let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
@@ -824,7 +847,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_sk!(20, 2, [(4, 5), (6, 7)], []));
                     let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_sk!(20, 6, [(3, 4), (5, 6)], [7]));
                     fuse_absorb_first(&mut acc, &o2, &o6);
-                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_sk!(20, 1, [(0, 1), (2, 3)], [4]));
+                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_tail!(20, 1, 5, [(0, 1), (2, 3)], [4]));
                     let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_lz!(20, 5, 4, bimg_sk!(20, 5, [(0, 1), (2, 3)], [])));
                     fuse_absorb_k1(&mut acc, &o1, &o5);
                     let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_g!(0));
@@ -954,7 +977,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_s!(24, 5, [(5, 6)], [7]));
                     horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
                     let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(24, 4, [(0, 1), (2, 3), (4, 5)], []));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_tail!(24, 4, 6, [(0, 1), (2, 3), (4, 5)], []));
                     horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                     acc
                 } else {
@@ -968,7 +991,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_s!(24, 5, [(5, 6)], [7]));
                     fuse_absorb_k1(&mut acc, &o1, &o5);
                     let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_g!(0));
-                    let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_sk!(24, 4, [(0, 1), (2, 3), (4, 5)], []));
+                    let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_tail!(24, 4, 6, [(0, 1), (2, 3), (4, 5)], []));
                     fuse_absorb_k0(&mut acc, &o0, &o4);
                     acc
                 }
@@ -988,8 +1011,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let lo1 = prods!(plain, plain_sw, kplain, 1, bimg_sk!(25, 1, [(4, 5), (6, 7)], []));
                     let hi1 = prods!(scaled, scaled_sw, kscaled, 5, bimg_sk!(25, 5, [(4, 5), (6, 7)], []));
                     horner_absorb_k1::<V>(&mut acc, &lo1, &hi1, carry_not);
-                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_sk!(25, 0, [(0, 1), (2, 3)], [4]));
-                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_sk!(25, 4, [(0, 1), (2, 3)], [4]));
+                    let lo0 = prods!(plain, plain_sw, kplain, 0, bimg_tail!(25, 0, 5, [(0, 1), (2, 3)], [4]));
+                    let hi0 = prods!(scaled, scaled_sw, kscaled, 4, bimg_tail!(25, 4, 5, [(0, 1), (2, 3)], [4]));
                     horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                     acc
                 } else {
@@ -1002,8 +1025,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_sk!(25, 1, [(4, 5), (6, 7)], []));
                     let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_sk!(25, 5, [(4, 5), (6, 7)], []));
                     fuse_absorb_k1(&mut acc, &o1, &o5);
-                    let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_sk!(25, 0, [(0, 1), (2, 3)], [4]));
-                    let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_sk!(25, 4, [(0, 1), (2, 3)], [4]));
+                    let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_tail!(25, 0, 5, [(0, 1), (2, 3)], [4]));
+                    let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_tail!(25, 4, 5, [(0, 1), (2, 3)], [4]));
                     fuse_absorb_k0(&mut acc, &o0, &o4);
                     acc
                 }
@@ -1335,11 +1358,36 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
     out_unit: &mut [u8],
     nt_store: bool,
 ) {
+    // Preserve both transform flags in the fused specialization. Every
+    // choice is constant for this instance, outside the row/chunk loops.
+    macro_rules! transform_unit_nt {
+        ($base:expr, $hoist:expr) => {{
+            macro_rules! run {
+                ($flags:expr) => {
+                    bstatic_horner_window_unit_nt::<{ $base | $flags }, $hoist, true>(
+                        x_outer, window_mask, a_packed, b_packed, inv_table,
+                        chunk_byte_base, partials, out_unit,
+                    )
+                };
+            }
+            if const { V & ABV_TRANSFORM_TRIM != 0 } {
+                if const { V & ABV_TRANSFORM_CONST != 0 } {
+                    run!(ABV_TRANSFORM_TRIM | ABV_TRANSFORM_CONST)
+                } else {
+                    run!(ABV_TRANSFORM_TRIM)
+                }
+            } else if const { V & ABV_TRANSFORM_CONST != 0 } {
+                run!(ABV_TRANSFORM_CONST)
+            } else {
+                run!(0)
+            }
+        }};
+    }
     // The first call reads the switch (the cold arm); later calls only look
     // at its stored value.
     match AB_ROWS_NT_CONST.get() {
         Some(true) if nt_store => {
-            if const { V == AB_UNIT_MAIN && HOIST } {
+            if const { V & !(ABV_TRANSFORM_TRIM | ABV_TRANSFORM_CONST) == AB_UNIT_MAIN && HOIST } {
                 // The main-pool instance with non-temporal stores runs the
                 // rows with the z-basis applies in the [`ABV_Z_OUT3`] form;
                 // `FLOCK_NO_ZC_AB_Z_EOR3` takes the per-chunk rows. On top,
@@ -1348,9 +1396,7 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                 if ab_z_out3_enabled() {
                     const BASE: u32 = AB_UNIT_MAIN | ABV_Z_OUT3;
                     if ab_fuse_enabled() {
-                        bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM }, true, true>(
-                            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
-                        )
+                        transform_unit_nt!(BASE | AB_FUSE_FORM, true)
                     } else {
                         // Kill switch only (build budget): the per-chunk rows
                         // write the same bytes; no separate unit instance.
@@ -1365,14 +1411,12 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                         x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, true,
                     )
                 }
-            } else if const { V == AB_UNIT_HELPER } {
+            } else if const { V & !(ABV_TRANSFORM_TRIM | ABV_TRANSFORM_CONST) == AB_UNIT_HELPER } {
                 // The helper threads' half-pair z rows with the fused
                 // products ([`ABV_FUSE`], `FLOCK_NO_ZC_AB_FUSE_E` kills), with
                 // the same bounds checks (`HOIST`: one per window).
                 if ab_fuse_e_enabled() {
-                    bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM }, HOIST, true>(
-                        x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
-                    )
+                    transform_unit_nt!(AB_UNIT_HELPER | AB_FUSE_FORM, HOIST)
                 } else {
                     // Kill switch only (build budget): the per-chunk rows
                     // write the same bytes; no separate unit instance.
