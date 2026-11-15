@@ -536,9 +536,14 @@ impl Gate {
     /// into, and the helper pool has no panic handler) and re-raised by the
     /// drain.
     fn run(&self) {
-        if !self.enter() {
+        if !self.try_run() {
             EPOOL_LATE_HELPERS.fetch_add(1, Ordering::Relaxed);
-            return;
+        }
+    }
+
+    fn try_run(&self) -> bool {
+        if !self.enter() {
+            return false;
         }
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: admitted by `enter`; the drain waits for our `leave`
@@ -550,6 +555,11 @@ impl Gate {
             self.panicked.store(true, Ordering::Relaxed);
         }
         self.state.fetch_sub(1, Ordering::Release);
+        true
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Relaxed) & GATE_CLOSED != 0
     }
 
     /// Drain side: admit no more helpers, then wait for the admitted ones to
@@ -644,6 +654,52 @@ pub(crate) fn drain_hetero<H>(
             .with_max_len(1)
             .for_each(|_| worker());
     });
+}
+
+///
+pub(crate) fn run_chunks_caller_first<F>(n_chunks: usize, f: &F)
+where
+    F: Fn(usize) + Sync,
+{
+    let main_threads = rayon::current_num_threads();
+    if n_chunks <= 1 || main_threads <= 1 {
+        for i in 0..n_chunks {
+            f(i);
+        }
+        return;
+    }
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let claim = || loop {
+        let i = cursor.fetch_add(1, Ordering::Relaxed);
+        if i >= n_chunks {
+            break;
+        }
+        f(i);
+    };
+    let gate = Arc::new(Gate {
+        state: AtomicUsize::new(0),
+        panicked: AtomicBool::new(false),
+        body: JobPtr::new(&claim),
+    });
+    let close = CloseOnDrop(Arc::clone(&gate));
+    let helpers = (main_threads - 1).min(n_chunks - 1);
+    {
+        let gate = Arc::clone(&gate);
+        let cursor = Arc::clone(&cursor);
+        rayon::spawn(move || {
+            let spent = || gate.is_closed() || cursor.load(Ordering::Relaxed) >= n_chunks;
+            if spent() {
+                return;
+            }
+            (0..helpers).into_par_iter().with_max_len(1).for_each(|_| {
+                if !spent() {
+                    gate.try_run();
+                }
+            });
+        });
+    }
+    claim();
+    drop(close);
 }
 
 /// Self-calibrating tail guard for the shared P+E chunk queue.
@@ -1482,6 +1538,33 @@ mod tests {
                 assert_eq!(before, 64, "rep={rep}");
             }
         }
+    }
+
+    #[test]
+    fn caller_first_drain_runs_each_chunk_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().expect("test pool");
+        pool.install(|| {
+            let caller = std::thread::current().id();
+            let by_pool = AtomicUsize::new(0);
+            for n_chunks in [0usize, 1, 2, 3, 4, 5, 16, 257] {
+                let hits: Vec<AtomicUsize> = (0..n_chunks).map(|_| AtomicUsize::new(0)).collect();
+                for _ in 0..32 {
+                    run_chunks_caller_first(n_chunks, &|i| {
+                        hits[i].fetch_add(1, Ordering::Relaxed);
+                        if std::thread::current().id() != caller {
+                            by_pool.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let t = std::time::Instant::now();
+                        while t.elapsed() < std::time::Duration::from_micros(5) {
+                            std::hint::spin_loop();
+                        }
+                    });
+                }
+                assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 32), "n_chunks={n_chunks}");
+            }
+            assert!(by_pool.load(Ordering::Relaxed) > 0, "no pool thread ever claimed a chunk");
+        });
     }
 
     /// A guest claims chunks of the draining queue one at a time, returns as

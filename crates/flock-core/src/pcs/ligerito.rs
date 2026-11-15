@@ -6433,6 +6433,16 @@ fn round_msg_and_eval_lsb_factorized_eq_split(
     eq_hi: &[F128],
     z_0: F128,
 ) -> (SumcheckMessage, F128) {
+    round_msg_and_eval_lsb_factorized_eq_split_arm(f, eq_lo, eq_hi, z_0, lig_fold_caller_first_enabled())
+}
+
+fn round_msg_and_eval_lsb_factorized_eq_split_arm(
+    f: &[F128],
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    z_0: F128,
+    caller_first: bool,
+) -> (SumcheckMessage, F128) {
     use rayon::prelude::*;
 
     assert!(eq_lo.len().is_power_of_two() && eq_lo.len() >= 2);
@@ -6462,6 +6472,21 @@ fn round_msg_and_eval_lsb_factorized_eq_split(
             s += s_chunk * hi_weight;
         }
         (a, s)
+    } else if caller_first {
+        let chunk_len = 2 * eq_lo.len();
+        let n_chunks = eq_hi.len();
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_caller_first(n_chunks, &|hi| {
+            let start = hi * chunk_len;
+            let (a_chunk, s_chunk) =
+                crate::field::f128_slice::round0_factorized_eq(&f[start..start + chunk_len], eq_lo);
+            let hi_weight = eq_hi[hi];
+            unsafe {
+                partials_base.ptr().add(hi).write((a_chunk * hi_weight, s_chunk * hi_weight));
+            }
+        });
+        merge_chunk_partials(&partials)
     } else {
         f.par_chunks(2 * eq_lo.len())
             .zip(eq_hi.par_iter())
@@ -6533,6 +6558,18 @@ fn lig_fold_hetero_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("FLOCK_NO_LIG_FOLD_HETERO").is_ok_and(|v| v == "1"))
 }
 
+fn lig_fold_caller_first_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LIG_FOLD_CF").is_none())
+}
+
+#[inline]
+fn merge_chunk_partials(partials: &[(F128, F128)]) -> (F128, F128) {
+    partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(a0, a2), &(c0, c2)| (a0 + c0, a2 + c2))
+}
+
 /// Same contract for the dense recursive-commit basis induction sweep:
 /// `FLOCK_NO_LIG_INDUCE_HETERO=1` (exactly `"1"`) restores the incumbent
 /// main-pool-only per-worker query split.
@@ -6570,6 +6607,17 @@ fn fold_and_msg_lsb_into(
     r: F128,
     nf: &mut Vec<F128>,
     nb: &mut Vec<F128>,
+) -> SumcheckMessage {
+    fold_and_msg_lsb_into_arm(f, b, r, nf, nb, lig_fold_caller_first_enabled())
+}
+
+fn fold_and_msg_lsb_into_arm(
+    f: &[F128],
+    b: &[F128],
+    r: F128,
+    nf: &mut Vec<F128>,
+    nb: &mut Vec<F128>,
+    caller_first: bool,
 ) -> SumcheckMessage {
     use rayon::prelude::*;
     let n = f.len();
@@ -6679,6 +6727,22 @@ fn fold_and_msg_lsb_into(
             });
         return SumcheckMessage { u_0, u_2 };
     }
+    if caller_first {
+        let n_chunks = half / CHUNK;
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
+        let f_base = crate::epool::SyncPtr(nf.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(nb.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_caller_first(n_chunks, &|ci| {
+            unsafe {
+                let fc = core::slice::from_raw_parts_mut(f_base.ptr().add(ci * CHUNK), CHUNK);
+                let bc = core::slice::from_raw_parts_mut(b_base.ptr().add(ci * CHUNK), CHUNK);
+                partials_base.ptr().add(ci).write(chunk_body(ci, fc, bc));
+            }
+        });
+        let (u_0, u_2) = merge_chunk_partials(&partials);
+        return SumcheckMessage { u_0, u_2 };
+    }
     let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -6710,6 +6774,35 @@ fn fold_and_msg_lsb_into_with_lazy_ood_eq(
     z_0: F128,
     nf: &mut Vec<F128>,
     nb: &mut Vec<F128>,
+) -> SumcheckMessage {
+    fold_and_msg_lsb_into_with_lazy_ood_eq_arm(
+        f,
+        b,
+        deferred_basis,
+        r,
+        eq_lo,
+        eq_hi,
+        beta,
+        z_0,
+        nf,
+        nb,
+        lig_fold_caller_first_enabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_and_msg_lsb_into_with_lazy_ood_eq_arm(
+    f: &[F128],
+    b: &[F128],
+    deferred_basis: Option<(&[F128], F128)>,
+    r: F128,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    beta: F128,
+    z_0: F128,
+    nf: &mut Vec<F128>,
+    nb: &mut Vec<F128>,
+    caller_first: bool,
 ) -> SumcheckMessage {
     use rayon::prelude::*;
 
@@ -6815,6 +6908,23 @@ fn fold_and_msg_lsb_into_with_lazy_ood_eq(
             .fold((F128::ZERO, F128::ZERO), |(a_0, a_2), (b_0, b_2)| {
                 (a_0 + b_0, a_2 + b_2)
             });
+        return SumcheckMessage { u_0, u_2 };
+    }
+    if caller_first {
+        let n_chunks = eq_hi.len();
+        debug_assert_eq!(nf.len(), chunk_w * n_chunks);
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
+        let f_base = crate::epool::SyncPtr(nf.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(nb.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_caller_first(n_chunks, &|hi| {
+            unsafe {
+                let fc = core::slice::from_raw_parts_mut(f_base.ptr().add(hi * chunk_w), chunk_w);
+                let bc = core::slice::from_raw_parts_mut(b_base.ptr().add(hi * chunk_w), chunk_w);
+                partials_base.ptr().add(hi).write(chunk_body(hi, fc, bc));
+            }
+        });
+        let (u_0, u_2) = merge_chunk_partials(&partials);
         return SumcheckMessage { u_0, u_2 };
     }
     let (u_0, u_2) = nf
@@ -12325,6 +12435,68 @@ mod tests {
                 }
                 sum + coefficient * weight
             })
+    }
+
+    #[test]
+    fn caller_first_fold_passes_match_rayon_arm() {
+        fn lcg(state: &mut u64) -> F128 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(*state, state.rotate_left(29) ^ 0x3C3C_C3C3_9696_6969)
+        }
+        fn vec_of(state: &mut u64, n: usize) -> Vec<F128> {
+            (0..n).map(|_| lcg(state)).collect()
+        }
+        let mut seed = 0x5EED_CAFE_F00D_1234u64;
+        for threads in [4usize, 1] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("test pool");
+            pool.install(|| {
+                for log_half in [12usize, 13, 14, 15] {
+                    let n = 2usize << log_half;
+                    let f = vec_of(&mut seed, n);
+                    let b = vec_of(&mut seed, n);
+                    let r = lcg(&mut seed);
+                    let (mut nf_cf, mut nb_cf) = (Vec::with_capacity(n / 2), Vec::with_capacity(n / 2));
+                    let (mut nf_rb, mut nb_rb) = (Vec::with_capacity(n / 2), Vec::with_capacity(n / 2));
+                    let m_cf = fold_and_msg_lsb_into_arm(&f, &b, r, &mut nf_cf, &mut nb_cf, true);
+                    let m_rb = fold_and_msg_lsb_into_arm(&f, &b, r, &mut nf_rb, &mut nb_rb, false);
+                    assert_eq!(m_cf, m_rb, "fold msg threads={threads} log_half={log_half}");
+                    assert!(nf_cf == nf_rb && nb_cf == nb_rb, "fold state log_half={log_half}");
+                }
+                for (lo_log, hi_log) in [(10usize, 2usize), (11, 4)] {
+                    let half = 1usize << (lo_log + hi_log);
+                    let f = vec_of(&mut seed, 2 * half);
+                    let b = vec_of(&mut seed, 2 * half);
+                    let deferred = vec_of(&mut seed, 2 * half);
+                    let eq_lo = vec_of(&mut seed, 1 << lo_log);
+                    let eq_hi = vec_of(&mut seed, 1 << hi_log);
+                    let (r, beta, z_0, alpha) =
+                        (lcg(&mut seed), lcg(&mut seed), lcg(&mut seed), lcg(&mut seed));
+                    for with_deferred in [false, true] {
+                        let basis = with_deferred.then_some((deferred.as_slice(), alpha));
+                        let (mut nf_cf, mut nb_cf) = (Vec::with_capacity(half), Vec::with_capacity(half));
+                        let (mut nf_rb, mut nb_rb) = (Vec::with_capacity(half), Vec::with_capacity(half));
+                        let m_cf = fold_and_msg_lsb_into_with_lazy_ood_eq_arm(
+                            &f, &b, basis, r, &eq_lo, &eq_hi, beta, z_0, &mut nf_cf, &mut nb_cf, true,
+                        );
+                        let m_rb = fold_and_msg_lsb_into_with_lazy_ood_eq_arm(
+                            &f, &b, basis, r, &eq_lo, &eq_hi, beta, z_0, &mut nf_rb, &mut nb_rb, false,
+                        );
+                        assert_eq!(m_cf, m_rb, "lazy fold msg lo={lo_log} hi={hi_log}");
+                        assert!(nf_cf == nf_rb && nb_cf == nb_rb, "lazy fold state lo={lo_log}");
+                    }
+                    let split_cf =
+                        round_msg_and_eval_lsb_factorized_eq_split_arm(&f, &eq_lo, &eq_hi, z_0, true);
+                    let split_rb =
+                        round_msg_and_eval_lsb_factorized_eq_split_arm(&f, &eq_lo, &eq_hi, z_0, false);
+                    assert_eq!(split_cf, split_rb, "split OOD msg lo={lo_log} hi={hi_log}");
+                }
+            });
+        }
     }
 
     #[test]
