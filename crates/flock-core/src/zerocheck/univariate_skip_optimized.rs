@@ -1583,9 +1583,6 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // distributes independent slabs dynamically.
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
-    // Resolve the rollback once before worker/row dispatch; no table setup.
-    let transform_trim = std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref()
-        != Some(std::ffi::OsStr::new("1"));
     if let Some(producer) = producer {
         // Deferred A/B rows: each job produces its units one at a time into
         // a worker-local scratch and transforms them from there, so the
@@ -1622,7 +1619,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             || {
                 #[cfg(target_arch = "aarch64")]
                 kernels::aarch64::ab_kara_note_worker();
-                let window_plan = ab_window_rows_worker_plan_with_trim(transform_trim);
+                let window_plan = ab_window_rows_worker_plan();
                 (
                     [F8::ZERO; ELL],
                     [F8::ZERO; ELL],
@@ -1674,7 +1671,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         || {
             #[cfg(target_arch = "aarch64")]
             kernels::aarch64::ab_kara_note_worker();
-            ([F8::ZERO; ELL], [F8::ZERO; ELL], ab_window_rows_worker_plan_with_trim(transform_trim))
+            ([F8::ZERO; ELL], [F8::ZERO; ELL], ab_window_rows_worker_plan())
         },
         |(a_col, b_col, window_plan), job| {
             let window_plan = *window_plan;
@@ -1903,31 +1900,6 @@ fn ab_window_rows_worker_plan() -> Option<AbWindowRows> {
     None
 }
 
-/// Select the complemented static-B basis once per worker. The original
-/// function instances remain the rollback, including their row policies.
-fn ab_window_rows_worker_plan_with_trim(trim: bool) -> Option<AbWindowRows> {
-    let plan = ab_window_rows_worker_plan();
-    #[cfg(target_arch = "aarch64")]
-    if trim {
-        use kernels::aarch64::{self as k, bstatic_horner_window_rows_impl as rows};
-        const MAIN: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16
-            | k::ABV_BSTATIC_Z | k::ABV_KARA_SLOT | k::ABV_HORNER2;
-        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
-        return plan.map(|rows_fn| {
-            if core::ptr::fn_addr_eq(rows_fn, rows::<MAIN, true> as AbWindowRows) {
-                rows::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows
-            } else if core::ptr::fn_addr_eq(rows_fn, rows::<HELPER, true> as AbWindowRows) {
-                rows::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows
-            } else {
-                rows_fn
-            }
-        });
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    let _ = trim;
-    plan
-}
-
 /// Kill switch for the unit window-rows call: any value of
 /// `FLOCK_NO_ZC_AB_WINDOW_UNIT_CALL` makes every chunk of a producer unit
 /// call its static-B window rows itself again. Read once per process. The
@@ -1973,11 +1945,7 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
         | k::ABV_KARA_SLOT
         | k::ABV_HORNER2;
     const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
-    if core::ptr::fn_addr_eq(rows, per_chunk::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows) {
-        Some(unit::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true>)
-    } else if core::ptr::fn_addr_eq(rows, per_chunk::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows) {
-        Some(unit::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true>)
-    } else if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
+    if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
         Some(unit::<MAIN, true>)
     } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, true> as AbWindowRows) {
         Some(unit::<HELPER, true>)
@@ -3601,6 +3569,65 @@ fn seeded_sweep_hoisted<const U: bool>(
     let ab = ab_inner.as_ptr();
     let tp = tables.as_ptr();
     let bp = banks.as_mut_ptr();
+
+    // The ranked seeded sweep is `w`-major with 128 consecutive `u` banks per
+    // 64 KiB table. Prepare the fourteen 4 KiB row bases once per table and
+    // reuse them across those 128 calls; the incumbent kernel prepared the
+    // same bases inside every call. Traversal, gathers and bank updates stay
+    // in exactly the same order. The two padding windows have the scored
+    // residual spans 2..16 and 0..14 respectively.
+    #[cfg(target_arch = "aarch64")]
+    if U
+        && kernels::ab_completion_table_hoist_enabled()
+        && bank_bits == 7
+        && within_outer_mask == 1
+        && spans[0] == (2, 16, true)
+        && spans[1] == (0, 14, true)
+        && range.start.is_multiple_of(1usize << bank_bits)
+        && range.end.is_multiple_of(1usize << bank_bits)
+    {
+        let n_banks = 1usize << bank_bits;
+        for w in (range.start >> bank_bits)..(range.end >> bank_bits) {
+            // SAFETY: the sweep admission checked the final table image. Each
+            // prepared pointer is one of its sixteen 4 KiB rows.
+            let table = unsafe { tp.add(w * CONVERT_TABLE_SIZE).cast::<u8>() };
+            let rows0 = core::array::from_fn(|b| unsafe { table.add(b * 256 * 16) });
+            let rows2 = core::array::from_fn(|b| unsafe { table.add((b + 2) * 256 * 16) });
+            for u in 0..n_banks {
+                let x_outer_lo = (w << bank_bits) | u;
+                let chunk_byte_base = ((x_outer_lo << N_INNER) | x_hi_inner) * N_CHUNKS;
+                // SAFETY: the hoist admission checked the last row block and
+                // all earlier offsets grow monotonically; `u` selects one of
+                // the 128 disjoint in-bounds banks.
+                let (chunk_rows, bank) = unsafe {
+                    (
+                        &*ab.add(chunk_byte_base).cast::<[[u8; 64]; 1 << N_MEDIUM]>(),
+                        &mut *bp.add(u * ELL).cast::<[F128; ELL]>(),
+                    )
+                };
+                let window = (x_outer_lo | x_hi_outer) & 1;
+                unsafe {
+                    if window == 0 {
+                        kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16_prepared::<U>(
+                            chunk_rows,
+                            2,
+                            &rows2,
+                            bank,
+                        );
+                    } else {
+                        kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16_prepared::<U>(
+                            chunk_rows,
+                            0,
+                            &rows0,
+                            bank,
+                        );
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     for x_outer_lo in range {
         let within_hash_outer = (x_outer_lo | x_hi_outer) & within_outer_mask;
         // SAFETY: `within_hash_outer <= within_outer_mask < HOIST_MAX_WINDOWS`.
@@ -3871,9 +3898,6 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 /// (`gpu_commit::zc_k_prewarm`, needed only after round two), unless that arm
 /// is off or `FLOCK_NO_ZC_K_PREWARM=1`.
 ///
-/// The 5+6 GPU arm's kernel is compiled later, after the warm-up commit's
-/// split retune ([`t56_prewarm_after_tune`]).
-///
 /// With R2-CS on (`gpu_commit::ENV_NO_ZC_R2_CS`), a thread of its own builds
 /// the R2-CS pipeline (`gpu_commit::zc_r2_cs_prewarm`), joined by the warm-up
 /// round two's calibration.
@@ -3883,6 +3907,9 @@ pub fn ab_completion_gpu_prewarm() {
         let ab = std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1"))
             && crate::gpu_commit::gpu_zc_ab_completion_share() != 0;
         let k = crate::gpu_commit::zc_k_prewarm_wanted();
+        // The K-T arm's library (`gpu_commit::ENV_NO_ZC_KT_GPU`) after the
+        // K arm's own pipelines, on the same thread.
+        let kt = k && crate::gpu_commit::zc_kt_prewarm_wanted();
         if ab || k {
             let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(move || {
                 if ab && let Some(basis) = ab_completion_convert_basis() {
@@ -3891,29 +3918,15 @@ pub fn ab_completion_gpu_prewarm() {
                 if k {
                     crate::gpu_commit::zc_k_prewarm();
                 }
+                if kt {
+                    crate::gpu_commit::zc_kt_prewarm();
+                }
             });
         }
         if crate::gpu_commit::zc_r2_cs_prewarm_wanted() {
             let _ = std::thread::Builder::new()
                 .name("flock-zcr2cs-prewarm".into())
                 .spawn(crate::gpu_commit::zc_r2_cs_prewarm);
-        }
-    }
-}
-
-/// Untimed warm-up only, right after the commit's split retune: compile the
-/// 5+6 GPU arm's kernel (`gpu_commit::zc_t56_prewarm`) on a background thread,
-/// so the compile runs during the warm-up prove's zerocheck instead of beside
-/// its commit and split retune. Its pipeline is a process-wide `OnceLock`, so
-/// a launch that arrives first waits for (or does) the same build. A no-op
-/// when the arm is off.
-pub fn t56_prewarm_after_tune() {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        if crate::gpu_commit::zc_t56_prewarm_wanted() {
-            let _ = std::thread::Builder::new()
-                .name("flock-zct56-prewarm".into())
-                .spawn(crate::gpu_commit::zc_t56_prewarm);
         }
     }
 }
@@ -9467,6 +9480,7 @@ mod tests {
                 }
                 let mut got_unscaled = start;
                 let mut got_scaled = start;
+                let mut got_prepared = start;
                 // SAFETY: fixed-size rows, bank and a full 16 x 256 table;
                 // `first + 14 <= 16`.
                 unsafe {
@@ -9476,9 +9490,18 @@ mod tests {
                     kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16::<false>(
                         &rows, first, &table, &mut got_scaled,
                     );
+                    let base = table.as_ptr().cast::<u8>().add(first * 256 * 16);
+                    let table_rows = core::array::from_fn(|b| base.add(b * 256 * 16));
+                    kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16_prepared::<true>(
+                        &rows,
+                        first,
+                        &table_rows,
+                        &mut got_prepared,
+                    );
                 }
                 assert_eq!(got_unscaled, defined, "unscaled trial={trial} first={first}");
                 assert_eq!(got_scaled, defined, "scaled trial={trial} first={first}");
+                assert_eq!(got_prepared, defined, "prepared trial={trial} first={first}");
                 if first % 2 != 0 {
                     // The general kernel requires an even start.
                     continue;
@@ -9505,6 +9528,57 @@ mod tests {
             .collect();
         assert_eq!(routed, [(0, 14), (1, 15), (2, 16)]);
         assert!(spans().all(|(first, end)| !kernels::seeded_pair16_route::<false>(first, end)));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_completion_ranked_table_hoist_matches_per_index_sweep() {
+        let mut rng = Rng::new(0xAB70_0157);
+        let n_lo = 9usize;
+        let n_lo_and_inner = n_lo + N_INNER;
+        let big_lo_size = 1usize << n_lo;
+        let bank_bits = 7usize;
+        let n_banks = 1usize << bank_bits;
+        let representation = Round1AbRepresentation::Blake3IdentityPrefixOmitted {
+            output_window: true,
+        };
+        let counts = [16u8, 15];
+        let ab_inner: Vec<u8> = (0..big_lo_size * (1 << N_INNER) * N_CHUNKS)
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        let tables = rng.f128_vec((big_lo_size >> bank_bits) * CONVERT_TABLE_SIZE);
+        let eq_bot = rng.f128_vec(n_banks);
+        let eq_hi_val = rng.f128();
+        let start_banks = rng.f128_vec(n_banks * ELL);
+        let mut want_banks = start_banks.clone();
+        let mut got_banks = start_banks;
+        let mut want = [F128::ZERO; ELL];
+        let mut got = want;
+        for (hoist, banks, partial) in [
+            (false, &mut want_banks, &mut want),
+            (true, &mut got_banks, &mut got),
+        ] {
+            process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded_with(
+                0,
+                0..big_lo_size,
+                big_lo_size,
+                n_lo_and_inner,
+                1,
+                &counts,
+                &ab_inner,
+                representation,
+                &eq_bot,
+                eq_hi_val,
+                &tables,
+                bank_bits,
+                true,
+                banks,
+                partial,
+                hoist,
+            );
+        }
+        assert_eq!(got_banks, want_banks);
+        assert_eq!(got, want);
     }
 
     /// The gather is an XOR chain over convert rows, so the pre-scaled table
