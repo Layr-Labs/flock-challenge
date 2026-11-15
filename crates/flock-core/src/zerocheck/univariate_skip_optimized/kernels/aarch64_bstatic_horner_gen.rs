@@ -108,15 +108,9 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
             ($blk:literal, $k:literal, [$(($j0:literal, $j1:literal)),*], [$($js:literal),*]) => {{
                 let pp = pbase.add(($blk * 8 + $k) * 64);
                 #[allow(unused_mut)]
-                let mut db0 = vld1q_u8(pp);
-                #[allow(unused_mut)]
-                let mut db1 = vld1q_u8(pp.add(16));
-                #[allow(unused_mut)]
-                let mut db2 = vld1q_u8(pp.add(32));
-                #[allow(unused_mut)]
-                let mut db3 = vld1q_u8(pp.add(48));
+                let (mut db0, mut db1, mut db2, mut db3) = transform_partial_seed::<V>(pp);
                 #[allow(unused_variables)]
-                let b_word = bw!($k);
+                let b_word = transform_partial_word::<V>(bw!($k));
                 if V & ABV_NOSW != 0 {
                     $(xor_vary_ext::<$j0, $j1>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
                     $(xor_vary_ext::<$js, 8>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
@@ -147,12 +141,15 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
             ($blk:literal, $k:literal, $nb:literal, $inc:expr) => {{
                 if V & ABV_BSTATIC_Z != 0 {
                     let pp = pbase.add(($blk * 8 + $k) * 64);
-                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(plain, kplain, bw!($k));
+                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(
+                        plain, kplain, transform_partial_word::<V>(bw!($k)),
+                    );
+                    let (d0, d1, d2, d3) = transform_partial_seed::<V>(pp);
                     (
-                        veorq_u8(vld1q_u8(pp), z0),
-                        veorq_u8(vld1q_u8(pp.add(16)), z1),
-                        veorq_u8(vld1q_u8(pp.add(32)), z2),
-                        veorq_u8(vld1q_u8(pp.add(48)), z3),
+                        veorq_u8(d0, z0),
+                        veorq_u8(d1, z1),
+                        veorq_u8(d2, z2),
+                        veorq_u8(d3, z3),
                     )
                 } else {
                     $inc
@@ -1347,13 +1344,18 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                 // kills).
                 if ab_z_out3_enabled() {
                     const BASE: u32 = AB_UNIT_MAIN | ABV_Z_OUT3;
-                    if ab_fuse_enabled() {
-                        bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM }, true, true>(
+                    // The fused rows take the `x^4` image in the lane z form
+                    // ([`ABV_KARA_LANEZ`]) and the complemented static-B images
+                    // ([`ABV_TRANSFORM_TRIM`]); this is the only fused instance.
+                    if ab_fuse_enabled() && ab_kara_lanez_enabled() && ab_transform_trim_enabled() {
+                        bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM | ABV_KARA_LANEZ | ABV_TRANSFORM_TRIM }, true, true>(
                             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                         )
                     } else {
-                        // Kill switch only (build budget): the per-chunk rows
-                        // write the same bytes; no separate unit instance.
+                        // Kill switches only (build budget): `FLOCK_NO_ZC_AB_FUSE`,
+                        // `FLOCK_NO_ZC_AB_LANEZ=1` and `FLOCK_NO_TRANSFORM_TRIM=1`
+                        // take the per-chunk rows, which write the same bytes; no
+                        // separate unit instance.
                         let _ = BASE;
                         bstatic_horner_window_unit_per_chunk::<V, HOIST>(
                             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
@@ -1368,14 +1370,17 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
             } else if const { V == AB_UNIT_HELPER } {
                 // The helper threads' half-pair z rows with the fused
                 // products ([`ABV_FUSE`], `FLOCK_NO_ZC_AB_FUSE_E` kills), with
-                // the same bounds checks (`HOIST`: one per window).
-                if ab_fuse_e_enabled() {
-                    bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM }, HOIST, true>(
+                // the same bounds checks (`HOIST`: one per window), with the
+                // complemented static-B images ([`ABV_TRANSFORM_TRIM`]); this
+                // is the only fused helper instance.
+                if ab_fuse_e_enabled() && ab_transform_trim_enabled() {
+                    bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM | ABV_TRANSFORM_TRIM }, HOIST, true>(
                         x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                     )
                 } else {
-                    // Kill switch only (build budget): the per-chunk rows
-                    // write the same bytes; no separate unit instance.
+                    // Kill switches only (build budget): `FLOCK_NO_ZC_AB_FUSE_E`
+                    // and `FLOCK_NO_TRANSFORM_TRIM=1` take the per-chunk rows,
+                    // which write the same bytes; no separate unit instance.
                     bstatic_horner_window_unit_per_chunk::<V, HOIST>(
                         x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
                         true,
@@ -1861,6 +1866,88 @@ fn ab_window_unit_fuse_matches_parent() {
                 let helper_want = both!(AB_UNIT_HELPER, false);
                 assert_eq!(helper_want.0, want.0, "helper {at}");
                 assert_eq!(both!(AB_UNIT_HELPER | ABV_FUSE, false), helper_want, "FUSE_E {at}");
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 4 * 5 * 2);
+}
+
+/// The default main-pool unit instance (with [`ABV_KARA_LANEZ`]) writes the
+/// bytes of the fused form without it and of the parent unit form for both
+/// store flavours, at the geometry and inputs of
+/// [`ab_window_unit_fuse_matches_parent`].
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_window_unit_lanez_matches_parent() {
+    use crate::ntt::AdditiveNttGf8;
+    const OUTER_BYTES: usize = 16 * 64;
+    const FUSED: u32 = AB_UNIT_MAIN | ABV_Z_OUT3 | ABV_FUSE;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let partials = bstatic_partials(&table);
+    let mut state = 0x1A2E_5EED_0BAD_CAFEu64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut checked = 0usize;
+    for (x0, n) in [(8usize, 8usize), (5, 3), (2, 1), (7, 1)] {
+        let total = (x0 + n) * OUTER_BYTES;
+        for case in 0..5usize {
+            let mut a: Vec<u8> = (0..total).map(|_| next() as u8).collect();
+            let mut b: Vec<u8> = (0..total).map(|_| (next() >> 9) as u8).collect();
+            if case != 1 {
+                for chunk in 0..x0 + n {
+                    let w = chunk & 1;
+                    for b_med in 0..16usize {
+                        if w * 16 + b_med > 30 || (case == 2 && b_med % 2 == 1) {
+                            continue;
+                        }
+                        for k in 0..N_CHUNKS {
+                            let off = chunk * OUTER_BYTES + b_med * 64 + k * N_CHUNKS;
+                            let (mask, expected) = BSTATIC_MASKS[w * 16 + b_med][k];
+                            let word = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                            b[off..off + 8].copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                        }
+                    }
+                }
+            }
+            if case == 3 {
+                a.fill(0);
+            }
+            if case == 4 {
+                a.fill(0xff);
+            }
+            for in_scratch in [true, false] {
+                let (a_in, b_in, base) = if in_scratch {
+                    (&a[x0 * OUTER_BYTES..], &b[x0 * OUTER_BYTES..], 0)
+                } else {
+                    (&a[..], &b[..], x0 * OUTER_BYTES)
+                };
+                let run = |f: &dyn Fn(&mut [u8])| {
+                    let mut out = vec![0x3cu8; n * OUTER_BYTES];
+                    f(&mut out);
+                    out
+                };
+                let p = [partials, partials];
+                let at = format!("x0={x0} n={n} case={case} scratch={in_scratch}");
+                macro_rules! both {
+                    ($v:expr) => {
+                        (
+                            run(&|o| bstatic_horner_window_unit_nt::<{ $v }, true, false>(x0, 1, a_in, b_in, &table, base, p, o)),
+                            run(&|o| bstatic_horner_window_unit_nt::<{ $v }, true, true>(x0, 1, a_in, b_in, &table, base, p, o)),
+                        )
+                    };
+                }
+                let want = both!(FUSED);
+                assert!(want.0.iter().any(|&x| x != 0x3c), "{at}");
+                assert_eq!(want.0, want.1, "{at}");
+                assert_eq!(both!(AB_UNIT_MAIN | ABV_Z_OUT3).0, want.0, "parent {at}");
+                assert_eq!(both!(FUSED | ABV_KARA_LANEZ), want, "LANEZ {at}");
                 checked += 1;
             }
         }
