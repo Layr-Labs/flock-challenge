@@ -925,6 +925,30 @@ fn late_close_enabled() -> bool {
     std::env::var_os("FLOCK_NO_LATE_CLOSE").as_deref() != Some(OsStr::new("1"))
 }
 
+/// Whether a publication through the pre-opened file leaves the published
+/// file alone after the rename: its descriptor and mapping are parked in
+/// [`PUBLISH_KEEP`] instead of being closed and unmapped there, and the
+/// temporary name (gone with the rename) is not unlinked. Those calls ran
+/// while the harness opened and read the published proof. Read once per
+/// process; exact-`1` kill: `FLOCK_NO_PUB_QUIET` restores close + unmap +
+/// unlink after the rename.
+fn pub_quiet_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_PUB_QUIET").as_deref() != Some(OsStr::new("1")))
+}
+
+/// Descriptor and mapping of the last file published through the pre-opened
+/// path under [`pub_quiet_enabled`]. Nothing writes through them after the
+/// rename. Released by the next pre-open (the untimed gap before another
+/// seed) or by the process exit.
+static PUBLISH_KEEP: Mutex<Option<(std::fs::File, Option<PublishMap>)>> = Mutex::new(None);
+
+/// Close and unmap the pair an earlier publication parked, if any.
+fn release_kept_publish() {
+    let kept = PUBLISH_KEEP.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(kept);
+}
+
 /// Warm-write size for [`preopen_publish_file`]: comfortably above every
 /// observed ranked proof (436,107–439,663 bytes) and below the trusted
 /// verifier's 500,000-byte cap, so the write machinery is exercised at real
@@ -1003,6 +1027,11 @@ impl Drop for PublishMap {
     }
 }
 
+// SAFETY: the mapping is process-wide memory that only its owning value
+// references (`fill_parked_file` borrows it through `&mut`); moving the owner
+// to another thread, or into [`PUBLISH_KEEP`], moves that sole ownership.
+unsafe impl Send for PublishMap {}
+
 /// The speculative publish target, opened during the untimed ready→seed gap
 /// and held until publication. `file` is an `Option` so publication can take
 /// the descriptor out while [`Drop`] keeps every exit path tidy.
@@ -1057,9 +1086,12 @@ impl Drop for PreopenedPublish {
         // After a successful rename the temporary path no longer exists, so
         // this is a no-op there; on every other exit (early seed-pipe death,
         // parse failure, panic, publication error) it leaves scratch exactly
-        // as the incumbent would.
+        // as the incumbent would. A publication that parked its descriptor
+        // (`pub_quiet_enabled`) empties the path: no unlink is issued then.
         self.file.take();
-        let _ = std::fs::remove_file(&self.temporary);
+        if !self.temporary.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.temporary);
+        }
     }
 }
 
@@ -1086,6 +1118,9 @@ fn preopen_publish_file(proof_path: &Path) -> Option<PreopenedPublish> {
 /// [`preopen_publish_file`] with the mapped-or-empty parked state chosen by
 /// the caller. A mapping that cannot be made parks the file empty.
 fn preopen_publish_file_with(proof_path: &Path, mapped: bool) -> Option<PreopenedPublish> {
+    // An earlier publication's parked pair, if any, is released here, in the
+    // untimed gap: the harness has long read that file.
+    release_kept_publish();
     let temporary = speculative_temporary_path(proof_path);
     let attempt = || -> io::Result<PreopenedPublish> {
         // Same create the incumbent publish performs — just earlier. A
@@ -1199,6 +1234,20 @@ fn publish_through_preopened(
             }
             let renamed = std::fs::rename(&preopened.temporary, proof_path);
             flock_core::tmark::mark("renamed");
+            if renamed.is_ok() && pub_quiet_enabled() {
+                // The harness opens and reads the published file next. Leave
+                // it alone: park the descriptor and the mapping instead of
+                // closing and unmapping them now, and empty the temporary
+                // path, which the rename consumed, so nothing is unlinked.
+                // `FLOCK_NO_PUB_QUIET=1` restores the teardown below.
+                let older = PUBLISH_KEEP
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .replace((file, preopened.map.take()));
+                preopened.temporary = PathBuf::new();
+                drop(older);
+                return renamed;
+            }
             drop(file);
             renamed
         }),
@@ -2279,5 +2328,84 @@ mod tests {
         assert!(!missing.exists());
         assert!(preopen_publish_file(&proof_path).is_none());
         assert!(!speculative_temporary_path(&proof_path).exists());
+    }
+
+    /// Kept publications (`pub_quiet_enabled`): two in one process leave
+    /// exactly the two proofs and no temporary, the second pre-open releases
+    /// the first publication's parked pair without touching that file, and
+    /// the bytes survive the final release. (Other tests may release a parked
+    /// pair concurrently; nothing here depends on which pair is parked.)
+    #[test]
+    fn pub_quiet_publishes_twice_and_leaves_only_the_proofs() {
+        if !pub_quiet_enabled() || !late_close_enabled() {
+            return;
+        }
+        let dir = publication_test_dir("pub-quiet");
+        let first = dir.join("proof1.bin");
+        let second = dir.join("proof2.bin");
+        // Both longer than the mapping, so the mapped arm publishes them.
+        let a: Vec<u8> = (0..437_000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let b: Vec<u8> = (0..438_500u32).map(|i| (i * 11 + 5) as u8).collect();
+        let pre = preopen_publish_file(&first).expect("pre-open in a writable scratch");
+        publish_bytes_through_preopened(&first, &a, pre).expect("first publication");
+        assert_eq!(std::fs::read(&first).expect("first proof"), a);
+        assert!(!speculative_temporary_path(&first).exists());
+        let pre = preopen_publish_file(&second).expect("pre-open in a writable scratch");
+        assert_eq!(std::fs::read(&first).expect("first proof"), a);
+        publish_bytes_through_preopened(&second, &b, pre).expect("second publication");
+        assert_eq!(std::fs::read(&second).expect("second proof"), b);
+        assert_eq!(std::fs::read(&first).expect("first proof"), a);
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("list publication test directory")
+            .map(|entry| entry.expect("directory entry").file_name().into_string().expect("utf-8 name"))
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["proof1.bin", "proof2.bin"]);
+        release_kept_publish();
+        assert_eq!(std::fs::read(&first).expect("first proof"), a);
+        assert_eq!(std::fs::read(&second).expect("second proof"), b);
+        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
+    }
+
+    /// A reader that opens the final path from its first appearance until
+    /// after the kept publication returned only ever sees the whole proof:
+    /// nothing writes through the parked mapping or descriptor.
+    #[test]
+    fn pub_quiet_kept_mapping_never_changes_the_published_bytes() {
+        if !pub_quiet_enabled() || !late_close_enabled() {
+            return;
+        }
+        let dir = publication_test_dir("pub-quiet-reader");
+        let proof_path = dir.join("proof.bin");
+        let expected: Vec<u8> = (0..439_000u32).map(|i| (i * 131 + 17) as u8).collect();
+        let reader_path = proof_path.clone();
+        let reader = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut reads = Vec::new();
+            loop {
+                match std::fs::read(&reader_path) {
+                    Ok(bytes) => {
+                        reads.push(bytes);
+                        if reads.len() == 64 {
+                            return reads;
+                        }
+                    }
+                    Err(error)
+                        if error.kind() == io::ErrorKind::NotFound
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("kept publication reader failed: {error}"),
+                }
+            }
+        });
+        let pre = preopen_publish_file(&proof_path).expect("pre-open in a writable scratch");
+        publish_bytes_through_preopened(&proof_path, &expected, pre)
+            .expect("publication through the pre-opened fd");
+        let reads = reader.join().expect("reader thread");
+        assert!(reads.iter().all(|bytes| *bytes == expected), "a read saw other bytes");
+        assert!(!speculative_temporary_path(&proof_path).exists());
+        std::fs::remove_dir_all(&dir).expect("remove publication test directory");
     }
 }
