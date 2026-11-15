@@ -3838,23 +3838,31 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 /// The same thread then builds the K pass GPU arm's two pipelines
 /// (`gpu_commit::zc_k_prewarm`, needed only after round two), unless that arm
 /// is off or `FLOCK_NO_ZC_K_PREWARM=1`.
+///
+/// With R2-CS on (`gpu_commit::ENV_NO_ZC_R2_CS`), a thread of its own builds
+/// the R2-CS pipeline (`gpu_commit::zc_r2_cs_prewarm`), joined by the warm-up
+/// round two's calibration.
 pub fn ab_completion_gpu_prewarm() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let ab = std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1"))
             && crate::gpu_commit::gpu_zc_ab_completion_share() != 0;
         let k = crate::gpu_commit::zc_k_prewarm_wanted();
-        if !ab && !k {
-            return;
+        if ab || k {
+            let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(move || {
+                if ab && let Some(basis) = ab_completion_convert_basis() {
+                    crate::gpu_commit::zc_ab_prewarm(basis);
+                }
+                if k {
+                    crate::gpu_commit::zc_k_prewarm();
+                }
+            });
         }
-        let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(move || {
-            if ab && let Some(basis) = ab_completion_convert_basis() {
-                crate::gpu_commit::zc_ab_prewarm(basis);
-            }
-            if k {
-                crate::gpu_commit::zc_k_prewarm();
-            }
-        });
+        if crate::gpu_commit::zc_r2_cs_prewarm_wanted() {
+            let _ = std::thread::Builder::new()
+                .name("flock-zcr2cs-prewarm".into())
+                .spawn(crate::gpu_commit::zc_r2_cs_prewarm);
+        }
     }
 }
 

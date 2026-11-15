@@ -1270,7 +1270,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         );
         match res {
             crate::gpu_commit::ZcR2Result::Calibrated => {}
-            crate::gpu_commit::ZcR2Result::Prefix(vals) => {
+            // (This sweep never launches R2-CS; its partials merge the same.)
+            crate::gpu_commit::ZcR2Result::Prefix(vals)
+            | crate::gpu_commit::ZcR2Result::PrefixCs { prefix: vals, .. } => {
                 // XOR the parities back together: this sweep only ever wanted
                 // the summed pair the arm used to return.
                 for (x_hi, v) in vals.iter().enumerate() {
@@ -1905,7 +1907,46 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         padding,
         deltas_backing,
         false,
+        None,
     )
+}
+
+/// The K pass GPU prefix arm's premap length over a compact state of
+/// `n_pairs` pairs: its dense anchors prefix in bytes, which covers every
+/// compacted layout's prefix (0 = no premap).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zc_k_premap_bytes(n_pairs: usize) -> usize {
+    if n_pairs < 16 {
+        return 0;
+    }
+    let share = crate::gpu_commit::gpu_zc_k_share();
+    if share == 0 {
+        return 0;
+    }
+    let k_hi = 1usize << cascade_k_pass_n_hi(n_pairs.trailing_zeros() as usize - 2);
+    let prefix_pairs = share.min(k_hi) * (n_pairs / k_hi);
+    prefix_pairs * 32
+}
+
+/// R2-CS (`gpu_commit::ENV_NO_ZC_R2_CS`): before round one of a prove whose
+/// round two runs the lookahead sweep, take that sweep's compact anchors and
+/// premap the K pass arm's view over them ([`crate::gpu_commit::zc_k_premap`])
+/// when R2-CS is admitted for timed launches and that view will exist. The
+/// sweep then takes these anchors (`anchors_premapped`) instead of its own.
+/// `None` = the sweep takes and premaps them itself.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn round2_anchors_premapped_early(m: usize, k_skip: usize) -> Option<Vec<F128>> {
+    if k_skip != 6 || m <= k_skip || !crate::gpu_commit::zc_r2_cs_premap_early() {
+        return None;
+    }
+    let n_pairs = (1usize << (m - k_skip)) / 2;
+    let bytes = zc_k_premap_bytes(n_pairs);
+    if bytes == 0 {
+        return None;
+    }
+    let anchors = crate::scratch::take_f128(2 * n_pairs);
+    crate::gpu_commit::zc_k_premap(&anchors, bytes);
+    Some(anchors)
 }
 
 /// Pair count per cascade K-pass output chunk for a compact state of
@@ -1935,6 +1976,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     padding: &PaddingSpec,
     deltas_backing: Option<ScratchBytes>,
     k_pass_only: bool,
+    anchors_premapped: Option<Vec<F128>>,
 ) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
     assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -1954,8 +1996,19 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         deltas_len,
         "donated compact delta backing has the wrong byte length"
     );
+    // Anchors taken (and the K view premapped) before round one, see
+    // `round2_anchors_premapped_early`; else taken here.
+    let (anchors, premapped) = match anchors_premapped {
+        Some(a) if a.len() == 2 * n_pairs => (a, true),
+        other => {
+            if let Some(a) = other {
+                crate::scratch::give_f128(a);
+            }
+            (crate::scratch::take_f128(2 * n_pairs), false)
+        }
+    };
     let mut compact = UniSkipCompactFold {
-        anchors: crate::scratch::take_f128(2 * n_pairs),
+        anchors,
         deltas,
         dead_tail: false,
         tail_compact: false,
@@ -1968,14 +2021,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // command buffer does not wait for the mapping. The dense prefix covers
     // every compacted layout's prefix.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if n_pairs >= 16 {
-        let share = crate::gpu_commit::gpu_zc_k_share();
-        if share > 0 {
-            let k_hi = 1usize << cascade_k_pass_n_hi(n_pairs.trailing_zeros() as usize - 2);
-            let prefix_pairs = share.min(k_hi) * (n_pairs / k_hi);
-            crate::gpu_commit::zc_k_premap(&compact.anchors, prefix_pairs * 32);
+    if !premapped {
+        let bytes = zc_k_premap_bytes(n_pairs);
+        if bytes > 0 {
+            crate::gpu_commit::zc_k_premap(&compact.anchors, bytes);
         }
     }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = premapped;
 
     let n_vars = mlv_challenges.len() - 1;
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], lookahead_n_hi(n_vars));
@@ -2035,13 +2088,78 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let horner_prescale = false;
 
+    // R2-CS (`gpu_commit::ENV_NO_ZC_R2_CS`): the compact layout this sweep
+    // writes when the arm runs, decided here (the same expressions as
+    // `tail_compact` and `head_compact` below with the arm admitted) so the
+    // arm's kernel can store the same bytes at the same offsets. Only the
+    // ranked walk: dead pairs skipped, prefix chunks on the prescaled walk.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let cs_layout = if crate::gpu_commit::zc_r2_cs_enabled()
+        && skip_dead
+        && zc_r2_odd_offload_enabled()
+        && horner_weights
+        && horner_prescale
+    {
+        let tc = periodic_padding
+            && zc_r2_tail_compact_enabled()
+            && cascade_k_fused_enabled()
+            && zc_k_one_table_enabled();
+        let hc = tc
+            && zc_r2_head_compact_enabled()
+            && kernels::aarch64::r2_head_compact_supported()
+            && degen
+            && table.fold_one_row(&[0xFF; 8]) == F128::ONE;
+        let tbb = if tc { (lo_size / 128).max(cascade_k_pairs_per_chunk(n_pairs) / 128) } else { 0 };
+        use kernels::aarch64::{
+            HC_ANCHOR_GAP, HC_ANCHOR_SHIFT, HC_ANCHORS_PER_BLOCK, HC_DELTA_BYTES_PER_BLOCK, HC_DELTA_GAP,
+            HC_DELTA_SHIFT, TC_ANCHOR_GAP, TC_ANCHORS_PER_BLOCK, TC_DELTA_BYTES_PER_BLOCK, TC_DELTA_GAP,
+        };
+        Some(if hc {
+            crate::gpu_commit::ZcR2CsLayout {
+                hc: true,
+                a_base: tbb * HC_ANCHOR_GAP + HC_ANCHOR_SHIFT,
+                a_stride: HC_ANCHORS_PER_BLOCK,
+                d_base: tbb * HC_DELTA_GAP + HC_DELTA_SHIFT,
+                d_stride: HC_DELTA_BYTES_PER_BLOCK,
+            }
+        } else if tc {
+            crate::gpu_commit::ZcR2CsLayout {
+                hc: false,
+                a_base: tbb * TC_ANCHOR_GAP,
+                a_stride: TC_ANCHORS_PER_BLOCK,
+                d_base: tbb * TC_DELTA_GAP,
+                d_stride: TC_DELTA_BYTES_PER_BLOCK,
+            }
+        } else {
+            crate::gpu_commit::ZcR2CsLayout { hc: false, a_base: 0, a_stride: 256, d_base: 0, d_stride: 2048 }
+        })
+    } else {
+        None
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_feature = "sha3")))]
+    let cs_layout: Option<crate::gpu_commit::ZcR2CsLayout> = None;
+
+    // R2-CS stores a timed prefix through this prove's existing views of
+    // the two allocations, never a new one: the K premap above (anchors) and
+    // round one's handed-over view of the donated deltas backing; the launch
+    // checks that both exist and cover its prefix. `cs_live` = (anchors
+    // base, deltas base, deltas bytes).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cs_live = cs_layout.map(|_| {
+        (
+            compact.anchors.as_ptr() as usize,
+            compact.deltas.full_overwrite_ptr() as usize,
+            compact.deltas.len(),
+        )
+    });
+
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
     // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
+    let gpu_job = crate::gpu_commit::launch_zc_r2_products_cs(
         a_packed,
         b_packed,
         &table.data,
@@ -2051,7 +2169,15 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
+        cs_layout,
+        cs_live,
     );
+    // R2-CS owns this timed launch's prefix chunks (the CPU skips them).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let r2cs = gpu_job.as_ref().is_some_and(|j| j.cs_active());
+    // R2-CS calibration launch: (chunks, layout) for its compact-state oracle.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cs_calib = gpu_job.as_ref().and_then(|j| j.cs_calibration());
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
     // The GPU arm now returns its round-two products parity-split, so on an
@@ -2140,6 +2266,31 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let (anchor_chunk_stride, delta_chunk_stride, anchor_base, delta_base) =
         (anchor_chunk_size, delta_chunk_size, 0usize, 0usize);
+    // R2-CS: the arm stores the prefix chunks at the planned layout, which
+    // is this sweep's by construction (same expressions, arm admitted). Were
+    // it not, the CPU walks every chunk and the whole round is redone
+    // serially once the arm has joined (`cs_redo_all`, below).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let cs_redo_all = r2cs
+        && !cs_layout.is_some_and(|l| {
+            l.hc == compact.head_compact
+                && l.a_base == anchor_base
+                && l.d_base == delta_base
+                && l.a_stride * (lo_size / 128) == anchor_chunk_stride
+                && l.d_stride * (lo_size / 128) == delta_chunk_stride
+        });
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let r2cs = r2cs && !cs_redo_all;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::gpu_commit::gpu_zc_r2_debug() {
+        eprintln!(
+            "[zc-r2] round-two layout: head_compact={} tail_compact={tail_compact} skip_dead={skip_dead} \
+             odd_on_gpu={odd_on_gpu} horner_weights={horner_weights} prescale={horner_prescale} \
+             gpu_prefix={gpu_prefix}/{hi_size} calibration={} r2cs={r2cs}",
+            compact.head_compact,
+            gpu_job.as_ref().is_some_and(|j| j.is_calibration()),
+        );
+    }
     let anchors_base = crate::epool::SyncPtr(unsafe { compact.anchors.as_mut_ptr().add(anchor_base) });
     let deltas_base = crate::epool::SyncPtr(unsafe { compact.deltas.full_overwrite_ptr().add(delta_base) });
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -2157,6 +2308,18 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         let row_base = pair_idx_base * 2;
         let mut out = [F128::ZERO; 8];
         let head_fail_ptr = head_fail_addr as *const std::sync::atomic::AtomicBool;
+
+        // R2-CS: the arm owns this prefix chunk outright (compact state,
+        // products, lookahead terms); its slots are filled after the join.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if r2cs && x_hi < gpu_prefix {
+            // SAFETY: exclusive owner of both partial slots (see above).
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
+                *la_base.ptr().add(x_hi) = [F128::ZERO; 6];
+            }
+            return;
+        }
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -2373,25 +2536,59 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     }
                 }
             }
+            crate::gpu_commit::ZcR2Result::PrefixCs { prefix: vals, lookahead, head_bad } => {
+                // R2-CS: the arm owned these chunks outright, so their
+                // lookahead slots 2..6 are its [W0, W3, W4, W5] as well, and its
+                // head-pair flag joins the CPU walk's. (Without `r2cs` the CPU
+                // walked them after all: the incumbent merge.)
+                for (x_hi, (v, w)) in vals.iter().zip(&lookahead).enumerate() {
+                    partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
+                    if r2cs {
+                        la_partials[x_hi] = [v[2], v[3], w[0], w[1], w[2], w[3]];
+                    } else if odd_on_gpu {
+                        la_partials[x_hi][0] = v[2];
+                        la_partials[x_hi][1] = v[3];
+                    }
+                }
+                if r2cs && head_bad {
+                    head_fail.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
                 // exact. Throwaway anchor/delta scratch: the real ranges were
                 // already written by the lookahead pass. The full-lookahead
                 // monomorphization is used so the odd-parity slots are
-                // recovered too when the CPU sweep skipped them.
+                // recovered too when the CPU sweep skipped them. R2-CS: the
+                // sweep skipped these chunks outright, so the redo writes their
+                // real compact state and lookahead slots with the sweep's own
+                // walk.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
+                    let (anchors, deltas, dead, tail, head) = if r2cs {
+                        unsafe {
+                            (
+                                anchors_base.ptr().add(x_hi * anchor_chunk_stride),
+                                deltas_base.ptr().add(x_hi * delta_chunk_stride),
+                                skip_dead,
+                                tail_compact,
+                                head_fail_addr as *const std::sync::atomic::AtomicBool,
+                            )
+                        }
+                    } else {
+                        (scr_anchors.as_mut_ptr(), scr_deltas.as_mut_ptr(), false, false, core::ptr::null())
+                    };
                     unsafe {
                         fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                             table.data.as_ptr().cast::<u8>(),
                             a_packed.as_ptr().add(row_base * n_chunks),
                             b_packed.as_ptr().add(row_base * n_chunks),
-                            scr_anchors.as_mut_ptr(),
-                            scr_deltas.as_mut_ptr(),
+                            anchors,
+                            deltas,
                             eq_lo.as_ptr(),
                             eq_prep_addr as *const F128,
                             lo_size,
@@ -2400,9 +2597,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             useful_pairs_inclusive,
                             degen,
                             periodic_padding,
-                            false,
-                            false,
-                            core::ptr::null(),
+                            dead,
+                            tail,
+                            head,
                             out.as_mut_ptr(),
                         );
                     }
@@ -2411,12 +2608,65 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         eq_h * (kappa * out[0] + out[2]),
                         eq_h * (kappa * out[1] + out[3]),
                     );
-                    if odd_on_gpu {
+                    if r2cs {
+                        la_partials[x_hi] = [
+                            eq_h * out[2],
+                            eq_h * out[3],
+                            eq_h * out[4],
+                            eq_h * out[5],
+                            eq_h * out[6],
+                            eq_h * out[7],
+                        ];
+                    } else if odd_on_gpu {
                         la_partials[x_hi][0] = eq_h * out[2];
                         la_partials[x_hi][1] = eq_h * out[3];
                     }
                 }
             }
+        }
+    }
+
+    // R2-CS stored at a layout this sweep does not write (never at the
+    // ranked shape, see `cs_redo_all`): the arm has joined, so redo the whole
+    // round serially with the full walk, every store and every slot.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    if cs_redo_all {
+        for x_hi in 0..hi_size {
+            let pair_idx_base = x_hi * lo_size;
+            let row_base = pair_idx_base * 2;
+            let mut out = [F128::ZERO; 8];
+            // SAFETY: every writer has joined; chunk x_hi's ranges, serially.
+            unsafe {
+                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    table.data.as_ptr().cast::<u8>(),
+                    a_packed.as_ptr().add(row_base * n_chunks),
+                    b_packed.as_ptr().add(row_base * n_chunks),
+                    anchors_base.ptr().add(x_hi * anchor_chunk_stride),
+                    deltas_base.ptr().add(x_hi * delta_chunk_stride),
+                    eq_lo.as_ptr(),
+                    eq_prep_addr as *const F128,
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    degen,
+                    periodic_padding,
+                    skip_dead,
+                    tail_compact,
+                    head_fail_addr as *const std::sync::atomic::AtomicBool,
+                    out.as_mut_ptr(),
+                );
+            }
+            let eq_h = eq_hi[x_hi];
+            partials[x_hi] = (eq_h * (kappa * out[0] + out[2]), eq_h * (kappa * out[1] + out[3]));
+            la_partials[x_hi] = [
+                eq_h * out[2],
+                eq_h * out[3],
+                eq_h * out[4],
+                eq_h * out[5],
+                eq_h * out[6],
+                eq_h * out[7],
+            ];
         }
     }
 
@@ -2461,6 +2711,52 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 );
             }
         }
+    }
+
+    // R2-CS calibration (warm-up prove, after every writer joined): the
+    // arm's scratch compact state against the CPU's final compact state,
+    // every live slot of the calibration chunks at the state's own
+    // `anchor_index` / `delta_offset`; the verdict admits R2-CS for the
+    // process (the lookahead partials were compared at the drain).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    if let Some((chunks, layout)) = cs_calib {
+        let laid_out = compact.head_compact == layout.hc
+            && compact.anchor_index(0) == layout.a_base
+            && compact.anchor_index(128) == layout.a_base + layout.a_stride
+            && compact.delta_offset(0) == layout.d_base
+            && compact.delta_offset(128) == layout.d_base + layout.d_stride;
+        let deltas_ptr = compact.deltas.full_overwrite_ptr().cast_const();
+        let res = if laid_out {
+            // SAFETY: the joined sweep wrote the state; `deltas_ptr` spans
+            // `compact.deltas.len()` bytes.
+            unsafe {
+                crate::gpu_commit::zc_r2_cs_oracle(
+                    chunks * lo_size,
+                    &compact.anchors,
+                    deltas_ptr,
+                    compact.deltas.len(),
+                    |p| (p & pair_in_block_mask) < useful_pairs_inclusive,
+                    |p| {
+                        (
+                            compact.anchor_index(p),
+                            compact.delta_offset(p),
+                            compact.head_compact && p % 128 < kernels::aarch64::HC_HEAD_PAIRS,
+                        )
+                    },
+                )
+            }
+        } else {
+            Err(format!(
+                "planned layout {layout:?} is not the state's (head_compact={})",
+                compact.head_compact
+            ))
+        };
+        if let Err(e) = &res
+            && crate::gpu_commit::gpu_zc_r2_debug()
+        {
+            eprintln!("[zc-r2] R2-CS ORACLE MISMATCH: {e} -> R2-CS disabled");
+        }
+        crate::gpu_commit::zc_r2_cs_verdict(res.is_ok(), chunks, hi_size);
     }
 
     // Both the standard and lookahead round-two producers promise identical
@@ -6364,6 +6660,7 @@ mod tests {
                     &f.padding,
                     Some(backing),
                     true,
+                    None,
                 );
                 let skip_on = std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none();
                 assert_eq!(sparse.dead_tail, cfg!(target_arch = "aarch64") && skip_on);
@@ -6469,6 +6766,7 @@ mod tests {
                 &f.padding,
                 Some(backing),
                 true,
+                None,
             );
             unsafe { std::env::remove_var("FLOCK_NO_R2_DEADPAIR_SKIP") };
             assert!(!off.dead_tail, "kill switch keeps the dense state");

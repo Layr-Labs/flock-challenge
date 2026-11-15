@@ -748,6 +748,33 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
     *ON
 }
 
+/// Kill switch for R2-CS, the round-two products arm owning its prefix
+/// chunks outright (`FLOCK_NO_ZC_R2_CS`, any value: the exact incumbent
+/// split, in which the CPU still walks every prefix chunk for its compact
+/// state and round-three lookahead terms). With R2-CS on, the arm's Horner
+/// kernel also stores, for every live pair of its chunks, the compact anchors
+/// and deltas the CPU walk writes (same bytes, same offsets, head and tail
+/// compaction, dead pairs skipped), computes the chunks' lookahead terms
+/// W0/W3/W4/W5 and flags a head pair whose b rows are not all ones, so the
+/// CPU skips those chunks entirely and the share balances with no CPU cost
+/// per GPU chunk. The R2-CS kernel is its own Metal library, compiled on a
+/// background thread from the warm-up prove's start (the arm's library is
+/// the incumbent's). The stores go through views that already exist in the
+/// prove, never a new one: the K pass arm's premapped anchors view of this
+/// prove and round one's handed-over view of the deltas; a prove without
+/// both (or with one too short) runs the incumbent split. The warm-up
+/// calibration admits R2-CS for the process only if the R2-CS kernel's
+/// products, lookahead partials and compact bytes of the calibration chunks
+/// (stored to a scratch state, freed after the comparison) equal the CPU's
+/// own. Read once per process.
+pub const ENV_NO_ZC_R2_CS: &str = "FLOCK_NO_ZC_R2_CS";
+
+pub(crate) fn zc_r2_cs_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_R2_CS).is_none());
+    *ON
+}
+
 /// Kill switch for the round-one AB completion GPU prefix arm (any value
 /// restores the exact CPU-only completion). With the arm on, the GPU computes
 /// the per-chunk 64-lane partials of a leading prefix of the 128 `x_hi`
@@ -19426,6 +19453,234 @@ kernel void zc_r2_products_horner(
 
 "#;
 
+    /// R2-CS kernel (`super::ENV_NO_ZC_R2_CS`). It is compiled as a library
+    /// of its own, after the arm's library source whose helpers it uses
+    /// ([`zc_r2_cs_build_pso`], on the R2-CS prewarm thread), so the arm's
+    /// own library is the incumbent's.
+    const ZC_R2_CS_MSL_SOURCE: &str = r#"
+// R2-CS kernel (see `ENV_NO_ZC_R2_CS`): zc_r2_products_horner on the
+// lane-parity map for all sixteen steps (no handoff: a round-three group's
+// two pairs, classes 2t and 2t + 1, are lanes lid and lid ^ 1 at every step),
+// plus, for every live pair, the compact stores of the CPU walk, and, for
+// every round-three group, the lookahead terms of
+// `fold_round2_compact_chunk_neon_prescaled_8`:
+//   W0 += x^m a2 b2,  W3 += x^m e_a e_b,  W4 += x^m o_a o_b,
+//   W5 += x^m (e + o)_a (e + o)_b,
+// e = row0 folds of both pairs, o = row1 folds of both pairs (F2-linear
+// folds, so fold(a1c ^ a3c) = a1 ^ a3), a2 b2 the odd pair's row0 folds,
+// m the medium position, every group weighted by its odd lane's eq_lo
+// (lambda(w, t) = eq_lo[(w << 6) | (2t + 1)]). The odd lane accumulates W0
+// and W5, the even lane W3 and W4; the parity-split reduction keeps them
+// apart. A padded pair contributes zero folds (a padded group nothing).
+
+// Compact-state layout of the round-two CPU walk (`ZcR2CsLayout` on the
+// host): a 128-pair block starts at a_base + blk * a_stride anchors and
+// d_base + blk * d_stride delta bytes; hc = head-compacted (pairs 0..7 keep
+// only their a anchor and a delta, pairs 8.. sit 8 anchors / 64 bytes early).
+struct ZcR2CsLayout { uint hc; uint a_base; uint a_stride; uint d_base; uint d_stride; uint pad0; uint pad1; uint pad2; };
+
+// One live pair's compact stores, at UniSkipCompactFold::anchor_index /
+// delta_offset: anchors [a0, b0]; deltas the packed bytes row0 ^ row1 (the
+// eight a bytes, then the eight b bytes, as `store_delta_pair_gpr`). The b
+// anchor of a b == 1 pair is the fold of the all-ones row and its b delta
+// zero, the bytes the CPU's degenerate branch stores.
+static inline void zc_r2_cs_store(
+    uint pair_idx, uint4 ar, uint4 br, uint4 a0, uint4 b0,
+    device uint4* anchors, device uint4* deltas, constant ZcR2CsLayout& cl)
+{
+    uint blk = pair_idx >> 7u;
+    uint q = pair_idx & 127u;
+    uint a = cl.a_base + blk * cl.a_stride;
+    uint d = cl.d_base + blk * cl.d_stride;
+    if (cl.hc != 0u) {
+        if (q < 8u) {
+            anchors[a + q] = a0;
+            reinterpret_cast<device uint2*>(deltas)[(d >> 3u) + q] = uint2(ar.x ^ ar.z, ar.y ^ ar.w);
+            return;
+        }
+        a += 2u * q - 8u;
+        d += 16u * q - 64u;
+    } else {
+        a += 2u * q;
+        d += 16u * q;
+    }
+    anchors[a] = a0;
+    anchors[a + 1u] = b0;
+    deltas[d >> 4u] = uint4(ar.x ^ ar.z, ar.y ^ ar.w, br.x ^ br.z, br.y ^ br.w);
+}
+
+// Parity-split XOR reduction of one accumulator (as zc_r2_write_partials):
+// lane 0 receives the even lanes' and the odd lanes' sums.
+static inline void zc_r2_cs_reduce(
+    ulong4 acc, threadgroup ulong4* red, uint lid, thread ulong4& even, thread ulong4& odd)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    red[lid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128u; s > 1u; s >>= 1u) {
+        if (lid < s) { red[lid] ^= red[lid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0u) {
+        even = red[0];
+        odd = red[1];
+    }
+}
+
+static inline uint4 zc_r2_cs_weigh(uint4 e, ulong4 v) {
+    U256k u; u.r0 = v.x; u.r1 = v.y; u.r2 = v.z; u.r3 = v.w;
+    return gf_reduce(clmul128(e, gf_reduce(u)));
+}
+
+kernel void zc_r2_products_horner_cs(
+    device const uint4* a_in  [[buffer(0)]],
+    device const uint4* b_in  [[buffer(1)]],
+    device const uint4* eq_lo [[buffer(2)]],
+    device const uint4* eq_hi [[buffer(3)]],
+    device const uint4* nib_tab_dev [[buffer(4)]],
+    device uint4*       partials    [[buffer(5)]],
+    constant ZcR2Params& p          [[buffer(6)]],
+    device uint4*       cs_anchors  [[buffer(7)]],
+    device uint4*       cs_deltas   [[buffer(8)]],
+    constant ZcR2CsLayout& cl       [[buffer(9)]],
+    device atomic_uint* cs_flag     [[buffer(10)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup ulong4 red[256];
+    threadgroup uint4* nib = reinterpret_cast<threadgroup uint4*>(red);
+    nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint hi_chunk = tgid >> 2;
+    uint window = ((tgid & 3u) << 6) | (lid >> 2);
+    uint small_class = lid & 3u;
+    bool odd_lane = (small_class & 1u) != 0u;
+    U320k h1 = {0ul, 0ul, 0ul, 0ul, 0ul};
+    U320k hi = {0ul, 0ul, 0ul, 0ul, 0ul};
+    U320k wa = {0ul, 0ul, 0ul, 0ul, 0ul};
+    U320k wb = {0ul, 0ul, 0ul, 0ul, 0ul};
+    bool head_bad = false;
+    for (uint step = 0u; step < (p.xpt & 0x7fffffffu); step++) {
+        if (step != 0u) {
+            zc_r2_horner_shift(h1);
+            zc_r2_horner_shift(hi);
+            zc_r2_horner_shift(wa);
+            zc_r2_horner_shift(wb);
+        }
+        uint medium = 15u - step;
+        uint x_lo = (window << 6) | (medium << 2) | small_class;
+        uint pair_idx = hi_chunk * p.lo_size + x_lo;
+        // A padded pair folds to zero; its group is live while the group's
+        // even pair is (the walk's boundary group pairs pair 120 with 121).
+        bool pad = (pair_idx & p.mask) >= p.useful;
+        bool group_live = ((pair_idx & ~1u) & p.mask) < p.useful;
+        uint4 a0 = uint4(0u);
+        uint4 b0 = uint4(0u);
+        uint4 sa = uint4(0u);
+        uint4 sb = uint4(0u);
+        if (!pad) {
+            uint4 ar = a_in[pair_idx];
+            uint4 br = b_in[pair_idx];
+            a0 = zc_r2_fold<ZC_R2_PL>(ar.x, ar.y, nib);
+            uint4 a1 = zc_r2_fold<ZC_R2_PL>(ar.z, ar.w, nib);
+            b0 = zc_r2_fold<ZC_R2_PL>(br.x, br.y, nib);
+            uint4 b1 = zc_r2_fold<ZC_R2_PL>(br.z, br.w, nib);
+            zc_r2_cs_store(pair_idx, ar, br, a0, b0, cs_anchors, cs_deltas, cl);
+            // Head-compacted state: a head pair's b rows must be all ones.
+            if (cl.hc != 0u && (pair_idx & 127u) < 8u) {
+                head_bad = head_bad || ((br.x & br.z) & (br.y & br.w)) != 0xffffffffu;
+            }
+            sa = a0 ^ a1;
+            sb = b0 ^ b1;
+            zc_r2_horner_add(h1, zc_r2_mul<ZC_R2_PL>(a1, b1));
+            zc_r2_horner_add(hi, zc_r2_mul<ZC_R2_PL>(sa, sb));
+        }
+        // The group partner's row0 folds and row0 + row1 folds (every lane).
+        uint4 pa0 = simd_shuffle_xor(a0, ushort(1));
+        uint4 pb0 = simd_shuffle_xor(b0, ushort(1));
+        uint4 psa = simd_shuffle_xor(sa, ushort(1));
+        uint4 psb = simd_shuffle_xor(sb, ushort(1));
+        if (group_live) {
+            // e = the pairs' row0 folds, t = e + o (row0 + row1 of both).
+            // Odd lane: W0 = a2 b2 (its own row0 folds) and W5 = t_a t_b;
+            // even lane: W3 = e_a e_b and W4 = o_a o_b, o = t + e. Operands
+            // are selected per lane so both lanes run the same two products.
+            uint4 ea = a0 ^ pa0;
+            uint4 eb = b0 ^ pb0;
+            uint4 ta = sa ^ psa;
+            uint4 tb = sb ^ psb;
+            uint4 x1 = odd_lane ? a0 : ea;
+            uint4 y1 = odd_lane ? b0 : eb;
+            uint4 x2 = odd_lane ? ta : ta ^ ea;
+            uint4 y2 = odd_lane ? tb : tb ^ eb;
+            zc_r2_horner_add(wa, zc_r2_mul<ZC_R2_PL>(x1, y1));
+            zc_r2_horner_add(wb, zc_r2_mul<ZC_R2_PL>(x2, y2));
+        }
+    }
+    if (head_bad) {
+        atomic_store_explicit(cs_flag, 1u, memory_order_relaxed);
+    }
+    uint4 e = eq_lo[window * 4u + small_class];
+    uint4 lam = eq_lo[window * 4u + (small_class | 1u)];
+    U256k m1 = zc_r2_mul<ZC_R2_PL>(e, zc_r2_horner_reduce(h1));
+    U256k mi = zc_r2_mul<ZC_R2_PL>(e, zc_r2_horner_reduce(hi));
+    U256k ma = zc_r2_mul<ZC_R2_PL>(lam, zc_r2_horner_reduce(wa));
+    U256k mb = zc_r2_mul<ZC_R2_PL>(lam, zc_r2_horner_reduce(wb));
+    // [p1_even, pinf_even, p1_odd, pinf_odd, W0, W3, W4, W5] per physical
+    // group, every slot eq_hi-weighted and reduced.
+    ulong4 p1e, p1o, pie, pio, w3, w0, w4, w5;
+    zc_r2_cs_reduce(ulong4(m1.r0, m1.r1, m1.r2, m1.r3), red, lid, p1e, p1o);
+    zc_r2_cs_reduce(ulong4(mi.r0, mi.r1, mi.r2, mi.r3), red, lid, pie, pio);
+    zc_r2_cs_reduce(ulong4(ma.r0, ma.r1, ma.r2, ma.r3), red, lid, w3, w0);
+    zc_r2_cs_reduce(ulong4(mb.r0, mb.r1, mb.r2, mb.r3), red, lid, w4, w5);
+    if (lid == 0u) {
+        uint4 eh = eq_hi[hi_chunk];
+        device uint4* out = partials + tgid * 8u;
+        out[0] = zc_r2_cs_weigh(eh, p1e);
+        out[1] = zc_r2_cs_weigh(eh, pie);
+        out[2] = zc_r2_cs_weigh(eh, p1o);
+        out[3] = zc_r2_cs_weigh(eh, pio);
+        out[4] = zc_r2_cs_weigh(eh, w0);
+        out[5] = zc_r2_cs_weigh(eh, w3);
+        out[6] = zc_r2_cs_weigh(eh, w4);
+        out[7] = zc_r2_cs_weigh(eh, w5);
+    }
+}
+"#;
+
+    /// Host mirror of the probe kernel's `ZcR2CsLayout` (see
+    /// `UniSkipCompactFold::anchor_index` / `delta_offset`): anchors and
+    /// delta bytes of block 0 (`anchor_index(0)`, `delta_offset(0)`), per
+    /// 128-pair block, and whether the state is head-compacted.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct ZcR2CsLayout {
+        pub(crate) hc: bool,
+        pub(crate) a_base: usize,
+        pub(crate) a_stride: usize,
+        pub(crate) d_base: usize,
+        pub(crate) d_stride: usize,
+    }
+
+    impl ZcR2CsLayout {
+        /// Exclusive byte ends (anchors, deltas) of the stores of the first
+        /// `blocks` 128-pair blocks: `16 * anchor_index(P)`, `delta_offset(P)`
+        /// for `P = 128 * blocks`.
+        pub(crate) fn ends(&self, blocks: usize) -> (usize, usize) {
+            (16 * (self.a_base + blocks * self.a_stride), self.d_base + blocks * self.d_stride)
+        }
+
+        /// Scratch bytes (anchors, deltas) covering `blocks` 128-pair blocks,
+        /// whole pages.
+        fn scratch_bytes(&self, blocks: usize) -> (usize, usize) {
+            let page = 16384usize;
+            (
+                ((self.a_base + blocks * self.a_stride) * 16).div_ceil(page) * page,
+                (self.d_base + blocks * self.d_stride).div_ceil(page) * page,
+            )
+        }
+    }
+
     fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
         if incumbent {
             std::borrow::Cow::Owned(format!(
@@ -19513,6 +19768,20 @@ kernel void zc_r2_horner_oracle(
         /// release) before anything rewrites the buffers it binds — the next
         /// round-two launch or the next prove's staging, whichever first.
         prefetch_cb: Id,
+        /// R2-CS (`super::ENV_NO_ZC_R2_CS`): the `_cs` Horner PSO (`NIL`
+        /// until the calibration launch installs it, see
+        /// [`zc_r2_cs_install`]), its partials (eight F128 per physical
+        /// group), the scratch compact state (anchors, delta bytes) the
+        /// calibration stores into (freed by [`zc_r2_cs_oracle`]), and the
+        /// head-pair flag word.
+        cs_pso: Id,
+        cs_part_buf: Id,
+        cs_part_cap: usize,
+        cs_a_buf: Id,
+        cs_a_cap: usize,
+        cs_d_buf: Id,
+        cs_d_cap: usize,
+        cs_flag_buf: Id,
     }
 
     // SAFETY: the Metal pipeline and buffer handles are only touched under
@@ -19527,6 +19796,27 @@ kernel void zc_r2_horner_oracle(
         std::sync::atomic::AtomicUsize::new(usize::MAX);
     static ZC_R2_POISONED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+    /// R2-CS admission (`super::ENV_NO_ZC_R2_CS`): uncalibrated (the
+    /// calibration launch runs the R2-CS kernel and its oracles), admitted
+    /// (timed launches own their prefix chunks), or disabled for the process.
+    static ZC_R2_CS_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    const ZC_R2_CS_UNCALIBRATED: u8 = 0;
+    const ZC_R2_CS_ADMITTED: u8 = 1;
+    const ZC_R2_CS_DISABLED: u8 = 2;
+    /// The incumbent split's share, published by the calibration: a timed
+    /// launch R2-CS cannot run (no usable view this prove) falls back to it.
+    static ZC_R2_INC_TUNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// The R2-CS ratio `r_cs` of the calibration (f64 bits), kept for the
+    /// R2-CS verdict, which republishes the share at its balance point.
+    static ZC_R2_CS_RATIO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// R2-CS pricing: the R2-CS kernel's per-chunk GPU cost in units of the
+    /// incumbent Horner kernel's (two more products per pair and the compact
+    /// stores). The R2-CS ratio
+    /// is this factor times the incumbent arm's own calibrated ratio: the
+    /// incumbent kernel's warm-up price tracks its timed price, the R2-CS
+    /// kernel's does not (the warm-up GPU clock), and no extra warm-up
+    /// replays are spent on it.
+    const ZC_R2_CS_PRICE: f64 = 2.2;
 
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
@@ -19751,8 +20041,140 @@ kernel void zc_r2_horner_oracle(
                 part_cap: 0,
                 wraps: Vec::new(),
                 prefetch_cb: NIL,
+                cs_pso: NIL,
+                cs_part_buf: NIL,
+                cs_part_cap: 0,
+                cs_a_buf: NIL,
+                cs_a_cap: 0,
+                cs_d_buf: NIL,
+                cs_d_cap: 0,
+                cs_flag_buf: NIL,
             })
         }
+    }
+    /// The R2-CS pipeline (`zc_r2_products_horner_cs`) and the device it was
+    /// built on, as raw handles: built once per process from a library of its
+    /// own (the arm's library source, whose helpers it uses, then
+    /// [`ZC_R2_CS_MSL_SOURCE`]), normally by the R2-CS prewarm thread
+    /// ([`zc_r2_cs_prewarm`]) while the warm-up prove runs; the calibration
+    /// launch joins that build ([`zc_r2_cs_pso`]). `None` = the compile or
+    /// the pipeline failed (R2-CS off for the process).
+    static ZC_R2_CS_PSO: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+
+    /// Compile the R2-CS library on `gpu`'s device and make its pipeline.
+    fn zc_r2_cs_build_pso(gpu: &Gpu) -> Result<Id, String> {
+        unsafe {
+            let pool = gpu.pool_push();
+            let built = (|| -> Result<Id, String> {
+                let mut source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled()).into_owned();
+                source.push_str(ZC_R2_CS_MSL_SOURCE);
+                let src = gpu.api.nsstring(&source)?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    gpu.api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return Err(format!("R2-CS shader compile failed: {}", gpu.api.error_string(err)));
+                }
+                let made = (|| -> Result<Id, String> {
+                    let ns = gpu.api.nsstring("zc_r2_products_horner_cs")?;
+                    let f: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if f.is_null() {
+                        return Err("zc_r2_products_horner_cs kernel not found".into());
+                    }
+                    let mut perr: Id = NIL;
+                    let pso: Id = send!(
+                        gpu.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        gpu.device,
+                        c"newComputePipelineStateWithFunction:error:",
+                        f,
+                        &mut perr
+                    );
+                    gpu.release(f);
+                    if pso.is_null() {
+                        return Err(format!("zc_r2_products_horner_cs pipeline: {}", gpu.api.error_string(perr)));
+                    }
+                    Ok(pso)
+                })();
+                gpu.release(library);
+                made
+            })();
+            gpu.pool_pop(pool);
+            built
+        }
+    }
+
+    /// The R2-CS pipeline for `gpu`'s device, joining its build (or doing it
+    /// when no prewarm thread started it). `None` = R2-CS off.
+    fn zc_r2_cs_pso(gpu: &Gpu) -> Option<Id> {
+        let built = *ZC_R2_CS_PSO.get_or_init(|| match zc_r2_cs_build_pso(gpu) {
+            Ok(pso) => Some((pso as usize, gpu.device as usize)),
+            Err(e) => {
+                if super::gpu_zc_r2_debug() {
+                    eprintln!("[zc-r2] R2-CS PSO unavailable (R2-CS off): {e}");
+                }
+                None
+            }
+        });
+        built.filter(|&(_, dev)| dev == gpu.device as usize).map(|(pso, _)| pso as Id)
+    }
+
+    /// Whether the warm-up should build the R2-CS pipeline in the background
+    /// ([`zc_r2_cs_prewarm`]): R2-CS and the arm's Horner kernel are on.
+    pub(crate) fn zc_r2_cs_prewarm_wanted() -> bool {
+        super::zc_r2_cs_enabled() && super::gpu_zc_r2_enabled() && super::gpu_zc_r2_horner_enabled()
+    }
+
+    /// Build the R2-CS pipeline now, on the GPU context's device. Runs on its
+    /// own thread from the warm-up prove's start, so the compile overlaps the
+    /// warm-up instead of the arm's library build on its round two.
+    pub(crate) fn zc_r2_cs_prewarm() {
+        if let Ok(gpu) = gpu() {
+            let _ = zc_r2_cs_pso(gpu);
+        }
+    }
+
+    /// Calibration launch: put the R2-CS pipeline `pso` and its head-pair
+    /// flag word into the arm's state. The pipeline shares the Horner launch
+    /// shape (256 threads; its group partners are SIMD neighbours). `false` =
+    /// no usable pipeline (R2-CS off).
+    unsafe fn zc_r2_cs_install(gpu: &Gpu, state: &mut ZcR2, pso: Option<Id>) -> bool {
+        if !state.cs_pso.is_null() {
+            return true;
+        }
+        let Some(pso) = pso else { return false };
+        unsafe {
+            let width: u64 = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"threadExecutionWidth");
+            let threads: u64 =
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup");
+            if width != state.horner_resources.1 || width < 2 || threads < 256 {
+                if super::gpu_zc_r2_debug() {
+                    eprintln!("[zc-r2] R2-CS PSO width={width} threads={threads} (R2-CS off)");
+                }
+                return false;
+            }
+            if state.cs_flag_buf.is_null() {
+                state.cs_flag_buf = gpu.new_buffer(16).unwrap_or(NIL);
+                if state.cs_flag_buf.is_null() {
+                    return false;
+                }
+            }
+            state.cs_pso = gpu.retain(pso);
+        }
+        true
     }
 
     fn zc_r2_state() -> Option<&'static std::sync::Mutex<ZcR2>> {
@@ -19783,6 +20205,41 @@ kernel void zc_r2_horner_oracle(
         mask: u32,
         useful: u32,
         submitted: Option<std::time::Instant>,
+        /// R2-CS: the layout the `_cs` kernel stored its chunks' compact
+        /// state in (a timed prefix: `cb` is that kernel; the calibration:
+        /// `cs_cb` is its oracle dispatch); `None` = the incumbent kernel.
+        cs: Option<ZcR2CsLayout>,
+        /// The calibration's R2-CS oracle command buffer (`NIL` otherwise).
+        cs_cb: Id,
+        /// A timed R2-CS prefix's references of the prove's views it binds,
+        /// held until the job is dropped (after its join).
+        _cs_views: ZcR2CsViews,
+    }
+
+    /// The R2-CS kernel's compact-state destination for one dispatch: its
+    /// layout and the anchors / deltas buffers (the scratch state for the
+    /// calibration, the prove's existing views for a timed prefix), both
+    /// bound at offset 0 (the layout indexes from the allocation base).
+    #[derive(Clone, Copy)]
+    struct ZcR2CsBind {
+        layout: ZcR2CsLayout,
+        anchors: Id,
+        deltas: Id,
+    }
+
+    /// A timed R2-CS prefix's +1 references of the views it binds,
+    /// released with the job (an in-flight command buffer retains what it
+    /// binds).
+    pub(crate) struct ZcR2CsViews([Id; 2]);
+
+    impl Drop for ZcR2CsViews {
+        fn drop(&mut self) {
+            if let Ok(g) = gpu() {
+                for v in self.0 {
+                    unsafe { g.release(v) };
+                }
+            }
+        }
     }
 
     // SAFETY: the command buffer handle is only waited/released from the
@@ -19801,6 +20258,19 @@ kernel void zc_r2_horner_oracle(
             self.calibration
         }
 
+        /// R2-CS owns this timed job's prefix chunks: the GPU writes their
+        /// compact state and computes their products and lookahead terms,
+        /// and the CPU skips them (`super::ENV_NO_ZC_R2_CS`).
+        pub(crate) fn cs_active(&self) -> bool {
+            self.cs.is_some() && !self.calibration
+        }
+
+        /// R2-CS calibration job: the chunks whose compact state the GPU
+        /// stored to scratch and their layout, for [`zc_r2_cs_oracle`].
+        pub(crate) fn cs_calibration(&self) -> Option<(usize, ZcR2CsLayout)> {
+            self.cs.filter(|_| self.calibration).map(|l| (self.chunks, l))
+        }
+
         #[cfg(test)]
         pub(crate) fn uses_horner(&self) -> bool {
             self.horner
@@ -19815,6 +20285,14 @@ kernel void zc_r2_horner_oracle(
         /// Timed-prove prefix partials, bit-exact per chunk, parity-split as
         /// `[p1_even, pinf_even, p1_odd, pinf_odd]` (all eq_hi-weighted).
         Prefix(Vec<[F128; 4]>),
+        /// R2-CS timed prefix: the GPU also wrote the chunks' compact state;
+        /// `lookahead` holds their eq_hi-weighted `[W0, W3, W4, W5]` and
+        /// `head_bad` whether a head pair's b rows were not all ones.
+        PrefixCs {
+            prefix: Vec<[F128; 4]>,
+            lookahead: Vec<[F128; 4]>,
+            head_bad: bool,
+        },
         /// Metal failed after admission; the caller must CPU-redo the
         /// prefix products. The arm is poisoned for the process.
         Failed,
@@ -19830,6 +20308,7 @@ kernel void zc_r2_horner_oracle(
         mask: u32,
         useful: u32,
         horner: bool,
+        cs: Option<&ZcR2CsBind>,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -19853,14 +20332,42 @@ kernel void zc_r2_horner_oracle(
                 std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let cb = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb)?;
-            gpu.set_pipeline(enc, if horner { state.horner_pso } else { state.pso });
+            gpu.set_pipeline(
+                enc,
+                if cs.is_some() {
+                    state.cs_pso
+                } else if horner {
+                    state.horner_pso
+                } else {
+                    state.pso
+                },
+            );
             gpu.set_buffer(enc, a_buf, 0, 0);
             gpu.set_buffer(enc, b_buf, 0, 1);
             gpu.set_buffer(enc, state.eq_lo_buf, 0, 2);
             gpu.set_buffer(enc, state.eq_hi_buf, 0, 3);
             gpu.set_buffer(enc, state.nib_buf, 0, 4);
-            gpu.set_buffer(enc, state.part_buf, 0, 5);
+            gpu.set_buffer(enc, if cs.is_some() { state.cs_part_buf } else { state.part_buf }, 0, 5);
             gpu.set_bytes(enc, pb, 6);
+            if let Some(bind) = cs {
+                // R2-CS: the compact state, its layout and the head flag.
+                let l = &bind.layout;
+                let lp: [u32; 8] = [
+                    u32::from(l.hc),
+                    l.a_base as u32,
+                    l.a_stride as u32,
+                    l.d_base as u32,
+                    l.d_stride as u32,
+                    0,
+                    0,
+                    0,
+                ];
+                let lb = std::slice::from_raw_parts(lp.as_ptr().cast::<u8>(), core::mem::size_of_val(&lp));
+                gpu.set_buffer(enc, bind.anchors, 0, 7);
+                gpu.set_buffer(enc, bind.deltas, 0, 8);
+                gpu.set_bytes(enc, lb, 9);
+                gpu.set_buffer(enc, state.cs_flag_buf, 0, 10);
+            }
             gpu.dispatch(enc, (chunks * if horner { 4 } else { 1 }) as u64, 256);
             gpu.end_encoding(enc);
             let cb = gpu.retain(cb);
@@ -20063,6 +20570,8 @@ kernel void zc_r2_horner_oracle(
                     pair_in_block_mask as u32,
                     useful_pairs_inclusive as u32,
                     horner,
+                    // The primer never stores compact state (R2-CS probe).
+                    None,
                 )?;
                 state.prefetch_cb = cb;
                 Ok(())
@@ -20102,6 +20611,47 @@ kernel void zc_r2_horner_oracle(
         pair_in_block_mask: usize,
         useful_pairs_inclusive: usize,
     ) -> Option<ZcR2Job> {
+        launch_zc_r2_products_cs(
+            a_packed,
+            b_packed,
+            table_data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            None,
+            None,
+        )
+    }
+
+    /// [`launch_zc_r2_products`] for the ranked lookahead sweep, whose compact
+    /// state uses `cs_layout` with the dead-pair skip; `cs_live` = (anchors
+    /// allocation base, deltas allocation base, deltas allocation bytes).
+    /// With R2-CS on (`super::ENV_NO_ZC_R2_CS`) and the Horner kernel
+    /// selected, the calibration launch joins the R2-CS pipeline's build and
+    /// adds the R2-CS oracle dispatch (scratch compact state) while R2-CS is
+    /// uncalibrated, and once it is admitted a timed launch runs the R2-CS
+    /// kernel through views that already exist in this prove: the K pass
+    /// arm's premapped anchors view ([`zc_k_premap`], peeked, still taken by
+    /// the K launch) and round one's handed-over view of the deltas. No view
+    /// is ever made here; a missing or too short one leaves the launch on the
+    /// incumbent kernel and share. `None` = the incumbent launch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_r2_products_cs(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+        cs_layout: Option<ZcR2CsLayout>,
+        cs_live: Option<(usize, usize, usize)>,
+    ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
             return None;
@@ -20140,6 +20690,25 @@ kernel void zc_r2_horner_oracle(
             super::gpu_zc_r2_horner_enabled() && super::zc_r2_horner_weights(eq_lo, lo_size);
         let gpu = gpu().ok()?;
         let state_mutex = zc_r2_state()?;
+        // R2-CS calibration: join the R2-CS pipeline's background build here,
+        // outside the arm's lock (`Some(None)` = it failed: R2-CS off).
+        let cs_join = (calibration
+            && horner
+            && cs_layout.is_some()
+            && super::zc_r2_cs_enabled()
+            && ZC_R2_CS_MODE.load(Ordering::Relaxed) == ZC_R2_CS_UNCALIBRATED)
+            .then(|| {
+                let waited = std::time::Instant::now();
+                let pso = zc_r2_cs_pso(gpu);
+                if super::gpu_zc_r2_debug() {
+                    eprintln!(
+                        "[zc-r2] R2-CS pipeline: {} (joined after {:.2} ms)",
+                        if pso.is_some() { "ready" } else { "unavailable" },
+                        waited.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+                pso
+            });
         // Deliberately NOT poison-tolerant: the grow sequences below
         // (release -> new_buffer -> cap update) are not unwind-atomic, so a
         // guard recovered after a caught panic could observe a released
@@ -20158,6 +20727,11 @@ kernel void zc_r2_horner_oracle(
             // window's measured idle — this wait finds it done). Also emits
             // the `[zc-idle-fill]` timing line.
             zc_r2_drain_prefetch(gpu, &mut state);
+            if let Some(pso) = cs_join
+                && !zc_r2_cs_install(gpu, &mut state, pso)
+            {
+                ZC_R2_CS_MODE.store(ZC_R2_CS_DISABLED, Ordering::Relaxed);
+            }
             // Nibble decomposition of the 32 KiB byte table (per prove; the
             // table depends on the round challenge z).
             let nib = gpu.buffer_contents(state.nib_buf).cast::<F128>();
@@ -20182,6 +20756,18 @@ kernel void zc_r2_horner_oracle(
                 gpu.buffer_contents(state.eq_hi_buf),
                 need_hi,
             );
+            // R2-CS for this launch (see the scratch sizing below).
+            let cs_mode = ZC_R2_CS_MODE.load(Ordering::Relaxed);
+            let cs_wanted = cs_layout.is_some()
+                && horner
+                && !state.cs_pso.is_null()
+                && super::zc_r2_cs_enabled()
+                && lo_size.is_multiple_of(128)
+                && if calibration {
+                    cs_mode == ZC_R2_CS_UNCALIBRATED
+                } else {
+                    cs_mode == ZC_R2_CS_ADMITTED
+                };
             // Four F128 per physical group, merged per logical hi chunk
             // after completion: [p1_even, pinf_even, p1_odd, pinf_odd].
             let need_part = hi_size * 64 * if horner { 4 } else { 1 };
@@ -20194,6 +20780,89 @@ kernel void zc_r2_horner_oracle(
             }
             let a_buf = zc_r2_wrap(&mut state, gpu, a_packed).ok()?;
             let b_buf = zc_r2_wrap(&mut state, gpu, b_packed).ok()?;
+            // R2-CS dispatch of this launch: the calibration's oracle
+            // dispatch over the calibration chunks into the scratch state, or
+            // a timed prefix through this prove's existing views. Any failure
+            // leaves this launch on the incumbent kernel.
+            let cs = match cs_layout {
+                Some(l) if cs_wanted => (|| -> Option<(ZcR2CsBind, ZcR2CsViews)> {
+                    let blocks = chunks * lo_size / 128;
+                    let need_part = hi_size * 128 * 4;
+                    if state.cs_part_cap < need_part {
+                        gpu.release(state.cs_part_buf);
+                        state.cs_part_buf = NIL;
+                        state.cs_part_cap = 0;
+                        state.cs_part_buf = gpu.new_buffer(need_part).ok()?;
+                        state.cs_part_cap = need_part;
+                    }
+                    if calibration {
+                        let (need_a, need_d) = l.scratch_bytes(blocks);
+                        if need_a / 16 > u32::MAX as usize || need_d > u32::MAX as usize {
+                            return None;
+                        }
+                        if state.cs_a_cap < need_a {
+                            gpu.release(state.cs_a_buf);
+                            state.cs_a_buf = NIL;
+                            state.cs_a_cap = 0;
+                            state.cs_a_buf = gpu.new_buffer(need_a).ok()?;
+                            state.cs_a_cap = need_a;
+                        }
+                        if state.cs_d_cap < need_d {
+                            gpu.release(state.cs_d_buf);
+                            state.cs_d_buf = NIL;
+                            state.cs_d_cap = 0;
+                            state.cs_d_buf = gpu.new_buffer(need_d).ok()?;
+                            state.cs_d_cap = need_d;
+                        }
+                        let bind = ZcR2CsBind { layout: l, anchors: state.cs_a_buf, deltas: state.cs_d_buf };
+                        return Some((bind, ZcR2CsViews([NIL, NIL])));
+                    }
+                    let (a_ptr, d_ptr, d_len) = cs_live?;
+                    let (need_a, need_d) = l.ends(blocks);
+                    if need_a / 16 > u32::MAX as usize || need_d > u32::MAX as usize {
+                        return None;
+                    }
+                    // +1 references of this prove's existing views, both
+                    // starting at their allocation's base (no view is made
+                    // here: two no-copy views may never overlap).
+                    let views = ZcR2CsViews([
+                        zc_k_premap_peek(gpu, a_ptr, need_a).unwrap_or(NIL),
+                        match zc_k_view_peek(gpu, d_ptr, d_len, need_d) {
+                            Ok(Some((_, v))) => v,
+                            _ => NIL,
+                        },
+                    ]);
+                    if views.0.iter().any(|v| v.is_null()) {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!(
+                                "[zc-r2] R2-CS: no premapped anchors view ({need_a} bytes) or round-one deltas \
+                                 view ({need_d} bytes) this prove; incumbent split"
+                            );
+                        }
+                        return None;
+                    }
+                    let bind = ZcR2CsBind { layout: l, anchors: views.0[0], deltas: views.0[1] };
+                    Some((bind, views))
+                })(),
+                _ => None,
+            };
+            if cs.is_some() {
+                // The head-pair flag of this launch starts clear.
+                *gpu.buffer_contents(state.cs_flag_buf).cast::<u32>() = 0;
+            }
+            // The calibration prices the incumbent kernel (its own dispatch);
+            // a timed R2-CS prefix runs the R2-CS kernel only.
+            let timed_cs = cs.as_ref().filter(|_| !calibration);
+            // A timed launch R2-CS cannot run although admitted (no shared
+            // view this prove): the incumbent split, at its own share.
+            let chunks = if !calibration && timed_cs.is_none() && cs_mode == ZC_R2_CS_ADMITTED {
+                match ZC_R2_INC_TUNED.load(Ordering::Relaxed) {
+                    0 => chunks,
+                    g => g.min(hi_size),
+                }
+            } else {
+                chunks
+            };
             let cb = zc_r2_submit(
                 gpu,
                 &state,
@@ -20204,8 +20873,35 @@ kernel void zc_r2_horner_oracle(
                 pair_in_block_mask as u32,
                 useful_pairs_inclusive as u32,
                 horner,
+                timed_cs.map(|(bind, _)| bind),
             )
             .ok()?;
+            let cs_cb = match cs.as_ref().filter(|_| calibration) {
+                Some((bind, _)) => zc_r2_submit(
+                    gpu,
+                    &state,
+                    a_buf,
+                    b_buf,
+                    chunks,
+                    lo_size,
+                    pair_in_block_mask as u32,
+                    useful_pairs_inclusive as u32,
+                    horner,
+                    Some(bind),
+                )
+                .unwrap_or(NIL),
+                None => NIL,
+            };
+            let (cs, _cs_views) = match cs {
+                // An unsubmitted oracle dispatch leaves R2-CS uncalibrated
+                // (its scratch state is not kept).
+                Some((bind, views)) if !calibration || !cs_cb.is_null() => (Some(bind.layout), views),
+                Some(_) => {
+                    zc_r2_cs_free_scratch(gpu, &mut state);
+                    (None, ZcR2CsViews([NIL, NIL]))
+                }
+                None => (None, ZcR2CsViews([NIL, NIL])),
+            };
             Some(ZcR2Job {
                 cb,
                 a_buf,
@@ -20217,8 +20913,180 @@ kernel void zc_r2_horner_oracle(
                 mask: pair_in_block_mask as u32,
                 useful: useful_pairs_inclusive as u32,
                 submitted: super::gpu_zc_r2_debug().then(std::time::Instant::now),
+                cs,
+                cs_cb,
+                _cs_views,
             })
         }
+    }
+
+    /// R2-CS compact-state oracle (warm-up calibration): byte-compare the
+    /// scratch compact state the `_cs` kernel stored for the calibration
+    /// chunks (pairs `0..pairs`) with the CPU's final compact state, and
+    /// require the kernel's head-pair flag clear. `slots(p)` is the CPU
+    /// state's `(anchor index, delta byte offset, head pair)` of a live pair
+    /// `p`, `live(p)` whether the walk stores pair `p` at all. `Err` names the
+    /// first difference. Must run after [`zc_r2_wait`] joined the calibration
+    /// job; feed the result to [`zc_r2_cs_verdict`]. The scratch state is
+    /// freed on return (it serves this one comparison).
+    ///
+    /// # Safety
+    /// `deltas` must be readable for `deltas_len` bytes.
+    pub(crate) unsafe fn zc_r2_cs_oracle(
+        pairs: usize,
+        anchors: &[F128],
+        deltas: *const u8,
+        deltas_len: usize,
+        live: impl Fn(usize) -> bool,
+        slots: impl Fn(usize) -> (usize, usize, bool),
+    ) -> Result<(), String> {
+        let Ok(gpu) = gpu() else { return Err("no Metal".into()) };
+        let Some(state_mutex) = zc_r2_state() else { return Err("no arm state".into()) };
+        let Ok(mut state) = state_mutex.lock() else { return Err("arm state poisoned".into()) };
+        let res = unsafe { zc_r2_cs_compare(gpu, &state, pairs, anchors, deltas, deltas_len, live, slots) };
+        zc_r2_cs_free_scratch(gpu, &mut state);
+        res
+    }
+
+    /// Release the calibration's scratch compact state (an in-flight command
+    /// buffer keeps what it binds).
+    fn zc_r2_cs_free_scratch(gpu: &Gpu, state: &mut ZcR2) {
+        unsafe {
+            gpu.release(state.cs_a_buf);
+            gpu.release(state.cs_d_buf);
+        }
+        state.cs_a_buf = NIL;
+        state.cs_a_cap = 0;
+        state.cs_d_buf = NIL;
+        state.cs_d_cap = 0;
+    }
+
+    /// [`zc_r2_cs_oracle`]'s comparison.
+    ///
+    /// # Safety
+    /// As [`zc_r2_cs_oracle`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn zc_r2_cs_compare(
+        gpu: &Gpu,
+        state: &ZcR2,
+        pairs: usize,
+        anchors: &[F128],
+        deltas: *const u8,
+        deltas_len: usize,
+        live: impl Fn(usize) -> bool,
+        slots: impl Fn(usize) -> (usize, usize, bool),
+    ) -> Result<(), String> {
+        if state.cs_a_buf.is_null() || state.cs_d_buf.is_null() || state.cs_flag_buf.is_null() {
+            return Err("no scratch state".into());
+        }
+        unsafe {
+            if *gpu.buffer_contents(state.cs_flag_buf).cast::<u32>() != 0 {
+                return Err("a head pair's b rows are not all ones".into());
+            }
+            let ga = gpu.buffer_contents(state.cs_a_buf).cast::<F128>().cast_const();
+            let gd = gpu.buffer_contents(state.cs_d_buf).cast_const();
+            for p in 0..pairs {
+                if !live(p) {
+                    continue;
+                }
+                let (ai, d_off, head) = slots(p);
+                let (na, nd) = if head { (1, 8) } else { (2, 16) };
+                if (ai + na) * 16 > state.cs_a_cap
+                    || ai + na > anchors.len()
+                    || d_off + nd > state.cs_d_cap
+                    || d_off + nd > deltas_len
+                {
+                    return Err(format!("pair {p} lies outside the state"));
+                }
+                let a_eq = (0..na).all(|k| *ga.add(ai + k) == anchors[ai + k]);
+                let d_eq = core::slice::from_raw_parts(gd.add(d_off), nd)
+                    == core::slice::from_raw_parts(deltas.add(d_off), nd);
+                if !(a_eq && d_eq) {
+                    return Err(format!(
+                        "compact bytes differ at pair {p} (anchor {ai}{}, delta byte {d_off})",
+                        if head { ", head" } else { "" }
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// R2-CS share for the R2-CS ratio `r_cs`: the CPU skips every GPU
+    /// chunk, so the balance point is `hi / (r_cs + 1)` (alpha 0), clamped
+    /// to `[hi/8, 0.29·hi]`. The incumbent's ratio
+    /// limit [`ZC_R2_MAX_RATIO`] doubles for the R2-CS ratio; past it the
+    /// incumbent's floor share and cut-off apply.
+    fn zc_r2_cs_gate_share(ratio: f64, hi_size: usize) -> usize {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return 0;
+        }
+        if ratio > 2.0 * ZC_R2_MAX_RATIO {
+            return if ratio < ZC_R2_FLOOR_MAX_RATIO { hi_size / 8 } else { 0 };
+        }
+        let g = (hi_size as f64 / (ratio + 1.0)).round() as usize;
+        g.clamp(hi_size / 8, zc_r2_cs_max_share(hi_size))
+    }
+
+    /// The largest prefix R2-CS is ever handed (the share clamp's ceiling).
+    fn zc_r2_cs_max_share(hi_size: usize) -> usize {
+        hi_size * 29 / 100
+    }
+
+    /// R2-CS admission once the calibration prove's sweep has joined: `ok` =
+    /// the compact-state oracle passed. Admits R2-CS for the process unless
+    /// the lookahead oracle already disabled it, and republishes the share at
+    /// the R2-CS balance point; otherwise R2-CS stays off for the process
+    /// (the incumbent share published by the calibration stands). Returns
+    /// whether R2-CS is admitted.
+    pub(crate) fn zc_r2_cs_verdict(ok: bool, chunks: usize, hi_size: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        // No calibration scratch state outlives the verdict (the oracle
+        // normally freed it already).
+        if let Ok(gpu) = gpu()
+            && let Some(state_mutex) = zc_r2_state()
+            && let Ok(mut state) = state_mutex.lock()
+        {
+            zc_r2_cs_free_scratch(gpu, &mut state);
+        }
+        let mut admitted = ok
+            && ZC_R2_CS_MODE
+                .compare_exchange(
+                    ZC_R2_CS_UNCALIBRATED,
+                    ZC_R2_CS_ADMITTED,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok();
+        if !admitted {
+            ZC_R2_CS_MODE.store(ZC_R2_CS_DISABLED, Ordering::Relaxed);
+        }
+        let mut share = ZC_R2_TUNED.load(Ordering::Relaxed);
+        if admitted && share != 0 && share != usize::MAX {
+            let g = zc_r2_cs_gate_share(f64::from_bits(ZC_R2_CS_RATIO.load(Ordering::Relaxed)), hi_size);
+            if g == 0 {
+                // No R2-CS share: keep the incumbent split's.
+                admitted = false;
+                ZC_R2_CS_MODE.store(ZC_R2_CS_DISABLED, Ordering::Relaxed);
+            } else {
+                share = g;
+                ZC_R2_TUNED.store(share, Ordering::Relaxed);
+            }
+        }
+        if super::gpu_zc_r2_debug() {
+            if admitted {
+                eprintln!(
+                    "[zc-r2] R2-CS oracle: products, lookahead partials and compact bytes EQUAL \
+                     ({chunks} chunks) -> active, share {share}/{hi_size} (r_cs {:.3}, clamp [{}, {}])",
+                    f64::from_bits(ZC_R2_CS_RATIO.load(Ordering::Relaxed)),
+                    hi_size / 8,
+                    zc_r2_cs_max_share(hi_size),
+                );
+            } else {
+                eprintln!("[zc-r2] R2-CS not admitted -> disabled for the process (incumbent split)");
+            }
+        }
+        admitted
     }
 
     /// Drain the arm. During calibration `cpu_partials` must hold the CPU's
@@ -20269,38 +21137,84 @@ kernel void zc_r2_horner_oracle(
                     return poison(job.cb);
                 }
             };
-            let parts = gpu.buffer_contents(state.part_buf).cast::<F128>();
-            let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
             let groups = if job.horner { 4 } else { 1 };
-            for c in 0..job.chunks {
-                let base = c * groups * 4;
-                let mut merged = [
-                    *parts.add(base),
-                    *parts.add(base + 1),
-                    *parts.add(base + 2),
-                    *parts.add(base + 3),
-                ];
-                for group in 1..groups {
-                    for lane in 0..4 {
-                        merged[lane] += *parts.add((c * groups + group) * 4 + lane);
+            // Merge the physical groups of every logical chunk. An R2-CS
+            // dispatch writes eight lanes per group, the last four the
+            // lookahead partials [W0, W3, W4, W5].
+            let merge = |buf: Id, lanes: usize| -> (Vec<[F128; 4]>, Vec<[F128; 4]>) {
+                let parts = gpu.buffer_contents(buf).cast::<F128>();
+                let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
+                let mut out_w: Vec<[F128; 4]> = Vec::new();
+                for c in 0..job.chunks {
+                    let base = c * groups * lanes;
+                    let mut merged = [
+                        *parts.add(base),
+                        *parts.add(base + 1),
+                        *parts.add(base + 2),
+                        *parts.add(base + 3),
+                    ];
+                    for group in 1..groups {
+                        for lane in 0..4 {
+                            merged[lane] += *parts.add((c * groups + group) * lanes + lane);
+                        }
+                    }
+                    out.push(merged);
+                    if lanes == 8 {
+                        let mut w = [
+                            *parts.add(base + 4),
+                            *parts.add(base + 5),
+                            *parts.add(base + 6),
+                            *parts.add(base + 7),
+                        ];
+                        for group in 1..groups {
+                            for lane in 0..4 {
+                                w[lane] += *parts.add((c * groups + group) * lanes + 4 + lane);
+                            }
+                        }
+                        out_w.push(w);
                     }
                 }
-                out.push(merged);
-            }
+                (out, out_w)
+            };
+            let timed_cs = job.cs.is_some() && !job.calibration;
+            let (out, out_w) = if timed_cs { merge(state.cs_part_buf, 8) } else { merge(state.part_buf, 4) };
+            let head_bad = timed_cs && *gpu.buffer_contents(state.cs_flag_buf).cast::<u32>() != 0;
             if !job.calibration {
                 gpu.release(job.cb);
                 if let Some(submitted) = job.submitted {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
-                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}",
+                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}{}",
                         job.chunks,
                         hi_size,
                         submitted.elapsed().as_secs_f64() * 1e3,
                         job.horner,
+                        if timed_cs {
+                            format!(
+                                " R2-CS active (CPU skipped {} chunks{})",
+                                job.chunks,
+                                if head_bad { ", head pair not b == 1" } else { "" },
+                            )
+                        } else {
+                            String::new()
+                        },
                     );
+                }
+                if timed_cs {
+                    return ZcR2Result::PrefixCs { prefix: out, lookahead: out_w, head_bad };
                 }
                 return ZcR2Result::Prefix(out);
             }
+
+            // R2-CS oracle dispatch of the calibration (scratch compact state):
+            // joined first, so no return below leaves it in flight.
+            let cs_calib = if job.cs_cb.is_null() {
+                None
+            } else {
+                let ok = gpu.wait_cb(job.cs_cb).is_ok();
+                gpu.release(job.cs_cb);
+                Some(ok.then(|| merge(state.cs_part_buf, 8)))
+            };
 
             // ---- Calibration (untimed warmup prove, once per process) ----
             let Some(cpu_all) = cpu_partials else {
@@ -20329,6 +21243,35 @@ kernel void zc_r2_horner_oracle(
                     return poison(job.cb);
                 }
             }
+            // R2-CS oracle: the R2-CS kernel's products (summed and split, as
+            // above) and lookahead partials [W0, W3, W4, W5] (the CPU's slots
+            // 2..6) must equal the CPU's own; a mismatch keeps the arm (its
+            // incumbent products are proven) but disables R2-CS for the
+            // process. The compact bytes are compared once the sweep has
+            // joined (`zc_r2_cs_oracle`).
+            if let Some(cs_res) = &cs_calib {
+                let bad = match cs_res {
+                    Some((cs_out, cs_w)) => (0..job.chunks).find(|&c| {
+                        let summed = (cs_out[c][0] + cs_out[c][2], cs_out[c][1] + cs_out[c][3]);
+                        summed != cpu_all[c]
+                            || cpu_la.is_none_or(|la| {
+                                la[c][0] != cs_out[c][2] || la[c][1] != cs_out[c][3] || la[c][2..6] != cs_w[c][..]
+                            })
+                    }),
+                    None => Some(0),
+                };
+                if let Some(c) = bad {
+                    ZC_R2_CS_MODE.store(ZC_R2_CS_DISABLED, Ordering::Relaxed);
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!(
+                            "[zc-r2] R2-CS ORACLE MISMATCH at chunk {c}: gpu={:?} cpu={:?} cpu_la={:?} -> R2-CS disabled",
+                            cs_res.as_ref().map(|(o, w)| (o[c], w[c])),
+                            cpu_all[c],
+                            cpu_la.map(|la| la[c]),
+                        );
+                    }
+                }
+            }
             // Ramp-robust GPU pricing: replay the probe back-to-back to a
             // plateau (>=3 replays, stop when a replay stops improving the
             // best seen by >5%), price from the minimum wall. Budget 5:
@@ -20350,6 +21293,7 @@ kernel void zc_r2_horner_oracle(
                     job.mask,
                     job.useful,
                     job.horner,
+                    None,
                 ) else {
                     break;
                 };
@@ -20380,13 +21324,23 @@ kernel void zc_r2_horner_oracle(
             let share = if u_cpu.is_finite() && u_cpu > 0.0 && u_gpu.is_finite() {
                 let measured = u_gpu / u_cpu;
                 let ratio = zc_r2_forced_ratio().unwrap_or(measured);
+                // R2-CS: its ratio is the incumbent kernel's measured one
+                // scaled by `ZC_R2_CS_PRICE` (a forced ratio is taken as the
+                // R2-CS ratio itself). The share published here is the
+                // incumbent split's; the R2-CS verdict (`zc_r2_cs_verdict`)
+                // republishes it once R2-CS is admitted.
+                let r_cs = zc_r2_forced_ratio().unwrap_or(ZC_R2_CS_PRICE * measured);
+                if job.cs.is_some() {
+                    ZC_R2_CS_RATIO.store(r_cs.to_bits(), Ordering::Relaxed);
+                }
                 let g = zc_r2_gate_share(ratio, hi_size);
                 if super::gpu_zc_r2_debug() {
                     eprintln!("[zc-r2] gate replay walls: {:?}", &walls[..n_walls]);
                     eprintln!(
                         "[zc-r2] gate u_gpu={u_gpu:.4}ms/chunk u_cpu={u_cpu:.4}ms/chunk \
-                         ratio={:.3} -> share {g}/{hi_size}",
+                         ratio={:.3} -> share {g}/{hi_size}{}",
                         u_gpu / u_cpu,
+                        if job.cs.is_some() { format!(" (R2-CS ratio {r_cs:.3} pending its verdict)") } else { String::new() },
                     );
                 }
                 g
@@ -20394,6 +21348,7 @@ kernel void zc_r2_horner_oracle(
                 0
             };
             ZC_R2_TUNED.store(share, Ordering::Relaxed);
+            ZC_R2_INC_TUNED.store(share, Ordering::Relaxed);
             ZcR2Result::Calibrated
         }
     }
@@ -21651,6 +22606,53 @@ kernel void zc_ab_finish(
                 Err(p) => p.into_inner(),
             };
             *slot = Some((ptr, len, view as usize));
+        }
+    }
+
+    /// R2-CS (`super::ENV_NO_ZC_R2_CS`): a +1 reference of this prove's
+    /// premapped anchors view when it starts at `ptr` and covers `need`
+    /// bytes, read without taking it (the K launch still takes it). The
+    /// caller binds it at offset 0 and releases it after its join (an
+    /// in-flight command buffer retains what it binds).
+    fn zc_k_premap_peek(gpu: &Gpu, ptr: usize, need: usize) -> Option<Id> {
+        let slot = match ZC_K_PREMAP.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        match *slot {
+            Some((p, l, v)) if p == ptr && l >= need => Some(unsafe { gpu.retain(v as Id) }),
+            _ => None,
+        }
+    }
+
+    /// R2-CS (`super::ENV_NO_ZC_R2_CS`): whether round two's compact anchors
+    /// should be taken, and the K pass arm's view over them premapped
+    /// ([`zc_k_premap`]), before round one: R2-CS is admitted for this
+    /// process's timed launches (the arm calibrated and on) and that premap
+    /// will make its view (on, the K arm admitted).
+    pub(crate) fn zc_r2_cs_premap_early() -> bool {
+        use std::sync::atomic::Ordering;
+        super::zc_r2_cs_enabled()
+            && ZC_R2_CS_MODE.load(Ordering::Relaxed) == ZC_R2_CS_ADMITTED
+            && !ZC_R2_POISONED.load(Ordering::Relaxed)
+            && !matches!(ZC_R2_TUNED.load(Ordering::Relaxed), 0 | usize::MAX)
+            && super::gpu_zc_k_premap_enabled()
+            && ZC_K_MODE.load(Ordering::Relaxed) == ZC_K_ADMITTED
+    }
+
+    /// The round-one handover slot, read without taking it: `Ok(Some((len,
+    /// +1 view)))` when it names the allocation at `ptr` with at least `need`
+    /// bytes, `Err(())` when it holds another view overlapping `[ptr, ptr +
+    /// alloc_len)` (no second view may be made), `Ok(None)` otherwise.
+    fn zc_k_view_peek(gpu: &Gpu, ptr: usize, alloc_len: usize, need: usize) -> Result<Option<(usize, Id)>, ()> {
+        let slot = match ZC_K_DELTA_VIEW.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        match *slot {
+            Some((p, l, b)) if p == ptr && l >= need => Ok(Some((l, unsafe { gpu.retain(b as Id) }))),
+            Some((p, l, _)) if p < ptr + alloc_len && ptr < p + l => Err(()),
+            _ => Ok(None),
         }
     }
 
@@ -24104,6 +25106,13 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
+
+/// R2-CS entry points (see `ENV_NO_ZC_R2_CS`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    ZcR2CsLayout, launch_zc_r2_products_cs, zc_r2_cs_oracle, zc_r2_cs_premap_early, zc_r2_cs_prewarm,
+    zc_r2_cs_prewarm_wanted, zc_r2_cs_verdict,
+};
 
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
