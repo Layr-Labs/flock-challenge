@@ -907,6 +907,28 @@ pub(crate) fn zc_k_share_is_v2_default() -> bool {
     *ON
 }
 
+/// Kill switch for the measured K share (`FLOCK_NO_ZC_K_SHARE_CAL`, any
+/// value): every prove uses the fixed default share. Read once per process.
+pub const ENV_NO_ZC_K_SHARE_CAL: &str = "FLOCK_NO_ZC_K_SHARE_CAL";
+
+pub(crate) fn zc_k_cal_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_K_SHARE_CAL).is_none());
+    *ON
+}
+
+/// Bounds and dead band of the measured K share, in chunks of the ranked
+/// shape's 2048. The GPU buffers are sized for the maximum.
+pub(crate) const ZC_K_CAL_MIN_CHUNKS: usize = 576;
+pub(crate) const ZC_K_CAL_MAX_CHUNKS: usize = 960;
+pub(crate) const ZC_K_CAL_DEADBAND: usize = 48;
+
+/// The measured K share (0 = not measured yet), and the oracle probe's GPU
+/// wall time (f64 bits) and chunk count it was measured over.
+pub(crate) static ZC_K_CAL_SHARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static ZC_K_LAST_GPU_MS_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static ZC_K_LAST_CHUNKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Requested GPU chunk share of the K pass arm; `0` = off (kill switch, share
 /// 0, or GPU commit disabled).
 pub(crate) fn gpu_zc_k_share() -> usize {
@@ -923,7 +945,11 @@ pub(crate) fn gpu_zc_k_share() -> usize {
                 .expect("FLOCK_ZC_K_GPU_CHUNKS must be a non-negative integer"),
         }
     });
-    if gpu_commit_enabled() { *SHARE } else { 0 }
+    if !gpu_commit_enabled() {
+        return 0;
+    }
+    let measured = ZC_K_CAL_SHARE.load(std::sync::atomic::Ordering::Relaxed);
+    if measured > 0 && zc_k_share_is_v2_default() { measured } else { *SHARE }
 }
 
 /// Diagnostic trace for the K pass arm (`FLOCK_ZC_K_GPU_DEBUG=1`, or any
@@ -21897,6 +21923,8 @@ kernel void zc_ab_finish(
 }
 "#;
 
+    include!("gpu_commit/ab_mul9.rs");
+
     /// Chunk geometry the kernel is built for: 4096 `x_lo` rows of 1 KiB.
     const ZC_AB_CHUNK_SHIFT: u32 = 22;
     const ZC_AB_MAX_CHUNKS: usize = 128;
@@ -21963,7 +21991,8 @@ kernel void zc_ab_finish(
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<(Id, Id, Id), String> {
-                let src = gpu.api.nsstring(ZC_AB_MSL_SOURCE)?;
+                let source = ab_mul9::source(ZC_AB_MSL_SOURCE);
+                let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
                     gpu.api,
@@ -22695,6 +22724,54 @@ kernel void zc_ab_finish(
         }
     }
 
+    /// Capacity (in chunks) of the K arm's GPU buffers: with the measured
+    /// share enabled the buffers are sized once for the largest share the
+    /// calibration may pick, so a later launch can use any share up to it.
+    fn zc_k_capacity(chunks: usize) -> usize {
+        if super::zc_k_cal_enabled() {
+            chunks.max(super::ZC_K_CAL_MAX_CHUNKS)
+        } else {
+            chunks
+        }
+    }
+
+    /// Measured K share (`FLOCK_NO_ZC_K_SHARE_CAL` keeps the fixed default).
+    /// Called once, after the arm's first launch (the untimed oracle probe,
+    /// where the CPU folded all `hi_size` chunks while the GPU folded the
+    /// default prefix): balances the GPU's per-chunk rate against the CPU's
+    /// and stores the share every later prove (the timed ones) uses. Only the
+    /// boundary between the GPU's and the CPU's chunks moves; each chunk's
+    /// partial and outputs are unchanged and the partials are combined by an
+    /// order-independent XOR, so the proof is byte-identical for any share.
+    /// A missing or implausible measurement, or a result within
+    /// `ZC_K_CAL_DEADBAND` of the default, keeps the default.
+    pub(crate) fn zc_k_calibrate(cpu_wall_ms: f64, hi_size: usize) {
+        use std::sync::atomic::Ordering;
+        if !super::zc_k_cal_enabled() || !super::zc_k_share_is_v2_default() {
+            return;
+        }
+        let gpu_ms = f64::from_bits(super::ZC_K_LAST_GPU_MS_BITS.load(Ordering::Relaxed));
+        let chunks = super::ZC_K_LAST_CHUNKS.load(Ordering::Relaxed);
+        if !(gpu_ms > 0.2 && cpu_wall_ms > 0.2 && chunks > 0 && hi_size >= 2 * chunks) {
+            return;
+        }
+        let u_gpu = gpu_ms / chunks as f64;
+        let u_cpu = cpu_wall_ms / hi_size as f64;
+        let ideal = hi_size as f64 * u_cpu / (u_gpu + u_cpu);
+        let mut share = (ideal.round() as usize).clamp(super::ZC_K_CAL_MIN_CHUNKS, super::ZC_K_CAL_MAX_CHUNKS);
+        let default = super::ZC_K_GPU_V2_DEFAULT_CHUNKS;
+        if share.abs_diff(default) < super::ZC_K_CAL_DEADBAND {
+            share = default;
+        }
+        super::ZC_K_CAL_SHARE.store(share, Ordering::Relaxed);
+        if super::gpu_zc_k_debug() {
+            eprintln!(
+                "[zc-k-gpu] calibrated share: gpu {gpu_ms:.2} ms / {chunks} chunks = {u_gpu:.5} ms/chunk, \
+                 cpu {cpu_wall_ms:.2} ms / {hi_size} chunks = {u_cpu:.5} ms/chunk -> ideal {ideal:.0}, share {share}"
+            );
+        }
+    }
+
     /// The K arm's share for this launch: the requested one, except that the
     /// faster kernel's default share falls back to the record's when that
     /// kernel did not build (source compile failed). Joins the pipeline build,
@@ -23066,7 +23143,7 @@ kernel void zc_ab_finish(
             return None;
         };
         let state_mutex = ZC_K_STATE
-            .get_or_init(|| match zc_k_init(gpu, chunks, per_chunk_a, per_chunk_b, sb_per_chunk, n_weights) {
+            .get_or_init(|| match zc_k_init(gpu, zc_k_capacity(chunks), per_chunk_a, per_chunk_b, sb_per_chunk, n_weights) {
                 Ok(s) => Some(std::sync::Mutex::new(s)),
                 Err(e) => {
                     if debug {
@@ -23088,7 +23165,7 @@ kernel void zc_ab_finish(
                 return None;
             }
         };
-        if state.chunks != chunks
+        if chunks > state.chunks
             || state.per_chunk_a != per_chunk_a
             || state.per_chunk_b != per_chunk_b
             || state.sb_per_chunk != sb_per_chunk
@@ -23282,6 +23359,10 @@ kernel void zc_ab_finish(
             let ok = gpu.spin_wait_cb(job.cb, 2.0);
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let gpu_ms = if ok.is_ok() { zc_fold_gpu_wall_ms(gpu, job.cb) } else { 0.0 };
+            if job.calibration {
+                super::ZC_K_LAST_GPU_MS_BITS.store(gpu_ms.to_bits(), Ordering::Relaxed);
+                super::ZC_K_LAST_CHUNKS.store(job.chunks, Ordering::Relaxed);
+            }
             gpu.release(job.cb);
             for v in job.views {
                 gpu.release(v);
@@ -25461,7 +25542,7 @@ pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
     ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_launch_share, zc_k_premap, zc_k_prewarm,
-    zc_k_prewarm_wanted, zc_k_verdict, zc_k_wait,
+    zc_k_calibrate, zc_k_prewarm_wanted, zc_k_verdict, zc_k_wait,
 };
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).

@@ -3443,7 +3443,10 @@ fn fold2_compact_and_round45_into_packed_b(
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
     };
+    let t_k_cpu = std::time::Instant::now();
     crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
+    #[allow(unused_variables)]
+    let k_cpu_ms = t_k_cpu.elapsed().as_secs_f64() * 1e3;
 
     // Join the GPU prefix (it was submitted first and is normally done).
     #[allow(unused_mut)]
@@ -3473,6 +3476,9 @@ fn fold2_compact_and_round45_into_packed_b(
                             && gb == &b_out[..len_b]
                             && parts.as_slice() == &partials[..chunks];
                         crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
+                        if equal && cpu_base == 0 {
+                            crate::gpu_commit::zc_k_calibrate(k_cpu_ms, hi_size);
+                        }
                     }
                 } else {
                     partials[..chunks].copy_from_slice(&parts);
