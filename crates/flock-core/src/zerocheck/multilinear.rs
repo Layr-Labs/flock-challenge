@@ -104,6 +104,8 @@ use kernels::aarch64::{
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_prescaled_8;
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) use kernels::aarch64::init_r2_memory_paths;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
     fold2_and_message_lookahead_normal_expanded_aarch64,
