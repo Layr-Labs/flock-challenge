@@ -104,6 +104,8 @@ use kernels::aarch64::{
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_prescaled_8;
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) use kernels::aarch64::init_r2_memory_paths;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
     fold2_and_message_lookahead_normal_expanded_aarch64,
@@ -3011,7 +3013,6 @@ fn fold2_compact_and_round45_into_packed_b(
     let gpu_job = {
         let share = crate::gpu_commit::gpu_zc_k_share().min(hi_size);
         if gpu && bpack && compact.tail_compact && share > 0 {
-            let share = crate::gpu_commit::zc_k_launch_share().min(hi_size);
             let hc = compact.head_compact;
             let layout = crate::gpu_commit::ZcKLayout {
                 hc,
@@ -4035,27 +4036,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     };
 
     let mut s = [F128::ZERO; 26];
-    if hi_size == 1 {
-        // No repeated reductions to eliminate for the single-chunk tail.
-        for (x_hi, outv) in partials.iter().enumerate() {
-            let eq_h = eq_hi[x_hi];
-            for (slot, &v) in s.iter_mut().zip(outv.iter()) {
-                *slot += eq_h * v;
-            }
-        }
-    } else {
-        // Reduction modulo the binary field polynomial is XOR-linear.
-        // Accumulate each weighted column in 256 bits, then reduce once:
-        // 26 * hi_size reductions become 26, with identical field values.
-        let mut unreduced = [F256Unreduced::ZERO; 26];
-        for (x_hi, outv) in partials.iter().enumerate() {
-            let eq_h = eq_hi[x_hi];
-            for (acc, &v) in unreduced.iter_mut().zip(outv.iter()) {
-                *acc ^= eq_h.mul_unreduced(v);
-            }
-        }
-        for (slot, acc) in s.iter_mut().zip(unreduced) {
-            *slot = acc.reduce();
+    for (x_hi, outv) in partials.iter().enumerate() {
+        let eq_h = eq_hi[x_hi];
+        for (slot, &v) in s.iter_mut().zip(outv.iter()) {
+            *slot += eq_h * v;
         }
     }
     tri_finish(&s, r_next)

@@ -1,3 +1,8 @@
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+mod r2_memory;
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) use r2_memory::init as init_r2_memory_paths;
+
 use crate::field::F128;
 // Used by the generic-AArch64 (no SHA3) `ProdAcc` twin and cfg-gated paths.
 #[allow(unused_imports)]
@@ -3319,23 +3324,33 @@ unsafe fn fold_round2_compact_chunk_neon_prescaled_8_ranked_inv(
     out: *mut F128,
 ) {
     unsafe {
-        fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true>(
-            table_data,
-            a_packed,
-            b_packed,
-            anchors,
-            deltas,
-            eq_lo,
-            lo_size,
-            pair_idx_base,
-            pair_in_block_mask,
-            useful_pairs_inclusive,
-            degen,
-            skip_dead,
-            tail_compact,
-            head_fail,
-            out,
-        )
+        macro_rules! run {
+            ($kernel:path) => {
+                $kernel(
+                    table_data,
+                    a_packed,
+                    b_packed,
+                    anchors,
+                    deltas,
+                    eq_lo,
+                    lo_size,
+                    pair_idx_base,
+                    pair_in_block_mask,
+                    useful_pairs_inclusive,
+                    degen,
+                    skip_dead,
+                    tail_compact,
+                    head_fail,
+                    out,
+                )
+            };
+        }
+        match r2_memory::mode() {
+            0 => run!(fold_round2_compact_chunk_neon_prescaled_8_impl::<true, true, true, true>),
+            1 => run!(r2_memory::candidate::<true, false>),
+            2 => run!(r2_memory::candidate::<false, true>),
+            _ => run!(r2_memory::candidate::<true, true>),
+        }
     }
 }
 

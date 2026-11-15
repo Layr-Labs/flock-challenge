@@ -813,39 +813,6 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
     *ON
 }
 
-/// Default share with the faster fold kernel ([`zc_k_v2_enabled`]): with the
-/// anchors view premapped during round two (the record's premap), the K pass
-/// on an M1 Max balances near 740 of the 2048 chunks (13.2 ms at 512, 12.0 at
-/// 640, 11.9 at 768, 13.7 at 896); the runner's GPU is at least 2.1x this
-/// one's, so 768 stays CPU-critical there.
-const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 768;
-
-/// Kill switch for the K arm's faster fold kernel (`FLOCK_NO_ZC_K_V2`, any
-/// value): the embedded `zc_k_fold` and the record's share
-/// ([`ZC_K_GPU_DEFAULT_CHUNKS`]). With it on, `zc_k_fold_v2` (compiled from
-/// source on the prewarm thread) (a) multiplies by the pass's fixed rho2
-/// through a per-prove nibble table of rho2 * (v << 4k), the same field
-/// elements since the product is F2-linear in the other factor, and (b) forms
-/// the remaining general products from 16-bit carry-less pieces of 9 native
-/// 32-bit products each (bit position mod 3, no carry reaches a kept bit)
-/// instead of 64-bit products of mod-4 pieces. Read once per process.
-pub(crate) fn zc_k_v2_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_K_V2").is_none());
-    *ON
-}
-
-/// Whether [`gpu_zc_k_share`] is the faster kernel's default share (no
-/// explicit `FLOCK_ZC_K_GPU_CHUNKS`).
-pub(crate) fn zc_k_share_is_v2_default() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        zc_k_v2_enabled()
-            && std::env::var_os(ENV_NO_ZC_K_GPU).is_none()
-            && std::env::var_os(ENV_ZC_K_GPU_CHUNKS).is_none()
-    });
-    *ON
-}
-
 /// Requested GPU chunk share of the K pass arm; `0` = off (kill switch, share
 /// 0, or GPU commit disabled).
 pub(crate) fn gpu_zc_k_share() -> usize {
@@ -854,7 +821,6 @@ pub(crate) fn gpu_zc_k_share() -> usize {
             return 0;
         }
         match std::env::var_os(ENV_ZC_K_GPU_CHUNKS) {
-            None if zc_k_v2_enabled() => ZC_K_GPU_V2_DEFAULT_CHUNKS,
             None => ZC_K_GPU_DEFAULT_CHUNKS,
             Some(value) => value
                 .to_str()
@@ -1382,7 +1348,20 @@ pub(crate) fn gpu_blake3_pow_scan(
     if !gpu_grind_enabled() {
         return Err("GPU grind disabled".into());
     }
-    imp::gpu_blake3_pow_scan(state_digest, start, len, bits)
+    imp::gpu_blake3_pow_scan(state_digest, start, len, bits, false)
+}
+
+/// Unordered scanner; calibration and the ordered policy keep their kernel.
+pub(crate) fn gpu_blake3_pow_scan_first(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u32,
+    bits: u32,
+) -> Result<Option<u64>, String> {
+    if !gpu_grind_enabled() {
+        return Err("GPU grind disabled".into());
+    }
+    imp::gpu_blake3_pow_scan(state_digest, start, len, bits, true)
 }
 
 /// Env var that disables this round's NTT pass tuning (the g4 shared-table +
@@ -3998,238 +3977,6 @@ kernel void zc_k_finish(
     }
     part[ulong(chunk) * 8ul + ulong(k)] = zck_mul(consts[p.eq_hi_off + chunk], s);
 }
-"#;
-
-    /// The K arm's faster fold kernel: the two rho2 products by a per-prove
-    /// nibble table, the other products from 16-bit carry-less pieces
-    /// (`FLOCK_NO_ZC_K_V2` keeps the embedded `zc_k_fold`). Compiled from
-    /// source on the prewarm thread; the embedded `zc_k_finish` sums its
-    /// superblock partials unchanged.
-    const ZC_K_V2_MSL_SOURCE: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
-// 16x16 carry-less product from 9 native 32-bit integer products: each
-// factor split by bit position mod 3, so a product of two masked parts has at
-// most 6 overlapping terms per result bit (16 bits / spacing 3) and its sums
-// stay below the next same-residue bit (no carry crosses into a kept bit).
-static inline uint zck_clmul16(uint a, uint b) {
-    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
-    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
-    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
-    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
-    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
-    return r0 | r1 | r2;
-}
-
-// 32x32 by one Karatsuba step over 16-bit halves (27 32-bit products instead
-// of the embedded kernel's 16 64-bit ones).
-static inline ulong zck_clmul32(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zck_clmul16(al, bl);
-    uint hi = zck_clmul16(ah, bh);
-    uint mid = zck_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
-    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
-}
-
-struct ZckU128 { ulong lo; ulong hi; };
-
-static inline ZckU128 zck_clmul64(ulong a, ulong b) {
-    uint al = uint(a), ah = uint(a >> 32);
-    uint bl = uint(b), bh = uint(b >> 32);
-    ulong p_lo = zck_clmul32(al, bl);
-    ulong p_hi = zck_clmul32(ah, bh);
-    ulong p_mid = zck_clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
-    ZckU128 r;
-    r.lo = p_lo ^ (p_mid << 32);
-    r.hi = p_hi ^ (p_mid >> 32);
-    return r;
-}
-
-// a * b mod x^128 + x^7 + x^2 + x + 1 (Karatsuba product, then reduction).
-static inline uint4 zck_mul(uint4 a, uint4 b) {
-    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
-    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
-    ZckU128 p0 = zck_clmul64(al, bl);
-    ZckU128 p2 = zck_clmul64(ah, bh);
-    ZckU128 pm = zck_clmul64(al ^ ah, bl ^ bh);
-    pm.lo ^= p0.lo ^ p2.lo;
-    pm.hi ^= p0.hi ^ p2.hi;
-    ulong r0 = p0.lo, r1 = p0.hi ^ pm.lo, h0 = p2.lo ^ pm.hi, h1 = p2.hi;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = r0 ^ t0, l1 = r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
-}
-
-// T(code) for one 8-byte delta code (lo = bytes 0..3, hi = bytes 4..7).
-static inline uint4 zck_fold8(uint lo, uint hi, threadgroup const uint4* nib) {
-    uint4 acc = uint4(0u);
-    for (uint j = 0u; j < 4u; j++) {
-        uint v = (lo >> (8u * j)) & 0xffu;
-        acc ^= nib[j * 32u + (v & 15u)] ^ nib[j * 32u + 16u + (v >> 4u)];
-    }
-    for (uint j = 0u; j < 4u; j++) {
-        uint v = (hi >> (8u * j)) & 0xffu;
-        acc ^= nib[(j + 4u) * 32u + (v & 15u)] ^ nib[(j + 4u) * 32u + 16u + (v >> 4u)];
-    }
-    return acc;
-}
-
-// x * rho2 for the pass's fixed rho2: rho2 * x is F2-linear in x, so it is
-// the XOR over the 32 nibbles of x of the precomputed rho2 * (v << 4k)
-// (`rt[16k + v]`, built on the host per prove, 8 KiB in threadgroup memory).
-static inline uint4 zck_mulc(uint4 x, threadgroup const uint4* rt) {
-    uint4 acc = uint4(0u);
-    for (uint w = 0u; w < 4u; w++) {
-        uint v = x[w];
-        for (uint j = 0u; j < 8u; j++) {
-            acc ^= rt[(w * 8u + j) * 16u + ((v >> (4u * j)) & 15u)];
-        }
-    }
-    return acc;
-}
-
-struct ZcKParams {
-    uint sb_per_chunk;
-    uint eq_hi_off;
-    // Compact-state layout (tail-compacted, optionally head-compacted; see
-    // `UniSkipCompactFold::anchor_index` / `delta_offset`): pair p = 128 B + q
-    // of block B. Non-head pairs: [a, b] anchors at a_base + a_stride B +
-    // 2q - a_shift, 16 delta bytes at uint4 d_base + d_stride B + q - d_shift.
-    // Head pairs (hc, q < 8): a anchor at a_base + a_stride B + q, 8 a delta
-    // bytes at byte 16 (d_base + d_stride B) + 8q; b anchor head_b, b delta 0.
-    uint hc;
-    uint a_base;
-    uint a_stride;
-    uint a_shift;
-    uint d_base;
-    uint d_stride;
-    uint d_shift;
-    uint pad0;
-    uint pad1;
-    uint pad2;
-};
-
-// One threadgroup per 256-output superblock (four dead-tail blocks of 64);
-// thread `lid` = output 64k + i of block B = 4 tg + k (pairs 2i, 2i + 1 of
-// the block). Outputs i = 61..63 are structural zeros (dead pairs): never
-// loaded or stored; output 60 has only its first pair live. The a outputs
-// land in the packed layout (244 per superblock: 60 per block, then the
-// four outputs 60); the b outputs in the b-one-packed layout (56 per block:
-// outputs 4..58, then output 60). The b outputs 0..3 and 59 are not stored:
-// each must be one, and any that is not sets `flag`. `consts[0]` = rho2,
-// `consts[1]` = head_b, `consts[2 + t]` = w_t = eq_lo[2t + 1],
-// `consts[eq_hi_off + c]` = eq_hi[c].
-kernel void zc_k_fold_v2(
-    device const uint4* anchors [[buffer(0)]],
-    device const uint4* deltas  [[buffer(1)]],
-    device const uint4* nib_dev [[buffer(2)]],
-    device const uint4* consts  [[buffer(3)]],
-    device uint4*       out_a   [[buffer(4)]],
-    device uint4*       out_b   [[buffer(5)]],
-    device uint4*       tg_part [[buffer(6)]],
-    constant ZcKParams& p       [[buffer(7)]],
-    device atomic_uint* flag    [[buffer(8)]],
-    uint tg  [[threadgroup_position_in_grid]],
-    uint lid [[thread_index_in_threadgroup]],
-    ushort sl [[thread_index_in_simdgroup]],
-    ushort sg [[simdgroup_index_in_threadgroup]])
-{
-    threadgroup uint4 nib[256];
-    threadgroup uint4 rtab[512];
-    threadgroup uint4 sred[8][8];
-    nib[lid] = nib_dev[lid];
-    rtab[lid] = nib_dev[256u + lid];
-    rtab[256u + lid] = nib_dev[512u + lid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint i = lid & 63u;
-    uint k = lid >> 6u;
-    ulong blk = ulong(tg) * 4ul + ulong(k);
-    uint4 a = uint4(0u);
-    uint4 b = uint4(0u);
-    if (i <= 60u) {
-        uint4 xa0, xb0;
-        uint4 xa1 = uint4(0u);
-        uint4 xb1 = uint4(0u);
-        ulong ab = ulong(p.a_base) + blk * ulong(p.a_stride);
-        ulong db = ulong(p.d_base) + blk * ulong(p.d_stride);
-        if (p.hc != 0u && i < 4u) {
-            uint4 dd = deltas[db + ulong(i)];
-            xa0 = anchors[ab + 2ul * ulong(i)] ^ zck_fold8(dd.x, dd.y, nib);
-            xa1 = anchors[ab + 2ul * ulong(i) + 1ul] ^ zck_fold8(dd.z, dd.w, nib);
-            xb0 = consts[1];
-            xb1 = consts[1];
-        } else {
-            ab += 4ul * ulong(i) - ulong(p.a_shift);
-            db += 2ul * ulong(i) - ulong(p.d_shift);
-            uint4 d0 = deltas[db];
-            xa0 = anchors[ab] ^ zck_fold8(d0.x, d0.y, nib);
-            xb0 = anchors[ab + 1ul] ^ zck_fold8(d0.z, d0.w, nib);
-            if (i < 60u) {
-                uint4 d1 = deltas[db + 1ul];
-                xa1 = anchors[ab + 2ul] ^ zck_fold8(d1.x, d1.y, nib);
-                xb1 = anchors[ab + 3ul] ^ zck_fold8(d1.z, d1.w, nib);
-            }
-        }
-        a = xa0 ^ zck_mulc(xa0 ^ xa1, rtab);
-        b = xb0 ^ zck_mulc(xb0 ^ xb1, rtab);
-        out_a[ulong(tg) * 244ul + ulong(i < 60u ? 60u * k + i : 240u + k)] = a;
-        if (i < 4u || i == 59u) {
-            if (any(b != uint4(1u, 0u, 0u, 0u))) {
-                atomic_fetch_or_explicit(flag, 1u, memory_order_relaxed);
-            }
-        } else {
-            out_b[blk * 56ul + ulong(i == 60u ? 55u : i - 4u)] = b;
-        }
-    }
-    uint t = ((tg % p.sb_per_chunk) * 256u + lid) >> 2u;
-    uint4 aw = zck_mul(consts[2u + t], a);
-    ushort qb = sl & ushort(0xFFFC);
-    uint4 aw0 = simd_shuffle(aw, qb);
-    uint4 aw1 = simd_shuffle(aw, ushort(qb + 1));
-    uint4 aw2 = simd_shuffle(aw, ushort(qb + 2));
-    uint4 aw3 = simd_shuffle(aw, ushort(qb + 3));
-    uint4 b0 = simd_shuffle(b, qb);
-    uint4 b1 = simd_shuffle(b, ushort(qb + 1));
-    uint4 b2 = simd_shuffle(b, ushort(qb + 2));
-    uint4 b3 = simd_shuffle(b, ushort(qb + 3));
-    // Quad lane q owns aggregate slots 2q and 2q + 1.
-    uint q = lid & 3u;
-    uint4 x0, y0, x1, y1;
-    if (q == 0u) {
-        x0 = aw1; y0 = b1; x1 = aw0 ^ aw1; y1 = b0 ^ b1;
-    } else if (q == 1u) {
-        x0 = aw3; y0 = b3; x1 = aw2 ^ aw3; y1 = b2 ^ b3;
-    } else if (q == 2u) {
-        x0 = aw2; y0 = b2; x1 = aw0 ^ aw2; y1 = b0 ^ b2;
-    } else {
-        x0 = aw1 ^ aw3; y0 = b1 ^ b3;
-        x1 = aw0 ^ aw1 ^ aw2 ^ aw3; y1 = b0 ^ b1 ^ b2 ^ b3;
-    }
-    uint4 r0 = zck_mul(x0, y0);
-    uint4 r1 = zck_mul(x1, y1);
-    for (ushort off = 4; off < 32; off <<= 1) {
-        r0 ^= simd_shuffle_xor(r0, off);
-        r1 ^= simd_shuffle_xor(r1, off);
-    }
-    if (sl < 4) {
-        sred[sg][2u * uint(sl)] = r0;
-        sred[sg][2u * uint(sl) + 1u] = r1;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 8u) {
-        uint4 s = uint4(0u);
-        for (uint j = 0u; j < 8u; j++) { s ^= sred[j][lid]; }
-        tg_part[ulong(tg) * 8ul + ulong(lid)] = s;
-    }
-}
-
 "#;
 
     /// Supplemental leaf+parent3 fuse (kept out of the embedded metallib so a
@@ -8094,6 +7841,24 @@ kernel void blake3_pow_scan(
         atomic_fetch_min_explicit(best, id, memory_order_relaxed);
     }
 }
+
+kernel void blake3_pow_scan_first(
+    constant uint* state_words [[buffer(0)]],
+    device atomic_uint* best   [[buffer(1)]],
+    constant PowParams& params [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= params.len || atomic_load_explicit(best, memory_order_relaxed) != 0xffffffffu) return;
+    uint nonce_lo = params.start_lo + id;
+    uint carry = nonce_lo < params.start_lo ? 1u : 0u;
+    uint cv0 = pow_compress0(state_words, nonce_lo, params.start_hi + carry);
+    if (pow_has_leading_zero_bits(cv0, params.bits)) {
+        uint expected = 0xffffffffu;
+        while (expected == 0xffffffffu &&
+               !atomic_compare_exchange_weak_explicit(best, &expected, id,
+                   memory_order_relaxed, memory_order_relaxed)) {}
+    }
+}
 "#;
 
     // -----------------------------------------------------------------------
@@ -8256,6 +8021,7 @@ kernel void blake3_pow_scan(
         /// Supplemental PCS Fiat--Shamir BLAKE3 nonce scanner.  Its single
         /// shared result word is protected because `Gpu` itself is global.
         pub(crate) pso_pow: Id,
+        pub(crate) pso_pow_first: Id,
         pub(crate) pow_out: Id,
         pub(crate) pow_lock: std::sync::Mutex<()>,
     }
@@ -8709,12 +8475,12 @@ kernel void blake3_pow_scan(
                     (NIL, NIL)
                 };
 
-                let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
+                let (pso_pow, pso_pow_first, pow_out) = if super::gpu_grind_enabled() {
                     // This optimization is supplemental: a compile/pipeline/
                     // allocation failure must not poison the already-valid
                     // ranked commitment GPU.  The grind gate will see NIL and
                     // permanently retain the exact CPU implementation.
-                    (|| -> Result<(Id, Id), String> {
+                    (|| -> Result<(Id, Id, Id), String> {
                         let src = api.nsstring(POW_MSL_SOURCE)?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
@@ -8764,6 +8530,28 @@ kernel void blake3_pow_scan(
                             function,
                             c"release"
                         );
+                        // Both pipelines are prepared at initialization. A
+                        // missing supplemental pipeline leaves CPU fallback.
+                        let pso_first = if crate::challenger::pow_first_hit_enabled() && !pso.is_null() {
+                            let name = api.nsstring("blake3_pow_scan_first")?;
+                            let first_fn: Id = send!(
+                                api, unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                                library, c"newFunctionWithName:", name
+                            );
+                            if first_fn.is_null() {
+                                NIL
+                            } else {
+                                let first_pso: Id = send!(
+                                    api, unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                    device, c"newComputePipelineStateWithFunction:error:",
+                                    first_fn, &mut pso_err
+                                );
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, first_fn, c"release");
+                                first_pso
+                            }
+                        } else {
+                            NIL
+                        };
                         send!(
                             api,
                             unsafe extern "C" fn(Id, Sel) -> Id,
@@ -8786,13 +8574,16 @@ kernel void blake3_pow_scan(
                         );
                         if out.is_null() {
                             send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                            if !pso_first.is_null() {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso_first, c"release");
+                            }
                             return Err("PCS grind result buffer allocation failed".into());
                         }
-                        Ok((pso, out))
+                        Ok((pso, pso_first, out))
                     })()
-                    .unwrap_or((NIL, NIL))
+                    .unwrap_or((NIL, NIL, NIL))
                 } else {
-                    (NIL, NIL)
+                    (NIL, NIL, NIL)
                 };
                 // Supplemental two-tiles-per-thread g4 NTT pass, its own
                 // library. Any failure, or a pipeline that cannot run a
@@ -9083,6 +8874,7 @@ kernel void blake3_pow_scan(
                     pso_ntt5t3,
                     pso_final_leaf,
                     pso_pow,
+                    pso_pow_first,
                     pow_out,
                     pow_lock: std::sync::Mutex::new(()),
                 })
@@ -14688,12 +14480,14 @@ kernel void blake3_pow_scan(
         start: u64,
         len: u32,
         bits: u32,
+        first_hit: bool,
     ) -> Result<Option<u64>, String> {
         if len == 0 || !(1..=32).contains(&bits) {
             return Err(format!("invalid GPU grind block len={len} bits={bits}"));
         }
         let gpu = gpu()?;
-        if gpu.pso_pow.is_null() || gpu.pow_out.is_null() {
+        let pipeline = if first_hit { gpu.pso_pow_first } else { gpu.pso_pow };
+        if pipeline.is_null() || gpu.pow_out.is_null() {
             return Err("GPU grind pipeline unavailable".into());
         }
         // Poison-tolerant: the guarded state is `()` (pure exclusion over
@@ -14717,7 +14511,7 @@ kernel void blake3_pow_scan(
                 );
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, gpu.pso_pow);
+                gpu.set_pipeline(enc, pipeline);
                 gpu.set_bytes(enc, state_digest, 0);
                 gpu.set_buffer(enc, gpu.pow_out, 0, 1);
                 gpu.set_bytes(enc, params_bytes, 2);
@@ -19950,6 +19744,8 @@ kernel void zc_ab_finish(
 }
 "#;
 
+    include!("gpu_commit/ab_mul9.rs");
+
     /// Chunk geometry the kernel is built for: 4096 `x_lo` rows of 1 KiB.
     const ZC_AB_CHUNK_SHIFT: u32 = 22;
     const ZC_AB_MAX_CHUNKS: usize = 128;
@@ -20016,7 +19812,8 @@ kernel void zc_ab_finish(
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<(Id, Id, Id), String> {
-                let src = gpu.api.nsstring(ZC_AB_MSL_SOURCE)?;
+                let source = ab_mul9::source(ZC_AB_MSL_SOURCE);
+                let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
                     gpu.api,
@@ -20589,13 +20386,9 @@ kernel void zc_ab_finish(
     /// the prewarm helper ([`zc_k_prewarm_start`]); `None` = no embedded
     /// metallib or a pipeline failed (arm off).
     static ZC_K_PSOS: std::sync::OnceLock<Option<(usize, usize, usize)>> = std::sync::OnceLock::new();
-    /// Whether the fold pipeline last built is `zc_k_fold_v2` (it then reads
-    /// the rho2 nibble table after the byte-table nibbles in `nib_buf`).
-    static ZC_K_V2_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    /// Build the K arm's pipelines on `device` from the embedded metallib; the
-    /// faster fold (`zc_k_fold_v2`, see [`super::zc_k_v2_enabled`]) from
-    /// source, keeping the embedded fold if that fails.
+    /// Build the K arm's pipelines on `device` from the embedded metallib (no
+    /// source compile).
     unsafe fn zc_k_build_psos(api: &Api, device: Id) -> Result<(Id, Id), String> {
         unsafe {
             let release = |obj: Id| {
@@ -20635,65 +20428,8 @@ kernel void zc_ab_finish(
                 }
                 Ok(pso)
             };
-            let mut fold = make_pipeline("zc_k_fold");
+            let fold = make_pipeline("zc_k_fold");
             let finish = make_pipeline("zc_k_finish");
-            // The faster fold (`FLOCK_NO_ZC_K_V2` kills): compiled
-            // from source here (the prewarm thread); on any failure the
-            // embedded kernel stays.
-            ZC_K_V2_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
-            if super::zc_k_v2_enabled() && fold.is_ok() {
-                let v2 = (|| -> Result<Id, String> {
-                    let src = api.nsstring(ZC_K_V2_MSL_SOURCE)?;
-                    let mut err: Id = NIL;
-                    let lib: Id = send!(
-                        api,
-                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                        device,
-                        c"newLibraryWithSource:options:error:",
-                        src,
-                        NIL,
-                        &mut err
-                    );
-                    if lib.is_null() {
-                        return Err(format!("zc-k v2 compile: {}", api.error_string(err)));
-                    }
-                    let ns = api.nsstring("zc_k_fold_v2")?;
-                    let f: Id = send!(api, unsafe extern "C" fn(Id, Sel, Id) -> Id, lib, c"newFunctionWithName:", ns);
-                    if f.is_null() {
-                        release(lib);
-                        return Err("zc_k_fold_v2 not found".into());
-                    }
-                    let mut perr: Id = NIL;
-                    let pso: Id = send!(
-                        api,
-                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                        device,
-                        c"newComputePipelineStateWithFunction:error:",
-                        f,
-                        &mut perr
-                    );
-                    release(f);
-                    release(lib);
-                    if pso.is_null() {
-                        return Err(format!("zc_k_fold_v2 pipeline: {}", api.error_string(perr)));
-                    }
-                    Ok(pso)
-                })();
-                match v2 {
-                    Ok(pso) => {
-                        if let Ok(old) = fold {
-                            release(old);
-                        }
-                        fold = Ok(pso);
-                        ZC_K_V2_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        if super::gpu_zc_k_debug() {
-                            eprintln!("[zc-k-gpu] v2 fold unavailable ({e}); embedded kernel kept");
-                        }
-                    }
-                }
-            }
             (api.pool_pop)(pool);
             release(library);
             let (fold_pso, finish_pso) = match (fold, finish) {
@@ -20748,23 +20484,6 @@ kernel void zc_ab_finish(
         }
     }
 
-    /// The K arm's share for this launch: the requested one, except that the
-    /// faster kernel's default share falls back to the record's when that
-    /// kernel did not build (source compile failed). Joins the pipeline build,
-    /// which the launch does anyway.
-    pub(crate) fn zc_k_launch_share() -> usize {
-        let share = super::gpu_zc_k_share();
-        if share == 0 || !super::zc_k_share_is_v2_default() {
-            return share;
-        }
-        zc_k_prewarm();
-        if ZC_K_V2_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-            share
-        } else {
-            super::ZC_K_GPU_DEFAULT_CHUNKS
-        }
-    }
-
     fn zc_k_init(
         gpu: &'static Gpu,
         chunks: usize,
@@ -20795,7 +20514,7 @@ kernel void zc_ab_finish(
             }
             let mut made: Vec<Id> = Vec::with_capacity(8);
             for len in [
-                (256 + 512) * 16,
+                256 * 16,
                 (2 + n_weights + chunks) * 16,
                 chunks * per_chunk_a * 16,
                 chunks * per_chunk_b * 16,
@@ -21172,19 +20891,6 @@ kernel void zc_ab_finish(
                 for n in 0..16 {
                     *nib.add(j * 32 + n) = table[j * 256 + n];
                     *nib.add(j * 32 + 16 + n) = table[j * 256 + (n << 4)];
-                }
-            }
-            if ZC_K_V2_ACTIVE.load(Ordering::Relaxed) {
-                // rho2 * (v << 4k) for the 32 nibbles k of the other factor.
-                for k in 0..32usize {
-                    for v in 0..16u64 {
-                        let x = if k < 16 {
-                            F128::new(v << (4 * k), 0)
-                        } else {
-                            F128::new(0, v << (4 * (k - 16)))
-                        };
-                        *nib.add(256 + 16 * k + v as usize) = rho2 * x;
-                    }
                 }
             }
             let consts = gpu.buffer_contents(state.consts_buf).cast::<F128>();
@@ -23459,8 +23165,8 @@ pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm
 /// Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
-    ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_launch_share, zc_k_premap, zc_k_prewarm,
-    zc_k_prewarm_wanted, zc_k_verdict, zc_k_wait,
+    ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_premap, zc_k_prewarm, zc_k_prewarm_wanted,
+    zc_k_verdict, zc_k_wait,
 };
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
@@ -23566,6 +23272,7 @@ mod imp {
         _start: u64,
         _len: u32,
         _bits: u32,
+        _first_hit: bool,
     ) -> Result<Option<u64>, String> {
         Err("GPU grind is only available on macOS/aarch64".into())
     }
