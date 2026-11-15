@@ -738,6 +738,99 @@ where
     run_chunks_with_helper(n_chunks, &f, epool());
 }
 
+/// Caller-first chunk drain (grind pack 3). Runs `f(i)` exactly once for every
+/// `i < n_chunks`. The calling thread starts claiming chunks from an atomic
+/// cursor at once; one job posted to the main pool fans out over the other
+/// pool threads, and each of them claims from the same cursor as soon as it
+/// runs (a lingering worker picks the job up within a spin). The caller never
+/// parks on a pool latch and never waits for a pool thread that has not
+/// started: once the cursor is exhausted it waits only for the chunks other
+/// threads have already claimed. A pool thread that starts late finds the
+/// cursor exhausted and touches nothing but the shared counters.
+///
+/// Which thread runs a chunk is the only thing that changes, so a body whose
+/// chunk outputs are disjoint (and independent of the running thread) gives
+/// the same bytes as the serial loop. Outside a pool, or with a one-thread
+/// pool, this is the serial loop.
+pub(crate) fn run_caller_first_chunks<F>(n_chunks: usize, f: &F)
+where
+    F: Fn(usize) + Sync,
+{
+    let threads = rayon::current_num_threads();
+    if n_chunks <= 1 || threads <= 1 || rayon::current_thread_index().is_none() {
+        for i in 0..n_chunks {
+            f(i);
+        }
+        return;
+    }
+    struct Drain {
+        next: AtomicUsize,
+        done: AtomicUsize,
+        n: usize,
+        f: *const (dyn Fn(usize) + Sync + 'static),
+    }
+    // SAFETY: `f` is only called for a claimed index below `n` (see `work`),
+    // and the publisher returns only after every claimed index completed.
+    unsafe impl Send for Drain {}
+    unsafe impl Sync for Drain {}
+    impl Drain {
+        fn work(&self) {
+            loop {
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= self.n {
+                    return;
+                }
+                // SAFETY: `i < n` was claimed before the publisher saw the
+                // cursor exhausted, and the publisher waits for `done == n`
+                // before the borrow behind `f` ends.
+                unsafe { (*self.f)(i) };
+                self.done.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+    let f_dyn: &(dyn Fn(usize) + Sync) = f;
+    // SAFETY: lifetime erasure only; see `Drain` above.
+    let f_static: &'static (dyn Fn(usize) + Sync + 'static) = unsafe {
+        std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync + 'static)>(
+            f_dyn,
+        )
+    };
+    let drain = Arc::new(Drain {
+        next: AtomicUsize::new(0),
+        done: AtomicUsize::new(0),
+        n: n_chunks,
+        f: f_static as *const (dyn Fn(usize) + Sync + 'static),
+    });
+    /// If `f` panics on the calling thread, the unwind must not end the
+    /// borrow behind `f` while another thread still runs a chunk: close the
+    /// cursor (later claims see an index past `n`) and wait for every chunk
+    /// handed out except the caller's own, which never completes.
+    struct UnwindWait<'a>(&'a Drain);
+    impl Drop for UnwindWait<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let claimed = self.0.next.swap(usize::MAX / 2, Ordering::AcqRel).min(self.0.n);
+                while self.0.done.load(Ordering::Acquire) + 1 < claimed {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+    {
+        let drain = Arc::clone(&drain);
+        let helpers = (threads - 1).min(n_chunks - 1);
+        rayon::spawn(move || {
+            (0..helpers).into_par_iter().with_max_len(1).for_each(|_| drain.work());
+        });
+    }
+    let guard = UnwindWait(&drain);
+    drain.work();
+    while drain.done.load(Ordering::Acquire) < n_chunks {
+        std::hint::spin_loop();
+    }
+    drop(guard);
+}
+
 /// [`run_hetero_chunks`] plus one caller-thread tail job: the calling thread
 /// drains the shared queue like every other main worker, and the moment its
 /// own claim loop finds the queue exhausted it runs `tail` while the other
@@ -1345,6 +1438,51 @@ unsafe impl<T> Sync for SyncPtr<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Grind pack 3: the caller-first drain runs every chunk exactly once,
+    /// in and out of a pool; and when the body panics on the calling thread,
+    /// the unwind leaves the drain only after every chunk another thread
+    /// claimed has finished (nothing runs the body afterwards).
+    #[test]
+    fn caller_first_chunks_run_once_and_unwind_waits() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(5).build().unwrap();
+        for n in [0usize, 1, 2, 7, 64, 333] {
+            let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            let body = |i: usize| {
+                hits[i].fetch_add(1, Ordering::Relaxed);
+            };
+            run_caller_first_chunks(n, &body);
+            for rep in 0..20 {
+                pool.install(|| run_caller_first_chunks(n, &body));
+                let _ = rep;
+            }
+            assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 21), "n={n}");
+        }
+        for rep in 0..20 {
+            let hits: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
+            let unwound = pool.install(|| {
+                let me = rayon::current_thread_index();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_caller_first_chunks(64, &|i: usize| {
+                        if rayon::current_thread_index() == me && i >= 4 {
+                            panic!("caller chunk {i}");
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(30));
+                        hits[i].fetch_add(1, Ordering::Release);
+                    })
+                }))
+                .is_err()
+            });
+            let total = |h: &[AtomicUsize]| h.iter().map(|x| x.load(Ordering::Acquire)).sum::<usize>();
+            let before = total(&hits);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            assert_eq!(total(&hits), before, "a chunk ran after the drain returned (rep={rep})");
+            assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) <= 1), "rep={rep}");
+            if !unwound {
+                assert_eq!(before, 64, "rep={rep}");
+            }
+        }
+    }
 
     /// A guest claims chunks of the draining queue one at a time, returns as
     /// soon as its own condition holds, and every chunk still runs exactly
