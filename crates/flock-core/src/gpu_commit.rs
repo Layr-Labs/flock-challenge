@@ -791,10 +791,10 @@ pub const ENV_NO_ZC_K_GPU: &str = "FLOCK_NO_ZC_K_GPU";
 
 /// Fixed GPU chunk share of the K pass arm: `FLOCK_ZC_K_GPU_CHUNKS=<n>`
 /// (`0` = off), clamped to the chunk count. Unset = [`ZC_K_GPU_DEFAULT_CHUNKS`]
-/// of the 2048 K chunks of the ranked shape (3/16). A non-integer value fails
+/// of the 2048 K chunks of the ranked shape (1/4). A non-integer value fails
 /// loudly.
 pub const ENV_ZC_K_GPU_CHUNKS: &str = "FLOCK_ZC_K_GPU_CHUNKS";
-const ZC_K_GPU_DEFAULT_CHUNKS: usize = 384;
+const ZC_K_GPU_DEFAULT_CHUNKS: usize = 512;
 
 /// Kill switch for mapping the K pass arm's anchors view during round two
 /// (`FLOCK_NO_ZC_K_PREMAP`, any value): the K launch then creates the view
@@ -13201,12 +13201,17 @@ kernel void blake3_pow_scan(
     /// chunk before eviction. `FLOCK_NO_HYBRID_CPU_SUFFIX_DEEP=1` restores the
     /// original all-layer streaming suffix plus separate leaf-hash pass for an
     /// exact same-binary comparison.
-    /// S1 kill switch: `FLOCK_NO_HYBRID_GPU_SUFFIX_HASH=1` restores the CPU
-    /// suffix leaf/parent hashing.
+    /// S1 (the GPU hashes the CPU suffix's leaves and parents) is opt-in:
+    /// `FLOCK_HYBRID_GPU_SUFFIX_HASH=1` enables it. By default, and always
+    /// with `FLOCK_NO_HYBRID_GPU_SUFFIX_HASH=1`, the CPU hashes its own suffix
+    /// leaves and parents.
     fn hybrid_gpu_suffix_hash_enabled() -> bool {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_HYBRID_GPU_SUFFIX_HASH").is_none())
+        *ON.get_or_init(|| {
+            std::env::var_os("FLOCK_NO_HYBRID_GPU_SUFFIX_HASH").is_none()
+                && std::env::var("FLOCK_HYBRID_GPU_SUFFIX_HASH").is_ok_and(|v| v == "1")
+        })
     }
 
     fn hybrid_cpu_suffix_deep_pipeline_enabled() -> bool {
@@ -18670,7 +18675,7 @@ kernel void zc_r2_horner_oracle(
         *V
     }
 
-    /// Anchors-only CPU work is measured locally at ~0.55x of the fused
+    /// Anchors-only CPU work costs ~0.70x of the fused
     /// chunk (two of four folds, no products); the share solves
     /// `(hi - (1-ALPHA) g) c_f = g u_g` — balanced, no CPU-ward bias — and
     /// caps at `15·hi/16` as the overshoot guard (an optimistic warmup ratio
@@ -18705,7 +18710,7 @@ kernel void zc_r2_horner_oracle(
     /// suspected cause of admission failing on a majority of ranked worker
     /// processes while every admitted process posts record p10s). Ratio ≥ 8
     /// or unusable ⇒ 0 = exact incumbent.
-    const ZC_R2_ALPHA: f64 = 0.55;
+    const ZC_R2_ALPHA: f64 = 0.70;
     const ZC_R2_MAX_RATIO: f64 = 2.0;
     const ZC_R2_FLOOR_MAX_RATIO: f64 = 8.0;
 
@@ -25855,13 +25860,13 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     #[test]
     fn zc_r2_gate_share_policy() {
         use imp::zc_r2_gate_share;
-        // Balance point hi/(ratio+0.45); unclamped up to hi_size.
-        assert_eq!(zc_r2_gate_share(0.57, 2048), 2008);
+        // Balance point hi/(ratio+0.30); unclamped up to hi_size.
+        assert_eq!(zc_r2_gate_share(0.57, 2048), 2048);
         assert_eq!(zc_r2_gate_share(0.38, 2048), 2048);
-        assert_eq!(zc_r2_gate_share(0.62, 2048), 1914);
+        assert_eq!(zc_r2_gate_share(0.62, 2048), 2048);
         // Slow-but-usable GPU: the formula takes over below the cap.
-        assert_eq!(zc_r2_gate_share(1.0, 2048), 1412); // 2048/1.45
-        assert_eq!(zc_r2_gate_share(2.0, 2048), 836); // 2048/2.45
+        assert_eq!(zc_r2_gate_share(1.0, 2048), 1575); // 2048/1.30
+        assert_eq!(zc_r2_gate_share(2.0, 2048), 890); // 2048/2.30
         // Admission floor for ratios in (2, 8): the equality oracle already
         // proved the kernel, so pricing failures get hi/8, not 0.
         assert_eq!(zc_r2_gate_share(2.01, 2048), 256);
