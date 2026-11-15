@@ -5278,6 +5278,11 @@ impl Blake3Setup {
         );
         let out = setup.prove_fast_inner(blocks, &mut challenger);
         flock_core::cpu_keepalive::pool_spin_release();
+        // Diagnostic run: this proof returns late, at the time that encodes
+        // the worker's telemetry quantity (`flock_core::tmark`). The seed and
+        // publication code that runs after it is untouched.
+        flock_core::tmark::mark("prove end");
+        flock_core::tmark::telem_hold();
         out
     }
 

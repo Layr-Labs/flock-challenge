@@ -832,6 +832,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // Convention A wrapping: pass `mlv_arg[0] = ONE` so the function's output
     // `mlv_arg[0] · G(1)` becomes the bare `G(1)` we send on the wire. The
     // verifier samples ρ_1 after observing this message.
+    crate::tmark::mark("zc r1 done");
     let cpu_r2 = crate::pcs::commit::commit_cpu_ms();
     let t_round2 = std::time::Instant::now();
     let fold_table = UniSkipFoldTable::new(k_skip, z);
@@ -897,6 +898,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             crate::pcs::commit::commit_cpu_ms() - cpu_r2
         );
     }
+    crate::tmark::mark("zc r2 done");
     let cpu_tail = crate::pcs::commit::commit_cpu_ms();
     let t_tail = std::time::Instant::now();
     let mut multilinear_msgs = Vec::with_capacity(n_mlv);
@@ -1018,6 +1020,7 @@ fn prove_packed_padded_inner<C: Challenger>(
 
         // Rounds three and four now fold together in one pass over the compact
         // state, replacing the T3 reconstruction *and* tail iteration i = 1.
+        crate::tmark::mark("k start");
         let t_k = std::time::Instant::now();
         let n_groups = compact_mlv.len() / 2;
         let mut r_next4 = vec![F128::ONE; n_mlv - 2];
@@ -1044,6 +1047,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     tri_steps > 0 && multilinear::zc_k_dead_pack_enabled(),
                     true,
                 );
+            crate::tmark::mark("k end");
             if tail_round_timing {
                 eprintln!(
                     "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}, tail_compact={}, head_compact={}, packed={packed}, bpacked={bpacked}): {:.2} ms",
@@ -1070,6 +1074,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             // pass (ρ₃ and ρ₄ at once), replacing tail iterations i = 2 and
             // i = 3: their 512 MiB + 256 MiB reads and 256 MiB + 128 MiB
             // writes become one 512 MiB read + 128 MiB write.
+            crate::tmark::mark("t56 start");
             let t_c = std::time::Instant::now();
             let quarter = n_groups / 4;
             let mut r_next6 = vec![F128::ONE; n_mlv - 4];
@@ -1094,6 +1099,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     &mlv_rhos[2..4],
                     &r_next6,
                 );
+                crate::tmark::mark("t56 end");
                 if tail_round_timing {
                     eprintln!(
                         "[zc-tail-rounds] composed rounds 5+6 fold (tri +la7 +la8, out n={quarter}): {:.2} ms",

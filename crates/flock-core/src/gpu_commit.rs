@@ -15099,6 +15099,7 @@ kernel void blake3_pow_scan_v2(
 
         let t0 = std::time::Instant::now();
         let k_cpu16 = hybrid_cpu_sixteenths();
+        crate::tmark::mark_value("split base", "split k", k_cpu16 as u64 * crate::tmark::TELEM_SPLIT_UNIT_NS);
         let run = unsafe {
             if k_cpu16 > 0 {
                 run_commit_graph_from_z_hybrid(
@@ -15241,6 +15242,7 @@ kernel void blake3_pow_scan_v2(
                 Err("streamed GPU z allocation changed before finish".into())
             } else {
                 let k_cpu16 = hybrid_cpu_sixteenths();
+                crate::tmark::mark_value("split base", "split k", k_cpu16 as u64 * crate::tmark::TELEM_SPLIT_UNIT_NS);
                 unsafe {
                     run_from_z_first_pass(stream.gpu, stream.z_buf, stream.staging, stream.tw_buf, stream.log_d)
                         .and_then(|()| {
@@ -15267,6 +15269,7 @@ kernel void blake3_pow_scan_v2(
             Err("streamed GPU latch or z allocation changed before finish".into())
         } else {
             let k_cpu16 = hybrid_cpu_sixteenths();
+            crate::tmark::mark_value("split base", "split k", k_cpu16 as u64 * crate::tmark::TELEM_SPLIT_UNIT_NS);
             unsafe {
                 match early {
                     Some((cb2, k_early)) if k_early == k_cpu16 => {
@@ -21475,8 +21478,14 @@ kernel void zc_r2_horner_oracle(
             // (first status poll, zero cost) or within a hair of it — a
             // bounded spin dodges the ~0.3-0.5 ms `waitUntilCompleted` park
             // once per timed prove.
+            crate::tmark::mark("r2 wait start");
             if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
                 return poison(job.cb);
+            }
+            crate::tmark::mark("r2 wait end");
+            if crate::tmark::on() {
+                let (s, e) = cb_gpu_interval(gpu, job.cb);
+                crate::tmark::mark_gpu("r2 gpu start", "r2 gpu end", s, e);
             }
             let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
             let state_mutex = match zc_r2_state() {
@@ -22352,16 +22361,24 @@ kernel void zc_ab_finish(
             }
         };
         unsafe {
+            crate::tmark::mark("ab wait start");
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
             // the table build; the table build's status is checked too.
             let ok = gpu.spin_wait_cb(job.cb, 2.0).and_then(|()| gpu.wait_cb(job.cb_tables));
+            crate::tmark::mark("ab wait end");
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let (tables_ms, gather_ms) = if ok.is_ok() {
                 (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
             } else {
                 (0.0, 0.0)
             };
+            if ok.is_ok() && crate::tmark::on() {
+                // From the table build's GPU start to the gather's GPU end.
+                let (s, _) = cb_gpu_interval(gpu, job.cb_tables);
+                let (_, e) = cb_gpu_interval(gpu, job.cb);
+                crate::tmark::mark_gpu("ab gpu start", "ab gpu end", s, e);
+            }
             let gpu_ms = tables_ms + gather_ms;
             gpu.release(job.cb_tables);
             gpu.release(job.cb);

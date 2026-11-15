@@ -487,6 +487,15 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
+        // Diagnostic run: this grind's wall, from here to its return.
+        crate::tmark::mark("grind start");
+        struct GrindEnd;
+        impl Drop for GrindEnd {
+            fn drop(&mut self) {
+                crate::tmark::mark("grind end");
+            }
+        }
+        let _grind_end = GrindEnd;
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
         // Aggregate-aware parallelism: decide on the grind's *expected hash
