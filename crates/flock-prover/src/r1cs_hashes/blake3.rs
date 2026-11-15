@@ -298,16 +298,14 @@ impl DeferredAb<'_> {
                         (false, true) if self.input_mem => {
                             witgen_simd::build_quad_split_neon_mem::<false>(input, a, b, sa, sb)
                         }
-                        (true, true) => witgen_simd::build_quad_split_neon::<false, true, true, true>(
-                            input, none, a, b, sa, sb,
-                        ),
-                        (true, false) => witgen_simd::build_quad_split_neon::<false, true, true, false>(
-                            input, none, a, b, sa, sb,
-                        ),
-                        (false, true) => witgen_simd::build_quad_split_neon::<false, true, false, true>(
-                            input, none, a, b, sa, sb,
-                        ),
-                        (false, false) => witgen_simd::build_quad_split_neon::<false, true, false, false>(
+                        // Kill switches only (`FLOCK_NO_WITGEN_AB_INPUT_MEM=1`
+                        // or `FLOCK_NO_WITGEN_AB_COPY_DRAIN`; build budget):
+                        // the register form that rewrites the whole scratch
+                        // and drains in two passes. It writes the same a, b
+                        // and scratch bytes as the primed and copy-drain
+                        // register forms, so those get no instances of their
+                        // own (~115 KiB of worker text).
+                        _ => witgen_simd::build_quad_split_neon::<false, true, false, false>(
                             input, none, a, b, sa, sb,
                         ),
                     }
@@ -6943,7 +6941,7 @@ mod tests {
             })
             .collect();
         let n_quads = blocks.len() / 4;
-        let fill_all = |input_mem: bool, spec_init: Option<u64>| {
+        let fill_all = |input_mem: bool, copy_drain: bool, spec_init: Option<u64>| {
             let mut a = vec![0x1111_1111u32; n_quads * U32S];
             let mut b = vec![0x2222_2222u32; n_quads * U32S];
             let mut scratch = vec![0x3333_3333u32; 2 * U32S];
@@ -6956,7 +6954,7 @@ mod tests {
                 b: b.as_mut_ptr(),
                 n_quads,
                 primed_scratch: true,
-                copy_drain: true,
+                copy_drain,
                 input_mem,
                 seed_in_place: true,
             };
@@ -6969,10 +6967,16 @@ mod tests {
             (a, b, scratches)
         };
         for spec_init in [None, Some(0x0123_4567_89ab_cdefu64)] {
-            let on = fill_all(true, spec_init);
-            let off = fill_all(false, spec_init);
-            assert!(on == off, "input-mem switch changed bytes (spec_init {spec_init:?})");
+            let on = fill_all(true, true, spec_init);
             assert!(on.0.iter().any(|&w| w != 0x1111_1111));
+            // Every kill-switch form (input-mem off and/or copy drain off).
+            for (input_mem, copy_drain) in [(false, true), (true, false), (false, false)] {
+                let off = fill_all(input_mem, copy_drain, spec_init);
+                assert!(
+                    on == off,
+                    "switch form (input_mem {input_mem}, copy_drain {copy_drain}) changed bytes (spec_init {spec_init:?})"
+                );
+            }
         }
     }
 
