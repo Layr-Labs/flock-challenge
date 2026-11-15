@@ -825,7 +825,7 @@ pub const ENV_NO_GPU_ZC_AB_COMPLETION: &str = "FLOCK_NO_GPU_ZC_AB_COMPLETION";
 /// `FLOCK_ZC_AB_GPU_CHUNKS=<n>`, `0` = arm off, clamped to the chunk count.
 /// Unset = [`ZC_AB_GPU_DEFAULT_CHUNKS`]. A non-integer value fails loudly.
 pub const ENV_ZC_AB_GPU_CHUNKS: &str = "FLOCK_ZC_AB_GPU_CHUNKS";
-const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 32;
+const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 40;
 
 /// Requested GPU chunk share of the round-one AB completion arm; `0` = off
 /// (kill switch, share 0, or GPU commit disabled).
