@@ -1944,6 +1944,9 @@ fn zc_k_premap_bytes(n_pairs: usize) -> usize {
         return 0;
     }
     let k_hi = 1usize << cascade_k_pass_n_hi(n_pairs.trailing_zeros() as usize - 2);
+    // R2-CS binds this same view for its own prefix (`zc_k_premap_peek`):
+    // cover the larger of the K share and the R2-CS share ceiling.
+    let share = share.max(crate::gpu_commit::zc_r2_cs_max_share(k_hi));
     let prefix_pairs = share.min(k_hi) * (n_pairs / k_hi);
     prefix_pairs * 32
 }
