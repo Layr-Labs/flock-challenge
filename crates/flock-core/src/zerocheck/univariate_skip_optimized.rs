@@ -3871,6 +3871,9 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 /// (`gpu_commit::zc_k_prewarm`, needed only after round two), unless that arm
 /// is off or `FLOCK_NO_ZC_K_PREWARM=1`.
 ///
+/// The 5+6 GPU arm's kernel is compiled later, after the warm-up commit's
+/// split retune ([`t56_prewarm_after_tune`]).
+///
 /// With R2-CS on (`gpu_commit::ENV_NO_ZC_R2_CS`), a thread of its own builds
 /// the R2-CS pipeline (`gpu_commit::zc_r2_cs_prewarm`), joined by the warm-up
 /// round two's calibration.
@@ -3894,6 +3897,23 @@ pub fn ab_completion_gpu_prewarm() {
             let _ = std::thread::Builder::new()
                 .name("flock-zcr2cs-prewarm".into())
                 .spawn(crate::gpu_commit::zc_r2_cs_prewarm);
+        }
+    }
+}
+
+/// Untimed warm-up only, right after the commit's split retune: compile the
+/// 5+6 GPU arm's kernel (`gpu_commit::zc_t56_prewarm`) on a background thread,
+/// so the compile runs during the warm-up prove's zerocheck instead of beside
+/// its commit and split retune. Its pipeline is a process-wide `OnceLock`, so
+/// a launch that arrives first waits for (or does) the same build. A no-op
+/// when the arm is off.
+pub fn t56_prewarm_after_tune() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if crate::gpu_commit::zc_t56_prewarm_wanted() {
+            let _ = std::thread::Builder::new()
+                .name("flock-zct56-prewarm".into())
+                .spawn(crate::gpu_commit::zc_t56_prewarm);
         }
     }
 }

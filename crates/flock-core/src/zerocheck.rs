@@ -1083,7 +1083,9 @@ fn prove_packed_padded_inner<C: Challenger>(
                 // SAFETY: the prefix buffers are rewritten only by the next K
                 // pass.
                 let prefix = k_prefix.as_ref().map(|p| unsafe { p.slices() });
-                let (m6_1, m6_inf, la7, la8) = multilinear::fold_cascade_t_into_packed_prefix(
+                // `t56_prefix`: the 5+6 pass GPU prefix arm's outputs, which
+                // tri pass 0 below reads in place of the leading entries.
+                let (m6_1, m6_inf, la7, la8, t56_prefix) = multilinear::fold_cascade_t_into_packed_prefix_gpu(
                     &a_out[..main],
                     &b_out[..main_b],
                     packed,
@@ -1093,6 +1095,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     &mut b2_out,
                     &mlv_rhos[2..4],
                     &r_next6,
+                    true,
                 );
                 if tail_round_timing {
                     eprintln!(
@@ -1134,14 +1137,29 @@ fn prove_packed_padded_inner<C: Challenger>(
                     // ~1.3 ms before the lincheck GPU prefix: wake the idle
                     // GPU (see `gpu_commit::ENV_NO_LC_GPU_WAKE`).
                     crate::gpu_commit::lc_gpu_wake_fire(step as u32);
-                    let (e1, einf, la, la2) = multilinear::fold_cascade_t_into(
-                        &cur_a,
-                        &cur_b,
-                        &mut na,
-                        &mut nb,
-                        &mlv_rhos[k - 3..k],
-                        &r_nx,
-                    );
+                    let (e1, einf, la, la2) = match t56_prefix.as_ref().filter(|_| step == 0) {
+                        // SAFETY: the prefix buffers are rewritten only by
+                        // the next 5+6 GPU launch.
+                        Some(p) => multilinear::fold_cascade_t_into_packed_prefix(
+                            &cur_a,
+                            &cur_b,
+                            false,
+                            false,
+                            Some(unsafe { p.slices() }),
+                            &mut na,
+                            &mut nb,
+                            &mlv_rhos[k - 3..k],
+                            &r_nx,
+                        ),
+                        None => multilinear::fold_cascade_t_into(
+                            &cur_a,
+                            &cur_b,
+                            &mut na,
+                            &mut nb,
+                            &mlv_rhos[k - 3..k],
+                            &r_nx,
+                        ),
+                    };
                     if tail_round_timing {
                         eprintln!(
                             "[zc-tail-rounds] tri pass {step} (out n={out_n}): {:.2} ms",
