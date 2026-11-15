@@ -195,7 +195,7 @@ impl BlockR1cs {
             || self.b_0.num_cols != k
             || self.b_0.rows.len() != k
             || self.c_0.rows.len() != k
-            || !c0_is_identity_scan(k, &self.c_0)
+            || !self.c0_is_identity()
         {
             return None;
         }
