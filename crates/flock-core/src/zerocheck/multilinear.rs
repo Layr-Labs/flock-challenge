@@ -3195,7 +3195,9 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
 /// `gpu_commit::ENV_NO_ZC_K_GPU`): `len_a` / `len_b` entries of the packed a
 /// and b-one-packed b layouts, held in the arm's process-lifetime buffers.
 /// The same entries of `a_out` / `b_out` were not written; the tri pass reads
-/// them from here. Valid until the next K pass.
+/// them from here. Valid until the next K pass. Also the leading outputs of
+/// the composed 5+6 pass that its GPU prefix arm folded (see
+/// `gpu_commit::ENV_NO_ZC_T56_GPU`), valid until that arm's next launch.
 pub(crate) struct KGpuPrefix {
     a: *const F128,
     b: *const F128,
@@ -3549,6 +3551,13 @@ fn fold2_compact_and_round45_into_packed_b(
                             && gb == &b_out[..len_b]
                             && parts.as_slice() == &partials[..chunks];
                         crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
+                        // With the 5+6 GPU arm on, an admitted probe hands its
+                        // buffers (byte-equal to the CPU's outputs above) to
+                        // the 5+6 pass, so that arm's own first launch, its
+                        // oracle, chains on them in this prove too.
+                        if equal && crate::gpu_commit::gpu_zc_t56_enabled() {
+                            gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
+                        }
                     }
                 } else {
                     partials[..chunks].copy_from_slice(&parts);
@@ -4153,7 +4162,7 @@ fn tri_n_hi(n_vars: usize) -> usize {
     SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(8))
 }
 
-fn tri_chunk_scalar(
+pub(crate) fn tri_chunk_scalar(
     a_in: &[F128],
     b_in: &[F128],
     a_out: &mut [F128],
@@ -4261,9 +4270,9 @@ fn prefixed_input<'a>(main: &'a [F128], pre: &'a [F128], lo: usize, hi: usize) -
 }
 
 /// [`fold_cascade_t_into_packed`] whose leading input entries come from
-/// `prefix = Some((pa, pb))` (the K pass GPU prefix, [`KGpuPrefix`]): entries
-/// `0..pa.len()` of `a` and `0..pb.len()` of `b` are read there, not in `a` /
-/// `b`.
+/// `prefix = Some((pa, pb))` (the K pass GPU prefix, [`KGpuPrefix`], or the
+/// 5+6 one): entries `0..pa.len()` of `a` and `0..pb.len()` of `b` are read
+/// there, not in `a` / `b`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold_cascade_t_into_packed_prefix(
     a: &[F128],
@@ -4276,6 +4285,32 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
+    let (m1, minf, la, la2, _) =
+        fold_cascade_t_into_packed_prefix_gpu(a, b, packed, bpacked, prefix, a_out, b_out, rhos, r_next, false);
+    (m1, minf, la, la2)
+}
+
+/// [`fold_cascade_t_into_packed_prefix`] with the 5+6 GPU prefix arm when
+/// `gpu` is set (see `gpu_commit::ENV_NO_ZC_T56_GPU`): on the ranked packed
+/// b-one-packed depth-two pass whose `prefix` is the K arm's, the GPU folds
+/// the leading chunks that lie wholly inside that prefix. Also returns the
+/// arm's prefix (`None` unless it was used for this pass's outputs): its
+/// `len` leading outputs of `a_out` / `b_out` were not written, and the next
+/// tri pass reads them from there.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
+    a: &[F128],
+    b: &[F128],
+    packed: bool,
+    bpacked: bool,
+    prefix: Option<(&[F128], &[F128])>,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+    gpu: bool,
+) -> (F128, F128, Round3Lookahead, Lookahead2, Option<KGpuPrefix>) {
+    let _ = gpu;
     let depth = rhos.len();
     assert!(depth == 2 || depth == 3);
     let bpacked = packed && bpacked;
@@ -4369,12 +4404,45 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
+    #[allow(unused_mut)]
+    let mut gpu_prefix: Option<KGpuPrefix> = None;
     let partials: Vec<[F128; 26]> = if hetero {
         let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
         let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // 5+6 GPU prefix arm (`FLOCK_NO_ZC_T56_GPU` kills): the GPU folds
+        // chunks `0..cpu_base` (those wholly inside the K arm's prefix) from
+        // the K arm's buffers into its own, submitted before the CPU queue,
+        // which starts at `cpu_base`. During the arm's first launch (oracle)
+        // `cpu_base == 0` and the queue is exactly the incumbent one.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let gpu_job = match prefix {
+            Some((pa, pb))
+                if gpu
+                    && crate::gpu_commit::gpu_zc_t56_enabled()
+                    && packed
+                    && bpacked
+                    && depth == 2
+                    && hi_size == crate::gpu_commit::zc_t56::HI
+                    && chunk_out == crate::gpu_commit::zc_t56::OUT
+                    && per_chunk == crate::gpu_commit::zc_t56::IN_A
+                    && per_chunk_b == crate::gpu_commit::zc_t56::IN_B =>
+            {
+                let chunks =
+                    (pa.len() / per_chunk).min(pb.len() / per_chunk_b).min(crate::gpu_commit::gpu_zc_t56_cap());
+                crate::gpu_commit::launch_zc_t56_prefix(pa, pb, chunks, rhos[0], rhos[1], eq_lo)
+            }
+            _ => None,
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let cpu_base = gpu_job.as_ref().map_or(0, crate::gpu_commit::ZcT56Job::cpu_base);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let cpu_base = 0usize;
+        // One queue closure for both drains below (CPU chunks from `base`).
+        let base = std::sync::atomic::AtomicUsize::new(cpu_base);
+        let body = |i: usize| {
+            let x_hi = base.load(std::sync::atomic::Ordering::Relaxed) + i;
             // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
             let (a_o, b_o) = unsafe {
                 (
@@ -4388,7 +4456,42 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
             unsafe {
                 *partials_base.ptr().add(x_hi) = outv;
             }
-        });
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let t_cpu = std::time::Instant::now();
+        crate::epool::run_hetero_chunks(hi_size - cpu_base, &body);
+        // Join the GPU prefix (submitted first; normally done).
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(job) = gpu_job {
+            let calibration = job.calibration();
+            let chunks = job.chunks();
+            let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
+            match crate::gpu_commit::zc_t56_wait(job, hi_size, cpu_ms) {
+                crate::gpu_commit::ZcT56Result::Prefix { parts, a, b, len } => {
+                    if calibration {
+                        // Oracle: the CPU folded every chunk; the GPU's
+                        // outputs and slots must equal the CPU's.
+                        // SAFETY: the joined job's buffers hold `len` entries each.
+                        let (ga, gb) =
+                            unsafe { (std::slice::from_raw_parts(a, len), std::slice::from_raw_parts(b, len)) };
+                        let equal = len <= a_out.len()
+                            && ga == &a_out[..len]
+                            && gb == &b_out[..len]
+                            && parts.as_slice() == &partials[..chunks];
+                        crate::gpu_commit::zc_t56_verdict(equal, chunks, hi_size);
+                    } else {
+                        partials[..chunks].copy_from_slice(&parts);
+                        gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
+                    }
+                }
+                crate::gpu_commit::ZcT56Result::Failed => {
+                    // The GPU failed after admission: the CPU folds the
+                    // prefix chunks (the arm is now disabled).
+                    base.store(0, std::sync::atomic::Ordering::Relaxed);
+                    crate::epool::run_hetero_chunks(cpu_base, &body);
+                }
+            }
+        }
         partials
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
@@ -4413,7 +4516,8 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
             *slot += eq_h * v;
         }
     }
-    tri_finish(&s, r_next)
+    let (m1, minf, la, la2) = tri_finish(&s, r_next);
+    (m1, minf, la, la2, gpu_prefix)
 }
 
 /// Kill switch for the shared inversion of the tri-cascade finish:

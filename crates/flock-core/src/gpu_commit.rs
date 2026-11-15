@@ -953,6 +953,71 @@ pub(crate) fn gpu_zc_k_debug() -> bool {
     *ON
 }
 
+/// Kill switch for the zerocheck 5+6 GPU prefix arm (`FLOCK_NO_ZC_T56_GPU`,
+/// any value): the CPU queue folds every chunk of the composed rounds-5+6
+/// pass and the first tri pass reads only the CPU's outputs, as before. With
+/// the arm on, and only in a prove whose K pass GPU prefix arm ran and was
+/// admitted, the GPU folds the leading 5+6 chunks that lie wholly inside the
+/// K arm's prefix, at most the share cap ([`ENV_ZC_T56_GPU_CHUNKS`]), reading
+/// the K arm's output buffers in place and writing
+/// the folded outputs and raw slot banks into its own buffers; the CPU queue
+/// starts after them, the CPU reduces the banks into the chunks' 26 message
+/// slots, and the first tri pass reads those chunks' outputs from the arm's
+/// buffers. Every output and slot is the same field element as the CPU
+/// kernel's; the first launch of each process is an equality check against
+/// the CPU's complete pass, and any mismatch keeps the arm off. Read once
+/// per process.
+pub const ENV_NO_ZC_T56_GPU: &str = "FLOCK_NO_ZC_T56_GPU";
+
+/// Cap on the 5+6 arm's chunk share: `FLOCK_ZC_T56_GPU_CHUNKS=<n>` (`0` =
+/// off). Unset = [`ZC_T56_GPU_DEFAULT_CHUNKS`]. The launch never goes past
+/// the chunks inside the K arm's prefix. A non-integer value fails loudly.
+pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
+
+/// The 5+6 arm's default share, in 5+6 chunks (of 512), when
+/// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
+pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 128;
+
+/// Whether the 5+6 arm may run: no kill switch, a non-zero cap, GPU commit
+/// enabled.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_zc_t56_enabled() -> bool {
+    gpu_zc_t56_cap() > 0
+}
+
+/// Upper bound on the 5+6 arm's share in 5+6 chunks; `0` = off.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_zc_t56_cap() -> usize {
+    static CAP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if std::env::var_os(ENV_NO_ZC_T56_GPU).is_some() {
+            return 0;
+        }
+        match std::env::var_os(ENV_ZC_T56_GPU_CHUNKS) {
+            None => ZC_T56_GPU_DEFAULT_CHUNKS,
+            Some(value) => value
+                .to_str()
+                .and_then(|text| text.trim().parse::<usize>().ok())
+                .expect("FLOCK_ZC_T56_GPU_CHUNKS must be a non-negative integer"),
+        }
+    });
+    if gpu_commit_enabled() { *CAP } else { 0 }
+}
+
+/// Diagnostic trace for the 5+6 arm (`FLOCK_ZC_T56_GPU_DEBUG=1`, or any
+/// `FLOCK_PHASE_TIMING` run): pipeline build failures, the oracle verdict,
+/// and one line per launch with the share and the GPU and CPU times.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_zc_t56_debug() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_ZC_T56_GPU_DEBUG").is_some()
+            || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+    });
+    *ON
+}
+
+/// Geometry, constants and bank finish of the 5+6 arm.
+pub(crate) mod zc_t56;
+
 /// Kill switch for the L1 recursive-commit NTT/Merkle-leaf overlap
 /// (`FLOCK_NO_L1_MERKLE_OVERLAP=1`): instead of hashing each finalized NTT
 /// chunk's 128-byte leaves on the GPU while the CPU transform is still
@@ -23433,6 +23498,14 @@ kernel void zc_ab_finish(
         }
     }
 
+    // Zerocheck 5+6 GPU prefix arm (see `ENV_NO_ZC_T56_GPU`): chained on
+    // the K arm's output buffers above.
+    mod t56_metal;
+    pub(crate) use t56_metal::{
+        ZcT56Job, ZcT56Result, launch_zc_t56_prefix, zc_t56_prewarm, zc_t56_prewarm_wanted, zc_t56_verdict,
+        zc_t56_wait,
+    };
+
     // -----------------------------------------------------------------------
     // Zerocheck first-tail-round (T3) compact-reconstruction products GPU
     // arm (see `ENV_NO_GPU_ZC_T3`).
@@ -25557,6 +25630,12 @@ pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm
 pub(crate) use imp::{
     ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_launch_share, zc_k_premap, zc_k_prewarm,
     zc_k_prewarm_wanted, zc_k_verdict, zc_k_wait,
+};
+
+/// Zerocheck 5+6 GPU prefix arm (see `ENV_NO_ZC_T56_GPU`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    ZcT56Job, ZcT56Result, launch_zc_t56_prefix, zc_t56_prewarm, zc_t56_prewarm_wanted, zc_t56_verdict, zc_t56_wait,
 };
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
