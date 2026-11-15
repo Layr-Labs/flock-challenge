@@ -5,6 +5,17 @@
 
 pub(crate) const ABV_TRANSFORM_TRIM: u32 = 1 << 17;
 
+/// Kill switch for [`ABV_TRANSFORM_TRIM`]: exactly `FLOCK_NO_TRANSFORM_TRIM=1`
+/// keeps the partial-table seeds. The fused static-B window units then take
+/// the per-chunk rows (no second fused unit instance, build budget). Read once
+/// per process. The rows written are byte-identical.
+pub(crate) fn ab_transform_trim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 #[inline(always)]
 fn transform_partial_word<const V: u32>(word: u64) -> u64 {
     if V & ABV_TRANSFORM_TRIM != 0 {

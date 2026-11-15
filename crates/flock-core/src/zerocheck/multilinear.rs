@@ -2229,6 +2229,17 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let eq_prep_addr = eq_prep.as_ptr() as usize;
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let eq_prep_addr = 0usize;
+    // The fold table in seven pieces (`FLOCK_NO_R2_FOLD7`), for the full
+    // chunks' ranked walks on the performance-core workers: one lookup fewer
+    // per row, the same folded rows (none when a byte bank is not linear).
+    #[cfg(target_arch = "aarch64")]
+    let fold7 = if kernels::aarch64::r2_fold7_enabled() {
+        kernels::aarch64::r2_fold7_table(&table.data)
+    } else {
+        None
+    };
+    #[cfg(target_arch = "aarch64")]
+    let fold7_addr = fold7.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
     // Tail-compacted layout: the dead-pair skip is on, every chunk's
     // producer runs its ranked periodic walk (the lookahead, prescaled and
     // Horner producers all rebase per block there) and the one-table fused
@@ -2357,7 +2368,28 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
-                if full {
+                if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                    kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
+                        t,
+                        fold7_addr as *const u8,
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        eq_prep_addr as *const F128,
+                        lo_size,
+                        pair_idx_base,
+                        pair_in_block_mask,
+                        useful_pairs_inclusive,
+                        degen,
+                        periodic_padding,
+                        skip_dead,
+                        tail_compact,
+                        head_fail_ptr,
+                        out.as_mut_ptr(),
+                    );
+                } else if full {
                     fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                         t,
                         ap,
@@ -3314,6 +3346,17 @@ fn fold2_compact_and_round45_into_packed_b(
     // prepared form, one table shared by every chunk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
+    // The scaled table in seven pieces (`FLOCK_NO_ZC_K_FOLD7`) for the packed
+    // chunks on the performance-core workers: one lookup fewer per tree, the
+    // same values (none when a byte bank is not linear).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let fold7 = if one_table && pack && kernels::aarch64::zc_k_fold7_enabled() {
+        kernels::aarch64::r2_fold7_table(&table_l1)
+    } else {
+        None
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let fold7_addr = fold7.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
     // b-one pack (packed outputs only): each 64-output block's b takes
     // `B_PACK_BLOCK` entries; a kernel that meets a skipped b output that is
     // not one says so, and the whole pass is rerun without it.
@@ -3415,24 +3458,31 @@ fn fold2_compact_and_round45_into_packed_b(
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
-                    let ok = fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
-                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
-                        compact.tail_compact, compact.head_compact, compact.head_b,
-                    );
+                    let ok = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                        kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+                            fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
+                            degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                    } else {
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                            compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                    };
                     if !ok {
                         b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                         compact.tail_compact, compact.head_compact, compact.head_b,
                     );
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
                         t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                         false, false, F128::ZERO,
                     );
@@ -3499,6 +3549,12 @@ fn fold2_compact_and_round45_into_packed_b(
                             && gb == &b_out[..len_b]
                             && parts.as_slice() == &partials[..chunks];
                         crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
+                        // K-T arm (`gpu_commit::ENV_NO_ZC_KT_GPU`): its oracle
+                        // probe in the next tri pass takes its inputs from the
+                        // K arm's buffers, which now equal the CPU's outputs.
+                        if equal && crate::gpu_commit::gpu_zc_kt_share() > 0 {
+                            gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
+                        }
                     }
                 } else {
                     partials[..chunks].copy_from_slice(&parts);
@@ -4166,6 +4222,7 @@ fn tri_chunk_scalar(
 }
 
 ///
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fold_cascade_t_into(
     a: &[F128],
     b: &[F128],
@@ -4226,6 +4283,128 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
+    fold_cascade_t_into_packed_prefix_arm(
+        a,
+        b,
+        packed,
+        bpacked,
+        prefix,
+        a_out,
+        b_out,
+        rhos,
+        r_next,
+        zc_tri_caller_first_enabled(),
+    )
+}
+
+/// Caller-first main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, any value,
+/// restores the rayon `par_chunks_mut` collect). The tri passes below the
+/// hetero floor (ranked: passes 1 and 2, 128 and 16 chunks) run through
+/// [`crate::epool::run_chunks_caller_first`]: the calling thread starts on
+/// chunk 0 at once and never parks on a pool latch, which matters here
+/// because zerocheck arms no post-drain linger. Same `x_hi` chunk grid and
+/// chunk closure as both other arms; each chunk writes its own output range
+/// and its own `partials[x_hi]`, and the combine below walks the partials in
+/// index order, so bytes are identical. Read once per process.
+fn zc_tri_caller_first_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TRI_CF").is_none());
+    *ON
+}
+
+/// [`fold_cascade_t_into_packed_prefix`] with the caller-first arm explicit
+/// (`false` = the rayon collect), so tests can compare both.
+#[allow(clippy::too_many_arguments)]
+fn fold_cascade_t_into_packed_prefix_arm(
+    a: &[F128],
+    b: &[F128],
+    packed: bool,
+    bpacked: bool,
+    prefix: Option<(&[F128], &[F128])>,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+    caller_first: bool,
+) -> (F128, F128, Round3Lookahead, Lookahead2) {
+    let (m1, minf, la, la2, _) =
+        fold_cascade_t_into_packed_prefix_impl(a, b, packed, bpacked, prefix, a_out, b_out, rhos, r_next, caller_first, false);
+    (m1, minf, la, la2)
+}
+
+/// Byte equality of two F128 slices (`F128` is `repr(C)` with no padding, so
+/// equal bytes are equal elements), compared in parallel blocks: the K-T
+/// oracle's comparison of its prefix outputs (two 24 MiB tables).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn f128_slices_equal_par(x: &[F128], y: &[F128]) -> bool {
+    use rayon::prelude::*;
+    fn bytes(v: &[F128]) -> &[u8] {
+        // SAFETY: `F128` is `repr(C, align(16))` of two `u64`s (no padding).
+        unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+    }
+    x.len() == y.len() && x.par_chunks(1 << 15).zip(y.par_chunks(1 << 15)).all(|(p, q)| bytes(p) == bytes(q))
+}
+
+/// Outputs of the leading tri chunks that the K-T arm folded (see
+/// `gpu_commit::ENV_NO_ZC_KT_GPU`): the first `len` entries of the pass's
+/// `a_out` / `b_out`, held in the arm's process-lifetime buffers. The same
+/// entries of `a_out` / `b_out` were not written; the next tri pass reads
+/// them from here. Valid until the next K-T launch.
+pub(crate) struct TGpuPrefix {
+    a: *const F128,
+    b: *const F128,
+    len: usize,
+}
+
+impl TGpuPrefix {
+    /// SAFETY: call before the next K-T launch of the process (which
+    /// rewrites the buffers).
+    pub(crate) unsafe fn slices<'a>(&self) -> (&'a [F128], &'a [F128]) {
+        unsafe { (std::slice::from_raw_parts(self.a, self.len), std::slice::from_raw_parts(self.b, self.len)) }
+    }
+}
+
+/// [`fold_cascade_t_into_packed_prefix`] with the K-T arm when `gpu` is set
+/// (`gpu_commit::ENV_NO_ZC_KT_GPU`; depth two over the packed K output whose
+/// leading chunks are the K arm's prefix): the GPU folds the tri chunks whose
+/// inputs lie wholly in `prefix`, the CPU queue the rest. Also returns the
+/// prefix outputs the next tri pass must read in place of the leading entries
+/// of `a_out` / `b_out`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
+    a: &[F128],
+    b: &[F128],
+    packed: bool,
+    bpacked: bool,
+    prefix: Option<(&[F128], &[F128])>,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+    gpu: bool,
+) -> (F128, F128, Round3Lookahead, Lookahead2, Option<TGpuPrefix>) {
+    fold_cascade_t_into_packed_prefix_impl(a, b, packed, bpacked, prefix, a_out, b_out, rhos, r_next, zc_tri_caller_first_enabled(), gpu)
+}
+
+/// The shared body of [`fold_cascade_t_into_packed_prefix`] and its two
+/// explicit arms: `caller_first` selects the caller-first drain for the
+/// main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, 8e440189), `gpu` the K-T arm
+/// (`gpu_commit::ENV_NO_ZC_KT_GPU`), which acts only on the hetero path.
+#[allow(clippy::too_many_arguments)]
+fn fold_cascade_t_into_packed_prefix_impl(
+    a: &[F128],
+    b: &[F128],
+    packed: bool,
+    bpacked: bool,
+    prefix: Option<(&[F128], &[F128])>,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+    caller_first: bool,
+    gpu: bool,
+) -> (F128, F128, Round3Lookahead, Lookahead2, Option<TGpuPrefix>) {
+    let _ = gpu;
     let depth = rhos.len();
     assert!(depth == 2 || depth == 3);
     let bpacked = packed && bpacked;
@@ -4319,13 +4498,113 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
+    // K-T arm (`gpu_commit::ENV_NO_ZC_KT_GPU` kills): the GPU folds the
+    // leading tri chunks whose inputs lie wholly in the K arm's prefix (its
+    // own buffers), submitted before the CPU queue, which starts after them.
+    // During the arm's first launch (oracle probe) `cpu_base == 0` and the
+    // queue is exactly the incumbent one.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let kt_job = if gpu && hetero && depth == 2 && packed && bpacked && hi_size > 1 && !pre_a.is_empty() {
+        let covered = (pre_a.len() / per_chunk).min(pre_b.len() / per_chunk_b).min(hi_size);
+        let chunks = crate::gpu_commit::zc_kt_chunks(covered);
+        if chunks > 0 {
+            crate::gpu_commit::launch_zc_kt_prefix(
+                pre_a.as_ptr(),
+                pre_b.as_ptr(),
+                pre_a.len(),
+                pre_b.len(),
+                rhos[0],
+                rhos[1],
+                eq_lo,
+                per_chunk,
+                per_chunk_b,
+                chunk_out,
+                chunks,
+                covered,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cpu_base = kt_job.as_ref().map_or(0, crate::gpu_commit::ZcKtJob::cpu_base);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let cpu_base = 0usize;
+    #[allow(unused_mut)]
+    let mut t_prefix: Option<TGpuPrefix> = None;
+
     let partials: Vec<[F128; 26]> = if hetero {
         let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
         let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        let body = |x_hi: usize| {
             // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
+            let (a_o, b_o) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let (a_in, b_in) = inputs(x_hi);
+            let outv = chunk(&a_in, &b_in, a_o, b_o);
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = outv;
+            }
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let t_queue = std::time::Instant::now();
+        crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| body(cpu_base + i));
+        // Join the K-T prefix (submitted before the queue).
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(job) = kt_job {
+            let calibration = job.calibration();
+            let chunks = job.chunks();
+            let cpu_ms = t_queue.elapsed().as_secs_f64() * 1e3;
+            match crate::gpu_commit::zc_kt_wait(job, hi_size, cpu_ms) {
+                crate::gpu_commit::ZcKtResult::Prefix { parts, a, b, len } => {
+                    if calibration {
+                        // Oracle probe: the CPU folded every chunk; the GPU's
+                        // outputs and slot sums must equal the CPU's.
+                        // SAFETY: the joined job's buffers hold `len` entries.
+                        let (ga, gb) = unsafe { (std::slice::from_raw_parts(a, len), std::slice::from_raw_parts(b, len)) };
+                        let equal = len <= a_out.len()
+                            && len <= b_out.len()
+                            && f128_slices_equal_par(ga, &a_out[..len])
+                            && f128_slices_equal_par(gb, &b_out[..len])
+                            && parts.as_slice() == &partials[..chunks];
+                        crate::gpu_commit::zc_kt_verdict(equal, chunks, hi_size);
+                    } else {
+                        partials[..chunks].copy_from_slice(&parts);
+                        t_prefix = Some(TGpuPrefix { a, b, len });
+                    }
+                }
+                crate::gpu_commit::ZcKtResult::Failed => {
+                    // The GPU failed after admission: the CPU folds the
+                    // prefix chunks with the same kernel (the arm is now
+                    // disabled).
+                    crate::epool::run_hetero_chunks(cpu_base, &body);
+                }
+            }
+        }
+        partials
+    } else if hi_size == 1 {
+        let (a_in, b_in) = inputs(0);
+        vec![chunk(&a_in, &b_in, a_out, b_out)]
+    } else if caller_first {
+        // The `par_chunks_mut(chunk_out)` grid below: `hi_size` chunks
+        // (`2 * lo_size * hi_size == out_n`, asserted above).
+        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_caller_first(hi_size, &|x_hi| {
+            // SAFETY: the drain runs each `x_hi` exactly once; its output
+            // ranges are disjoint per chunk, and the drain publishes every
+            // write before the combine below reads them.
             let (a_o, b_o) = unsafe {
                 (
                     std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
@@ -4340,9 +4619,6 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
             }
         });
         partials
-    } else if hi_size == 1 {
-        let (a_in, b_in) = inputs(0);
-        vec![chunk(&a_in, &b_in, a_out, b_out)]
     } else {
         use rayon::prelude::*;
         a_out
@@ -4363,7 +4639,8 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
             *slot += eq_h * v;
         }
     }
-    tri_finish(&s, r_next)
+    let (m1, minf, la, la2) = tri_finish(&s, r_next);
+    (m1, minf, la, la2, t_prefix)
 }
 
 /// Kill switch for the shared inversion of the tri-cascade finish:
@@ -7351,6 +7628,47 @@ mod tests {
             g_via_sum += eq_remaining[x_prime] * a_x * b_x;
         }
         assert_eq!(g_via_poly, g_via_sum);
+    }
+
+    /// Caller-first tri passes (`FLOCK_NO_ZC_TRI_CF`): the caller-first arm
+    /// writes the same folded outputs and returns the same messages and
+    /// lookaheads, byte for byte, as the rayon arm, for both depths on chunk
+    /// grids of 4..128 `x_hi` chunks (ranked passes 1 and 2: 128 and 16), in
+    /// a multi-thread pool and inline in a single-thread pool.
+    #[test]
+    fn tri_pass_caller_first_matches_rayon_arm() {
+        let mut rng = Rng::new(0x7121_0C1F);
+        for threads in [4usize, 1] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("test pool");
+            for depth in [2usize, 3] {
+                for log_out in [11usize, 12, 13, 14, 16] {
+                    let n = 1usize << (log_out + depth);
+                    let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+                    let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+                    let rhos: Vec<F128> = (0..depth).map(|_| rng.f128()).collect();
+                    let mut r_next = vec![F128::ONE; log_out];
+                    for s in r_next[1..].iter_mut() {
+                        *s = rng.f128();
+                    }
+                    let run = |caller_first: bool| {
+                        let mut a_o = vec![LA_POISON; n >> depth];
+                        let mut b_o = vec![LA_POISON; n >> depth];
+                        let out = pool.install(|| {
+                            fold_cascade_t_into_packed_prefix_arm(
+                                &a, &b, false, false, None, &mut a_o, &mut b_o, &rhos, &r_next,
+                                caller_first,
+                            )
+                        });
+                        (out, a_o, b_o)
+                    };
+                    let (cf, rb) = (run(true), run(false));
+                    assert!(cf == rb, "threads {threads} depth {depth} log_out {log_out}");
+                }
+            }
+        }
     }
 
     #[test]
