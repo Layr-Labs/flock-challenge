@@ -1631,7 +1631,139 @@ pub(crate) fn gpu_blake3_pow_scan(
     if !gpu_grind_enabled() {
         return Err("GPU grind disabled".into());
     }
-    imp::gpu_blake3_pow_scan(state_digest, start, len, bits)
+    imp::gpu_blake3_pow_scan(state_digest, start, len, bits, 1, None, None)
+}
+
+/// Segmented wide grind scan (`FLOCK_NO_GRIND_SEG=1`, exact, keeps the one
+/// dispatch). The v2 kernel's threads do not see a match found by another
+/// thread of the same dispatch: measured on the M1 Max, a wide block costs
+/// its full length whatever the offset of its first match (127 / 247 /
+/// 488 us for 2^19 / 2^20 / 2^21 nonces, to the microsecond, with the match
+/// at offset 381 as at offset 2,008,938). A wide block is four expected
+/// works, so three quarters of that scan is past the answer on average.
+///
+/// Here the same block goes out as `GRIND_SEGS` consecutive dispatches of
+/// the same kernel in one command buffer, each with its own result slot.
+/// The thread that spins the buffer home watches the slots: as soon as one
+/// holds a match, every later segment's slot is set to zero, so each thread
+/// of a later segment returns at its first check (a thread reads its slot
+/// when it starts). The GPU then scans up to the segment holding the first
+/// match and little more.
+///
+/// Exactness: slots are only zeroed above a segment in which the GPU itself
+/// stored a match, so the lowest slot that is not empty at completion always
+/// holds a real result; every segment below it ran in full and found
+/// nothing; and within a segment the kernel returns its smallest match as
+/// before. The answer is the smallest qualifying nonce of the block, the one
+/// the single dispatch returns.
+pub const ENV_NO_GRIND_SEG: &str = "FLOCK_NO_GRIND_SEG";
+
+pub(crate) fn grind_seg_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !env_is_one(ENV_NO_GRIND_SEG))
+}
+
+/// Segments of one wide grind block (diagnostic override
+/// `FLOCK_GRIND_SEGS`, a power of two up to [`GRIND_SEG_SLOTS`]).
+pub(crate) const GRIND_SEGS: u32 = 8;
+pub(crate) const GRIND_SEG_SLOTS: u32 = 16;
+
+fn grind_segs() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLOCK_GRIND_SEGS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| n.is_power_of_two() && *n <= GRIND_SEG_SLOTS)
+            .unwrap_or(GRIND_SEGS)
+    })
+}
+
+/// [`gpu_blake3_pow_scan`] for a wide block of the race: segmented when the
+/// switch is on and the block splits into whole grids, the single dispatch
+/// otherwise.
+///
+/// `cancel` is raised by the caller once it no longer wants the result (the
+/// CPU side of the race answered first): the remaining segments are then
+/// zeroed out too and the call returns `Ok(None)`, which frees the GPU and
+/// the dispatch thread for the next grind. A cancelled result is never
+/// consumed.
+pub(crate) fn gpu_blake3_pow_scan_wide(
+    state_digest: &[u8; 32],
+    start: u64,
+    len: u32,
+    bits: u32,
+    cancel: &std::sync::atomic::AtomicBool,
+    park_next: Option<(u32, u32)>,
+) -> Result<Option<u64>, String> {
+    if !gpu_grind_enabled() {
+        return Err("GPU grind disabled".into());
+    }
+    let segs = if grind_seg_enabled() { grind_segs() } else { 1 };
+    let park = park_next.filter(|_| grind_precommit_enabled()).map(|(b, l)| (b, l, segs));
+    imp::gpu_blake3_pow_scan(state_digest, start, len, bits, segs, Some(cancel), park)
+}
+
+/// Kill switch for the event-gated pre-commit of the raced GPU grinds
+/// (`FLOCK_NO_GRIND_PRECOMMIT`, any value: every raced grind encodes and
+/// commits its own scan, as before). The 19-, 18- and 17-bit grinds of the
+/// open run back to back. In the timed prove (M1 Max, 16 proves) the 18- and
+/// 17-bit grinds reached their GPU start 181 and 197 us after the call at the
+/// median: dispatch-thread wake 15/12 us, encode 16/14 us and 141/162 us from
+/// `commit` to GPU start, the GPU having finished the previous grind about
+/// 0.12 ms before.
+///
+/// With the switch unset, while a raced grind of `b` bits runs, its dispatch
+/// thread encodes the segmented scan of the next grind (`b - 1` bits, when
+/// that is still a GPU grind) on a second command queue behind
+/// `encodeWaitForEvent`, reading the digest from a small shared buffer
+/// instead of `setBytes`, with its own result slots, and commits it (it
+/// cannot run yet). The next grind of exactly that shape writes its 24
+/// round-zero words into that buffer and signals the event from the calling
+/// thread, then races as before: the dispatch thread only spins the parked
+/// buffer home with the same segment cut and cancel. Two buffer pairs are
+/// used alternately, so a digest is never written while a scan that reads it
+/// can still run. A parked scan nobody fires (another grind came first) is
+/// released: its slots are zeroed (every thread returns at its first check),
+/// the event is signalled, and the pair is reused only after it completed.
+///
+/// Exactness: the parked scan is the segmented scan of 1dd9295 for the same
+/// range, bits and segments; only the moment the GPU gets the digest
+/// changes. Resources (one queue, one event, four small buffers) are made by
+/// the first park, in the untimed warm-up; no pipeline, no compile.
+pub const ENV_NO_GRIND_PRECOMMIT: &str = "FLOCK_NO_GRIND_PRECOMMIT";
+
+pub(crate) fn grind_precommit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_GRIND_PRECOMMIT).is_none() && grind_seg_enabled() && gpu_grind_enabled()
+    })
+}
+
+/// A parked grind scan that the calling thread has just released (see
+/// [`ENV_NO_GRIND_PRECOMMIT`]).
+pub(crate) use imp::GrindFired;
+
+/// Release the parked scan for a raced grind of `bits` over `[0, len)` with
+/// `state_digest`, if one of exactly that shape is parked (see
+/// [`ENV_NO_GRIND_PRECOMMIT`]). `None`: nothing parked, the incumbent path.
+pub(crate) fn grind_fire_parked(state_digest: &[u8; 32], bits: u32, len: u32) -> Option<GrindFired> {
+    if !grind_precommit_enabled() {
+        return None;
+    }
+    imp::grind_fire_parked(state_digest, bits, len)
+}
+
+/// Spin a fired parked scan home (dispatch thread): the segmented scan's
+/// result for `[0, len)`, or `Ok(None)` once `cancel` was raised. Parks the
+/// scan of `park_next = (bits, len)` first.
+pub(crate) fn gpu_blake3_pow_scan_fired(
+    fired: GrindFired,
+    cancel: &std::sync::atomic::AtomicBool,
+    park_next: Option<(u32, u32)>,
+) -> Result<Option<u64>, String> {
+    let segs = grind_segs();
+    imp::gpu_blake3_pow_scan_fired(fired, cancel, park_next.map(|(b, l)| (b, l, segs)))
 }
 
 /// Env var that disables this round's NTT pass tuning (the g4 shared-table +
@@ -9437,7 +9569,9 @@ kernel void blake3_pow_scan_v2(
                             unsafe extern "C" fn(Id, Sel, u64, u64) -> Id,
                             device,
                             c"newBufferWithLength:options:",
-                            4u64,
+                            // One result slot per segment of a segmented
+                            // scan; the single dispatch uses slot 0.
+                            4u64 * super::GRIND_SEG_SLOTS as u64,
                             0u64
                         );
                         if out.is_null() {
@@ -10152,6 +10286,58 @@ kernel void blake3_pow_scan_v2(
                 let r = self.commit_and_spin_sig(cb, sig.as_ref(), budget_ms);
                 Self::recycle_done(sig);
                 r
+            }
+        }
+
+        /// Commit and spin a buffer home, running `after` right after the
+        /// commit (before the spin and its budget) and calling `poll` on
+        /// every turn of the spin (not during the blocking wait past the
+        /// budget).
+        pub(crate) unsafe fn commit_and_spin_poll_after(
+            &self,
+            cb: Id,
+            budget_ms: f64,
+            after: impl FnOnce(),
+            poll: impl FnMut(),
+        ) -> Result<(), String> {
+            unsafe {
+                let sig = self.arm_done(cb);
+                send!(self.api, unsafe extern "C" fn(Id, Sel), cb, c"commit");
+                after();
+                let r = self.spin_poll(cb, sig.as_ref(), budget_ms, poll);
+                Self::recycle_done(sig);
+                r
+            }
+        }
+
+        /// Spin an already committed buffer home, calling `poll` on every
+        /// turn (the loop of [`Self::commit_and_spin_poll_after`] without the
+        /// commit); past `budget_ms` the exact blocking wait.
+        pub(crate) unsafe fn spin_poll(
+            &self,
+            cb: Id,
+            sig: Option<&DoneSig>,
+            budget_ms: f64,
+            mut poll: impl FnMut(),
+        ) -> Result<(), String> {
+            unsafe {
+                let start = std::time::Instant::now();
+                loop {
+                    poll();
+                    if let Some(s) = sig
+                        && self.done_signaled(s)
+                    {
+                        break self.done_status(cb);
+                    }
+                    let status = self.cb_status(cb);
+                    if status >= 4 {
+                        break self.done_status(cb);
+                    }
+                    if start.elapsed().as_secs_f64() * 1e3 > budget_ms {
+                        break self.wait_cb(cb);
+                    }
+                    std::hint::spin_loop();
+                }
             }
         }
 
@@ -15524,11 +15710,273 @@ kernel void blake3_pow_scan_v2(
         }
     }
 
+    // ---- Grind pre-commit (see `super::ENV_NO_GRIND_PRECOMMIT`) ----
+
+    /// Threadgroup and grid of the v2 scan's segments (the values of
+    /// `gpu_blake3_pow_scan`'s `POW_V2_TG` / `POW_V2_GRID`).
+    const PARK_POW_TG: u64 = 256;
+    const PARK_POW_GRID: u64 = 1 << 16;
+
+    /// One queue (a buffer waiting on an event blocks every later buffer of
+    /// its queue, so not the shared one), one event whose value only grows,
+    /// and two (digest, result slots) buffer pairs used alternately.
+    struct GrindParkRes {
+        queue: usize,
+        ev: usize,
+        pre: [usize; 2],
+        slots: [usize; 2],
+    }
+
+    /// A parked scan: its shape, buffer pair, retained command buffer, done
+    /// signal and the event value it waits for.
+    pub(crate) struct GrindFired {
+        bits: u32,
+        len: u32,
+        segs: u32,
+        idx: usize,
+        cb: usize,
+        sig: Option<DoneSig>,
+        v: u64,
+    }
+
+    struct GrindParkState {
+        res: Option<GrindParkRes>,
+        failed: bool,
+        next_v: u64,
+        next_idx: usize,
+        parked: Option<GrindFired>,
+        /// A released (never fired) scan that may still be in flight on its
+        /// pair: waited for before the pair is reused.
+        draining: [Option<(usize, Option<DoneSig>)>; 2],
+    }
+
+    static GRIND_PARK: std::sync::Mutex<GrindParkState> = std::sync::Mutex::new(GrindParkState {
+        res: None,
+        failed: false,
+        next_v: 0,
+        next_idx: 0,
+        parked: None,
+        draining: [None, None],
+    });
+
+    fn grind_park_lock() -> std::sync::MutexGuard<'static, GrindParkState> {
+        GRIND_PARK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    unsafe fn grind_park_res_create(gpu: &Gpu) -> Option<GrindParkRes> {
+        unsafe {
+            let queue: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newCommandQueue");
+            if queue.is_null() {
+                return None;
+            }
+            let ev: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newSharedEvent");
+            if ev.is_null() {
+                return None;
+            }
+            let slot_bytes = 4 * super::GRIND_SEG_SLOTS as usize;
+            Some(GrindParkRes {
+                queue: queue as usize,
+                ev: ev as usize,
+                pre: [gpu.new_buffer(96).ok()? as usize, gpu.new_buffer(96).ok()? as usize],
+                slots: [
+                    gpu.new_buffer(slot_bytes).ok()? as usize,
+                    gpu.new_buffer(slot_bytes).ok()? as usize,
+                ],
+            })
+        }
+    }
+
+    /// Release a parked scan nobody fired: zero its slots (every thread
+    /// returns at its first check), signal its value, and leave it to drain
+    /// on its pair.
+    unsafe fn grind_release(gpu: &Gpu, st: &mut GrindParkState, p: GrindFired) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let Some(res) = st.res.as_ref() else { return };
+        unsafe {
+            let slots = core::slice::from_raw_parts(
+                gpu.buffer_contents(res.slots[p.idx] as Id).cast::<AtomicU32>(),
+                p.segs as usize,
+            );
+            for slot in slots {
+                slot.store(0, Ordering::Relaxed);
+            }
+            std::sync::atomic::fence(Ordering::SeqCst);
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel, u64), res.ev as Id, c"setSignaledValue:", p.v);
+        }
+        st.draining[p.idx] = Some((p.cb, p.sig));
+    }
+
+    /// Encode and commit the segmented scan of a raced grind of `bits` over
+    /// `[0, len)` in `segs` segments on the grind queue, behind a wait for
+    /// the next event value, and park it. Dispatch thread only.
+    unsafe fn grind_park(gpu: &Gpu, bits: u32, len: u32, segs: u32) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        if !gpu.pow_v2
+            || gpu.pso_pow.is_null()
+            || segs <= 1
+            || segs > super::GRIND_SEG_SLOTS
+            || !len.is_power_of_two()
+            || u64::from(len / segs) < PARK_POW_GRID
+            || !(1..=32).contains(&bits)
+        {
+            return;
+        }
+        let mut st = grind_park_lock();
+        unsafe {
+            if let Some(old) = st.parked.take() {
+                grind_release(gpu, &mut st, old);
+            }
+            if st.res.is_none() {
+                if st.failed {
+                    return;
+                }
+                match grind_park_res_create(gpu) {
+                    Some(r) => st.res = Some(r),
+                    None => {
+                        st.failed = true;
+                        return;
+                    }
+                }
+            }
+            let idx = st.next_idx;
+            if let Some((cb, sig)) = st.draining[idx].take() {
+                let _ = gpu.wait_cb(cb as Id);
+                Gpu::recycle_done(sig);
+                gpu.release(cb as Id);
+            }
+            let Some(res) = st.res.as_ref() else { return };
+            let (queue, ev, pre, slots_buf) =
+                (res.queue as Id, res.ev as Id, res.pre[idx] as Id, res.slots[idx] as Id);
+            let v = st.next_v + 1;
+            let slots =
+                core::slice::from_raw_parts(gpu.buffer_contents(slots_buf).cast::<AtomicU32>(), segs as usize);
+            for slot in slots {
+                slot.store(u32::MAX, Ordering::Relaxed);
+            }
+            let pool = gpu.pool_push();
+            let parked = (|| -> Option<GrindFired> {
+                let cb: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, queue, c"commandBuffer");
+                if cb.is_null() {
+                    return None;
+                }
+                send!(gpu.api, unsafe extern "C" fn(Id, Sel, Id, u64), cb, c"encodeWaitForEvent:value:", ev, v);
+                let enc = gpu.compute_encoder(cb).ok()?;
+                gpu.set_pipeline(enc, gpu.pso_pow);
+                gpu.set_buffer(enc, pre, 0, 0);
+                let seg = len / segs;
+                for k in 0..segs {
+                    let s = u64::from(k) * u64::from(seg);
+                    let seg_params = [s as u32, (s >> 32) as u32, seg, bits];
+                    let seg_bytes = core::slice::from_raw_parts(
+                        seg_params.as_ptr().cast::<u8>(),
+                        core::mem::size_of_val(&seg_params),
+                    );
+                    gpu.set_buffer(enc, slots_buf, 4 * k as usize, 1);
+                    gpu.set_bytes(enc, seg_bytes, 2);
+                    gpu.dispatch(enc, PARK_POW_GRID / PARK_POW_TG, PARK_POW_TG);
+                }
+                gpu.end_encoding(enc);
+                let sig = gpu.arm_done(cb);
+                let cb = gpu.retain(cb);
+                gpu.commit_async(cb);
+                Some(GrindFired { bits, len, segs, idx, cb: cb as usize, sig, v })
+            })();
+            gpu.pool_pop(pool);
+            if let Some(p) = parked {
+                st.next_v = v;
+                st.next_idx = idx ^ 1;
+                st.parked = Some(p);
+            }
+        }
+    }
+
+    /// Calling thread: release the parked scan for `bits` over `[0, len)`
+    /// with this digest, if one of exactly that shape is parked.
+    pub(crate) fn grind_fire_parked(state_digest: &[u8; 32], bits: u32, len: u32) -> Option<GrindFired> {
+        let gpu = gpu().ok()?;
+        let mut st = grind_park_lock();
+        if !st.parked.as_ref().is_some_and(|p| p.bits == bits && p.len == len) {
+            return None;
+        }
+        let p = st.parked.take()?;
+        let res = st.res.as_ref()?;
+        let pre = super::pow_round0_pre(state_digest);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pre.as_ptr().cast::<u8>(),
+                gpu.buffer_contents(res.pre[p.idx] as Id),
+                core::mem::size_of_val(&pre),
+            );
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            send!(gpu.api, unsafe extern "C" fn(Id, Sel, u64), res.ev as Id, c"setSignaledValue:", p.v);
+        }
+        Some(p)
+    }
+
+    /// Dispatch thread: park the next scan (if any), then spin the fired
+    /// one home with the segmented scan's cut and cancel.
+    pub(crate) fn gpu_blake3_pow_scan_fired(
+        p: GrindFired,
+        cancel: &std::sync::atomic::AtomicBool,
+        park_next: Option<(u32, u32, u32)>,
+    ) -> Result<Option<u64>, String> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let gpu = gpu()?;
+        unsafe {
+            if let Some((b, l, sg)) = park_next {
+                grind_park(gpu, b, l, sg);
+            }
+            let slots_buf = grind_park_lock().res.as_ref().map(|r| r.slots[p.idx]);
+            let Some(slots_buf) = slots_buf else {
+                return Err("grind pre-commit buffers missing".into());
+            };
+            let slots =
+                core::slice::from_raw_parts(gpu.buffer_contents(slots_buf as Id).cast::<AtomicU32>(), p.segs as usize);
+            let seg = p.len / p.segs;
+            let mut cut = false;
+            let mut cancelled = false;
+            let r = gpu.spin_poll(p.cb as Id, p.sig.as_ref(), 4.0, || {
+                if cancelled {
+                    return;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    for slot in slots {
+                        slot.store(0, Ordering::Relaxed);
+                    }
+                    cancelled = true;
+                    return;
+                }
+                if cut {
+                    return;
+                }
+                if let Some(k) = slots.iter().position(|s| s.load(Ordering::Relaxed) != u32::MAX) {
+                    for slot in &slots[k + 1..] {
+                        slot.store(0, Ordering::Relaxed);
+                    }
+                    cut = true;
+                }
+            });
+            Gpu::recycle_done(p.sig);
+            gpu.release(p.cb as Id);
+            r?;
+            if cancelled {
+                return Ok(None);
+            }
+            Ok(slots.iter().enumerate().find_map(|(k, slot)| {
+                let v = slot.load(Ordering::Relaxed);
+                (v != u32::MAX).then(|| k as u64 * u64::from(seg) + u64::from(v))
+            }))
+        }
+    }
+
     pub(crate) fn gpu_blake3_pow_scan(
         state_digest: &[u8; 32],
         start: u64,
         len: u32,
         bits: u32,
+        segs: u32,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        park_next: Option<(u32, u32, u32)>,
     ) -> Result<Option<u64>, String> {
         if len == 0 || !(1..=32).contains(&bits) {
             return Err(format!("invalid GPU grind block len={len} bits={bits}"));
@@ -15571,6 +16019,82 @@ kernel void blake3_pow_scan_v2(
                         core::mem::size_of_val(&pre),
                     );
                     gpu.set_bytes(enc, pre_bytes, 0);
+                    // Segmented scan (see `ENV_NO_GRIND_SEG`): whole grids
+                    // per segment only, so each segment keeps the full
+                    // thread grid of the single dispatch.
+                    if segs > 1
+                        && segs <= super::GRIND_SEG_SLOTS
+                        && len.is_power_of_two()
+                        && u64::from(len / segs) >= POW_V2_GRID
+                    {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        let seg = len / segs;
+                        let slots = core::slice::from_raw_parts(
+                            out.cast::<AtomicU32>(),
+                            segs as usize,
+                        );
+                        for slot in slots {
+                            slot.store(u32::MAX, Ordering::Relaxed);
+                        }
+                        for k in 0..segs {
+                            let s = start + u64::from(k) * u64::from(seg);
+                            let seg_params = [s as u32, (s >> 32) as u32, seg, bits];
+                            let seg_bytes = core::slice::from_raw_parts(
+                                seg_params.as_ptr().cast::<u8>(),
+                                core::mem::size_of_val(&seg_params),
+                            );
+                            gpu.set_buffer(enc, gpu.pow_out, 4 * k as usize, 1);
+                            gpu.set_bytes(enc, seg_bytes, 2);
+                            gpu.dispatch(enc, POW_V2_GRID / POW_V2_TG, POW_V2_TG);
+                        }
+                        gpu.end_encoding(enc);
+                        // Zero the slots above the first segment seen with a
+                        // match, once: the slot read then is the GPU's own
+                        // store, never one of these zeroes.
+                        let mut cut = false;
+                        let mut cancelled = false;
+                        // Pre-commit (see `ENV_NO_GRIND_PRECOMMIT`): park
+                        // the next grind's scan while this one starts.
+                        let park = || {
+                            if let Some((b, l, sg)) = park_next {
+                                grind_park(gpu, b, l, sg);
+                            }
+                        };
+                        gpu.commit_and_spin_poll_after(cb, 4.0, park, || {
+                            if cancelled {
+                                return;
+                            }
+                            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                                // Result no longer wanted: end every segment
+                                // that has not started.
+                                for slot in slots {
+                                    slot.store(0, Ordering::Relaxed);
+                                }
+                                cancelled = true;
+                                return;
+                            }
+                            if cut {
+                                return;
+                            }
+                            if let Some(k) =
+                                slots.iter().position(|s| s.load(Ordering::Relaxed) != u32::MAX)
+                            {
+                                for slot in &slots[k + 1..] {
+                                    slot.store(0, Ordering::Relaxed);
+                                }
+                                cut = true;
+                            }
+                        })?;
+                        if cancelled {
+                            return Ok(None);
+                        }
+                        let hit = slots.iter().enumerate().find_map(|(k, slot)| {
+                            let v = slot.load(Ordering::Relaxed);
+                            (v != u32::MAX)
+                                .then(|| start + k as u64 * u64::from(seg) + u64::from(v))
+                        });
+                        return Ok(hit);
+                    }
                     gpu.set_buffer(enc, gpu.pow_out, 0, 1);
                     gpu.set_bytes(enc, params_bytes, 2);
                     let groups = u64::from(len).div_ceil(POW_V2_TG).min(POW_V2_GRID / POW_V2_TG);
@@ -25741,6 +26265,23 @@ mod imp {
         _start: u64,
         _len: u32,
         _bits: u32,
+        _segs: u32,
+        _cancel: Option<&std::sync::atomic::AtomicBool>,
+        _park_next: Option<(u32, u32, u32)>,
+    ) -> Result<Option<u64>, String> {
+        Err("GPU grind is only available on macOS/aarch64".into())
+    }
+
+    pub(crate) struct GrindFired;
+
+    pub(crate) fn grind_fire_parked(_state_digest: &[u8; 32], _bits: u32, _len: u32) -> Option<GrindFired> {
+        None
+    }
+
+    pub(crate) fn gpu_blake3_pow_scan_fired(
+        _fired: GrindFired,
+        _cancel: &std::sync::atomic::AtomicBool,
+        _park_next: Option<(u32, u32, u32)>,
     ) -> Result<Option<u64>, String> {
         Err("GPU grind is only available on macOS/aarch64".into())
     }
