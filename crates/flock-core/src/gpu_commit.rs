@@ -856,6 +856,15 @@ pub const ENV_NO_ZC_K_GPU: &str = "FLOCK_NO_ZC_K_GPU";
 /// loudly.
 pub const ENV_ZC_K_GPU_CHUNKS: &str = "FLOCK_ZC_K_GPU_CHUNKS";
 const ZC_K_GPU_DEFAULT_CHUNKS: usize = 384;
+/// GPU range with the CPU/GPU split ([`zc_k_steal_enabled`]): the CPU takes
+/// chunks from its top while the GPU has not reached them, so the range only
+/// bounds the GPU's part from above. Each range chunk costs a little even when
+/// the CPU takes it (its anchors view is mapped in round two, its skipped
+/// superblocks still load the tables), so the range is set just above the
+/// GPU's part on the ranked runner: an official run with a fixed 896 read
+/// about 1.4 ms slower than the fixed 768 (about 10.5 us per chunk on the
+/// runner's GPU), which puts the balance there near 750-810 chunks.
+const ZC_K_GPU_STEAL_DEFAULT_CHUNKS: usize = 832;
 
 /// Kill switch for mapping the K pass arm's anchors view during round two
 /// (`FLOCK_NO_ZC_K_PREMAP`, any value): the K launch then creates the view
@@ -896,6 +905,20 @@ pub(crate) fn zc_k_v2_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the K arm's CPU/GPU chunk split (`FLOCK_NO_ZC_K_STEAL`,
+/// any value): the fixed split at the share. With it on (and the faster
+/// kernel), the CPU queue, once its own chunks are done, takes chunks of the
+/// GPU range from the top down, each only if no superblock of it has started
+/// on the GPU (a per-chunk claim word, 0 -> 1 on the CPU, bit 1 ORed by every
+/// GPU superblock, which skips a chunk the CPU holds). The split then settles
+/// where the two arms meet, on any machine. Same chunk values either way.
+/// Read once per process.
+pub(crate) fn zc_k_steal_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_K_STEAL").is_none());
+    *ON
+}
+
 /// Whether [`gpu_zc_k_share`] is the faster kernel's default share (no
 /// explicit `FLOCK_ZC_K_GPU_CHUNKS`).
 pub(crate) fn zc_k_share_is_v2_default() -> bool {
@@ -915,6 +938,7 @@ pub(crate) fn gpu_zc_k_share() -> usize {
             return 0;
         }
         match std::env::var_os(ENV_ZC_K_GPU_CHUNKS) {
+            None if zc_k_v2_enabled() && zc_k_steal_enabled() => ZC_K_GPU_STEAL_DEFAULT_CHUNKS,
             None if zc_k_v2_enabled() => ZC_K_GPU_V2_DEFAULT_CHUNKS,
             None => ZC_K_GPU_DEFAULT_CHUNKS,
             Some(value) => value
@@ -4255,7 +4279,9 @@ struct ZcKParams {
     uint d_base;
     uint d_stride;
     uint d_shift;
-    uint pad0;
+    // Index of the skipped-superblock counter in `claim` (zc_k_fold_v2);
+    // chunk c's claim word is claim[32 c] (one 128-byte line each).
+    uint n_claim;
     uint pad1;
     uint pad2;
 };
@@ -4280,6 +4306,7 @@ kernel void zc_k_fold_v2(
     device uint4*       tg_part [[buffer(6)]],
     constant ZcKParams& p       [[buffer(7)]],
     device atomic_uint* flag    [[buffer(8)]],
+    device atomic_uint* claim   [[buffer(9)]],
     uint tg  [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     ushort sl [[thread_index_in_simdgroup]],
@@ -4288,10 +4315,25 @@ kernel void zc_k_fold_v2(
     threadgroup uint4 nib[256];
     threadgroup uint4 rtab[512];
     threadgroup uint4 sred[8][8];
+    threadgroup uint skip;
+    // Chunk claim (bit 1 = GPU, bit 0 = CPU): the CPU takes a chunk only by
+    // moving its word from 0 to 1, so a chunk with the CPU bit was never
+    // started here, and every superblock of it is skipped. (The claim's
+    // latency overlaps the table loads; one barrier serves both.)
+    if (lid == 0u) {
+        uint prev = atomic_fetch_or_explicit(&claim[(tg / p.sb_per_chunk) * 32u], 2u, memory_order_relaxed);
+        skip = prev & 1u;
+        if (skip != 0u) {
+            atomic_fetch_add_explicit(&claim[p.n_claim], 1u, memory_order_relaxed);
+        }
+    }
     nib[lid] = nib_dev[lid];
     rtab[lid] = nib_dev[256u + lid];
     rtab[256u + lid] = nib_dev[512u + lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (skip != 0u) {
+        return;
+    }
 
     uint i = lid & 63u;
     uint k = lid >> 6u;
@@ -22265,6 +22307,10 @@ kernel void zc_ab_finish(
         flag_buf: Id,
         /// Scratch output of the round-two premap touch dispatch.
         touch_buf: Id,
+        /// Per-chunk claim words of the CPU/GPU split (`zc_k_fold_v2`), one
+        /// per 128-byte line (word 32 c), then the skipped-superblock counter
+        /// (word 32 chunks).
+        claim_buf: Id,
         chunks: usize,
         per_chunk_a: usize,
         per_chunk_b: usize,
@@ -22543,7 +22589,7 @@ kernel void zc_ab_finish(
             if super::gpu_zc_k_debug() {
                 eprintln!("[zc-k-gpu] pipelines: {how} (joined after {wait_ms:.2} ms)");
             }
-            let mut made: Vec<Id> = Vec::with_capacity(8);
+            let mut made: Vec<Id> = Vec::with_capacity(9);
             for len in [
                 (256 + 512) * 16,
                 (2 + n_weights + chunks) * 16,
@@ -22553,6 +22599,7 @@ kernel void zc_ab_finish(
                 chunks * 8 * 16,
                 16,
                 8 * 16,
+                (chunks + 1) * 128,
             ] {
                 match gpu.new_buffer(len) {
                     Ok(b) => made.push(b),
@@ -22563,6 +22610,18 @@ kernel void zc_ab_finish(
                         gpu.release(fold_pso);
                         gpu.release(finish_pso);
                         return Err(e);
+                    }
+                }
+            }
+            // Map the output buffers' pages for the CPU now (warm-up): the CPU
+            // writes the chunks it takes from the GPU range into them and the
+            // tri pass reads them, and first touches in a timed prove would
+            // fault page by page (`FLOCK_NO_ZC_K_PRETOUCH` skips this).
+            if std::env::var_os("FLOCK_NO_ZC_K_PRETOUCH").is_none() {
+                for (buf, len) in [(made[2], chunks * per_chunk_a * 16), (made[3], chunks * per_chunk_b * 16)] {
+                    let p = gpu.buffer_contents(buf).cast::<u8>();
+                    for off in (0..len).step_by(16384) {
+                        p.add(off).write_volatile(0);
                     }
                 }
             }
@@ -22577,6 +22636,7 @@ kernel void zc_ab_finish(
                 part_buf: made[5],
                 flag_buf: made[6],
                 touch_buf: made[7],
+                claim_buf: made[8],
                 chunks,
                 per_chunk_a,
                 per_chunk_b,
@@ -22597,6 +22657,12 @@ kernel void zc_ab_finish(
         per_chunk_b: usize,
         calibration: bool,
         submitted: std::time::Instant,
+        /// The CPU may take chunks of the GPU range from its top
+        /// ([`ZcKJob::try_take`]); the claim words and the output buffers.
+        steal: bool,
+        claim: usize,
+        out_a: usize,
+        out_b: usize,
     }
 
     // SAFETY: the handles are only waited/released by the launching thread;
@@ -22617,6 +22683,62 @@ kernel void zc_ab_finish(
         /// GPU prefix length in chunks.
         pub(crate) fn chunks(&self) -> usize {
             self.chunks
+        }
+
+        /// The CPU's handle on the GPU range's chunks (`FLOCK_NO_ZC_K_STEAL`
+        /// kills; never in the oracle probe or with the embedded kernel).
+        pub(crate) fn steal(&self) -> Option<ZcKSteal> {
+            self.steal.then_some(ZcKSteal {
+                claim: self.claim,
+                out_a: self.out_a,
+                out_b: self.out_b,
+                chunks: self.chunks,
+                per_chunk_a: self.per_chunk_a,
+                per_chunk_b: self.per_chunk_b,
+            })
+        }
+    }
+
+    /// Claim words and output buffers of an in-flight K GPU range, for the
+    /// CPU queue's workers.
+    #[derive(Clone, Copy)]
+    pub(crate) struct ZcKSteal {
+        claim: usize,
+        out_a: usize,
+        out_b: usize,
+        chunks: usize,
+        per_chunk_a: usize,
+        per_chunk_b: usize,
+    }
+
+    impl ZcKSteal {
+        /// Claim GPU-range chunk `c` for the CPU: true when no superblock of
+        /// it has started on the GPU (its claim word moves from 0 to 1, and
+        /// the kernel then skips every superblock of it). The CPU then folds
+        /// it into [`ZcKSteal::outputs`].
+        pub(crate) fn try_take(&self, c: usize) -> bool {
+            if c >= self.chunks {
+                return false;
+            }
+            // SAFETY: `claim` holds `32 (chunks + 1)` u32 words of a shared
+            // buffer that lives for the process; the GPU only ORs bit 1 into
+            // chunk words. Should a GPU atomic ever miss the CPU's bit, both
+            // sides fold the chunk to the same values (the CPU's are used),
+            // and no chunk is skipped by both: a skip needs the bit, which
+            // only a successful take sets.
+            let word = unsafe { std::sync::atomic::AtomicU32::from_ptr((self.claim as *mut u32).add(32 * c)) };
+            word.compare_exchange(0, 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed)
+                .is_ok()
+        }
+
+        /// Where GPU-range chunk `c`'s packed outputs live (the tri pass reads
+        /// the whole range there): a and b pointers.
+        pub(crate) fn outputs(&self, c: usize) -> (*mut F128, *mut F128) {
+            debug_assert!(c < self.chunks);
+            (
+                (self.out_a as *mut F128).wrapping_add(c * self.per_chunk_a),
+                (self.out_b as *mut F128).wrapping_add(c * self.per_chunk_b),
+            )
         }
     }
 
@@ -22709,7 +22831,9 @@ kernel void zc_ab_finish(
             return;
         };
         unsafe {
+            crate::tmark::mark("premap wrap start");
             let Ok(view) = gpu.wrap_buffer(anchors.as_ptr().cast::<u8>().cast_mut(), len) else { return };
+            crate::tmark::mark("premap wrapped");
             #[repr(C)]
             struct P {
                 sb_per_chunk: u32,
@@ -22992,6 +23116,10 @@ kernel void zc_ab_finish(
             }
             std::ptr::copy_nonoverlapping(eq_hi.as_ptr(), consts.add(2 + n_weights), chunks);
             *gpu.buffer_contents(state.flag_buf).cast::<u32>() = 0;
+            let claim = gpu.buffer_contents(state.claim_buf).cast::<u32>();
+            for c in 0..=chunks {
+                claim.add(32 * c).write(0);
+            }
             #[repr(C)]
             struct P {
                 sb_per_chunk: u32,
@@ -23015,7 +23143,7 @@ kernel void zc_ab_finish(
                 d_base: (layout.d_base / 16) as u32,
                 d_stride: (layout.d_stride / 16) as u32,
                 d_shift: (layout.d_shift / 16) as u32,
-                pad: [0; 3],
+                pad: [(32 * chunks) as u32, 0, 0],
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let pool = gpu.pool_push();
@@ -23032,6 +23160,7 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.tgp_buf, 0, 6);
                 gpu.set_bytes(enc, pb, 7);
                 gpu.set_buffer(enc, state.flag_buf, 0, 8);
+                gpu.set_buffer(enc, state.claim_buf, 0, 9);
                 gpu.dispatch(enc, (chunks * sb_per_chunk) as u64, 256);
                 // Serial dispatches of one encoder: the finish reads the
                 // superblock sums the fold wrote.
@@ -23044,6 +23173,7 @@ kernel void zc_ab_finish(
                 gpu.end_encoding(enc);
                 let cb = gpu.retain(cb);
                 gpu.commit_async(cb);
+                crate::tmark::mark("k gpu committed");
                 Ok(cb)
             })();
             gpu.pool_pop(pool);
@@ -23056,6 +23186,12 @@ kernel void zc_ab_finish(
                     per_chunk_b,
                     calibration: mode == ZC_K_UNCALIBRATED,
                     submitted: std::time::Instant::now(),
+                    steal: mode != ZC_K_UNCALIBRATED
+                        && ZC_K_V2_ACTIVE.load(Ordering::Relaxed)
+                        && super::zc_k_steal_enabled(),
+                    claim: claim as usize,
+                    out_a: gpu.buffer_contents(state.out_a) as usize,
+                    out_b: gpu.buffer_contents(state.out_b) as usize,
                 }),
                 Err(e) => {
                     if debug {
@@ -23085,6 +23221,10 @@ kernel void zc_ab_finish(
             let ok = gpu.spin_wait_cb(job.cb, 2.0);
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let gpu_ms = if ok.is_ok() { zc_fold_gpu_wall_ms(gpu, job.cb) } else { 0.0 };
+            if ok.is_ok() && crate::tmark::on() {
+                let (s, e) = cb_gpu_interval(gpu, job.cb);
+                crate::tmark::mark_gpu("k gpu start", "k gpu end", s, e);
+            }
             gpu.release(job.cb);
             for v in job.views {
                 gpu.release(v);
@@ -23113,12 +23253,13 @@ kernel void zc_ab_finish(
             let a = gpu.buffer_contents(state.out_a).cast::<F128>().cast_const();
             let b = gpu.buffer_contents(state.out_b).cast::<F128>().cast_const();
             let b_ones = *gpu.buffer_contents(state.flag_buf).cast::<u32>() == 0;
+            let skipped = *gpu.buffer_contents(state.claim_buf).cast::<u32>().add(32 * job.chunks);
             drop(state);
             if debug && !job.calibration {
                 let fired = ZC_K_FIRED.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!(
                     "[zc-k-gpu] fired: GPU prefix {}/{hi_size} K chunks (CPU folded {}), gpu={gpu_ms:.2}ms \
-                     submit-to-drain={:.2}ms wait={wait_ms:.3}ms fired_proves={fired}",
+                     submit-to-drain={:.2}ms wait={wait_ms:.3}ms fired_proves={fired} skipped_sb={skipped}",
                     job.chunks,
                     hi_size - job.chunks,
                     job.submitted.elapsed().as_secs_f64() * 1e3,
@@ -25263,7 +25404,7 @@ pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm
 /// Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
-    ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_launch_share, zc_k_premap, zc_k_prewarm,
+    ZcKJob, ZcKLayout, ZcKResult, ZcKSteal, launch_zc_k_prefix, zc_k_launch_share, zc_k_premap, zc_k_prewarm,
     zc_k_prewarm_wanted, zc_k_verdict, zc_k_wait,
 };
 

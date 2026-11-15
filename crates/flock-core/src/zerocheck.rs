@@ -1019,6 +1019,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         // Rounds three and four now fold together in one pass over the compact
         // state, replacing the T3 reconstruction *and* tail iteration i = 1.
         let t_k = std::time::Instant::now();
+        crate::tmark::mark("k call");
         let n_groups = compact_mlv.len() / 2;
         let mut r_next4 = vec![F128::ONE; n_mlv - 2];
         r_next4[1..].copy_from_slice(&r[k_skip + 3..]);
@@ -1044,6 +1045,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     tri_steps > 0 && multilinear::zc_k_dead_pack_enabled(),
                     true,
                 );
+            crate::tmark::mark("k returned");
             if tail_round_timing {
                 eprintln!(
                     "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}, tail_compact={}, head_compact={}, packed={packed}, bpacked={bpacked}): {:.2} ms",
@@ -1071,6 +1073,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             // i = 3: their 512 MiB + 256 MiB reads and 256 MiB + 128 MiB
             // writes become one 512 MiB read + 128 MiB write.
             let t_c = std::time::Instant::now();
+            crate::tmark::mark("c56 start");
             let quarter = n_groups / 4;
             let mut r_next6 = vec![F128::ONE; n_mlv - 4];
             r_next6[1..].copy_from_slice(&r[k_skip + 5..]);
@@ -1094,6 +1097,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     &mlv_rhos[2..4],
                     &r_next6,
                 );
+                crate::tmark::mark("c56 end");
                 if tail_round_timing {
                     eprintln!(
                         "[zc-tail-rounds] composed rounds 5+6 fold (tri +la7 +la8, out n={quarter}): {:.2} ms",
