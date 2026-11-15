@@ -104,6 +104,8 @@ use kernels::aarch64::{
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_prescaled_8;
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) use kernels::aarch64::init_r2_memory_paths;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
     fold2_and_message_lookahead_normal_expanded_aarch64,
@@ -3011,7 +3013,6 @@ fn fold2_compact_and_round45_into_packed_b(
     let gpu_job = {
         let share = crate::gpu_commit::gpu_zc_k_share().min(hi_size);
         if gpu && bpack && compact.tail_compact && share > 0 {
-            let share = crate::gpu_commit::zc_k_launch_share().min(hi_size);
             let hc = compact.head_compact;
             let layout = crate::gpu_commit::ZcKLayout {
                 hc,
