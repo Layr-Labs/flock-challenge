@@ -27,6 +27,10 @@ use crate::field::F128;
 use crate::hash::HashKind;
 use sha2::{Digest, Sha256};
 
+#[path = "pow_first_hit.rs"]
+mod pow_first_hit;
+pub(crate) use pow_first_hit::enabled as pow_first_hit_enabled;
+
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
 // single-thread rayon pool (see `verifier::verifier_pool`), so the challenger
 // it threads through must be able to cross into that pool. Both concrete
@@ -489,6 +493,7 @@ impl Challenger for FsChallenger {
     fn grind_pow(&mut self, bits: u32) -> u64 {
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
+        let trace_started = (bits > 0 && grind_trace_enabled()).then(std::time::Instant::now);
         // Aggregate-aware parallelism: decide on the grind's *expected hash
         // work* (`2^bits`), not a raw bit threshold. Fold-challenge grinds are
         // individually modest — e.g. 2^15 at L0 under the per-round profiles —
@@ -511,7 +516,11 @@ impl Challenger for FsChallenger {
         // scanned/`find_first`ed in ascending order and each returns its
         // smallest match, so the result stays the globally smallest.
         const GRIND_CHUNK: u64 = 960;
+        let first_hit = pow_first_hit::enabled();
         let cpu_scan = || {
+            if first_hit && (1u64 << bits.min(63)) >= PARALLEL_GRIND_MIN_HASHES {
+                return pow_first_hit::cpu_nonce(&state_digest, bits, kind);
+            }
             if bits == 0 {
                 0
             } else if (1u64 << bits.min(63)) < PARALLEL_GRIND_MIN_HASHES {
@@ -757,6 +766,12 @@ impl Challenger for FsChallenger {
         // Absorb the nonce so subsequent transcript state binds to it.
         // Verifier mirrors via verify_pow.
         self.observe_bytes(&nonce.to_le_bytes());
+        if let Some(started) = trace_started {
+            eprintln!(
+                "[grind] bits={bits} first_hit={first_hit} nonce={nonce} wall={:.3} ms",
+                started.elapsed().as_secs_f64() * 1e3,
+            );
+        }
         nonce
     }
 
@@ -962,8 +977,9 @@ mod grind_worker {
         start: u64,
         len: u32,
         bits: u32,
-        stop: Arc<AtomicBool>,
+        stop: Option<Arc<AtomicBool>>,
         abort: bool,
+        first_hit: Option<Arc<super::pow_first_hit::Winner>>,
         done: Sender<Result<Option<u64>, String>>,
     }
 
@@ -983,14 +999,31 @@ mod grind_worker {
                 .name("flock-grind-dispatch".into())
                 .spawn(move || {
                     while let Ok(job) = rx.recv() {
-                        let res = crate::gpu_commit::gpu_blake3_pow_scan(
-                            &job.digest,
-                            job.start,
-                            job.len,
-                            job.bits,
-                        );
+                        let res = if let Some(winner) = &job.first_hit {
+                            let res = if winner.get().is_some() {
+                                Ok(None)
+                            } else {
+                                crate::gpu_commit::gpu_blake3_pow_scan_first(
+                                    &job.digest, job.start, job.len, job.bits,
+                                )
+                            };
+                            match &res {
+                                Ok(Some(nonce)) => winner.offer(*nonce),
+                                Err(_) => super::GPU_GRIND_FAILED.store(
+                                    true, std::sync::atomic::Ordering::Relaxed,
+                                ),
+                                Ok(None) => {}
+                            }
+                            res
+                        } else {
+                            crate::gpu_commit::gpu_blake3_pow_scan(
+                                &job.digest, job.start, job.len, job.bits,
+                            )
+                        };
                         if job.abort && matches!(&res, Ok(Some(_))) {
-                            job.stop.store(true, std::sync::atomic::Ordering::Release);
+                            if let Some(stop) = &job.stop {
+                                stop.store(true, std::sync::atomic::Ordering::Release);
+                            }
                         }
                         let _ = job.done.send(res);
                     }
@@ -1026,8 +1059,9 @@ mod grind_worker {
             start,
             len,
             bits,
-            stop,
+            stop: Some(stop),
             abort,
+            first_hit: None,
             done: done_tx,
         };
         if w.tx.send(job).is_err() {
@@ -1038,6 +1072,27 @@ mod grind_worker {
             return Some(done_rx);
         }
         Some(done_rx)
+    }
+
+    pub(super) fn dispatch_first_hit(
+        digest: &[u8; 32],
+        start: u64,
+        len: u32,
+        bits: u32,
+        winner: Arc<super::pow_first_hit::Winner>,
+    ) -> Option<Receiver<Result<Option<u64>, String>>> {
+        let w = worker()?;
+        let (done, rx) = channel();
+        let job = Job {
+            digest: *digest, start, len, bits,
+            stop: None, abort: false,
+            first_hit: Some(winner), done,
+        };
+        // Failure leaves the CPU search live; it uses no GPU result.
+        if w.tx.send(job).is_err() {
+            super::GPU_GRIND_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(rx)
     }
 
     /// Receive one result from [`dispatch_async`], mapping a closed channel
@@ -1180,6 +1235,9 @@ fn cpu_race_scan(
 
 fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, String> {
     debug_assert!((GPU_GRIND_MIN_BITS..=32).contains(&bits));
+    if pow_first_hit::enabled() {
+        return pow_first_hit::gpu_nonce(state_digest, bits);
+    }
     // Wide policy: one dispatch covers 2^GPU_GRIND_WIDE_EXTRA_BITS expected-
     // work blocks, so it misses with probability e^-4 (1.8%) instead of e^-1
     // (37%). The kernel's early exit (`id >= best`) retires the lanes past
@@ -1874,15 +1932,10 @@ mod tests {
             .collect()
     }
 
-    /// The two-pool early-exit grind must emit exactly the smallest
-    /// satisfying nonce — proof bytes depend on it. The oracle is the
-    /// library's own `pow_scan` over ascending blocks, which is the
-    /// sequential search's definition of "globally smallest". bits = 14
-    /// crosses both the parallel threshold (2^13 expected hashes) and, on
-    /// hosts with a helper pool, the grind's epool engagement floor, so this
-    /// exercises the heterogeneous claim/bound/re-derive path end to end.
+    /// Both two-pool policies must meet the scalar predicate. The ordered
+    /// rollback must additionally agree with the sequential minimum oracle.
     #[test]
-    fn grind_two_pool_matches_sequential_scan_smallest() {
+    fn grind_two_pool_meets_target_and_ordered_minimum() {
         for kind in KINDS {
             let mut ch = FsChallenger::with_hash(b"grind-2pool-test", kind);
             ch.observe_label(b"flock-grind-2pool");
@@ -1897,7 +1950,10 @@ mod tests {
                 }
                 block_start += 4096;
             };
-            assert_eq!(nonce, expect, "kind={kind:?}");
+            assert!(pow_has_leading_zero_bits(&digest, nonce, bits, kind));
+            if !pow_first_hit::enabled() {
+                assert_eq!(nonce, expect, "kind={kind:?}");
+            }
         }
     }
 
@@ -1927,6 +1983,24 @@ mod tests {
                     assert_eq!(prover.sample_f128(), verifier.sample_f128());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn fs_challenger_pow_accepts_nonminimum_and_replays_challenges() {
+        for kind in KINDS {
+            let mut prover = FsChallenger::with_hash(b"pow-any", kind);
+            prover.observe_bytes(b"root");
+            let mut verifier = FsChallenger::with_hash(b"pow-any", kind);
+            verifier.observe_bytes(b"root");
+            let digest = prover.state_digest();
+            let first = (0..).find(|&n| pow_has_leading_zero_bits(&digest, n, 4, kind)).unwrap();
+            let later = (first + 1..)
+                .find(|&n| pow_has_leading_zero_bits(&digest, n, 4, kind)).unwrap();
+            assert!(later > first);
+            assert!(verifier.verify_pow(later, 4));
+            prover.observe_bytes(&later.to_le_bytes());
+            assert_eq!(prover.sample_f128_vec(4), verifier.sample_f128_vec(4));
         }
     }
 
@@ -2135,9 +2209,8 @@ mod tests {
         }
     }
 
-    /// Fixed-seed transcripts must grind to the identical nonce under the
-    /// dispatching scan (register-resident kernel on Apple AArch64) as the
-    /// sequential generic oracle — proof bytes depend on the exact nonce.
+    /// The dispatching scan must meet the generic predicate; the ordered
+    /// rollback must also retain the generic scanner's exact nonce.
     #[test]
     fn grind_reg_selects_identical_nonces_fixed_seeds() {
         for seed in [424242u64, 777, 1, 0xDEAD_BEEF] {
@@ -2153,7 +2226,10 @@ mod tests {
                     }
                     start += 4096;
                 };
-                assert_eq!(nonce, expect, "seed={seed} bits={bits}");
+                assert!(pow_has_leading_zero_bits(&digest, nonce, bits, HashKind::Blake3));
+                if !pow_first_hit::enabled() {
+                    assert_eq!(nonce, expect, "seed={seed} bits={bits}");
+                }
             }
         }
     }
@@ -2185,11 +2261,8 @@ mod tests {
         );
     }
 
-    /// The hybrid GPU/CPU-prefetch block walk must select the identical
-    /// nonce as the sequential generic oracle — proof bytes depend on the
-    /// exact nonce, so the prefetch's "GPU block first, CPU next-block on a
-    /// miss" merge is held to bit-exactness on real Metal hardware. Skips
-    /// where no GPU grind pipeline is available.
+    /// The GPU/CPU search must meet the generic predicate. Its ordered
+    /// rollback must also select the sequential minimum. Requires Metal.
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn gpu_grind_hybrid_nonce_matches_generic_oracle() {
@@ -2210,7 +2283,10 @@ mod tests {
                     }
                     start += 4096;
                 };
-                assert_eq!(got, expect, "seed={seed} bits={bits}");
+                assert!(pow_has_leading_zero_bits(&digest, got, bits, HashKind::Blake3));
+                if !pow_first_hit::enabled() {
+                    assert_eq!(got, expect, "seed={seed} bits={bits}");
+                }
             }
         }
     }
@@ -2328,12 +2404,10 @@ mod tests {
         );
     }
 
-    /// The grind must return the globally smallest satisfying nonce, on both
-    /// the sequential and the block-parallel path, and under both hashes.
-    /// Proof determinism depends on it: a different nonce is a different
-    /// transcript and therefore a different proof.
+    /// Every policy meets the target; sequential and ordered searches also
+    /// retain their minimum-nonce contract under both hashes.
     #[test]
-    fn fs_challenger_grind_returns_smallest_nonce() {
+    fn fs_challenger_grind_meets_target_and_ordered_minimum() {
         for kind in KINDS {
             // 4 bits stays sequential; 14 crosses PARALLEL_GRIND_MIN_HASHES.
             for bits in [4u32, 14] {
@@ -2346,11 +2420,13 @@ mod tests {
                 };
                 let nonce = ch.grind_pow(bits);
                 // Every smaller nonce must fail the scalar check.
-                for n in 0..nonce {
-                    assert!(
-                        !pow_has_leading_zero_bits(&digest_probe, n, bits, kind),
-                        "{kind} bits={bits}: nonce {n} < {nonce} also satisfies the PoW"
-                    );
+                if bits < 13 || !pow_first_hit::enabled() {
+                    for n in 0..nonce {
+                        assert!(
+                            !pow_has_leading_zero_bits(&digest_probe, n, bits, kind),
+                            "{kind} bits={bits}: nonce {n} < {nonce} also satisfies the PoW"
+                        );
+                    }
                 }
                 assert!(
                     pow_has_leading_zero_bits(&digest_probe, nonce, bits, kind),
