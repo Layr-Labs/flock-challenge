@@ -10007,6 +10007,43 @@ kernel void blake3_pow_scan(
                 }
             }
         }
+    /// Bounded status poll on an already-committed command buffer that
+    /// never falls back to the blocking wait: past the deadline it
+    /// returns Err, and the caller degrades to its CPU fallback instead
+    /// of hanging the prove past the harness deadline. Read-only.
+    #[allow(dead_code)]
+    unsafe fn zc_wait_cb_deadline(
+        &self,
+        cb: Id,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        unsafe {
+            loop {
+                let status: u64 = send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    cb,
+                    c"status"
+                );
+                if status >= 4 {
+                    if status == 4 {
+                        return Ok(());
+                    }
+                    let err: Id =
+                        send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                    return Err(format!(
+                        "command buffer status {status}: {}",
+                        self.api.error_string(err)
+                    ));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("gpu wait timeout".to_string());
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+
 
         pub(crate) unsafe fn commit_and_wait(&self, cb: Id) -> Result<(), String> {
             unsafe {
@@ -20662,6 +20699,8 @@ kernel void zc_ab_finish(
     const ZC_AB_UNCALIBRATED: u8 = 0;
     const ZC_AB_ADMITTED: u8 = 1;
     const ZC_AB_DISABLED: u8 = 2;
+    /// Wall-clock budget for the round-1 AB completion arm's GPU waits.
+    const ZC_AB_WAIT_BUDGET_MS: u64 = 250;
     /// Proves whose AB message folded GPU partials (diagnostic receipt).
     static ZC_AB_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -21041,7 +21080,16 @@ kernel void zc_ab_finish(
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
             // the table build; the table build's status is checked too.
-            let ok = gpu.spin_wait_cb(job.cb, 2.0).and_then(|()| gpu.wait_cb(job.cb_tables));
+            //
+            // Both waits are bounded: past the budget they return Err and
+            // this trial's prefix falls back to the CPU arm, which produces
+            // byte-identical proofs, instead of parking the spine into the
+            // harness deadline.
+            let wait_deadline =
+                waited + std::time::Duration::from_millis(ZC_AB_WAIT_BUDGET_MS);
+            let ok = gpu
+                .zc_wait_cb_deadline(job.cb, wait_deadline)
+                .and_then(|()| gpu.zc_wait_cb_deadline(job.cb_tables, wait_deadline));
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let (tables_ms, gather_ms) = if ok.is_ok() {
                 (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
