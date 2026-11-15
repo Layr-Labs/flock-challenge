@@ -802,7 +802,42 @@ pub struct Round1AbInner {
     /// of the allocation only on such a hit (allocation identity), and
     /// re-wraps otherwise. Never read by any CPU computation.
     provenance_hit: bool,
+    /// Lane abtf: the producer skipped the TRANSFORM (not the production)
+    /// of every window from `from_window` on; those backing windows hold no
+    /// output of this prove and only the folded completion, given the
+    /// complete A/B rows, may consume them (it re-transforms each unit into a
+    /// worker-local buffer). `None` everywhere else.
+    tail_deferral: Option<AbTailDeferral>,
 }
+
+/// Lane abtf: what the folded completion needs to re-run the skipped
+/// transform exactly as the producer would have (same fast policy, static-B
+/// context and window-rows trim selection).
+#[derive(Clone, Copy)]
+struct AbTailDeferral {
+    from_window: usize,
+    fast_policy: bool,
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+    transform_trim: bool,
+}
+
+/// Lane abtf: the complete packed A/B rows (and the inverse-NTT table) the
+/// folded completion re-transforms deferred tail units from. Borrowed for
+/// the completion call only.
+#[derive(Clone, Copy)]
+pub(crate) struct AbTailSource<'a> {
+    pub(crate) a_packed: &'a [u8],
+    pub(crate) b_packed: &'a [u8],
+    pub(crate) inv_table: &'a InvNttTableByteSingleGf8,
+}
+
+/// Lane abtf: trailing `x_hi` chunks whose transform moves from the
+/// precompute into the folded completion (ranked: 8 of 128).
+const AB_TAIL_DEFER_CHUNKS: usize = 8;
+
+/// Bytes of one round-one AB transform window (16 medium rows of 64 bytes).
+const AB_WINDOW_BYTES: usize = (1 << N_MEDIUM) * 64;
 
 /// Representation carried with the large round-one AB transform backing.
 /// An omitted buffer is a residual component and must never reach a consumer
@@ -849,6 +884,16 @@ impl Round1AbInner {
     /// Resident scratch bytes retained until the challenge-weighted finish.
     pub fn len_bytes(&self) -> usize {
         self.storage.len() * core::mem::size_of::<F128>()
+    }
+
+    /// Lane abtf: consumers other than the folded completion must never see
+    /// a backing whose tail transform was deferred.
+    #[inline]
+    fn assert_no_tail_deferral(&self, consumer: &str) {
+        assert!(
+            self.tail_deferral.is_none(),
+            "{consumer} cannot consume an AB transform with a deferred tail"
+        );
     }
 
     #[inline]
@@ -1091,6 +1136,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
     identity_prefix: Option<Round1PinnedOnePrefixStatement>,
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Round1AbProducer<'_>,
+    defer_tail: bool,
 ) -> Round1AbInner {
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     let total_bytes = (1usize << m) / 8;
@@ -1109,7 +1155,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
             core::slice::from_raw_parts(b_packed, total_bytes),
         )
     };
-    precompute_round1_ab_inner_packed_padded_body(
+    precompute_round1_ab_inner_packed_padded_body_with(
         a_packed,
         b_packed,
         m,
@@ -1123,6 +1169,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
         tail,
         fused.then_some(producer),
         None,
+        defer_tail,
     )
 }
 
@@ -1278,6 +1325,45 @@ fn precompute_round1_ab_inner_packed_padded_body(
     producer: Option<Round1AbProducer<'_>>,
     backing: Option<ExactTuneBacking>,
 ) -> Round1AbInner {
+    precompute_round1_ab_inner_packed_padded_body_with(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        inv_table,
+        padding,
+        nt,
+        compact,
+        use_provenance,
+        identity_prefix,
+        tail,
+        producer,
+        backing,
+        false,
+    )
+}
+
+/// [`precompute_round1_ab_inner_packed_padded_body`] with the lane-abtf
+/// request: `defer_tail` lets the fused producer queue skip the transform of
+/// the trailing [`AB_TAIL_DEFER_CHUNKS`] chunks at the ranked shape (see
+/// [`ab_tail_defer_from_window`]); ignored everywhere else.
+#[allow(clippy::too_many_arguments)]
+fn precompute_round1_ab_inner_packed_padded_body_with(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    nt: bool,
+    compact: bool,
+    use_provenance: bool,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
+    producer: Option<Round1AbProducer<'_>>,
+    backing: Option<ExactTuneBacking>,
+    defer_tail: bool,
+) -> Round1AbInner {
     use rayon::prelude::*;
 
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
@@ -1383,6 +1469,20 @@ fn precompute_round1_ab_inner_packed_padded_body(
             kernels::static_b_context_is_prepared(static_b_context),
             zc_ab_pre_fast_policy_hoist_enabled(),
         ) && kernels::fast_shift_reduce_enabled();
+        // Lane abtf: decided once here, stored with the backing and passed to
+        // the queue; only the fused producer branch honours it.
+        let tail_deferral = producer
+            .filter(|_| defer_tail)
+            .and_then(|p| ab_tail_defer_from_window(m, k_skip, padding, p.unit_bytes / OUTER_BYTES))
+            .map(|from_window| AbTailDeferral {
+                from_window,
+                fast_policy: ranked_fast_policy,
+                blake3_static_layout,
+                static_b_context,
+                transform_trim: std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref()
+                    != Some(std::ffi::OsStr::new("1")),
+            });
+        let tail_from = tail_deferral.map_or(n_chunks, |d| d.from_window);
         if ranked_fast_policy {
             // Resolve the process-wide direct-store switch once before the
             // queue starts. The ranked/default arm is compiled without the
@@ -1404,6 +1504,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     out_bytes,
                     tail,
                     producer,
+                    tail_from,
                 );
             } else {
                 precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
@@ -1421,6 +1522,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     out_bytes,
                     tail,
                     producer,
+                    tail_from,
                 );
             }
         } else {
@@ -1439,12 +1541,14 @@ fn precompute_round1_ab_inner_packed_padded_body(
                 out_bytes,
                 tail,
                 producer,
+                tail_from,
             );
         }
         return Round1AbInner {
             storage,
             representation,
             provenance_hit,
+            tail_deferral,
         };
     }
 
@@ -1483,10 +1587,209 @@ fn precompute_round1_ab_inner_packed_padded_body(
         storage,
         representation,
         provenance_hit,
+        tail_deferral: None,
     }
 }
 
 /// Use a deeper queue for the sequential block-cyclic scheduler so the ranked
+/// Lane abtf: first window whose transform the fused producer queue defers
+/// into the folded completion, or `None` (keep the incumbent full
+/// transform). Admitted only on macOS/aarch64 at the ranked BLAKE3 shape
+/// (`m = 32`, `k_log = 14`, 15,409 useful bits) whose completion takes the
+/// folded 128-bank drain (`n_lo = 12`, `n_hi = 7`, `bank_bits = 7`, from the
+/// same cached configuration the completion reads), when the trailing
+/// [`AB_TAIL_DEFER_CHUNKS`] chunks lie wholly outside the AB GPU arm's
+/// requested raw prefix (otherwise no deferral; the GPU share is never
+/// capped) and the boundary is a whole number of producer units.
+fn ab_tail_defer_from_window(
+    m: usize,
+    k_skip: usize,
+    padding: &PaddingSpec,
+    unit_chunks: usize,
+) -> Option<usize> {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return None;
+    }
+    if m != 32 || k_skip != K_SKIP || padding.k_log != 14 || padding.useful_bits_per_block != 15_409 {
+        return None;
+    }
+    let n_outer = m - k_skip - N_INNER;
+    let n_hi = fold4_n_hi_from_env().min(n_outer);
+    let n_lo = n_outer - n_hi;
+    if n_hi != 7 || n_lo != 12 || ab_eq_fold_from_env().bank_bits(n_lo) != Some(7) {
+        return None;
+    }
+    let hi_size = 1usize << n_hi;
+    let first_deferred_chunk = hi_size - AB_TAIL_DEFER_CHUNKS;
+    if crate::gpu_commit::gpu_zc_ab_completion_share().min(hi_size) > first_deferred_chunk {
+        return None;
+    }
+    let from_window = first_deferred_chunk << n_lo;
+    (unit_chunks > 0 && from_window.is_multiple_of(unit_chunks)).then_some(from_window)
+}
+
+std::thread_local! {
+    /// Lane abtf: one producer unit (8 windows, 8 KiB at the ranked shape)
+    /// of transform output per completion worker. Zero-filled once, so every
+    /// byte a row reference spans is initialized; only rows the unit's own
+    /// transform wrote (`[first, end)` of each window) are read.
+    static AB_TAIL_UNIT_OUT: std::cell::RefCell<Vec<F128>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Lane abtf: the folded completion of `lo_range` of a deferred tail chunk.
+/// Each run of `unit_chunks` windows is transformed from the complete A/B
+/// rows by the same `precompute_ab_unit` the producer queue uses (same fast
+/// policy, static-B context, window-rows trim and unit grouping; plain cached
+/// stores) into the worker's unit buffer, and its materialized rows are
+/// gathered immediately into the 128 banks with the same table, bank and
+/// first-touch rules as the incumbent sweep. The banks are finished exactly
+/// like the incumbent (`finish_ab_eq_fold_banks`).
+#[allow(clippy::too_many_arguments)]
+fn fold_deferred_ab_range(
+    src: &AbTailSource<'_>,
+    deferral: &AbTailDeferral,
+    x_hi: usize,
+    lo_range: std::ops::Range<usize>,
+    n_lo: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    representation: Round1AbRepresentation,
+    eq_bot: &[F128],
+    eq_hi_val: F128,
+    tables: &[F128],
+    bank_bits: usize,
+    bank_deferred: bool,
+    banks: &mut [F128],
+    partial_ab: &mut [F128; ELL],
+) {
+    const UNIT_CHUNKS: usize = 8;
+    let n_banks = 1usize << bank_bits;
+    let bank_mask = n_banks - 1;
+    assert_eq!(banks.len(), n_banks * ELL);
+    assert!(lo_range.start.is_multiple_of(UNIT_CHUNKS) && lo_range.end.is_multiple_of(UNIT_CHUNKS));
+    assert!(lo_range.end <= 1 << n_lo);
+    let store_first = lo_range.len() >= n_banks;
+    if !store_first {
+        banks.fill(F128::ZERO);
+    }
+    let unscaled = zc_ab_unscaled_enabled();
+    let seeded = zc_ab_seeded_enabled();
+    let window_plan = ab_window_rows_worker_plan_with_trim(deferral.transform_trim);
+    // All units in this range use the same static-B run and worker kernel.
+    // Resolve those once, not once for each eight-window unit.
+    let window_runs = if deferral.fast_policy {
+        ab_window_unit_runs::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
+            src.inv_table,
+            within_outer_mask,
+            b_med_counts,
+            deferral.blake3_static_layout,
+            deferral.static_b_context,
+            false,
+            representation,
+        )
+    } else {
+        ab_window_unit_runs::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+            src.inv_table,
+            within_outer_mask,
+            b_med_counts,
+            deferral.blake3_static_layout,
+            deferral.static_b_context,
+            false,
+            representation,
+        )
+    };
+    let window_unit = ab_window_unit_worker_plan(window_plan).zip(window_runs);
+    let (mut a_col, mut b_col) = ([F8::ZERO; ELL], [F8::ZERO; ELL]);
+    AB_TAIL_UNIT_OUT.with(|cell| {
+        let mut unit_out = cell.borrow_mut();
+        if unit_out.len() != UNIT_CHUNKS * ELL {
+            *unit_out = vec![F128::ZERO; UNIT_CHUNKS * ELL];
+        }
+        let out_ptr = unit_out.as_mut_ptr().cast::<u8>();
+        macro_rules! transform_unit {
+            ($policy:expr, $x_outer:expr) => {{
+                // SAFETY: `out_ptr` is this worker's own initialized,
+                // F128-aligned `UNIT_CHUNKS * 1 KiB` buffer, written with
+                // plain stores (`nt = false`) and read back by this thread
+                // only; the A/B rows are complete (every unit was produced
+                // before the precompute returned) and `x_outer * 1 KiB +
+                // UNIT_CHUNKS KiB` lies inside both packed buffers.
+                unsafe {
+                    precompute_ab_unit::<{ $policy }, false>(
+                        src.a_packed,
+                        src.b_packed,
+                        src.inv_table,
+                        within_outer_mask,
+                        b_med_counts,
+                        deferral.blake3_static_layout,
+                        deferral.static_b_context,
+                        false,
+                        true,
+                        representation,
+                        $x_outer,
+                        UNIT_CHUNKS,
+                        $x_outer * AB_WINDOW_BYTES,
+                        out_ptr,
+                        &mut a_col,
+                        &mut b_col,
+                        window_plan,
+                        window_unit,
+                    );
+                }
+            }};
+        }
+        let mut lo = lo_range.start;
+        while lo < lo_range.end {
+            let x_outer = (x_hi << n_lo) | lo;
+            assert!((x_outer + UNIT_CHUNKS) * AB_WINDOW_BYTES <= src.a_packed.len());
+            assert!((x_outer + UNIT_CHUNKS) * AB_WINDOW_BYTES <= src.b_packed.len());
+            assert!(x_outer >= deferral.from_window);
+            if deferral.fast_policy {
+                transform_unit!(kernels::AB_FAST_POLICY_FORCE_FAST, x_outer);
+            } else {
+                transform_unit!(kernels::AB_FAST_POLICY_PROCESS, x_outer);
+            }
+            for i in 0..UNIT_CHUNKS {
+                let x_outer_lo = lo + i;
+                let w = (x_outer + i) & within_outer_mask;
+                let n_b_med = b_med_counts[w] as usize;
+                let bank_u = x_outer_lo & bank_mask;
+                let bank: &mut [F128; ELL] = (&mut banks[bank_u * ELL..(bank_u + 1) * ELL])
+                    .try_into()
+                    .expect("one 64-lane bank");
+                let first_touch = store_first && x_outer_lo - lo_range.start < n_banks;
+                if n_b_med == 0 {
+                    if first_touch {
+                        bank.fill(F128::ZERO);
+                    }
+                    continue;
+                }
+                let first = representation.first_materialized_b_med(w);
+                let end = representation.materialized_b_med_end(w, n_b_med);
+                let t = x_outer_lo >> bank_bits;
+                let table = &tables[t * CONVERT_TABLE_SIZE..(t + 1) * CONVERT_TABLE_SIZE];
+                // SAFETY: window `i` of the unit buffer (initialized, aligned);
+                // only its rows `[first, end)` are read by the kernel.
+                let rows = unsafe { &*out_ptr.add(i * AB_WINDOW_BYTES).cast::<[[u8; 64]; 1 << N_MEDIUM]>() };
+                // Same kernel selection as the incumbent sweep.
+                match (first_touch, unscaled) {
+                    (true, true) => kernels::accumulate_convert_ab_nomul::<true, true>(rows, first, end, table, bank),
+                    (false, true) if seeded => kernels::accumulate_convert_ab_nomul_seeded::<true>(rows, first, end, table, bank),
+                    (false, false) if seeded => {
+                        kernels::accumulate_convert_ab_nomul_seeded::<false>(rows, first, end, table, bank)
+                    }
+                    (false, true) => kernels::accumulate_convert_ab_nomul::<false, true>(rows, first, end, table, bank),
+                    (true, false) => kernels::accumulate_convert_ab_nomul::<true, false>(rows, first, end, table, bank),
+                    (false, false) => kernels::accumulate_convert_ab_nomul::<false, false>(rows, first, end, table, bank),
+                }
+            }
+            lo += UNIT_CHUNKS;
+        }
+    });
+    finish_ab_eq_fold_banks(eq_bot, eq_hi_val, banks, bank_deferred, partial_ab);
+}
+
 #[inline]
 fn ab_pre_chunks_per_job(n_chunks: usize) -> usize {
     n_chunks.div_ceil(2048).max(1)
@@ -1566,6 +1869,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     out_bytes: &mut [u8],
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Option<Round1AbProducer<'_>>,
+    tail_from: usize,
 ) {
     // This is a private specialization contract, but keep it checked in
     // release builds so a future caller cannot accidentally select
@@ -1637,8 +1941,16 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                 let unit_start = job * units_per_job;
                 let unit_end = (unit_start + units_per_job).min(n_units);
                 for unit in unit_start..unit_end {
+                    // Every unit is produced exactly once (contract), also
+                    // the deferred ones: the stripe emitter and round two
+                    // depend on the complete A/B rows.
                     let (a_unit, b_unit) =
                         scratch.fill(unit, |a, b, primed| (producer.produce)(unit, a, b, primed));
+                    // Lane abtf: the transform of a deferred tail unit runs
+                    // in the folded completion instead.
+                    if unit * unit_chunks >= tail_from {
+                        continue;
+                    }
                     // SAFETY: this job owns the output of its units.
                     unsafe {
                         precompute_ab_unit::<FAST_POLICY, FORCE_DIRECT>(
@@ -3726,7 +4038,62 @@ where
         ab_eq_fold_from_env(),
         pre,
         tail,
+        None,
     )
+}
+
+/// Lane abtf: [`round1_shift_reduce_ab_packed_padded_with_precomputed_overlapped`]
+/// for the ranked lincheck-C prove, which also lends the complete packed A/B
+/// rows so a backing whose tail transform was deferred can be completed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed_overlapped_src<T, R>(
+    ab_inner: &Round1AbInner,
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    padding: &PaddingSpec,
+    pre: &(dyn Fn() + Sync),
+    tail: T,
+    tail_src: AbTailSource<'_>,
+) -> (Vec<F128>, R)
+where
+    T: FnOnce() -> R,
+{
+    round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold_and(
+        ab_inner,
+        m,
+        k_skip,
+        r,
+        padding,
+        ab_eq_fold_from_env(),
+        pre,
+        tail,
+        Some(tail_src),
+    )
+}
+
+/// Lane abtf: [`round1_shift_reduce_ab_packed_padded_with_precomputed`] with
+/// the complete packed A/B rows lent (see the `_overlapped_src` variant).
+pub(crate) fn round1_shift_reduce_ab_packed_padded_with_precomputed_src(
+    ab_inner: &Round1AbInner,
+    m: usize,
+    k_skip: usize,
+    r: &[F128],
+    padding: &PaddingSpec,
+    tail_src: AbTailSource<'_>,
+) -> Vec<F128> {
+    let (ab, ()) = round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold_and(
+        ab_inner,
+        m,
+        k_skip,
+        r,
+        padding,
+        ab_eq_fold_from_env(),
+        &|| {},
+        || {},
+        Some(tail_src),
+    );
+    ab
 }
 
 /// [`round1_shift_reduce_ab_packed_padded_with_precomputed`] with the `eq_lo`
@@ -3748,6 +4115,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold(
         fold,
         &|| {},
         || {},
+        None,
     );
     ab
 }
@@ -3998,6 +4366,7 @@ fn round1_shift_reduce_ab_packed_padded_with_precomputed_with_fold_and<T, R>(
     fold: AbEqFold,
     pre: &(dyn Fn() + Sync),
     tail: T,
+    tail_src: Option<AbTailSource<'_>>,
 ) -> (Vec<F128>, R)
 where
     T: FnOnce() -> R,
@@ -4016,6 +4385,31 @@ where
     let n_hi = fold4_n_hi.min(r_outer.len());
     let n_lo = r_outer.len() - n_hi;
     let bank_bits = fold.bank_bits(n_lo);
+    // Lane abtf: chunks `tail_chunk..` of a deferred backing hold no
+    // transform output; only the folded 128-bank geometry it was produced
+    // for, with the complete A/B rows lent, may complete them, and the GPU
+    // raw prefix must lie wholly before them (the producer only defers then).
+    let (tail_chunk, tail_job) = match ab_inner.tail_deferral {
+        Some(deferral) => {
+            let src = tail_src.expect("a deferred AB tail needs the complete A/B rows");
+            assert!(
+                bank_bits == Some(7)
+                    && n_lo == 12
+                    && n_hi == 7
+                    && deferral.from_window.is_multiple_of(1 << n_lo)
+                    && src.a_packed.len() == total_bytes
+                    && src.b_packed.len() == total_bytes,
+                "deferred AB tail reached a completion geometry it was not produced for"
+            );
+            let tail_chunk = deferral.from_window >> n_lo;
+            assert!(
+                crate::gpu_commit::gpu_zc_ab_completion_share().min(1usize << n_hi) <= tail_chunk,
+                "the AB GPU raw prefix overlaps the deferred tail"
+            );
+            (tail_chunk, Some((src, deferral)))
+        }
+        None => (1usize << n_hi, None),
+    };
     // GPU prefix arm (`FLOCK_NO_GPU_ZC_AB_COMPLETION` kills): submitted first
     // so the GPU starts while the CPU builds its tables. Folded drain only.
     let gpu_prefix = if bank_bits.is_some() && n_hi > 0 {
@@ -4079,6 +4473,7 @@ where
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let tail_out = match setup {
         AbCompletionSetup::Plain { eq, eq_lo_scaled } => {
+            ab_inner.assert_no_tail_deferral("the plain AB completion");
             crate::epool::run_hetero_chunks_caller_tail(
                 hi_size,
                 |x_hi| {
@@ -4135,6 +4530,29 @@ where
                     if banks.len() != bank_len {
                         banks.clear();
                         banks.resize(bank_len, F128::ZERO);
+                    }
+                    // Lane abtf: a deferred chunk is transformed and gathered
+                    // unit by unit from the complete A/B rows; the backing's
+                    // tail windows are never read.
+                    if let Some((src, deferral)) = tail_job.as_ref().filter(|_| x_hi >= tail_chunk) {
+                        fold_deferred_ab_range(
+                            src,
+                            deferral,
+                            x_hi,
+                            range,
+                            n_lo,
+                            within_outer_mask,
+                            &b_med_counts,
+                            ab_inner.representation,
+                            &eq_bot,
+                            eq.hi[x_hi],
+                            &tables,
+                            bank_bits,
+                            bank_deferred,
+                            &mut banks,
+                            &mut partial,
+                        );
+                        return;
                     }
                     process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
                         x_hi,
@@ -5299,6 +5717,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     ab_inner.assert_complete("combined round-one AB/C completion");
+    ab_inner.assert_no_tail_deferral("combined round-one AB/C completion");
     assert_eq!(k_skip, K_SKIP, "optimized variant is k_skip=6 only");
     assert!(
         m >= k_skip + N_INNER,
@@ -5465,6 +5884,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
     pair4: bool,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     ab_inner.assert_complete("combined round-one Fold4 AB/C completion");
+    ab_inner.assert_no_tail_deferral("combined round-one Fold4 AB/C completion");
     let profile =
         std::env::var_os("FLOCK_FOLD4_TIMING").as_deref() == Some(std::ffi::OsStr::new("1"));
     let t_total = std::time::Instant::now();
@@ -6738,6 +7158,7 @@ mod tests {
                                     out,
                                     None,
                                     producer,
+                                    usize::MAX,
                                 )
                             };
                         }
@@ -7160,6 +7581,7 @@ mod tests {
                         None,
                         None,
                         producer,
+                        false,
                     )
                 }
             } else {
@@ -9295,6 +9717,70 @@ mod tests {
             finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, false, &mut scalar);
             finish_ab_eq_fold_banks(&eq_bot, eq_hi, &banks, true, &mut deferred);
             assert_eq!(deferred, scalar, "trial={trial}");
+        }
+    }
+
+    /// Lane abtf: the deferred-tail completion (re-transform each unit into
+    /// the worker buffer, then gather) equals the incumbent sweep over a
+    /// fully materialized backing, for every representation/count form,
+    /// whole and half ranges, and both first-touch regimes.
+    #[test]
+    fn ab_deferred_tail_matches_materialized_sweep() {
+        let mut rng = Rng::new(0xAB7F_0D11);
+        let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let n_lo = 8usize;
+        let big_lo_size = 1usize << n_lo;
+        let reps = [
+            (Round1AbRepresentation::Complete, [16u8, 15]),
+            (Round1AbRepresentation::Complete, [16u8, 0]),
+            (Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true }, [16u8, 15]),
+            (Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false }, [16u8, 15]),
+        ];
+        for (rep_index, (representation, counts)) in reps.into_iter().enumerate() {
+            let x_hi = 1usize;
+            let n_windows = (x_hi + 1) << n_lo;
+            let a: Vec<u8> = (0..n_windows * AB_WINDOW_BYTES).map(|_| rng.next_u64() as u8).collect();
+            let b: Vec<u8> = (0..n_windows * AB_WINDOW_BYTES).map(|_| rng.next_u64() as u8).collect();
+            // Incumbent: materialize every window of the chunk, then sweep.
+            let mut backing = vec![0u8; n_windows * AB_WINDOW_BYTES];
+            let (mut a_col, mut b_col) = ([F8::ZERO; ELL], [F8::ZERO; ELL]);
+            for x_outer in x_hi << n_lo..n_windows {
+                let out = &mut backing[x_outer * AB_WINDOW_BYTES..(x_outer + 1) * AB_WINDOW_BYTES];
+                precompute_ab_one_chunk::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
+                    &a, &b, inv_table, 1, &counts, false, None, false, false, representation, x_outer,
+                    x_outer * AB_WINDOW_BYTES, out, &mut a_col, &mut b_col, None,
+                );
+            }
+            let deferral = AbTailDeferral {
+                from_window: x_hi << n_lo,
+                fast_policy: false,
+                blake3_static_layout: false,
+                static_b_context: None,
+                transform_trim: true,
+            };
+            let src = AbTailSource { a_packed: &a, b_packed: &b, inv_table };
+            for bank_bits in [2usize, 4] {
+                let n_banks = 1usize << bank_bits;
+                let tables = rng.f128_vec((big_lo_size >> bank_bits) * CONVERT_TABLE_SIZE);
+                let eq_bot = rng.f128_vec(n_banks);
+                let eq_hi_val = rng.f128();
+                for lo_range in [0..big_lo_size, 0..big_lo_size / 2, big_lo_size / 2..big_lo_size, 8..16] {
+                    let mut want_banks = vec![F128::ZERO; n_banks * ELL];
+                    let mut got_banks = rng.f128_vec(n_banks * ELL);
+                    let mut want = [F128::ZERO; ELL];
+                    let mut got = [F128::ONE; ELL];
+                    process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded_with(
+                        x_hi, lo_range.clone(), big_lo_size, n_lo + N_INNER, 1, &counts, &backing,
+                        representation, &eq_bot, eq_hi_val, &tables, bank_bits, false, &mut want_banks,
+                        &mut want, false,
+                    );
+                    fold_deferred_ab_range(
+                        &src, &deferral, x_hi, lo_range.clone(), n_lo, 1, &counts, representation,
+                        &eq_bot, eq_hi_val, &tables, bank_bits, false, &mut got_banks, &mut got,
+                    );
+                    assert_eq!(got, want, "rep {rep_index} s {bank_bits} range {lo_range:?}");
+                }
+            }
         }
     }
 

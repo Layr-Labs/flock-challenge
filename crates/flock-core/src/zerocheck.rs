@@ -691,8 +691,16 @@ fn prove_packed_padded_inner<C: Challenger>(
             // completion's table set-up, and the C fold runs on this thread
             // inside the completion queue's ragged tail. Neither touches the
             // completion's inputs or outputs; same values, same transcript.
+            // Lane abtf: the complete packed A/B rows are lent to the
+            // completion so a backing whose tail transform the producer
+            // deferred is completed from them (read-only, this call only).
+            let tail_src = crate::zerocheck::univariate_skip_optimized::AbTailSource {
+                a_packed,
+                b_packed,
+                inv_table,
+            };
             let (ab, (c, capture, recovered_ab)) = if zc_entry_overlap_enabled() {
-                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed_overlapped(
+                crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed_overlapped_src(
                     ab_inner,
                     m,
                     k_skip,
@@ -700,15 +708,17 @@ fn prove_packed_padded_inner<C: Challenger>(
                     padding,
                     &r2_stage,
                     c_fold,
+                    tail_src,
                 )
             } else {
                 r2_stage();
-                let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed(
+                let ab = crate::zerocheck::univariate_skip_optimized::round1_shift_reduce_ab_packed_padded_with_precomputed_src(
                     ab_inner,
                     m,
                     k_skip,
                     &r,
                     padding,
+                    tail_src,
                 );
                 (ab, c_fold())
             };
