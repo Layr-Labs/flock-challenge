@@ -791,23 +791,6 @@ pub(crate) fn zc_r2_cs_enabled() -> bool {
     *ON
 }
 
-/// Kill switch for the K view hand-over (`FLOCK_NO_ZC_K_HANDOVER`, any value:
-/// every prove whose round two takes its anchors early, before round one,
-/// also makes and maps their K view there). With the switch unset, the
-/// cascade K pass of the prove that first finds R2-CS and the K arm both
-/// admitted keeps its compact anchors instead of recycling them and makes and
-/// maps their K view at once; the next prove's round two takes that
-/// allocation with that view published as its premap, so it neither takes
-/// nor maps anything before round one. Once per process: every later prove
-/// takes and maps its own, as before. Read once per process.
-pub const ENV_NO_ZC_K_HANDOVER: &str = "FLOCK_NO_ZC_K_HANDOVER";
-
-pub(crate) fn zc_k_handover_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_K_HANDOVER).is_none());
-    *ON
-}
-
 /// Kill switch for the round-one AB completion GPU prefix arm (any value
 /// restores the exact CPU-only completion). With the arm on, the GPU computes
 /// the per-chunk 64-lane partials of a leading prefix of the 128 `x_hi`
@@ -10243,6 +10226,43 @@ kernel void blake3_pow_scan_v2(
                 }
             }
         }
+    /// Bounded status poll on an already-committed command buffer that
+    /// never falls back to the blocking wait: past the deadline it
+    /// returns Err, and the caller degrades to its CPU fallback instead
+    /// of hanging the prove past the harness deadline. Read-only.
+    #[allow(dead_code)]
+    unsafe fn zc_wait_cb_deadline(
+        &self,
+        cb: Id,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        unsafe {
+            loop {
+                let status: u64 = send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> u64,
+                    cb,
+                    c"status"
+                );
+                if status >= 4 {
+                    if status == 4 {
+                        return Ok(());
+                    }
+                    let err: Id =
+                        send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cb, c"error");
+                    return Err(format!(
+                        "command buffer status {status}: {}",
+                        self.api.error_string(err)
+                    ));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("gpu wait timeout".to_string());
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+
 
         pub(crate) unsafe fn commit_and_wait(&self, cb: Id) -> Result<(), String> {
             unsafe {
@@ -21975,6 +21995,8 @@ kernel void zc_ab_finish(
     const ZC_AB_UNCALIBRATED: u8 = 0;
     const ZC_AB_ADMITTED: u8 = 1;
     const ZC_AB_DISABLED: u8 = 2;
+    /// Wall-clock budget for the round-1 AB completion arm's GPU waits.
+    const ZC_AB_WAIT_BUDGET_MS: u64 = 250;
     /// Proves whose AB message folded GPU partials (diagnostic receipt).
     static ZC_AB_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -22355,7 +22377,16 @@ kernel void zc_ab_finish(
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
             // the table build; the table build's status is checked too.
-            let ok = gpu.spin_wait_cb(job.cb, 2.0).and_then(|()| gpu.wait_cb(job.cb_tables));
+            //
+            // Both waits are bounded: past the budget they return Err and
+            // this trial's prefix falls back to the CPU arm, which produces
+            // byte-identical proofs, instead of parking the spine into the
+            // harness deadline.
+            let wait_deadline =
+                waited + std::time::Duration::from_millis(ZC_AB_WAIT_BUDGET_MS);
+            let ok = gpu
+                .zc_wait_cb_deadline(job.cb, wait_deadline)
+                .and_then(|()| gpu.zc_wait_cb_deadline(job.cb_tables, wait_deadline));
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let (tables_ms, gather_ms) = if ok.is_ok() {
                 (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
@@ -22904,108 +22935,29 @@ kernel void zc_ab_finish(
     /// scheduled. Only once the arm is admitted (its pipelines and buffers
     /// exist); no-op otherwise.
     pub(crate) fn zc_k_premap(anchors: &[F128], prefix_bytes: usize) {
+        use std::sync::atomic::Ordering;
         drop(ZcKPremap(zc_k_premap_take()));
-        if let Some(mapped) = zc_k_map_view(anchors, prefix_bytes) {
-            let mut slot = match ZC_K_PREMAP.lock() {
-                Ok(s) => s,
-                Err(p) => p.into_inner(),
-            };
-            *slot = Some(mapped);
-        }
-    }
-
-    /// K view hand-over (`super::ENV_NO_ZC_K_HANDOVER`): the compact anchors
-    /// of the K pass that kept them, their view's byte length and the view
-    /// (mapped when kept), for the next prove's round two. At most one per
-    /// process ([`ZC_K_HANDOVER_MADE`]).
-    static ZC_K_HANDOVER: std::sync::Mutex<Option<(Vec<F128>, usize, usize)>> = std::sync::Mutex::new(None);
-    static ZC_K_HANDOVER_MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-    /// The cascade K pass, recycling its compact state: keep `anchors` and
-    /// make and map the K view over their dense prefix of `prefix_bytes` now
-    /// ([`zc_k_map_view`]), for the next prove's round two to take with
-    /// [`zc_k_handover_take`] instead of taking and mapping its own. Only once
-    /// per process, and only when that round two takes its anchors early
-    /// (R2-CS and the K arm admitted, [`zc_r2_cs_premap_early`]). `Some` =
-    /// not kept (switch off, already made once, not wanted, or no view): the
-    /// caller recycles the vector as before.
-    pub(crate) fn zc_k_handover_keep(anchors: Vec<F128>, prefix_bytes: usize) -> Option<Vec<F128>> {
-        use std::sync::atomic::Ordering;
-        if !super::zc_k_handover_enabled()
-            || !zc_r2_cs_premap_early()
-            || ZC_K_HANDOVER_MADE.swap(true, Ordering::Relaxed)
-        {
-            return Some(anchors);
-        }
-        match zc_k_map_view(&anchors, prefix_bytes) {
-            Some((_, len, view)) => {
-                let mut slot = match ZC_K_HANDOVER.lock() {
-                    Ok(s) => s,
-                    Err(p) => p.into_inner(),
-                };
-                *slot = Some((anchors, len, view));
-                None
-            }
-            None => Some(anchors),
-        }
-    }
-
-    /// Round two's early step: the kept anchors when they hold `n` elements
-    /// and their view spans `prefix_bytes` rounded up to whole pages (what
-    /// [`zc_k_premap`] would map for them), with that view published as this
-    /// prove's premap, exactly as [`zc_k_premap`] publishes its own. `None` =
-    /// nothing kept (or a different shape, which stays kept and unused): the
-    /// caller takes and premaps as before.
-    pub(crate) fn zc_k_handover_take(n: usize, prefix_bytes: usize) -> Option<Vec<F128>> {
-        let mut slot = match ZC_K_HANDOVER.lock() {
-            Ok(s) => s,
-            Err(p) => p.into_inner(),
-        };
-        let page = 16384usize;
-        match slot.take() {
-            Some((anchors, len, view)) if anchors.len() == n && len == prefix_bytes.div_ceil(page) * page => {
-                drop(ZcKPremap(zc_k_premap_take()));
-                let mut premap = match ZC_K_PREMAP.lock() {
-                    Ok(s) => s,
-                    Err(p) => p.into_inner(),
-                };
-                *premap = Some((anchors.as_ptr() as usize, len, view));
-                Some(anchors)
-            }
-            other => {
-                *slot = other;
-                None
-            }
-        }
-    }
-
-    /// The K arm's view over the first `prefix_bytes` of `anchors` (rounded up
-    /// to whole pages; the dense prefix covers every compacted layout's
-    /// prefix), bound in a one-thread touch dispatch on a second command queue
-    /// so the GPU maps its pages from now on: `(anchors base, view bytes,
-    /// view)`. Only once the arm is admitted (its pipelines and buffers
-    /// exist); `None` otherwise.
-    fn zc_k_map_view(anchors: &[F128], prefix_bytes: usize) -> Option<(usize, usize, usize)> {
-        use std::sync::atomic::Ordering;
         if !super::gpu_zc_k_premap_enabled() || ZC_K_MODE.load(Ordering::Relaxed) != ZC_K_ADMITTED {
-            return None;
+            return;
         }
         let page = 16384usize;
         let len = prefix_bytes.div_ceil(page) * page;
         let ptr = anchors.as_ptr() as usize;
         if len == 0 || len > anchors.len() * 16 || crate::scratch::f128_range_overlaps_pin(ptr, len) {
-            return None;
+            return;
         }
-        let gpu = gpu().ok()?;
-        let state_mutex = ZC_K_STATE.get().and_then(|s| s.as_ref())?;
-        let state = state_mutex.lock().ok()?;
+        let Ok(gpu) = gpu() else { return };
+        let Some(state_mutex) = ZC_K_STATE.get().and_then(|s| s.as_ref()) else { return };
+        let Ok(state) = state_mutex.lock() else { return };
         static QUEUE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-        let queue = (*QUEUE.get_or_init(|| unsafe {
+        let Some(queue) = *QUEUE.get_or_init(|| unsafe {
             let q: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newCommandQueue");
             (!q.is_null()).then_some(q as usize)
-        }))?;
+        }) else {
+            return;
+        };
         unsafe {
-            let view = gpu.wrap_buffer(anchors.as_ptr().cast::<u8>().cast_mut(), len).ok()?;
+            let Ok(view) = gpu.wrap_buffer(anchors.as_ptr().cast::<u8>().cast_mut(), len) else { return };
             #[repr(C)]
             struct P {
                 sb_per_chunk: u32,
@@ -23037,9 +22989,13 @@ kernel void zc_ab_finish(
             gpu.pool_pop(pool);
             if !ok {
                 gpu.release(view);
-                return None;
+                return;
             }
-            Some((ptr, len, view as usize))
+            let mut slot = match ZC_K_PREMAP.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            *slot = Some((ptr, len, view as usize));
         }
     }
 
@@ -25544,8 +25500,8 @@ pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 /// R2-CS entry points (see `ENV_NO_ZC_R2_CS`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
-    ZcR2CsLayout, launch_zc_r2_products_cs, zc_k_handover_keep, zc_k_handover_take, zc_r2_cs_oracle,
-    zc_r2_cs_premap_early, zc_r2_cs_prewarm, zc_r2_cs_prewarm_wanted, zc_r2_cs_verdict,
+    ZcR2CsLayout, launch_zc_r2_products_cs, zc_r2_cs_oracle, zc_r2_cs_premap_early, zc_r2_cs_prewarm,
+    zc_r2_cs_prewarm_wanted, zc_r2_cs_verdict,
 };
 
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
