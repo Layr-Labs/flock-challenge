@@ -922,9 +922,14 @@ pub(crate) fn zc_k_v2_enabled() -> bool {
 /// elements; threadgroup table lookups per K chunk 978,944 -> 829,184.
 /// Compiled from source on the prewarm thread in place of `zc_k_fold_v2`,
 /// which is built instead if that compile fails. Read once per process.
+///
+/// Default off: `zc_k_fold_v2` runs unless `FLOCK_ZC_K_V3` is set (any
+/// value). A per-piece A/B of ca9730fe's pieces (akki-rock05, 0718ac2f's
+/// note) read the v3 kernel about 2% slower end to end; the K share stays
+/// the v2 default either way.
 pub(crate) fn zc_k_v3_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_K_V3").is_none());
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_K_V3").is_some());
     *ON
 }
 
