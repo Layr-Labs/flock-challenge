@@ -104,6 +104,8 @@ use kernels::aarch64::{
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 use kernels::aarch64::fold_round2_compact_chunk_neon_prescaled_8;
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) use kernels::aarch64::init_r2_memory_paths;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 use kernels::aarch64::{
     fold2_and_message_lookahead_normal_expanded_aarch64,
@@ -1973,7 +1975,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         if share > 0 {
             let k_hi = 1usize << cascade_k_pass_n_hi(n_pairs.trailing_zeros() as usize - 2);
             let prefix_pairs = share.min(k_hi) * (n_pairs / k_hi);
+            crate::tmark::mark("premap start");
             crate::gpu_commit::zc_k_premap(&compact.anchors, prefix_pairs * 32);
+            crate::tmark::mark("premap end");
         }
     }
 
@@ -3007,6 +3011,7 @@ fn fold2_compact_and_round45_into_packed_b(
     // tail-compacted b-one-packed pass (the arm's layouts). During the arm's
     // first launch (oracle probe) `cpu_base == 0` and the queue is exactly the
     // incumbent one.
+    crate::tmark::mark("k launch start");
     #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
     let gpu_job = {
         let share = crate::gpu_commit::gpu_zc_k_share().min(hi_size);
@@ -3047,15 +3052,9 @@ fn fold2_compact_and_round45_into_packed_b(
     let cpu_base = gpu_job.as_ref().map_or(0, crate::gpu_commit::ZcKJob::cpu_base);
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3")))]
     let cpu_base = 0usize;
-    let chunk_body = |x_hi: usize| {
-        // SAFETY: exclusive per-chunk ownership; the queue join publishes the
-        // writes before the reduction below reads them. Packed: each of a
-        // chunk's `out_chunk / 256` superblocks takes 244 entries.
-        let (a_ptr, b_ptr) = unsafe {
-            let o = if pack { x_hi * out_chunk / 256 * 244 } else { x_hi * out_chunk };
-            let ob = if bpack { x_hi * out_chunk / 64 * b_block } else { o };
-            (a_base.ptr().add(o), b_base.ptr().add(ob))
-        };
+    // Chunk `x_hi` into `a_ptr` / `b_ptr` (its slots in `a_out` / `b_out`,
+    // or, for a chunk the CPU takes from the GPU range, the GPU's buffers).
+    let chunk_into = |x_hi: usize, a_ptr: *mut F128, b_ptr: *mut F128| {
         // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
         let pair_base = 2 * x_hi * out_chunk;
         let mut outv = [F128::ZERO; 8];
@@ -3147,7 +3146,53 @@ fn fold2_compact_and_round45_into_packed_b(
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
     };
-    crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
+    let chunk_body = |x_hi: usize| {
+        // SAFETY: exclusive per-chunk ownership; the queue join publishes the
+        // writes before the reduction below reads them. Packed: each of a
+        // chunk's `out_chunk / 256` superblocks takes 244 entries.
+        let (a_ptr, b_ptr) = unsafe {
+            let o = if pack { x_hi * out_chunk / 256 * 244 } else { x_hi * out_chunk };
+            let ob = if bpack { x_hi * out_chunk / 64 * b_block } else { o };
+            (a_base.ptr().add(o), b_base.ptr().add(ob))
+        };
+        chunk_into(x_hi, a_ptr, b_ptr);
+    };
+    // CPU/GPU split (`FLOCK_NO_ZC_K_STEAL` kills): after its own chunks the
+    // queue takes GPU-range chunks from the top down while the GPU has not
+    // started them; the first refusal ends the taking.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let steal = gpu_job.as_ref().and_then(crate::gpu_commit::ZcKJob::steal);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let steal_n = steal.map_or(0, |_| cpu_base);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3")))]
+    let steal_n = 0usize;
+    let stolen: Vec<std::sync::atomic::AtomicBool> =
+        (0..steal_n).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+    let steal_stop = std::sync::atomic::AtomicBool::new(false);
+    let n_own = hi_size - cpu_base;
+    crate::tmark::mark("k cpu start");
+    crate::epool::run_hetero_chunks(n_own + steal_n, |i| {
+        if i < n_own {
+            chunk_body(cpu_base + i);
+            return;
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+        if let Some(job) = steal.as_ref() {
+            use std::sync::atomic::Ordering;
+            if steal_stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let c = cpu_base - 1 - (i - n_own);
+            if !job.try_take(c) {
+                steal_stop.store(true, Ordering::Relaxed);
+                return;
+            }
+            stolen[c].store(true, Ordering::Relaxed);
+            let (a_ptr, b_ptr) = job.outputs(c);
+            chunk_into(c, a_ptr, b_ptr);
+        }
+    });
+    crate::tmark::mark("k cpu done");
 
     // Join the GPU prefix (it was submitted first and is normally done).
     #[allow(unused_mut)]
@@ -3179,7 +3224,19 @@ fn fold2_compact_and_round45_into_packed_b(
                         crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
                     }
                 } else {
-                    partials[..chunks].copy_from_slice(&parts);
+                    // Chunks the CPU took keep its partials (it wrote their
+                    // outputs into the GPU's buffers).
+                    let mut taken = 0usize;
+                    for (c, part) in parts.iter().enumerate() {
+                        if stolen.get(c).is_some_and(|t| t.load(std::sync::atomic::Ordering::Relaxed)) {
+                            taken += 1;
+                        } else {
+                            partials[c] = *part;
+                        }
+                    }
+                    if crate::gpu_commit::gpu_zc_k_debug() && steal_n > 0 {
+                        eprintln!("[zc-k-gpu] split: CPU took {taken} of the GPU's {chunks} chunks");
+                    }
                     gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
                 }
             }
@@ -3190,6 +3247,7 @@ fn fold2_compact_and_round45_into_packed_b(
             }
         }
     }
+    crate::tmark::mark("k joined");
     if b_failed.into_inner() {
         return None;
     }
