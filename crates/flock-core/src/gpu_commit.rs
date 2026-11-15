@@ -842,7 +842,46 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
                 .expect("FLOCK_ZC_AB_GPU_CHUNKS must be a non-negative integer"),
         }
     });
-    if gpu_commit_enabled() { *SHARE } else { 0 }
+    if !gpu_commit_enabled() || *SHARE == 0 {
+        return 0;
+    }
+    // After the warm-up oracle admitted the arm: the later proves' share (see
+    // `ENV_NO_ZC_AB_LATE_SHARE`); the oracle's share until then.
+    match ZC_AB_LATE_SHARE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => *SHARE,
+        late => late,
+    }
+}
+
+/// Share of the proves after the warm-up oracle (`FLOCK_NO_ZC_AB_LATE_SHARE`,
+/// any value: every prove runs the oracle's share, as before). The warm-up
+/// oracle launch keeps [`ZC_AB_GPU_DEFAULT_CHUNKS`], so the warm-up prove is
+/// unchanged; once the oracle admits the arm, the later proves launch
+/// [`ZC_AB_GPU_LATE_CHUNKS`] (clamped to the chunk count). An explicit
+/// `FLOCK_ZC_AB_GPU_CHUNKS` share applies to every prove instead.
+pub const ENV_NO_ZC_AB_LATE_SHARE: &str = "FLOCK_NO_ZC_AB_LATE_SHARE";
+const ZC_AB_GPU_LATE_CHUNKS: usize = 40;
+
+/// The later proves' share once the oracle admitted the arm (0 = none yet).
+static ZC_AB_LATE_SHARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn zc_ab_late_share_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_ZC_AB_LATE_SHARE).is_none() && std::env::var_os(ENV_ZC_AB_GPU_CHUNKS).is_none()
+    });
+    *ON
+}
+
+/// Record the later proves' share (oracle admission), clamped to `hi_size`.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn zc_ab_set_late_share(hi_size: usize) -> Option<usize> {
+    if !zc_ab_late_share_enabled() {
+        return None;
+    }
+    let share = ZC_AB_GPU_LATE_CHUNKS.min(hi_size);
+    ZC_AB_LATE_SHARE.store(share, std::sync::atomic::Ordering::Relaxed);
+    Some(share)
 }
 
 /// Diagnostic trace for the round-one AB completion arm: the warm-up oracle
@@ -16614,6 +16653,10 @@ kernel void lc_fold_stripes_factored_b4(
                 Gpu::recycle_done(sig);
             }
             let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
+            if self.arm == FoldArm::Zc && wait.is_ok() && super::gpu_zc_ab_debug() {
+                let (c0, c1) = unsafe { cb_gpu_interval(gpu, cb) };
+                zc_span_note(false, c0, c1);
+            }
             let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
             unsafe { gpu.release(cb) };
             wait?;
@@ -21978,6 +22021,59 @@ kernel void zc_ab_finish(
     /// Proves whose AB message folded GPU partials (diagnostic receipt).
     static ZC_AB_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+    /// Round-one GPU intervals noted at the two joins (f64 seconds, bits; 0 =
+    /// none): the AB arm's (its table build's GPUStartTime to its gather +
+    /// finish buffer's GPUEndTime) and the zerocheck C-fold prefix's. Debug
+    /// only; see [`zc_span_note`].
+    static ZC_SPAN_AB_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ZC_SPAN_AB_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ZC_SPAN_CF_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ZC_SPAN_CF_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    /// GPU start times further apart than this belong to different proves.
+    const ZC_SPAN_SAME_PROVE_S: f64 = 0.05;
+
+    /// Note one round-one GPU interval (`ab`: the AB arm's, else the C fold's)
+    /// at its join. The joins come in either order, so whichever is second in
+    /// a prove prints the span line (`[zc-ab-gpu] span:`) with the other's
+    /// interval and clears it. A note whose GPU start is more than
+    /// [`ZC_SPAN_SAME_PROVE_S`] away belongs to another prove (the warm-up runs
+    /// ~0.8 s earlier) and is replaced instead of paired.
+    fn zc_span_note(ab: bool, start: f64, end: f64) {
+        use std::sync::atomic::Ordering;
+        let (mine, other) = if ab {
+            ((&ZC_SPAN_AB_START, &ZC_SPAN_AB_END), (&ZC_SPAN_CF_START, &ZC_SPAN_CF_END))
+        } else {
+            ((&ZC_SPAN_CF_START, &ZC_SPAN_CF_END), (&ZC_SPAN_AB_START, &ZC_SPAN_AB_END))
+        };
+        let o0 = f64::from_bits(other.0.load(Ordering::Relaxed));
+        let o1 = f64::from_bits(other.1.load(Ordering::Relaxed));
+        if !(end > start) {
+            return;
+        }
+        if o1 > o0 && (o0 - start).abs() < ZC_SPAN_SAME_PROVE_S {
+            other.0.store(0, Ordering::Relaxed);
+            other.1.store(0, Ordering::Relaxed);
+            let ((a0, a1), (c0, c1)) = if ab { ((start, end), (o0, o1)) } else { ((o0, o1), (start, end)) };
+            let t0 = a0.min(c0);
+            let span = a1.max(c1) - t0;
+            let overlap = (a1.min(c1) - a0.max(c0)).max(0.0);
+            let union = (a1 - a0) + (c1 - c0) - overlap;
+            eprintln!(
+                "[zc-ab-gpu] span: ab=[{:.3},{:.3}] cfold=[{:.3},{:.3}] span={:.3}ms union-busy={:.3}ms overlap={:.3}ms",
+                (a0 - t0) * 1e3,
+                (a1 - t0) * 1e3,
+                (c0 - t0) * 1e3,
+                (c1 - t0) * 1e3,
+                span * 1e3,
+                union * 1e3,
+                overlap * 1e3,
+            );
+        } else {
+            mine.0.store(start.to_bits(), Ordering::Relaxed);
+            mine.1.store(end.to_bits(), Ordering::Relaxed);
+        }
+    }
+
     fn zc_ab_init(gpu: &'static Gpu, basis: &[F128; 128]) -> Result<ZcAb, String> {
         unsafe {
             let pool = gpu.pool_push();
@@ -22363,6 +22459,11 @@ kernel void zc_ab_finish(
                 (0.0, 0.0)
             };
             let gpu_ms = tables_ms + gather_ms;
+            if debug && ok.is_ok() {
+                let (start, _) = cb_gpu_interval(gpu, job.cb_tables);
+                let (_, end) = cb_gpu_interval(gpu, job.cb);
+                zc_span_note(true, start, end);
+            }
             gpu.release(job.cb_tables);
             gpu.release(job.cb);
             if let Err(e) = ok {
@@ -22422,12 +22523,17 @@ kernel void zc_ab_finish(
             match mismatch {
                 None => {
                     ZC_AB_MODE.store(ZC_AB_ADMITTED, Ordering::Relaxed);
+                    let late = super::zc_ab_set_late_share(hi_size);
                     if debug {
                         eprintln!(
                             "[zc-ab-gpu] oracle: GPU partials of chunks 0..{} EQUAL the CPU's \
                              ({} lanes each) -> admitted, share {}/{hi_size}; tb={} gpu={gpu_ms:.2}ms \
                              (tables={tables_ms:.2} gather+finish={gather_ms:.2})",
                             job.chunks, 64, job.chunks, job.tops_per_group,
+                        );
+                        eprintln!(
+                            "[zc-ab-gpu] later share: {}",
+                            late.map_or_else(|| "the oracle's".to_string(), |s| format!("{s}/{hi_size}")),
                         );
                     }
                 }
