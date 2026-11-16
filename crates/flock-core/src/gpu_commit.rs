@@ -791,6 +791,25 @@ pub(crate) fn zc_r2_cs_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the R2-CS price of the lean R2-CS kernel
+/// (`FLOCK_NO_R2CS_REPRICE`, any value): restores the original kernel's
+/// price (1.75), the 37 % share ceiling and the K-share premap length. With
+/// the switch unset and the lean kernel built (`FLOCK_NO_R2CS_FAST` not
+/// exactly `1`), the R2-CS ratio is the incumbent kernel's calibrated ratio
+/// times the lean kernel's price (1.49), the share ceiling is 45 % and the
+/// premapped anchors view spans at least half the pairs, so the share's
+/// stores fit the view the timed launch binds. Read once per process.
+pub const ENV_NO_R2CS_REPRICE: &str = "FLOCK_NO_R2CS_REPRICE";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_r2_cs_reprice_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_R2CS_REPRICE).is_none()
+            && std::env::var_os("FLOCK_NO_R2CS_FAST").as_deref() != Some(std::ffi::OsStr::new("1"))
+    });
+    *ON
+}
+
 /// Kill switch for the K view hand-over (`FLOCK_NO_ZC_K_HANDOVER`, any value:
 /// every prove whose round two takes its anchors early, before round one,
 /// also makes and maps their K view there). With the switch unset, the
@@ -20946,6 +20965,15 @@ kernel void zc_r2_horner_oracle(
     /// kernel's does not (the warm-up GPU clock), and no extra warm-up
     /// replays are spent on it.
     const ZC_R2_CS_PRICE: f64 = 1.75;
+    /// [`ZC_R2_CS_PRICE`] for the lean R2-CS kernel (`r2cs_fast`), which does
+    /// the same products and stores in fewer GPU cycles per chunk
+    /// (`super::ENV_NO_R2CS_REPRICE`).
+    const ZC_R2_CS_PRICE_FAST: f64 = 1.49;
+
+    /// The R2-CS price in effect for this process's R2-CS kernel.
+    fn zc_r2_cs_price() -> f64 {
+        if super::zc_r2_cs_reprice_enabled() { ZC_R2_CS_PRICE_FAST } else { ZC_R2_CS_PRICE }
+    }
 
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
@@ -22144,7 +22172,8 @@ kernel void zc_r2_horner_oracle(
 
     /// R2-CS share for the R2-CS ratio `r_cs`: the CPU skips every GPU
     /// chunk, so the balance point is `hi / (r_cs + 1)` (alpha 0), clamped
-    /// to `[hi/8, 0.37·hi]`. The incumbent's ratio
+    /// to `[hi/8, 0.37·hi]` (`[hi/8, 0.45·hi]` with the lean kernel's price,
+    /// `super::ENV_NO_R2CS_REPRICE`). The incumbent's ratio
     /// limit [`ZC_R2_MAX_RATIO`] doubles for the R2-CS ratio; past it the
     /// incumbent's floor share and cut-off apply.
     fn zc_r2_cs_gate_share(ratio: f64, hi_size: usize) -> usize {
@@ -22160,7 +22189,7 @@ kernel void zc_r2_horner_oracle(
 
     /// The largest prefix R2-CS is ever handed (the share clamp's ceiling).
     fn zc_r2_cs_max_share(hi_size: usize) -> usize {
-        hi_size * 37 / 100
+        if super::zc_r2_cs_reprice_enabled() { hi_size * 45 / 100 } else { hi_size * 37 / 100 }
     }
 
     /// R2-CS admission once the calibration prove's sweep has joined: `ok` =
@@ -22459,7 +22488,7 @@ kernel void zc_r2_horner_oracle(
                 // R2-CS ratio itself). The share published here is the
                 // incumbent split's; the R2-CS verdict (`zc_r2_cs_verdict`)
                 // republishes it once R2-CS is admitted.
-                let r_cs = zc_r2_forced_ratio().unwrap_or(ZC_R2_CS_PRICE * measured);
+                let r_cs = zc_r2_forced_ratio().unwrap_or(zc_r2_cs_price() * measured);
                 if job.cs.is_some() {
                     ZC_R2_CS_RATIO.store(r_cs.to_bits(), Ordering::Relaxed);
                 }

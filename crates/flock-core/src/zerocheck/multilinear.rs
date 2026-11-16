@@ -1933,7 +1933,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
 
 /// The K pass GPU prefix arm's premap length over a compact state of
 /// `n_pairs` pairs: its dense anchors prefix in bytes, which covers every
-/// compacted layout's prefix (0 = no premap).
+/// compacted layout's prefix (0 = no premap). With the lean R2-CS kernel's
+/// price (`gpu_commit::ENV_NO_R2CS_REPRICE`) and R2-CS taking its anchors
+/// early for timed launches, the prefix spans at least half the pairs, so
+/// the stores of an R2-CS share up to its 45 % ceiling fit the view.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn zc_k_premap_bytes(n_pairs: usize) -> usize {
     if n_pairs < 16 {
@@ -1944,7 +1947,10 @@ fn zc_k_premap_bytes(n_pairs: usize) -> usize {
         return 0;
     }
     let k_hi = 1usize << cascade_k_pass_n_hi(n_pairs.trailing_zeros() as usize - 2);
-    let prefix_pairs = share.min(k_hi) * (n_pairs / k_hi);
+    let mut prefix_pairs = share.min(k_hi) * (n_pairs / k_hi);
+    if crate::gpu_commit::zc_r2_cs_reprice_enabled() && crate::gpu_commit::zc_r2_cs_premap_early() {
+        prefix_pairs = prefix_pairs.max(n_pairs / 2);
+    }
     prefix_pairs * 32
 }
 
