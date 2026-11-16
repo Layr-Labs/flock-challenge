@@ -1403,6 +1403,27 @@ pub(crate) fn gpu_zc_loop_debug() -> bool {
 /// against a hard 8-minute wall; this deletes the redundant ~119 repeats.
 pub const ENV_NO_WARMUP_LATCH_CACHE: &str = "FLOCK_NO_WARMUP_LATCH_CACHE";
 
+/// Diagnostic knob for the ranked split tune: `FLOCK_SPLIT_TUNE_CPU_BIAS=<n>`
+/// adds `n` 256ths of CPU share (16 = one sixteenth) to the tune's final
+/// decision, after the fit and the fine refinement and before the dead-store
+/// check, the byte verification and publication, so the sweep and every
+/// table it builds in the warm-up are kept. Unset, 0, negative or
+/// unparsable keeps the tune's decision unchanged. Read once, on first use
+/// (inside the untimed warm-up tune), so a value set with `set_var` at
+/// process start is seen. The split never changes proof bytes.
+pub const ENV_SPLIT_TUNE_CPU_BIAS: &str = "FLOCK_SPLIT_TUNE_CPU_BIAS";
+
+/// See [`ENV_SPLIT_TUNE_CPU_BIAS`]; in 256ths, at most 255.
+pub(crate) fn split_tune_cpu_bias() -> usize {
+    static BIAS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var(ENV_SPLIT_TUNE_CPU_BIAS)
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map_or(0, |v| v.clamp(0, 255) as usize)
+    });
+    *BIAS
+}
+
 pub(crate) fn warmup_latch_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_WARMUP_LATCH_CACHE).is_none())
@@ -13770,6 +13791,35 @@ kernel void blake3_pow_race_tail(
         }
     }
 
+    /// CPU share of a stored split in 256ths of the position range
+    /// (`16 k + m` for `k + 16 m`); 0 for the pure-GPU split.
+    fn split_cpu_share256(k_split: usize) -> usize {
+        let (k, m) = decode_hybrid_split(k_split);
+        16 * k + m
+    }
+
+    /// `k_split` with `bias256` 256ths more CPU share (see
+    /// `super::ENV_SPLIT_TUNE_CPU_BIAS`). The pure-GPU split and invalid
+    /// values are returned unchanged. The result is clamped to the storable
+    /// hybrid range (at most 255/256, at least one sixteenth); without the
+    /// fine path it is rounded to the nearest whole sixteenth (at most 15).
+    /// Every split shares the one per-`log_d` CPU-suffix twiddle table the
+    /// sweep prebuilds, and the biased split's own first run is the warm-up's
+    /// dead-store check and byte verification, so nothing it needs is built
+    /// in a timed prove.
+    fn bias_split_toward_cpu(k_split: usize, bias256: usize, allow_fine: bool) -> usize {
+        if bias256 == 0 || k_split == 0 || !hybrid_split_valid(k_split) {
+            return k_split;
+        }
+        let c = (split_cpu_share256(k_split) + bias256).clamp(16, 255);
+        if allow_fine {
+            let (k, m) = (c / 16, c % 16);
+            k + 16 * m
+        } else {
+            ((c + 8) / 16).clamp(1, 15)
+        }
+    }
+
     /// Per-sample latency from the CPU suffix's end to cb3's GPU start, for
     /// the samples whose CPU suffix finished after cb2 (cb3 is encoded and
     /// committed only once the CPU suffix is done, so a CPU-late window pays
@@ -14679,6 +14729,25 @@ kernel void blake3_pow_race_tail(
             s
         } else if hybrid_fine_enabled() {
             fine_split_from_arms(&fine_samples, chosen)
+        } else {
+            chosen
+        };
+        // Diagnostic CPU-ward bias of the final decision
+        // (`ENV_SPLIT_TUNE_CPU_BIAS`); the biased split is what the
+        // dead-store check, the byte verification and publication see.
+        let bias = super::split_tune_cpu_bias();
+        let chosen = if bias > 0 {
+            let biased = bias_split_toward_cpu(
+                chosen,
+                bias,
+                hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled(),
+            );
+            eprintln!(
+                "[gpu-commit] split bias +{bias}/256: k={chosen} (cpu {}/256) -> k={biased} (cpu {}/256)",
+                split_cpu_share256(chosen),
+                split_cpu_share256(biased),
+            );
+            biased
         } else {
             chosen
         };
@@ -19140,6 +19209,42 @@ kernel void lc_fold_stripes_factored_b4(
             assert_eq!(super::split_from_fit(&s[..1], true, 0.0), None);
             let flat: Vec<_> = s.iter().map(|r| (r.0, 40.0, 40.0 - r.0 as f64, 1.0)).collect();
             assert_eq!(super::split_from_fit(&flat, true, 0.0), None);
+        }
+
+        /// The CPU-ward bias moves coarse and fine splits by whole 256ths,
+        /// keeps the pure-GPU split and invalid values, clamps to the storable
+        /// range, and rounds to whole sixteenths without the fine path.
+        #[test]
+        fn cpu_bias_moves_the_split_by_256ths() {
+            use super::{bias_split_toward_cpu as b, hybrid_split_valid, split_cpu_share256 as c};
+            assert_eq!(b(2, 0, true), 2);
+            assert_eq!(b(2, 16, true), 3);
+            assert_eq!(b(2, 48, true), 5);
+            // Fine: 2 + 16*15 (cpu 47) + 16 -> 3 + 16*15 (cpu 63).
+            assert_eq!(c(2 + 16 * 15), 47);
+            assert_eq!(b(2 + 16 * 15, 16, true), 3 + 16 * 15);
+            // Fine -> coarse when the share lands on a whole sixteenth.
+            assert_eq!(b(6 + 16 * 10, 6, true), 7);
+            // Coarse -> fine for a non-multiple bias.
+            assert_eq!(b(7, 4, true), 7 + 16 * 4);
+            // Pure GPU and invalid values unchanged; clamp at 255/256.
+            assert_eq!(b(0, 32, true), 0);
+            assert_eq!(b(16, 32, true), 16);
+            assert_eq!(b(15, 48, true), 15 + 16 * 15);
+            assert_eq!(c(b(15, 48, true)), 255);
+            // Without the fine path: nearest whole sixteenth, at most 15.
+            assert_eq!(b(2, 24, false), 4);
+            assert_eq!(b(14, 48, false), 15);
+            for k in 1..16usize {
+                for m in 0..16usize {
+                    let s = if m == 0 { k } else { k + 16 * m };
+                    for bias in [1usize, 7, 16, 32, 48, 200] {
+                        assert!(hybrid_split_valid(b(s, bias, true)), "{s} +{bias}");
+                        assert!(b(s, bias, false) < 16 && b(s, bias, false) >= 1, "{s} +{bias}");
+                        assert!(c(b(s, bias, true)) >= c(s).min(255), "{s} +{bias}");
+                    }
+                }
+            }
         }
 
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
