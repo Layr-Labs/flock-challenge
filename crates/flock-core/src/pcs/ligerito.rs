@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 
 #[path = "ligerito/c2.rs"]
 mod c2;
+mod open_restore;
 
 #[cfg(test)]
 #[path = "ligerito/c2_tests.rs"]
@@ -5436,6 +5437,18 @@ fn transpose_forward_ntt_sparse_retained_with(
     drop_log: usize,
     lean: bool,
 ) -> Option<Vec<F128>> {
+    prepare_sparse_retained(ntt, positions, values, log_d, drop_log, lean)
+        .map(|basis| basis.materialize(ntt))
+}
+
+fn prepare_sparse_retained(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    drop_log: usize,
+    lean: bool,
+) -> Option<open_restore::RetainedBasis> {
     if drop_log == 0
         || drop_log >= log_d
         || positions.len() != values.len()
@@ -5490,9 +5503,7 @@ fn transpose_forward_ntt_sparse_retained_with(
             remaining -= 3;
             transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, remaining);
         }
-        transpose_forward_ntt_factored_final_3layer_low_half(ntt, &mut data, log_d);
-        data.truncate(n >> 1);
-        return Some(data);
+        return Some(open_restore::RetainedBasis { data, log_d, drop_log, low_half: true });
     }
     while remaining >= drop_log + 3 {
         remaining -= 3;
@@ -5501,9 +5512,7 @@ fn transpose_forward_ntt_sparse_retained_with(
     for layer in (drop_log..remaining).rev() {
         transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, layer);
     }
-    let retained = xor_collapse_cosets(&data, log_d - drop_log);
-    crate::scratch::give_sparse_ntt_data(data);
-    Some(retained)
+    Some(open_restore::RetainedBasis { data, log_d, drop_log, low_half: false })
 }
 
 /// The same retained row with four multipliers prepared before the row loop.
@@ -6289,6 +6298,10 @@ impl RoundQuad {
         }
     }
 }
+
+/// Largest log2 prover state of a recursive level whose deep-C2 dual and
+/// opening skip their Rayon join (`FLOCK_NO_SMALL_SERIAL=1` kills).
+const SMALL_SERIAL_MAX_LOG_STATE: usize = 15;
 
 /// Enable the previously-promoted two-challenge initial-fold cadence only for
 /// the ranked opening geometry it was designed and validated for. The opt-out
@@ -9344,22 +9357,41 @@ fn sample_distinct_queries<Ch: Challenger>(
     block_len: usize,
     count: usize,
 ) -> Vec<usize> {
+    sample_distinct_queries_visit(challenger, block_len, count, |_| {})
+}
+
+fn sample_distinct_queries_visit<Ch: Challenger>(
+    challenger: &mut Ch,
+    block_len: usize,
+    count: usize,
+    visit: impl FnMut(usize),
+) -> Vec<usize> {
     if query_probe_set_enabled() {
-        return sample_distinct_queries_probe(challenger, block_len, count);
+        return sample_distinct_queries_probe_visit(challenger, block_len, count, visit);
     }
-    sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled())
+    sample_distinct_queries_with_visit(challenger, block_len, count, query_set_presized_enabled(), visit)
 }
 
 /// [`sample_distinct_queries_with`] with the probe set for the ranked shapes
 /// (`count <= 256`, `block_len < 2^32`); other shapes take the `HashSet`.
 /// Same draws, same first-occurrence dedupe, same sort.
+#[cfg(test)]
 fn sample_distinct_queries_probe<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
     count: usize,
 ) -> Vec<usize> {
+    sample_distinct_queries_probe_visit(challenger, block_len, count, |_| {})
+}
+
+fn sample_distinct_queries_probe_visit<Ch: Challenger>(
+    challenger: &mut Ch,
+    block_len: usize,
+    count: usize,
+    mut visit: impl FnMut(usize),
+) -> Vec<usize> {
     if count > 256 || block_len >= u32::MAX as usize {
-        return sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled());
+        return sample_distinct_queries_with_visit(challenger, block_len, count, query_set_presized_enabled(), visit);
     }
     assert!(
         count <= block_len,
@@ -9372,6 +9404,7 @@ fn sample_distinct_queries_probe<Ch: Challenger>(
             let q = (v.lo as usize) % block_len;
             if seen.insert(q) {
                 out.push(q);
+                visit(q);
             }
         }
     });
@@ -9379,11 +9412,22 @@ fn sample_distinct_queries_probe<Ch: Challenger>(
     out
 }
 
+#[cfg(test)]
 fn sample_distinct_queries_with<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
     count: usize,
     presized: bool,
+) -> Vec<usize> {
+    sample_distinct_queries_with_visit(challenger, block_len, count, presized, |_| {})
+}
+
+fn sample_distinct_queries_with_visit<Ch: Challenger>(
+    challenger: &mut Ch,
+    block_len: usize,
+    count: usize,
+    presized: bool,
+    mut visit: impl FnMut(usize),
 ) -> Vec<usize> {
     assert!(
         count <= block_len,
@@ -9402,6 +9446,7 @@ fn sample_distinct_queries_with<Ch: Challenger>(
         let q = (v.lo as usize) % block_len;
         if seen.insert(q) {
             out.push(q);
+            visit(q);
         }
     }
     out.sort_unstable();
@@ -10230,12 +10275,25 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // Open L0; lane-fold weights = r_lane_fold.
     let num_queries_0 = config.queries[0];
-    let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
-    let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
     let use_c2 = c2::enabled(
         use_lazy_l1_ood,
         std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
     );
+    let l0_depth = if config.recursive_ks.first().copied() == Some(3) { 3 } else { 2 };
+    let (queries_0, alpha_0, sampled_setup) = if use_c2
+        && open_restore::enabled()
+        && rayon::current_num_threads() > 1
+    {
+        let (queries, alpha, dual, opened) = c2::Dual::sample_with_setup(
+            l0_depth, n1 + log_inv_rate_0, log_inv_rate_0, &r_lane_fold,
+            l0_block_len, num_queries_0, challenger, l0_tree, l0_row,
+        );
+        (queries, alpha, Some((dual, opened)))
+    } else {
+        let queries = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
+        let alpha = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+        (queries, alpha, None)
+    };
     let open_l0 = || {
         use rayon::prelude::*;
         rayon::join(
@@ -10244,12 +10302,9 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         )
     };
     let _t = std::time::Instant::now();
-    let ((merkle_proof_0, opened_rows_0), sparse_l0, full_l0) = if use_c2 {
-        let l0_depth = if config.recursive_ks.first().copied() == Some(3) {
-            3
-        } else {
-            2
-        };
+    let ((merkle_proof_0, opened_rows_0), sparse_l0, full_l0) = if let Some((dual, opened)) = sampled_setup {
+        (opened, Some(dual), None)
+    } else if use_c2 {
         let (dual, opened) = rayon::join(
             || {
                 c2::Dual::new_sync(
@@ -10603,20 +10658,26 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         };
         let _t = std::time::Instant::now();
         let ((merkle_proof_i, opened_rows_i), sparse_deep_i) = if use_deep_c2 {
-            let (dual, opened) = rayon::join(
-                || {
-                    c2::Dual::new_sync(
-                        3,
-                        n_next + config.log_inv_rates[i + 1],
-                        config.log_inv_rates[i + 1],
-                        &level_rs,
-                        &queries_i,
-                        &alpha_i,
-                        |q| wtns_prev.row(q),
-                    )
-                },
-                open_i,
-            );
+            let dual_i = || {
+                c2::Dual::new_sync(
+                    3,
+                    n_next + config.log_inv_rates[i + 1],
+                    config.log_inv_rates[i + 1],
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                    |q| wtns_prev.row(q),
+                )
+            };
+            // Small levels (`FLOCK_NO_SMALL_SERIAL=1` kills): the dual and the
+            // opening are a few microseconds each from the 2^15-state level
+            // down, so they run one after the other on this thread instead
+            // of as a Rayon join. Same two computations, same results.
+            let (dual, opened) = if n_next <= SMALL_SERIAL_MAX_LOG_STATE && crate::small_serial_enabled() {
+                (dual_i(), open_i())
+            } else {
+                rayon::join(dual_i, open_i)
+            };
             (opened, Some(dual))
         } else {
             (open_i(), None)
