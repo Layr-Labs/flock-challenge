@@ -1180,10 +1180,23 @@ pub(crate) fn zc_t0_park() {
 /// changes when the GPU work is issued.
 pub const ENV_NO_L1_MERKLE_OVERLAP: &str = "FLOCK_NO_L1_MERKLE_OVERLAP";
 
+/// Kill switch for the L2 recursive-commit NTT/Merkle overlap
+/// (`FLOCK_NO_L2_MERKLE_OVERLAP=1`). The ordinary non-overlapped L2 GPU
+/// Merkle remains disabled; only streamed leaf work may use this shape.
+pub const ENV_NO_L2_MERKLE_OVERLAP: &str = "FLOCK_NO_L2_MERKLE_OVERLAP";
+
 pub(crate) fn gpu_l1_merkle_overlap_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_L1_MERKLE_OVERLAP).is_none());
     *ON
+}
+
+pub(crate) fn gpu_l2_merkle_overlap_enabled() -> bool {
+    // Off in this tree: under the ranked benchmark's sandbox, processes with
+    // this overlap on ran about 10 ms slower in roughly a third of trials
+    // (measured on an M4 with the harness's own protocol); off, none did.
+    // The L2 commit then takes the record's CPU path.
+    false
 }
 
 /// Admission latch for the L1 overlap: the first eligible L1 commit in the
@@ -1198,7 +1211,11 @@ pub(crate) fn gpu_l1_merkle_overlap_enabled() -> bool {
 const L1_OVERLAP_UNMEASURED: u8 = 0;
 const L1_OVERLAP_ON: u8 = 1;
 const L1_OVERLAP_OFF: u8 = 2;
+const L1_MERKLE_LEAVES: usize = 1 << 18;
+const L2_MERKLE_LEAVES: usize = 1 << 16;
 static L1_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(L1_OVERLAP_UNMEASURED);
+static L2_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(L1_OVERLAP_UNMEASURED);
 
 /// Latch margin for the warmup race. The race necessarily runs the arms
@@ -1211,35 +1228,62 @@ static L1_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
 /// distortion; an overlap slower than the incumbent by MORE than the
 /// allowance even in this incumbent-flattering regime latches Off.
 const L1_OVERLAP_LATCH_MARGIN: f64 = 1.10;
+const L2_OVERLAP_LATCH_MARGIN: f64 = 1.00;
 
 pub(crate) fn l1_overlap_latch_state() -> u8 {
     L1_OVERLAP_LATCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+fn recursive_overlap_latch(num_leaves: usize) -> Option<&'static std::sync::atomic::AtomicU8> {
+    match num_leaves {
+        L1_MERKLE_LEAVES => Some(&L1_OVERLAP_LATCH),
+        L2_MERKLE_LEAVES => Some(&L2_OVERLAP_LATCH),
+        _ => None,
+    }
+}
+
 /// Publish the warmup race outcome. `equal` is `None` when either arm failed
 /// to produce a GPU tree (no oracle possible — latch Off).
-pub(crate) fn l1_overlap_report(overlap_wall_ms: f64, incumbent_wall_ms: f64, equal: Option<bool>) {
+pub(crate) fn recursive_overlap_report(
+    num_leaves: usize,
+    overlap_wall_ms: f64,
+    incumbent_wall_ms: f64,
+    equal: Option<bool>,
+) {
+    let Some(latch) = recursive_overlap_latch(num_leaves) else {
+        return;
+    };
+    let margin = if num_leaves == L1_MERKLE_LEAVES {
+        L1_OVERLAP_LATCH_MARGIN
+    } else {
+        // L2 races the CPU incumbent, not a whole-tree GPU dispatch whose
+        // back-to-back hot state needs L1's correction. Admit only a real
+        // measured wall-time win.
+        L2_OVERLAP_LATCH_MARGIN
+    };
     let decision = match equal {
-        Some(true) if overlap_wall_ms <= incumbent_wall_ms * L1_OVERLAP_LATCH_MARGIN => {
+        Some(true) if overlap_wall_ms <= incumbent_wall_ms * margin => {
             L1_OVERLAP_ON
         }
         Some(true) => L1_OVERLAP_OFF,
         Some(false) => {
             if gpu_zc_r2_debug() {
                 eprintln!(
-                    "[l1-overlap] MISMATCH: overlapped tree diverges from incumbent — \
-                     poisoned off for the process"
+                    "[L{}-overlap] MISMATCH: overlapped tree diverges from incumbent — \
+                     poisoned off for the process",
+                    if num_leaves == L1_MERKLE_LEAVES { 1 } else { 2 }
                 );
             }
             L1_OVERLAP_OFF
         }
         None => L1_OVERLAP_OFF,
     };
-    L1_OVERLAP_LATCH.store(decision, std::sync::atomic::Ordering::Relaxed);
+    latch.store(decision, std::sync::atomic::Ordering::Relaxed);
     if gpu_zc_r2_debug() {
         eprintln!(
-            "[l1-overlap] warmup race: overlapped {overlap_wall_ms:.2} ms vs incumbent \
+            "[L{}-overlap] warmup race: overlapped {overlap_wall_ms:.2} ms vs incumbent \
              {incumbent_wall_ms:.2} ms, trees_equal={equal:?} -> latch {}",
+            if num_leaves == L1_MERKLE_LEAVES { 1 } else { 2 },
             match decision {
                 L1_OVERLAP_ON => "ON",
                 _ => "OFF",
@@ -1253,12 +1297,17 @@ pub(crate) fn l1_overlap_latch_force(state: u8) {
     L1_OVERLAP_LATCH.store(state, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(test)]
+pub(crate) fn l2_overlap_latch_force(state: u8) {
+    L2_OVERLAP_LATCH.store(state, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One in-flight L1 overlap session: leaf dispatches are submitted per
 /// finalized NTT chunk while the transform still runs; `finish` drains them,
 /// encodes the internal levels exactly as the incumbent does, and copies the
 /// flat tree out. Any failure at any point returns `None` from `finish` and
 /// the caller runs the incumbent whole-tree path (exact same bytes).
-pub(crate) struct L1MerkleOverlap {
+pub(crate) struct RecursiveMerkleOverlap {
     inner: imp::L1MerkleOverlapSession,
     measuring: bool,
 }
@@ -1267,25 +1316,31 @@ pub(crate) struct L1MerkleOverlap {
 /// arm must stay on the incumbent path (kill switches, latch Off, non-L1
 /// shape, Metal init/wrap failure). All init and wrap-cache costs are paid
 /// here, before the caller starts its race clocks.
-pub(crate) fn gpu_l1_merkle_overlap_begin(
+pub(crate) fn gpu_recursive_merkle_overlap_begin(
     data_ptr: *const u8,
     data_len: usize,
     num_leaves: usize,
-) -> Option<L1MerkleOverlap> {
-    if !gpu_l1_merkle_overlap_enabled() || !gpu_recursive_merkle_enabled() {
+) -> Option<RecursiveMerkleOverlap> {
+    let level_enabled = match num_leaves {
+        L1_MERKLE_LEAVES => gpu_l1_merkle_overlap_enabled(),
+        L2_MERKLE_LEAVES => gpu_l2_merkle_overlap_enabled(),
+        _ => false,
+    };
+    if !level_enabled || !gpu_recursive_merkle_enabled() {
         return None;
     }
-    let latch = l1_overlap_latch_state();
+    let latch = recursive_overlap_latch(num_leaves)?
+        .load(std::sync::atomic::Ordering::Relaxed);
     if latch == L1_OVERLAP_OFF {
         return None;
     }
-    imp::l1_merkle_overlap_begin(data_ptr, data_len, num_leaves).map(|inner| L1MerkleOverlap {
+    imp::l1_merkle_overlap_begin(data_ptr, data_len, num_leaves).map(|inner| RecursiveMerkleOverlap {
         inner,
         measuring: latch == L1_OVERLAP_UNMEASURED,
     })
 }
 
-impl L1MerkleOverlap {
+impl RecursiveMerkleOverlap {
     /// Whether this session is the process's warmup race (latch unmeasured).
     pub(crate) fn measuring(&self) -> bool {
         self.measuring
@@ -1632,6 +1687,34 @@ pub fn gpu_recursive_merkle_blake3(
     imp::gpu_recursive_merkle_blake3(data, num_leaves)
 }
 
+/// Kill switch for the L1 whole-tree offload's zero-copy view:
+/// `FLOCK_NO_L1_WHOLE_TREE_VIEW=1` (exact value, read once) copies the
+/// 16 MiB tree out of the GPU buffer as before.
+///
+/// An L1 commit whose overlap latch is OFF builds its tree with the
+/// whole-tree GPU offload after the NTT, then copied the 16 MiB tree out:
+/// 0.32-0.34 ms on the M4 (ranked pool) with the opening's pool waiting on
+/// it. The overlap arm already hands the same persistent tree buffer to the
+/// L1 caller as a zero-copy view (`LigeroWitness::tree_view`); the offload
+/// now does the same for that caller, under the same lifetime rule (the
+/// witness dies before the next L1-shape commit rewrites the buffer). Same
+/// nodes, read in place.
+pub const ENV_NO_L1_WHOLE_TREE_VIEW: &str = "FLOCK_NO_L1_WHOLE_TREE_VIEW";
+
+pub(crate) fn l1_whole_tree_view_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_L1_WHOLE_TREE_VIEW).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// [`gpu_recursive_merkle_blake3`] returning `(address, nodes)` of the tree
+/// left in the persistent GPU buffer instead of a copy (see
+/// [`ENV_NO_L1_WHOLE_TREE_VIEW`]).
+pub(crate) fn gpu_recursive_merkle_blake3_view(data: &[u8], num_leaves: usize) -> Option<(usize, usize)> {
+    imp::gpu_recursive_merkle_blake3_view(data, num_leaves)
+}
+
 /// Exact rollback for the PCS Fiat--Shamir BLAKE3 grind scanner.  The first
 /// untimed ranked grind still has to prove that Metal returns the same
 /// globally-smallest nonce and clears the target-side timing gate before the
@@ -1772,15 +1855,21 @@ pub(crate) fn pow_race_tail_wanted() -> bool {
 }
 
 /// Build the race tail's library and pipeline and the result slots now, on
-/// the calling thread. Called last on the warm-up's pipeline-build helper
-/// thread (`ab_completion_gpu_prewarm`), so the compile never sits on the
-/// path to ready; a launch only reads the outcome and never waits for it.
+/// the calling thread, then (segmented race scan and its GPU-side cut on, see
+/// [`ENV_NO_SEG2_GPU_CUT`]) the cut kernel's library and pipeline. Called
+/// last on the warm-up's pipeline-build helper thread
+/// (`ab_completion_gpu_prewarm`), so the compile never sits on the path to
+/// ready; a launch only reads the outcome and never waits for it.
 pub(crate) fn gpu_pow_race_tail_prewarm() {
     if !pow_race_tail_wanted() {
         return;
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     imp::pow_race_tail_prewarm();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if grind_seg2_enabled() && seg2_gpu_cut_enabled() {
+        imp::pow_seg_cut_prewarm();
+    }
 }
 
 /// Race grind result slots (see [`gpu_pow_race_launch`]).
@@ -1976,6 +2065,30 @@ pub(crate) const GRIND_SEG2_SEGMENTS: usize = 4;
 pub(crate) fn grind_seg2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GRIND_SEG2).is_none());
     *ON && gpu_grind_enabled() && grind_lat_enabled() && !POW_RACE_OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Kill switch for the segmented race scan's GPU-side cut
+/// (`FLOCK_NO_SEG2_GPU_CUT`, any value: every segment runs
+/// `blake3_pow_scan_v2`, as before). With the switch unset the segments run
+/// `blake3_pow_scan_seg_cut`: the same scan of the same segment, and a thread
+/// that stores a match also stores 0 into the `best` words of every later
+/// segment of the same launch. The segments run one after another in one
+/// command buffer, so each later segment then returns at its first
+/// `id >= best` check instead of scanning its range for a match that is never
+/// read: a segment's word is read only after its signal and only when every
+/// lower segment's word is still empty, so once a segment holds a match no
+/// later word is read. Same smallest qualifying nonce: the matching
+/// segment's own word is written exactly as before, and only words above it
+/// are cut. The kernel is its own small library (the grind source plus the
+/// kernel), built after the race tail on the warm-up's pipeline-build helper
+/// thread ([`gpu_pow_race_tail_prewarm`]); until it is built, and when it is
+/// rejected, the segments keep `blake3_pow_scan_v2`. Read once per process.
+pub const ENV_NO_SEG2_GPU_CUT: &str = "FLOCK_NO_SEG2_GPU_CUT";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn seg2_gpu_cut_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_SEG2_GPU_CUT).is_none());
+    *ON
 }
 
 /// Encode the next segmented race launch's command buffer ahead of it.
@@ -2366,6 +2479,19 @@ pub(crate) fn gpu_tw_prefetch_enabled() -> bool {
 pub(crate) fn gpu_zero_root_shl4_bases_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZERO_ROOT_SHL4_BASES").is_none())
+}
+
+/// Kill switch for the layer-one byte table of the zero-root from-z library
+/// (`FLOCK_NO_BAND_BYTE_TABLE`, any value: the incumbent text). With it
+/// unset, the 4,096 B of threadgroup memory the first-pass kernel allocates
+/// for residency hold a 256-entry byte table `b * w` of its layer-one
+/// twiddle, filled from that twiddle's nibble banks 0 and 1, and layer one's
+/// four products read it: a 16-step byte Horner with one lookup per byte
+/// instead of the nibble Horner's 32 lookups. Same products, same
+/// threadgroup bytes per group (same residency). Read once per process.
+pub(crate) fn gpu_band_byte_table_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_BAND_BYTE_TABLE").is_none())
 }
 
 /// Kill switch for the two-tiles-per-thread g4 NTT pass
@@ -5619,10 +5745,131 @@ kernel void export_from_z_zero_root_tabs(
     /// instead of `4 * bank` single-bit steps, unless
     /// `FLOCK_NO_ZERO_ROOT_SHL4_BASES` is set. Same base values.
     pub(crate) fn zero_root_msl_source() -> &'static str {
-        if super::gpu_zero_root_shl4_bases_enabled() {
+        let base = if super::gpu_zero_root_shl4_bases_enabled() {
             zero_root_shl4_bases_source()
         } else {
             FROM_Z_ZERO_ROOT_MSL_SOURCE
+        };
+        if super::gpu_band_byte_table_enabled() {
+            // Both switches are read once, so `base` is the same text on
+            // every call of this process.
+            static SRC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            if let Some(s) = SRC.get_or_init(|| with_zero_root_byte_table(base)) {
+                return s;
+            }
+        }
+        base
+    }
+
+    const BAND_BYTE_HELPERS: &str = r#"static inline uint4 gf_shl8_zero_root(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// v * w from the byte table btab[b] = b(x) * w (16-step Horner, one lookup per byte).
+static inline uint4 gf_mul_btab_zero_root(uint4 v, threadgroup const uint4* btab) {
+    uint4 acc = uint4(0u);
+    for (int i = 15; i >= 0; i--) {
+        acc = gf_shl8_zero_root(acc);
+        acc ^= btab[(v[i >> 2] >> ((i & 3) * 8)) & 255u];
+    }
+    return acc;
+}
+
+"#;
+
+    const BAND_PAD_DECL: &str = r#"    // Residency only, never read: 4,096 B, so the group allocates 16,064 B
+    // of threadgroup memory and five groups share a core instead of six.
+    // Sixteen live F128 columns per lane want the lower residency: measured
+    // on an M4 GPU, 25.2 ms per full pass versus 36.7 ms at 11,968 B (six
+    // groups up to 13.5 KiB, five from 13.8 KiB at 25.2 ms, four from
+    // 16.8 KiB at 25.5 ms, three at 21.6 KiB at 31.1 ms).
+    threadgroup uint4 pad[256u];
+"#;
+    const BAND_BTAB_DECL: &str = r#"    // Layer one's byte table b * w (4,096 B: the group still allocates
+    // 16,064 B, so five groups share a core as with the residency pad).
+    threadgroup uint4 btab0[256u];
+"#;
+    const BAND_PAD_USE: &str = r#"    build_zero_root_tabs(twiddles, bases, tabs, lid);
+    if (P.log_d == 77u) {          // unreachable; keeps `pad` allocated
+        pad[lid % 256u] = tabs[lid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tabs[lid] ^= pad[(lid + 1u) % 256u];
+    }
+"#;
+    const BAND_BTAB_FILL: &str = r#"    build_zero_root_tabs(twiddles, bases, tabs, lid);
+    // btab0[b] = (b & 15) * w ^ (b >> 4) * w * x^4: nibble banks 0 and 1 of
+    // compact twiddle 0, complete after the build's last barrier.
+    for (uint b = lid; b < 256u; b += 64u) {
+        btab0[b] = tabs[b & 15u] ^ tabs[16u + (b >> 4)];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+"#;
+    const BAND_BYTE_BFLY: &str = r#"        #define BYTE_BFLY(EU, EV) { \
+            uint4 nu = elems[EU] ^ gf_mul_btab_zero_root(elems[EV], btab0); \
+            elems[EU] = nu; \
+            elems[EV] ^= nu; \
+        }
+"#;
+
+    /// The layer-one byte table (see [`super::gpu_band_byte_table_enabled`])
+    /// spliced into a zero-root source: the byte Horner helpers, the table in
+    /// place of the residency pad (same 4,096 B), its fill from the nibble
+    /// banks 0 and 1 of compact twiddle 0 behind the nibble build's last
+    /// barrier plus one barrier, and layer one's four compact-0 butterflies
+    /// on the byte table. `None` if any anchor is not found exactly once (the
+    /// incumbent text is then kept).
+    fn with_zero_root_byte_table(src: &str) -> Option<String> {
+        let mul_anchor = "static inline uint4 gf_mul_tab4_zero_root(";
+        let tab_anchor = "        #define TAB_BFLY(EU, EV, CT) {";
+        let edits: [(&str, String); 9] = [
+            (mul_anchor, format!("{BAND_BYTE_HELPERS}{mul_anchor}")),
+            (BAND_PAD_DECL, BAND_BTAB_DECL.to_owned()),
+            (BAND_PAD_USE, BAND_BTAB_FILL.to_owned()),
+            (tab_anchor, format!("{BAND_BYTE_BFLY}{tab_anchor}")),
+            ("        #undef TAB_BFLY\n", "        #undef TAB_BFLY\n        #undef BYTE_BFLY\n".to_owned()),
+            ("        TAB_BFLY(8, 12, 0)\n", "        BYTE_BFLY(8, 12)\n".to_owned()),
+            ("        TAB_BFLY(9, 13, 0)\n", "        BYTE_BFLY(9, 13)\n".to_owned()),
+            ("        TAB_BFLY(10, 14, 0)\n", "        BYTE_BFLY(10, 14)\n".to_owned()),
+            ("        TAB_BFLY(11, 15, 0)\n", "        BYTE_BFLY(11, 15)\n".to_owned()),
+        ];
+        let mut out = src.to_owned();
+        for (old, new) in edits.iter() {
+            if out.matches(old).count() != 1 {
+                return None;
+            }
+            out = out.replacen(old, new, 1);
+        }
+        Some(out)
+    }
+
+    #[cfg(test)]
+    mod band_byte_table_tests {
+        use super::*;
+
+        /// The splice applies to both zero-root bases, keeps the group's
+        /// threadgroup bytes, and moves exactly layer one's four compact-0
+        /// butterflies to the byte table; the production source carries it
+        /// whenever the switch is unset.
+        #[test]
+        fn byte_table_splice_moves_only_layer_one() {
+            for base in [FROM_Z_ZERO_ROOT_MSL_SOURCE, zero_root_shl4_bases_source()] {
+                let s = with_zero_root_byte_table(base).expect("zero-root byte-table anchors");
+                assert!(!s.contains("pad["));
+                assert_eq!(s.matches("threadgroup uint4 btab0[256u];").count(), 1);
+                assert_eq!(s.matches("        BYTE_BFLY(").count(), 4);
+                assert_eq!(s.matches("        TAB_BFLY(").count() + 4, base.matches("        TAB_BFLY(").count());
+                assert_eq!(s.matches(", 0)\n").count() + 4, base.matches(", 0)\n").count());
+            }
+            assert_eq!(
+                zero_root_msl_source().contains("btab0"),
+                super::super::gpu_band_byte_table_enabled()
+            );
         }
     }
 
@@ -9292,6 +9539,38 @@ kernel void blake3_pow_race_tail(
     atomic_store_explicit(best, 0xffffffffu, memory_order_relaxed);
     word[0] = (tag << 24u) | (b < params.len ? b : 0xffffffu);
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, POW_RACE_SCOPE_SYSTEM);
+}
+"#;
+
+    // Segmented race scan's GPU-side cut (`ENV_NO_SEG2_GPU_CUT`): compiled
+    // after `POW_MSL_SOURCE` (its `PowParams` and compression) into its own
+    // library by `pow_seg_cut_prewarm`; the grind library stays
+    // `POW_MSL_SOURCE` alone. `blake3_pow_scan_v2`'s loop, and a thread that
+    // stores a match also stores 0 into the `later` words that follow its
+    // segment's `best` word (the later segments' words of the same launch).
+    const POW_SEG_CUT_MSL_SOURCE: &str = r#"
+kernel void blake3_pow_scan_seg_cut(
+    constant uint* pre         [[buffer(0)]],
+    device atomic_uint* best   [[buffer(1)]],
+    constant PowParams& params [[buffer(2)]],
+    constant uint& later       [[buffer(3)]],
+    uint t [[thread_position_in_grid]],
+    uint grid [[threads_per_grid]])
+{
+    for (uint id = t; id < params.len; id += grid) {
+        if (id >= atomic_load_explicit(best, memory_order_relaxed)) return;
+        uint nonce_lo = params.start_lo + id;
+        uint carry = nonce_lo < params.start_lo ? 1u : 0u;
+        uint nonce_hi = params.start_hi + carry;
+        uint cv0 = pow_compress0_pre(pre, nonce_lo, nonce_hi);
+        if (pow_has_leading_zero_bits(cv0, params.bits)) {
+            atomic_fetch_min_explicit(best, id, memory_order_relaxed);
+            for (uint j = 1u; j <= later; j++) {
+                atomic_store_explicit(best + j, 0u, memory_order_relaxed);
+            }
+            return;
+        }
+    }
 }
 "#;
 
@@ -16217,6 +16496,9 @@ kernel void blake3_pow_race_tail(
     const SEG_ARGS_STRIDE: usize = 256;
     /// Per set: segment `k`'s `best` word at `4 k`.
     const SEG_SLOT_STRIDE: usize = 64;
+    // The cut kernel writes the words after its own up to segment
+    // `SEG_K - 1`: they stay inside the launch's set.
+    const _: () = assert!(4 * SEG_K <= SEG_SLOT_STRIDE);
 
     struct SegRace {
         ev: Id,
@@ -16280,16 +16562,23 @@ kernel void blake3_pow_race_tail(
         const POW_V2_GRID: u64 = 1 << 16;
         let base = st.next_value;
         st.next_value = base + SEG_K as u64;
+        // The GPU-side cut's pipeline once built (`pow_seg_cut_prewarm`),
+        // else the plain scan.
+        let cut = POW_SEG_CUT.get().copied().unwrap_or(0) as Id;
         unsafe {
             let pool = gpu.pool_push();
             let cb = (|| -> Option<Id> {
                 let cb = gpu.command_buffer().ok()?;
                 for k in 0..SEG_K {
                     let enc = gpu.compute_encoder(cb).ok()?;
-                    gpu.set_pipeline(enc, gpu.pso_pow);
+                    gpu.set_pipeline(enc, if cut.is_null() { gpu.pso_pow } else { cut });
                     gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE, 0);
                     gpu.set_buffer(enc, st.slots, i * SEG_SLOT_STRIDE + 4 * k, 1);
                     gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE + 128 + 16 * k, 2);
+                    if !cut.is_null() {
+                        // Words after this segment's own: the later segments.
+                        gpu.set_bytes(enc, &((SEG_K - 1 - k) as u32).to_ne_bytes(), 3);
+                    }
                     gpu.dispatch(enc, POW_V2_GRID / POW_V2_TG, POW_V2_TG);
                     gpu.end_encoding(enc);
                     gpu.encode_signal_event(cb, st.ev, base + k as u64 + 1);
@@ -16303,6 +16592,92 @@ kernel void blake3_pow_race_tail(
 
     fn seg_lock() -> std::sync::MutexGuard<'static, Option<SegRace>> {
         SEG_RACE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `blake3_pow_scan_seg_cut`'s pipeline (see `super::ENV_NO_SEG2_GPU_CUT`)
+    /// as an address, 0 when rejected. Set once by `pow_seg_cut_prewarm`;
+    /// encodes only `get` it, so they never wait for the build.
+    static POW_SEG_CUT: OnceLock<usize> = OnceLock::new();
+
+    /// Build the cut kernel's library and pipeline now, on the calling
+    /// thread (see `super::gpu_pow_race_tail_prewarm`). Once per process.
+    pub(crate) fn pow_seg_cut_prewarm() {
+        let _ = POW_SEG_CUT.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let pso = pow_seg_cut_build().map_or(0, |p| p as usize);
+            if super::pow_race_trace() {
+                eprintln!(
+                    "[grind] seg2: gpu cut {} after {:.1} ms",
+                    if pso != 0 { "ready" } else { "unavailable" },
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            pso
+        });
+    }
+
+    fn pow_seg_cut_build() -> Option<Id> {
+        const POW_V2_TG: u64 = 256;
+        let gpu = gpu().ok()?;
+        if !gpu.pow_v2 || gpu.pso_pow.is_null() {
+            return None;
+        }
+        unsafe {
+            let api = &gpu.api;
+            let pool = gpu.pool_push();
+            let pso = (|| -> Option<Id> {
+                let src = api.nsstring(&format!("{POW_MSL_SOURCE}\n{POW_SEG_CUT_MSL_SOURCE}")).ok()?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return None;
+                }
+                let mut pso: Id = NIL;
+                if let Ok(ns) = api.nsstring("blake3_pow_scan_seg_cut") {
+                    let function: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if !function.is_null() {
+                        let mut pso_err: Id = NIL;
+                        pso = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            gpu.device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        gpu.release(function);
+                    }
+                }
+                gpu.release(library);
+                if pso.is_null() {
+                    return None;
+                }
+                // The segments dispatch 256-thread groups.
+                let max_threads: u64 =
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup");
+                if max_threads < POW_V2_TG {
+                    gpu.release(pso);
+                    return None;
+                }
+                Some(pso)
+            })();
+            gpu.pool_pop(pool);
+            pso
+        }
     }
 
     /// Encode the next launch's buffer now (off the Metal arm's path).
@@ -17919,7 +18294,17 @@ kernel void lc_fold_stripes_factored_b4(
                     self.k,
                 )
             };
+            if self.arm == FoldArm::Zc
+                && crate::zerocheck::univariate_skip_optimized::zc_c_tail_trim_enabled()
             {
+                // Round-one C tail trim: the join is 2^k_log lanes (256 KiB),
+                // a few microseconds of streaming on this thread, while the
+                // rayon split woke pool threads that had parked after the AB
+                // completion. Same XORs into the same lanes.
+                for (a, b) in dst.iter_mut().zip(src.iter()) {
+                    *a += *b;
+                }
+            } else {
                 use rayon::prelude::*;
                 dst.par_chunks_mut(2048)
                     .zip(src.par_chunks(2048))
@@ -19715,11 +20100,11 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 }
 "#;
 
-    /// The exact recursive shapes worth offloading. L1 (2^18 leaves) wins
-    /// ~0.9 ms per timed prove; L2 (2^16 leaves) was measured NET NEGATIVE
-    /// (GPU 1.06 ms vs CPU 0.81 ms — the fixed wrap/submit/wait roundtrip
-    /// dominates at 16 MiB) and is deliberately excluded.
-    const REC_MERKLE_SHAPES: [usize; 1] = [1usize << 18];
+    /// Persistent-buffer shapes used by recursive Merkle work. L1 supports
+    /// both whole-tree offload and streaming. L2 is streaming-only: its
+    /// measured non-overlapped GPU wall (1.06 ms) lost to the CPU (0.81 ms),
+    /// but its leaf pass can hide under the CPU NTT.
+    const REC_MERKLE_SHAPES: [usize; 2] = [1usize << 18, 1usize << 16];
 
     /// Process-lifetime Metal state for the recursive Merkle offload.
     struct RecMerkle {
@@ -19910,8 +20295,24 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     }
 
     pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
+        gpu_recursive_merkle_blake3_impl(data, num_leaves, true).map(|(tree, _)| tree)
+    }
+
+    /// [`gpu_recursive_merkle_blake3`] minus the 16 MiB copy-out: the tree
+    /// stays in the persistent 2^18-leaf tree buffer (the one the L1 overlap
+    /// session's `finish_view` returns), and the result is its `(address,
+    /// nodes)` view.
+    pub(crate) fn gpu_recursive_merkle_blake3_view(data: &[u8], num_leaves: usize) -> Option<(usize, usize)> {
+        gpu_recursive_merkle_blake3_impl(data, num_leaves, false).map(|(_, view)| view)
+    }
+
+    fn gpu_recursive_merkle_blake3_impl(
+        data: &[u8],
+        num_leaves: usize,
+        copy_out: bool,
+    ) -> Option<(Vec<Hash>, (usize, usize))> {
         if !super::gpu_recursive_merkle_enabled()
-            || !REC_MERKLE_SHAPES.contains(&num_leaves)
+            || num_leaves != 1usize << 18
             || data.len() != num_leaves * 128
         {
             return None;
@@ -20040,6 +20441,10 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             return None;
         }
 
+        let view = (unsafe { gpu.buffer_contents(tree_buf) } as usize, total_nodes);
+        if !copy_out {
+            return Some((Vec::new(), view));
+        }
         // Pooled destination: a fresh 16 MiB uninit Vec pays ~4k first-touch
         // page faults inside this FS-serial copy and a single-threaded munmap
         // on the following drop; the recycled buffer's pages stay resident
@@ -20059,13 +20464,13 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                 state.misses,
             );
         }
-        Some(tree)
+        Some((tree, view))
     }
 
     // -----------------------------------------------------------------------
-    // L1 recursive-commit NTT/Merkle-leaf overlap (see
-    // `ENV_NO_L1_MERKLE_OVERLAP`). The CPU NTT already fires a per-finalized-
-    // chunk callback with a never-touched-again guarantee; each callback
+    // L1/L2 recursive-commit NTT/Merkle-leaf overlap (see
+    // `ENV_NO_L1_MERKLE_OVERLAP` / `ENV_NO_L2_MERKLE_OVERLAP`). The CPU NTT
+    // fires a per-finalized-chunk callback with a never-touched-again guarantee; each callback
     // submits a `leaf_hash128` dispatch over that chunk's disjoint leaf range
     // of the persistent tree buffer, so the leaf pass runs while the
     // transform is still producing the remaining chunks. `finish` drains the
@@ -20120,13 +20525,15 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         local_levels: Option<usize>,
     }
 
-    /// Off by default (incumbent shape: leaves only per batch, every parent
-    /// level behind the cover-completing batch). `FLOCK_L1_LOCAL_PARENTS=1`
-    /// (exact) opts in to per-batch local parent levels; it measured faster
-    /// on an M4 GPU but has no grader measurement yet.
+    /// Candidate #3: reduce each L1 leaf batch's complete local subtree in
+    /// the same command buffer, leaving only the top three levels for the
+    /// cover-completing batch. Exact `FLOCK_NO_L1_LOCAL_PARENTS=1` restores
+    /// the record's leaves-first shape. L2 deliberately keeps that incumbent
+    /// shape so its independent overlap measurement is not conflated.
     fn l1_local_parents_enabled() -> bool {
         static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("FLOCK_L1_LOCAL_PARENTS").is_ok_and(|v| v == "1")
+            std::env::var_os("FLOCK_NO_L1_LOCAL_PARENTS").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
         });
         *ON
     }
@@ -20317,7 +20724,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             let encode_parents = inner.covered_leaves == self.num_leaves
                 && l1_ranges_cover_exactly(&mut inner.ranges, self.num_leaves);
             let log_n = self.num_leaves.trailing_zeros() as usize;
-            let local = l1_local_parents_enabled();
+            let local = self.num_leaves == 1usize << 18 && l1_local_parents_enabled();
             // Per-range local depth: the levels whose every node's leaf span
             // lies inside `[s, s + n)` (both multiples of 2^depth).
             let range_levels = |s: usize, n: usize| -> usize {
@@ -26672,12 +27079,39 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
             cut: Id,
             ev: Id,
             next_value: u64,
-            /// Command buffer of the previous launch still in flight
-            /// (skipping its stolen tail); retired at the next launch.
-            inflight: Option<Id>,
+            /// Command buffers of the previous launch still in flight
+            /// (skipping its stolen tail), in commit order; retired at the
+            /// next launch.
+            inflight: Vec<Id>,
         }
         // SAFETY: Metal objects are thread-safe; access serialized by ZF.
         unsafe impl Send for ZfState {}
+
+        /// Kill switch for the per-chunk command buffers:
+        /// `FLOCK_NO_ZFOLD_SPLIT_CB=1` (exact value) restores the incumbent
+        /// single buffer that signals the event between its chunk encoders.
+        /// Read once.
+        ///
+        /// A signal encoded between two encoders of one command buffer is
+        /// only seen by the host when the whole buffer completes (M4: the
+        /// fine split's mid-buffer boundary signal showed ~0.1 ms after the
+        /// buffer's GPU end, not after its encoder). Here that hid every
+        /// finished chunk until the GPU met the steal boundary, so the CPU
+        /// stole and refolded blocks the GPU had already folded. With one
+        /// buffer per chunk, each chunk's signal ends its own buffer and is
+        /// seen when that chunk completes. Same kernel, same dispatches,
+        /// same queue and commit order (each buffer is committed as soon as
+        /// it is encoded); the buffers write disjoint stripes of the tracked
+        /// `out` buffer, so the queue runs them in order and the event
+        /// value still only grows, one step per completed chunk.
+        pub(crate) const ENV_NO_ZFOLD_SPLIT_CB: &str = "FLOCK_NO_ZFOLD_SPLIT_CB";
+
+        fn zfold_split_cb_enabled() -> bool {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                std::env::var_os(ENV_NO_ZFOLD_SPLIT_CB).as_deref() != Some(std::ffi::OsStr::new("1"))
+            })
+        }
 
         static ZF: Mutex<Option<Result<ZfState, String>>> = Mutex::new(None);
 
@@ -26706,7 +27140,7 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
                         cut,
                         ev,
                         next_value: 0,
-                        inflight: None,
+                        inflight: Vec::new(),
                     })
                 })();
                 gpu.pool_pop(pool);
@@ -26728,7 +27162,9 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
         /// `base + j + 1`.
         pub(crate) struct ZfJob {
             gpu: &'static Gpu,
-            cb: Id,
+            /// The launch's command buffers in commit order (one per chunk,
+            /// or the incumbent single buffer), all retained.
+            cbs: Vec<Id>,
             ev: Id,
             base: u64,
             chunk_blocks: usize,
@@ -26778,22 +27214,29 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
             pub(crate) fn finish(self, wait: bool) -> Option<(f64, f64)> {
                 unsafe {
                     self.set_cut(0);
-                    let done = self.gpu.cb_status(self.cb) >= 4;
+                    let done = self.cbs.iter().all(|&cb| self.gpu.cb_status(cb) >= 4);
                     if wait || done {
-                        let _ = self.gpu.wait_cb(self.cb);
-                        let (s, e) = cb_gpu_interval(self.gpu, self.cb);
-                        self.gpu.release(self.cb);
+                        for &cb in &self.cbs {
+                            let _ = self.gpu.wait_cb(cb);
+                        }
+                        let (s, _) = cb_gpu_interval(self.gpu, self.cbs[0]);
+                        let (_, e) = cb_gpu_interval(self.gpu, self.cbs[self.cbs.len() - 1]);
+                        for &cb in &self.cbs {
+                            self.gpu.release(cb);
+                        }
                         Some(((s - self.submit_s) * 1e3, (e - s) * 1e3))
                     } else {
                         let mut g = ZF.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(Ok(st)) = g.as_mut() {
-                            if let Some(old) = st.inflight.replace(self.cb) {
+                            for old in std::mem::replace(&mut st.inflight, self.cbs) {
                                 let _ = self.gpu.wait_cb(old);
                                 self.gpu.release(old);
                             }
                         } else {
-                            let _ = self.gpu.wait_cb(self.cb);
-                            self.gpu.release(self.cb);
+                            for &cb in &self.cbs {
+                                let _ = self.gpu.wait_cb(cb);
+                                self.gpu.release(cb);
+                            }
                         }
                         None
                     }
@@ -26853,7 +27296,7 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
                 _ => return None,
             };
             unsafe {
-                if let Some(old) = st.inflight.take() {
+                for old in std::mem::take(&mut st.inflight) {
                     let _ = st.gpu.wait_cb(old);
                     st.gpu.release(old);
                 }
@@ -26874,6 +27317,9 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
                 cut.write_volatile(n_blocks as u32);
                 let pool = st.gpu.pool_push();
                 let r = (|| -> Option<ZfJob> {
+                    if zfold_split_cb_enabled() {
+                        return launch_split(st, z_buf, block_len, gpu_blocks, chunk_blocks);
+                    }
                     let cb = st.gpu.command_buffer().ok()?;
                     let retained = st.gpu.retain(cb);
                     let base = st.next_value;
@@ -26903,7 +27349,7 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
                     st.gpu.commit_async(cb);
                     Some(ZfJob {
                         gpu: st.gpu,
-                        cb: retained,
+                        cbs: vec![retained],
                         ev: st.ev,
                         base,
                         chunk_blocks,
@@ -26916,6 +27362,72 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
                 })();
                 st.gpu.pool_pop(pool);
                 r
+            }
+        }
+
+        /// [`launch_on`] with one command buffer per chunk (see
+        /// [`ENV_NO_ZFOLD_SPLIT_CB`]): chunk `j`'s encoder and then its
+        /// signal (`base + j + 1`) end their own buffer, committed as soon as
+        /// it is encoded. Caller holds the ZF lock and an autorelease pool;
+        /// the consts and the steal boundary are already written. If an
+        /// encode fails, the launch stops at the chunks already committed:
+        /// the job offers only their blocks (the CPU steals the rest), and
+        /// with none committed it returns `None` (CPU only).
+        unsafe fn launch_split(
+            st: &mut ZfState,
+            z_buf: Id,
+            block_len: usize,
+            gpu_blocks: usize,
+            chunk_blocks: usize,
+        ) -> Option<ZfJob> {
+            unsafe {
+                let base = st.next_value;
+                let block_log = block_len.trailing_zeros();
+                let n_chunks = gpu_blocks.div_ceil(chunk_blocks);
+                let mut cbs: Vec<Id> = Vec::with_capacity(n_chunks);
+                let mut submit_s = 0.0;
+                for j in 0..n_chunks {
+                    let b0 = j * chunk_blocks;
+                    let b1 = (b0 + chunk_blocks).min(gpu_blocks);
+                    let Ok(cb) = st.gpu.command_buffer() else { break };
+                    let Ok(enc) = st.gpu.compute_encoder(cb) else { break };
+                    encode_zfold(
+                        st.gpu,
+                        enc,
+                        st.pso,
+                        z_buf,
+                        st.consts,
+                        st.out,
+                        st.cut,
+                        block_log,
+                        b0 * block_len,
+                        (b1 - b0) * block_len,
+                    );
+                    st.gpu.end_encoding(enc);
+                    st.gpu.encode_signal_event(cb, st.ev, base + j as u64 + 1);
+                    let retained = st.gpu.retain(cb);
+                    if j == 0 {
+                        submit_s = host_media_seconds();
+                    }
+                    st.gpu.commit_async(cb);
+                    cbs.push(retained);
+                }
+                if cbs.is_empty() {
+                    return None;
+                }
+                st.next_value = base + cbs.len() as u64;
+                Some(ZfJob {
+                    gpu: st.gpu,
+                    gpu_blocks: (cbs.len() * chunk_blocks).min(gpu_blocks),
+                    cbs,
+                    ev: st.ev,
+                    base,
+                    chunk_blocks,
+                    block_len,
+                    out: st.gpu.buffer_contents(st.out).cast::<F128>(),
+                    cut: st.gpu.buffer_contents(st.cut).cast::<u32>(),
+                    submit_s,
+                })
             }
         }
     }
@@ -27009,6 +27521,13 @@ mod imp {
         _data: &[u8],
         _num_leaves: usize,
     ) -> Option<Vec<crate::merkle::Hash>> {
+        None
+    }
+
+    pub(crate) fn gpu_recursive_merkle_blake3_view(
+        _data: &[u8],
+        _num_leaves: usize,
+    ) -> Option<(usize, usize)> {
         None
     }
 
@@ -27138,6 +27657,9 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 mod tests {
     use super::*;
     use crate::field::F128;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    static REC_MERKLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// GPU idle-decay probe at ranked size: full commit graph wall
     /// back-to-back vs after idle gaps. Ignored; run with --ignored --nocapture.
@@ -29007,6 +29529,9 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_recursive_merkle_matches_cpu_tree() {
+        let _guard = REC_MERKLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut rng = Rng::new(0x51AB);
         for log_leaves in [18usize] {
             let n_leaves = 1usize << log_leaves;
@@ -30607,17 +31132,16 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         imp::zc_r2_test_reset();
     }
 
-    /// The L1 NTT/Merkle-leaf overlap must reproduce the incumbent commit
-    /// byte-for-byte on the real L1 shape: same codeword matrix, same flat
+    /// The L1/L2 NTT/Merkle-leaf overlap must reproduce the incumbent commit
+    /// byte-for-byte on both real shapes: same codeword matrix, same flat
     /// tree, same root. Drives the full production path (`ligero_commit`
     /// with the fused3 transform's per-chunk callback) with the admission
     /// latch forced to each arm; the latch is process-global, hence the
     /// serial lock and the reset at the end.
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_l1_merkle_overlap_matches_sync() {
-        static L1_OVERLAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = L1_OVERLAP_TEST_LOCK
+    fn gpu_recursive_merkle_overlap_matches_sync() {
+        let _guard = REC_MERKLE_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Err(e) = imp::gpu() {
@@ -30667,6 +31191,24 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             &ntt,
             crate::merkle::HashKind::Blake3,
         );
+        // Whole-tree offload view arm (latch OFF, `ENV_NO_L1_WHOLE_TREE_VIEW`):
+        // the same nodes, read in place from the persistent tree buffer.
+        if super::l1_whole_tree_view_enabled() {
+            let w_off_view = crate::pcs::ligerito::ligero_commit_with_tree_view(
+                &poly,
+                16,
+                3,
+                2,
+                &ntt,
+                crate::merkle::HashKind::Blake3,
+            );
+            assert!(w_off_view.tree.is_empty(), "whole-tree view arm copied the tree out");
+            assert!(
+                w_off_view.nodes() == w_sync.tree.as_slice(),
+                "whole-tree view diverges from the copied tree"
+            );
+            assert_eq!(w_off_view.root(), w_sync.root());
+        }
         super::l1_overlap_latch_force(super::L1_OVERLAP_UNMEASURED);
 
         assert!(
@@ -30678,6 +31220,47 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             "L1 overlap tree diverges from the sync path"
         );
         assert_eq!(w_overlap.root(), w_sync.root());
+
+        // L2 shape: log_msg_cols=13, 8 lanes, rate 1/8 — 2^16 leaves.
+        // Its sync arm is deliberately the incumbent CPU subtree builder;
+        // the unsupported whole-tree GPU route must remain out of the test.
+        let poly_l2 = rng.vec(8 << 13);
+        let ntt_l2 = crate::ntt::AdditiveNttF128::standard(16);
+        super::l2_overlap_latch_force(super::L1_OVERLAP_ON);
+        let w_l2_overlap = crate::pcs::ligerito::ligero_commit(
+            &poly_l2,
+            13,
+            3,
+            3,
+            &ntt_l2,
+            crate::merkle::HashKind::Blake3,
+        );
+        super::l2_overlap_latch_force(super::L1_OVERLAP_OFF);
+        let w_l2_sync = crate::pcs::ligerito::ligero_commit(
+            &poly_l2,
+            13,
+            3,
+            3,
+            &ntt_l2,
+            crate::merkle::HashKind::Blake3,
+        );
+        super::l2_overlap_latch_force(super::L1_OVERLAP_UNMEASURED);
+        assert!(
+            w_l2_overlap.mat == w_l2_sync.mat,
+            "L2 overlap codeword diverges from the sync path"
+        );
+        // With the L2 overlap switched off in this tree
+        // (`gpu_l2_merkle_overlap_enabled()` is false), the forced-on commit
+        // takes the CPU path and keeps its copied tree; only then is the
+        // zero-copy check moot.
+        if super::gpu_l2_merkle_overlap_enabled() {
+            assert!(w_l2_overlap.tree.is_empty(), "L2 overlap copied the tree");
+        }
+        assert!(
+            w_l2_overlap.nodes() == w_l2_sync.tree.as_slice(),
+            "L2 overlap tree diverges from the sync path"
+        );
+        assert_eq!(w_l2_overlap.root(), w_l2_sync.root());
     }
 
     /// T3 products arm oracle: the GPU's per-chunk reduced partials must
