@@ -621,6 +621,22 @@ pub(crate) fn build_eq_table_into(point: &[F128], out: &mut [F128]) {
             });
         return;
     }
+    if d >= 14 {
+        let a = d / 2;
+        let mut lo = vec![F128::ZERO; 1usize << a];
+        let mut hi = vec![F128::ZERO; 1usize << (d - a)];
+        build_eq_table_into(&point[..a], &mut lo);
+        build_eq_table_into(&point[a..], &mut hi);
+        let lo = &lo;
+        out.par_chunks_mut(1usize << a)
+            .zip(hi.par_iter())
+            .for_each(|(chunk, &s)| {
+                for (o, &l) in chunk.iter_mut().zip(lo) {
+                    *o = l * s;
+                }
+            });
+        return;
+    }
     out[0] = F128::ONE;
     const PAR_THRESHOLD: usize = 1 << 12;
     const PAR_CHUNK: usize = 1 << 8;
@@ -673,6 +689,23 @@ pub(crate) fn build_eq_table_optimized_into(point: &[F128], out: &mut [F128]) {
             .zip(hi.par_iter())
             .for_each(|(chunk, &s)| {
                 crate::field::f128_slice::scale_slice_into(chunk, lo, s);
+            });
+        return;
+    }
+    let d = point.len();
+    if d >= 14 {
+        let a = d / 2;
+        let mut lo = vec![F128::ZERO; 1usize << a];
+        let mut hi = vec![F128::ZERO; 1usize << (d - a)];
+        build_eq_table_optimized_into(&point[..a], &mut lo);
+        build_eq_table_optimized_into(&point[a..], &mut hi);
+        let lo = &lo;
+        out.par_chunks_mut(1usize << a)
+            .zip(hi.par_iter())
+            .for_each(|(chunk, &s)| {
+                for (o, &l) in chunk.iter_mut().zip(lo) {
+                    *o = l * s;
+                }
             });
         return;
     }

@@ -875,6 +875,12 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
         (compact, m1, mi, Some(la))
     } else {
+        // Round-two A/B rebuild (`univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`):
+        // this round two reads every row from the buffers, so the rows the
+        // AB arm left to the lookahead sweep's rebuild are published first.
+        if let Some(rebuild) = univariate_skip_optimized::round2_ab_rebuild_take(a_packed, b_packed) {
+            rebuild.complete_globals();
+        }
         // (Taken early only on this predicate; never the case here.)
         if let Some(anchors) = early_anchors {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
