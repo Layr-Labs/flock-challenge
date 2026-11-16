@@ -41,6 +41,7 @@ pub mod scratch;
 pub mod stage_ir;
 pub use stage_ir as gf2_kernels;
 pub mod tmark;
+pub mod diag_ab;
 pub mod verifier;
 pub mod zerocheck;
 
@@ -103,7 +104,9 @@ pub fn micro_stack_enabled() -> bool {
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
-    // Before anything exists: the ranked worker's one idle pause.
+    // Diagnostic arm assignment happens before any thread or lazy setting.
+    diag_ab::init(is_ranked_worker_process());
+    // Preserve the record's full untimed startup pause.
     ranked_start_pause();
     let n = std::env::var("RAYON_NUM_THREADS")
         .ok()

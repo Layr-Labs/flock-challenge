@@ -5296,6 +5296,8 @@ impl Blake3Setup {
             }
             return (proof, commitment, claim);
         }
+        // Public diagnostic only: one fixed arm-label delay after the timed proof.
+        flock_core::diag_ab::after_timed_proof();
         (proof, commitment, claim)
     }
 
@@ -5331,6 +5333,8 @@ impl Blake3Setup {
         );
         let out = setup.prove_fast_inner(blocks, &mut challenger);
         flock_core::cpu_keepalive::pool_spin_release();
+        // Fixed diagnostic label delay, claimed only once by this process.
+        flock_core::diag_ab::after_timed_proof();
         out
     }
 
