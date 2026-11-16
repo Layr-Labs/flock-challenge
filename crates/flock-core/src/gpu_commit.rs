@@ -9944,6 +9944,11 @@ kernel void blake3_pow_race_tail(
     unsafe impl Send for Gpu {}
     unsafe impl Sync for Gpu {}
 
+    /// (residency set, tracked buffers, creation attempted) — see `Gpu::rs_track`.
+    #[allow(clippy::type_complexity)]
+    static RS: std::sync::LazyLock<std::sync::Mutex<(usize, std::collections::HashSet<usize>, bool)>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new((0, std::collections::HashSet::new(), false)));
+
     #[cfg(test)]
     std::thread_local! {
         pub(crate) static TEST_GPU_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -10801,6 +10806,7 @@ kernel void blake3_pow_race_tail(
                 if b.is_null() {
                     Err(format!("newBufferWithLength {len} failed"))
                 } else {
+                    self.rs_track(b, len);
                     Ok(b)
                 }
             }
@@ -10831,6 +10837,7 @@ kernel void blake3_pow_race_tail(
                 if b.is_null() {
                     Err("newBufferWithBytesNoCopy failed".into())
                 } else {
+                    self.rs_track(b, len);
                     Ok(b)
                 }
             }
@@ -10847,8 +10854,75 @@ kernel void blake3_pow_race_tail(
             }
         }
 
+        /// Residency set (`FLOCK_NO_RESIDENCY_SET=1` kills): every buffer of
+        /// 64 MiB or more joins one `MTLResidencySet` attached to the command
+        /// queue, so the large proof buffers stay mapped for the GPU across
+        /// idle gaps. Measured on an M5 Pro: after ~0.7 s without GPU use of
+        /// these buffers, the timed proof's first command buffer started
+        /// ~23 ms late (and a second ~17 ms stall followed in zerocheck);
+        /// with the set, the same gap costs a few percent instead of ~25 %.
+        /// Scheduling/memory only; no kernel or byte changes. A machine
+        /// without the API (no `MTLResidencySetDescriptor` class or a nil
+        /// set) leaves the record behaviour.
+        pub(crate) unsafe fn rs_track(&self, b: Id, len: usize) {
+            static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var_os("FLOCK_NO_RESIDENCY_SET").is_none_or(|v| v != "1")
+            });
+            if !*ON || len < (64 << 20) || b.is_null() {
+                return;
+            }
+            let mut g = RS.lock().unwrap_or_else(|e| e.into_inner());
+            unsafe {
+                if g.0 == 0 {
+                    if g.2 {
+                        return;
+                    }
+                    g.2 = true;
+                    let cls = (self.api.get_class)(c"MTLResidencySetDescriptor".as_ptr().cast());
+                    if cls.is_null() {
+                        return;
+                    }
+                    let d: Id = send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, cls, c"alloc");
+                    let d: Id = send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, d, c"init");
+                    if d.is_null() {
+                        return;
+                    }
+                    send!(self.api, unsafe extern "C" fn(Id, Sel, u64), d, c"setInitialCapacity:", 64u64);
+                    let mut err: Id = NIL;
+                    let set: Id = send!(
+                        self.api,
+                        unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                        self.device,
+                        c"newResidencySetWithDescriptor:error:",
+                        d,
+                        &mut err
+                    );
+                    send!(self.api, unsafe extern "C" fn(Id, Sel) -> Id, d, c"release");
+                    if set.is_null() {
+                        return;
+                    }
+                    send!(self.api, unsafe extern "C" fn(Id, Sel, Id), self.queue, c"addResidencySet:", set);
+                    g.0 = set as usize;
+                }
+                let set = g.0 as Id;
+                send!(self.api, unsafe extern "C" fn(Id, Sel, Id), set, c"addAllocation:", b);
+                send!(self.api, unsafe extern "C" fn(Id, Sel), set, c"commit");
+                send!(self.api, unsafe extern "C" fn(Id, Sel), set, c"requestResidency");
+                g.1.insert(b as usize);
+            }
+        }
+
         pub(crate) unsafe fn release(&self, obj: Id) {
             if !obj.is_null() {
+                {
+                    let mut g = RS.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.0 != 0 && g.1.remove(&(obj as usize)) {
+                        unsafe {
+                            send!(self.api, unsafe extern "C" fn(Id, Sel, Id), g.0 as Id, c"removeAllocation:", obj);
+                            send!(self.api, unsafe extern "C" fn(Id, Sel), g.0 as Id, c"commit");
+                        }
+                    }
+                }
                 unsafe {
                     send!(
                         self.api,
