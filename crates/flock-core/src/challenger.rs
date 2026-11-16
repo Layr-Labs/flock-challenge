@@ -1545,9 +1545,20 @@ fn grind_spawn_drain_applies(bits: u32) -> bool {
 /// empty: the smallest qualifying nonce, as the sequential scan finds it.
 /// Windows of `2^(bits+1)` nonces are walked in ascending order (a window
 /// with no match moves the search to the next one).
+///
+/// Grind linger (`epool::grind_linger_enabled`, `FLOCK_NO_GRIND_LINGER=1`
+/// kills): inside the linger phase each window's claim loop is also the
+/// linger target while the caller scans, and the kickoff is one broadcast
+/// job per pool thread instead of the fork-join fan-out; a thread that
+/// leaves its claim loop before the grind returns lingers one window, so the
+/// queue after the grind is joined by running threads. No fork-join frame of
+/// the grind sits under a lingering thread, and a job that runs after the
+/// grind returned does not linger (its thread may be waiting in a join of a
+/// later parallel region, which would then wait out the window). Claims,
+/// bound and the caller's walk are the same, so the nonce is the same.
 fn cpu_grind_spawned(state_digest: &[u8; 32], bits: u32, kind: HashKind) -> u64 {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     // Two 48-nonce kernel batches.
     const CHUNK: u64 = 96;
     const PENDING: u64 = u64::MAX;
@@ -1562,13 +1573,17 @@ fn cpu_grind_spawned(state_digest: &[u8; 32], bits: u32, kind: HashKind) -> u64 
         bound: AtomicUsize,
     }
     impl Drain {
-        fn work(&self) {
+        /// Claims and scans chunks until the cursor passes the window or the
+        /// bound; returns the number of chunks this call scanned.
+        fn work(&self) -> usize {
             let n_chunks = self.results.len();
+            let mut ran = 0usize;
             loop {
                 let c = self.next.fetch_add(1, Ordering::Relaxed);
                 if c >= n_chunks || c >= self.bound.load(Ordering::Relaxed) {
-                    break;
+                    break ran;
                 }
+                ran += 1;
                 let start = self.base.saturating_add(c as u64 * CHUNK);
                 match pow_scan(&self.digest, start, CHUNK, self.bits, self.kind) {
                     Some(n) => {
@@ -1583,6 +1598,11 @@ fn cpu_grind_spawned(state_digest: &[u8; 32], bits: u32, kind: HashKind) -> u64 
     let window: u64 = 1u64 << (bits.min(24) + 1);
     let n_chunks = usize::try_from(window.div_ceil(CHUNK)).expect("chunk count");
     let helpers = rayon::current_num_threads();
+    // Grind linger, inside the linger phase only: set while the grind runs,
+    // cleared before it returns its nonce.
+    let live = (crate::epool::grind_linger_enabled() && crate::epool::linger_phase_armed())
+        .then(|| Arc::new(AtomicBool::new(true)));
+    let caller = rayon::current_thread_index();
     let mut base = 0u64;
     loop {
         let drain = Arc::new(Drain {
@@ -1594,25 +1614,54 @@ fn cpu_grind_spawned(state_digest: &[u8; 32], bits: u32, kind: HashKind) -> u64 
             next: AtomicUsize::new(0),
             bound: AtomicUsize::new(n_chunks),
         });
-        {
-            let drain = Arc::clone(&drain);
-            rayon::spawn(move || {
-                use rayon::prelude::*;
-                (0..helpers).into_par_iter().with_max_len(1).for_each(|_| drain.work());
-            });
-        }
-        drain.work();
-        // Every chunk below the first match was claimed (the cursor is
-        // ascending) and is scanned in full, so each one reaches NO_MATCH or
-        // a nonce; wait out the ones still in flight on a pool thread.
-        for r in drain.results.iter() {
-            loop {
-                match r.load(Ordering::Acquire) {
-                    NO_MATCH => break,
-                    PENDING => std::hint::spin_loop(),
-                    n => return n,
+        let scan = || -> Option<u64> {
+            match &live {
+                Some(live) => {
+                    let drain = Arc::clone(&drain);
+                    let live = Arc::clone(live);
+                    rayon::spawn_broadcast(move |_| {
+                        drain.work();
+                        if live.load(Ordering::Acquire) {
+                            crate::epool::grind_linger_tail(caller);
+                        }
+                    });
+                }
+                None => {
+                    let drain = Arc::clone(&drain);
+                    rayon::spawn(move || {
+                        use rayon::prelude::*;
+                        (0..helpers).into_par_iter().with_max_len(1).for_each(|_| {
+                            drain.work();
+                        });
+                    });
                 }
             }
+            drain.work();
+            // Every chunk below the first match was claimed (the cursor is
+            // ascending) and is scanned in full, so each one reaches NO_MATCH
+            // or a nonce; wait out the ones still in flight on another thread.
+            for r in drain.results.iter() {
+                loop {
+                    match r.load(Ordering::Acquire) {
+                        NO_MATCH => break,
+                        PENDING => std::hint::spin_loop(),
+                        n => return Some(n),
+                    }
+                }
+            }
+            None
+        };
+        let found = if live.is_some() {
+            let guest = |_stop: &dyn Fn() -> bool| -> usize { drain.work() };
+            crate::epool::with_grind_linger_slot(&guest, scan)
+        } else {
+            scan()
+        };
+        if let Some(n) = found {
+            if let Some(l) = &live {
+                l.store(false, Ordering::Release);
+            }
+            return n;
         }
         base = base.saturating_add(window);
     }

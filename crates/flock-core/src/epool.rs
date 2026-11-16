@@ -221,6 +221,52 @@ fn spawn_lingerers(main_threads: usize) {
     }
 }
 
+/// Small-grind linger (`FLOCK_NO_GRIND_LINGER=1` kills; exact, read once).
+/// A small CPU grind (`challenger::cpu_grind_spawned`, 8 to 16 bits) posts
+/// one job that fans out to every pool thread. Without this, a thread that
+/// leaves the grind's claim loop goes back to Rayon's idle path and is asleep
+/// again when the fold or commit queue after the grind publishes itself, so
+/// that queue pays the wake cascade. With it, (a) the grind's claim loop is
+/// the linger target while the scan runs ([`with_grind_linger_slot`]), so the
+/// threads still lingering after the previous queue join the grind and renew
+/// their window, and (b) the kickoff is one broadcast job per pool thread,
+/// and a thread that leaves its claim loop while the grind still runs
+/// lingers one window ([`grind_linger_tail`]). Both act only on grinds that
+/// start inside the linger phase ([`set_linger_phase`]); other grinds keep
+/// the fork-join kickoff. Scheduling only: the grind's chunks are claimed
+/// from the same cursor under the same bound, and the lingerers run the same
+/// queues the drain lingerers run.
+pub(crate) fn grind_linger_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FLOCK_NO_GRIND_LINGER").is_ok_and(|v| v == "1"))
+}
+
+/// Whether the linger phase is armed (see [`set_linger_phase`]).
+pub(crate) fn linger_phase_armed() -> bool {
+    LINGER_PHASE.load(Ordering::Relaxed)
+}
+
+/// Publishes a small grind's claim loop as the linger target for the
+/// duration of `body` (see [`grind_linger_enabled`]); `body` runs
+/// unpublished outside the linger phase or while another queue holds the
+/// slot. Returns after every linger guest has left `guest`.
+pub(crate) fn with_grind_linger_slot<R>(
+    guest: &(dyn Fn(&dyn Fn() -> bool) -> usize + Sync),
+    body: impl FnOnce() -> R,
+) -> R {
+    with_linger_slot(guest, body)
+}
+
+/// Run by a thread of a small grind's kickoff that leaves its claim loop
+/// while the grind still runs (see [`grind_linger_enabled`]): linger one
+/// window. `caller` is the thread that runs the grind, which returns at once
+/// if it picks the job up; so does a thread that is already lingering.
+pub(crate) fn grind_linger_tail(caller: Option<usize>) {
+    if LINGER_PHASE.load(Ordering::Relaxed) {
+        linger_loop(crate::tmark::now_ns() + linger_window_ns(), caller);
+    }
+}
+
 thread_local! {
     static IN_LINGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
