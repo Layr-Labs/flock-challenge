@@ -2389,6 +2389,25 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let tail_compact = false;
     compact.tail_compact = tail_compact;
+    // Full chunks (the suffix after the round-two GPU prefix, stolen prefix
+    // chunks, every chunk without the arm) on the window-scaled walk
+    // (`FLOCK_NO_R2_FULL_XB` keeps the prepared-weight walk): it needs the
+    // fixed medium weights (`horner_weights`, which also pins the ranked
+    // periodic block shape), the dead pairs skipped and the odd groups'
+    // weights a constant multiple of the even ones' (checked when the table
+    // is built). Same state bytes and slots as the prepared-weight walk.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let xb_rho = if horner_weights && skip_dead && kernels::aarch64::r2_full_xb_enabled() {
+        kernels::aarch64::r2_full_xb_rho_prep(eq_lo)
+    } else {
+        None
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let xb_rho_addr = xb_rho.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let full_xb = xb_rho_addr != 0;
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let full_xb = false;
     // Head-compacted layout on top: every chunk's producer must be one of the
     // two ranked walks that write it (the full lookahead walk, or the
     // prescaled ranked-invariant walk on GPU-offloaded chunks).
@@ -2512,7 +2531,31 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 // reads its rows from this worker's scratch, rebuilt now.
                 debug_assert_eq!(row_base * n_chunks, x_hi * chunk_ab_bytes);
                 let (ap, bp) = r2_rows(x_hi);
-                if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                if full && full_xb {
+                    // Full chunk on the window-scaled walk
+                    // (`FLOCK_NO_R2_FULL_XB`): the seven-piece table on the
+                    // performance-core workers, the byte banks on the helpers.
+                    #[cfg(target_feature = "sha3")]
+                    kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_xb(
+                        t,
+                        if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                            fold7_addr as *const u8
+                        } else {
+                            core::ptr::null()
+                        },
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        xb_rho_addr as *const F128,
+                        lo_size,
+                        degen,
+                        tail_compact,
+                        head_fail_ptr,
+                        out.as_mut_ptr(),
+                    );
+                } else if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
                     kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
                         t,
                         fold7_addr as *const u8,
@@ -4469,6 +4512,82 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     (m1, minf, la, la2)
 }
 
+/// Allocate tri-pass partial rows without clearing storage that each chunk
+/// overwrites in full. The legacy switch restores the original zero fill.
+fn tri_partial_storage(len: usize) -> Vec<std::mem::MaybeUninit<[F128; 26]>> {
+    use std::mem::MaybeUninit;
+    #[cfg(test)]
+    {
+        let mode = TRI_PARTIAL_TEST_MODE.with(|m| m.get());
+        if mode == 1 {
+            return vec![MaybeUninit::new([F128::ZERO; 26]); len];
+        }
+        if mode == 2 {
+            return (0..len)
+                .map(|row| MaybeUninit::new(std::array::from_fn(|lane| {
+                    F128::new(
+                        0xa5a5_6b6b_1234_5678 ^ (row as u64).wrapping_mul(0x9e37_79b9),
+                        0x5a5a_9494_fedc_ba98 ^ (lane as u64).wrapping_mul(0x85eb_ca6b),
+                    )
+                })))
+                .collect();
+        }
+        if mode == 3 {
+            return vec![MaybeUninit::uninit(); len];
+        }
+    }
+    static UNCLEARED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_TRI_PARTIALS_UNINIT").is_none()
+    });
+    if *UNCLEARED {
+        vec![MaybeUninit::uninit(); len]
+    } else {
+        vec![MaybeUninit::new([F128::ZERO; 26]); len]
+    }
+}
+
+/// Borrow only the prefix already initialized by the completed CPU queue.
+///
+/// # Safety
+/// Every row in `0..len` must be fully written and no concurrent writer may
+/// touch that prefix for the returned borrow's lifetime.
+unsafe fn tri_partial_prefix(
+    rows: &[std::mem::MaybeUninit<[F128; 26]>],
+    len: usize,
+) -> &[[F128; 26]] {
+    let prefix = &rows[..len];
+    // SAFETY: caller establishes initialization and exclusive completion;
+    // MaybeUninit<T> has exactly T's layout and alignment.
+    unsafe { std::slice::from_raw_parts(prefix.as_ptr().cast(), prefix.len()) }
+}
+
+/// Reuse the allocation after all CPU/GPU owners have initialized their rows.
+///
+/// # Safety
+/// Every element must be fully initialized, with all writes joined. Abandoned
+/// incomplete passes must drop the MaybeUninit vector instead of calling this.
+unsafe fn tri_partials_assume_init(
+    rows: Vec<std::mem::MaybeUninit<[F128; 26]>>,
+) -> Vec<[F128; 26]> {
+    let mut rows = std::mem::ManuallyDrop::new(rows);
+    // SAFETY: caller establishes initialization; element layouts, lengths and
+    // capacities are identical, and ManuallyDrop transfers the allocation once.
+    let initialized: Vec<[F128; 26]> = unsafe {
+        Vec::from_raw_parts(rows.as_mut_ptr().cast(), rows.len(), rows.capacity())
+    };
+    #[cfg(test)]
+    if TRI_PARTIAL_TEST_MODE.with(|m| m.get() != 0) {
+        TRI_PARTIAL_TEST_ROWS.with(|capture| *capture.borrow_mut() = Some(initialized.clone()));
+    }
+    initialized
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TRI_PARTIAL_TEST_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static TRI_PARTIAL_TEST_ROWS: std::cell::RefCell<Option<Vec<[F128; 26]>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Tri pass 0's claim queue with the GPU arm (see
 /// `gpu_commit::ENV_NO_ZC_T0_GPU`). `hi_size` claims, one per queue job,
 /// each under one mutex: `(g0, g1)` = (next chunk to take from the GPU,
@@ -4488,7 +4607,7 @@ fn tri0_gpu_queue(
     chunk_out: usize,
     a_base: crate::epool::SyncPtr<F128>,
     b_base: crate::epool::SyncPtr<F128>,
-    partials_base: crate::epool::SyncPtr<[F128; 26]>,
+    partials_base: crate::epool::SyncPtr<std::mem::MaybeUninit<[F128; 26]>>,
     body: &(dyn Fn(usize) + Sync),
 ) {
     let calibration = job.calibration();
@@ -4526,7 +4645,7 @@ fn tri0_gpu_queue(
             unsafe {
                 std::ptr::copy_nonoverlapping(ga.as_ptr(), a_base.ptr().add(x_hi * chunk_out), chunk_out);
                 std::ptr::copy_nonoverlapping(gb.as_ptr(), b_base.ptr().add(x_hi * chunk_out), chunk_out);
-                *partials_base.ptr().add(x_hi) = slots;
+                partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(slots));
             }
         } else {
             body(x_hi);
@@ -4541,7 +4660,7 @@ fn tri0_gpu_queue(
                 unsafe {
                     std::slice::from_raw_parts(a_base.ptr().add(c * chunk_out).cast_const(), chunk_out) == ga
                         && std::slice::from_raw_parts(b_base.ptr().add(c * chunk_out).cast_const(), chunk_out) == gb
-                        && *partials_base.ptr().add(c) == slots
+                        && (&*partials_base.ptr().add(c)).assume_init_ref() == &slots
                 }
             });
         crate::gpu_commit::zc_t0_verdict(equal, job.offer());
@@ -4679,8 +4798,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
 
     #[allow(unused_mut)]
     let mut gpu_prefix: Option<KGpuPrefix> = None;
+    #[cfg(test)]
+    let hetero = hetero || TRI_PARTIAL_TEST_MODE.with(|m| m.get() != 0);
     let partials: Vec<[F128; 26]> = if hetero {
-        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
+        let mut partials = tri_partial_storage(hi_size);
         let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -4734,9 +4855,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 };
                 let (a_in, b_in) = inputs(x_hi);
                 let outv = chunk(&a_in, &b_in, a_o, b_o);
-                // SAFETY: exclusive owner of partials[x_hi].
+                // SAFETY: exclusive owner of this row; write a complete value
+                // without forming a reference to uninitialized storage.
                 unsafe {
-                    *partials_base.ptr().add(x_hi) = outv;
+                    partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
                 }
             };
             // The record's launch and queue: the GPU's share first, the CPU
@@ -4793,7 +4915,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 }
                 let taken = if gpu_ok { lo } else { 0 };
                 for c in 0..taken {
-                    partials[c] = job.part(c);
+                    partials[c].write(job.part(c));
                 }
                 if taken > 0 {
                     let (a, b) = job.outputs();
@@ -4802,6 +4924,9 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 job.finish(taken, hi_size);
             }
             return {
+                // SAFETY: the joined CPU suffix/steals and the copied GPU
+                // prefix partition every row; failure paths recompute the rest.
+                let partials = unsafe { tri_partials_assume_init(partials) };
                 let mut s = [F128::ZERO; 26];
                 for (x_hi, outv) in partials.iter().enumerate() {
                     let eq_h = eq_hi[x_hi];
@@ -4849,9 +4974,9 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
             };
             let (a_in, b_in) = inputs(x_hi);
             let outv = chunk(&a_in, &b_in, a_o, b_o);
-            // SAFETY: exclusive owner of partials[x_hi].
+            // SAFETY: exclusive owner; initialize the complete row by value.
             unsafe {
-                *partials_base.ptr().add(x_hi) = outv;
+                partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
             }
         };
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4900,7 +5025,9 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                         let equal = len <= a_out.len()
                             && ga == &a_out[..len]
                             && gb == &b_out[..len]
-                            && parts.as_slice() == &partials[..chunks];
+                            // SAFETY: calibration uses cpu_base=0; the CPU
+                            // queue has completed every row before this oracle.
+                            && parts.as_slice() == unsafe { tri_partial_prefix(&partials, chunks) };
                         crate::gpu_commit::zc_t56_verdict(equal, chunks, hi_size);
                         // With the tri pass 0 arm on, an admitted oracle hands
                         // its buffers (byte-equal to the CPU's outputs above)
@@ -4910,7 +5037,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                             gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
                         }
                     } else {
-                        partials[..chunks].copy_from_slice(&parts);
+                        assert_eq!(parts.len(), chunks);
+                        for (dst, value) in partials[..chunks].iter_mut().zip(parts) {
+                            dst.write(value);
+                        }
                         gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
                     }
                 }
@@ -4922,7 +5052,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 }
             }
         }
-        partials
+        // SAFETY: each CPU row is assigned in full; admitted GPU prefix rows
+        // are copied in full, and any failed prefix was recomputed on the CPU.
+        // The tri0 queue likewise writes each claimed row before returning.
+        unsafe { tri_partials_assume_init(partials) }
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
         vec![chunk(&a_in, &b_in, a_out, b_out)]
@@ -8174,6 +8307,101 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Force the real heterogeneous CPU path at small sizes and compare every
+    /// unweighted partial row, not only the final XOR reduction. A repeated
+    /// poison could cancel in the reduction, so retain the full row snapshots.
+    #[test]
+    fn tri_partials_no_clear_matches_zero_and_poison() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TRI_PARTIAL_TEST_MODE.with(|m| m.set(0));
+                TRI_PARTIAL_TEST_ROWS.with(|r| *r.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        let mut rng = Rng::new(0x7472_6970_6172_746c);
+        for (depth, packed, bpacked) in [(2, false, false), (3, false, false), (2, true, false), (2, true, true)] {
+            if packed && !cfg!(all(target_arch = "aarch64", target_feature = "aes")) {
+                continue;
+            }
+            for log_out in [3usize, 8, 11] {
+                let n = 1usize << (log_out + depth);
+                if packed && n < 256 { continue; }
+                let mut a = rng.f128_vec(n);
+                let mut b = rng.f128_vec(n);
+                if packed {
+                    for i in 0..n {
+                        if i % 64 >= 61 {
+                            a[i] = F128::ZERO;
+                            b[i] = F128::ZERO;
+                        } else if bpacked && matches!(i % 64, 0..=3 | 59) {
+                            b[i] = F128::ONE;
+                        }
+                    }
+                    a = a.into_iter().enumerate().filter_map(|(i, v)| (i % 64 <= 60).then_some(v)).collect();
+                    b = b.into_iter().enumerate().filter_map(|(i, v)| {
+                        (i % 64 <= 60 && !(bpacked && matches!(i % 64, 0..=3 | 59))).then_some(v)
+                    }).collect();
+                }
+                let rhos = rng.f128_vec(depth);
+                let mut r_next = rng.f128_vec(log_out);
+                r_next[0] = F128::ONE;
+                r_next[1] = F128::new(7, 13);
+                r_next[2] = F128::new(17, 19);
+                let run = |mode| {
+                    TRI_PARTIAL_TEST_MODE.with(|m| m.set(mode));
+                    TRI_PARTIAL_TEST_ROWS.with(|r| *r.borrow_mut() = None);
+                    let mut a_out = vec![LA_POISON; 1 << log_out];
+                    let mut b_out = vec![LA_POISON; 1 << log_out];
+                    let (m1, mi, la, la2, prefix) = fold_cascade_t_into_packed_prefix_gpu(
+                        &a, &b, packed, bpacked, None, &mut a_out, &mut b_out,
+                        &rhos, &r_next, false,
+                    );
+                    assert!(prefix.is_none());
+                    let rows = TRI_PARTIAL_TEST_ROWS.with(|r| r.borrow_mut().take()).expect("heterogeneous rows captured");
+                    (a_out, b_out, m1, mi, la, la2, rows)
+                };
+                let reference = run(1);
+                assert_eq!(run(2), reference, "poison depth={depth} packed={packed} bpacked={bpacked} log_out={log_out}");
+                assert_eq!(run(3), reference, "uninit depth={depth} packed={packed} bpacked={bpacked} log_out={log_out}");
+            }
+        }
+    }
+
+    /// Model only ownership handoffs, not Metal execution. Each producer
+    /// writes a complete row; read a prefix only after it has been written.
+    #[test]
+    fn tri_partial_storage_prefix_and_failure_handoffs() {
+        const N: usize = 17;
+        let expected: Vec<[F128; 26]> = (0..N).map(|row| {
+            std::array::from_fn(|lane| F128::new((row * 31 + lane + 1) as u64, (row * 71 + lane * 13 + 3) as u64))
+        }).collect();
+        for mode in [1, 2, 3] {
+            TRI_PARTIAL_TEST_MODE.with(|m| m.set(mode));
+            for prefix in [0, 1, N / 2, N] {
+                for failed in [false, true] {
+                    let mut rows = tri_partial_storage(N);
+                    for row in prefix..N { rows[row].write(expected[row]); }
+                    if failed {
+                        // Failed or declined GPU: CPU recomputes its prefix.
+                        for row in 0..prefix { rows[row].write(expected[row]); }
+                    } else {
+                        for row in 0..prefix { rows[row].write(expected[row]); }
+                        // SAFETY: that prefix has just been fully written.
+                        assert_eq!(unsafe { tri_partial_prefix(&rows, prefix) }, &expected[..prefix]);
+                    }
+                    // SAFETY: prefix and suffix partition all complete rows.
+                    assert_eq!(unsafe { tri_partials_assume_init(rows) }, expected);
+                }
+            }
+        }
+        TRI_PARTIAL_TEST_MODE.with(|m| m.set(0));
+        TRI_PARTIAL_TEST_ROWS.with(|r| *r.borrow_mut() = None);
+        // Dropping incomplete storage is safe; it never assumes initialization.
+        drop(tri_partial_storage(N));
     }
 
     #[test]

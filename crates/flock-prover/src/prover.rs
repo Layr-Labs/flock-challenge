@@ -2755,7 +2755,9 @@ fn commit_with_round1_ab_precompute(
     // The CPU tail hash of the hybrid commit waits for this arm (see
     // `gpu_commit::ENV_NO_HYBRID_CPU_TAIL_HASH`).
     flock_core::gpu_commit::note_ab_arm_running(true);
-    let result = rayon::join(
+    // The proving thread hands the whole join to a pool worker and waits on a
+    // spin join (`flock_core::in_pool`), as it does for the later phases.
+    let result = flock_core::in_pool(|| rayon::join(
         || {
             flock_core::tmark::mark("commit arm start");
             let pre = match commit_codeword {
@@ -2801,7 +2803,7 @@ fn commit_with_round1_ab_precompute(
             }
             r
         },
-    );
+    ));
 
     flock_core::tmark::mark("commit join end");
     if run_ranked_exact_tune {

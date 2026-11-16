@@ -230,14 +230,184 @@ mod ranked_start_pause_tests {
 /// same pool, with the same work and the same transcript order, so proof
 /// bytes are unchanged. `FLOCK_NO_IN_POOL=1` restores the direct call, and a
 /// caller that is already a worker of any pool takes the direct call anyway.
+///
+/// The hand-off back is a spin join ([`in_pool_spin`]): the caller waits on a
+/// done flag instead of parking on the join's latch. `FLOCK_NO_IN_POOL_SPIN=1`
+/// restores the parked `rayon::join`.
 pub fn in_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL").is_none());
+    static SPIN: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_IN_POOL_SPIN").is_none());
     if !*ON || rayon::current_thread_index().is_some() || rayon::current_num_threads() <= 1 {
         return op();
     }
+    if *SPIN {
+        return in_pool_spin(op);
+    }
     rayon::join(op, || ()).0
 }
+
+/// [`in_pool`]'s hand-off with a spin join.
+///
+/// A `rayon::join` entered from a thread outside the pool injects its job and
+/// then parks the caller on a lock latch (a mutex and a condition variable).
+/// When the body finishes on a worker, the worker signals the latch and the
+/// caller has to be woken and rescheduled before the next serial step can
+/// start. Here the body is spawned into the same pool and the caller waits on
+/// an atomic flag instead:
+/// - it spins `IN_POOL_SPIN_POLLS` times between checks of the flag, then
+///   calls `std::thread::yield_now`, so another runnable thread can take its
+///   core;
+/// - past `IN_POOL_SPIN_DEADLINE` it stops spinning and blocks in
+///   `std::thread::park` until the worker unparks it, so an unusually long
+///   body costs a blocking wait, as on the record, and no spinning.
+///
+/// The body runs exactly once, on a worker of the same pool, and completes
+/// before this returns. A panic in the body is caught on the worker and
+/// resumed on the caller, as `rayon::join` does.
+fn in_pool_spin<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    use std::cell::UnsafeCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// Shared by the caller and the job; the job owns a clone, so it may still
+    /// read `parked` after it has released the caller.
+    struct Flags {
+        done: AtomicBool,
+        parked: AtomicBool,
+    }
+    type Out<R> = UnsafeCell<Option<std::thread::Result<R>>>;
+    struct OutPtr<R>(*const Out<R>);
+    // SAFETY: the job writes the result once, before it sets `done`, and the
+    // caller keeps the result slot alive until it has seen `done`.
+    unsafe impl<R: Send> Send for OutPtr<R> {}
+
+    let out: Out<R> = UnsafeCell::new(None);
+    let flags = Arc::new(Flags { done: AtomicBool::new(false), parked: AtomicBool::new(false) });
+    let caller = std::thread::current();
+    let ptr = OutPtr(&out as *const Out<R>);
+    let job_flags = Arc::clone(&flags);
+    let job = move || {
+        let ptr = ptr;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(op));
+        // SAFETY: the caller is still waiting below, so the slot is alive, and
+        // nothing else writes it. This is the job's last access to the frame.
+        unsafe { *(*ptr.0).get() = Some(r) };
+        job_flags.done.store(true, Ordering::SeqCst);
+        if job_flags.parked.load(Ordering::SeqCst) {
+            caller.unpark();
+        }
+    };
+    let job: Box<dyn FnOnce() + Send + '_> = Box::new(job);
+    // SAFETY: the job borrows from this frame. The wait below returns only after
+    // the job's last access to the frame (the result write, ordered before the
+    // `done` store), and nothing in the wait can unwind, so the frame outlives
+    // every such access.
+    let job: Box<dyn FnOnce() + Send + 'static> = unsafe { std::mem::transmute(job) };
+    rayon::spawn(job);
+    let deadline = std::time::Instant::now() + IN_POOL_SPIN_DEADLINE;
+    let mut polls = 0u32;
+    while !flags.done.load(Ordering::SeqCst) {
+        if polls < IN_POOL_SPIN_POLLS {
+            std::hint::spin_loop();
+            polls += 1;
+            continue;
+        }
+        polls = 0;
+        if std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+            continue;
+        }
+        // Past the deadline: block. `parked` is set before `done` is checked
+        // again, and the job sets `done` before it reads `parked`, so (both
+        // SeqCst) at least one side sees the other: the job unparks, or this
+        // check sees `done`. An unpark that lands before `park` is kept as the
+        // thread's token, and `park` returns at once.
+        flags.parked.store(true, Ordering::SeqCst);
+        while !flags.done.load(Ordering::SeqCst) {
+            std::thread::park();
+        }
+        break;
+    }
+    // SAFETY: `done` (SeqCst load) orders the job's write of the slot before
+    // this read.
+    match out.into_inner() {
+        Some(Ok(v)) => v,
+        Some(Err(payload)) => std::panic::resume_unwind(payload),
+        None => unreachable!("in_pool_spin: done without a result"),
+    }
+}
+
+#[cfg(test)]
+mod in_pool_spin_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn runs_once_on_a_worker_with_borrowed_data() {
+        let data: Vec<u64> = (0..1000).collect();
+        let runs = AtomicUsize::new(0);
+        let (sum, on_worker) = super::in_pool_spin(|| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            (data.iter().sum::<u64>(), rayon::current_thread_index().is_some())
+        });
+        assert_eq!(sum, 499_500);
+        assert!(on_worker);
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_panic_in_the_body_reaches_the_caller() {
+        let r = std::panic::catch_unwind(|| super::in_pool_spin(|| -> u8 { panic!("body") }));
+        assert!(r.is_err());
+        // The pool is still usable afterwards.
+        assert_eq!(super::in_pool_spin(|| 7u8), 7);
+    }
+
+    #[test]
+    fn inside_another_pools_in_place_scope_the_body_runs_on_the_global_pool() {
+        // The open calls `in_pool` inside the helper pool's `in_place_scope`;
+        // the caller is still not a worker there, so the body must land on
+        // the global pool, as `rayon::join` did, and the scope's own task
+        // must still run.
+        let other = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let handle = std::thread::spawn(move || {
+            let side = AtomicUsize::new(0);
+            let global = other.in_place_scope(|s| {
+                s.spawn(|_| {
+                    side.fetch_add(1, Ordering::SeqCst);
+                });
+                super::in_pool(|| rayon::current_thread_index().map(|_| rayon::current_num_threads()))
+            });
+            assert_eq!(side.load(Ordering::SeqCst), 1);
+            if rayon::current_num_threads() > 1 {
+                assert_eq!(global, Some(rayon::current_num_threads()));
+            }
+        });
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_body_past_the_deadline_is_waited_for_by_blocking() {
+        let t = std::time::Instant::now();
+        let v = super::in_pool_spin(|| {
+            // Busy, not asleep: the body outlasts the caller's spin window.
+            let t0 = std::time::Instant::now();
+            while t0.elapsed() <= super::IN_POOL_SPIN_DEADLINE {
+                std::hint::spin_loop();
+            }
+            42u32
+        });
+        assert_eq!(v, 42);
+        assert!(t.elapsed() >= super::IN_POOL_SPIN_DEADLINE);
+    }
+}
+
+/// Spins between two checks of [`in_pool_spin`]'s done flag before a yield.
+const IN_POOL_SPIN_POLLS: u32 = 64;
+/// How long [`in_pool_spin`] spins and yields before it blocks instead. The
+/// phase bodies it wraps take 2-30 ms.
+const IN_POOL_SPIN_DEADLINE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Apply the prover's QoS class to the calling thread.
 ///
