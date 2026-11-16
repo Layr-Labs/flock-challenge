@@ -5331,6 +5331,9 @@ impl Blake3Setup {
         );
         let out = setup.prove_fast_inner(blocks, &mut challenger);
         flock_core::cpu_keepalive::pool_spin_release();
+        // Diagnostic run: return late, at the time that encodes this worker's
+        // arm and its seed read -> prove end time (`flock_core::diagx`).
+        flock_core::diagx::hold();
         out
     }
 
