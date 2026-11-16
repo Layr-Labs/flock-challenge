@@ -5819,6 +5819,10 @@ fn ligero_commit_select(
     let level_opt_out = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
         (16, 3, 2) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1"),
         (13, 3, 3) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2"),
+        // L3 / L4: the same fused first radix-8 pass in place of a serial
+        // replica fill (their messages are below the parallel-copy chunk).
+        (10, 3, 4) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L3"),
+        (7, 3, 5) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L4"),
         _ => None,
     };
     let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
@@ -5948,7 +5952,14 @@ fn ligero_commit_impl_view(
     // `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, latch Off, non-L1 shape, any Metal
     // failure).
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
-    let overlap = if fuse_from_message && kind == HashKind::Blake3 && leaf_size_bytes == 128 {
+    // Only the L1 shape (16 message-column bits) may open the GPU leaf
+    // overlap or its one-shot warm-up race; every other fused level takes the
+    // plain fused path below.
+    let overlap = if fuse_from_message
+        && kind == HashKind::Blake3
+        && leaf_size_bytes == 128
+        && log_msg_cols == 16
+    {
         crate::gpu_commit::gpu_l1_merkle_overlap_begin(
             mat.as_ptr().cast::<u8>(),
             codeword_len * core::mem::size_of::<F128>(),
@@ -6103,6 +6114,8 @@ fn ligero_commit_impl_view(
         let level = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
             (16, 3, 2) => Some("L1"),
             (13, 3, 3) => Some("L2"),
+            (10, 3, 4) => Some("L3"),
+            (7, 3, 5) => Some("L4"),
             _ => None,
         };
         if let Some(level) = level {
@@ -12570,6 +12583,8 @@ mod tests {
         for (log_msg_cols, log_inv_rate, seed) in [
             (16usize, 2usize, 0xF14C_0002_u64),
             (13usize, 3usize, 0xF14C_0003_u64),
+            (10usize, 4usize, 0xF14C_0004_u64),
+            (7usize, 5usize, 0xF14C_0005_u64),
         ] {
             let log_num_interleaved = 3usize;
             let mut rng = crate::challenger::RandomChallenger::new(seed);
