@@ -1005,6 +1005,52 @@ pub(crate) fn gpu_zc_k_share() -> usize {
     if gpu_commit_enabled() { *SHARE } else { 0 }
 }
 
+/// Kill switch for the K arm's late-GPU steal (`FLOCK_NO_ZC_K_STEAL`, any
+/// value: the record's join, where the CPU queue, having folded the chunks
+/// after the GPU's share, waits for the GPU's buffer). With it on, the
+/// launch, the share, the dispatch and the CPU queue are the record's; only
+/// the join differs. If the GPU's buffer is complete when the queue has
+/// drained, nothing else happens. If it is not, the CPU does not wait: it
+/// folds the GPU's chunks itself from the top of the share downward with the
+/// same kernel as its own chunks, lowering the fold kernel's skip boundary
+/// (read once per threadgroup, so a superblock is folded whole or not at
+/// all), and asks at every claim whether the buffer has completed (one
+/// shared-event signal behind the encoder). From that moment every chunk
+/// below the boundary is the GPU's. The K prefix handed to the 5+6 pass is
+/// the GPU's kept chunks only, so that pass (and its GPU arm, whose share is
+/// the 5+6 chunks wholly inside the prefix) reads every stolen chunk from
+/// the CPU's outputs. Same values per chunk either way. Needs the faster fold
+/// kernel (`FLOCK_NO_ZC_K_V2` also turns this off). Read once per process.
+pub const ENV_NO_ZC_K_STEAL: &str = "FLOCK_NO_ZC_K_STEAL";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_k_steal_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_K_STEAL).is_none());
+    *ON
+}
+
+/// Test hook of the K steal: chunks the CPU takes from the top of the GPU's
+/// share before its own queue, while the GPU runs (so a fast GPU still
+/// loses them and the steal path can be checked at chosen boundaries). It
+/// exists only in a build made with `FLOCK_ZC_K_TEST_HOOK` set in the BUILD
+/// environment (`option_env!`): such a build takes `FLOCK_ZC_K_STEAL_FORCE`
+/// (run time) chunks, or the build variable's value when that is unset. In
+/// every other build this is the constant 0 and nothing in the process
+/// environment can change the steal.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_k_steal_force() -> usize {
+    const HOOK: Option<&str> = option_env!("FLOCK_ZC_K_TEST_HOOK");
+    let Some(built) = HOOK else { return 0 };
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLOCK_ZC_K_STEAL_FORCE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| built.trim().parse().unwrap_or(0))
+    })
+}
+
 /// Diagnostic trace for the K pass arm (`FLOCK_ZC_K_GPU_DEBUG=1`, or any
 /// `FLOCK_PHASE_TIMING` run): the oracle verdict and one line per prove.
 pub(crate) fn gpu_zc_k_debug() -> bool {
@@ -4975,6 +5021,7 @@ kernel void zc_k_fold_v2(
     device uint4*       tg_part [[buffer(6)]],
     constant ZcKParams& p       [[buffer(7)]],
     device atomic_uint* flag    [[buffer(8)]],
+    device const uint*  cut     [[buffer(9)]],
     uint tg  [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     ushort sl [[thread_index_in_simdgroup]],
@@ -4983,10 +5030,16 @@ kernel void zc_k_fold_v2(
     threadgroup uint4 nib[256];
     threadgroup uint4 rtab[512];
     threadgroup uint4 sred[8][8];
+    // `cut[0]`: the lowest K chunk the CPU has taken (late-GPU steal; all
+    // ones = none). One thread reads it for the group, so the whole group
+    // returns or the whole group runs, before any anchor or delta is read.
+    threadgroup uint skip_tg;
+    if (lid == 0u) { skip_tg = (tg / p.sb_per_chunk) >= cut[0] ? 1u : 0u; }
     nib[lid] = nib_dev[lid];
     rtab[lid] = nib_dev[256u + lid];
     rtab[256u + lid] = nib_dev[512u + lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (skip_tg != 0u) { return; }
 
     uint i = lid & 63u;
     uint k = lid >> 6u;
@@ -23883,6 +23936,12 @@ kernel void zc_ab_finish(
         flag_buf: Id,
         /// Scratch output of the round-two premap touch dispatch.
         touch_buf: Id,
+        /// The fold kernel's skip boundary (one word, K chunks; all ones =
+        /// none), see `super::ENV_NO_ZC_K_STEAL`.
+        cut_buf: Id,
+        /// Steal form: one step per launch, signalled behind the encoder.
+        ev: Id,
+        next_value: u64,
         chunks: usize,
         per_chunk_a: usize,
         per_chunk_b: usize,
@@ -24161,7 +24220,7 @@ kernel void zc_ab_finish(
             if super::gpu_zc_k_debug() {
                 eprintln!("[zc-k-gpu] pipelines: {how} (joined after {wait_ms:.2} ms)");
             }
-            let mut made: Vec<Id> = Vec::with_capacity(8);
+            let mut made: Vec<Id> = Vec::with_capacity(9);
             for len in [
                 (256 + 512) * 16,
                 (2 + n_weights + chunks) * 16,
@@ -24171,6 +24230,7 @@ kernel void zc_ab_finish(
                 chunks * 8 * 16,
                 16,
                 8 * 16,
+                16,
             ] {
                 match gpu.new_buffer(len) {
                     Ok(b) => made.push(b),
@@ -24184,6 +24244,17 @@ kernel void zc_ab_finish(
                     }
                 }
             }
+            // No skip until a steal launch sets one.
+            gpu.buffer_contents(made[8]).cast::<u32>().write_volatile(u32::MAX);
+            let ev: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newSharedEvent");
+            if ev.is_null() {
+                for b in made {
+                    gpu.release(b);
+                }
+                gpu.release(fold_pso);
+                gpu.release(finish_pso);
+                return Err("newSharedEvent failed".into());
+            }
             Ok(ZcK {
                 fold_pso,
                 finish_pso,
@@ -24195,6 +24266,9 @@ kernel void zc_ab_finish(
                 part_buf: made[5],
                 flag_buf: made[6],
                 touch_buf: made[7],
+                cut_buf: made[8],
+                ev,
+                next_value: 0,
                 chunks,
                 per_chunk_a,
                 per_chunk_b,
@@ -24215,13 +24289,45 @@ kernel void zc_ab_finish(
         per_chunk_b: usize,
         calibration: bool,
         submitted: std::time::Instant,
+        /// Steal form (see `super::ENV_NO_ZC_K_STEAL`): the event and the
+        /// value its signal behind the encoder sets, and the skip boundary.
+        steal: Option<(Id, u64, *mut u32)>,
     }
 
     // SAFETY: the handles are only waited/released by the launching thread;
-    // Metal objects are themselves thread-safe.
+    // Metal objects are themselves thread-safe; the boundary word is the
+    // arm's process-lifetime shared buffer.
     unsafe impl Send for ZcKJob {}
+    // SAFETY: the steal's claim workers only read the event and write the
+    // boundary word (one aligned u32) under the claim lock.
+    unsafe impl Sync for ZcKJob {}
 
     impl ZcKJob {
+        /// Whether this launch is the steal form (an admitted, timed launch).
+        pub(crate) fn steal_form(&self) -> bool {
+            self.steal.is_some()
+        }
+
+        /// Whether the buffer's encoder has completed: every chunk below the
+        /// boundary its threadgroups read was folded whole and is visible to
+        /// the host. `false` for a launch without the steal form.
+        pub(crate) fn done(&self) -> bool {
+            let Some((ev, v, _)) = self.steal else { return false };
+            let Ok(gpu) = gpu() else { return false };
+            let done = unsafe { gpu.event_signaled_value(ev) } >= v;
+            // Order the reads of the buffer's outputs after this read.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            done
+        }
+
+        /// Publish the CPU's steal boundary: threadgroups of chunks `>= hi`
+        /// that have not started return without reading anything.
+        pub(crate) fn set_cut(&self, hi: usize) {
+            if let Some((_, _, cut)) = self.steal {
+                unsafe { cut.write_volatile(hi as u32) };
+            }
+        }
+
         /// First chunk the CPU queue folds: zero during the oracle probe (the
         /// CPU folds every chunk and the GPU's are compared, then dropped).
         pub(crate) fn cpu_base(&self) -> usize {
@@ -24579,7 +24685,7 @@ kernel void zc_ab_finish(
             release_view(ab_view);
             return None;
         };
-        let state = match state_mutex.lock() {
+        let mut state = match state_mutex.lock() {
             Ok(s) => s,
             Err(_) => {
                 note_poisoned_lock("zc-k launch", false);
@@ -24714,6 +24820,23 @@ kernel void zc_ab_finish(
                 pad: [0; 3],
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
+            // Steal form (`super::ENV_NO_ZC_K_STEAL`): an admitted launch of
+            // the faster fold, whose threadgroups read the boundary. Its
+            // signal follows the encoder (fold and finish). The oracle probe
+            // and every other launch keep the record's form (no skip, no
+            // signal).
+            let cut = gpu.buffer_contents(state.cut_buf).cast::<u32>();
+            let steal = (mode == ZC_K_ADMITTED
+                && super::zc_k_steal_enabled()
+                && ZC_K_V2_ACTIVE.load(Ordering::Relaxed))
+            .then(|| {
+                let v = state.next_value + 1;
+                // Skipped whether or not the buffer encodes: a value that is
+                // never signalled is never waited for.
+                state.next_value = v;
+                (state.ev, v, cut)
+            });
+            cut.write_volatile(if steal.is_some() { chunks as u32 } else { u32::MAX });
             let pool = gpu.pool_push();
             let submitted = (|| -> Result<Id, String> {
                 let cb = gpu.command_buffer()?;
@@ -24728,6 +24851,7 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.tgp_buf, 0, 6);
                 gpu.set_bytes(enc, pb, 7);
                 gpu.set_buffer(enc, state.flag_buf, 0, 8);
+                gpu.set_buffer(enc, state.cut_buf, 0, 9);
                 gpu.dispatch(enc, (chunks * sb_per_chunk) as u64, 256);
                 // Serial dispatches of one encoder: the finish reads the
                 // superblock sums the fold wrote.
@@ -24738,6 +24862,9 @@ kernel void zc_ab_finish(
                 gpu.set_bytes(enc, pb, 3);
                 gpu.dispatch(enc, chunks as u64, 8);
                 gpu.end_encoding(enc);
+                if let Some((ev, v, _)) = steal {
+                    gpu.encode_signal_event(cb, ev, v);
+                }
                 let cb = gpu.retain(cb);
                 gpu.commit_async(cb);
                 Ok(cb)
@@ -24752,6 +24879,7 @@ kernel void zc_ab_finish(
                     per_chunk_b,
                     calibration: mode == ZC_K_UNCALIBRATED,
                     submitted: std::time::Instant::now(),
+                    steal,
                 }),
                 Err(e) => {
                     if debug {
@@ -24832,6 +24960,87 @@ kernel void zc_ab_finish(
                 b,
                 len_a: job.chunks * job.per_chunk_a,
                 len_b: job.chunks * job.per_chunk_b,
+                b_ones,
+            }
+        }
+    }
+
+    /// Join of a steal-form launch (see `super::ENV_NO_ZC_K_STEAL`) after
+    /// the CPU's claims: chunks `0..kept` are the GPU's. `done` = the
+    /// buffer's completion was seen (its encoder has ended, so nothing of it
+    /// reads the views any more); otherwise the CPU took every chunk
+    /// (`kept == 0`), and threadgroups already running may still read the
+    /// anchors and deltas the caller recycles after the pass, so the buffer
+    /// is drained here (every threadgroup that has not started returns at
+    /// once). The result's prefix is the kept chunks only.
+    pub(crate) fn zc_k_steal_join(job: ZcKJob, kept: usize, done: bool, hi_size: usize) -> ZcKResult {
+        use std::sync::atomic::Ordering;
+        let debug = super::gpu_zc_k_debug();
+        debug_assert!(done || kept == 0);
+        job.set_cut(0);
+        let Ok(gpu) = gpu() else {
+            ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+            return ZcKResult::Failed;
+        };
+        unsafe {
+            let drained = std::time::Instant::now();
+            let failed = if done {
+                // MTLCommandBufferStatusError: the GPU's chunks are not
+                // trusted; the caller folds the prefix (idempotent writes).
+                gpu.cb_status(job.cb) == 5
+            } else {
+                gpu.wait_cb(job.cb).is_err()
+            };
+            let drain_ms = drained.elapsed().as_secs_f64() * 1e3;
+            gpu.release(job.cb);
+            for v in job.views {
+                gpu.release(v);
+            }
+            if failed && kept > 0 {
+                ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                if debug {
+                    eprintln!("[zc-k-gpu] command buffer failed; arm disabled, CPU folds the prefix");
+                }
+                return ZcKResult::Failed;
+            }
+            if debug {
+                let fired = ZC_K_FIRED.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[zc-k-gpu] steal: GPU kept {kept} of {} offered (of {hi_size} K chunks), {} stolen, \
+                     completion {}, {:.2} ms after submit, drain {drain_ms:.3} ms, fired_proves={fired}",
+                    job.chunks,
+                    job.chunks - kept,
+                    if done { "seen" } else { "not seen" },
+                    job.submitted.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            let Some(state_mutex) = ZC_K_STATE.get().and_then(|s| s.as_ref()) else {
+                ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                return ZcKResult::Failed;
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("zc-k steal join", false);
+                    ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                    return ZcKResult::Failed;
+                }
+            };
+            let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 8]>();
+            let parts: Vec<[F128; 8]> = std::slice::from_raw_parts(parts, kept).to_vec();
+            let a = gpu.buffer_contents(state.out_a).cast::<F128>().cast_const();
+            let b = gpu.buffer_contents(state.out_b).cast::<F128>().cast_const();
+            // Complete for the kept chunks (every one of their threadgroups
+            // ran before the signal). A stolen chunk's threadgroup that ran
+            // may also have set it; the CPU's fold of that chunk then flags
+            // the same output, so the pass reruns unpacked either way.
+            let b_ones = kept == 0 || *gpu.buffer_contents(state.flag_buf).cast::<u32>() == 0;
+            ZcKResult::Prefix {
+                parts,
+                a,
+                b,
+                len_a: kept * job.per_chunk_a,
+                len_b: kept * job.per_chunk_b,
                 b_ones,
             }
         }
@@ -26972,7 +27181,7 @@ pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
     ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_launch_share, zc_k_premap, zc_k_prewarm,
-    zc_k_prewarm_wanted, zc_k_verdict, zc_k_wait,
+    zc_k_prewarm_wanted, zc_k_steal_join, zc_k_verdict, zc_k_wait,
 };
 
 /// Tri pass 0 GPU arm (see `ENV_NO_ZC_T0_GPU`).
