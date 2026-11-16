@@ -2189,6 +2189,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let t_r2_launch = std::time::Instant::now();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_job = crate::gpu_commit::launch_zc_r2_products_cs(
         a_packed,
         b_packed,
@@ -2336,11 +2338,81 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let deltas_base = crate::epool::SyncPtr(unsafe { compact.deltas.full_overwrite_ptr().add(delta_base) });
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
+    // R2-CS GPU continuation (`FLOCK_NO_R2_GPU_CONT`). The CPU sweep claims
+    // chunks bottom-up; when the GPU's prefix completes early, the first
+    // worker to see it hands the top of the not-yet-claimed range to a second
+    // `_cs` dispatch, sized from the measured GPU and CPU rates. Under one
+    // claim lock every CPU chunk checks the boundary and records its index,
+    // and the firing worker launches the continuation and only then lowers
+    // the boundary to above every claimed chunk: each chunk is computed
+    // exactly once, by the CPU or by one of the two dispatches, with the same
+    // kernel and the same compact-state layout as the prefix.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cont_on = r2cs
+        && gpu_prefix > 0
+        && gpu_prefix < hi_size
+        && crate::gpu_commit::r2_gpu_cont_enabled()
+        && cs_live.is_some()
+        && gpu_job.as_ref().is_some_and(crate::gpu_commit::zc_r2_cont_eligible);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cont_ptrs = cs_live.map_or((0usize, 0usize), |(a, d, _)| (a, d));
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cont_job_addr = gpu_job.as_ref().map_or(0usize, |j| j as *const crate::gpu_commit::ZcR2Job as usize);
+    // (top boundary, highest claimed CPU chunk + 1, CPU chunks claimed, fired,
+    //  continuation start, continuation command buffer)
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cont_state = std::sync::Mutex::new((hi_size, gpu_prefix, 0usize, false, hi_size, 0usize, [0usize; 2], [0f64; 3]));
     // `stolen`: R2-CS steal (`gpu_commit::ENV_NO_R2_STEAL`), a prefix chunk
     // the CPU took from the GPU, walked in full as a chunk after the prefix.
     let chunk_body = |x_hi: usize, stolen: bool| {
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let _ = stolen;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if cont_on && !stolen && x_hi >= gpu_prefix {
+            let mut st = cont_state.lock().unwrap_or_else(|e| e.into_inner());
+            if x_hi >= st.0 {
+                // Owned by the continuation; its slots are filled after the join.
+                return;
+            }
+            st.1 = st.1.max(x_hi + 1);
+            st.2 += 1;
+            if !st.3 {
+                // SAFETY: the job outlives the sweep and is not mutated during it.
+                let job = unsafe { &*(cont_job_addr as *const crate::gpu_commit::ZcR2Job) };
+                if crate::gpu_commit::zc_r2_prefix_done(job) {
+                    st.3 = true;
+                    let gpu_ms = t_r2_launch.elapsed().as_secs_f64() * 1e3;
+                    let cpu_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+                    let remaining = hi_size - st.1;
+                    st.7 = [gpu_ms, cpu_ms, st.2 as f64];
+                    if gpu_ms > 0.0 && cpu_ms > 0.0 && st.2 > 0 && remaining > 0 {
+                        // Chunks per ms: the GPU's over its prefix (its age
+                        // includes any detection lag, so it errs slow), the
+                        // CPU pool's over the chunks claimed so far (claims
+                        // include chunks in flight, so it errs fast).
+                        let rg = gpu_prefix as f64 / gpu_ms;
+                        let rc = st.2 as f64 / cpu_ms;
+                        let g = (0.85 * remaining as f64 * rg / (rg + rc)) as usize;
+                        if g >= 8 {
+                            let start = hi_size - g;
+                            if let Some((cb, views)) = crate::gpu_commit::launch_zc_r2_cs_continuation(
+                                    job,
+                                    start,
+                                    hi_size,
+                                    cont_ptrs.0,
+                                    cont_ptrs.1,
+                                )
+                            {
+                                st.0 = start;
+                                st.4 = start;
+                                st.5 = cb as usize;
+                                st.6 = views.map(|v| v as usize);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // SAFETY: the queue (or the steal's claim) hands out each x_hi
         // exactly once; chunk x_hi exclusively owns its anchors/deltas ranges
         // and both partial slots.
@@ -2844,6 +2916,87 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
             eprintln!("[zc-r2] R2-CS ORACLE MISMATCH: {e} -> R2-CS disabled");
         }
         crate::gpu_commit::zc_r2_cs_verdict(res.is_ok(), chunks, hi_size);
+    }
+
+    // Join of the R2-CS GPU continuation: its chunks' compact state is
+    // already in place (the same kernel and layout as the prefix); adopt
+    // their products and lookahead terms exactly like the prefix's, or redo
+    // them on the CPU with the sweep's own full walk if the dispatch failed.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let (cont_start, cont_cb, cont_claimed, cont_views, cont_fire) = {
+            let st = cont_state.lock().unwrap_or_else(|e| e.into_inner());
+            (st.4, st.5, st.2, st.6, st.7)
+        };
+        if cont_cb != 0 {
+            let t_join = std::time::Instant::now();
+            let res = crate::gpu_commit::zc_r2_cs_continuation_wait(cont_cb, cont_views, cont_start, hi_size);
+            let wait_ms = t_join.elapsed().as_secs_f64() * 1e3;
+            if crate::gpu_commit::gpu_zc_r2_debug() {
+                eprintln!(
+                    "[zc-r2-cont] GPU continuation chunks {cont_start}..{hi_size} ({}), CPU claimed {cont_claimed} \
+                     above the prefix, join wait {wait_ms:.3} ms, ok={}; fired at launch+{:.2} ms, sweep+{:.2} ms, {} CPU chunks claimed",
+                    hi_size - cont_start,
+                    res.is_some(),
+                    cont_fire[0],
+                    cont_fire[1],
+                    cont_fire[2],
+                );
+            }
+            match res {
+                Some((vals, lookahead, head_bad)) => {
+                    for (i, (v, w)) in vals.iter().zip(&lookahead).enumerate() {
+                        let x_hi = cont_start + i;
+                        partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
+                        la_partials[x_hi] = [v[2], v[3], w[0], w[1], w[2], w[3]];
+                    }
+                    if head_bad {
+                        head_fail.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    #[cfg(target_arch = "aarch64")]
+                    for x_hi in cont_start..hi_size {
+                        let pair_idx_base = x_hi * lo_size;
+                        let row_base = pair_idx_base * 2;
+                        let mut out = [F128::ZERO; 8];
+                        unsafe {
+                            fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                table.data.as_ptr().cast::<u8>(),
+                                a_packed.as_ptr().add(row_base * n_chunks),
+                                b_packed.as_ptr().add(row_base * n_chunks),
+                                anchors_base.ptr().add(x_hi * anchor_chunk_stride),
+                                deltas_base.ptr().add(x_hi * delta_chunk_stride),
+                                eq_lo.as_ptr(),
+                                eq_prep_addr as *const F128,
+                                lo_size,
+                                pair_idx_base,
+                                pair_in_block_mask,
+                                useful_pairs_inclusive,
+                                degen,
+                                periodic_padding,
+                                skip_dead,
+                                tail_compact,
+                                head_fail_addr as *const std::sync::atomic::AtomicBool,
+                                out.as_mut_ptr(),
+                            );
+                        }
+                        let eq_h = eq_hi[x_hi];
+                        let p1 = kappa * out[0] + out[2];
+                        let pinf = kappa * out[1] + out[3];
+                        partials[x_hi] = (eq_h * p1, eq_h * pinf);
+                        la_partials[x_hi] = [
+                            eq_h * out[2],
+                            eq_h * out[3],
+                            eq_h * out[4],
+                            eq_h * out[5],
+                            eq_h * out[6],
+                            eq_h * out[7],
+                        ];
+                    }
+                }
+            }
+        }
     }
 
     // Both the standard and lookahead round-two producers promise identical
@@ -3559,7 +3712,42 @@ fn fold2_compact_and_round45_into_packed_b(
     if let Some(job) = gpu_job {
         let calibration = job.calibration();
         let chunks = job.chunks();
-        match crate::gpu_commit::zc_k_wait(job, hi_size) {
+        // Late-GPU steal (see `ENV_NO_ZC_K_LOOP`): the GPU is late, so the
+        // CPU folds its chunks from the top of the prefix downward, never
+        // below the chunks the 5+6 arm reads in place.
+        let mut lo = cpu_base;
+        if !calibration && cpu_base > 0 && crate::gpu_commit::gpu_zc_k_loop_enabled() && !job.done() {
+            let t56_cap = crate::gpu_commit::gpu_zc_t56_cap();
+            let per_a = out_chunk / 256 * 244;
+            let hold = if t56_cap == 0 || per_a == 0 {
+                0
+            } else {
+                (t56_cap * crate::gpu_commit::zc_t56::IN_A).div_ceil(per_a)
+            };
+            if cpu_base > hold {
+                let claims = std::sync::Mutex::new((cpu_base, false));
+                crate::epool::run_hetero_chunks(cpu_base - hold, |_| {
+                    let x_hi = {
+                        let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.1 || g.0 <= hold {
+                            return;
+                        }
+                        if job.done() {
+                            g.1 = true;
+                            return;
+                        }
+                        job.set_cut(g.0 - 1);
+                        g.0 -= 1;
+                        g.0
+                    };
+                    chunk_body(x_hi);
+                });
+                lo = claims.into_inner().unwrap_or_else(|e| e.into_inner()).0;
+            }
+        }
+        // The oracle probe compares every offered chunk (the CPU folded all).
+        let taken = if calibration { chunks } else { lo };
+        match crate::gpu_commit::zc_k_wait(job, hi_size, taken) {
             crate::gpu_commit::ZcKResult::Prefix { parts, a, b, len_a, len_b, b_ones } => {
                 if !b_ones {
                     // A b output of the GPU's chunks that the pack skips is
@@ -3588,15 +3776,17 @@ fn fold2_compact_and_round45_into_packed_b(
                             gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
                         }
                     }
-                } else {
-                    partials[..chunks].copy_from_slice(&parts);
+                } else if !parts.is_empty() {
+                    // `parts.len()` = the chunks left to the GPU (`lo`).
+                    partials[..parts.len()].copy_from_slice(&parts);
                     gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
                 }
             }
             crate::gpu_commit::ZcKResult::Failed => {
                 // The GPU failed after admission: the CPU folds the prefix
-                // chunks with the same kernel (the arm is now disabled).
-                crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
+                // chunks it left to the GPU with the same kernel (the arm is
+                // now disabled).
+                crate::epool::run_hetero_chunks(lo, &chunk_body);
             }
         }
     }
@@ -4399,6 +4589,20 @@ fn tri0_gpu_queue(
     job.finish(taken, hi_size);
 }
 
+/// Caller-first main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, any value,
+/// restores the rayon `par_chunks_mut` collect; c1fbbc9e's piece). The tri
+/// passes below the hetero floor run through
+/// [`crate::epool::run_caller_first_chunks`]: the calling thread starts on
+/// chunk 0 at once and never parks on a pool latch. Same `x_hi` chunk grid
+/// and chunk closure; each chunk writes its own output range and its own
+/// `partials[x_hi]`, combined in index order, so bytes are identical. Read
+/// once per process.
+fn zc_tri_caller_first_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TRI_CF").is_none());
+    *ON
+}
+
 /// [`fold_cascade_t_into_packed_prefix`] with the 5+6 GPU prefix arm when
 /// `gpu` is set (see `gpu_commit::ENV_NO_ZC_T56_GPU`): on the ranked packed
 /// b-one-packed depth-two pass whose `prefix` is the K arm's, the GPU folds
@@ -4762,6 +4966,30 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
         vec![chunk(&a_in, &b_in, a_out, b_out)]
+    } else if zc_tri_caller_first_enabled() {
+        // The `par_chunks_mut(chunk_out)` grid below: `hi_size` chunks.
+        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_caller_first_chunks(hi_size, &|x_hi| {
+            // SAFETY: the drain runs each `x_hi` exactly once; its output
+            // ranges are disjoint per chunk, and the drain publishes every
+            // write before the combine below reads them.
+            let (a_o, b_o) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let (a_in, b_in) = inputs(x_hi);
+            let outv = chunk(&a_in, &b_in, a_o, b_o);
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = outv;
+            }
+        });
+        partials
     } else {
         use rayon::prelude::*;
         a_out

@@ -686,10 +686,6 @@ fn prove_packed_padded_inner<C: Challenger>(
             };
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
             let t_ab = std::time::Instant::now();
-            // C fold tune fix (`gpu_commit::ENV_NO_ZC_FOLD_TUNE_FIX`): the
-            // warm-up window times its head from here.
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            crate::gpu_commit::zc_fold_tune_note_ab_start();
             // ZC entry overlap (`FLOCK_NO_ZC_ENTRY_OVERLAP=1` restores the
             // serial order): the round-two GPU staging runs beside the AB
             // completion's table set-up, and the C fold runs on this thread
@@ -809,6 +805,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
+    crate::tmark::diag::at(crate::tmark::diag::ZC_R1);
     if zc_timing {
         eprintln!(
             "[zc-timing] round1 URM: {:.2} ms cpu={:.1}",
@@ -894,6 +891,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         (compact, m1, mi, None)
     };
 
+    crate::tmark::diag::at(crate::tmark::diag::ZC_R2);
     if zc_timing {
         eprintln!(
             "[zc-timing] round2 fused fold: {:.2} ms cpu={:.1}",
@@ -1057,6 +1055,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }
+            crate::tmark::diag::at(crate::tmark::diag::ZC_K);
             compact_mlv.recycle_after_k();
             multilinear_msgs.push((m4_1, m4_inf));
             challenger.observe_f128(m4_1);
@@ -1409,6 +1408,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }
+            crate::tmark::diag::at(crate::tmark::diag::ZC_K);
             compact_mlv.recycle();
             multilinear_msgs.push((m4_1, m4_inf));
             challenger.observe_f128(m4_1);

@@ -1529,134 +1529,6 @@ fn sumcheck_bind_both_and_eval_next(
     (e1, einf)
 }
 
-/// Lincheck sum-check on the pool, caller first (`FLOCK_NO_LC_SC_CALLER_FIRST=1`,
-/// exact, keeps every round on the calling thread). At the ranked shape the
-/// sum-check is serial (`lc_sumcheck_par_min`): a Rayon region per round cost
-/// more than it saved while the pool slept after the fold. Lincheck now runs
-/// with the pool lingering, and the first evaluation and the first binds (8192
-/// lanes down to 2048) are about 70 us of one thread on the M4, so those
-/// rounds go through the caller-first chunk drain
-/// (`epool::run_caller_first_chunks`): the calling thread starts at once, the
-/// lingering threads join, and the caller never waits for a thread that has
-/// not started. Each chunk binds its own disjoint lanes and returns its
-/// unreduced partial sums; their XOR, reduced once, is the serial loop's
-/// deferred reduction. Read once.
-pub const ENV_NO_LC_SC_CALLER_FIRST: &str = "FLOCK_NO_LC_SC_CALLER_FIRST";
-
-fn lc_sc_caller_first_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var(ENV_NO_LC_SC_CALLER_FIRST).is_ok_and(|v| v == "1")
-    })
-}
-
-/// Pairs (evaluation) or quads (bind) per caller-first chunk, and the fewest
-/// a round needs before it is split at all.
-const LC_SC_CF_CHUNK: usize = 256;
-const LC_SC_CF_MIN: usize = 1024;
-
-fn lc_sc_caller_first(units: usize) -> bool {
-    units >= LC_SC_CF_MIN && lc_sc_caller_first_enabled()
-}
-
-/// XOR of the chunks' unreduced partial pairs, reduced once.
-fn lc_sc_reduce_parts(
-    parts: &[std::sync::OnceLock<(crate::field::F256Unreduced, crate::field::F256Unreduced)>],
-) -> (F128, F128) {
-    let mut e1 = crate::field::F256Unreduced::ZERO;
-    let mut einf = crate::field::F256Unreduced::ZERO;
-    for p in parts {
-        let (a, b) = p.get().expect("every chunk ran");
-        e1 ^= *a;
-        einf ^= *b;
-    }
-    (e1.reduce(), einf.reduce())
-}
-
-/// [`sumcheck_round_eval_par`]'s serial arm, chunked caller-first.
-fn sumcheck_round_eval_caller_first(c: &[F128], z: &[F128]) -> (F128, F128) {
-    let half = c.len() / 2;
-    debug_assert_eq!(z.len(), c.len());
-    let (clo, chi) = c.split_at(half);
-    let (zlo, zhi) = z.split_at(half);
-    let n_chunks = half.div_ceil(LC_SC_CF_CHUNK);
-    let parts: Vec<std::sync::OnceLock<_>> = (0..n_chunks).map(|_| std::sync::OnceLock::new()).collect();
-    crate::epool::run_caller_first_chunks(n_chunks, &|ci: usize| {
-        let lo = ci * LC_SC_CF_CHUNK;
-        let hi = (lo + LC_SC_CF_CHUNK).min(half);
-        let mut e1 = crate::field::F256Unreduced::ZERO;
-        let mut einf = crate::field::F256Unreduced::ZERO;
-        for i in lo..hi {
-            e1 ^= chi[i].mul_unreduced(zhi[i]);
-            einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
-        }
-        let _ = parts[ci].set((e1, einf));
-    });
-    lc_sc_reduce_parts(&parts)
-}
-
-/// The fused bind + next evaluation of [`sumcheck_bind_both_and_eval_next`]
-/// (serial arm) or [`sumcheck_bind_both_into_and_eval_next_serial`] (`z_dst`
-/// set), chunked caller-first. Quad `i` reads lanes `i`, `i + half2`,
-/// `i + half`, `i + half + half2` of each table and writes lanes `i` and
-/// `i + half2` (of `comb`, and of `z` or `z_dst`), so chunks of quads write
-/// disjoint lanes and read only lanes no chunk writes (or `z_src`).
-fn sumcheck_bind_both_eval_next_caller_first(
-    comb: &mut Vec<F128>,
-    z_src: *mut F128,
-    z_len: usize,
-    z_dst: Option<&mut Vec<F128>>,
-    r: F128,
-) -> (F128, F128) {
-    let len = comb.len();
-    debug_assert_eq!(z_len, len);
-    let half = len / 2;
-    let half2 = half / 2;
-    debug_assert!(half2 >= 1, "fused step needs a well-defined next round");
-    let c_ptr = comb.as_mut_ptr() as usize;
-    let zs_ptr = z_src as usize;
-    let zd_ptr = match z_dst.as_ref() {
-        Some(d) => {
-            assert!(d.len() >= half);
-            d.as_ptr() as usize
-        }
-        None => zs_ptr,
-    };
-    let n_chunks = half2.div_ceil(LC_SC_CF_CHUNK);
-    let parts: Vec<std::sync::OnceLock<_>> = (0..n_chunks).map(|_| std::sync::OnceLock::new()).collect();
-    crate::epool::run_caller_first_chunks(n_chunks, &|ci: usize| {
-        let lo = ci * LC_SC_CF_CHUNK;
-        let hi = (lo + LC_SC_CF_CHUNK).min(half2);
-        let (c, zs, zd) = (c_ptr as *mut F128, zs_ptr as *const F128, zd_ptr as *mut F128);
-        let mut e1 = crate::field::F256Unreduced::ZERO;
-        let mut einf = crate::field::F256Unreduced::ZERO;
-        for i in lo..hi {
-            // SAFETY: `i < half2`; every index below is in bounds of tables of
-            // `len` lanes, this chunk alone writes lanes `i` and `i + half2`,
-            // and no chunk writes a lane at or past `half` (the only other
-            // lanes read). With `z_dst`, writes go to the other buffer.
-            unsafe {
-                let lo_v = *c.add(i) + r * (*c.add(i + half) + *c.add(i));
-                let hi_v = *c.add(i + half2) + r * (*c.add(i + half + half2) + *c.add(i + half2));
-                let zlo = *zs.add(i) + r * (*zs.add(i + half) + *zs.add(i));
-                let zhi = *zs.add(i + half2) + r * (*zs.add(i + half + half2) + *zs.add(i + half2));
-                *c.add(i) = lo_v;
-                *c.add(i + half2) = hi_v;
-                *zd.add(i) = zlo;
-                *zd.add(i + half2) = zhi;
-                e1 ^= hi_v.mul_unreduced(zhi);
-                einf ^= (hi_v + lo_v).mul_unreduced(zhi + zlo);
-            }
-        }
-        let _ = parts[ci].set((e1, einf));
-    });
-    comb.truncate(half);
-    if let Some(d) = z_dst {
-        d.truncate(half);
-    }
-    lc_sc_reduce_parts(&parts)
-}
-
 fn sumcheck_bind_both_into_and_eval_next_serial(
     comb: &mut Vec<F128>,
     z_src: &[F128],
@@ -2028,14 +1900,7 @@ fn prove_padded_inner<Ch: Challenger>(
         // round's message falls out of binding the previous round (fold +
         // next-eval fused into one pass — see `sumcheck_bind_both_and_eval_next`).
         let par_min = lc_sumcheck_par_min(k);
-        // Caller-first rounds (`ENV_NO_LC_SC_CALLER_FIRST`): only where the
-        // serial arm would run, and only for the wide early rounds.
-        let cf = |units: usize| par_min == usize::MAX && lc_sc_caller_first(units);
-        let (mut e1, mut einf) = if cf(comb_vec.len() / 2) {
-            sumcheck_round_eval_caller_first(&comb_vec, &z_vec)
-        } else {
-            sumcheck_round_eval_par(&comb_vec, &z_vec, par_min)
-        };
+        let (mut e1, mut einf) = sumcheck_round_eval_par(&comb_vec, &z_vec, par_min);
         for t in 0..inner_rest_len {
             challenger.observe_f128(e1);
             challenger.observe_f128(einf);
@@ -2049,35 +1914,16 @@ fn prove_padded_inner<Ch: Challenger>(
                 let (ne1, neinf) = if capture_before_round == Some(t)
                     && let Some(mut dst) = z_bind_dst.take()
                 {
-                    let next = if cf(comb_vec.len() / 4) {
-                        let z_len = z_vec.len();
-                        sumcheck_bind_both_eval_next_caller_first(
-                            &mut comb_vec,
-                            z_vec.as_ptr().cast_mut(),
-                            z_len,
-                            Some(&mut dst),
-                            r,
-                        )
-                    } else {
-                        sumcheck_bind_both_into_and_eval_next_serial(&mut comb_vec, &z_vec, &mut dst, r)
-                    };
+                    let next = sumcheck_bind_both_into_and_eval_next_serial(
+                        &mut comb_vec,
+                        &z_vec,
+                        &mut dst,
+                        r,
+                    );
                     captured_z_vec = Some(std::mem::replace(&mut z_vec, dst));
                     next
                 } else {
-                    if cf(comb_vec.len() / 4) {
-                        let (z_ptr, z_len) = (z_vec.as_mut_ptr(), z_vec.len());
-                        let next = sumcheck_bind_both_eval_next_caller_first(
-                            &mut comb_vec,
-                            z_ptr,
-                            z_len,
-                            None,
-                            r,
-                        );
-                        z_vec.truncate(z_len / 2);
-                        next
-                    } else {
-                        sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r, par_min)
-                    }
+                    sumcheck_bind_both_and_eval_next(&mut comb_vec, &mut z_vec, r, par_min)
                 };
                 e1 = ne1;
                 einf = neinf;
@@ -2443,58 +2289,6 @@ mod tests {
             let got = build_quirky_eq_table(z_skip, &x_inner_rest, k_skip);
             assert_eq!(got.len(), want.len(), "k_skip={k_skip} rest={rest}");
             assert!(got == want, "k_skip={k_skip} rest={rest}");
-        }
-    }
-
-    /// Caller-first sum-check rounds against the serial arm: the first
-    /// evaluation, the fused bind + evaluation in place and into a separate
-    /// buffer, on random tables of the ranked sizes and smaller, on a plain
-    /// thread and inside pools: every message and every bound lane identical.
-    #[test]
-    fn lc_sc_caller_first_matches_serial() {
-        fn check(rng: &mut Rng, len: usize) {
-            let comb = rng.f128_vec(len);
-            let z = rng.f128_vec(len);
-            let r = rng.f128();
-            assert_eq!(
-                sumcheck_round_eval_caller_first(&comb, &z),
-                sumcheck_round_eval_par(&comb, &z, usize::MAX),
-                "eval len {len}"
-            );
-            let (mut c_a, mut z_a) = (comb.clone(), z.clone());
-            let want = sumcheck_bind_both_and_eval_next(&mut c_a, &mut z_a, r, usize::MAX);
-            let (mut c_b, mut z_b) = (comb.clone(), z.clone());
-            let (zp, zl) = (z_b.as_mut_ptr(), z_b.len());
-            let got = sumcheck_bind_both_eval_next_caller_first(&mut c_b, zp, zl, None, r);
-            z_b.truncate(zl / 2);
-            assert_eq!(got, want, "bind len {len}");
-            assert_eq!((c_b, z_b), (c_a, z_a), "bound lanes len {len}");
-            let mut c_a = comb.clone();
-            let mut dst_a = rng.f128_vec(len);
-            // A different stale buffer for the caller-first side, so lanes it
-            // failed to write would show.
-            let mut dst_b = rng.f128_vec(len);
-            let want = sumcheck_bind_both_into_and_eval_next_serial(&mut c_a, &z, &mut dst_a, r);
-            let mut c_b = comb.clone();
-            let got = sumcheck_bind_both_eval_next_caller_first(
-                &mut c_b,
-                z.as_ptr().cast_mut(),
-                z.len(),
-                Some(&mut dst_b),
-                r,
-            );
-            assert_eq!(got, want, "bind into len {len}");
-            assert_eq!((c_b, dst_b), (c_a, dst_a), "bound into lanes len {len}");
-        }
-        let run = || {
-            let mut rng = Rng::new(0x1c5c_cf01);
-            for len in [8192usize, 4096, 2048, 1024, 64, 8] {
-                check(&mut rng, len);
-            }
-        };
-        run();
-        for threads in [2usize, 4, 10] {
-            rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(run);
         }
     }
 
