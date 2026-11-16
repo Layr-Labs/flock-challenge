@@ -232,6 +232,7 @@ mod imp {
         }
         HOT_PROVE.store(false, Ordering::Relaxed);
         HOT_PROVE_OFF.store(std::env::var_os("FLOCK_NO_HOT_PROVE").is_some(), Ordering::Relaxed);
+        EPOOL_HOT_OFF.store(std::env::var_os("FLOCK_NO_EPOOL_HOT").is_some(), Ordering::Relaxed);
         let deadline = Instant::now() + MAX_KEEPALIVE;
         rayon::spawn_broadcast(move |ctx| {
             // Leave one core to the seed-pipe thread's hot poll.
@@ -287,6 +288,9 @@ mod imp {
         if POOL_SPIN.load(Ordering::Relaxed) {
             POOL_SPIN.store(false, Ordering::Release);
         }
+        if EPOOL_HOT.load(Ordering::Relaxed) {
+            EPOOL_HOT.store(false, Ordering::Release);
+        }
     }
 
     /// `true` from the witness hand-off until the release at proof done.
@@ -299,6 +303,44 @@ mod imp {
             pool_spin_release();
         } else if POOL_SPIN.load(Ordering::Relaxed) {
             HOT_PROVE.store(true, Ordering::Release);
+            epool_hot_start();
+        }
+    }
+
+    /// `true` from the witness hand-off until the release at proof done: the
+    /// efficiency-core helper pool's threads idle in [`epool_hot_body`]
+    /// instead of Rayon's sleep. Between hetero drains those threads otherwise
+    /// fall asleep and each drain's detached `spawn_broadcast` wakes them one
+    /// by one; a helper that wakes after its drain closed runs nothing
+    /// (`EPOOL_LATE_HELPERS`). Spinning on-core they pick each broadcast up
+    /// through `rayon::yield_now` at once. Scheduling only: the same jobs, run
+    /// by the same pool, so the proof bytes are unchanged.
+    /// `FLOCK_NO_EPOOL_HOT=1` keeps the helpers parking as before.
+    static EPOOL_HOT: AtomicBool = AtomicBool::new(false);
+    /// `FLOCK_NO_EPOOL_HOT`, read once in [`pool_spin_start`] (untimed).
+    static EPOOL_HOT_OFF: AtomicBool = AtomicBool::new(false);
+
+    fn epool_hot_start() {
+        if EPOOL_HOT_OFF.load(Ordering::Relaxed) || EPOOL_HOT.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(ep) = crate::epool::helper_pool() else {
+            EPOOL_HOT.store(false, Ordering::Release);
+            return;
+        };
+        let deadline = Instant::now() + MAX_KEEPALIVE;
+        ep.spawn_broadcast(move |_| epool_hot_body(deadline));
+    }
+
+    fn epool_hot_body(deadline: Instant) {
+        while EPOOL_HOT.load(Ordering::Relaxed) {
+            if let Some(rayon::Yield::Executed) = rayon::yield_now() {
+                continue;
+            }
+            std::thread::yield_now();
+            if Instant::now() >= deadline {
+                break;
+            }
         }
     }
 
