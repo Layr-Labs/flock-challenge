@@ -186,7 +186,11 @@ unsafe fn ab_chunk_oracle(gpu: &Gpu, psos: &[Id], mul9: bool, next: &mut impl Fn
             struct Params { tops: u32, groups: u32, shift: u32, pad: u32, bmask: [u32; 16] }
             let p = Params { tops: tops as u32, groups: (256 / tops) as u32, shift: ZC_AB_CHUNK_SHIFT, pad: 0, bmask };
             let bytes = core::slice::from_raw_parts((&raw const p).cast::<u8>(), core::mem::size_of::<Params>());
+            // `cut` = the kernels' skip boundary: none, then chunk 1 (the
+            // late-GPU steal): chunk 0 as before, chunk 1's partial untouched.
+            for cut in [u32::MAX, 1] {
             std::ptr::write_bytes(gpu.buffer_contents(out), 0xa5, CHUNKS * 64 * 16);
+            let cut_buf = ab_upload(gpu, &[cut, 0, 0, 0]);
             let mut walls = Vec::new();
             for pass in 0..3 {
                 let cb = gpu.command_buffer().unwrap();
@@ -202,6 +206,7 @@ unsafe fn ab_chunk_oracle(gpu: &Gpu, psos: &[Id], mul9: bool, next: &mut impl Fn
                 }
                 if pass != 0 {
                     gpu.set_bytes(enc, bytes, bindings.len());
+                    gpu.set_buffer(enc, cut_buf, 0, bindings.len() + 1);
                 }
                 let groups = match pass { 0 => 256, 1 => CHUNKS * 256 / tops, _ => CHUNKS };
                 gpu.dispatch(enc, groups as u64, if pass == 0 { 256 } else { 64 });
@@ -209,9 +214,17 @@ unsafe fn ab_chunk_oracle(gpu: &Gpu, psos: &[Id], mul9: bool, next: &mut impl Fn
                 gpu.commit_and_wait(cb).unwrap();
                 walls.push(zc_fold_gpu_wall_ms(gpu, cb));
             }
+            gpu.release(cut_buf);
             let actual = core::slice::from_raw_parts(gpu.buffer_contents(out).cast::<[F128; 64]>(), CHUNKS);
+            if cut != u32::MAX {
+                assert_eq!(actual[0], expected[0], "chunk below the skip boundary mul9={mul9} tops={tops}");
+                let skipped = core::slice::from_raw_parts(gpu.buffer_contents(out).add(64 * 16), 64 * 16);
+                assert!(skipped.iter().all(|&b| b == 0xa5), "a skipped chunk's partial was written");
+                continue;
+            }
             assert_eq!(actual, expected.as_slice(), "per-chunk CPU oracle mul9={mul9} tops={tops}");
             eprintln!("[ab-multiply-oracle] mul9={mul9} chunks={CHUNKS} tops={tops} tables/gather/finish-ms={walls:?}");
+            }
         }
         for buffer in [basis_buf, top_buf, bot_buf, hi_buf, ab_buf, tables, banks, out] {
             gpu.release(buffer);

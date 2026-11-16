@@ -151,6 +151,51 @@ mod r2cs_fast {
                                 "layout {li} mask {mask} useful {useful} head ones {}",
                                 core::ptr::eq(b_in, &b_ones)
                             );
+                            // Skip boundary (late-GPU steal): with word 1 of
+                            // the flag buffer the complement of 1, the lean
+                            // kernel leaves chunk 0 as in the full launch and
+                            // touches nothing of the chunks from 1 on.
+                            {
+                                std::ptr::write_bytes(gpu.buffer_contents(anchors), 0x5a, a_bytes);
+                                std::ptr::write_bytes(gpu.buffer_contents(deltas), 0xc3, d_bytes);
+                                std::ptr::write_bytes(gpu.buffer_contents(parts), 0x3c, CHUNKS * 4 * 8 * 16);
+                                std::ptr::write_bytes(gpu.buffer_contents(flag), 0, 16);
+                                *gpu.buffer_contents(flag).cast::<u32>().add(1) = !1u32;
+                                let cb = gpu.command_buffer().unwrap();
+                                let enc = gpu.compute_encoder(cb).unwrap();
+                                gpu.set_pipeline(enc, psos[1]);
+                                for (index, buffer) in [a_buf, b_buf, eq_lo_buf, eq_hi_buf, nib_buf, parts].iter().enumerate() {
+                                    gpu.set_buffer(enc, *buffer, 0, index);
+                                }
+                                gpu.set_bytes(enc, core::slice::from_raw_parts(params.as_ptr().cast::<u8>(), 16), 6);
+                                gpu.set_buffer(enc, anchors, 0, 7);
+                                gpu.set_buffer(enc, deltas, 0, 8);
+                                gpu.set_bytes(enc, core::slice::from_raw_parts(lp.as_ptr().cast::<u8>(), 32), 9);
+                                gpu.set_buffer(enc, flag, 0, 10);
+                                gpu.dispatch(enc, (CHUNKS * 4) as u64, 256);
+                                gpu.end_encoding(enc);
+                                gpu.commit_and_wait(cb).unwrap();
+                                let p_len = CHUNKS * 4 * 8 * 16;
+                                let full = &out[1];
+                                // (buffer, bytes, its offset in `full`, chunk 0's end, fill)
+                                let chunk_blocks = LO / 128;
+                                let regions = [
+                                    (parts, p_len, 0, 4 * 8 * 16, 0x3cu8),
+                                    (anchors, a_bytes, p_len, 16 * (l[1] as usize + chunk_blocks * l[2] as usize), 0x5a),
+                                    (deltas, d_bytes, p_len + a_bytes, l[3] as usize + chunk_blocks * l[4] as usize, 0xc3),
+                                ];
+                                for (ri, (buf, len, at, split, fill)) in regions.into_iter().enumerate() {
+                                    let got = core::slice::from_raw_parts(gpu.buffer_contents(buf), len);
+                                    assert!(
+                                        got[..split] == full[at..at + split],
+                                        "skip boundary: chunk 0 differs (layout {li} mask {mask} region {ri})"
+                                    );
+                                    assert!(
+                                        got[split..].iter().all(|&b| b == fill),
+                                        "skip boundary: a skipped chunk was written (layout {li} mask {mask} region {ri})"
+                                    );
+                                }
+                            }
                             gpu.release(b_buf);
                             runs += 1;
                         }

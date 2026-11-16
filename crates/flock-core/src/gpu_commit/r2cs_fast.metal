@@ -1,7 +1,8 @@
 // R2-CS kernel, lean form (`FLOCK_NO_R2CS_FAST=1` restores the original
 // kernel text). Same entry point, buffers, launch shape and stores; every
 // output is the same exact GF(2^128) value or byte. Four changes, each
-// order-free because every partial is an XOR sum over the threadgroup:
+// order-free because every partial is an XOR sum over the threadgroup (a
+// fifth, the skip boundary of the late-GPU steal, is described at its read):
 //  - Parity-sorted map: SIMD group s of a threadgroup (lanes 32s..32s+31)
 //    takes sixteen windows of one parity (s & 1) and one class pair
 //    {2t, 2t + 1}, t = (s >> 1) & 1. Pair partners stay lanes lid and
@@ -92,10 +93,19 @@ kernel void zc_r2_products_horner_cs(
 {
     threadgroup ulong4 red[256];
     threadgroup uint4* nib = reinterpret_cast<threadgroup uint4*>(red);
+    // Skip boundary (late-GPU steal): word 1 of the flag buffer holds the
+    // ones' complement of the lowest chunk the CPU has taken (0 = none); a
+    // group of a chunk at or above it returns at once. One thread reads the
+    // word into threadgroup memory, so every thread of the group takes the
+    // same branch whatever the CPU writes meanwhile (the threads of a group
+    // must not part ways before the barriers and SIMD shuffles below).
+    threadgroup uint cut_tg;
+    if (lid == 0u) { cut_tg = ~atomic_load_explicit(cs_flag + 1, memory_order_relaxed); }
     nib[lid] = nib_tab_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint hi_chunk = tgid >> 2;
+    if (hi_chunk >= cut_tg) { return; }
     // lid bits -> window bit 0 = bit 5, window bits 1..4 = bits 1..4,
     // window bit 5 = bit 7, class bit 0 = bit 0, class bit 1 = bit 6.
     uint block = lid >> 5;

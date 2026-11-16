@@ -3799,13 +3799,17 @@ impl AbGpuPrefix {
     /// the GPU's partials with the CPU's complete `partials` (verdict kept for
     /// the process) and returns `true`. `false` = the GPU failed after
     /// admission: the caller must CPU-compute `partials[..cpu_base()]`.
-    fn finish(self, partials: &mut [[F128; ELL]]) -> bool {
+    /// `kept` = the leading chunks left to the GPU (all of its share unless
+    /// the CPU stole from the top, see `gpu_commit::ENV_NO_ZC_AB_STEAL`):
+    /// only their partials are taken.
+    fn finish(self, partials: &mut [[F128; ELL]], kept: usize) -> bool {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let hi_size = partials.len();
             match crate::gpu_commit::zc_ab_wait(self.job, partials, hi_size) {
                 crate::gpu_commit::ZcAbResult::Prefix(gpu) => {
-                    partials[..gpu.len()].copy_from_slice(&gpu);
+                    let kept = kept.min(gpu.len());
+                    partials[..kept].copy_from_slice(&gpu[..kept]);
                     true
                 }
                 crate::gpu_commit::ZcAbResult::Calibrated => true,
@@ -3814,10 +3818,128 @@ impl AbGpuPrefix {
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = partials;
+            let _ = (partials, kept);
             true
         }
     }
+
+    /// The late-GPU steal (`gpu_commit::ENV_NO_ZC_AB_STEAL`), after the CPU
+    /// has drained its own chunks: if the GPU's buffer has not signalled,
+    /// fold its chunks from the top of the share downward on the main pool,
+    /// lowering the kernels' skip boundary with every chunk claimed, until
+    /// it signals. A chunk is folded as `pieces` equal ranges of its rows
+    /// (`fold(x_hi, piece)` returns one range's partial), so the whole pool
+    /// works on one chunk at a time and a claim made just before the signal
+    /// costs one chunk's fold spread over the pool, not one thread's.
+    /// Returns the leading chunks left to the GPU and the partials of the
+    /// chunks the CPU took (chunk `share - 1 - k` at index `k`; XOR of its
+    /// pieces, exact).
+    ///
+    /// The boundary and the completion flag change only under the claim
+    /// lock, and no chunk is claimed once completion was seen. The kernels
+    /// skip a chunk only at or above a boundary value the CPU wrote, and
+    /// every value written is the chunk claimed with it: a chunk below the
+    /// final boundary was never skipped and never claimed, and every piece
+    /// of a claimed chunk is folded before the steal returns.
+    fn steal(
+        &self,
+        pieces: usize,
+        fold: &(dyn Fn(usize, usize) -> [F128; ELL] + Sync),
+    ) -> (usize, Vec<[F128; ELL]>) {
+        let share = self.cpu_base();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            let job = &self.job;
+            let hold = ab_steal_hold();
+            if !job.steal_armed() || (hold.is_none() && job.steal_done()) {
+                return (share, Vec::new());
+            }
+            // (lowest chunk claimed, next piece of it, completion seen)
+            let claims = std::sync::Mutex::new((share, pieces, false));
+            let mut taken: Vec<[F128; ELL]> = crate::alloc_uninit_vec(share * pieces);
+            let taken_base = crate::epool::SyncPtr(taken.as_mut_ptr());
+            let claim = |_: usize| {
+                let (x_hi, piece) = {
+                    let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.1 == pieces {
+                        // The claimed chunks are complete: claim another
+                        // unless the GPU is done.
+                        if g.2 || g.0 == 0 {
+                            return;
+                        }
+                        match hold {
+                            // Test builds only: the CPU takes the chunks
+                            // from `n` up whatever the GPU did, then waits.
+                            Some(n) => {
+                                if g.0 <= n.min(share) {
+                                    while !job.steal_done() {
+                                        std::hint::spin_loop();
+                                    }
+                                    g.2 = true;
+                                    return;
+                                }
+                            }
+                            None => {
+                                if job.steal_done() {
+                                    g.2 = true;
+                                    return;
+                                }
+                            }
+                        }
+                        job.steal_cut(g.0 - 1);
+                        g.0 -= 1;
+                        g.1 = 0;
+                    }
+                    g.1 += 1;
+                    (g.0, g.1 - 1)
+                };
+                let partial = fold(x_hi, piece);
+                // SAFETY: one disjoint slot per claimed (chunk, piece); the
+                // queue's join publishes the writes.
+                unsafe { *taken_base.ptr().add((share - 1 - x_hi) * pieces + piece) = partial };
+            };
+            crate::epool::run_chunks_with_helper(share * pieces, &claim, None);
+            let (lo, next, done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+            // Every claimed chunk is whole, and without the completion seen
+            // the CPU folded every chunk (the join then only waits for the
+            // buffer's groups to return).
+            assert!(next == pieces && (done || lo == 0), "round-one AB steal ended early");
+            if crate::gpu_commit::gpu_zc_ab_debug() {
+                eprintln!("[zc-ab-gpu] steal: {lo} of {share} chunks left to the GPU, the CPU took {}", share - lo);
+            }
+            let out = (0..share - lo)
+                .map(|k| {
+                    let mut p = taken[k * pieces];
+                    for q in &taken[k * pieces + 1..(k + 1) * pieces] {
+                        for lane in 0..ELL {
+                            p[lane] += q[lane];
+                        }
+                    }
+                    p
+                })
+                .collect();
+            (lo, out)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (pieces, fold);
+            (share, Vec::new())
+        }
+    }
+}
+
+/// Test hook of the round-one AB steal. It exists only in a build made with
+/// `FLOCK_ZC_AB_STEAL_TEST_HOOK` set in the BUILD environment (`option_env!`):
+/// such a build leaves exactly `FLOCK_ZC_AB_STEAL_HOLD` chunks (run time, or
+/// the build variable's value) to the GPU. `None` in every other build.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn ab_steal_hold() -> Option<usize> {
+    const HOOK: Option<&str> = option_env!("FLOCK_ZC_AB_STEAL_TEST_HOOK");
+    let built = HOOK?;
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLOCK_ZC_AB_STEAL_HOLD").ok().and_then(|v| v.parse().ok()).or_else(|| built.parse().ok())
+    })
 }
 
 /// The 128 F2-basis images `convert[b * 256 + (1 << k)]` (`[b][k]`) of the
@@ -4228,11 +4350,24 @@ where
                     // The oracle probe compares against the CPU's complete
                     // per-chunk partials, so reassemble before joining.
                     reassemble(&mut partials);
-                    if !prefix.finish(&mut partials) {
+                    // A late GPU: the CPU folds from the top of its share,
+                    // a chunk at a time in equal row ranges (whole bank
+                    // groups, as the tail split's halves are).
+                    let pieces = {
+                        let n_banks = 1usize << bank_bits;
+                        if big_lo_size % 16 == 0 && (big_lo_size / 16) % n_banks == 0 { 16 } else { 1 }
+                    };
+                    let piece_lo = big_lo_size / pieces;
+                    let (kept, taken) =
+                        prefix.steal(pieces, &|x_hi, piece| fold_chunk(x_hi, piece * piece_lo..(piece + 1) * piece_lo));
+                    for (k, p) in taken.into_iter().enumerate() {
+                        partials[cpu_base - 1 - k] = p;
+                    }
+                    if !prefix.finish(&mut partials, kept) {
                         // GPU failed after admission: CPU computes its chunks
                         // with the same kernel (the arm is now disabled).
                         crate::epool::run_hetero_chunks_caller_tail(
-                            cpu_base,
+                            kept,
                             |x_hi| {
                                 let partial = fold_chunk(x_hi, 0..big_lo_size);
                                 // SAFETY: one disjoint slot per index; the
