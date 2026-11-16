@@ -439,6 +439,13 @@ pub(crate) fn fold_serial_xor_enabled() -> bool {
     *ON
 }
 
+pub const ENV_NO_CB2_DONE_SIGNAL: &str = "FLOCK_NO_CB2_DONE_SIGNAL";
+
+pub(crate) fn cb2_done_signal_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_CB2_DONE_SIGNAL));
+    *ON
+}
+
 pub(crate) fn gpu_done_event_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !std::env::var(ENV_NO_GPU_DONE_EVENT).is_ok_and(|v| v == "1")
@@ -12741,6 +12748,7 @@ kernel void blake3_pow_race_tail(
                         // Retain across the pool: completion is consumed by
                         // `finish` (same idiom as the streamed tiles above).
                         let cb2 = self.gpu.retain(cb2);
+                        arm_cb2_done(self.gpu, cb2);
                         self.gpu.commit_async(cb2);
                         crate::tmark::mark("early cb2 committed");
                         Ok(cb2)
@@ -13721,6 +13729,35 @@ kernel void blake3_pow_race_tail(
     /// Process-lifetime indirect-count buffer of the CPU tail hash's cb3.
     static TAIL_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+    static CB2_DONE: std::sync::Mutex<Option<(usize, DoneSig)>> = std::sync::Mutex::new(None);
+
+    unsafe fn arm_cb2_done(gpu: &Gpu, cb2: Id) {
+        if !super::cb2_done_signal_enabled() || hybrid_arm_recording() {
+            return;
+        }
+        if let Some(sig) = unsafe { gpu.arm_done(cb2) } {
+            let held = unsafe { gpu.retain(cb2) };
+            let old = CB2_DONE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace((held as usize, sig));
+            if let Some((c, _)) = old {
+                unsafe { gpu.release(c as Id) };
+            }
+        }
+    }
+
+    unsafe fn take_cb2_done(gpu: &Gpu, cb2: Id) -> Option<DoneSig> {
+        let mut slot = CB2_DONE.lock().unwrap_or_else(|e| e.into_inner());
+        if !slot.is_some_and(|(c, _)| c == cb2 as usize) {
+            return None;
+        }
+        let (_, sig) = slot.take()?;
+        drop(slot);
+        unsafe { gpu.release(cb2) };
+        Some(sig)
+    }
+
     /// The CPU tail hash's join (see `super::ENV_NO_HYBRID_CPU_TAIL_HASH`),
     /// in place of cb3 over the whole suffix. cb3 is committed at once behind
     /// cb2, as before, but over the suffix's GPU units only: its dispatches
@@ -13742,6 +13779,7 @@ kernel void blake3_pow_race_tail(
     unsafe fn hybrid_cpu_tail_hash_join(
         gpu: &Gpu,
         cb2: Id,
+        sig2: Option<DoneSig>,
         staging: Id,
         tree_buf: Id,
         tree_base: crate::epool::SyncPtr<Hash>,
@@ -13817,8 +13855,7 @@ kernel void blake3_pow_race_tail(
                     hash_unit(start);
                 });
             }
-            // This thread: stop the claims at cb2's completion.
-            let cb2_done = || unsafe { gpu.cb_status(cb2_u as Id) >= 4 };
+            let cb2_done = || unsafe { gpu.cb_done(cb2_u as Id, sig2.as_ref()) };
             let mut spins = 0u32;
             loop {
                 {
@@ -13853,7 +13890,12 @@ kernel void blake3_pow_race_tail(
         });
         let tail_ms = t_tail.elapsed().as_secs_f64() * 1e3;
         crate::tmark::mark("tail hash workers done");
-        gpu.wait_cb(cb2)?;
+        if sig2.is_some() && !window_trace_enabled() {
+            gpu.join_cb_sig(cb2, sig2.as_ref(), 0.0)?;
+        } else {
+            gpu.wait_cb(cb2)?;
+        }
+        Gpu::recycle_done(sig2);
         // cb3's tree writes are read only below, after this join: on its
         // signal every write is complete and visible. The window trace reads
         // cb3's GPU timestamps, so it keeps the status wait.
@@ -13949,6 +13991,7 @@ kernel void blake3_pow_race_tail(
                         let cb2 = encode_hybrid_prefix_cb2(
                             gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_split,
                         )?;
+                        arm_cb2_done(gpu, cb2);
                         gpu.commit_async(cb2);
                         crate::tmark::mark("cb2 committed (late)");
                         cb2
@@ -14028,16 +14071,18 @@ kernel void blake3_pow_race_tail(
                     // returned (the CPU is idle only then), never in the
                     // tuner's sweep.
                     let tail_force = super::hybrid_tail_hash_force();
+                    let sig2 = take_cb2_done(gpu, cb2);
                     let tail = !hybrid_arm_recording()
                         && super::hybrid_cpu_tail_hash_enabled()
                         && (tail_force > 0 || {
-                            super::help_pool_until(|| super::ab_arm_done() || gpu.cb_status(cb2) >= 4);
-                            gpu.cb_status(cb2) < 4
+                            super::help_pool_until(|| super::ab_arm_done() || gpu.cb_done(cb2, sig2.as_ref()));
+                            !gpu.cb_done(cb2, sig2.as_ref())
                         });
                     if tail {
                         hybrid_cpu_tail_hash_join(
                             gpu,
                             cb2,
+                            sig2,
                             staging,
                             tree_buf,
                             tree_base,
@@ -14083,6 +14128,7 @@ kernel void blake3_pow_race_tail(
                         gpu.wait_cb(cb2)?;
                         gpu.wait_cb(cb3)?;
                     }
+                    Gpu::recycle_done(sig2);
                     // Arms for the sweep's split selection. cb3 queues behind
                     // both cb2 and the CPU NTT, so this split's window is
                     // max(cb2, cpu NTT) + cb3: price the GPU arm as cb2's
