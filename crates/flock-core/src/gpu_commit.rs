@@ -853,6 +853,60 @@ pub(crate) fn zc_r2_cs_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the R2-CS late-GPU steal (`FLOCK_NO_R2_STEAL`, any value:
+/// the record's join, where the CPU sweep, having walked the chunks after the
+/// arm's prefix, waits for the GPU; the R2-CS library is then the record's
+/// text and a timed prefix one dispatch with no signal).
+///
+/// With it on, the R2-CS library's kernel reads one claim word, through a
+/// volatile system-coherent pointer, per threadgroup before its first barrier
+/// (into threadgroup memory, so the whole group decides alike) and returns at
+/// once when its chunk is at or above it; each SIMD group reads it again
+/// every four steps of its step loop and leaves the loop (all lanes alike)
+/// once its chunk is at or above it, with the stores of the steps it walked
+/// made and its partial sums never read. A timed R2-CS prefix is the record's single dispatch over chunks
+/// `0..share` with the word at `share`, followed by one shared-event signal:
+/// once the CPU sees it, every chunk below the word is stored and its
+/// partials are visible to the host. The CPU sweep walks its own chunks as
+/// before; each main-pool worker whose queue claim finds them exhausted then
+/// takes the GPU's chunks from the top of the prefix downward, one claim at a
+/// time under one mutex: if the signal has been seen it stops (the GPU keeps
+/// every chunk below the word), else it lowers the word to the chunk and
+/// walks that chunk itself with the full lookahead walk (compact stores,
+/// products and lookahead terms in its own partial slots, exactly the walk
+/// the warm-up oracle compares the kernel with). The join merges the GPU's
+/// partials of the chunks below the word only. A threadgroup or SIMD group
+/// that read the word before the CPU lowered it stores the same bytes as the
+/// CPU walk (both are the walk the oracle proved equal), and its partials are
+/// not read; when the CPU has taken the whole prefix without seeing the signal,
+/// the join waits for the buffer as the record's does. Which side walks a
+/// chunk cannot change a bit. Read once per process.
+pub const ENV_NO_R2_STEAL: &str = "FLOCK_NO_R2_STEAL";
+
+pub(crate) fn zc_r2_steal_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_R2_STEAL).is_none());
+    *ON && zc_r2_cs_enabled()
+}
+
+/// Test builds only (`FLOCK_ZC_R2_STEAL_TEST_HOOK` set in the BUILD
+/// environment, the constant 0 otherwise): the R2-CS steal ignores the GPU's
+/// signal until it has taken `FLOCK_ZC_R2_STEAL_MIN` chunks (default: the
+/// hook's own value), so the steal and the threadgroups that race it run in
+/// every timed prove whatever the arms' speeds.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_r2_steal_min() -> usize {
+    const HOOK: Option<&str> = option_env!("FLOCK_ZC_R2_STEAL_TEST_HOOK");
+    let Some(built) = HOOK else { return 0 };
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLOCK_ZC_R2_STEAL_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| built.parse().unwrap_or(0))
+    })
+}
+
 /// Kill switch for the K view hand-over (`FLOCK_NO_ZC_K_HANDOVER`, any value:
 /// every prove whose round two takes its anchors early, before round one,
 /// also makes and maps their K view there). With the switch unset, the
@@ -21315,6 +21369,7 @@ kernel void zc_r2_products_horner_cs(
 "#;
 
     include!("gpu_commit/r2cs_fast.rs");
+    include!("gpu_commit/r2steal.rs");
 
     /// Host mirror of the probe kernel's `ZcR2CsLayout` (see
     /// `UniSkipCompactFold::anchor_index` / `delta_offset`): anchors and
@@ -21460,6 +21515,12 @@ kernel void zc_r2_horner_oracle(
         cs_d_buf: Id,
         cs_d_cap: usize,
         cs_flag_buf: Id,
+        /// R2-CS steal (`super::ENV_NO_R2_STEAL`): the kernel's claim word
+        /// (one u32; `NIL` = no steal kernel), the shared event a timed
+        /// prefix signals after its dispatch, and that event's next value.
+        steal_cut_buf: Id,
+        steal_ev: Id,
+        steal_next: u64,
     }
 
     // SAFETY: the Metal pipeline and buffer handles are only touched under
@@ -21734,6 +21795,9 @@ kernel void zc_r2_horner_oracle(
                 cs_d_buf: NIL,
                 cs_d_cap: 0,
                 cs_flag_buf: NIL,
+                steal_cut_buf: NIL,
+                steal_ev: NIL,
+                steal_next: 0,
             })
         }
     }
@@ -21746,14 +21810,39 @@ kernel void zc_r2_horner_oracle(
     /// the pipeline failed (R2-CS off for the process).
     static ZC_R2_CS_PSO: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
 
-    /// Compile the R2-CS library on `gpu`'s device and make its pipeline.
+    /// Whether the R2-CS pipeline was built from the steal source
+    /// (`super::ENV_NO_R2_STEAL`): its kernel reads the claim word.
+    static ZC_R2_STEAL_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Compile the R2-CS library on `gpu`'s device and make its pipeline;
+    /// with the steal on, from the steal source first (the record's source
+    /// if that one does not build).
     fn zc_r2_cs_build_pso(gpu: &Gpu) -> Result<Id, String> {
+        let mut source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled()).into_owned();
+        source.push_str(&r2cs_fast::source(ZC_R2_CS_MSL_SOURCE));
+        if super::zc_r2_steal_enabled()
+            && let Some(steal) = r2steal::source(&source)
+        {
+            match zc_r2_cs_compile(gpu, &steal) {
+                Ok(pso) => {
+                    ZC_R2_STEAL_KERNEL.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(pso);
+                }
+                Err(e) => {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!("[zc-r2] R2-CS steal source did not build ({e}); steal off");
+                    }
+                }
+            }
+        }
+        zc_r2_cs_compile(gpu, &source)
+    }
+
+    fn zc_r2_cs_compile(gpu: &Gpu, source: &str) -> Result<Id, String> {
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<Id, String> {
-                let mut source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled()).into_owned();
-                source.push_str(&r2cs_fast::source(ZC_R2_CS_MSL_SOURCE));
-                let src = gpu.api.nsstring(&source)?;
+                let src = gpu.api.nsstring(source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
                     gpu.api,
@@ -21858,6 +21947,26 @@ kernel void zc_r2_horner_oracle(
                     return false;
                 }
             }
+            // The steal kernel's claim word (above every chunk until a timed
+            // prefix lowers it) and the event its timed prefixes signal; the
+            // kernel then reads the word whatever the launch, so without
+            // both there is no R2-CS.
+            if ZC_R2_STEAL_KERNEL.load(std::sync::atomic::Ordering::Relaxed) && state.steal_cut_buf.is_null() {
+                let ev: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newSharedEvent");
+                let cut = gpu.new_buffer(16).unwrap_or(NIL);
+                if ev.is_null() || cut.is_null() {
+                    if !ev.is_null() {
+                        gpu.release(ev);
+                    }
+                    if !cut.is_null() {
+                        gpu.release(cut);
+                    }
+                    return false;
+                }
+                gpu.buffer_contents(cut).cast::<u32>().write_volatile(u32::MAX);
+                state.steal_ev = ev;
+                state.steal_cut_buf = cut;
+            }
             state.cs_pso = gpu.retain(pso);
         }
         true
@@ -21900,6 +22009,80 @@ kernel void zc_r2_horner_oracle(
         /// A timed R2-CS prefix's references of the prove's views it binds,
         /// held until the job is dropped (after its join).
         _cs_views: ZcR2CsViews,
+        /// R2-CS steal (`super::ENV_NO_R2_STEAL`): a timed R2-CS prefix of the
+        /// steal kernel; `None` = the record's join.
+        steal: Option<ZcR2Steal>,
+    }
+
+    /// The R2-CS steal's claims (`super::ENV_NO_R2_STEAL`): `next` = the
+    /// lowest chunk the CPU has taken (the claim word), `stop` = the prefix's
+    /// signal was seen, `late` = whether it had not been at the first claim.
+    struct ZcR2Claims {
+        next: usize,
+        stop: bool,
+        late: Option<bool>,
+    }
+
+    /// A timed R2-CS prefix's steal control, shared by the CPU sweep's
+    /// workers: its event and value, its claim word, its claims.
+    pub(crate) struct ZcR2Steal {
+        gpu: &'static Gpu,
+        ev: Id,
+        value: u64,
+        cut: *mut u32,
+        chunks: usize,
+        /// Test hook (`super::zc_r2_steal_min`): chunks taken before the
+        /// signal is asked; 0 otherwise.
+        min: usize,
+        claims: std::sync::Mutex<ZcR2Claims>,
+        t_submit: std::time::Instant,
+        t_seen: std::sync::Mutex<Option<f64>>,
+    }
+
+    // SAFETY: `cut` names the arm's process-lifetime claim word, which only
+    // this job writes until its join; event reads are thread-safe.
+    unsafe impl Send for ZcR2Steal {}
+    unsafe impl Sync for ZcR2Steal {}
+
+    impl ZcR2Steal {
+        /// Whether the prefix's signal has been seen: every chunk below the
+        /// claim word is stored and its partials are visible to the host.
+        fn done(&self) -> bool {
+            let done = unsafe { self.gpu.event_signaled_value(self.ev) } >= self.value;
+            // Order the reads of the GPU's stores after this read.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            done
+        }
+
+        /// The next chunk the CPU takes from the GPU (from the top of the
+        /// prefix down), with the claim word lowered to it; `None` once the
+        /// signal has been seen or the whole prefix is taken.
+        pub(crate) fn claim(&self) -> Option<usize> {
+            let mut g = self.claims.lock().unwrap_or_else(|e| e.into_inner());
+            if g.stop || g.next == 0 {
+                return None;
+            }
+            if self.chunks - g.next >= self.min && self.done() {
+                g.stop = true;
+                g.late.get_or_insert(false);
+                if super::gpu_zc_r2_debug() {
+                    *self.t_seen.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(self.t_submit.elapsed().as_secs_f64() * 1e3);
+                }
+                return None;
+            }
+            g.late.get_or_insert(true);
+            g.next -= 1;
+            unsafe { self.cut.write_volatile(g.next as u32) };
+            Some(g.next)
+        }
+
+        /// The lowest chunk the CPU has taken (the GPU's chunks are below
+        /// it), and whether the signal was seen.
+        pub(crate) fn taken(&self) -> (usize, bool) {
+            let g = self.claims.lock().unwrap_or_else(|e| e.into_inner());
+            (g.next, g.stop)
+        }
     }
 
     /// The R2-CS kernel's compact-state destination for one dispatch: its
@@ -21951,6 +22134,12 @@ kernel void zc_r2_horner_oracle(
             self.cs.is_some() && !self.calibration
         }
 
+        /// R2-CS steal (`super::ENV_NO_R2_STEAL`): this timed prefix's steal
+        /// control, `None` = the record's join.
+        pub(crate) fn steal(&self) -> Option<&ZcR2Steal> {
+            self.steal.as_ref()
+        }
+
         /// R2-CS calibration job: the chunks whose compact state the GPU
         /// stored to scratch and their layout, for [`zc_r2_cs_oracle`].
         pub(crate) fn cs_calibration(&self) -> Option<(usize, ZcR2CsLayout)> {
@@ -21995,6 +22184,7 @@ kernel void zc_r2_horner_oracle(
         useful: u32,
         horner: bool,
         cs: Option<&ZcR2CsBind>,
+        signal: Option<u64>,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -22053,9 +22243,17 @@ kernel void zc_r2_horner_oracle(
                 gpu.set_buffer(enc, bind.deltas, 0, 8);
                 gpu.set_bytes(enc, lb, 9);
                 gpu.set_buffer(enc, state.cs_flag_buf, 0, 10);
+                // The steal kernel's claim word (`super::ENV_NO_R2_STEAL`).
+                if !state.steal_cut_buf.is_null() {
+                    gpu.set_buffer(enc, state.steal_cut_buf, 0, 11);
+                }
             }
             gpu.dispatch(enc, (chunks * if horner { 4 } else { 1 }) as u64, 256);
             gpu.end_encoding(enc);
+            // A timed steal prefix: its completion, seen by the CPU sweep.
+            if let Some(v) = signal {
+                gpu.encode_signal_event(cb, state.steal_ev, v);
+            }
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
             Ok(cb)
@@ -22257,6 +22455,7 @@ kernel void zc_r2_horner_oracle(
                     useful_pairs_inclusive as u32,
                     horner,
                     // The primer never stores compact state (R2-CS probe).
+                    None,
                     None,
                 )?;
                 state.prefetch_cb = cb;
@@ -22549,6 +22748,18 @@ kernel void zc_r2_horner_oracle(
             } else {
                 chunks
             };
+            // R2-CS steal (`super::ENV_NO_R2_STEAL`): a timed R2-CS prefix
+            // with the steal kernel offers chunks `0..chunks` (the claim word
+            // at `chunks`) and signals the next event value after its
+            // dispatch; every other launch leaves the word above every chunk.
+            let steal_value = (timed_cs.is_some() && !state.steal_cut_buf.is_null()).then(|| {
+                state.steal_next += 1;
+                state.steal_next
+            });
+            if !state.steal_cut_buf.is_null() {
+                let word = if steal_value.is_some() { chunks as u32 } else { u32::MAX };
+                gpu.buffer_contents(state.steal_cut_buf).cast::<u32>().write_volatile(word);
+            }
             let cb = zc_r2_submit(
                 gpu,
                 &state,
@@ -22560,8 +22771,20 @@ kernel void zc_r2_horner_oracle(
                 useful_pairs_inclusive as u32,
                 horner,
                 timed_cs.map(|(bind, _)| bind),
+                steal_value,
             )
             .ok()?;
+            let steal = steal_value.map(|value| ZcR2Steal {
+                gpu,
+                ev: state.steal_ev,
+                value,
+                cut: gpu.buffer_contents(state.steal_cut_buf).cast::<u32>(),
+                chunks,
+                min: super::zc_r2_steal_min().min(chunks),
+                claims: std::sync::Mutex::new(ZcR2Claims { next: chunks, stop: false, late: None }),
+                t_submit: std::time::Instant::now(),
+                t_seen: std::sync::Mutex::new(None),
+            });
             let cs_cb = match cs.as_ref().filter(|_| calibration) {
                 Some((bind, _)) => zc_r2_submit(
                     gpu,
@@ -22574,6 +22797,7 @@ kernel void zc_r2_horner_oracle(
                     useful_pairs_inclusive as u32,
                     horner,
                     Some(bind),
+                    None,
                 )
                 .unwrap_or(NIL),
                 None => NIL,
@@ -22602,6 +22826,7 @@ kernel void zc_r2_horner_oracle(
                 cs,
                 cs_cb,
                 _cs_views,
+                steal,
             })
         }
     }
@@ -22846,15 +23071,28 @@ kernel void zc_r2_horner_oracle(
             ZcR2Result::Failed
         };
         unsafe {
+            // R2-CS steal (`super::ENV_NO_R2_STEAL`): the CPU took the chunks
+            // from `take` up; with the prefix's signal seen, the GPU's chunks
+            // below `take` are complete and visible, and nothing is waited
+            // for (the buffer's work ended with that signal). Without it (the
+            // CPU took the whole prefix, or no steal), the record's join.
+            let (take, seen) = job.steal.as_ref().map_or((job.chunks, false), ZcR2Steal::taken);
             // The CPU worker reaches this join after finishing its own share
             // of a balanced split, so the GPU is normally already complete
             // (first status poll, zero cost) or within a hair of it — a
             // bounded spin dodges the ~0.3-0.5 ms `waitUntilCompleted` park
             // once per timed prove.
-            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+            if seen {
+                if gpu.cb_status(job.cb) == 5 {
+                    return poison(job.cb);
+                }
+            } else if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
                 return poison(job.cb);
             }
-            let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
+            let first_wall = match job.steal.as_ref() {
+                Some(s) if seen => s.t_seen.lock().map_or(None, |t| *t).unwrap_or(0.0),
+                _ => zc_fold_gpu_wall_ms(gpu, job.cb),
+            };
             let state_mutex = match zc_r2_state() {
                 Some(s) => s,
                 None => return poison(job.cb),
@@ -22875,9 +23113,9 @@ kernel void zc_r2_horner_oracle(
             // lookahead partials [W0, W3, W4, W5].
             let merge = |buf: Id, lanes: usize| -> (Vec<[F128; 4]>, Vec<[F128; 4]>) {
                 let parts = gpu.buffer_contents(buf).cast::<F128>();
-                let mut out: Vec<[F128; 4]> = Vec::with_capacity(job.chunks);
+                let mut out: Vec<[F128; 4]> = Vec::with_capacity(take);
                 let mut out_w: Vec<[F128; 4]> = Vec::new();
-                for c in 0..job.chunks {
+                for c in 0..take {
                     let base = c * groups * lanes;
                     let mut merged = [
                         *parts.add(base),
@@ -22916,7 +23154,7 @@ kernel void zc_r2_horner_oracle(
                 if let Some(submitted) = job.submitted {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
-                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}{}",
+                         cpu-sweep={cpu_wall_ms:.2}ms submit-to-drain={:.2}ms horner={}{}{}",
                         job.chunks,
                         hi_size,
                         submitted.elapsed().as_secs_f64() * 1e3,
@@ -22929,6 +23167,15 @@ kernel void zc_r2_horner_oracle(
                             )
                         } else {
                             String::new()
+                        },
+                        match job.steal.as_ref() {
+                            Some(s) => format!(
+                                " steal: stolen={} late={} seen={} (gpu= is the signal seen)",
+                                job.chunks - take,
+                                u8::from(s.claims.lock().map_or(false, |g| g.late == Some(true))),
+                                u8::from(seen),
+                            ),
+                            None => String::new(),
                         },
                     );
                 }
@@ -23031,6 +23278,7 @@ kernel void zc_r2_horner_oracle(
                     job.mask,
                     job.useful,
                     job.horner,
+                    None,
                     None,
                 ) else {
                     break;

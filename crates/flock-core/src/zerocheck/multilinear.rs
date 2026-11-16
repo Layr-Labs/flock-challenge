@@ -2336,9 +2336,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let deltas_base = crate::epool::SyncPtr(unsafe { compact.deltas.full_overwrite_ptr().add(delta_base) });
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
-        // exclusively owns its anchors/deltas ranges and both partial slots.
+    // `stolen`: R2-CS steal (`gpu_commit::ENV_NO_R2_STEAL`), a prefix chunk
+    // the CPU took from the GPU, walked in full as a chunk after the prefix.
+    let chunk_body = |x_hi: usize, stolen: bool| {
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = stolen;
+        // SAFETY: the queue (or the steal's claim) hands out each x_hi
+        // exactly once; chunk x_hi exclusively owns its anchors/deltas ranges
+        // and both partial slots.
         let (anchors, deltas) = unsafe {
             (
                 anchors_base.ptr().add(x_hi * anchor_chunk_stride),
@@ -2353,7 +2358,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         // R2-CS: the arm owns this prefix chunk outright (compact state,
         // products, lookahead terms); its slots are filled after the join.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if r2cs && x_hi < gpu_prefix {
+        if r2cs && x_hi < gpu_prefix && !stolen {
             // SAFETY: exclusive owner of both partial slots (see above).
             unsafe {
                 *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
@@ -2365,7 +2370,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         #[cfg(target_arch = "aarch64")]
         {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let full = x_hi >= gpu_prefix;
+            let full = stolen || x_hi >= gpu_prefix;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let full = true;
             unsafe {
@@ -2560,7 +2565,25 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 eq_h * out[7],
             ];
         }
-    });
+    };
+    // R2-CS steal (`gpu_commit::ENV_NO_R2_STEAL`): the queue walks the chunks
+    // after the prefix; each main-pool worker that finds them claimed then
+    // takes the GPU's chunks from the top of the prefix until the prefix's
+    // signal has been seen. Otherwise the record's queue over every chunk.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let steal = gpu_job.as_ref().and_then(|j| j.steal()).filter(|_| r2cs);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let Some(steal) = steal {
+        crate::epool::run_hetero_chunks_then(hi_size - gpu_prefix, &|i| chunk_body(gpu_prefix + i, false), &|| {
+            while let Some(x_hi) = steal.claim() {
+                chunk_body(x_hi, true);
+            }
+        });
+    } else {
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| chunk_body(x_hi, false));
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| chunk_body(x_hi, false));
 
     // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
     // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
@@ -2571,7 +2594,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     if let Some(job) = gpu_job {
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
         let calib = job.is_calibration();
-        let prefix = job.cpu_split();
+        // R2-CS steal: the GPU's chunks are those below the lowest chunk the
+        // CPU took (the CPU walked the rest of the prefix).
+        let prefix = job.steal().map_or(job.cpu_split(), |s| s.taken().0);
         let res = crate::gpu_commit::zc_r2_wait(
             job,
             if calib {
