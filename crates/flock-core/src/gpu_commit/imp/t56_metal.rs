@@ -22,9 +22,17 @@
 //! eight simdgroups, and land as 32 raw bank entries per threadgroup; the CPU
 //! reduces them per slot (`zc_t56::finish_banks`). Every step is an exact
 //! GF(2^128) product, XOR or table expansion.
+//!
+//! Flat fold (`zc_t56::ENV_NO_T56_SKIP`, on unless `FLOCK_NO_T56_SKIP=1`):
+//! the library is this source's helpers followed by `ZC_T56_FLAT_KERNEL`,
+//! the same kernel except that each output folds its four inputs `x0..x3`
+//! as `x0 + rho_a (x0 + x1) + rho_b (x0 + x2) + rho_a rho_b (x0 + x1 + x2 +
+//! x3)`, three table products that need nothing of each other (a third
+//! nibble table, of `rho_a * rho_b`, after `eq_odd` in the constants), and
+//! the reduction rows reuse the tables' threadgroup memory after a barrier.
 
 use super::*;
-use crate::gpu_commit::zc_t56::{self, BANKS, CONSTS, IN_A, IN_B, OUT, SLOTS};
+use crate::gpu_commit::zc_t56::{self, BANKS, IN_A, IN_B, OUT, SLOTS};
 
 const ZC_T56_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -258,6 +266,150 @@ kernel void zc_t56_fold(
 }
 "#;
 
+/// The flat-fold form of `zc_t56_fold` (see `zc_t56::ENV_NO_T56_SKIP`): the
+/// record kernel with each four-input fold as three independent table
+/// products (`rho_a`, `rho_b`, `rho_a * rho_b`) and the reduction rows in the
+/// tables' memory. Compiled after the record source's helpers.
+const ZC_T56_FLAT_KERNEL: &str = r#"kernel void zc_t56_fold(
+    device const uint4* a_in   [[buffer(0)]],
+    device const uint4* b_in   [[buffer(1)]],
+    device uint4*       a_out  [[buffer(2)]],
+    device uint4*       b_out  [[buffer(3)]],
+    device const uint4* consts [[buffer(4)]],
+    device ulong4*      banks  [[buffer(5)]],
+    constant T56Params& p      [[buffer(6)]],
+    device const uint*  cut    [[buffer(7)]],
+    uint tg_rel [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    // The rho_a, rho_b and rho_a * rho_b nibble tables (constants 0..1023
+    // and 2048..2559), 1536 entries viewed through `nib`. After the loop and
+    // a barrier, the first 256 rows hold the reduction rows (`red`): the
+    // same 24 KB as the record form. Declared as `ulong4` so both views keep
+    // their natural alignment.
+    threadgroup ulong4 tab[768];
+    threadgroup uint4* nib = (threadgroup uint4*)tab;
+    threadgroup ulong4* red = tab;
+    // `tg_base`: first threadgroup of this dispatch in the pass's grid.
+    // `cut[0]`: the lowest chunk the CPU has taken (late-GPU steal); a group
+    // of a chunk at or above it returns at once. One thread reads the word
+    // into threadgroup memory, so every thread of the group takes the same
+    // branch whatever the CPU writes meanwhile (threads of one group must
+    // not part ways before the barriers and SIMD shuffles below).
+    threadgroup uint cut_tg;
+    const uint tg = p.tg_base + tg_rel;
+    if (lid == 0u) { cut_tg = cut[0]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((tg >> 2) >= cut_tg) { return; }
+    for (uint i = lid; i < 1024u; i += 256u) { nib[i] = consts[i]; }
+    for (uint i = lid; i < 512u; i += 256u) { nib[1024u + i] = consts[2048u + i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint chunk = tg >> 2;
+    const uint quarter = tg & 3u;
+    const uint l = lid & 7u;
+    const uint4 one = uint4(1u, 0u, 0u, 0u);
+    // Round b: pair sums at lanes 1, 2, 5, 6, even/odd quad sums at 0, 3,
+    // 4, 7; round c: halves at lanes 0..3, half-pair sums at 5, 6 and 4, 7.
+    const bool sel_b = ((l ^ (l >> 1u)) & 1u) != 0u;
+    device const uint4* ai = a_in + ulong(chunk) * T56_IN_A;
+    device const uint4* bi = b_in + ulong(chunk) * T56_IN_B;
+    device uint4* ao = a_out + ulong(chunk) * T56_OUT;
+    device uint4* bo = b_out + ulong(chunk) * T56_OUT;
+    device const uint4* eq_odd = consts + 1024u;
+    ulong4 acc_a = ulong4(0ul), acc_b = ulong4(0ul), acc_c = ulong4(0ul), acc_d = ulong4(0ul);
+    uint4 qa = uint4(0u), qb = uint4(0u);
+    for (uint j = 0u; j < 8u; j++) {
+        const uint o = (quarter << 11) + (j << 8) + lid;
+        const uint y = o >> 3;
+        const uint blk = y >> 1;
+        const uint hsel = y & 1u;
+        const bool tail = (hsel != 0u) && (l == 7u);
+        const uint sup = (blk >> 2) * 244u;
+        uint4 a0, a1, a2, a3;
+        if (tail) {
+            a0 = ai[sup + 240u + (blk & 3u)];
+            a1 = uint4(0u); a2 = uint4(0u); a3 = uint4(0u);
+        } else {
+            const uint p = sup + 60u * (blk & 3u) + (hsel << 5) + (l << 2);
+            a0 = ai[p]; a1 = ai[p + 1u]; a2 = ai[p + 2u]; a3 = ai[p + 3u];
+        }
+        // b-one-packed: block blk's inputs 4..58 at 56 blk + 0..54 and its
+        // input 60 at 56 blk + 55; inputs 0..3 and 59 are one, 61..63 zero.
+        const uint bm = blk * 56u;
+        uint4 b0, b1, b2, b3;
+        if (hsel == 0u && l == 0u) {
+            b0 = one; b1 = one; b2 = one; b3 = one;
+        } else if (tail) {
+            b0 = bi[bm + 55u];
+            b1 = uint4(0u); b2 = uint4(0u); b3 = uint4(0u);
+        } else {
+            const uint q = bm + (hsel << 5) + (l << 2) - 4u;
+            b0 = bi[q]; b1 = bi[q + 1u]; b2 = bi[q + 2u];
+            if (hsel != 0u && l == 6u) { b3 = one; } else { b3 = bi[q + 3u]; }
+        }
+        // Flat fold: x0 + rho_a (x0 + x1) + rho_b (x0 + x2)
+        // + rho_a rho_b (x0 + x1 + x2 + x3), three independent products.
+        const uint4 fa = a0 ^ mul_rho16(a0 ^ a1, nib) ^ mul_rho16(a0 ^ a2, nib + 512)
+                       ^ mul_rho16(a0 ^ a1 ^ a2 ^ a3, nib + 1024);
+        const uint4 fb = b0 ^ mul_rho16(b0 ^ b1, nib) ^ mul_rho16(b0 ^ b2, nib + 512)
+                       ^ mul_rho16(b0 ^ b1 ^ b2 ^ b3, nib + 1024);
+        ao[o] = fa;
+        bo[o] = fb;
+        const uint4 wa = gf_reduce(clmul128(eq_odd[y], fa));
+        const uint4 pa = xor_lanes(wa, ushort(1)), pb = xor_lanes(fb, ushort(1));
+        const uint4 ea = xor_lanes(wa, ushort(2)), eb = xor_lanes(fb, ushort(2));
+        const uint4 qsa = xor_lanes(ea, ushort(1)), qsb = xor_lanes(eb, ushort(1));
+        const uint4 ha = xor_lanes(wa, ushort(4)), hb = xor_lanes(fb, ushort(4));
+        const uint4 h1a = xor_lanes(ha, ushort(1)), h1b = xor_lanes(hb, ushort(1));
+        const uint4 h2a = xor_lanes(ha, ushort(2)), h2b = xor_lanes(hb, ushort(2));
+        const uint4 hha = xor_lanes(h1a, ushort(2)), hhb = xor_lanes(h1b, ushort(2));
+        acc_b = acc_mul(acc_b, sel_b ? pa : ea, sel_b ? pb : eb);
+        if ((l & 3u) == (j & 3u)) { qa = qsa; qb = qsb; }
+        const uint4 ca = l < 4u ? ha : (sel_b ? h1a : h2a);
+        const uint4 cb = l < 4u ? hb : (sel_b ? h1b : h2b);
+        acc_c = acc_mul(acc_c, ca, cb);
+        acc_a = acc_mul(acc_a, l == 0u ? hha : wa, l == 0u ? hhb : fb);
+        if ((j & 3u) == 3u) { acc_d = acc_mul(acc_d, qa, qb); }
+    }
+    acc_a = xor_lanes4(acc_a, ushort(8));
+    acc_b = xor_lanes4(acc_b, ushort(8));
+    acc_c = xor_lanes4(acc_c, ushort(8));
+    acc_d = xor_lanes4(acc_d, ushort(8));
+    acc_a = xor_lanes4(acc_a, ushort(16));
+    acc_b = xor_lanes4(acc_b, ushort(16));
+    acc_c = xor_lanes4(acc_c, ushort(16));
+    acc_d = xor_lanes4(acc_d, ushort(16));
+    // Every simdgroup is done with the tables before `red` overwrites them.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((lid & 31u) < 8u) {
+        const uint base = (lid >> 5) * 32u + l;
+        red[base] = acc_a;
+        red[base + 8u] = acc_b;
+        red[base + 16u] = acc_c;
+        red[base + 24u] = acc_d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 32u) {
+        ulong4 s = red[lid];
+        for (uint k = 1u; k < 8u; k++) { s ^= red[(k << 5) + lid]; }
+        banks[(ulong(tg) << 5) + lid] = s;
+    }
+}
+"#;
+
+const ZC_T56_ENTRY: &str = "kernel void zc_t56_fold(";
+
+/// The arm's library source: the record text, or (flat fold on) the record
+/// text's helpers followed by [`ZC_T56_FLAT_KERNEL`], one entry point either
+/// way.
+fn zc_t56_source(flat: bool) -> std::borrow::Cow<'static, str> {
+    match ZC_T56_MSL_SOURCE.find(ZC_T56_ENTRY) {
+        Some(k) if flat => std::borrow::Cow::Owned(format!("{}{}", &ZC_T56_MSL_SOURCE[..k], ZC_T56_FLAT_KERNEL)),
+        _ => std::borrow::Cow::Borrowed(ZC_T56_MSL_SOURCE),
+    }
+}
+
 /// The fold pipeline and the device it was built on, built once per
 /// process (prewarm thread, else the first launch); `None` = the source did
 /// not compile or the pipeline cannot run the kernel's widths (arm off).
@@ -267,7 +419,7 @@ unsafe fn zc_t56_build_pso(gpu: &Gpu) -> Result<Id, String> {
     unsafe {
         let pool = gpu.pool_push();
         let built = (|| -> Result<Id, String> {
-            let src = gpu.api.nsstring(ZC_T56_MSL_SOURCE)?;
+            let src = gpu.api.nsstring(&zc_t56_source(zc_t56::flat_enabled()))?;
             let mut err: Id = NIL;
             let library: Id = send!(
                 gpu.api,
@@ -343,7 +495,7 @@ pub(crate) fn zc_t56_prewarm() {
 
 /// The arm's own process-lifetime buffers, sized at the first launch.
 struct ZcT56 {
-    /// Per-launch constants (`zc_t56::consts_into`).
+    /// Per-launch constants (`zc_t56::launch_consts_into`).
     consts_buf: Id,
     /// Raw bank entries, [`BANKS`] x 32 B per chunk.
     banks_buf: Id,
@@ -377,7 +529,7 @@ static ZC_T56_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 
 unsafe fn zc_t56_alloc(gpu: &Gpu, cap: usize) -> Result<ZcT56, String> {
     let mut made: Vec<Id> = Vec::with_capacity(5);
-    for len in [CONSTS * 16, cap * BANKS * 32, cap * OUT * 16, cap * OUT * 16, 16] {
+    for len in [zc_t56::consts_len() * 16, cap * BANKS * 32, cap * OUT * 16, cap * OUT * 16, 16] {
         match unsafe { gpu.new_buffer(len) } {
             Ok(b) => made.push(b),
             Err(e) => {
@@ -529,8 +681,9 @@ pub(crate) fn launch_zc_t56_prefix(
     }
     unsafe {
         // The previous job was joined, so nothing in flight reads these.
-        let consts = std::slice::from_raw_parts_mut(gpu.buffer_contents(state.consts_buf).cast::<F128>(), CONSTS);
-        zc_t56::consts_into(consts, rho_a, rho_b, eq_lo);
+        let consts =
+            std::slice::from_raw_parts_mut(gpu.buffer_contents(state.consts_buf).cast::<F128>(), zc_t56::consts_len());
+        zc_t56::launch_consts_into(consts, rho_a, rho_b, eq_lo);
         let pool = gpu.pool_push();
         let submitted = (|| -> Result<Id, String> {
             let cb = gpu.command_buffer()?;
@@ -730,8 +883,9 @@ pub(crate) fn launch_zc_t56_loop(
         return None;
     }
     unsafe {
-        let consts = std::slice::from_raw_parts_mut(gpu.buffer_contents(state.consts_buf).cast::<F128>(), CONSTS);
-        zc_t56::consts_into(consts, rho_a, rho_b, eq_lo);
+        let consts =
+            std::slice::from_raw_parts_mut(gpu.buffer_contents(state.consts_buf).cast::<F128>(), zc_t56::consts_len());
+        zc_t56::launch_consts_into(consts, rho_a, rho_b, eq_lo);
         let cut = gpu.buffer_contents(state.cut_buf).cast::<u32>();
         cut.write_volatile(zc_t56::HI as u32);
         let base = state.next_value;
@@ -868,5 +1022,29 @@ pub(super) fn zc_t56_out_bufs() -> Option<(Id, Id, *const F128, *const F128, usi
             gpu.buffer_contents(st.out_b).cast::<F128>().cast_const(),
             st.cap,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Switch off: the record text exactly. On: the record helpers, then the
+    /// flat kernel, with one kernel and one entry point; the flat kernel is
+    /// the record kernel with only its tables, fold and reduction rows changed.
+    #[test]
+    fn t56_skip_source_selection() {
+        let off = zc_t56_source(false);
+        assert!(matches!(off, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(off.as_ref(), ZC_T56_MSL_SOURCE);
+        let k = ZC_T56_MSL_SOURCE.find(ZC_T56_ENTRY).unwrap();
+        let on = zc_t56_source(true);
+        assert_eq!(on.as_ref(), format!("{}{ZC_T56_FLAT_KERNEL}", &ZC_T56_MSL_SOURCE[..k]));
+        assert_eq!(on.matches("kernel void ").count(), 1);
+        assert_eq!(on.matches(ZC_T56_ENTRY).count(), 1);
+        assert!(ZC_T56_FLAT_KERNEL.starts_with(ZC_T56_ENTRY));
+        assert_eq!(ZC_T56_FLAT_KERNEL.matches("mul_rho16(").count(), 6);
+        assert_eq!(ZC_T56_FLAT_KERNEL.matches("nib + 1024").count(), 2);
+        assert_eq!(ZC_T56_FLAT_KERNEL.matches("consts[2048u + i]").count(), 1);
     }
 }
