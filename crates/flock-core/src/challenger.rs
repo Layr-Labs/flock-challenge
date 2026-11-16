@@ -1430,6 +1430,26 @@ fn race_with_launch_polls(
     poll: &mut dyn FnMut() -> Option<Option<u64>>,
     check: &mut dyn FnMut() -> crate::gpu_commit::PowRaceCheck,
 ) -> Option<u64> {
+    race_with_launch_polls_prep(
+        state_digest,
+        bits,
+        block_len,
+        poll,
+        check,
+        &mut crate::gpu_commit::gpu_pow_race_prepare,
+    )
+}
+
+/// [`race_with_launch_polls`] with the launch path's own `prepare` (run once
+/// the CPU arm is posted), so the segmented scan prepares its next buffer.
+fn race_with_launch_polls_prep(
+    state_digest: &[u8; 32],
+    bits: u32,
+    block_len: u32,
+    poll: &mut dyn FnMut() -> Option<Option<u64>>,
+    check: &mut dyn FnMut() -> crate::gpu_commit::PowRaceCheck,
+    prepare: &mut dyn FnMut(),
+) -> Option<u64> {
     use crate::gpu_commit::PowRaceCheck;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let t_iter = grind_trace_enabled().then(std::time::Instant::now);
@@ -1486,7 +1506,7 @@ fn race_with_launch_polls(
         // The next race launch's command buffer is encoded here, once the
         // CPU arm is posted: off the Metal arm's path and ahead of the
         // calling thread's own chunks.
-        &mut crate::gpu_commit::gpu_pow_race_prepare,
+        prepare,
     );
     let won = match (cpu, gpu) {
         (Some(n), _) | (None, Some(n)) => Some(n),
@@ -1646,6 +1666,24 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         // needs, so `FLOCK_NO_GPACK3=1` or `FLOCK_NO_RACE_CALLER_SCAN=1` also
         // keep the worker's scan). No launch (item off, tail unavailable, no
         // free slot) keeps the worker's race below.
+        // Segmented race scan (`gpu_commit::ENV_NO_GRIND_SEG2`): the same
+        // launch from the calling thread, cut into segments that publish at
+        // the first match and stop when the CPU arm answers first.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if crate::gpu_commit::race_caller_scan_enabled()
+            && grind_worker::available()
+            && let Some(job) = crate::gpu_commit::gpu_pow_seg_launch(state_digest, 0, block_len, bits)
+            && let Some(n) = race_with_launch_polls_prep(
+                state_digest,
+                bits,
+                block_len,
+                &mut || job.poll(),
+                &mut || job.check(),
+                &mut crate::gpu_commit::gpu_pow_seg_prepare,
+            )
+        {
+            return Ok(n);
+        }
         if crate::gpu_commit::race_caller_scan_enabled()
             && grind_worker::available()
             && let Some(job) = crate::gpu_commit::gpu_pow_race_launch(state_digest, 0, block_len, bits)

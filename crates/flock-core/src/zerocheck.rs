@@ -1083,6 +1083,9 @@ fn prove_packed_padded_inner<C: Challenger>(
                 // SAFETY: the prefix buffers are rewritten only by the next K
                 // pass.
                 let prefix = k_prefix.as_ref().map(|p| unsafe { p.slices() });
+                // Tri pass 0 GPU arm: commit its buffer now, behind an event
+                // that pass 0 sets (see `gpu_commit::ENV_NO_ZC_T0_GPU`).
+                crate::gpu_commit::zc_t0_park();
                 // `t56_prefix`: the 5+6 pass GPU prefix arm's outputs, which
                 // tri pass 0 below reads in place of the leading entries.
                 let (m6_1, m6_inf, la7, la8, t56_prefix) = multilinear::fold_cascade_t_into_packed_prefix_gpu(

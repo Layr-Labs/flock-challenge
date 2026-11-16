@@ -5157,6 +5157,10 @@ impl Blake3Setup {
         blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
+        // The first prove opens the recycler's size classes (see
+        // `recycle_alloc::ENV_NO_RECYCLE_SETUP_GATE`).
+        #[cfg(all(target_os = "macos", not(test)))]
+        crate::recycle_alloc::open_classes();
         // Build-time only: the Fiat-Shamir challenger goes through one
         // non-generic instance compiled here, so a downstream caller (the
         // benchmark worker) does not re-instantiate the generic prover tree
@@ -5262,6 +5266,9 @@ impl Blake3Setup {
             // `gpu_commit::ENV_NO_STREAM_WARM`). Ranked worker only.
             if crate::seed_pipe::is_ranked_worker() {
                 flock_core::gpu_commit::warm_streamed_first_pass(&self.pcs_params);
+                // Untimed: the two GPU objects the timed prove still made on
+                // first use (see `gpu_commit::ENV_NO_WARM_GPU_SPARES`).
+                flock_core::gpu_commit::warm_gpu_spares();
             }
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
