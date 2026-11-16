@@ -5720,11 +5720,10 @@ pub(crate) struct LigeroWitness {
     pub mat: Vec<F128>,
     pub tree: Vec<Hash>,
     /// Zero-copy flat tree `(address, node count)` inside the persistent GPU
-    /// L1 tree buffer, set only by [`ligero_commit_with_tree_view`] when the
-    /// overlapped L1 Merkle session completes (then `tree` stays empty). The
-    /// buffer is next written by the following prove's L1 commit, so the
-    /// witness must be dropped before that — the ranked open drops it at the
-    /// end of its first recursive level.
+    /// Recursive tree buffer, set when an overlapped L1/L2 Merkle session
+    /// completes without copying (then `tree` stays empty). Each shape has a
+    /// distinct persistent buffer, next written by the following prove's
+    /// same-level commit, after the ranked open has dropped this witness.
     tree_view: Option<(usize, usize)>,
     pub block_len: usize,
     pub num_interleaved: usize,
@@ -5830,6 +5829,16 @@ fn ligero_commit_select(
     )) && recursive_from_message_shape
         && level_enabled
         && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
+    // L1 opts in through the explicit caller because its view lifetime is
+    // unusually long. L2 is also safe: it has a distinct persistent tree
+    // buffer and its witness dies before the next proof's L2 commit. Skipping
+    // the 4 MiB copy is part of the L2 overlap arm; its kill switch prevents
+    // a session from existing and therefore restores the owned CPU tree.
+    let allow_tree_view = allow_tree_view
+        || matches!(
+            (log_msg_cols, log_num_interleaved, log_inv_rate),
+            (13, 3, 3)
+        );
     ligero_commit_impl_view(
         poly,
         log_msg_cols,
@@ -5856,6 +5865,32 @@ fn recursive_subtree_merkle_enabled() -> bool {
         std::env::var("FLOCK_NO_PCS_SUBTREE").map_or(true, |v| v != "1")
     });
     *ON
+}
+
+/// Incumbent CPU builder for recursive commitment trees. Kept in one helper
+/// so the L2 overlap admission race measures and returns precisely the same
+/// pooled/subtree path used by its rollback arm.
+fn recursive_merkle_cpu(data: &[u8], block_len: usize, kind: HashKind) -> Vec<Hash> {
+    // Recursive 128-byte-leaf trees (2^10..2^16 leaves, L2..L5 on the
+    // ranked shape) are built as aligned subtrees in one P+E chunk queue.
+    let leaf_size_bytes = data.len() / block_len;
+    let lb = block_len.trailing_zeros() as usize;
+    let sub_log = if recursive_subtree_merkle_enabled()
+        && (10..=16).contains(&lb)
+        && leaf_size_bytes == 128
+    {
+        (lb - 6).clamp(5, 10)
+    } else {
+        0
+    };
+    let tree = crate::scratch::take_hash_tree(2 * block_len - 1);
+    if sub_log > 0 && lb <= 10 && op_small_merkle_serial_enabled() {
+        merkle::merkle_tree_into_subtrees_serial(tree, data, block_len, kind, sub_log)
+    } else if sub_log > 0 {
+        merkle::merkle_tree_into_subtrees(tree, data, block_len, kind, sub_log)
+    } else {
+        merkle::merkle_tree_into(tree, data, block_len, kind)
+    }
 }
 
 /// [`ligero_commit`] whose overlapped-L1 GPU tree may be returned as a
@@ -5938,18 +5973,18 @@ fn ligero_commit_impl_view(
     let mut mat = crate::scratch::take_f128(codeword_len);
     let alloc_elapsed = alloc_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     let mut fill_elapsed = std::time::Duration::ZERO;
-    // L1 NTT/Merkle-leaf overlap: the transform fires a per-finalized-chunk
+    // L1/L2 NTT/Merkle-leaf overlap: the transform fires a per-finalized-chunk
     // callback with a never-touched-again guarantee, so each chunk's disjoint
     // leaf range is hashed on the otherwise idle GPU while the CPU is still
     // producing the remaining chunks. Transcript-legal (no observe/sample
     // between NTT start and the root observe); `begin` pays every init/wrap
     // cost before the race clocks below and returns `None` whenever the
-    // incumbent must run instead (kill switch `FLOCK_NO_L1_MERKLE_OVERLAP=1`,
-    // `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, latch Off, non-L1 shape, any Metal
+    // incumbent must run instead (per-level overlap kill switch,
+    // `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, latch Off, other shape, any Metal
     // failure).
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
     let overlap = if fuse_from_message && kind == HashKind::Blake3 && leaf_size_bytes == 128 {
-        crate::gpu_commit::gpu_l1_merkle_overlap_begin(
+        crate::gpu_commit::gpu_recursive_merkle_overlap_begin(
             mat.as_ptr().cast::<u8>(),
             codeword_len * core::mem::size_of::<F128>(),
             block_len,
@@ -5960,14 +5995,14 @@ fn ligero_commit_impl_view(
     let ntt_start = timing.then(std::time::Instant::now);
     let mut raced_tree: Option<Vec<Hash>> = None;
     let mut race_ran = false;
-    let mut overlap_session: Option<crate::gpu_commit::L1MerkleOverlap> = None;
+    let mut overlap_session: Option<crate::gpu_commit::RecursiveMerkleOverlap> = None;
     match overlap {
         // First eligible L1 commit of the process (the warmup prove):
         // dual-run overlapped-then-incumbent and latch the faster arm. The
         // race's tree (the incumbent arm's) lands in `raced_tree`; `None`
         // there means the CPU builder below, exactly the incumbent fallback.
         Some(session) if session.measuring() => {
-            raced_tree = l1_overlap_warmup_race(
+            raced_tree = recursive_overlap_warmup_race(
                 session,
                 poly,
                 &mut mat,
@@ -6047,7 +6082,18 @@ fn ligero_commit_impl_view(
                 .or_else(|| crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len))
         }
     } else if matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128 {
-        crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
+        // A view caller reads the whole-tree offload's buffer in place, as it
+        // does the overlap arm's (`FLOCK_NO_L1_WHOLE_TREE_VIEW=1` copies).
+        match (allow_tree_view && crate::gpu_commit::l1_whole_tree_view_enabled())
+            .then(|| crate::gpu_commit::gpu_recursive_merkle_blake3_view(data_bytes, block_len))
+            .flatten()
+        {
+            Some(view) => {
+                tree_view = Some(view);
+                Some(Vec::new())
+            }
+            None => crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len),
+        }
     } else {
         None
     };
@@ -6057,44 +6103,7 @@ fn ligero_commit_impl_view(
         // copy-out is pooled inside `gpu_recursive_merkle_blake3`): same
         // fault/munmap argument, byte-identical output.
         None => {
-            // Recursive 128-byte-leaf trees (2^10..2^16 leaves, L2..L5 on the
-            // ranked shape) are built as 64 aligned subtrees (32 at 2^10) in
-            // one P+E chunk queue instead of a leaf pass plus one parallel
-            // region per wide level and a serial tail: same kernels per node,
-            // byte-identical tree. A/B-CONTROL: FLOCK_NO_PCS_SUBTREE=1.
-            let lb = block_len.trailing_zeros() as usize;
-            let sub_log = if recursive_subtree_merkle_enabled()
-                && (10..=16).contains(&lb)
-                && leaf_size_bytes == 128
-            {
-                (lb - 6).clamp(5, 10)
-            } else {
-                0
-            };
-            if sub_log > 0 && lb <= 10 && op_small_merkle_serial_enabled() {
-                merkle::merkle_tree_into_subtrees_serial(
-                    crate::scratch::take_hash_tree(2 * block_len - 1),
-                    data_bytes,
-                    block_len,
-                    kind,
-                    sub_log,
-                )
-            } else if sub_log > 0 {
-                merkle::merkle_tree_into_subtrees(
-                    crate::scratch::take_hash_tree(2 * block_len - 1),
-                    data_bytes,
-                    block_len,
-                    kind,
-                    sub_log,
-                )
-            } else {
-                merkle::merkle_tree_into(
-                    crate::scratch::take_hash_tree(2 * block_len - 1),
-                    data_bytes,
-                    block_len,
-                    kind,
-                )
-            }
+            recursive_merkle_cpu(data_bytes, block_len, kind)
         }
     };
     let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
@@ -6138,8 +6147,8 @@ fn ligero_commit_impl_view(
 /// tree is byte-compared against the incumbent's; any mismatch or failure
 /// latches Off. Returns an INCUMBENT-arm GPU tree (`None` → the caller's CPU
 /// builder), so the warmup prove's bytes never depend on the overlapped arm.
-fn l1_overlap_warmup_race(
-    session: crate::gpu_commit::L1MerkleOverlap,
+fn recursive_overlap_warmup_race(
+    session: crate::gpu_commit::RecursiveMerkleOverlap,
     poly: &[F128],
     mat: &mut [F128],
     num_interleaved: usize,
@@ -6158,7 +6167,11 @@ fn l1_overlap_warmup_race(
         let data_bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(mat.as_ptr().cast::<u8>(), core::mem::size_of_val(mat))
         };
-        let tree = crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len);
+        let tree = if block_len == 1 << 18 {
+            crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
+        } else {
+            Some(recursive_merkle_cpu(data_bytes, block_len, HashKind::Blake3))
+        };
         (tree, t.elapsed().as_secs_f64() * 1e3)
     };
 
@@ -6166,7 +6179,7 @@ fn l1_overlap_warmup_race(
     let (primer_tree, _) = run_incumbent(mat);
     let Some(mut incumbent_tree) = primer_tree else {
         // No incumbent GPU tree — nothing to overlap with; latch Off.
-        crate::gpu_commit::l1_overlap_report(f64::INFINITY, 0.0, None);
+        crate::gpu_commit::recursive_overlap_report(block_len, f64::INFINITY, 0.0, None);
         return None;
     };
 
@@ -6189,13 +6202,18 @@ fn l1_overlap_warmup_race(
     for _round in 0..3 {
         // Overlapped arm.
         let Some(s) = next_session.take().or_else(|| {
-            crate::gpu_commit::gpu_l1_merkle_overlap_begin(
+            crate::gpu_commit::gpu_recursive_merkle_overlap_begin(
                 mat.as_ptr().cast::<u8>(),
                 core::mem::size_of_val(&*mat),
                 block_len,
             )
         }) else {
-            crate::gpu_commit::l1_overlap_report(f64::INFINITY, wall_b, None);
+            crate::gpu_commit::recursive_overlap_report(
+                block_len,
+                f64::INFINITY,
+                wall_b,
+                None,
+            );
             return Some(incumbent_tree);
         };
         settle();
@@ -6207,26 +6225,55 @@ fn l1_overlap_warmup_race(
             log_inv_rate,
             |offset, chunk| s.chunk_ready(offset, chunk.len()),
         );
-        let tree_a = s.finish();
-        wall_a = wall_a.min(t.elapsed().as_secs_f64() * 1e3);
-        let Some(tree_a) = tree_a else {
-            crate::gpu_commit::l1_overlap_report(f64::INFINITY, wall_b, None);
-            return Some(incumbent_tree);
+        let round_equal = if block_len == 1 << 16 {
+            // The timed L2 arm returns a zero-copy view, so time and compare
+            // that exact arm. The distinct L2 GPU buffer remains untouched
+            // until the next overlap iteration, after this comparison.
+            let Some((addr, len)) = s.finish_view() else {
+                crate::gpu_commit::recursive_overlap_report(
+                    block_len,
+                    f64::INFINITY,
+                    wall_b,
+                    None,
+                );
+                return Some(incumbent_tree);
+            };
+            wall_a = wall_a.min(t.elapsed().as_secs_f64() * 1e3);
+            let view = unsafe { core::slice::from_raw_parts(addr as *const Hash, len) };
+            view == incumbent_tree.as_slice()
+        } else {
+            let Some(tree_a) = s.finish() else {
+                crate::gpu_commit::recursive_overlap_report(
+                    block_len,
+                    f64::INFINITY,
+                    wall_b,
+                    None,
+                );
+                return Some(incumbent_tree);
+            };
+            wall_a = wall_a.min(t.elapsed().as_secs_f64() * 1e3);
+            let round_equal = tree_a == incumbent_tree;
+            crate::scratch::give_hash_tree(tree_a);
+            round_equal
         };
-        equal &= tree_a == incumbent_tree;
-        crate::scratch::give_hash_tree(tree_a);
+        equal &= round_equal;
 
         // Incumbent arm.
         settle();
         let (tree_b, round_wall_b) = run_incumbent(mat);
         let Some(tree_b) = tree_b else {
-            crate::gpu_commit::l1_overlap_report(wall_a, f64::INFINITY, None);
+            crate::gpu_commit::recursive_overlap_report(
+                block_len,
+                wall_a,
+                f64::INFINITY,
+                None,
+            );
             return Some(incumbent_tree);
         };
         wall_b = wall_b.min(round_wall_b);
         crate::scratch::give_hash_tree(std::mem::replace(&mut incumbent_tree, tree_b));
     }
-    crate::gpu_commit::l1_overlap_report(wall_a, wall_b, Some(equal));
+    crate::gpu_commit::recursive_overlap_report(block_len, wall_a, wall_b, Some(equal));
     Some(incumbent_tree)
 }
 
@@ -6433,6 +6480,18 @@ fn round_msg_and_eval_lsb_factorized_eq_split(
     eq_hi: &[F128],
     z_0: F128,
 ) -> (SumcheckMessage, F128) {
+    round_msg_and_eval_lsb_factorized_eq_split_arm(f, eq_lo, eq_hi, z_0, lig_fold_caller_first_enabled())
+}
+
+/// [`round_msg_and_eval_lsb_factorized_eq_split`] with the caller-first arm
+/// explicit (`false` = the rayon reduction), so tests can compare both.
+fn round_msg_and_eval_lsb_factorized_eq_split_arm(
+    f: &[F128],
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    z_0: F128,
+    caller_first: bool,
+) -> (SumcheckMessage, F128) {
     use rayon::prelude::*;
 
     assert!(eq_lo.len().is_power_of_two() && eq_lo.len() >= 2);
@@ -6462,6 +6521,25 @@ fn round_msg_and_eval_lsb_factorized_eq_split(
             s += s_chunk * hi_weight;
         }
         (a, s)
+    } else if caller_first {
+        // The `par_chunks(2 * eq_lo.len())` grid below: one chunk per
+        // `eq_hi` entry (`f.len() == 2 * eq_lo.len() * eq_hi.len()`).
+        let chunk_len = 2 * eq_lo.len();
+        let n_chunks = eq_hi.len();
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_caller_first(n_chunks, &|hi| {
+            let start = hi * chunk_len;
+            let (a_chunk, s_chunk) =
+                crate::field::f128_slice::round0_factorized_eq(&f[start..start + chunk_len], eq_lo);
+            let hi_weight = eq_hi[hi];
+            // SAFETY: the drain runs each `hi` exactly once, so each partial
+            // slot has one writer, published before the merge reads it.
+            unsafe {
+                partials_base.ptr().add(hi).write((a_chunk * hi_weight, s_chunk * hi_weight));
+            }
+        });
+        merge_chunk_partials(&partials)
     } else {
         f.par_chunks(2 * eq_lo.len())
             .zip(eq_hi.par_iter())
@@ -6533,6 +6611,29 @@ fn lig_fold_hetero_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("FLOCK_NO_LIG_FOLD_HETERO").is_ok_and(|v| v == "1"))
 }
 
+/// Caller-first main-pool fold passes (`FLOCK_NO_LIG_FOLD_CF`, any value,
+/// restores the rayon `par_chunks` reductions). The fold/message passes that
+/// stay on the main pool (below the hetero floor: the mid recursive rounds,
+/// a few chunks each) and the split-OOD round message run through
+/// [`crate::epool::run_chunks_caller_first`]: the calling thread starts on
+/// chunk 0 at once and never parks on a pool latch. Same chunk grid, same
+/// per-chunk kernel and base; each chunk writes its own outputs and its own
+/// partial slot, and the partials are merged in chunk-index order, so bytes
+/// are identical. Read once per process.
+fn lig_fold_caller_first_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off in this tree: a piece restored from an earlier record, left off by default because the entries on record 466756c7 that carried it drew slower than the record; the record's path runs.
+    *ON.get_or_init(|| false)
+}
+
+/// XOR-merge per-chunk `(u_0, u_2)` partials in chunk-index order.
+#[inline]
+fn merge_chunk_partials(partials: &[(F128, F128)]) -> (F128, F128) {
+    partials
+        .iter()
+        .fold((F128::ZERO, F128::ZERO), |(a0, a2), &(c0, c2)| (a0 + c0, a2 + c2))
+}
+
 /// Same contract for the dense recursive-commit basis induction sweep:
 /// `FLOCK_NO_LIG_INDUCE_HETERO=1` (exactly `"1"`) restores the incumbent
 /// main-pool-only per-worker query split.
@@ -6570,6 +6671,19 @@ fn fold_and_msg_lsb_into(
     r: F128,
     nf: &mut Vec<F128>,
     nb: &mut Vec<F128>,
+) -> SumcheckMessage {
+    fold_and_msg_lsb_into_arm(f, b, r, nf, nb, lig_fold_caller_first_enabled())
+}
+
+/// [`fold_and_msg_lsb_into`] with the caller-first arm explicit (`false` =
+/// the rayon reduction), so tests can compare both.
+fn fold_and_msg_lsb_into_arm(
+    f: &[F128],
+    b: &[F128],
+    r: F128,
+    nf: &mut Vec<F128>,
+    nb: &mut Vec<F128>,
+    caller_first: bool,
 ) -> SumcheckMessage {
     use rayon::prelude::*;
     let n = f.len();
@@ -6679,6 +6793,26 @@ fn fold_and_msg_lsb_into(
             });
         return SumcheckMessage { u_0, u_2 };
     }
+    if caller_first {
+        // The `par_chunks_mut(CHUNK)` grid below: `half / CHUNK` chunks.
+        let n_chunks = half / CHUNK;
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
+        let f_base = crate::epool::SyncPtr(nf.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(nb.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_caller_first(n_chunks, &|ci| {
+            // SAFETY: the drain runs each `ci` exactly once; the output
+            // ranges and the partial slot are disjoint per chunk, and the
+            // drain publishes every write before the merge below reads them.
+            unsafe {
+                let fc = core::slice::from_raw_parts_mut(f_base.ptr().add(ci * CHUNK), CHUNK);
+                let bc = core::slice::from_raw_parts_mut(b_base.ptr().add(ci * CHUNK), CHUNK);
+                partials_base.ptr().add(ci).write(chunk_body(ci, fc, bc));
+            }
+        });
+        let (u_0, u_2) = merge_chunk_partials(&partials);
+        return SumcheckMessage { u_0, u_2 };
+    }
     let (u_0, u_2) = nf
         .par_chunks_mut(CHUNK)
         .zip(nb.par_chunks_mut(CHUNK))
@@ -6710,6 +6844,37 @@ fn fold_and_msg_lsb_into_with_lazy_ood_eq(
     z_0: F128,
     nf: &mut Vec<F128>,
     nb: &mut Vec<F128>,
+) -> SumcheckMessage {
+    fold_and_msg_lsb_into_with_lazy_ood_eq_arm(
+        f,
+        b,
+        deferred_basis,
+        r,
+        eq_lo,
+        eq_hi,
+        beta,
+        z_0,
+        nf,
+        nb,
+        lig_fold_caller_first_enabled(),
+    )
+}
+
+/// [`fold_and_msg_lsb_into_with_lazy_ood_eq`] with the caller-first arm
+/// explicit (`false` = the rayon reduction), so tests can compare both.
+#[allow(clippy::too_many_arguments)]
+fn fold_and_msg_lsb_into_with_lazy_ood_eq_arm(
+    f: &[F128],
+    b: &[F128],
+    deferred_basis: Option<(&[F128], F128)>,
+    r: F128,
+    eq_lo: &[F128],
+    eq_hi: &[F128],
+    beta: F128,
+    z_0: F128,
+    nf: &mut Vec<F128>,
+    nb: &mut Vec<F128>,
+    caller_first: bool,
 ) -> SumcheckMessage {
     use rayon::prelude::*;
 
@@ -6815,6 +6980,28 @@ fn fold_and_msg_lsb_into_with_lazy_ood_eq(
             .fold((F128::ZERO, F128::ZERO), |(a_0, a_2), (b_0, b_2)| {
                 (a_0 + b_0, a_2 + b_2)
             });
+        return SumcheckMessage { u_0, u_2 };
+    }
+    if caller_first {
+        // The `par_chunks_mut(chunk_w)` grid below: one chunk per `eq_hi`
+        // entry (`nf.len() == chunk_w * eq_hi.len()`, checked above).
+        let n_chunks = eq_hi.len();
+        debug_assert_eq!(nf.len(), chunk_w * n_chunks);
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
+        let f_base = crate::epool::SyncPtr(nf.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(nb.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_caller_first(n_chunks, &|hi| {
+            // SAFETY: the drain runs each `hi` exactly once; the output
+            // ranges and the partial slot are disjoint per chunk, and the
+            // drain publishes every write before the merge below reads them.
+            unsafe {
+                let fc = core::slice::from_raw_parts_mut(f_base.ptr().add(hi * chunk_w), chunk_w);
+                let bc = core::slice::from_raw_parts_mut(b_base.ptr().add(hi * chunk_w), chunk_w);
+                partials_base.ptr().add(hi).write(chunk_body(hi, fc, bc));
+            }
+        });
+        let (u_0, u_2) = merge_chunk_partials(&partials);
         return SumcheckMessage { u_0, u_2 };
     }
     let (u_0, u_2) = nf
@@ -12325,6 +12512,74 @@ mod tests {
                 }
                 sum + coefficient * weight
             })
+    }
+
+    /// Caller-first fold passes (`FLOCK_NO_LIG_FOLD_CF`): the caller-first
+    /// arm returns the same message and writes the same folded states, byte
+    /// for byte, as the rayon reduction arm, on the ranked main-pool grids
+    /// (plain fold 2..16 chunks of 2,048; lazy-OOD fold and split-OOD
+    /// message 4 x 1,024 and 16 x 2,048, with and without a deferred basis),
+    /// in a multi-thread pool and inline in a single-thread pool.
+    #[test]
+    fn caller_first_fold_passes_match_rayon_arm() {
+        fn lcg(state: &mut u64) -> F128 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(*state, state.rotate_left(29) ^ 0x3C3C_C3C3_9696_6969)
+        }
+        fn vec_of(state: &mut u64, n: usize) -> Vec<F128> {
+            (0..n).map(|_| lcg(state)).collect()
+        }
+        let mut seed = 0x5EED_CAFE_F00D_1234u64;
+        for threads in [4usize, 1] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("test pool");
+            pool.install(|| {
+                for log_half in [12usize, 13, 14, 15] {
+                    let n = 2usize << log_half;
+                    let f = vec_of(&mut seed, n);
+                    let b = vec_of(&mut seed, n);
+                    let r = lcg(&mut seed);
+                    let (mut nf_cf, mut nb_cf) = (Vec::with_capacity(n / 2), Vec::with_capacity(n / 2));
+                    let (mut nf_rb, mut nb_rb) = (Vec::with_capacity(n / 2), Vec::with_capacity(n / 2));
+                    let m_cf = fold_and_msg_lsb_into_arm(&f, &b, r, &mut nf_cf, &mut nb_cf, true);
+                    let m_rb = fold_and_msg_lsb_into_arm(&f, &b, r, &mut nf_rb, &mut nb_rb, false);
+                    assert_eq!(m_cf, m_rb, "fold msg threads={threads} log_half={log_half}");
+                    assert!(nf_cf == nf_rb && nb_cf == nb_rb, "fold state log_half={log_half}");
+                }
+                for (lo_log, hi_log) in [(10usize, 2usize), (11, 4)] {
+                    let half = 1usize << (lo_log + hi_log);
+                    let f = vec_of(&mut seed, 2 * half);
+                    let b = vec_of(&mut seed, 2 * half);
+                    let deferred = vec_of(&mut seed, 2 * half);
+                    let eq_lo = vec_of(&mut seed, 1 << lo_log);
+                    let eq_hi = vec_of(&mut seed, 1 << hi_log);
+                    let (r, beta, z_0, alpha) =
+                        (lcg(&mut seed), lcg(&mut seed), lcg(&mut seed), lcg(&mut seed));
+                    for with_deferred in [false, true] {
+                        let basis = with_deferred.then_some((deferred.as_slice(), alpha));
+                        let (mut nf_cf, mut nb_cf) = (Vec::with_capacity(half), Vec::with_capacity(half));
+                        let (mut nf_rb, mut nb_rb) = (Vec::with_capacity(half), Vec::with_capacity(half));
+                        let m_cf = fold_and_msg_lsb_into_with_lazy_ood_eq_arm(
+                            &f, &b, basis, r, &eq_lo, &eq_hi, beta, z_0, &mut nf_cf, &mut nb_cf, true,
+                        );
+                        let m_rb = fold_and_msg_lsb_into_with_lazy_ood_eq_arm(
+                            &f, &b, basis, r, &eq_lo, &eq_hi, beta, z_0, &mut nf_rb, &mut nb_rb, false,
+                        );
+                        assert_eq!(m_cf, m_rb, "lazy fold msg lo={lo_log} hi={hi_log}");
+                        assert!(nf_cf == nf_rb && nb_cf == nb_rb, "lazy fold state lo={lo_log}");
+                    }
+                    let split_cf =
+                        round_msg_and_eval_lsb_factorized_eq_split_arm(&f, &eq_lo, &eq_hi, z_0, true);
+                    let split_rb =
+                        round_msg_and_eval_lsb_factorized_eq_split_arm(&f, &eq_lo, &eq_hi, z_0, false);
+                    assert_eq!(split_cf, split_rb, "split OOD msg lo={lo_log} hi={hi_log}");
+                }
+            });
+        }
     }
 
     #[test]

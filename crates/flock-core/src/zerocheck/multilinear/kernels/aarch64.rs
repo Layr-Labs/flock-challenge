@@ -1394,6 +1394,286 @@ unsafe fn fold_row_code_q(table_data: *const u8, row: u64) -> core::arch::aarch6
     }
 }
 
+/// Entries of a seven-piece fold table: the 64 bits of a row code split into
+/// bits `0..10` (1024 entries) and six 9-bit fields at bits 10, 19, 28, 37,
+/// 46 and 55 (512 entries each), 64 KiB in all. Piece `p` holds, for every
+/// value `v` of its field, the XOR of the byte-bank entries of the single
+/// bits set in `v`. When every byte bank is GF(2)-linear in its byte, the XOR
+/// of a code's seven piece entries is the XOR of its eight byte-bank entries
+/// (both are the XOR of the single-bit entries of its set bits): one lookup,
+/// one index operation and one XOR fewer per row.
+pub(crate) const FOLD7_ENTRIES: usize = 1024 + 6 * 512;
+/// First bit of each piece.
+const FOLD7_SHIFTS: [u32; 7] = [0, 10, 19, 28, 37, 46, 55];
+/// First entry of each piece.
+const FOLD7_BASES: [usize; 7] = [0, 1024, 1536, 2048, 2560, 3072, 3584];
+/// `0x1ff << 4`: one 9-bit piece index, already multiplied by 16.
+const Q7_INDEX_MASK: u64 = 0x1ff0;
+
+/// Whether the full round-two sweep's performance-core workers fold through
+/// the seven-piece table (`FLOCK_NO_R2_FOLD7=1` keeps the byte banks
+/// everywhere). Read once per process.
+pub(crate) fn r2_fold7_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off in this tree: a piece restored from an earlier record, left off by default because the entries on record 466756c7 that carried it drew slower than the record; the record's path runs.
+    *ON.get_or_init(|| false)
+}
+
+/// Whether the calling thread is one of the efficiency-core helpers
+/// (`flock-ecore-*`, see `epool`), cached per thread. Their L1 data cache
+/// (64 KiB) holds the 32 KiB byte banks but not the 64 KiB seven-piece table,
+/// so they keep the byte banks.
+pub(crate) fn r2_on_efficiency_helper() -> bool {
+    thread_local! {
+        static HELPER: core::cell::Cell<u8> = const { core::cell::Cell::new(2) };
+    }
+    HELPER.with(|cell| {
+        let known = cell.get();
+        if known != 2 {
+            return known == 1;
+        }
+        let helper = std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with("flock-ecore-"));
+        cell.set(u8::from(helper));
+        helper
+    })
+}
+
+/// Whether the K pass's packed CPU chunks on the performance-core workers fold
+/// through the seven-piece table (`FLOCK_NO_ZC_K_FOLD7=1` keeps the byte banks
+/// everywhere). Read once per process.
+pub(crate) fn zc_k_fold7_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off in this tree: a piece restored from an earlier record, left off by default because the entries on record 466756c7 that carried it drew slower than the record; the record's path runs.
+    *ON.get_or_init(|| false)
+}
+
+/// The packed dead-tail instance of
+/// [`fold2_compact_and_round45_chunk_neon_8_fused_r1`] through the seven-piece
+/// table `table7` ([`r2_fold7_table`] of the byte banks): the same stores,
+/// slots and return value.
+///
+/// # Safety
+/// As [`fold2_compact_and_round45_chunk_neon_8_fused_r1`], with `table7` in
+/// place of `table_r1`.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+    table7: *const u8,
+    rho2: F128,
+    anchors: *const F128,
+    deltas: *const u8,
+    a_out: *mut F128,
+    b_out: *mut F128,
+    eq_prep: *const F128,
+    out_pairs: usize,
+    degen: bool,
+    out: *mut F128,
+    bpack: bool,
+    tail_compact: bool,
+    head_compact: bool,
+    head_b: F128,
+) -> bool {
+    unsafe {
+        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, true>(
+            table7, rho2, anchors, deltas, a_out, b_out, eq_prep, out_pairs, degen, out, bpack,
+            tail_compact, head_compact, head_b,
+        )
+    }
+}
+
+/// The seven-piece table ([`FOLD7_ENTRIES`]) of the eight byte banks at the
+/// start of `data` (bank `j` at entries `256 j..256 j + 256`), or `None`
+/// when a bank is not GF(2)-linear in its byte. Linearity is checked here
+/// for every entry (`e(x) = e(x & (x - 1)) + e(lowest bit of x)` for every
+/// byte `x >= 1`, which also forces `e(0) = 0`), so the seven-piece fold is
+/// the byte-bank fold for every code whenever a table is returned.
+pub(crate) fn r2_fold7_table(data: &[F128]) -> Option<Vec<F128>> {
+    if data.len() < 8 * 256 {
+        return None;
+    }
+    for bank in data[..8 * 256].chunks_exact(256) {
+        for x in 1..256usize {
+            if bank[x] != bank[x & (x - 1)] + bank[x & x.wrapping_neg()] {
+                return None;
+            }
+        }
+    }
+    let single = |bit: u32| data[(bit / 8) as usize * 256 + (1usize << (bit % 8))];
+    let mut out = vec![F128::ZERO; FOLD7_ENTRIES];
+    for p in 0..7 {
+        let base = FOLD7_BASES[p];
+        let end = FOLD7_BASES.get(p + 1).copied().unwrap_or(FOLD7_ENTRIES);
+        for v in 1..end - base {
+            out[base + v] = out[base + (v & (v - 1))] + single(FOLD7_SHIFTS[p] + v.trailing_zeros());
+        }
+    }
+    Some(out)
+}
+
+/// Entry `(row >> SHIFT) & 0x1ff` of the 512-entry piece at `piece` (bits
+/// `0..10` and a 1024-entry piece for `SHIFT == 0`). Two instructions, as
+/// [`bank_load_q`]'s default form.
+///
+/// # Safety
+/// `piece` must point to the piece's readable 16-byte entries.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn piece7_load_q<const SHIFT: u32>(
+    piece: *const u8,
+    row: u64,
+) -> core::arch::aarch64::uint64x2_t {
+    let out: core::arch::aarch64::uint64x2_t;
+    // SAFETY: the index is at most 1023 (`SHIFT == 0`) or 511, as a byte
+    // offset a multiple of 16 inside the piece; the asm only reads it.
+    unsafe {
+        if SHIFT == 0 {
+            // idx = (row & 0x3ff) << 4
+            core::arch::asm!(
+                "ubfiz {idx}, {row}, #4, #10",
+                "ldr {out:q}, [{piece}, {idx}]",
+                row = in(reg) row,
+                piece = in(reg) piece,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        } else {
+            // idx = (row >> (SHIFT - 4)) & 0x1ff0 = ((row >> SHIFT) & 0x1ff) << 4
+            core::arch::asm!(
+                "and {idx}, {mask}, {row}, lsr #{shift}",
+                "ldr {out:q}, [{piece}, {idx}]",
+                shift = const (SHIFT + 60) % 64,
+                mask = in(reg) Q7_INDEX_MASK,
+                row = in(reg) row,
+                piece = in(reg) piece,
+                idx = out(reg) _,
+                out = lateout(vreg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+    }
+    out
+}
+
+/// [`fold_four_row_codes_q`] through a seven-piece table ([`FOLD7_ENTRIES`]):
+/// seven lookups and three three-way XORs per row.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_four_row_codes_q7(
+    table7: *const u8,
+    row0: u64,
+    row1: u64,
+    row2: u64,
+    row3: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        macro_rules! load {
+            ($row:expr, $p:literal) => {
+                piece7_load_q::<{ FOLD7_SHIFTS[$p] }>(table7.add(FOLD7_BASES[$p] * 16), $row)
+            };
+        }
+        let mut acc0 = xor3_u64(load!(row0, 0), load!(row0, 1), load!(row0, 2));
+        let mut acc1 = xor3_u64(load!(row1, 0), load!(row1, 1), load!(row1, 2));
+        let mut acc2 = xor3_u64(load!(row2, 0), load!(row2, 1), load!(row2, 2));
+        let mut acc3 = xor3_u64(load!(row3, 0), load!(row3, 1), load!(row3, 2));
+        macro_rules! step {
+            ($c0:literal, $c1:literal) => {
+                acc0 = xor3_u64(acc0, load!(row0, $c0), load!(row0, $c1));
+                acc1 = xor3_u64(acc1, load!(row1, $c0), load!(row1, $c1));
+                acc2 = xor3_u64(acc2, load!(row2, $c0), load!(row2, $c1));
+                acc3 = xor3_u64(acc3, load!(row3, $c0), load!(row3, $c1));
+            };
+        }
+        step!(3, 4);
+        step!(5, 6);
+        (acc0, acc1, acc2, acc3)
+    }
+}
+
+/// Two-row variant of [`fold_four_row_codes_q7`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_two_row_codes_q7(
+    table7: *const u8,
+    row0: u64,
+    row1: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        macro_rules! load {
+            ($row:expr, $p:literal) => {
+                piece7_load_q::<{ FOLD7_SHIFTS[$p] }>(table7.add(FOLD7_BASES[$p] * 16), $row)
+            };
+        }
+        let mut acc0 = xor3_u64(load!(row0, 0), load!(row0, 1), load!(row0, 2));
+        let mut acc1 = xor3_u64(load!(row1, 0), load!(row1, 1), load!(row1, 2));
+        macro_rules! step {
+            ($c0:literal, $c1:literal) => {
+                acc0 = xor3_u64(acc0, load!(row0, $c0), load!(row0, $c1));
+                acc1 = xor3_u64(acc1, load!(row1, $c0), load!(row1, $c1));
+            };
+        }
+        step!(3, 4);
+        step!(5, 6);
+        (acc0, acc1)
+    }
+}
+
+/// [`fold_four_row_codes_q`] (`F7 = false`, eight byte banks at `table`) or
+/// [`fold_four_row_codes_q7`] (`F7`, a seven-piece table at `table`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_four_rows_g<const F7: bool>(
+    table: *const u8,
+    row0: u64,
+    row1: u64,
+    row2: u64,
+    row3: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        if F7 {
+            fold_four_row_codes_q7(table, row0, row1, row2, row3)
+        } else {
+            fold_four_row_codes_q(table, row0, row1, row2, row3)
+        }
+    }
+}
+
+/// Two-row variant of [`fold_four_rows_g`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fold_two_rows_g<const F7: bool>(
+    table: *const u8,
+    row0: u64,
+    row1: u64,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        if F7 {
+            fold_two_row_codes_q7(table, row0, row1)
+        } else {
+            fold_two_row_codes_q(table, row0, row1)
+        }
+    }
+}
+
 /// Returns `true` iff a 128-bit vector is all-zero.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -1668,7 +1948,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_anchors_only_8(
 /// Returns the four folded rows plus whether the b≡1 shortcut was taken.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store(
+unsafe fn r2_pair_fold_and_store<const F7: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -1729,14 +2009,14 @@ unsafe fn r2_pair_fold_and_store(
         ));
 
         if degen && (b0_code & b1_code) == u64::MAX {
-            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            let (a0, a1) = fold_two_rows_g::<F7>(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
             store_delta_a_only_gpr(deltas.add(x_lo * 16), a0_code, a1_code);
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
-            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+            fold_four_rows_g::<F7>(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
         store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
         (a0, a1, b0, b1, false)
@@ -1749,7 +2029,7 @@ unsafe fn r2_pair_fold_and_store(
 /// and values; the stores take the offset as an immediate.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store_off<const CODE: usize, const ANC: usize>(
+unsafe fn r2_pair_fold_and_store_off<const F7: bool, const CODE: usize, const ANC: usize>(
     table_data: *const u8,
     a_row: *const u8,
     b_row: *const u8,
@@ -1771,14 +2051,14 @@ unsafe fn r2_pair_fold_and_store_off<const CODE: usize, const ANC: usize>(
         let b1_code = u64::from_le(core::ptr::read_unaligned(b_row.add(CODE + 8).cast::<u64>()));
 
         if degen && (b0_code & b1_code) == u64::MAX {
-            let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+            let (a0, a1) = fold_two_rows_g::<F7>(table_data, a0_code, a1_code);
             store_anchor_pair_nt_off::<ANC>(anchors, a0, b_ones);
             store_delta_a_only_gpr_off::<CODE>(deltas, a0_code, a1_code);
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
-            fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+            fold_four_rows_g::<F7>(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt_off::<ANC>(anchors, a0, b0);
         store_delta_pair_gpr_off::<CODE>(deltas, a0_code, a1_code, b0_code, b1_code);
         (a0, a1, b0, b1, false)
@@ -1922,7 +2202,7 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
 ) {
     unsafe {
         if FULL && r2_asm_offsets_enabled() && !eq_prep.is_null() {
-            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, true>(
+            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, true, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -1942,7 +2222,84 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8<
                 out,
             )
         } else {
-            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, false>(
+            fold_round2_compact_chunk_neon_lookahead_8_impl::<FULL, ODD_ON_GPU, false, false>(
+                table_data,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                eq_prep,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                periodic_padding,
+                skip_dead,
+                tail_compact,
+                head_fail,
+                out,
+            )
+        }
+    }
+}
+
+/// The full-chunk (`FULL`, CPU-owned odd parity) instance of
+/// [`fold_round2_compact_chunk_neon_lookahead_8`] whose ranked walk folds through the seven-piece table at `table7` ([`r2_fold7_table`]
+/// of the byte banks at `table_data`) instead of the byte banks: the same
+/// rows, stores, products and outputs. Without the prepared weights or the
+/// offset walk it is the byte-bank kernel.
+///
+/// # Safety
+/// As [`fold_round2_compact_chunk_neon_lookahead_8`]; `table7` must hold the
+/// [`FOLD7_ENTRIES`] entries [`r2_fold7_table`] returned for `table_data`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8_pieces7(
+    table_data: *const u8,
+    table7: *const u8,
+    a_packed: *const u8,
+    b_packed: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    eq_lo: *const F128,
+    eq_prep: *const F128,
+    lo_size: usize,
+    pair_idx_base: usize,
+    pair_in_block_mask: usize,
+    useful_pairs_inclusive: usize,
+    degen: bool,
+    periodic_padding: bool,
+    skip_dead: bool,
+    tail_compact: bool,
+    head_fail: *const core::sync::atomic::AtomicBool,
+    out: *mut F128,
+) {
+    unsafe {
+        if r2_asm_offsets_enabled() && !eq_prep.is_null() {
+            fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, true>(
+                table7,
+                a_packed,
+                b_packed,
+                anchors,
+                deltas,
+                eq_lo,
+                eq_prep,
+                lo_size,
+                pair_idx_base,
+                pair_in_block_mask,
+                useful_pairs_inclusive,
+                degen,
+                periodic_padding,
+                skip_dead,
+                tail_compact,
+                head_fail,
+                out,
+            )
+        } else {
+            fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                 table_data,
                 a_packed,
                 b_packed,
@@ -1976,6 +2333,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
     const FULL: bool,
     const ODD_ON_GPU: bool,
     const ASM_OFF: bool,
+    const F7: bool,
 >(
     table_data: *const u8,
     a_packed: *const u8,
@@ -2059,7 +2417,11 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
         }
 
         let ones_bytes = [0xFFu8; 8];
-        let b_ones = fold_row_q(table_data, ones_bytes.as_ptr());
+        let b_ones = if F7 {
+            fold_two_row_codes_q7(table_data, u64::MAX, u64::MAX).0
+        } else {
+            fold_row_q(table_data, ones_bytes.as_ptr())
+        };
         let ones_is_one = is_zero_q(veorq_u64(
             b_ones,
             core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
@@ -2085,11 +2447,11 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                 let pad0 = $pad0;
                 let pad1 = $pad1;
 
-                let rows0 = r2_pair_fold_and_store(
+                let rows0 = r2_pair_fold_and_store::<F7>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
                     skip_dead,
                 );
-                let rows1 = r2_pair_fold_and_store(
+                let rows1 = r2_pair_fold_and_store::<F7>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
                     skip_dead,
                 );
@@ -2254,6 +2616,23 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
             && n_groups.is_multiple_of(64);
         assert!(!tail_compact || (ranked_periodic && skip_dead));
         assert!(!head || (tail_compact && ASM_OFF));
+        let head_inline = head && r2_head_inline_enabled();
+        // One head group (`$i` < `HC_HEAD_PAIRS / 2`) of block `$block`,
+        // its rows at `$a`, `$b`: its two folded pairs and whether both
+        // pairs' b rows are all ones.
+        macro_rules! head_group {
+            ($a:expr, $b:expr, $block:expr, $i:expr) => {{
+                let head_a = anchors0.add(HC_ANCHORS_PER_BLOCK * $block + 2 * $i);
+                let head_d = deltas0.add(HC_DELTA_BYTES_PER_BLOCK * $block + 16 * $i);
+                if head_inline {
+                    r2_head_group_fold_and_store_inline::<F7>(
+                        table_data, $a, $b, head_a, head_d, degen, b_ones,
+                    )
+                } else {
+                    r2_head_group_fold_and_store::<F7>(table_data, $a, $b, head_a, head_d, degen, b_ones)
+                }
+            }};
+        }
         if ranked_periodic {
             for block in 0..n_groups / 64 {
                 let first = block * 64;
@@ -2281,23 +2660,15 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                     for t in 0..30 {
                         let i0 = 2 * t;
                         let (rows0, rows1) = if head && i0 < HC_HEAD_PAIRS / 2 {
-                            let (r0, r1, ones) = r2_head_group_fold_and_store(
-                                table_data,
-                                pa,
-                                pb,
-                                anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * i0),
-                                deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * i0),
-                                degen,
-                                b_ones,
-                            );
+                            let (r0, r1, ones) = head_group!(pa, pb, block, i0);
                             head_ok &= ones;
                             (r0, r1)
                         } else {
                             (
-                                r2_pair_fold_and_store_off::<0, 0>(
+                                r2_pair_fold_and_store_off::<F7, 0, 0>(
                                     table_data, pa, pb, pn, pd, degen, b_ones,
                                 ),
-                                r2_pair_fold_and_store_off::<16, 32>(
+                                r2_pair_fold_and_store_off::<F7, 16, 32>(
                                     table_data, pa, pb, pn, pd, degen, b_ones,
                                 ),
                             )
@@ -2307,23 +2678,16 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                         process_group!(prepared rows0, rows1, p0, p1);
                         let i1 = i0 + 1;
                         let (rows0, rows1) = if head && i1 < HC_HEAD_PAIRS / 2 {
-                            let (r0, r1, ones) = r2_head_group_fold_and_store(
-                                table_data,
-                                pa.wrapping_add(32),
-                                pb.wrapping_add(32),
-                                anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * i1),
-                                deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * i1),
-                                degen,
-                                b_ones,
-                            );
+                            let (r0, r1, ones) =
+                                head_group!(pa.wrapping_add(32), pb.wrapping_add(32), block, i1);
                             head_ok &= ones;
                             (r0, r1)
                         } else {
                             (
-                                r2_pair_fold_and_store_off::<32, 64>(
+                                r2_pair_fold_and_store_off::<F7, 32, 64>(
                                     table_data, pa, pb, pn, pd, degen, b_ones,
                                 ),
-                                r2_pair_fold_and_store_off::<48, 96>(
+                                r2_pair_fold_and_store_off::<F7, 48, 96>(
                                     table_data, pa, pb, pn, pd, degen, b_ones,
                                 ),
                             )
@@ -4330,6 +4694,49 @@ unsafe fn lookup8_q(table: *const u8, code: u64) -> core::arch::aarch64::uint64x
     }
 }
 
+/// [`lookup8_acc_q`] through a seven-piece table ([`FOLD7_ENTRIES`], the
+/// [`r2_fold7_table`] of the eight banks): seven lookups, three `EOR3`s and an
+/// `EOR`. The same value whenever the banks are GF(2)-linear in each byte,
+/// which [`r2_fold7_table`] checks before it returns a table.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn lookup7_acc_q(
+    table7: *const u8,
+    code: u64,
+    init: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe {
+        macro_rules! load {
+            ($p:literal) => {
+                piece7_load_q::<{ FOLD7_SHIFTS[$p] }>(table7.add(FOLD7_BASES[$p] * 16), code)
+            };
+        }
+        let acc = xor3_u64(init, load!(0), load!(1));
+        let acc = xor3_u64(acc, load!(2), load!(3));
+        let acc = xor3_u64(acc, load!(4), load!(5));
+        veorq_u64(acc, load!(6))
+    }
+}
+
+/// [`lookup8_acc_q`] (`F7 = false`, eight byte banks at `table`) or
+/// [`lookup7_acc_q`] (`F7`, a seven-piece table at `table`).
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn lookup8_acc_g<const F7: bool>(
+    table: *const u8,
+    code: u64,
+    init: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    unsafe {
+        if F7 {
+            lookup7_acc_q(table, code, init)
+        } else {
+            lookup8_acc_q(table, code, init)
+        }
+    }
+}
+
 /// [`fold2_compact_and_round45_chunk_neon_8`] with the same stores and the
 /// same eight reduced slots, rebuilt around the fused PMULL+EOR forms the
 /// one-body kernel could not afford next to its compact accumulators:
@@ -4791,6 +5198,10 @@ unsafe fn mul_prep_q(
 /// returns false if any is not one; the caller then discards the pass and
 /// reruns it without `bpack`. The a outputs and the slots do not depend on
 /// `bpack`. Returns true without `bpack`.
+///
+/// `F7`: `table_r1` is the seven-piece form of the byte banks
+/// ([`r2_fold7_table`] of them) and every lookup tree takes seven lookups
+/// ([`lookup7_acc_q`]); the same field elements, so the same stores and slots.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
@@ -4799,6 +5210,7 @@ unsafe fn mul_prep_q(
 pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     const DEAD_TAIL: bool,
     const PACK: bool,
+    const F7: bool,
 >(
     table_r1: *const u8,
     rho2: F128,
@@ -4904,8 +5316,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     )
                 };
 
-                let xa0 = lookup8_acc_q(table_r1, da0, anc_a0);
-                let xa1 = lookup8_acc_q(table_r1, da1, anc_a1);
+                let xa0 = lookup8_acc_g::<F7>(table_r1, da0, anc_a0);
+                let xa1 = lookup8_acc_g::<F7>(table_r1, da1, anc_a1);
                 let av = mul_prep86_xor1_q(rho2_p0, rho2_p1, veorq_u64(xa0, xa1), k86, xa0);
                 let bv = if degen && (db0 | db1) == 0 {
                     let bd = veorq_u64(anc_b0, anc_b1);
@@ -4917,8 +5329,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     }
                 } else {
                     $b_flat = false;
-                    let xb0 = lookup8_acc_q(table_r1, db0, anc_b0);
-                    let xb1 = lookup8_acc_q(table_r1, db1, anc_b1);
+                    let xb0 = lookup8_acc_g::<F7>(table_r1, db0, anc_b0);
+                    let xb1 = lookup8_acc_g::<F7>(table_r1, db1, anc_b1);
                     mul_prep86_xor1_q(rho2_p0, rho2_p1, veorq_u64(xb0, xb1), k86, xb0)
                 };
                 (av, bv)
@@ -5059,8 +5471,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 let dp = deltas.add(32 * g);
                 let da0 = u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>()));
                 let db0 = u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>()));
-                let xa0 = lookup8_acc_q(table_r1, da0, anc_a0);
-                let xb0 = lookup8_acc_q(table_r1, db0, anc_b0);
+                let xa0 = lookup8_acc_g::<F7>(table_r1, da0, anc_a0);
+                let xb0 = lookup8_acc_g::<F7>(table_r1, db0, anc_b0);
                 let av0 = mul_prep86_xor1_q(rho2_p0, rho2_p1, xa0, k86, xa0);
                 let bv0 = mul_prep86_xor1_q(rho2_p0, rho2_p1, xb0, k86, xb0);
                 if PACK {
@@ -5187,7 +5599,7 @@ pub(crate) fn r2_head_compact_supported() -> bool {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::type_complexity)]
-unsafe fn r2_head_group_fold_and_store(
+unsafe fn r2_head_group_fold_and_store<const F7: bool>(
     table_data: *const u8,
     a_row: *const u8,
     b_row: *const u8,
@@ -5220,17 +5632,104 @@ unsafe fn r2_head_group_fold_and_store(
             let b1_code = u64::from_le(core::ptr::read_unaligned(b_row.add(code + 8).cast::<u64>()));
             let ones = (b0_code & b1_code) == u64::MAX;
             let rows = if degen && ones {
-                let (a0, a1) = fold_two_row_codes_q(table_data, a0_code, a1_code);
+                let (a0, a1) = fold_two_rows_g::<F7>(table_data, a0_code, a1_code);
                 (a0, a1, b_ones, b_ones, true)
             } else {
                 let (a0, a1, b0, b1) =
-                    fold_four_row_codes_q(table_data, a0_code, a1_code, b0_code, b1_code);
+                    fold_four_rows_g::<F7>(table_data, a0_code, a1_code, b0_code, b1_code);
                 (a0, a1, b0, b1, false)
             };
             (rows, a0_code, a1_code, ones)
         };
         let (r0, a00, a01, ones0) = pair(0);
         let (r1, a10, a11, ones1) = pair(16);
+        core::arch::asm!(
+            "stnp {a:q}, {b:q}, [{dst}]",
+            dst = in(reg) head_a,
+            a = in(vreg) r0.0,
+            b = in(vreg) r1.0,
+            options(nostack, preserves_flags),
+        );
+        store_delta_pair_gpr(head_d, a00, a01, a10, a11);
+        (r0, r1, ones0 & ones1)
+    }
+}
+
+/// Whether the round-two ranked walk writes its head groups with
+/// [`r2_head_group_fold_and_store_inline`] (`FLOCK_NO_R2_HEAD_INLINE=1`
+/// keeps [`r2_head_group_fold_and_store`]). Read once per process.
+#[cfg(target_arch = "aarch64")]
+fn r2_head_inline_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Off in this tree: a piece restored from an earlier record, left off by default because the entries on record 466756c7 that carried it drew slower than the record; the record's path runs.
+    *ON.get_or_init(|| false)
+}
+
+/// [`r2_head_group_fold_and_store`] with each pair written in place: the
+/// same loads, folds, returned rows and stores, in the same order. The
+/// shared closure there is called twice per group, so it is emitted out of
+/// line, and every call saves and restores the walk's live accumulators
+/// (the vector registers a call clobbers) around it.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::type_complexity)]
+unsafe fn r2_head_group_fold_and_store_inline<const F7: bool>(
+    table_data: *const u8,
+    a_row: *const u8,
+    b_row: *const u8,
+    head_a: *mut F128,
+    head_d: *mut u8,
+    degen: bool,
+    b_ones: core::arch::aarch64::uint64x2_t,
+) -> (
+    (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+        bool,
+    ),
+    (
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+        core::arch::aarch64::uint64x2_t,
+        bool,
+    ),
+    bool,
+) {
+    use core::arch::aarch64::uint64x2_t;
+
+    #[inline(always)]
+    #[allow(clippy::type_complexity)]
+    unsafe fn pair<const F7: bool, const CODE: usize>(
+        table_data: *const u8,
+        a_row: *const u8,
+        b_row: *const u8,
+        degen: bool,
+        b_ones: uint64x2_t,
+    ) -> ((uint64x2_t, uint64x2_t, uint64x2_t, uint64x2_t, bool), u64, u64, bool) {
+        unsafe {
+            let a0_code = u64::from_le(core::ptr::read_unaligned(a_row.add(CODE).cast::<u64>()));
+            let a1_code = u64::from_le(core::ptr::read_unaligned(a_row.add(CODE + 8).cast::<u64>()));
+            let b0_code = u64::from_le(core::ptr::read_unaligned(b_row.add(CODE).cast::<u64>()));
+            let b1_code = u64::from_le(core::ptr::read_unaligned(b_row.add(CODE + 8).cast::<u64>()));
+            let ones = (b0_code & b1_code) == u64::MAX;
+            let rows = if degen && ones {
+                let (a0, a1) = fold_two_rows_g::<F7>(table_data, a0_code, a1_code);
+                (a0, a1, b_ones, b_ones, true)
+            } else {
+                let (a0, a1, b0, b1) =
+                    fold_four_rows_g::<F7>(table_data, a0_code, a1_code, b0_code, b1_code);
+                (a0, a1, b0, b1, false)
+            };
+            (rows, a0_code, a1_code, ones)
+        }
+    }
+
+    unsafe {
+        let (r0, a00, a01, ones0) = pair::<F7, 0>(table_data, a_row, b_row, degen, b_ones);
+        let (r1, a10, a11, ones1) = pair::<F7, 16>(table_data, a_row, b_row, degen, b_ones);
         core::arch::asm!(
             "stnp {a:q}, {b:q}, [{dst}]",
             dst = in(reg) head_a,
@@ -7424,6 +7923,63 @@ mod tests {
         check_lane!(7);
     }
 
+    /// The in-place head group returns the same rows and flag and writes the
+    /// same anchor and delta bytes as the closure form, for degenerate
+    /// (b rows all ones), mixed and general pairs, with the shortcut on and
+    /// off.
+    #[test]
+    fn head_group_inline_matches_closure_form() {
+        let mut state = 0x4845_4144_494e_4c4e;
+        let table: Vec<[u64; 2]> = (0..8 * 256)
+            .map(|_| [splitmix64(&mut state), splitmix64(&mut state)])
+            .collect();
+        let t = table.as_ptr().cast::<u8>();
+        let as_words = |v: uint64x2_t| -> [u64; 2] { unsafe { core::mem::transmute(v) } };
+        type Rows = (uint64x2_t, uint64x2_t, uint64x2_t, uint64x2_t, bool);
+        let words = |r: Rows| [as_words(r.0), as_words(r.1), as_words(r.2), as_words(r.3)];
+        for case in 0..2048 {
+            let mut a = [0u64; 4];
+            let mut b = [0u64; 4];
+            for k in 0..4 {
+                a[k] = splitmix64(&mut state);
+                b[k] = match (case + k) % 4 {
+                    0 | 1 => u64::MAX,
+                    _ => splitmix64(&mut state),
+                };
+            }
+            let degen = case % 3 != 0;
+            unsafe {
+                let b_ones = core::mem::transmute::<[u64; 2], uint64x2_t>([
+                    splitmix64(&mut state),
+                    splitmix64(&mut state),
+                ]);
+                let mut anc = [[[0u64; 2]; 2]; 2];
+                let mut del = [[0u8; 16]; 2];
+                let (p0, p1, po) = r2_head_group_fold_and_store::<false>(
+                    t,
+                    a.as_ptr().cast(),
+                    b.as_ptr().cast(),
+                    anc[0].as_mut_ptr().cast(),
+                    del[0].as_mut_ptr(),
+                    degen,
+                    b_ones,
+                );
+                let (q0, q1, qo) = r2_head_group_fold_and_store_inline::<false>(
+                    t,
+                    a.as_ptr().cast(),
+                    b.as_ptr().cast(),
+                    anc[1].as_mut_ptr().cast(),
+                    del[1].as_mut_ptr(),
+                    degen,
+                    b_ones,
+                );
+                assert_eq!((words(p0), p0.4, words(p1), p1.4, po), (words(q0), q0.4, words(q1), q1.4, qo));
+                assert_eq!(anc[0], anc[1], "case {case}");
+                assert_eq!(del[0], del[1], "case {case}");
+            }
+        }
+    }
+
     /// The eight-lane lookups built on `bank_load_q` equal the XOR of the
     /// eight plainly indexed entries.
     #[test]
@@ -8438,9 +8994,9 @@ mod tests {
                                 }
                                 _ => {
                                     let k = if kernel == 2 {
-                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false>
+                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false, false>
                                     } else {
-                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true>
+                                        fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, false>
                                     };
                                     let ep = eq_prep.as_ptr();
                                     k(t, a, b, anc, del, eq, ep, LO_SIZE, base, mask, useful, degen, periodic, skip_dead, false, core::ptr::null(), o)
@@ -8517,9 +9073,9 @@ mod tests {
                         let mut out = [poison; 8];
                         unsafe {
                             let k = if trips {
-                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true>
+                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, false>
                             } else {
-                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false>
+                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, false, false>
                             };
                             k(
                                 table.as_ptr().cast::<u8>(),
@@ -8548,6 +9104,170 @@ mod tests {
                     assert_eq!(got.0, want.0, "anchors: {at}");
                     assert_eq!(got.1, want.1, "deltas: {at}");
                     assert_eq!(got.2, want.2, "slots: {at}");
+                    assert!(got.2.iter().all(|v| *v != poison), "slots written: {at}");
+                }
+            }
+        }
+    }
+
+    /// The seven-piece table of linear byte banks folds every code to the
+    /// byte-bank fold; banks that are not linear get no table.
+    #[test]
+    fn fold7_table_folds_like_the_byte_banks() {
+        let mut state = 0x464f_4c44_3750_4945;
+        let singles: Vec<F128> =
+            (0..64).map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state))).collect();
+        let table = linear_byte_banks(&singles);
+        let t7 = r2_fold7_table(&table).expect("linear banks");
+        assert_eq!(t7.len(), FOLD7_ENTRIES);
+        let (t8, t7p) = (table.as_ptr().cast::<u8>(), t7.as_ptr().cast::<u8>());
+        let as_words = |v: uint64x2_t| -> [u64; 2] { unsafe { core::mem::transmute(v) } };
+        for case in 0..8192 {
+            let codes: [u64; 4] = match case {
+                0 => [0; 4],
+                1 => [u64::MAX; 4],
+                2 => [1, 1 << 9, 1 << 10, 1 << 63],
+                3 => [0x3ff, 0x7fc00, 1 << 55, 0x1ff << 55],
+                _ => core::array::from_fn(|_| splitmix64(&mut state)),
+            };
+            unsafe {
+                let (w, x, y, z) = fold_four_row_codes_q(t8, codes[0], codes[1], codes[2], codes[3]);
+                let (w7, x7, y7, z7) = fold_four_row_codes_q7(t7p, codes[0], codes[1], codes[2], codes[3]);
+                assert_eq!(
+                    [as_words(w7), as_words(x7), as_words(y7), as_words(z7)],
+                    [as_words(w), as_words(x), as_words(y), as_words(z)],
+                    "codes {codes:x?}"
+                );
+                let (u, v) = fold_two_row_codes_q(t8, codes[2], codes[3]);
+                let (u7, v7) = fold_two_row_codes_q7(t7p, codes[2], codes[3]);
+                assert_eq!([as_words(u7), as_words(v7)], [as_words(u), as_words(v)]);
+            }
+        }
+        let mut bent = table.clone();
+        bent[3 * 256 + 0x81] = bent[3 * 256 + 0x81] + F128::ONE;
+        assert!(r2_fold7_table(&bent).is_none());
+        let mut offset = table.clone();
+        offset[5 * 256] = F128::ONE;
+        assert!(r2_fold7_table(&offset).is_none());
+    }
+
+    /// Eight byte banks, GF(2)-linear in each byte, whose single-bit entries
+    /// are `singles` (bit `8 j + i` at bank `j`, entry `1 << i`).
+    fn linear_byte_banks(singles: &[F128]) -> Vec<F128> {
+        let mut table = vec![F128::ZERO; 8 * 256];
+        for lane in 0..8 {
+            for x in 1..256usize {
+                let low = x.trailing_zeros() as usize;
+                table[lane * 256 + x] = table[lane * 256 + (x & (x - 1))] + singles[8 * lane + low];
+            }
+        }
+        table
+    }
+
+    /// The offset walk through the seven-piece table writes the same anchors
+    /// and deltas, returns the same slots and the same head flag as through
+    /// the byte banks: dense and head-compacted layouts, degenerate groups,
+    /// head pairs whose b rows are or are not all ones, and the b == 1 shortcut.
+    #[test]
+    fn round2_lookahead_pieces7_walk_matches_byte_banks() {
+        const LO_SIZE: usize = 2048;
+        let mut state = 0x5232_4c41_3750_4945;
+        let mut a_packed = vec![0u8; 16 * LO_SIZE];
+        let mut b_packed = vec![0u8; 16 * LO_SIZE];
+        for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+            *byte = splitmix64(&mut state) as u8;
+        }
+        let n_groups = LO_SIZE / 2;
+        for block in 0..n_groups / 64 {
+            // Head pairs 0..7: b all ones, except one pair of block 3.
+            b_packed[block * 64 * 32..(block * 64 + 4) * 32].fill(0xff);
+            for trip in 2..30 {
+                let g = 64 * block + 2 * trip + (trip + block) % 2;
+                match (trip + 3 * block) % 4 {
+                    0 => b_packed[g * 32..(g + 1) * 32].fill(0xff),
+                    1 => b_packed[g * 32..g * 32 + 16].fill(0xff),
+                    _ => {}
+                }
+            }
+        }
+        let eq_lo: Vec<F128> = (0..LO_SIZE)
+            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+            .collect();
+        let eq_prep = round2_eq_prep(&eq_lo);
+        let mut singles: Vec<F128> =
+            (0..64).map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state))).collect();
+        let poison = F128::new(0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555);
+        let n_blocks = LO_SIZE / 128;
+        for ones_is_one in [false, true] {
+            if ones_is_one {
+                // An all-ones row folds to one: the b == 1 group shortcut.
+                let rest = singles[..63].iter().fold(F128::ZERO, |acc, s| acc + *s);
+                singles[63] = F128::ONE + rest;
+            }
+            let table = linear_byte_banks(&singles);
+            let t7 = r2_fold7_table(&table).expect("linear banks");
+            for bad_head in [false, true] {
+                let mut b_packed = b_packed.clone();
+                if bad_head {
+                    b_packed[(3 * 64 + 1) * 32 + 16..(3 * 64 + 1) * 32 + 24].fill(0x7f);
+                }
+                for (head, degen, skip_dead) in [
+                    (false, false, false),
+                    (false, true, false),
+                    (false, true, true),
+                    (true, true, true),
+                ] {
+                    let run = |pieces: bool| {
+                        let a_off = n_blocks * HC_ANCHOR_GAP + HC_ANCHOR_SHIFT;
+                        let d_off = n_blocks * HC_DELTA_GAP + HC_DELTA_SHIFT;
+                        let mut anchors = vec![poison; 2 * LO_SIZE + a_off];
+                        let mut deltas = vec![0xa5u8; 16 * LO_SIZE + d_off];
+                        let mut out = [poison; 8];
+                        let flag = core::sync::atomic::AtomicBool::new(false);
+                        unsafe {
+                            let (anc, del, hf) = if head {
+                                (
+                                    anchors.as_mut_ptr().add(a_off),
+                                    deltas.as_mut_ptr().add(d_off),
+                                    &flag as *const core::sync::atomic::AtomicBool,
+                                )
+                            } else {
+                                (anchors.as_mut_ptr(), deltas.as_mut_ptr(), core::ptr::null())
+                            };
+                            let k = if pieces {
+                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, true>
+                            } else {
+                                fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, false>
+                            };
+                            k(
+                                if pieces { t7.as_ptr().cast::<u8>() } else { table.as_ptr().cast::<u8>() },
+                                a_packed.as_ptr(),
+                                b_packed.as_ptr(),
+                                anc,
+                                del,
+                                eq_lo.as_ptr(),
+                                eq_prep.as_ptr(),
+                                LO_SIZE,
+                                0,
+                                127,
+                                121,
+                                degen,
+                                true,
+                                skip_dead,
+                                head,
+                                hf,
+                                out.as_mut_ptr(),
+                            );
+                        }
+                        (anchors, deltas, out, flag.into_inner())
+                    };
+                    let (want, got) = (run(false), run(true));
+                    let at = format!("ones {ones_is_one} bad {bad_head} head {head} degen {degen} skip {skip_dead}");
+                    assert_eq!(got.0, want.0, "anchors: {at}");
+                    assert_eq!(got.1, want.1, "deltas: {at}");
+                    assert_eq!(got.2, want.2, "slots: {at}");
+                    assert_eq!(got.3, want.3, "head flag: {at}");
+                    assert_eq!(want.3, head && bad_head, "head flag set: {at}");
                     assert!(got.2.iter().all(|v| *v != poison), "slots written: {at}");
                 }
             }
@@ -9830,14 +10550,14 @@ mod tests {
                                 OUT_PAIRS, true, out.as_mut_ptr(),
                             ),
                             (false, false) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
                                 );
                             }
                             (false, true) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
@@ -9921,12 +10641,12 @@ mod tests {
                 let (mut ap, mut bp) = (vec![poison; n_out], vec![poison; n_out]);
                 let (mut o_full, mut o_pack) = ([F128::ZERO; 8], [F128::ZERO; 8]);
                 unsafe {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_full.as_mut_ptr(), false, false, false, F128::ONE,
                     );
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         ap.as_mut_ptr(), bp.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_pack.as_mut_ptr(), false, false, false, F128::ONE,
@@ -10010,7 +10730,7 @@ mod tests {
                     let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
                     let mut o = [F128::ZERO; 8];
                     let ok = unsafe {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
                             r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                             a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                             o.as_mut_ptr(), bpack, false, false, F128::ONE,
@@ -10043,6 +10763,67 @@ mod tests {
                     let (_, _, _, ok) = run(&anc, &deltas, true);
                     assert!(!ok, "bad b at {bad} not reported, case {case}, degen {degen}");
                 }
+            }
+        }
+    }
+
+    /// The packed K kernel through the seven-piece table writes the same a
+    /// and b outputs, returns the same slots and the same b-one verdict as
+    /// through the byte banks, with and without the b-one pack and `degen`.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn k_pieces7_matches_byte_banks() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        let mut state = 0x4b37_5049_4543_4553;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, rho(&mut state));
+        for case in 0..6 {
+            let out_pairs = if case % 2 == 0 { 2 * 16 * 8 } else { 2 * 16 * 4 };
+            let n_out = 2 * out_pairs;
+            let (rho1, rho2) = (rho(&mut state), rho(&mut state));
+            let r1 = table.scaled_linear(rho1);
+            let t7 = r2_fold7_table(&r1).expect("scaled banks are linear");
+            let mut anchors: Vec<F128> = (0..8 * out_pairs).map(|_| rho(&mut state)).collect();
+            let mut deltas: Vec<u8> =
+                (0..64 * out_pairs).map(|_| splitmix64(&mut state) as u8).collect();
+            let eq: Vec<F128> = (0..out_pairs).map(|_| rho(&mut state)).collect();
+            let eq_prep = round2_eq_prep(&eq);
+            for g in 0..n_out {
+                if matches!(g % 64, 0..4 | 59) || (case >= 2 && splitmix64(&mut state) % 4 == 0) {
+                    anchors[4 * g + 1] = F128::ONE;
+                    anchors[4 * g + 3] = F128::ONE;
+                    deltas[32 * g + 8..32 * g + 16].fill(0);
+                    deltas[32 * g + 24..32 * g + 32].fill(0);
+                }
+            }
+            for (degen, bpack) in [(false, false), (true, false), (true, true)] {
+                let poison = F128::new(0xdead, 0xbeef);
+                let run = |pieces: bool| {
+                    let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
+                    let mut o = [F128::ZERO; 8];
+                    let ok = unsafe {
+                        if pieces {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+                                t7.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
+                                o.as_mut_ptr(), bpack, false, false, F128::ONE,
+                            )
+                        } else {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                                r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
+                                o.as_mut_ptr(), bpack, false, false, F128::ONE,
+                            )
+                        }
+                    };
+                    (a, b, o, ok)
+                };
+                let at = format!("case {case}, degen {degen}, bpack {bpack}");
+                let (want, got) = (run(false), run(true));
+                assert_eq!(got.0, want.0, "a outputs, {at}");
+                assert_eq!(got.1, want.1, "b outputs, {at}");
+                assert_eq!(got.2, want.2, "slots, {at}");
+                assert_eq!(got.3, want.3, "b-one verdict, {at}");
             }
         }
     }
