@@ -429,10 +429,6 @@ impl Dual {
     }
 }
 
-/// Largest prover state whose C2 fold skips the Rayon join (see
-/// [`Pending::fold`]).
-const C2_SEQ_MAX_STATE: usize = 1 << 15;
-
 pub(super) struct Pending {
     dual: Dual,
     enforced: F128,
@@ -478,36 +474,6 @@ impl Pending {
         assert!(self.glued && self.challenges.len() < d);
         self.challenges.push(r);
         let complete = self.challenges.len() == d;
-        // Small states (`FLOCK_NO_SMALL_SERIAL=1` kills): the fold and the
-        // dual's message / materialize run one after the other on this
-        // thread instead of as a Rayon join. On the ranked open these are
-        // the folds of the 2^15..2^5 states, where the join's wake and wait
-        // cost about as much as the dual's work (M4: the c2 folds of one
-        // prove take 1.04 -> 0.98 ms with 4 threads, 1.34 -> 1.20 ms with
-        // 10). Same operations on the same inputs, combined in the same
-        // order, so the message, the basis and the transcript are unchanged.
-        if sc.f.len() <= C2_SEQ_MAX_STATE && crate::small_serial_enabled() {
-            let mut message = sc.fold(r);
-            let correction = self.dual.message(&self.challenges);
-            message.u_0 += correction.u_0;
-            message.u_2 += correction.u_2;
-            *sc.transcript.last_mut().expect("fold records a message") = message;
-            if !complete {
-                return (message, false);
-            }
-            assert!(
-                sc.pending_glue.is_none()
-                    && sc.pending_fold_basis.is_none()
-                    && sc.pending_ood_eq.is_none()
-            );
-            let basis = self.dual.materialize(&self.challenges);
-            assert_eq!(basis.len(), sc.combined_basis.len());
-            for (dst, &src) in sc.combined_basis.iter_mut().zip(&basis) {
-                *dst += src;
-            }
-            crate::scratch::give_sparse_ntt_data(basis);
-            return (message, true);
-        }
         if complete {
             assert!(
                 sc.pending_glue.is_none()

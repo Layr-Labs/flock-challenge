@@ -87,6 +87,28 @@ pub fn pool_spin_release() {
     imp::pool_spin_release();
 }
 
+/// Witness generation has handed its work to the pool. Rayon's workers park
+/// after 32 idle rounds and are woken one by one, one `pthread_cond_signal`
+/// per pushed job, when the next parallel region opens; a census of card R's
+/// timed prove counted 187-195 such parks of performance-core workers, 220-227
+/// wake signals and 77-107 waits on a worker's sleep lock per proof, nearly all
+/// of them after this point. So the hot pool spin is not released here any
+/// more: its workers stay in [`imp::pool_spin_body`] until the proof is done
+/// (the existing [`pool_spin_release`] calls after `prove_fast_inner`) and
+/// find the next region's jobs without having been parked. From here on an
+/// idle round ends in the kernel yield Rayon's own idle loop makes, instead of
+/// the scalar churn, so a runnable thread (Metal's submit thread, the proving
+/// thread) gets a core as quickly as it does from an idle Rayon worker today.
+/// Three workers (the one the spin never included and two more) leave the
+/// spin here and park as before, so the spinners never occupy the cores of
+/// Metal's two service threads and the proving thread. Scheduling
+/// only: the same jobs, run by the same pool. `FLOCK_NO_HOT_PROVE=1` restores
+/// the release at this point.
+pub fn pool_spin_witness_done() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::pool_spin_witness_done();
+}
+
 /// Stop the keep-alive: signal the spin threads and join them. Idempotent and
 /// safe to call from any thread. Called by the seed-pipe thread the instant its
 /// stdin `read()` returns (before forwarding the seed or starting the
@@ -208,21 +230,43 @@ mod imp {
         if POOL_SPIN.swap(true, Ordering::AcqRel) {
             return true;
         }
+        HOT_PROVE.store(false, Ordering::Relaxed);
+        HOT_PROVE_OFF.store(std::env::var_os("FLOCK_NO_HOT_PROVE").is_some(), Ordering::Relaxed);
         let deadline = Instant::now() + MAX_KEEPALIVE;
         rayon::spawn_broadcast(move |ctx| {
             // Leave one core to the seed-pipe thread's hot poll.
             if ctx.index() + 1 == ctx.num_threads() {
                 return;
             }
-            pool_spin_body(deadline);
+            pool_spin_body(deadline, ctx.index() + HOT_PROVE_RESERVED >= ctx.num_threads());
         });
         true
     }
 
-    fn pool_spin_body(deadline: Instant) {
+    /// Cores the hot-prove spin leaves alone: one each for Metal's submit
+    /// thread, Metal's completion thread and the proving thread, the three
+    /// threads besides the pool's workers that run on performance cores
+    /// during a prove. The workers with the highest indices (the one the
+    /// spin never included, and two more) park as before, so spinners plus
+    /// those three never exceed the pool's width.
+    const HOT_PROVE_RESERVED: usize = 3;
+
+    fn pool_spin_body(deadline: Instant, leaves_at_witness: bool) {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         while POOL_SPIN.load(Ordering::Relaxed) {
             if let Some(rayon::Yield::Executed) = rayon::yield_now() {
+                continue;
+            }
+            if HOT_PROVE.load(Ordering::Relaxed) {
+                if leaves_at_witness {
+                    break;
+                }
+                // After the witness hand-off: yield like an idle Rayon
+                // worker, never park.
+                std::thread::yield_now();
+                if Instant::now() >= deadline {
+                    break;
+                }
                 continue;
             }
             for _ in 0..64 {
@@ -242,6 +286,19 @@ mod imp {
     pub(super) fn pool_spin_release() {
         if POOL_SPIN.load(Ordering::Relaxed) {
             POOL_SPIN.store(false, Ordering::Release);
+        }
+    }
+
+    /// `true` from the witness hand-off until the release at proof done.
+    static HOT_PROVE: AtomicBool = AtomicBool::new(false);
+    /// `FLOCK_NO_HOT_PROVE`, read once in [`pool_spin_start`] (untimed).
+    static HOT_PROVE_OFF: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn pool_spin_witness_done() {
+        if HOT_PROVE_OFF.load(Ordering::Relaxed) {
+            pool_spin_release();
+        } else if POOL_SPIN.load(Ordering::Relaxed) {
+            HOT_PROVE.store(true, Ordering::Release);
         }
     }
 
