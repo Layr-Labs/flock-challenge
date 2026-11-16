@@ -599,20 +599,3 @@ pub(crate) fn zc_t56_verdict(equal: bool, chunks: usize, hi_size: usize) {
         }
     }
 }
-
-/// The arm's output buffers for the tri pass 0 arm (`t0_metal`): `(out_a,
-/// out_b, their contents, cap in chunks)`, or `None` before the first launch.
-pub(super) fn zc_t56_out_bufs() -> Option<(Id, Id, *const F128, *const F128, usize)> {
-    let gpu = gpu().ok()?;
-    let slot = ZC_T56_STATE.lock().ok()?;
-    let st = slot.as_ref()?;
-    unsafe {
-        Some((
-            st.out_a,
-            st.out_b,
-            gpu.buffer_contents(st.out_a).cast::<F128>().cast_const(),
-            gpu.buffer_contents(st.out_b).cast::<F128>().cast_const(),
-            st.cap,
-        ))
-    }
-}

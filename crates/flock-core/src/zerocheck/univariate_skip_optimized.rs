@@ -3916,11 +3916,9 @@ pub fn t56_prewarm_after_tune() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         if crate::gpu_commit::zc_t56_prewarm_wanted() {
-            let _ = std::thread::Builder::new().name("flock-zct56-prewarm".into()).spawn(|| {
-                crate::gpu_commit::zc_t56_prewarm();
-                // The tri pass 0 arm's kernel, on the same thread, after.
-                crate::gpu_commit::zc_t0_prewarm();
-            });
+            let _ = std::thread::Builder::new()
+                .name("flock-zct56-prewarm".into())
+                .spawn(crate::gpu_commit::zc_t56_prewarm);
         }
     }
 }

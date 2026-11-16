@@ -785,68 +785,6 @@ pub(crate) fn gpu_zc_r2_debug() -> bool {
 /// own. Read once per process.
 pub const ENV_NO_ZC_R2_CS: &str = "FLOCK_NO_ZC_R2_CS";
 
-/// Kill switch for the measured R2-CS share (`FLOCK_NO_ZC_R2_CS_SHARE=1`:
-/// the record's rule, share `hi / (1.75 m + 1)` clamped to `[hi/8, 0.37 hi]`,
-/// and the K view over the K share's prefix only).
-///
-/// The record prices an R2-CS chunk at a constant 1.75 incumbent chunks and
-/// caps the share at 0.37 hi = 757 of 2048 chunks. On the ranked machine the
-/// priced share is above the cap (ratio m = 0.57, so `hi / (1.75 m + 1)` is
-/// 1024), so the cap alone sets the share, and the cap is a length: the
-/// R2-CS kernel stores through the K arm's anchors view, which covers the K
-/// share's prefix, 768 chunks. A leaner R2-CS kernel therefore changes
-/// nothing in the split: it only ends its 757 chunks sooner.
-///
-/// With this item the calibration reads what it already runs: the GPU wall
-/// of the R2-CS oracle dispatch over the calibration chunks, next to the
-/// incumbent kernel's wall over the same chunks. `p` = their ratio is the
-/// R2-CS kernel's measured price. The share follows from the record's own
-/// balance, taken at face value: at 757 chunks the two arms end together,
-/// so a GPU chunk costs `rho0 = (hi - 757) / 757 = 1.705` CPU chunks in a
-/// timed prove, of which `1.75 m` is the priced kernel work. A kernel
-/// measured at `p < 1.75` saves `(1.75 - p) m` of that, and the share is
-/// `hi / (1 + rho0 - (1.75 - p) m)`, never below the record's share and
-/// never above [`ZC_R2_CS_SHARE_CEIL_PCT`] percent of `hi`. A measurement at
-/// or above 1.75, a missing one, a non-finite one, or one below
-/// [`ZC_R2_CS_PRICE_FLOOR`] (a wall near zero: the dispatch did not run or
-/// the timestamps are broken) gives the record's share exactly; a low price
-/// above that floor is a fast kernel and takes the ceiling. One read per
-/// process: every worker measures for itself. The read is one dispatch
-/// against the least of the incumbent's replays, so noise reads the price
-/// high and costs only the gain; a second oracle dispatch for a minimum
-/// would add its GPU time to every worker's start and is not taken. The measurement is the calibration's own
-/// dispatch shape: the same kernel entry and threadgroups over the 128
-/// calibration chunks, against the incumbent kernel over the same chunks. It
-/// differs from a timed launch in the chunk count (128 against 757-880) and
-/// in the stores' target (the calibration's scratch state, not the views). The anchors view (the hand-over's and the early premap's)
-/// is made over the ceiling's prefix, so the kernel's stores always have
-/// their view; nothing else about the round changes. Read once per process.
-pub const ENV_NO_ZC_R2_CS_SHARE: &str = "FLOCK_NO_ZC_R2_CS_SHARE";
-
-/// Hard ceiling of the measured R2-CS share, percent of `hi` (880 of 2048
-/// chunks). If the measurement were wrong in the worst way (the kernel no
-/// faster in a timed prove than the record's), the GPU arm at the ceiling
-/// would end `(880 - 757) * 1.705` CPU chunks late, about 1.4 ms on the
-/// ranked machine; the gain at the ceiling is 123 CPU chunks, about 0.8 ms.
-pub(crate) const ZC_R2_CS_SHARE_CEIL_PCT: usize = 43;
-
-/// Measured prices below this are taken as bad samples: a wall this small
-/// means the oracle dispatch did not run or its timestamps are broken.
-pub(crate) const ZC_R2_CS_PRICE_FLOOR: f64 = 0.15;
-
-pub(crate) fn zc_r2_cs_measured_share_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| !env_is_one(ENV_NO_ZC_R2_CS_SHARE));
-    *ON && zc_r2_cs_enabled()
-}
-
-/// Chunks of `hi` the anchors view must cover for the R2-CS stores: the
-/// measured share's ceiling (0 when the item is off: the K share's prefix
-/// covers the record's cap).
-pub(crate) fn zc_r2_cs_view_chunks(hi: usize) -> usize {
-    if zc_r2_cs_measured_share_enabled() { (hi * ZC_R2_CS_SHARE_CEIL_PCT).div_ceil(100) } else { 0 }
-}
-
 pub(crate) fn zc_r2_cs_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_R2_CS).is_none());
@@ -1079,74 +1017,6 @@ pub(crate) fn gpu_zc_t56_debug() -> bool {
 
 /// Geometry, constants and bank finish of the 5+6 arm.
 pub(crate) mod zc_t56;
-
-/// Kill switch for the tri pass 0 GPU arm (`FLOCK_NO_ZC_T0_GPU`, any value:
-/// the CPU queue folds every chunk of the first tri pass, as before). Tri
-/// pass 0 (depth three, right after the composed 5+6 pass, CPU only, about
-/// 1.5 ms) reads its leading inputs from the 5+6 arm's output buffers: pass-0
-/// chunk `x` is 5+6 chunk `x`'s outputs. With the arm on, the GPU folds the
-/// pass-0 chunks whose inputs are there, from chunk 0 up, into its own
-/// buffers, while the CPU queue claims chunks from the top; the queue takes
-/// a chunk from the GPU only when the GPU's encoder holding it has signalled
-/// completion (a shared event encoded behind the encoder), and otherwise
-/// folds it itself; the GPU skips every chunk the CPU has taken. The CPU
-/// never waits for the GPU. The pass's three challenges exist only after the
-/// 5+6 pass, so the GPU work is encoded and committed before that pass, on a
-/// queue of its own behind `encodeWaitForEvent`, and pass 0 starts it by
-/// writing the challenges' tables and setting the event. The first launch of
-/// each process (warm-up prove) is an equality check of every offered
-/// chunk's outputs and slots against the CPU's complete pass; any mismatch
-/// keeps the arm off. Its kernel is compiled on the 5+6 arm's warm-up helper
-/// thread. Read once per process.
-pub const ENV_NO_ZC_T0_GPU: &str = "FLOCK_NO_ZC_T0_GPU";
-
-/// Whether the tri pass 0 arm may run: no kill switch and the 5+6 arm on
-/// (its buffers are this arm's inputs).
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn gpu_zc_t0_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_T0_GPU).is_none());
-    *ON && gpu_zc_t56_enabled()
-}
-
-/// Diagnostic cap on the tri pass 0 arm's offer, in pass-0 chunks
-/// (`FLOCK_ZC_T0_GPU_CHUNKS=<n>`); unset = every chunk whose input is on the
-/// GPU.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn gpu_zc_t0_cap() -> Option<usize> {
-    static CAP: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_ZC_T0_GPU_CHUNKS").ok().and_then(|v| v.trim().parse().ok())
-    });
-    *CAP
-}
-
-/// Test hook (`FLOCK_ZC_T0_FORCE=<n>`, diagnostic only): the CPU queue
-/// leaves pass-0 chunks `0..n` (within the offer) to the GPU and waits for
-/// them, so the GPU-kept path runs on a machine whose GPU would rarely win
-/// the race. Never set in a ranked run.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn gpu_zc_t0_force() -> usize {
-    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("FLOCK_ZC_T0_FORCE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-    });
-    *N
-}
-
-/// Diagnostic trace of the tri pass 0 arm (`FLOCK_ZC_T0_GPU_DEBUG=1`).
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn gpu_zc_t0_debug() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_T0_GPU_DEBUG").is_some());
-    *ON
-}
-
-/// Park the next tri pass 0 GPU buffer (call before the 5+6 pass; see
-/// [`ENV_NO_ZC_T0_GPU`]). A no-op off macOS/aarch64 or with the arm off.
-pub(crate) fn zc_t0_park() {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if gpu_zc_t0_enabled() {
-        imp::zc_t0_park();
-    }
-}
 
 /// Kill switch for the L1 recursive-commit NTT/Merkle-leaf overlap
 /// (`FLOCK_NO_L1_MERKLE_OVERLAP=1`): instead of hashing each finalized NTT
@@ -1661,6 +1531,21 @@ pub(crate) fn grind_scan_v2_enabled() -> bool {
     *ON.get_or_init(|| gpack_enabled() && !env_is_one(ENV_NO_GRIND_SCAN_V2))
 }
 
+/// Metal grind scan with ascending claims (`FLOCK_NO_GRIND_CLAIM=1`, exact,
+/// keeps `blake3_pow_scan_v2`): the scan runs `blake3_pow_scan_v3`, whose
+/// threadgroups take the block's offsets from a per-scan cursor in ascending
+/// order instead of each thread striding a fixed residue class, so the
+/// offsets below a match are covered first whatever order the threadgroups
+/// start in. Same arguments, grid, result word and smallest-match rule as v2.
+/// Needs the v2 scan (`FLOCK_NO_GRIND_SCAN_V2=1` or `FLOCK_NO_GPACK=1` turn
+/// it off too). Read once per process (at pipeline creation).
+pub const ENV_NO_GRIND_CLAIM: &str = "FLOCK_NO_GRIND_CLAIM";
+
+pub(crate) fn grind_claim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| grind_scan_v2_enabled() && !env_is_one(ENV_NO_GRIND_CLAIM))
+}
+
 pub(crate) fn grind_chunk480_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| gpack_enabled() && !env_is_one(ENV_NO_GRIND_CHUNK480))
@@ -1917,61 +1802,6 @@ impl PowRaceJob {
             PowRaceCheck::Dead
         }
     }
-}
-
-/// Kill switch for the segmented race scan (`FLOCK_NO_GRIND_SEG2`, any
-/// value: the race launches terrapinelf's single whole-block dispatch, as
-/// before). That scan publishes its result word only when the whole block
-/// has been scanned, and keeps the GPU when the CPU side answers first; the
-/// kernel's own `id >= best` exit does not stop a dispatch in practice, so
-/// on average three quarters of each scan lie past the answer (timed proves
-/// on an M1 Max: first match at 0.08-0.58 of the block; hit -> published
-/// 0.21-0.46 ms at 19 bits, 0.11-0.25 ms at 18, 0.04-0.12 ms at 17; when the
-/// CPU wins the 19-bit grind, the scan holds the GPU 0.16-0.46 ms into the
-/// next grind's launch).
-///
-/// With the switch unset the race's Metal arm is the same
-/// `blake3_pow_scan_v2` kernel over the same block cut into
-/// [`GRIND_SEG2_SEGMENTS`] consecutive segments, each its own dispatch with
-/// its own `best` word, in its own encoder followed by a shared-event signal,
-/// in one command buffer encoded ahead of the launch. The calling thread
-/// polls from its CPU scan: once segment `k`'s signal is seen (all earlier
-/// segments signalled, their words empty), segment `k`'s word is that
-/// segment's final smallest match and the answer; a word stored by the
-/// running segment zeroes every later segment's word, so their threads
-/// return at their first check (they start only after it). When the CPU
-/// arm answers first the remaining segments' words are zeroed the same way,
-/// which frees the GPU for the next grind. Same smallest qualifying nonce:
-/// a segment is read only after its signal, every lower segment was
-/// scanned in full without a match, and only segments above the one that
-/// holds a match are ever cut. One prepared buffer at a time, so launches
-/// take the event's values in order. Read once per process.
-pub const ENV_NO_GRIND_SEG2: &str = "FLOCK_NO_GRIND_SEG2";
-
-/// Segments of the segmented race scan.
-pub(crate) const GRIND_SEG2_SEGMENTS: usize = 4;
-
-pub(crate) fn grind_seg2_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GRIND_SEG2).is_none());
-    *ON && gpu_grind_enabled() && grind_lat_enabled() && !POW_RACE_OFF.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Encode the next segmented race launch's command buffer ahead of it.
-pub(crate) fn gpu_pow_seg_prepare() {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if grind_seg2_enabled() {
-        imp::gpu_pow_seg_prepare();
-    }
-}
-
-/// Launch one segmented race scan of `[start, start + len)` (see
-/// [`ENV_NO_GRIND_SEG2`]). `None` = the caller takes the incumbent launch.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn gpu_pow_seg_launch(state_digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<imp::SegRaceJob> {
-    if !grind_seg2_enabled() {
-        return None;
-    }
-    imp::gpu_pow_seg_launch(state_digest, start, len, bits)
 }
 
 /// Result-word code of a race scan whose block holds no match.
@@ -3029,36 +2859,6 @@ pub fn warm_streamed_first_pass(params: &crate::pcs::commit::PcsParams) {
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     imp::warm_streamed_first_pass(params.k_code());
-}
-
-/// Kill switch for the warm-up's spare GPU objects (`FLOCK_NO_WARM_GPU_SPARES`,
-/// any value: the timed prove makes them on first use, as before). With the
-/// switch unset, the untimed warm-up makes, once per process, the two objects
-/// the timed prove otherwise still made: the lincheck wake's two scratch
-/// buffers (its warm-up call returns before them, the split is not tuned yet;
-/// 84-210 us on the wake poster thread in the timed prove, M1 Max) and
-/// [`WARM_DONE_EVENTS`] completion events parked in the done-event pool (the
-/// timed prove's band submits found it two short: two `newSharedEvent`,
-/// 8-11 us each). Neither object holds proof data, so proof bytes are
-/// unchanged. Read once.
-pub const ENV_NO_WARM_GPU_SPARES: &str = "FLOCK_NO_WARM_GPU_SPARES";
-
-/// Completion events [`warm_gpu_spares`] parks: the two the timed prove was
-/// short of, with margin.
-pub const WARM_DONE_EVENTS: usize = 4;
-
-/// Make the warm-up's spare GPU objects (see [`ENV_NO_WARM_GPU_SPARES`]).
-/// Untimed warm-up only, once per process; no-op without the GPU.
-pub fn warm_gpu_spares() {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if std::env::var_os(ENV_NO_WARM_GPU_SPARES).is_some()
-        || !gpu_commit_enabled()
-        || DONE.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        return;
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    imp::warm_gpu_spares(WARM_DONE_EVENTS);
 }
 
 impl FromZFirstPassStream {
@@ -9232,6 +9032,50 @@ kernel void blake3_pow_scan_v2(
         }
     }
 }
+
+// blake3_pow_scan_v2's block scan with ascending claims (ENV_NO_GRIND_CLAIM).
+// The word after `best` is the scan's cursor (0 at the start of every scan).
+// A threadgroup takes the next threads_per_threadgroup offsets from it, each
+// thread tests its one offset unless it cannot beat `best`, and the group
+// claims again; it stops once a claim starts at or past the block's end or
+// at or past `best`. Claims are handed out in ascending order, so whichever
+// threadgroups run first cover the lowest offsets, and a threadgroup that
+// starts after the match finds its claim past `best` and stops. The smallest
+// matching offset m is still found: `best` never drops below m, so every
+// claim below m is taken by a group that tests all of its offsets below
+// `best`, m's among them. The stop test reads one shared copy of the claim
+// and of `best`, so a threadgroup always stops as a whole.
+kernel void blake3_pow_scan_v3(
+    constant uint* pre         [[buffer(0)]],
+    device atomic_uint* best   [[buffer(1)]],
+    constant PowParams& params [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]])
+{
+    threadgroup uint claim[2];
+    device atomic_uint* cursor = best + 1;
+    for (;;) {
+        if (tid == 0u) {
+            claim[0] = atomic_fetch_add_explicit(cursor, tgsize, memory_order_relaxed);
+            claim[1] = atomic_load_explicit(best, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint base = claim[0];
+        uint b = claim[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (base >= params.len || base >= b) return;
+        uint id = base + tid;
+        if (id < params.len && id < atomic_load_explicit(best, memory_order_relaxed)) {
+            uint nonce_lo = params.start_lo + id;
+            uint carry = nonce_lo < params.start_lo ? 1u : 0u;
+            uint nonce_hi = params.start_hi + carry;
+            uint cv0 = pow_compress0_pre(pre, nonce_lo, nonce_hi);
+            if (pow_has_leading_zero_bits(cv0, params.bits)) {
+                atomic_fetch_min_explicit(best, id, memory_order_relaxed);
+            }
+        }
+    }
+}
 "#;
 
     // Race grind latency (`ENV_NO_GRIND_LAT`): its own small library, built
@@ -9268,6 +9112,9 @@ kernel void blake3_pow_race_tail(
 {
     uint b = atomic_load_explicit(best, memory_order_relaxed);
     atomic_store_explicit(best, 0xffffffffu, memory_order_relaxed);
+    // The claim scan's cursor (the word after `best`) back to 0 for the
+    // slot's next launch; the fixed-stride scan never reads it.
+    atomic_store_explicit(best + 1, 0u, memory_order_relaxed);
     word[0] = (tag << 24u) | (b < params.len ? b : 0xffffffu);
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, POW_RACE_SCOPE_SYSTEM);
 }
@@ -9915,7 +9762,13 @@ kernel void blake3_pow_race_tail(
                                 api.error_string(err)
                             ));
                         }
-                        let ns = api.nsstring(if pow_v2 { "blake3_pow_scan_v2" } else { "blake3_pow_scan" })?;
+                        let ns = api.nsstring(if super::grind_claim_enabled() {
+                            "blake3_pow_scan_v3"
+                        } else if pow_v2 {
+                            "blake3_pow_scan_v2"
+                        } else {
+                            "blake3_pow_scan"
+                        })?;
                         let function: Id = send!(
                             api,
                             unsafe extern "C" fn(Id, Sel, Id) -> Id,
@@ -9964,7 +9817,8 @@ kernel void blake3_pow_race_tail(
                             unsafe extern "C" fn(Id, Sel, u64, u64) -> Id,
                             device,
                             c"newBufferWithLength:options:",
-                            4u64,
+                            // The result word, then the claim scan's cursor.
+                            8u64,
                             0u64
                         );
                         if out.is_null() {
@@ -16175,6 +16029,8 @@ kernel void blake3_pow_race_tail(
                 let result_words = gpu.buffer_contents(word).cast::<u32>();
                 for i in 0..POW_RACE_SLOTS {
                     best_words.add(i * POW_RACE_WORD_STRIDE / 4).write_volatile(u32::MAX);
+                    // The claim scan's cursor; the tail re-arms it with `best`.
+                    best_words.add(i * POW_RACE_WORD_STRIDE / 4 + 1).write_volatile(0);
                     result_words.add(i * POW_RACE_WORD_STRIDE / 4).write_volatile(0);
                 }
                 self.args = args;
@@ -16182,282 +16038,6 @@ kernel void blake3_pow_race_tail(
                 self.word = word;
                 Some(())
             }
-        }
-    }
-
-    // ---- Segmented race scan (see `super::ENV_NO_GRIND_SEG2`) ----
-
-    const SEG_K: usize = super::GRIND_SEG2_SEGMENTS;
-    /// Slot sets: a launch's set is reused only after its buffer completed.
-    const SEG_SETS: usize = 3;
-    /// Per set: the 24 round-zero words at 0, segment `k`'s parameters at
-    /// `128 + 16 k`.
-    const SEG_ARGS_STRIDE: usize = 256;
-    /// Per set: segment `k`'s `best` word at `4 k`.
-    const SEG_SLOT_STRIDE: usize = 64;
-
-    struct SegRace {
-        ev: Id,
-        next_value: u64,
-        args: Id,
-        slots: Id,
-        /// The one buffer encoded ahead: (set, command buffer, event base).
-        prepared: Option<(usize, Id, u64)>,
-        /// Each set's last committed buffer (retained), until it completed.
-        inflight: [Id; SEG_SETS],
-        next: usize,
-    }
-
-    // SAFETY: the handles are only touched under the state mutex; Metal
-    // objects are thread-safe.
-    unsafe impl Send for SegRace {}
-
-    static SEG_RACE: std::sync::Mutex<Option<SegRace>> = std::sync::Mutex::new(None);
-
-    unsafe fn seg_setup(gpu: &Gpu) -> Option<SegRace> {
-        unsafe {
-            let ev: Id = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newSharedEvent");
-            if ev.is_null() {
-                return None;
-            }
-            let args = gpu.new_buffer(SEG_SETS * SEG_ARGS_STRIDE).ok()?;
-            let slots = gpu.new_buffer(SEG_SETS * SEG_SLOT_STRIDE).ok()?;
-            let w = gpu.buffer_contents(slots).cast::<u32>();
-            for i in 0..SEG_SETS * SEG_SLOT_STRIDE / 4 {
-                w.add(i).write_volatile(u32::MAX);
-            }
-            Some(SegRace { ev, next_value: 0, args, slots, prepared: None, inflight: [NIL; SEG_SETS], next: 0 })
-        }
-    }
-
-    /// A set no buffer is using: never launched, or its last buffer completed.
-    unsafe fn seg_set_free(gpu: &Gpu, st: &mut SegRace, i: usize) -> bool {
-        if st.prepared.is_some_and(|(p, _, _)| p == i) {
-            return false;
-        }
-        let cb = st.inflight[i];
-        if cb.is_null() {
-            return true;
-        }
-        unsafe {
-            if gpu.cb_status(cb) >= 4 {
-                gpu.release(cb);
-                st.inflight[i] = NIL;
-                true
-            } else {
-                false
-            }
-        }
-    }
-
-    /// Encode set `i`'s buffer: per segment, the v2 scan over the set's
-    /// state, the segment's `best` word and parameters, then the segment's
-    /// signal (`base + k + 1`). Retained, not committed.
-    unsafe fn seg_encode(gpu: &Gpu, st: &mut SegRace, i: usize) -> Option<(Id, u64)> {
-        const POW_V2_TG: u64 = 256;
-        const POW_V2_GRID: u64 = 1 << 16;
-        let base = st.next_value;
-        st.next_value = base + SEG_K as u64;
-        unsafe {
-            let pool = gpu.pool_push();
-            let cb = (|| -> Option<Id> {
-                let cb = gpu.command_buffer().ok()?;
-                for k in 0..SEG_K {
-                    let enc = gpu.compute_encoder(cb).ok()?;
-                    gpu.set_pipeline(enc, gpu.pso_pow);
-                    gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE, 0);
-                    gpu.set_buffer(enc, st.slots, i * SEG_SLOT_STRIDE + 4 * k, 1);
-                    gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE + 128 + 16 * k, 2);
-                    gpu.dispatch(enc, POW_V2_GRID / POW_V2_TG, POW_V2_TG);
-                    gpu.end_encoding(enc);
-                    gpu.encode_signal_event(cb, st.ev, base + k as u64 + 1);
-                }
-                Some(gpu.retain(cb))
-            })();
-            gpu.pool_pop(pool);
-            cb.map(|cb| (cb, base))
-        }
-    }
-
-    fn seg_lock() -> std::sync::MutexGuard<'static, Option<SegRace>> {
-        SEG_RACE.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Encode the next launch's buffer now (off the Metal arm's path).
-    pub(crate) fn gpu_pow_seg_prepare() {
-        let Ok(gpu) = gpu() else { return };
-        if !gpu.pow_v2 || gpu.pso_pow.is_null() {
-            return;
-        }
-        let mut slot = seg_lock();
-        unsafe {
-            if slot.is_none() {
-                *slot = seg_setup(gpu);
-            }
-            let Some(st) = slot.as_mut() else { return };
-            if st.prepared.is_some() {
-                return;
-            }
-            let next = st.next;
-            let Some(i) = (0..SEG_SETS).map(|k| (next + k) % SEG_SETS).find(|&i| seg_set_free(gpu, st, i)) else {
-                return;
-            };
-            if let Some((cb, base)) = seg_encode(gpu, st, i) {
-                st.prepared = Some((i, cb, base));
-            }
-        }
-    }
-
-    /// A launched segmented race scan.
-    pub(crate) struct SegRaceJob {
-        gpu: &'static Gpu,
-        cb: Id,
-        ev: Id,
-        base: u64,
-        slots: *const std::sync::atomic::AtomicU32,
-        seg: u32,
-        start: u64,
-        /// Lowest segment not yet found empty.
-        k: std::sync::atomic::AtomicUsize,
-        /// The answer was read (or no segment matched): nothing to cancel.
-        settled: std::sync::atomic::AtomicBool,
-        cut: std::sync::atomic::AtomicBool,
-    }
-
-    // SAFETY: the pointers name the race's process-lifetime shared buffers;
-    // event and status reads are thread-safe Metal calls.
-    unsafe impl Send for SegRaceJob {}
-    unsafe impl Sync for SegRaceJob {}
-
-    impl SegRaceJob {
-        fn slot(&self, k: usize) -> &std::sync::atomic::AtomicU32 {
-            unsafe { &*self.slots.add(k) }
-        }
-
-        fn zero_from(&self, k: usize) {
-            for j in k..SEG_K {
-                self.slot(j).store(0, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-
-        /// The answer once known: `Some(Some(n))` = smallest match, `Some(None)`
-        /// = no match in the block, `None` = not yet.
-        pub(crate) fn poll(&self) -> Option<Option<u64>> {
-            use std::sync::atomic::Ordering;
-            if self.settled.load(Ordering::Relaxed) {
-                return None;
-            }
-            loop {
-                let k = self.k.load(Ordering::Relaxed);
-                if k >= SEG_K {
-                    self.settled.store(true, Ordering::Relaxed);
-                    return Some(None);
-                }
-                let signalled = unsafe { self.gpu.event_signaled_value(self.ev) } >= self.base + k as u64 + 1;
-                if signalled {
-                    std::sync::atomic::fence(Ordering::Acquire);
-                    let v = self.slot(k).load(Ordering::Relaxed);
-                    if v != u32::MAX {
-                        self.zero_from(k + 1);
-                        self.settled.store(true, Ordering::Relaxed);
-                        return Some(Some(self.start + k as u64 * u64::from(self.seg) + u64::from(v)));
-                    }
-                    self.k.store(k + 1, Ordering::Relaxed);
-                    continue;
-                }
-                // The running segment already holds a match: no later
-                // segment can hold the answer.
-                if !self.cut.load(Ordering::Relaxed) && self.slot(k).load(Ordering::Relaxed) != u32::MAX {
-                    self.zero_from(k + 1);
-                    self.cut.store(true, Ordering::Relaxed);
-                }
-                return None;
-            }
-        }
-
-        /// Status check: a failed buffer is dead (the caller falls back to
-        /// the dispatch worker's scan); a completed one answers.
-        pub(crate) fn check(&self) -> super::PowRaceCheck {
-            let status = unsafe { self.gpu.cb_status(self.cb) };
-            if status == 5 {
-                return super::PowRaceCheck::Dead;
-            }
-            if status >= 4 {
-                return match self.poll() {
-                    Some(r) => super::PowRaceCheck::Published(r),
-                    None => super::PowRaceCheck::Dead,
-                };
-            }
-            super::PowRaceCheck::Running
-        }
-    }
-
-    impl Drop for SegRaceJob {
-        /// Unsettled (the CPU arm answered first): end every segment that has
-        /// not run; its result is never read.
-        fn drop(&mut self) {
-            use std::sync::atomic::Ordering;
-            if !self.settled.load(Ordering::Relaxed) {
-                self.zero_from(self.k.load(Ordering::Relaxed));
-            }
-        }
-    }
-
-    /// Launch the prepared buffer (or encode one now) over `[start, start +
-    /// len)` in [`SEG_K`] equal segments.
-    pub(crate) fn gpu_pow_seg_launch(state_digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<SegRaceJob> {
-        const POW_V2_GRID: u32 = 1 << 16;
-        let seg = len / SEG_K as u32;
-        if !(1..=32).contains(&bits) || !len.is_power_of_two() || seg < POW_V2_GRID || len >= super::POW_RACE_NO_MATCH {
-            return None;
-        }
-        let gpu = gpu().ok()?;
-        if !gpu.pow_v2 || gpu.pso_pow.is_null() {
-            return None;
-        }
-        let mut slot = seg_lock();
-        unsafe {
-            if slot.is_none() {
-                *slot = seg_setup(gpu);
-            }
-            let st = slot.as_mut()?;
-            let (i, cb, base) = match st.prepared.take() {
-                Some(p) => p,
-                None => {
-                    let next = st.next;
-                    let i = (0..SEG_SETS).map(|k| (next + k) % SEG_SETS).find(|&i| seg_set_free(gpu, st, i))?;
-                    let (cb, base) = seg_encode(gpu, st, i)?;
-                    (i, cb, base)
-                }
-            };
-            let args = gpu.buffer_contents(st.args).add(i * SEG_ARGS_STRIDE);
-            let pre = super::pow_round0_pre(state_digest);
-            core::ptr::copy_nonoverlapping(pre.as_ptr(), args.cast::<u32>(), pre.len());
-            for k in 0..SEG_K {
-                let s0 = start + k as u64 * u64::from(seg);
-                let params = [s0 as u32, (s0 >> 32) as u32, seg, bits];
-                core::ptr::copy_nonoverlapping(params.as_ptr(), args.add(128 + 16 * k).cast::<u32>(), 4);
-            }
-            let slots = gpu.buffer_contents(st.slots).add(i * SEG_SLOT_STRIDE).cast::<std::sync::atomic::AtomicU32>();
-            for k in 0..SEG_K {
-                (*slots.add(k)).store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            gpu.commit_async(cb);
-            st.inflight[i] = cb;
-            st.next = (i + 1) % SEG_SETS;
-            Some(SegRaceJob {
-                gpu,
-                cb,
-                ev: st.ev,
-                base,
-                slots,
-                seg,
-                start,
-                k: std::sync::atomic::AtomicUsize::new(0),
-                settled: std::sync::atomic::AtomicBool::new(false),
-                cut: std::sync::atomic::AtomicBool::new(false),
-            })
         }
     }
 
@@ -16749,6 +16329,8 @@ kernel void blake3_pow_race_tail(
             let result = (|| -> Result<Option<u64>, String> {
                 let out = gpu.buffer_contents(gpu.pow_out).cast::<u32>();
                 out.write_volatile(u32::MAX);
+                // The claim scan's cursor (`blake3_pow_scan_v3`).
+                out.add(1).write_volatile(0);
                 let params = [start as u32, (start >> 32) as u32, len, bits];
                 let params_bytes = core::slice::from_raw_parts(
                     params.as_ptr().cast::<u8>(),
@@ -18805,48 +18387,6 @@ kernel void lc_fold_stripes_factored_b4(
         Some((eq, job, submitted))
     }
 
-    /// The lincheck wake's private scratch pair (made on first use, or by the
-    /// warm-up's [`warm_gpu_spares`]).
-    fn lc_wake_scratch(gpu: &Gpu) -> Option<(usize, usize)> {
-        static SCRATCH: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
-        *SCRATCH.get_or_init(|| unsafe {
-            match (gpu.new_buffer(256 * 1024), gpu.new_buffer(256 * 32)) {
-                (Ok(d), Ok(t)) => Some((d as usize, t as usize)),
-                _ => None,
-            }
-        })
-    }
-
-    /// Untimed warm-up (see `super::ENV_NO_WARM_GPU_SPARES`): make the
-    /// lincheck wake's scratch pair when the wake can fire, and park `events`
-    /// fresh completion events in the done-event pool.
-    pub(crate) fn warm_gpu_spares(events: usize) {
-        let Ok(gpu) = gpu() else { return };
-        if super::gpu_lincheck_enabled() && super::lc_gpu_wake_enabled() {
-            let _ = lc_wake_scratch(gpu);
-        }
-        if super::gpu_done_event_enabled() {
-            let mut fresh = Vec::with_capacity(events);
-            for _ in 0..events {
-                let ev: Id = unsafe {
-                    send!(
-                        gpu.api,
-                        unsafe extern "C" fn(Id, Sel) -> Id,
-                        gpu.device,
-                        c"newSharedEvent"
-                    )
-                };
-                if ev.is_null() {
-                    break;
-                }
-                // Value 0: `arm_done` arms it to 1, exactly like an event it
-                // makes itself on a pool miss.
-                fresh.push((ev as usize, 0u64));
-            }
-            DONE_POOL.lock().unwrap_or_else(|e| e.into_inner()).extend(fresh);
-        }
-    }
-
     /// Lincheck GPU wake (see `ENV_NO_LC_GPU_WAKE`): one leaf-kernel
     /// threadgroup on a private scratch pair, fire-and-forget on the main
     /// queue. Only once the lincheck split is tuned (timed proves) and only
@@ -18861,7 +18401,13 @@ kernel void lc_fold_stripes_factored_b4(
             return;
         }
         let Ok(gpu) = gpu() else { return };
-        let Some((data, tree)) = lc_wake_scratch(gpu) else {
+        static SCRATCH: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+        let Some((data, tree)) = *SCRATCH.get_or_init(|| unsafe {
+            match (gpu.new_buffer(256 * 1024), gpu.new_buffer(256 * 32)) {
+                (Ok(d), Ok(t)) => Some((d as usize, t as usize)),
+                _ => None,
+            }
+        }) else {
             return;
         };
         unsafe {
@@ -21473,13 +21019,6 @@ kernel void zc_r2_horner_oracle(
     /// kernel's does not (the warm-up GPU clock), and no extra warm-up
     /// replays are spent on it.
     const ZC_R2_CS_PRICE: f64 = 1.75;
-    /// The R2-CS kernel's measured price (`super::ENV_NO_ZC_R2_CS_SHARE`):
-    /// its calibration wall per chunk over the incumbent kernel's, f64 bits;
-    /// 0 = not measured.
-    static ZC_R2_CS_MEASURED_PRICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    /// The incumbent kernel's measured ratio `m` of the calibration (f64
-    /// bits; 0 = none), for the measured share.
-    static ZC_R2_INC_RATIO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     #[cfg(test)]
     pub(crate) fn zc_r2_test_reset() {
@@ -22689,58 +22228,12 @@ kernel void zc_r2_horner_oracle(
             return if ratio < ZC_R2_FLOOR_MAX_RATIO { hi_size / 8 } else { 0 };
         }
         let g = (hi_size as f64 / (ratio + 1.0)).round() as usize;
-        let record = g.clamp(hi_size / 8, zc_r2_cs_record_max_share(hi_size));
-        zc_r2_cs_measured_share(
-            record,
-            hi_size,
-            f64::from_bits(ZC_R2_CS_MEASURED_PRICE.load(std::sync::atomic::Ordering::Relaxed)),
-            f64::from_bits(ZC_R2_INC_RATIO.load(std::sync::atomic::Ordering::Relaxed)),
-            super::zc_r2_cs_measured_share_enabled(),
-        )
-    }
-
-    /// The measured share (see `super::ENV_NO_ZC_R2_CS_SHARE`). `record` is
-    /// the record rule's share, `p` the R2-CS kernel's measured price, `m`
-    /// the incumbent kernel's measured ratio. Returns `record` unless the
-    /// item is on, the record's share sits at its cap, and `p` is a finite
-    /// positive number below the constant price; then
-    /// `hi / (1 + rho0 - (PRICE - p) m)` within `[record, ceiling]`.
-    pub(crate) fn zc_r2_cs_measured_share(record: usize, hi_size: usize, p: f64, m: f64, on: bool) -> usize {
-        let cap = zc_r2_cs_record_max_share(hi_size);
-        // Test builds only (`FLOCK_ZC_R2_CS_TEST_SHARE=<n>` in the BUILD
-        // environment): the share is `n` within the ceiling, so a machine
-        // whose own measurement never moves it can exercise the longer
-        // prefix. Other builds have no such path.
-        if on && let Some(n) = option_env!("FLOCK_ZC_R2_CS_TEST_SHARE").and_then(|v| v.parse::<usize>().ok()) {
-            return n.clamp(hi_size / 8, hi_size * super::ZC_R2_CS_SHARE_CEIL_PCT / 100);
-        }
-        if !on || record != cap || cap == 0 || !(p.is_finite() && m.is_finite()) || m <= 0.0 {
-            return record;
-        }
-        if p >= ZC_R2_CS_PRICE || p < super::ZC_R2_CS_PRICE_FLOOR {
-            return record;
-        }
-        let rho0 = (hi_size - cap) as f64 / cap as f64;
-        let rho = rho0 - (ZC_R2_CS_PRICE - p) * m;
-        if !(rho.is_finite()) || rho <= 0.0 {
-            return record;
-        }
-        let ceil = hi_size * super::ZC_R2_CS_SHARE_CEIL_PCT / 100;
-        ((hi_size as f64 / (1.0 + rho)).floor() as usize).clamp(record, ceil.max(record))
-    }
-
-    /// The record's cap on the R2-CS prefix.
-    fn zc_r2_cs_record_max_share(hi_size: usize) -> usize {
-        hi_size * 37 / 100
+        g.clamp(hi_size / 8, zc_r2_cs_max_share(hi_size))
     }
 
     /// The largest prefix R2-CS is ever handed (the share clamp's ceiling).
     fn zc_r2_cs_max_share(hi_size: usize) -> usize {
-        if super::zc_r2_cs_measured_share_enabled() {
-            hi_size * super::ZC_R2_CS_SHARE_CEIL_PCT / 100
-        } else {
-            zc_r2_cs_record_max_share(hi_size)
-        }
+        hi_size * 37 / 100
     }
 
     /// R2-CS admission once the calibration prove's sweep has joined: `ok` =
@@ -22918,16 +22411,10 @@ kernel void zc_r2_horner_oracle(
 
             // R2-CS oracle dispatch of the calibration (scratch compact state):
             // joined first, so no return below leaves it in flight.
-            let mut cs_wall_ms = 0.0f64;
             let cs_calib = if job.cs_cb.is_null() {
                 None
             } else {
                 let ok = gpu.wait_cb(job.cs_cb).is_ok();
-                if ok {
-                    // The R2-CS kernel's own GPU wall over the calibration
-                    // chunks (see `super::ENV_NO_ZC_R2_CS_SHARE`).
-                    cs_wall_ms = zc_fold_gpu_wall_ms(gpu, job.cs_cb);
-                }
                 gpu.release(job.cs_cb);
                 Some(ok.then(|| merge(state.cs_part_buf, 8)))
             };
@@ -23048,25 +22535,6 @@ kernel void zc_r2_horner_oracle(
                 let r_cs = zc_r2_forced_ratio().unwrap_or(ZC_R2_CS_PRICE * measured);
                 if job.cs.is_some() {
                     ZC_R2_CS_RATIO.store(r_cs.to_bits(), Ordering::Relaxed);
-                    // Measured price of the R2-CS kernel: its wall per chunk
-                    // over the incumbent's, both over the calibration chunks
-                    // of this warm-up (0 = no usable wall: the record's rule).
-                    let p = if cs_wall_ms > 0.0 && u_gpu > 0.0 { (cs_wall_ms / job.chunks as f64) / u_gpu } else { 0.0 };
-                    ZC_R2_CS_MEASURED_PRICE.store(p.to_bits(), Ordering::Relaxed);
-                    ZC_R2_INC_RATIO.store(measured.to_bits(), Ordering::Relaxed);
-                    if super::gpu_zc_r2_debug() {
-                        eprintln!(
-                            "[zc-r2] R2-CS measured price p={p:.3} (constant {ZC_R2_CS_PRICE}, floor {}), incumbent ratio m={measured:.3}, \
-                             measured share {} of {hi_size} (record rule {}), anchors view over {} chunks",
-                            super::ZC_R2_CS_PRICE_FLOOR,
-                            zc_r2_cs_gate_share(r_cs, hi_size),
-                            {
-                                let g = (hi_size as f64 / (r_cs + 1.0)).round() as usize;
-                                g.clamp(hi_size / 8, zc_r2_cs_record_max_share(hi_size))
-                            },
-                            super::zc_r2_cs_view_chunks(hi_size).max(super::gpu_zc_k_share()),
-                        );
-                    }
                 }
                 let g = zc_r2_gate_share(ratio, hi_size);
                 if super::gpu_zc_r2_debug() {
@@ -24814,10 +24282,6 @@ kernel void zc_ab_finish(
 
     // Zerocheck 5+6 GPU prefix arm (see `ENV_NO_ZC_T56_GPU`): chained on
     // the K arm's output buffers above.
-    // Tri pass 0 GPU arm (see `ENV_NO_ZC_T0_GPU`): chained on the 5+6
-    // arm's output buffers.
-    mod t0_metal;
-    pub(crate) use t0_metal::{T0_HI, T0_IN, T0_OUT, ZcT0Job, zc_t0_fire, zc_t0_park, zc_t0_prewarm, zc_t0_verdict};
     mod t56_metal;
     pub(crate) use t56_metal::{
         ZcT56Job, ZcT56Result, launch_zc_t56_prefix, zc_t56_prewarm, zc_t56_prewarm_wanted, zc_t56_verdict,
@@ -26950,10 +26414,6 @@ pub(crate) use imp::{
     zc_k_prewarm_wanted, zc_k_verdict, zc_k_wait,
 };
 
-/// Tri pass 0 GPU arm (see `ENV_NO_ZC_T0_GPU`).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use imp::{T0_HI, T0_IN, T0_OUT, ZcT0Job, zc_t0_fire, zc_t0_prewarm, zc_t0_verdict};
-
 /// Zerocheck 5+6 GPU prefix arm (see `ENV_NO_ZC_T56_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
@@ -27778,6 +27238,52 @@ mod tests {
                 preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
                 let want = u32::from_le_bytes(blake3::hash(&preimage).as_bytes()[..4].try_into().unwrap());
                 assert_eq!(v[0] ^ v[8], want, "digest={d} nonce={nonce}");
+            }
+        }
+    }
+
+    /// The claim scan (`blake3_pow_scan_v3`, the default pipeline unless
+    /// `FLOCK_NO_GRIND_CLAIM=1`) against an ascending CPU search: matches at
+    /// scattered offsets of blocks wider than one claim round, blocks that
+    /// start mid-range, every scan run twice in a row on the same result
+    /// buffer (the cursor starts at 0 each time), and bit counts alternating
+    /// between scans so a low `best` is followed by a high one.
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn claim_scan_matches_ascending_search() {
+        fn cpu(digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<u64> {
+            (start..start + u64::from(len)).find(|&nonce| {
+                let mut preimage = [0u8; 64];
+                preimage[..32].copy_from_slice(digest);
+                preimage[32..40].copy_from_slice(&nonce.to_le_bytes());
+                let h = blake3::hash(&preimage);
+                let b = h.as_bytes();
+                let full = (bits / 8) as usize;
+                let extra = bits % 8;
+                b[..full].iter().all(|&x| x == 0) && (extra == 0 || b[full] >> (8 - extra) == 0)
+            })
+        }
+        assert_eq!(
+            super::grind_claim_enabled(),
+            std::env::var(super::ENV_NO_GRIND_CLAIM).map_or(true, |v| v != "1") && super::grind_scan_v2_enabled()
+        );
+        for d in 0u8..8 {
+            let digest: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(97).wrapping_add(d.wrapping_mul(41)));
+            for (start, len, bits) in [
+                (0u64, 1u32 << 16, 12u32),
+                (0, 1u32 << 17, 14),
+                (40_000, 1u32 << 16, 13),
+                (0, 1u32 << 16, 2),
+                (5, 300, 9),
+            ] {
+                let want = cpu(&digest, start, len, bits);
+                for rep in 0..2 {
+                    let got = match gpu_or_skip(gpu_blake3_pow_scan(&digest, start, len, bits)) {
+                        Some(result) => result,
+                        None => return,
+                    };
+                    assert_eq!(got, want, "digest={d} start={start} len={len} bits={bits} rep={rep}");
+                }
             }
         }
     }

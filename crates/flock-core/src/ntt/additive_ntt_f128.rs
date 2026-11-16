@@ -294,42 +294,6 @@ fn deep_subtree_pairs_enabled() -> bool {
     *ON
 }
 
-/// Radix-8 lead of an odd deep-layer count in the fused-pair deep subtree
-/// (see `try_deep_radix8_lead`); exactly `FLOCK_NO_DEEP_RADIX8_LEAD=1`
-/// restores the lone first layer. Same butterflies and twiddles either way.
-/// Read once per process (a plain atomic, no lazy-cell instance).
-#[inline]
-fn deep_radix8_lead_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    #[cfg(test)]
-    if let Some(on) = DEEP_RADIX8_LEAD_OVERRIDE.with(|o| o.get()) {
-        return on;
-    }
-    // 0: not read yet, 1: on, 2: off.
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("FLOCK_NO_DEEP_RADIX8_LEAD").as_deref() != Some(std::ffi::OsStr::new("1"));
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Per-thread switch override so one test can run both leads side by side.
-    static DEEP_RADIX8_LEAD_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Sub-transforms that took the radix-8 lead, counted only while the
-/// recursive NTT trace is on (`FLOCK_TRACE_RECURSIVE_L1_NTT_EPOOL=1`), which
-/// prints it per recursive L1/L2 transform.
-static DEEP_RADIX8_LEADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 #[inline]
 fn small_transform_pairs_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1130,8 +1094,6 @@ impl AdditiveNttF128 {
                 crate::epool::helper_broadcasts_issued(),
             )
         });
-        let leads_before =
-            if trace { DEEP_RADIX8_LEADS.load(std::sync::atomic::Ordering::Relaxed) } else { 0 };
         if let Some(helper) = recursive_l1_helper {
             self.forward_transform_interleaved_recursive_deep_with_helper_and_then(
                 data,
@@ -1154,14 +1116,11 @@ impl AdditiveNttF128 {
             eprintln!(
                 "[recursive-l1-ntt-epool] helper={} top_ms={top_ms:.3} \
                  top_claims={top_claims} top_broadcasts={top_broadcasts} deep_ms={:.3} \
-                 deep_claims={} deep_broadcasts={} radix8_leads={}",
+                 deep_claims={} deep_broadcasts={}",
                 recursive_l1_helper.is_some(),
                 started.elapsed().as_secs_f64() * 1e3,
                 crate::epool::helper_chunks_claimed().wrapping_sub(claims),
                 crate::epool::helper_broadcasts_issued().wrapping_sub(broadcasts),
-                DEEP_RADIX8_LEADS
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .wrapping_sub(leads_before),
             );
         }
     }
@@ -2279,8 +2238,6 @@ impl AdditiveNttF128 {
     /// whose three twiddles have a zero high limb takes the 2-PMULL kernel
     /// (an exact specialization of the general multiply). Recursive L1
     /// (13 deep layers) goes from 13 sweeps to 7, L2 (10) from 10 to 5.
-    /// The odd lead layer and the first pair run as one radix-8 pass where
-    /// [`Self::try_deep_radix8_lead`] accepts the sub-transform.
     #[inline(always)]
     fn forward_transform_interleaved_deep_subtree_pairs(
         &self,
@@ -2293,26 +2250,22 @@ impl AdditiveNttF128 {
     ) {
         let mut layer = n_top.max(start_layer);
         if layer < log_d && (log_d - layer) % 2 == 1 {
-            if self.try_deep_radix8_lead(sub_data, num_ntts, layer, n_top, log_d, sub_idx) {
-                layer += 3;
-            } else {
-                let layer_in_sub = layer - n_top;
-                let num_blocks_in_sub = 1usize << layer_in_sub;
-                let block_size = 1usize << (log_d - layer);
-                let block_bytes = block_size * num_ntts;
-                for block_in_sub in 0..num_blocks_in_sub {
-                    let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
-                    let twiddle = self.twiddle(layer, global_block);
-                    let block_start = block_in_sub * block_bytes;
-                    butterfly_interleaved_block(
-                        &mut sub_data[block_start..block_start + block_bytes],
-                        twiddle,
-                        block_size >> 1,
-                        num_ntts,
-                    );
-                }
-                layer += 1;
+            let layer_in_sub = layer - n_top;
+            let num_blocks_in_sub = 1usize << layer_in_sub;
+            let block_size = 1usize << (log_d - layer);
+            let block_bytes = block_size * num_ntts;
+            for block_in_sub in 0..num_blocks_in_sub {
+                let global_block = sub_idx * num_blocks_in_sub + block_in_sub;
+                let twiddle = self.twiddle(layer, global_block);
+                let block_start = block_in_sub * block_bytes;
+                butterfly_interleaved_block(
+                    &mut sub_data[block_start..block_start + block_bytes],
+                    twiddle,
+                    block_size >> 1,
+                    num_ntts,
+                );
             }
+            layer += 1;
         }
         // One fused pair (`layer`, `layer + 1`) over the sub-transform's
         // blocks `block_lo..block_hi` of that layer.
@@ -2371,72 +2324,6 @@ impl AdditiveNttF128 {
             layer = log_d;
         }
         debug_assert_eq!(layer, log_d.max(n_top.max(start_layer)));
-    }
-
-    /// Radix-8 lead of an odd deep-layer count. The lone first layer and the
-    /// pair after it are three layers inside each layer-`layer` block, so one
-    /// pass of the radix-8 row kernel runs them: the same butterflies with the
-    /// same twiddles, one sweep of the sub-transform for the three layers
-    /// instead of two, half the row loads and stores, and fewer vector
-    /// operations per butterfly than the lone layer plus the pair.
-    /// Returns `false` without touching `sub_data` (the caller then runs the
-    /// lone layer) when fewer than three layers remain, when the vector
-    /// radix-8 rows are off, or when a block's first pair would take one of
-    /// the low-limb pair kernels, which the general radix-8 row does not
-    /// undercut.
-    fn try_deep_radix8_lead(
-        &self,
-        sub_data: &mut [F128],
-        num_ntts: usize,
-        layer: usize,
-        n_top: usize,
-        log_d: usize,
-        sub_idx: usize,
-    ) -> bool {
-        if log_d < layer + 3 || !deep_radix8_lead_enabled() || !kernels::vector_resident_rows() {
-            return false;
-        }
-        let num_blocks_in_sub = 1usize << (layer - n_top);
-        let block_size = 1usize << (log_d - layer);
-        let eighth = block_size >> 3;
-        let block_elems = block_size * num_ntts;
-        debug_assert_eq!(sub_data.len(), num_blocks_in_sub * block_elems);
-        let block_twiddles = |global_block: usize| {
-            let mut tw = [F128::ZERO; 7];
-            tw[0] = self.twiddle(layer, global_block);
-            for s in 0..2 {
-                tw[1 + s] = self.twiddle(layer + 1, 2 * global_block + s);
-            }
-            for s in 0..4 {
-                tw[3 + s] = self.twiddle(layer + 2, 4 * global_block + s);
-            }
-            tw
-        };
-        // The pair path picks a low-limb kernel for a layer-`layer + 1` block
-        // whose two inner twiddles both have a zero high limb.
-        let low_pair =
-            |tw: &[F128; 7]| (tw[3].hi == 0 && tw[4].hi == 0) || (tw[5].hi == 0 && tw[6].hi == 0);
-        let first = sub_idx * num_blocks_in_sub;
-        if (first..first + num_blocks_in_sub).any(|b| low_pair(&block_twiddles(b))) {
-            return false;
-        }
-        let base = sub_data.as_mut_ptr();
-        for block_in_sub in 0..num_blocks_in_sub {
-            let tw = block_twiddles(first + block_in_sub);
-            // SAFETY: the block is the `block_elems` run at this offset of
-            // `sub_data`, borrowed exclusively here; its row groups
-            // `0..eighth` cover exactly its `8 * eighth` positions.
-            unsafe {
-                let block_base = base.add(block_in_sub * block_elems);
-                let zero_root = tw[0] == F128::ZERO && tw[1] == F128::ZERO && tw[3] == F128::ZERO;
-                let ran = kernels::butterfly_fused_3layer_lead_rows(block_base, eighth, num_ntts, &tw, zero_root);
-                debug_assert!(ran, "the vector rows were checked on above");
-            }
-        }
-        if trace_recursive_ntt_epool() {
-            DEEP_RADIX8_LEADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        true
     }
 
     /// Finish layers `n_top..log_d` two at a time inside independent
@@ -5188,55 +5075,6 @@ mod mf_deep_l1_groups {
                     "grouped order diverges (log_d {log_d}, start {start_layer}, {budget_kib} KiB)"
                 );
             }
-        }
-    }
-
-    /// The radix-8 lead of an odd deep-layer count equals the lone first
-    /// layer plus the first pair (same thread, switch override), for every
-    /// sub-transform (the zero-root one and the others), with grouping off
-    /// and on, at scaled recursive-L1 shapes and at one whose deep layers
-    /// start below the sub layer (several blocks per sub-transform).
-    #[test]
-    fn deep_radix8_lead_matches_lone_layer() {
-        let num_ntts = 8usize;
-        let mut leads = 0usize;
-        for (log_d, start_layer, n_top) in [(16usize, 3usize, 3usize), (15, 4, 4), (13, 2, 2), (14, 5, 3)] {
-            let ntt = AdditiveNttF128::standard(log_d);
-            let src = rng_vec(0x7d1e_93a0_5c4b_2f61 ^ log_d as u64, (1usize << log_d) * num_ntts);
-            let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
-            for budget in [0usize, 64 << 10] {
-                let run = |lead: bool| {
-                    DEEP_RADIX8_LEAD_OVERRIDE.with(|o| o.set(Some(lead)));
-                    DEEP_GROUP_BUDGET_OVERRIDE.with(|b| b.set(Some(budget)));
-                    let mut data = src.clone();
-                    for (sub_idx, sub_data) in data.chunks_exact_mut(sub_elems).enumerate() {
-                        ntt.forward_transform_interleaved_deep_subtree(
-                            sub_data, num_ntts, start_layer, n_top, log_d, sub_idx,
-                        );
-                    }
-                    DEEP_GROUP_BUDGET_OVERRIDE.with(|b| b.set(None));
-                    DEEP_RADIX8_LEAD_OVERRIDE.with(|o| o.set(None));
-                    data
-                };
-                let lone = run(false);
-                assert!(lone != src);
-                assert!(
-                    run(true) == lone,
-                    "radix-8 lead diverges (log_d {log_d}, start {start_layer}, n_top {n_top}, budget {budget})"
-                );
-            }
-            DEEP_RADIX8_LEAD_OVERRIDE.with(|o| o.set(Some(true)));
-            for sub_idx in 0..1usize << n_top {
-                let mut scratch = src[sub_idx * sub_elems..(sub_idx + 1) * sub_elems].to_vec();
-                let layer = n_top.max(start_layer);
-                if ntt.try_deep_radix8_lead(&mut scratch, num_ntts, layer, n_top, log_d, sub_idx) {
-                    leads += 1;
-                }
-            }
-            DEEP_RADIX8_LEAD_OVERRIDE.with(|o| o.set(None));
-        }
-        if kernels::vector_resident_rows() {
-            assert!(leads > 0, "no sub-transform took the radix-8 lead");
         }
     }
 
