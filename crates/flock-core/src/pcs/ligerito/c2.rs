@@ -429,6 +429,8 @@ impl Dual {
     }
 }
 
+const C2_SEQ_MAX_STATE: usize = 1 << 15;
+
 pub(super) struct Pending {
     dual: Dual,
     enforced: F128,
@@ -474,6 +476,28 @@ impl Pending {
         assert!(self.glued && self.challenges.len() < d);
         self.challenges.push(r);
         let complete = self.challenges.len() == d;
+        if sc.f.len() <= C2_SEQ_MAX_STATE && crate::small_serial_enabled() {
+            let mut message = sc.fold(r);
+            let correction = self.dual.message(&self.challenges);
+            message.u_0 += correction.u_0;
+            message.u_2 += correction.u_2;
+            *sc.transcript.last_mut().expect("fold records a message") = message;
+            if !complete {
+                return (message, false);
+            }
+            assert!(
+                sc.pending_glue.is_none()
+                    && sc.pending_fold_basis.is_none()
+                    && sc.pending_ood_eq.is_none()
+            );
+            let basis = self.dual.materialize(&self.challenges);
+            assert_eq!(basis.len(), sc.combined_basis.len());
+            for (dst, &src) in sc.combined_basis.iter_mut().zip(&basis) {
+                *dst += src;
+            }
+            crate::scratch::give_sparse_ntt_data(basis);
+            return (message, true);
+        }
         if complete {
             assert!(
                 sc.pending_glue.is_none()

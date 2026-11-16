@@ -6290,6 +6290,8 @@ impl RoundQuad {
     }
 }
 
+const SMALL_SERIAL_MAX_LOG_STATE: usize = 15;
+
 /// Enable the previously-promoted two-challenge initial-fold cadence only for
 /// the ranked opening geometry it was designed and validated for. The opt-out
 /// keeps an adjacent single-fold control available without rebuilding.
@@ -10603,20 +10605,22 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         };
         let _t = std::time::Instant::now();
         let ((merkle_proof_i, opened_rows_i), sparse_deep_i) = if use_deep_c2 {
-            let (dual, opened) = rayon::join(
-                || {
-                    c2::Dual::new_sync(
-                        3,
-                        n_next + config.log_inv_rates[i + 1],
-                        config.log_inv_rates[i + 1],
-                        &level_rs,
-                        &queries_i,
-                        &alpha_i,
-                        |q| wtns_prev.row(q),
-                    )
-                },
-                open_i,
-            );
+            let dual_i = || {
+                c2::Dual::new_sync(
+                    3,
+                    n_next + config.log_inv_rates[i + 1],
+                    config.log_inv_rates[i + 1],
+                    &level_rs,
+                    &queries_i,
+                    &alpha_i,
+                    |q| wtns_prev.row(q),
+                )
+            };
+            let (dual, opened) = if n_next <= SMALL_SERIAL_MAX_LOG_STATE && crate::small_serial_enabled() {
+                (dual_i(), open_i())
+            } else {
+                rayon::join(dual_i, open_i)
+            };
             (opened, Some(dual))
         } else {
             (open_i(), None)

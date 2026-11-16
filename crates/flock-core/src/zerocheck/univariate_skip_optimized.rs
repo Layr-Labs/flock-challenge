@@ -1049,6 +1049,146 @@ pub struct Round1AbProducer<'a> {
     pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync),
 }
 
+pub const ENV_NO_R2_AB_REBUILD: &str = "FLOCK_NO_R2_AB_REBUILD";
+
+fn r2_ab_rebuild_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_R2_AB_REBUILD).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+static R2_AB_REBUILD_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn round2_ab_rebuild_latch_off() {
+    R2_AB_REBUILD_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+type AbProduceFn = dyn Fn(usize, *mut u8, *mut u8, bool) + Sync;
+
+#[derive(Clone, Copy)]
+pub(crate) struct Round2AbRebuild {
+    a: usize,
+    b: usize,
+    len: usize,
+    pub(crate) published: usize,
+    pub(crate) rebuild_from: usize,
+    pub(crate) unit_bytes: usize,
+    produce: &'static AbProduceFn,
+    pub(crate) id: u64,
+}
+
+impl Round2AbRebuild {
+    ///
+    /// # Safety
+    #[inline(always)]
+    pub(crate) unsafe fn produce_into(&self, unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool) {
+        (self.produce)(unit, a_scratch, b_scratch, primed)
+    }
+
+    pub(crate) fn complete_globals(&self) {
+        use rayon::prelude::*;
+        let produce = self.produce;
+        (self.published / self.unit_bytes..self.len / self.unit_bytes)
+            .into_par_iter()
+            .with_min_len(64)
+            .for_each(|unit| produce(unit, core::ptr::null_mut(), core::ptr::null_mut(), false));
+    }
+}
+
+static R2_AB_REBUILDS: std::sync::Mutex<Vec<Round2AbRebuild>> = std::sync::Mutex::new(Vec::new());
+static R2_AB_REBUILD_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub struct Round2AbRebuildScope<'a> {
+    id: u64,
+    _producer: core::marker::PhantomData<&'a ()>,
+}
+
+impl Drop for Round2AbRebuildScope<'_> {
+    fn drop(&mut self) {
+        let mut list = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|r| r.id != self.id);
+    }
+}
+
+pub fn round2_ab_rebuild_published_bytes(total_bytes: usize) -> Option<usize> {
+    let (cap, hi_size, chunk_bytes) = round2_ab_rebuild_geometry(total_bytes)?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_reads = crate::gpu_commit::zc_r2_gpu_read_bound(hi_size);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let gpu_reads = {
+        let _ = hi_size;
+        0usize
+    };
+    (gpu_reads <= cap).then_some(cap * chunk_bytes)
+}
+
+pub fn round2_ab_rebuild_complete_from_bytes(total_bytes: usize) -> Option<usize> {
+    let (cap, _, chunk_bytes) = round2_ab_rebuild_geometry(total_bytes)?;
+    Some(round2_ab_rebuild_cpu_from(cap * chunk_bytes))
+}
+
+pub fn round2_ab_rebuild_cpu_from(published: usize) -> usize {
+    published
+}
+
+fn round2_ab_rebuild_geometry(total_bytes: usize) -> Option<(usize, usize, usize)> {
+    if !r2_ab_rebuild_enabled() || R2_AB_REBUILD_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    if !total_bytes.is_power_of_two() {
+        return None;
+    }
+    let m = (total_bytes * 8).trailing_zeros() as usize;
+    let (hi_size, chunk_bytes) = crate::zerocheck::multilinear::round2_lookahead_chunk_geometry(m)?;
+    if hi_size * chunk_bytes != total_bytes {
+        return None;
+    }
+    let cap = hi_size * crate::gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT / 100;
+    (cap > 0 && cap < hi_size).then_some((cap, hi_size, chunk_bytes))
+}
+
+///
+/// # Safety
+pub unsafe fn round2_ab_rebuild_scope<'a>(
+    a_packed: *const u8,
+    b_packed: *const u8,
+    len: usize,
+    published: usize,
+    rebuild_from: usize,
+    producer: Round1AbProducer<'a>,
+) -> Round2AbRebuildScope<'a> {
+    assert!(producer.unit_bytes > 0 && published.is_multiple_of(producer.unit_bytes));
+    assert!(rebuild_from <= published && rebuild_from.is_multiple_of(producer.unit_bytes));
+    assert!(published <= len && len.is_multiple_of(producer.unit_bytes));
+    let id = R2_AB_REBUILD_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let produce: &'static AbProduceFn = unsafe {
+        core::mem::transmute::<&'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync + 'a), &'static AbProduceFn>(
+            producer.produce,
+        )
+    };
+    let mut list = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+    list.push(Round2AbRebuild {
+        a: a_packed as usize,
+        b: b_packed as usize,
+        len,
+        published,
+        rebuild_from,
+        unit_bytes: producer.unit_bytes,
+        produce,
+        id,
+    });
+    Round2AbRebuildScope { id, _producer: core::marker::PhantomData }
+}
+
+pub(crate) fn round2_ab_rebuild_take(a_packed: &[u8], b_packed: &[u8]) -> Option<Round2AbRebuild> {
+    let mut list = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+    let at = list.iter().position(|r| {
+        r.a == a_packed.as_ptr() as usize && r.b == b_packed.as_ptr() as usize && r.len == a_packed.len() && r.len == b_packed.len()
+    })?;
+    Some(list.swap_remove(at))
+}
+
 /// Same-binary control for the fused producer path: with exactly
 /// `FLOCK_NO_ZC_AB_PRODUCER_FUSED=1` every unit is produced up front (no
 /// scratch) and the incumbent precompute then reads the buffers.

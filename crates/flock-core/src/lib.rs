@@ -76,6 +76,13 @@ pub(crate) fn spawn_publish_warm_hook() {
     }
 }
 
+pub const ENV_NO_SMALL_SERIAL: &str = "FLOCK_NO_SMALL_SERIAL";
+
+pub(crate) fn small_serial_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_SMALL_SERIAL).as_deref() != Some(std::ffi::OsStr::new("1")))
+}
+
 /// Unlike `ab_compact_store_enabled` this does **not** latch the first read
 /// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
 /// per-call `var_os` read is noise, and re-reading keeps same-process A/B

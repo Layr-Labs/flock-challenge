@@ -279,7 +279,62 @@ impl SplitEqGhash {
 /// Ports `ntt_extend_f128_vec_ghash` (scalar form). The NTT is F_2-linear and
 /// φ_8 commutes with that linearity, which is what makes the bit-by-bit
 /// decomposition equal to the direct F_8-valued NTT extension.
+///
 pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingleGf8) -> Vec<F128> {
+    if in_s.len() == NTT_EXT_ELL
+        && inv_table.ell == NTT_EXT_ELL
+        && ntt_ext_matrix_enabled()
+        && std::ptr::eq(inv_table, InvNttTableByteSingleGf8::cached_standard_k6())
+    {
+        return ntt_extend_matrix(in_s, ntt_ext_matrix_k6());
+    }
+    ntt_extend_f128_vec_ghash_bitplanes(in_s, inv_table)
+}
+
+const NTT_EXT_ELL: usize = 64;
+
+fn ntt_ext_matrix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_NTT_EXT_MATRIX").is_none())
+}
+
+///
+fn ntt_ext_matrix_k6() -> &'static [F128] {
+    static PHI: std::sync::OnceLock<Vec<F128>> = std::sync::OnceLock::new();
+    PHI.get_or_init(|| {
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let mut phi = vec![F128::ZERO; NTT_EXT_ELL * NTT_EXT_ELL];
+        let mut unit = vec![F128::ZERO; NTT_EXT_ELL];
+        for s in 0..NTT_EXT_ELL {
+            unit[s] = F128::ONE;
+            let col = ntt_extend_f128_vec_ghash_bitplanes(&unit, table);
+            unit[s] = F128::ZERO;
+            for (lambda, value) in col.into_iter().enumerate() {
+                phi[lambda * NTT_EXT_ELL + s] = value;
+            }
+        }
+        phi
+    })
+}
+
+fn ntt_extend_matrix(in_s: &[F128], phi: &[F128]) -> Vec<F128> {
+    debug_assert_eq!(in_s.len(), NTT_EXT_ELL);
+    debug_assert_eq!(phi.len(), NTT_EXT_ELL * NTT_EXT_ELL);
+    phi.chunks_exact(NTT_EXT_ELL)
+        .map(|row| {
+            let mut acc = crate::field::F256Unreduced::ZERO;
+            for (m, v) in row.iter().zip(in_s) {
+                acc ^= m.mul_unreduced(*v);
+            }
+            acc.reduce()
+        })
+        .collect()
+}
+
+pub fn ntt_extend_f128_vec_ghash_bitplanes(
+    in_s: &[F128],
+    inv_table: &InvNttTableByteSingleGf8,
+) -> Vec<F128> {
     let ell = inv_table.ell;
     assert_eq!(in_s.len(), ell);
     assert_eq!(ell, 1usize << inv_table.k);
@@ -712,6 +767,51 @@ pub fn round1_evals_on_s(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ntt_extend_matrix_matches_bitplanes() {
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let phi = super::ntt_ext_matrix_k6();
+        let mut state = 0x4e54_5445_5854_4d58u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let mut cases: Vec<Vec<F128>> = Vec::new();
+        cases.push(vec![F128::ZERO; 64]);
+        cases.push(vec![F128 { lo: u64::MAX, hi: u64::MAX }; 64]);
+        for bit in [0u32, 1, 63, 64, 100, 127] {
+            for s in [0usize, 7, 63] {
+                let mut v = vec![F128::ZERO; 64];
+                v[s] = if bit < 64 {
+                    F128 { lo: 1u64 << bit, hi: 0 }
+                } else {
+                    F128 { lo: 0, hi: 1u64 << (bit - 64) }
+                };
+                cases.push(v);
+            }
+        }
+        for case in 0..64 {
+            let v: Vec<F128> = (0..64)
+                .map(|i| {
+                    if case % 4 == 1 && i % 5 != 0 {
+                        F128::ZERO
+                    } else {
+                        F128 { lo: next(), hi: next() }
+                    }
+                })
+                .collect();
+            cases.push(v);
+        }
+        for (i, v) in cases.iter().enumerate() {
+            let want = super::ntt_extend_f128_vec_ghash_bitplanes(v, table);
+            assert_eq!(super::ntt_extend_matrix(v, phi), want, "case {i}");
+            assert_eq!(super::ntt_extend_f128_vec_ghash(v, table), want, "dispatch, case {i}");
+        }
+    }
+
     use super::*;
 
     struct Rng(u64);
