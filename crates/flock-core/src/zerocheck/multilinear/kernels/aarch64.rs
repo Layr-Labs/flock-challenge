@@ -1440,11 +1440,15 @@ pub(crate) fn r2_on_efficiency_helper() -> bool {
 }
 
 /// Whether the K pass's packed CPU chunks on the performance-core workers fold
-/// through the seven-piece table (`FLOCK_NO_ZC_K_FOLD7=1` keeps the byte banks
-/// everywhere). Read once per process.
+/// through the seven-piece table. Off by default: the byte banks are faster
+/// on the CPU K pass (ranked-size probe `k_tail_compact_timing` on an M5 Pro,
+/// 8 threads: 8.37-8.40 ms with the byte banks vs 8.58-8.61 ms with fold7,
+/// three alternations), and the runner read the fold7 group +1.8 +- 1.7 ms
+/// slower (0xArion d4c5ba19). `FLOCK_ZC_K_FOLD7=1` opts in. Same field
+/// elements either way. Read once per process.
 pub(crate) fn zc_k_fold7_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_FOLD7").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_ZC_K_FOLD7").is_some_and(|v| v == *"1"))
 }
 
 /// The packed dead-tail instance of
