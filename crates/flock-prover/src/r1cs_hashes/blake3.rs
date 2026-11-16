@@ -4583,6 +4583,84 @@ pub(crate) mod witgen_simd {
         *ON
     }
 
+    /// Untimed warm-up probe for the ranked split tune's replay alignment
+    /// (`flock_core::gpu_commit::ENV_NO_SPLIT_TUNE_CPU_FIX`): an estimate,
+    /// in milliseconds, of the timed prove's witness phase on this machine
+    /// and pool. It runs an eighth of the witness kernel the timed prove
+    /// runs when A/B is deferred (the z-only split quad builder on seeded
+    /// word-major input, as [`generate_impl`] emits it) through the same
+    /// slab drain and pools as the timed witness, into a private anonymous
+    /// mapping that nothing else reads, and scales the time to `n_total`
+    /// blocks: one pass faults the mapping in and warms the code, and the
+    /// median of three timed passes is used. The input is a fixed state,
+    /// never a seed. `None` when the timed prove would not defer A/B, for a
+    /// shape the slices do not tile, or when the mapping fails.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn measure_deferred_witness_ms(n_total: usize) -> Option<f64> {
+        unsafe extern "C" {
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+            fn munmap(addr: *mut u8, len: usize) -> i32;
+        }
+        const SLICE_DIV: usize = 8;
+        const QUADS_PER_JOB: usize = 16;
+        const PROT_READ_WRITE: i32 = 0x1 | 0x2;
+        const MAP_PRIVATE_ANON: i32 = 0x0002 | 0x1000;
+        // Fixed input state: the probe's bytes are never read, and its cost
+        // does not depend on the input values.
+        const INIT: u64 = 0x7E57_5EED_0000_0001;
+        if !defer_ab_enabled() || n_total == 0 || !n_total.is_multiple_of(4 * SLICE_DIV * QUADS_PER_JOB) {
+            return None;
+        }
+        let quads = n_total / 4 / SLICE_DIV;
+        let quad_words = 4 * U32_PER_BLOCK;
+        let len = quads * quad_words * std::mem::size_of::<u32>();
+        // SAFETY: a fresh private anonymous mapping at a kernel-chosen
+        // address; failure is reported as all-ones.
+        let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0) };
+        if ptr.is_null() || ptr as isize == -1 {
+            return None;
+        }
+        let base = ptr as usize;
+        let jobs = quads / QUADS_PER_JOB;
+        let job = |j: usize| {
+            for q in j * QUADS_PER_JOB..(j + 1) * QUADS_PER_JOB {
+                let mut slot = std::mem::MaybeUninit::uninit();
+                let input = QuadInput::Seeded(crate::seed_pipe::gen_quad_soa_into(INIT, 4 * q, &mut slot));
+                // SAFETY: quad `q` owns words `q * quad_words ..` of the
+                // mapping (four blocks), and every job owns distinct quads;
+                // the z form writes z only.
+                unsafe {
+                    build_quad_split_neon::<true, false, false, false>(
+                        input,
+                        (base as *mut u32).add(q * quad_words),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+        };
+        let pass = || {
+            let t = std::time::Instant::now();
+            super::super::common::drain_witgen_slabs(jobs, &job);
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        let _ = pass();
+        let mut ms = [pass(), pass(), pass()];
+        ms.sort_by(f64::total_cmp);
+        // SAFETY: exactly the range mapped above, unmapped once, after every
+        // pass has joined.
+        unsafe { munmap(ptr, len) };
+        Some(ms[1] * SLICE_DIV as f64)
+    }
+
+    /// See the macOS version: no probe elsewhere (the record delay is kept).
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn measure_deferred_witness_ms(_n_total: usize) -> Option<f64> {
+        None
+    }
+
     /// Non-streamed entry (matches `drive_witness_packed_and_lincheck_full_write`).
     pub(crate) fn generate(
         blocks: &[Compression],
@@ -4845,6 +4923,21 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
 #[inline]
 fn should_request_ranked_exact_tune(call: usize, ranked_shape_enabled: bool) -> bool {
     call == 0 && ranked_shape_enabled
+}
+
+/// Block count the split tune's witness probe scales to (set at call zero;
+/// see [`split_tune_witness_probe`]).
+#[cfg(target_arch = "aarch64")]
+static SPLIT_TUNE_PROBE_BLOCKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Witness phase probe for the split tune's measured replay alignment
+/// (`flock_core::gpu_commit::ENV_NO_SPLIT_TUNE_CPU_FIX`): the deferred-A/B
+/// witness kernel the timed prove runs, timed at the warm-up's block count.
+#[cfg(target_arch = "aarch64")]
+fn split_tune_witness_probe() -> Option<f64> {
+    witgen_simd::measure_deferred_witness_ms(
+        SPLIT_TUNE_PROBE_BLOCKS.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// [`generate_witness_with_ab_packed_and_lincheck_streamed`] for the prover
@@ -5232,7 +5325,20 @@ impl Blake3Setup {
         // exact-contention ticket here, before witness generation, so only
         // warmup can calibrate and cache-hit workers skip the replay.
         if should_request_ranked_exact_tune(call, self.use_ranked_reverse_lincheck()) {
-            let _ = flock_core::gpu_commit::request_ranked_exact_contention_tune();
+            let requested = flock_core::gpu_commit::request_ranked_exact_contention_tune();
+            // Untimed: the split tune's measured replay alignment times this
+            // shape's witness kernel just before its sweep
+            // (`flock_core::gpu_commit::ENV_NO_SPLIT_TUNE_CPU_FIX`).
+            #[cfg(target_arch = "aarch64")]
+            if requested
+                && flock_core::gpu_commit::split_tune_cpu_fix_enabled()
+                && witgen_simd::enabled()
+            {
+                SPLIT_TUNE_PROBE_BLOCKS.store(self.n_blocks.next_power_of_two(), Ordering::Relaxed);
+                flock_core::gpu_commit::set_split_tune_witness_probe(split_tune_witness_probe);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            let _ = requested;
         }
         // Keepalive nudger removed: ranked submission 51a3127 measured the
         // stack containing it at −1.4% vs base (outside the ±0.3% band) —

@@ -244,6 +244,10 @@
 use crate::field::F128;
 use crate::ntt::AdditiveNttF128;
 
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+#[path = "gpu_commit/tune_cache.rs"]
+mod tune_cache;
+
 /// Env var that disables the GPU commit path entirely.
 pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
 
@@ -1502,6 +1506,86 @@ pub(crate) fn gpu_zc_loop_debug() -> bool {
 /// bytes). The ranked CI job pays the warmup in ~120 fresh processes
 /// against a hard 8-minute wall; this deletes the redundant ~119 repeats.
 pub const ENV_NO_WARMUP_LATCH_CACHE: &str = "FLOCK_NO_WARMUP_LATCH_CACHE";
+
+/// Kill switch for the measured confirmation of the split tune's pick:
+/// `FLOCK_NO_SPLIT_TUNE_STABLE=1` (any value; read once) keeps the
+/// incumbent pick. With the switch unset, a fine split (`k + 16 m`)
+/// proposed by the fit or the arm refinement is sampled itself, beside the
+/// same A/B replay as the sweep, and published only when it beats both
+/// coarse neighbours' measured walls; otherwise the cheaper coarse
+/// neighbour is published. Untimed warm-up only; the split never changes
+/// proof bytes and the published split is byte-verified as before.
+pub const ENV_NO_SPLIT_TUNE_STABLE: &str = "FLOCK_NO_SPLIT_TUNE_STABLE";
+
+pub(crate) fn split_tune_stable_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_SPLIT_TUNE_STABLE).is_none())
+}
+
+/// Diagnostic knob for the ranked split tune: `FLOCK_SPLIT_TUNE_CPU_BIAS=<n>`
+/// adds `n` 256ths of CPU share (16 = one sixteenth) to the tune's final
+/// decision, after the fit and the fine refinement and before the dead-store
+/// check, the byte verification and publication, so the sweep and every
+/// table it builds in the warm-up are kept. Unset, 0, negative or
+/// unparsable keeps the tune's decision unchanged. Read once, on first use
+/// (inside the untimed warm-up tune), so a value set with `set_var` at
+/// process start is seen. The split never changes proof bytes.
+pub const ENV_SPLIT_TUNE_CPU_BIAS: &str = "FLOCK_SPLIT_TUNE_CPU_BIAS";
+
+/// See [`ENV_SPLIT_TUNE_CPU_BIAS`]; in 256ths, at most 255.
+pub(crate) fn split_tune_cpu_bias() -> usize {
+    static BIAS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var(ENV_SPLIT_TUNE_CPU_BIAS)
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map_or(0, |v| v.clamp(0, 255) as usize)
+    });
+    *BIAS
+}
+
+/// Kill switch for the split tune's measured replay alignment:
+/// `FLOCK_NO_SPLIT_TUNE_CPU_FIX=1` (any value; read once) restores the
+/// record's replay delay of `phi` (`FLOCK_HYBRID_TUNE_LEAD_PHI`, default
+/// 0.5) times the sample's first pass. In the timed prove the A/B
+/// precompute starts when the witness phase ends, while the GPU's first
+/// pass started with the first band and the CPU suffix starts when that
+/// pass ends; so the A/B work leads the CPU suffix by the first pass minus
+/// the witness phase, and how much of the CPU suffix it contends with
+/// follows from that lead. With the switch unset and no explicit
+/// `FLOCK_HYBRID_TUNE_LEAD_PHI`, the ranked tune gives each sample's A/B
+/// replay the same lead: it starts the replay one witness phase after the
+/// re-prime (at most one first pass), the witness phase being the timed
+/// prove's own witness kernel, timed by a probe the prover registers
+/// ([`set_split_tune_witness_probe`]) and run by the tune just before its
+/// sweep, inside the same untimed warm-up. Without a probe or a usable
+/// measurement the record delay is kept. Warm-up sampling only: the split
+/// never changes proof bytes, and the published split is dead-store checked
+/// and byte-verified as before.
+pub const ENV_NO_SPLIT_TUNE_CPU_FIX: &str = "FLOCK_NO_SPLIT_TUNE_CPU_FIX";
+
+/// See [`ENV_NO_SPLIT_TUNE_CPU_FIX`].
+pub fn split_tune_cpu_fix_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_SPLIT_TUNE_CPU_FIX).is_none())
+}
+
+/// Witness phase probe for [`ENV_NO_SPLIT_TUNE_CPU_FIX`]: returns the
+/// timed witness phase estimate in milliseconds.
+static SPLIT_TUNE_WITNESS_PROBE: std::sync::OnceLock<fn() -> Option<f64>> = std::sync::OnceLock::new();
+
+/// Registers the prover's witness phase probe (first registration wins; see
+/// [`ENV_NO_SPLIT_TUNE_CPU_FIX`]). The ranked split tune runs it once, in
+/// the untimed warm-up, right before its sweep.
+#[doc(hidden)]
+pub fn set_split_tune_witness_probe(probe: fn() -> Option<f64>) {
+    let _ = SPLIT_TUNE_WITNESS_PROBE.set(probe);
+}
+
+/// Runs the registered witness phase probe; `None` without a probe or for a
+/// non-finite or non-positive result.
+pub(crate) fn split_tune_witness_ms() -> Option<f64> {
+    SPLIT_TUNE_WITNESS_PROBE.get().and_then(|probe| probe()).filter(|w| w.is_finite() && *w > 0.0)
+}
 
 pub(crate) fn warmup_latch_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -14367,6 +14451,9 @@ kernel void blake3_pow_race_tail(
         if let Some(k) = hybrid_cpu_split_override() {
             return k;
         }
+        if std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_some() {
+            return DEFAULT_HYBRID_K;
+        }
         match TUNED_HYBRID_K.load(std::sync::atomic::Ordering::Relaxed) {
             usize::MAX => DEFAULT_HYBRID_K,
             k => k,
@@ -14650,6 +14737,71 @@ kernel void blake3_pow_race_tail(
             base + 16 * best.0
         } else {
             k
+        }
+    }
+
+    /// Confirm a fine split using fresh, reverse-order samples of both coarse
+    /// neighbours and the fine split itself. Sweep samples select the region
+    /// only: their earlier clock/thermal regime must not compete with the
+    /// fresh fine timings. Keep the pick on any failed or invalid sample.
+    fn confirm_split_by_measurement<E>(
+        pick: usize,
+        _swept: &[(usize, [f64; 2])],
+        mut sample: impl FnMut(usize) -> Result<f64, E>,
+    ) -> usize {
+        let (base, m) = decode_hybrid_split(pick);
+        if m == 0 || base == 0 || base + 1 >= 16 {
+            return pick;
+        }
+        let splits = [base, pick, base + 1];
+        let mut walls = [[0.0f64; 2]; 3];
+        for round in 0..2 {
+            for position in 0..3 {
+                let i = if round == 0 { position } else { 2 - position };
+                match sample(splits[i]) {
+                    Ok(value) if value.is_finite() && value > 0.0 => walls[i][round] = value,
+                    _ => return pick,
+                }
+            }
+        }
+        let means = walls.map(|[a, b]| 0.5 * a + 0.5 * b);
+        let coarse_i = if means[2] < means[0] { 2 } else { 0 };
+        let repeatable = (0..2).all(|round| {
+            walls[1][round] < walls[0][round].min(walls[2][round]) * (1.0 - FINE_MARGIN)
+        });
+        if repeatable && means[1] < means[coarse_i] * (1.0 - FINE_MARGIN) {
+            pick
+        } else {
+            splits[coarse_i]
+        }
+    }
+
+    /// CPU share of a stored split in 256ths of the position range
+    /// (`16 k + m` for `k + 16 m`); 0 for the pure-GPU split.
+    fn split_cpu_share256(k_split: usize) -> usize {
+        let (k, m) = decode_hybrid_split(k_split);
+        16 * k + m
+    }
+
+    /// `k_split` with `bias256` 256ths more CPU share (see
+    /// `super::ENV_SPLIT_TUNE_CPU_BIAS`). The pure-GPU split and invalid
+    /// values are returned unchanged. The result is clamped to the storable
+    /// hybrid range (at most 255/256, at least one sixteenth); without the
+    /// fine path it is rounded to the nearest whole sixteenth (at most 15).
+    /// Every split shares the one per-`log_d` CPU-suffix twiddle table the
+    /// sweep prebuilds, and the biased split's own first run is the warm-up's
+    /// dead-store check and byte verification, so nothing it needs is built
+    /// in a timed prove.
+    fn bias_split_toward_cpu(k_split: usize, bias256: usize, allow_fine: bool) -> usize {
+        if bias256 == 0 || k_split == 0 || !hybrid_split_valid(k_split) {
+            return k_split;
+        }
+        let c = (split_cpu_share256(k_split) + bias256).clamp(16, 255);
+        if allow_fine {
+            let (k, m) = (c / 16, c % 16);
+            k + 16 * m
+        } else {
+            ((c + 8) / 16).clamp(1, 15)
         }
     }
 
@@ -14937,6 +15089,26 @@ kernel void blake3_pow_race_tail(
         )
     }
 
+    /// Whether the measured replay alignment applies: the kill switch is
+    /// unset and no explicit phi pins the record's delay rule (see
+    /// `super::ENV_NO_SPLIT_TUNE_CPU_FIX`).
+    fn tune_cpu_fix_applies() -> bool {
+        super::split_tune_cpu_fix_enabled() && std::env::var_os("FLOCK_HYBRID_TUNE_LEAD_PHI").is_none()
+    }
+
+    /// Replay delay (ms) of one ranked tune sample. The record delays the
+    /// A/B replay by `phi` of the first pass. With a measured witness phase
+    /// (`super::ENV_NO_SPLIT_TUNE_CPU_FIX`) the replay starts one witness
+    /// phase after the re-prime, as the timed A/B precompute starts when the
+    /// witness phase ends, capped at the first pass (a witness phase longer
+    /// than the first pass means the timed A/B starts with the CPU suffix).
+    fn tune_replay_delay_ms(phi: f64, first_pass_ms: f64, witness_ms: Option<f64>) -> f64 {
+        match witness_ms {
+            Some(w) if w.is_finite() && w > 0.0 => w.min(first_pass_ms).max(0.0),
+            _ => phi * first_pass_ms,
+        }
+    }
+
     /// Reprime is outside the score, but overlaps the replay just as the
     /// timed proof's first-pass wait does. None preserves simultaneous start.
     fn sample_ranked_exact_graph<E: Send>(
@@ -14952,6 +15124,9 @@ kernel void blake3_pow_race_tail(
         }
         let outer_fp_ms = tp.elapsed().as_secs_f64() * 1e3;
         let t0 = std::time::Instant::now();
+        // A delayed Rayon task has already spent part (or all) of the lead
+        // waiting in the pool. Never restart the full wait when it is picked up.
+        let replay_deadline = delay.map(|d| t0 + d);
         let (graph_arm, ()) = rayon::join(
             || {
                 let tp = std::time::Instant::now();
@@ -14968,8 +15143,8 @@ kernel void blake3_pow_race_tail(
                 Ok((tg, tg.elapsed().as_secs_f64() * 1e3, fp_ms))
             },
             || {
-                if let Some(d) = delay {
-                    std::thread::sleep(d);
+                if let Some(deadline) = replay_deadline {
+                    std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
                 }
                 replay();
             },
@@ -15445,7 +15620,7 @@ kernel void blake3_pow_race_tail(
             let c = &ctx;
             unsafe {
                 run_from_z_first_pass_then(c.gpu, c.z_buf, c.staging, c.tw_buf, params.k_code(), || {
-                    if !pre_cb2 || k == 0 || !(1..16).contains(&k) {
+                    if !pre_cb2 || k == 0 || !hybrid_split_valid(k) {
                         return Ok(());
                     }
                     let cb2 = encode_hybrid_prefix_cb2(
@@ -15464,8 +15639,20 @@ kernel void blake3_pow_race_tail(
             }
         };
         let (lead, extend, phi) = hybrid_tune_sampling();
+        // Measured replay alignment (`super::ENV_NO_SPLIT_TUNE_CPU_FIX`):
+        // time the timed prove's witness phase now, before the sweep.
+        let probe_t = std::time::Instant::now();
+        let witness_ms = if lead && tune_cpu_fix_applies() { super::split_tune_witness_ms() } else { None };
+        if dbg {
+            if let Some(w) = witness_ms {
+                eprintln!(
+                    "[gpu-commit] split cpu fix: witness phase {w:.3} ms (probe {:.3} ms); replay delay = min(witness phase, first pass)",
+                    probe_t.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+        }
         let mut first_pass_ms = None;
-        let sample = |k: usize| -> Result<f64, String> {
+        let mut sample = |k: usize| -> Result<f64, String> {
             let delay = if lead {
                 let fp_ms = match first_pass_ms {
                     Some(ms) => ms,
@@ -15475,7 +15662,9 @@ kernel void blake3_pow_race_tail(
                         tp.elapsed().as_secs_f64() * 1e3
                     }
                 };
-                Some(std::time::Duration::from_secs_f64(phi * fp_ms * 1e-3))
+                Some(std::time::Duration::from_secs_f64(
+                    tune_replay_delay_ms(phi, fp_ms, witness_ms) * 1e-3,
+                ))
             } else {
                 None
             };
@@ -15509,7 +15698,7 @@ kernel void blake3_pow_race_tail(
                 v.clear();
             }
             let _recording = ArmRecordScope::enter();
-            match collect_ranked_exact_samples(extend, sample) {
+            match collect_ranked_exact_samples(extend, &mut sample) {
                 Ok(samples) => samples,
                 Err(e) => {
                     if dbg {
@@ -15562,6 +15751,37 @@ kernel void blake3_pow_race_tail(
             s
         } else if hybrid_fine_enabled() {
             fine_split_from_arms(&fine_samples, chosen)
+        } else {
+            chosen
+        };
+        // Measured confirmation of a fine pick (`ENV_NO_SPLIT_TUNE_STABLE`).
+        let chosen = if super::split_tune_stable_enabled() {
+            let swept_rows: Vec<(usize, [f64; 2])> =
+                candidates.iter().copied().zip(samples.iter().copied()).collect();
+            let confirmed = confirm_split_by_measurement(chosen, &swept_rows, &mut sample);
+            if dbg && confirmed != chosen {
+                eprintln!("[gpu-commit] split confirm: fine pick {chosen} measured slower -> k={confirmed}");
+            }
+            confirmed
+        } else {
+            chosen
+        };
+        // Diagnostic CPU-ward bias of the final decision
+        // (`ENV_SPLIT_TUNE_CPU_BIAS`); the biased split is what the
+        // dead-store check, the byte verification and publication see.
+        let bias = super::split_tune_cpu_bias();
+        let chosen = if bias > 0 {
+            let biased = bias_split_toward_cpu(
+                chosen,
+                bias,
+                hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled(),
+            );
+            eprintln!(
+                "[gpu-commit] split bias +{bias}/256: k={chosen} (cpu {}/256) -> k={biased} (cpu {}/256)",
+                split_cpu_share256(chosen),
+                split_cpu_share256(biased),
+            );
+            biased
         } else {
             chosen
         };
@@ -15855,11 +16075,11 @@ kernel void blake3_pow_race_tail(
     // entries can contain the usize::MAX untuned sentinel. The canonical
     // reprime kill switch deliberately returns to the incumbent V2 cache.
     // (Redraw marker AUTO-1, 2026-08-02 11:19: automated same-binary redraw while the promoted bar remains the disclosed marker-only resample at 1,357,262.51. Latest account draws: 1319797.87332625 / 1317557.71279261 / 1342891.19447755. Content change required for per-account resubmission.)
-    const WARMUP_CACHE_MAGIC_V3: u64 = 0x464C_4B5F_574C_4333; // "FLK_WLC3"
+    const WARMUP_CACHE_MAGIC_V4: u64 = 0x464C_4B5F_574C_4334; // "FLK_WLC4"
 
     fn warmup_cache_magic() -> u64 {
         if hybrid_tune_canonical_reprime_enabled() {
-            WARMUP_CACHE_MAGIC_V3
+            WARMUP_CACHE_MAGIC_V4
         } else {
             WARMUP_CACHE_MAGIC_V2
         }
@@ -15883,6 +16103,53 @@ kernel void blake3_pow_race_tail(
         key ^ 0x5455_4E45_4C45_4144 // "TUNELEAD": excludes pre-change samples.
             ^ (u64::from(lead) | (u64::from(extend) << 1)).rotate_left(17)
             ^ phi.to_bits().rotate_left(7)
+    }
+
+    fn split_tune_selection_cache_key(key: u64, stable: bool, bias: usize) -> u64 {
+        // A version tag isolates this confirmation policy from earlier minima.
+        // The disjoint low bits encode all supported mode combinations.
+        key ^ 0x434F_4E46_4952_4D33 ^ ((stable as u64) << 8) ^ bias.min(255) as u64
+    }
+
+    /// Persist the sampling and selection-policy fields verbatim. The compact
+    /// source key is supplemental and cannot override this exact comparison.
+    fn warmup_cache_tuning_identity() -> super::tune_cache::Identity {
+        let (lead, extend, phi) = hybrid_tune_sampling();
+        [
+            2, // Configuration-header revision, including full environment.
+            u64::from(lead),
+            u64::from(extend),
+            phi.to_bits(),
+            u64::from(super::split_tune_stable_enabled()),
+            super::split_tune_cpu_bias() as u64,
+            u64::from(tune_cpu_fix_applies()),
+            u64::from(hybrid_tune_canonical_reprime_enabled()),
+            rayon::current_num_threads() as u64,
+        ]
+    }
+
+    /// Exact process-stable prover overrides, including future FLOCK controls.
+    fn warmup_cache_environment_policy() -> Option<&'static [u8]> {
+        static POLICY: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+        POLICY
+            .get_or_init(|| super::tune_cache::environment_policy(std::env::vars_os()))
+            .as_deref()
+    }
+
+    fn warmup_cache_reuse_eligible() -> bool {
+        let (lead, _, _) = hybrid_tune_sampling();
+        super::tune_cache::reuse_eligible(lead, tune_cpu_fix_applies())
+    }
+
+    fn warmup_cache_split_compatible(k: usize) -> bool {
+        super::tune_cache::split_compatible(
+            k,
+            DEFAULT_HYBRID_K,
+            hybrid_cpu_split_override().is_some(),
+            std::env::var_os("FLOCK_NO_HYBRID_AUTOTUNE").is_none(),
+            hybrid_fine_enabled(),
+            hybrid_gpu_suffix_hash_enabled(),
+        )
     }
 
     fn warmup_cache_msl_fnv() -> u64 {
@@ -15945,6 +16212,19 @@ kernel void blake3_pow_race_tail(
         } else {
             key
         };
+        // The measured replay alignment changes how the sweep prices the CPU
+        // arm: never share its split with the record's phi sampling.
+        let key = if tune_cpu_fix_applies() {
+            key ^ 0x4350_5546_4958_5731 // "CPUFIXW1"
+        } else {
+            key
+        };
+        // Selection policy and explicit bias may publish different splits.
+        let key = split_tune_selection_cache_key(
+            key,
+            super::split_tune_stable_enabled(),
+            super::split_tune_cpu_bias(),
+        );
         // The hybrid prefix's fused final leaf changes the GPU arm's cost, so
         // its tuned split must not be shared with the incumbent prefix.
         if super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled() {
@@ -15956,6 +16236,39 @@ kernel void blake3_pow_race_tail(
 
     #[cfg(test)]
     mod zero_root_cache_key_tests {
+        #[test]
+        fn phi_and_bias_fields_cannot_cancel_each_other() {
+            let phi0 = 0.5f64;
+            let phi1 = f64::from_bits(phi0.to_bits() + 1);
+            let a = super::split_tune_selection_cache_key(
+                super::warmup_cache_sampling_key(123456, true, true, phi0), true, 0,
+            );
+            let b = super::split_tune_selection_cache_key(
+                super::warmup_cache_sampling_key(123456, true, true, phi1), true, 128,
+            );
+            // The serialized identity must distinguish these even if the
+            // legacy compact fingerprints collide.
+            assert_eq!(a, b, "regression fixture no longer reaches the legacy alias");
+            let identity = |phi: f64, bias: u64| [2, 1, 1, phi.to_bits(), 1, bias, 0, 1, 10];
+            assert_ne!(identity(phi0, 0), identity(phi1, 128));
+            let mut encoded = Vec::new();
+            crate::gpu_commit::tune_cache::append_identity(&mut encoded, identity(phi0, 0));
+            encoded.extend_from_slice(&a.to_le_bytes());
+            assert!(crate::gpu_commit::tune_cache::strip_identity(&encoded, identity(phi0, 0)).is_some());
+            assert!(crate::gpu_commit::tune_cache::strip_identity(&encoded, identity(phi1, 128)).is_none());
+        }
+
+        #[test]
+        fn selection_modes_do_not_reuse_splits() {
+            let mut keys = std::collections::HashSet::new();
+            for stable in [false, true] {
+                for bias in 0..=255 {
+                    assert!(keys.insert(super::split_tune_selection_cache_key(123456, stable, bias)));
+                }
+            }
+            assert_eq!(keys.len(), 512);
+        }
+
         #[test]
         fn supplemental_source_and_mode_have_a_distinct_fingerprint() {
             let incumbent = super::warmup_cache_msl_fnv_for(false, false);
@@ -16008,15 +16321,23 @@ kernel void blake3_pow_race_tail(
 
     fn warmup_cache_path() -> std::path::PathBuf {
         let version = if hybrid_tune_canonical_reprime_enabled() {
-            3
+            4
         } else {
             2
         };
-        super::shared_cache_dir().join(format!("flock-warmup-latch-v{version}.bin"))
+        // Do not overwrite or consume legacy hash-only files, even in rollback
+        // mode. Those files lack the exact tuning-policy header.
+        super::shared_cache_dir().join(format!("flock-warmup-latch-cfg2-v{version}.bin"))
     }
 
     fn read_warmup_cache(log_d: usize, n_leaves: usize) -> Option<WarmupCache> {
+        if !warmup_cache_reuse_eligible() {
+            return None;
+        }
+        let policy = warmup_cache_environment_policy()?;
         let bytes = std::fs::read(warmup_cache_path()).ok()?;
+        let bytes = super::tune_cache::strip_identity(&bytes, warmup_cache_tuning_identity())?;
+        let bytes = super::tune_cache::strip_environment(bytes, policy)?;
         let mut off = 0usize;
         let mut take_u64 = |bytes: &[u8]| -> Option<u64> {
             let v = u64::from_le_bytes(bytes.get(off..off + 8)?.try_into().ok()?);
@@ -16035,7 +16356,7 @@ kernel void blake3_pow_race_tail(
         let latch_on = take_u64(&bytes)? == 1;
         let tuned_k = take_u64(&bytes)? as usize;
         let cpu_wall_ms = f64::from_bits(take_u64(&bytes)?);
-        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || !hybrid_split_valid(tuned_k) {
+        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || !warmup_cache_split_compatible(tuned_k) {
             return None;
         }
         let root_bytes = bytes.get(off..)?;
@@ -16060,9 +16381,14 @@ kernel void blake3_pow_race_tail(
         cpu_wall_ms: f64,
         cpu_tree: &[Hash],
     ) {
-        if !cpu_wall_ms.is_finite() || cpu_wall_ms <= 0.0 || !hybrid_split_valid(tuned_k) {
+        if !warmup_cache_reuse_eligible()
+            || !cpu_wall_ms.is_finite()
+            || cpu_wall_ms <= 0.0
+            || !warmup_cache_split_compatible(tuned_k)
+        {
             return;
         }
+        let Some(policy) = warmup_cache_environment_policy() else { return };
         let cpu_root: Hash = if latch_on {
             match cpu_tree.last() {
                 Some(root) => *root,
@@ -16071,7 +16397,9 @@ kernel void blake3_pow_race_tail(
         } else {
             [0u8; 32]
         };
-        let mut buf = Vec::with_capacity(64 + core::mem::size_of::<Hash>());
+        let mut buf = Vec::with_capacity(136 + core::mem::size_of::<Hash>());
+        super::tune_cache::append_identity(&mut buf, warmup_cache_tuning_identity());
+        super::tune_cache::append_environment(&mut buf, policy);
         for v in [
             warmup_cache_magic(),
             warmup_cache_msl_fnv(),
@@ -20173,6 +20501,123 @@ kernel void lc_fold_stripes_factored_b4(
             assert_eq!(super::split_from_fit(&flat, true, 0.0), None);
         }
 
+        /// The measured confirmation keeps coarse picks untouched, keeps a
+        /// fine pick that beats both freshly measured neighbours, takes the
+        /// cheaper coarse neighbour otherwise, and
+        /// keeps the pick when sampling fails.
+        #[test]
+        fn confirm_split_measures_fine_picks() {
+            let swept = [(6usize, [96.0, 95.5]), (7usize, [93.6, 93.1])];
+            let calls = std::cell::RefCell::new(Vec::new());
+            let sampler = |table: &'static [(usize, f64)]| {
+                let calls = &calls;
+                move |k: usize| -> Result<f64, ()> {
+                    calls.borrow_mut().push(k);
+                    table.iter().find(|(c, _)| *c == k).map(|&(_, v)| v).ok_or(())
+                }
+            };
+            // Coarse pick: no samples.
+            assert_eq!(super::confirm_split_by_measurement(7, &swept, sampler(&[])), 7);
+            assert!(calls.borrow().is_empty());
+            // Fine pick 6 + 16*11 slower than both neighbours -> k = 7 (cheaper).
+            let fine = 6 + 16 * 11;
+            assert_eq!(super::confirm_split_by_measurement(fine, &swept, sampler(&[(6, 95.5), (7, 93.1), (182, 101.0)])), 7);
+            assert_eq!(calls.borrow().as_slice(), &[6, 182, 7, 7, 182, 6]);
+            calls.borrow_mut().clear();
+            // Fine pick clearly faster than both -> kept.
+            assert_eq!(super::confirm_split_by_measurement(fine, &swept, sampler(&[(6, 95.5), (7, 93.1), (182, 90.0)])), fine);
+            calls.borrow_mut().clear();
+            // Upper neighbour never swept (k = 8): sampled here.
+            let fine7 = 7 + 16 * 4;
+            assert_eq!(
+                super::confirm_split_by_measurement(fine7, &swept, sampler(&[(7, 93.1), (8, 92.0), (71, 99.0)])),
+                8
+            );
+            assert_eq!(calls.borrow().as_slice(), &[7, 71, 8, 8, 71, 7]);
+            calls.borrow_mut().clear();
+            // A failed sample keeps the pick.
+            assert_eq!(super::confirm_split_by_measurement(fine7, &swept, sampler(&[(8, 92.0)])), fine7);
+        }
+
+        #[test]
+        fn confirm_split_rejects_invalid_new_timings() {
+            let pick = 6 + 16 * 11;
+            let swept = [(6usize, [96.0, 95.5]), (7usize, [93.6, 93.1])];
+            for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+                assert_eq!(
+                    super::confirm_split_by_measurement(pick, &swept, |_| Ok::<f64, ()>(bad)),
+                    pick,
+                    "invalid timing {bad:?} must not choose a replacement split",
+                );
+            }
+        }
+
+        #[test]
+        fn confirm_split_ignores_stale_sweep_for_final_choice() {
+            let pick = 6 + 16 * 11;
+            // The sweep predates the confirmation's slower clock regime.
+            // Fresh measurements consistently favor the fine split.
+            let swept = [(6usize, [80.0, 81.0]), (7usize, [79.0, 80.0])];
+            let calls = std::cell::RefCell::new(Vec::new());
+            let selected = super::confirm_split_by_measurement(pick, &swept, |k| {
+                calls.borrow_mut().push(k);
+                Ok::<f64, ()>(if k == pick { 95.0 } else { 100.0 })
+            });
+            assert_eq!(selected, pick, "a stale minimum must not beat every fresh pair");
+            assert_eq!(calls.borrow().as_slice(), &[6, pick, 7, 7, pick, 6]);
+        }
+
+        #[test]
+        fn confirm_split_requires_consistent_improvement() {
+            let pick = 6 + 16 * 11;
+            let swept = [(6usize, [100.0, 100.0]), (7usize, [101.0, 101.0])];
+            let mut seen = 0;
+            let selected = super::confirm_split_by_measurement(pick, &swept, |k| {
+                let value = if k == pick {
+                    seen += 1;
+                    if seen == 1 { 40.0 } else { 130.0 }
+                } else if k == 6 { 100.0 } else { 101.0 };
+                Ok::<f64, ()>(value)
+            });
+            assert_eq!(selected, 6, "one lucky sample must not hide a slower repeat");
+        }
+
+        /// The CPU-ward bias moves coarse and fine splits by whole 256ths,
+        /// keeps the pure-GPU split and invalid values, clamps to the storable
+        /// range, and rounds to whole sixteenths without the fine path.
+        #[test]
+        fn cpu_bias_moves_the_split_by_256ths() {
+            use super::{bias_split_toward_cpu as b, hybrid_split_valid, split_cpu_share256 as c};
+            assert_eq!(b(2, 0, true), 2);
+            assert_eq!(b(2, 16, true), 3);
+            assert_eq!(b(2, 48, true), 5);
+            // Fine: 2 + 16*15 (cpu 47) + 16 -> 3 + 16*15 (cpu 63).
+            assert_eq!(c(2 + 16 * 15), 47);
+            assert_eq!(b(2 + 16 * 15, 16, true), 3 + 16 * 15);
+            // Fine -> coarse when the share lands on a whole sixteenth.
+            assert_eq!(b(6 + 16 * 10, 6, true), 7);
+            // Coarse -> fine for a non-multiple bias.
+            assert_eq!(b(7, 4, true), 7 + 16 * 4);
+            // Pure GPU and invalid values unchanged; clamp at 255/256.
+            assert_eq!(b(0, 32, true), 0);
+            assert_eq!(b(16, 32, true), 16);
+            assert_eq!(b(15, 48, true), 15 + 16 * 15);
+            assert_eq!(c(b(15, 48, true)), 255);
+            // Without the fine path: nearest whole sixteenth, at most 15.
+            assert_eq!(b(2, 24, false), 4);
+            assert_eq!(b(14, 48, false), 15);
+            for k in 1..16usize {
+                for m in 0..16usize {
+                    let s = if m == 0 { k } else { k + 16 * m };
+                    for bias in [1usize, 7, 16, 32, 48, 200] {
+                        assert!(hybrid_split_valid(b(s, bias, true)), "{s} +{bias}");
+                        assert!(b(s, bias, false) < 16 && b(s, bias, false) >= 1, "{s} +{bias}");
+                        assert!(c(b(s, bias, true)) >= c(s).min(255), "{s} +{bias}");
+                    }
+                }
+            }
+        }
+
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
         #[test]
         fn fine_split_interpolates_between_bracketing_splits() {
@@ -20401,6 +20846,44 @@ kernel void lc_fold_stripes_factored_b4(
                         assert!(keys.insert(key));
                     }
                 }
+            }
+        }
+
+        #[test]
+        fn replay_wait_does_not_restart_after_task_pickup() {
+            use std::sync::Mutex;
+            use std::time::{Duration, Instant};
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+            let reprime_end = Mutex::new(None);
+            let replay_start = Mutex::new(None);
+            pool.install(|| super::sample_ranked_exact_graph(
+                || {
+                    std::thread::sleep(Duration::from_millis(120));
+                    *reprime_end.lock().unwrap() = Some(Instant::now());
+                    Ok::<(), ()>(())
+                },
+                || Ok(()),
+                || { *replay_start.lock().unwrap() = Some(Instant::now()); },
+                Some(Duration::from_millis(80)),
+                false,
+            )).unwrap();
+            let extra_wait = replay_start.into_inner().unwrap().unwrap()
+                .saturating_duration_since(reprime_end.into_inner().unwrap().unwrap());
+            assert!(extra_wait < Duration::from_millis(40),
+                "expired replay deadline must not add another full delay: {extra_wait:?}");
+        }
+
+        #[test]
+        fn cpu_fix_delays_the_replay_by_the_witness_phase() {
+            // Record rule without a measurement.
+            assert_eq!(super::tune_replay_delay_ms(0.5, 24.0, None), 12.0);
+            assert_eq!(super::tune_replay_delay_ms(0.25, 24.0, None), 6.0);
+            // Measured witness phase, capped at the first pass.
+            assert_eq!(super::tune_replay_delay_ms(0.5, 24.0, Some(7.0)), 7.0);
+            assert_eq!(super::tune_replay_delay_ms(0.5, 5.0, Some(7.0)), 5.0);
+            // Unusable measurements keep the record rule.
+            for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+                assert_eq!(super::tune_replay_delay_ms(0.5, 24.0, Some(bad)), 12.0);
             }
         }
 
