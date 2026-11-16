@@ -1617,6 +1617,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             nt,
             representation,
         );
+        let _tailsafe = crate::epool::TailsafeScope::new();
         crate::epool::run_hetero_chunks_stateful_with_tail(
             n_jobs,
             || {
@@ -3875,6 +3876,9 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 /// The 5+6 GPU arm's kernel is compiled later, after the warm-up commit's
 /// split retune ([`t56_prewarm_after_tune`]).
 ///
+/// The 5+6 GPU arm's kernel is compiled later, after the warm-up commit's
+/// split retune ([`t56_prewarm_after_tune`]).
+///
 /// With R2-CS on (`gpu_commit::ENV_NO_ZC_R2_CS`), a thread of its own builds
 /// the R2-CS pipeline (`gpu_commit::zc_r2_cs_prewarm`), joined by the warm-up
 /// round two's calibration.
@@ -4181,6 +4185,7 @@ where
                 });
                 partial
             };
+            let _tailsafe = crate::epool::TailsafeScope::new();
             let out = crate::epool::run_hetero_chunks_caller_tail(
                 whole + 2 * split,
                 |i| {

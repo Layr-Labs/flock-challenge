@@ -665,9 +665,88 @@ pub(crate) fn drain_hetero<H>(
 /// `FLOCK_NO_EPOOL_TAIL_GUARD=1` restores unconditional helper claims.
 struct TailGuard {
     on: bool,
+    tailsafe: bool,
     main_threads: u64,
     main_ns: AtomicU64,
     main_cnt: AtomicU64,
+    // Tail anatomy (`FLOCK_EPOOL_TAIL_DEBUG` only): drain start, chunk count,
+    // last main / helper chunk end (ns since start), helper first claims made
+    // with fewer than 4 chunks per main thread left, longest helper chunk,
+    // tail-safe refusals, and the drain's call site.
+    dbg_t0: std::time::Instant,
+    dbg_n: AtomicUsize,
+    dbg_main_end: AtomicU64,
+    dbg_helper_end: AtomicU64,
+    dbg_first_late: AtomicU64,
+    dbg_helper_max: AtomicU64,
+    dbg_declined: AtomicU64,
+    dbg_site: Option<&'static std::panic::Location<'static>>,
+}
+
+thread_local! {
+    /// Call site of the latest public hetero-drain entry on this thread (set
+    /// only under `FLOCK_EPOOL_TAIL_DEBUG`).
+    static DBG_SITE: std::cell::Cell<Option<&'static std::panic::Location<'static>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[track_caller]
+fn dbg_note_site() {
+    if epool_tail_debug() {
+        let here = std::panic::Location::caller();
+        DBG_SITE.with(|c| c.set(Some(here)));
+    }
+}
+
+fn epool_tail_debug() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_EPOOL_TAIL_DEBUG").is_some())
+}
+
+impl Drop for TailGuard {
+    fn drop(&mut self) {
+        if !self.on || !epool_tail_debug() {
+            return;
+        }
+        let m = self.dbg_main_end.load(Ordering::Relaxed);
+        let h = self.dbg_helper_end.load(Ordering::Relaxed);
+        eprintln!(
+            "[epool-tail] site={} n={} main_end={:.3}ms helper_end={:.3}ms tail={:+.3}ms first_late={} helper_max={:.3}ms tailsafe={} declined={}",
+            self.dbg_site.map_or_else(|| "?".to_string(), |l| format!("{}:{}", l.file(), l.line())),
+            self.dbg_n.load(Ordering::Relaxed),
+            m as f64 / 1e6,
+            h as f64 / 1e6,
+            (h as f64 - m as f64) / 1e6,
+            self.dbg_first_late.load(Ordering::Relaxed),
+            self.dbg_helper_max.load(Ordering::Relaxed) as f64 / 1e6,
+            self.tailsafe,
+            self.dbg_declined.load(Ordering::Relaxed),
+        );
+    }
+}
+
+thread_local! {
+    /// Set by the `*_tailsafe` drain entries for the TailGuard they create on
+    /// this thread (see [`TailGuard::new`]).
+    static TAILSAFE_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This helper thread's worst chunk time over the main-pool mean (x16) in
+    /// any tail-safe drain of this process (0 = none).
+    static HELPER_WORST_X16: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Tail-safe admission (`FLOCK_NO_EPOOL_TAILSAFE=1` kills): in drains entered
+/// through a `*_tailsafe` entry, a helper is admitted with its WORST chunk
+/// time instead of a running average, and its first claim (no chunk yet in
+/// this drain, which the base guard admits unconditionally) with its worst
+/// chunk-time ratio to the main pool from earlier tail-safe drains times this
+/// drain's main mean. An efficiency core's chunk time swings several-fold
+/// with DRAM contention, so a late optimistic claim can finish after the
+/// main pool. Scheduling only, like the guard itself.
+fn tailsafe_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_EPOOL_TAILSAFE").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 fn tail_guard_enabled() -> bool {
@@ -681,9 +760,18 @@ impl TailGuard {
     fn new(main_threads: usize, has_helper: bool) -> Self {
         Self {
             on: has_helper && tail_guard_enabled(),
+            tailsafe: TAILSAFE_NEXT.with(|c| c.replace(false)) && tailsafe_enabled(),
             main_threads: main_threads as u64,
             main_ns: AtomicU64::new(0),
             main_cnt: AtomicU64::new(0),
+            dbg_t0: std::time::Instant::now(),
+            dbg_n: AtomicUsize::new(0),
+            dbg_main_end: AtomicU64::new(0),
+            dbg_helper_end: AtomicU64::new(0),
+            dbg_first_late: AtomicU64::new(0),
+            dbg_helper_max: AtomicU64::new(0),
+            dbg_declined: AtomicU64::new(0),
+            dbg_site: DBG_SITE.with(|c| c.get()),
         }
     }
 
@@ -699,13 +787,22 @@ impl TailGuard {
         let ns = started.elapsed().as_nanos() as u64;
         self.main_ns.fetch_add(ns, Ordering::Relaxed);
         self.main_cnt.fetch_add(1, Ordering::Relaxed);
+        if epool_tail_debug() {
+            self.dbg_main_end.fetch_max(self.dbg_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 
     /// Whether a helper whose average chunk time is `own_ns` (0 = unknown)
     /// should still claim, given the queue cursor `next`.
     #[inline]
     fn helper_may_claim(&self, own_ns: u64, next: usize, n_chunks: usize) -> bool {
-        if !self.on || own_ns == 0 {
+        if self.on && epool_tail_debug() {
+            self.dbg_n.store(n_chunks, Ordering::Relaxed);
+            if own_ns == 0 && (n_chunks.saturating_sub(next) as u64) < 4 * self.main_threads {
+                self.dbg_first_late.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if !self.on || (own_ns == 0 && !self.tailsafe) {
             return true;
         }
         let cnt = self.main_cnt.load(Ordering::Relaxed);
@@ -713,8 +810,24 @@ impl TailGuard {
             return true;
         }
         let t_main = self.main_ns.load(Ordering::Relaxed) / cnt;
+        let own_ns = if self.tailsafe {
+            // Worst chunk time: this drain's (`own_ns` holds the max in a
+            // tail-safe drain), or the worst ratio from earlier drains.
+            let hist = HELPER_WORST_X16.with(|c| c.get()).saturating_mul(t_main) / 16;
+            let worst = own_ns.max(hist);
+            if worst == 0 {
+                return true;
+            }
+            worst
+        } else {
+            own_ns
+        };
         let remaining = n_chunks.saturating_sub(next) as u64;
-        own_ns.saturating_mul(self.main_threads) <= remaining.saturating_mul(t_main)
+        let admit = own_ns.saturating_mul(self.main_threads) <= remaining.saturating_mul(t_main);
+        if !admit && self.tailsafe && epool_tail_debug() {
+            self.dbg_declined.fetch_add(1, Ordering::Relaxed);
+        }
+        admit
     }
 
     /// Run helper chunk `i`, updating the helper's own average.
@@ -727,14 +840,49 @@ impl TailGuard {
         let started = std::time::Instant::now();
         run();
         let ns = (started.elapsed().as_nanos() as u64).max(1);
-        *own_ns = if *own_ns == 0 { ns } else { (*own_ns + ns) / 2 };
+        if self.tailsafe {
+            *own_ns = (*own_ns).max(ns);
+            let cnt = self.main_cnt.load(Ordering::Relaxed);
+            if cnt > 0 {
+                let t_main = (self.main_ns.load(Ordering::Relaxed) / cnt).max(1);
+                let r = ns.saturating_mul(16) / t_main;
+                HELPER_WORST_X16.with(|c| c.set(c.get().max(r)));
+            }
+        } else {
+            *own_ns = if *own_ns == 0 { ns } else { (*own_ns + ns) / 2 };
+        }
+        if epool_tail_debug() {
+            self.dbg_helper_end.fetch_max(self.dbg_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            self.dbg_helper_max.fetch_max(ns, Ordering::Relaxed);
+        }
     }
 }
 
+/// Tail-safe helper admission (see [`tailsafe_enabled`]) for the FIRST hetero
+/// drain started on this thread while the guard lives: the call-site opt-in
+/// for coarse post-commit drains. That drain's guard consumes the flag, and
+/// dropping the scope clears it, so it never leaks into a later drain.
+pub(crate) struct TailsafeScope(());
+
+impl TailsafeScope {
+    pub(crate) fn new() -> Self {
+        TAILSAFE_NEXT.with(|c| c.set(true));
+        TailsafeScope(())
+    }
+}
+
+impl Drop for TailsafeScope {
+    fn drop(&mut self) {
+        TAILSAFE_NEXT.with(|c| c.set(false));
+    }
+}
+
+#[track_caller]
 pub fn run_hetero_chunks<F>(n_chunks: usize, f: F)
 where
     F: Fn(usize) + Sync,
 {
+    dbg_note_site();
     run_chunks_with_helper(n_chunks, &f, epool());
 }
 
@@ -842,11 +990,13 @@ where
 ///
 /// Scheduling only: every chunk index is still claimed exactly once from the
 /// same cursor and `f(i)` does not depend on which thread runs it.
+#[track_caller]
 pub fn run_hetero_chunks_caller_tail<F, T, R>(n_chunks: usize, f: F, tail: T) -> R
 where
     F: Fn(usize) + Sync,
     T: FnOnce() -> R,
 {
+    dbg_note_site();
     struct CallerOnly<X>(std::cell::UnsafeCell<Option<X>>);
     // SAFETY: the cells are only ever touched on the thread whose id is
     // `caller` (checked before every access), so no two threads access them.
@@ -1136,11 +1286,13 @@ pub fn run_queue_with_helper_only(
 /// State never crosses threads and `f` is never called concurrently with the
 /// same state. Chunk ownership and output-disjointness requirements are the
 /// same as [`run_hetero_chunks`].
+#[track_caller]
 pub(crate) fn run_hetero_chunks_stateful<S, I, F>(n_chunks: usize, init: I, f: F)
 where
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
+    dbg_note_site();
     run_chunks_with_helper_stateful(n_chunks, &init, &f, epool());
 }
 
@@ -1150,6 +1302,7 @@ where
 /// not affect this queue's output; the ranked caller passes
 /// [`HelpQueue::help`] for the deferred lincheck stripe, whose helper
 /// broadcast this drain's own helper broadcast is queued behind.
+#[track_caller]
 pub(crate) fn run_hetero_chunks_stateful_with_tail<S, I, F>(
     n_chunks: usize,
     init: I,
@@ -1159,6 +1312,7 @@ pub(crate) fn run_hetero_chunks_stateful_with_tail<S, I, F>(
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
+    dbg_note_site();
     run_chunks_with_helper_stateful_arm_tail(
         n_chunks,
         &init,

@@ -3471,6 +3471,7 @@ fn fold2_compact_and_round45_into_packed_b(
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
     };
+    let _tailsafe = crate::epool::TailsafeScope::new();
     crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
 
     // Join the GPU prefix (it was submitted first and is normally done).

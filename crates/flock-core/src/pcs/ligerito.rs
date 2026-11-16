@@ -8159,6 +8159,7 @@ fn materialize_direct_fold8(
         let zf_launch_ns = std::sync::atomic::AtomicU64::new(0);
         let zf_t_drain = std::time::Instant::now();
         let zf_setup_ms = zf_t0.elapsed().as_secs_f64() * 1e3;
+        let _tailsafe = crate::epool::TailsafeScope::new();
         crate::epool::run_hetero_chunks_stateful(
             n_blocks,
             || crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN),
