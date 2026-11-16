@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "c2/restore.rs"]
+mod restore;
+
 #[inline]
 fn mul(a: F128, b: F128) -> F128 {
     a * b
@@ -386,6 +389,11 @@ impl Dual {
     }
 
     pub(super) fn materialize(&mut self, rs: &[F128]) -> Vec<F128> {
+        self.prepare_materialization(rs);
+        self.materialize_prepared()
+    }
+
+    fn prepare_materialization(&mut self, rs: &[F128]) {
         let d = self.depth;
         assert_eq!(rs.len(), d);
         if self.step_depth != d {
@@ -399,6 +407,10 @@ impl Dual {
                 *w0 = v;
             }
         }
+    }
+
+    fn materialize_prepared(&self) -> Vec<F128> {
+        let d = self.depth;
         let reduced_log_d = self.log_d - d;
         if c2_retained_transpose_enabled() {
             if let Some(basis) = transpose_forward_ntt_sparse_retained(
@@ -514,6 +526,9 @@ impl Pending {
                     && sc.pending_fold_basis.is_none()
                     && sc.pending_ood_eq.is_none()
             );
+            if open_restore::enabled() {
+                return self.fold_complete_restored(r, sc);
+            }
             let dual = &mut self.dual;
             let challenges = &self.challenges;
             let (mut message, (correction, basis)) = rayon::join(
