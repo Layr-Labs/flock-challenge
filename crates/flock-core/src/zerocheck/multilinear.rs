@@ -4289,8 +4289,53 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
-    let (m1, minf, la, la2, _) =
-        fold_cascade_t_into_packed_prefix_gpu(a, b, packed, bpacked, prefix, a_out, b_out, rhos, r_next, false);
+    fold_cascade_t_into_packed_prefix_arm(
+        a,
+        b,
+        packed,
+        bpacked,
+        prefix,
+        a_out,
+        b_out,
+        rhos,
+        r_next,
+        zc_tri_caller_first_enabled(),
+    )
+}
+
+/// Caller-first main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, any value,
+/// restores the rayon `par_chunks_mut` collect). The tri passes below the
+/// hetero floor (ranked: passes 1 and 2, 128 and 16 chunks) run through
+/// [`crate::epool::run_chunks_caller_first`]: the calling thread starts on
+/// chunk 0 at once and never parks on a pool latch, which matters here
+/// because zerocheck arms no post-drain linger. Same `x_hi` chunk grid and
+/// chunk closure as both other arms; each chunk writes its own output range
+/// and its own `partials[x_hi]`, and the combine below walks the partials in
+/// index order, so bytes are identical. Read once per process.
+fn zc_tri_caller_first_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TRI_CF").is_none());
+    *ON
+}
+
+/// [`fold_cascade_t_into_packed_prefix`] with the caller-first arm explicit
+/// (`false` = the rayon collect), so tests can compare both.
+#[allow(clippy::too_many_arguments)]
+fn fold_cascade_t_into_packed_prefix_arm(
+    a: &[F128],
+    b: &[F128],
+    packed: bool,
+    bpacked: bool,
+    prefix: Option<(&[F128], &[F128])>,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+    caller_first: bool,
+) -> (F128, F128, Round3Lookahead, Lookahead2) {
+    let (m1, minf, la, la2, _) = fold_cascade_t_into_packed_prefix_impl(
+        a, b, packed, bpacked, prefix, a_out, b_out, rhos, r_next, caller_first, false,
+    );
     (m1, minf, la, la2)
 }
 
@@ -4392,6 +4437,40 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     b_out: &mut [F128],
     rhos: &[F128],
     r_next: &[F128],
+    gpu: bool,
+) -> (F128, F128, Round3Lookahead, Lookahead2, Option<KGpuPrefix>) {
+    fold_cascade_t_into_packed_prefix_impl(
+        a,
+        b,
+        packed,
+        bpacked,
+        prefix,
+        a_out,
+        b_out,
+        rhos,
+        r_next,
+        zc_tri_caller_first_enabled(),
+        gpu,
+    )
+}
+
+/// The shared body of [`fold_cascade_t_into_packed_prefix`] and its two
+/// explicit arms: `caller_first` selects the caller-first drain for the
+/// main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, 8e440189), `gpu` the 5+6 GPU
+/// prefix arm, which acts only on the hetero path. At most one of the two
+/// folds a pass.
+#[allow(clippy::too_many_arguments)]
+fn fold_cascade_t_into_packed_prefix_impl(
+    a: &[F128],
+    b: &[F128],
+    packed: bool,
+    bpacked: bool,
+    prefix: Option<(&[F128], &[F128])>,
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rhos: &[F128],
+    r_next: &[F128],
+    caller_first: bool,
     gpu: bool,
 ) -> (F128, F128, Round3Lookahead, Lookahead2, Option<KGpuPrefix>) {
     let _ = gpu;
@@ -4613,6 +4692,31 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
         vec![chunk(&a_in, &b_in, a_out, b_out)]
+    } else if caller_first {
+        // The `par_chunks_mut(chunk_out)` grid below: `hi_size` chunks
+        // (`2 * lo_size * hi_size == out_n`, asserted above).
+        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_chunks_caller_first(hi_size, &|x_hi| {
+            // SAFETY: the drain runs each `x_hi` exactly once; its output
+            // ranges are disjoint per chunk, and the drain publishes every
+            // write before the combine below reads them.
+            let (a_o, b_o) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let (a_in, b_in) = inputs(x_hi);
+            let outv = chunk(&a_in, &b_in, a_o, b_o);
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = outv;
+            }
+        });
+        partials
     } else {
         use rayon::prelude::*;
         a_out
@@ -7622,6 +7726,47 @@ mod tests {
             g_via_sum += eq_remaining[x_prime] * a_x * b_x;
         }
         assert_eq!(g_via_poly, g_via_sum);
+    }
+
+    /// Caller-first tri passes (`FLOCK_NO_ZC_TRI_CF`): the caller-first arm
+    /// writes the same folded outputs and returns the same messages and
+    /// lookaheads, byte for byte, as the rayon arm, for both depths on chunk
+    /// grids of 4..128 `x_hi` chunks (ranked passes 1 and 2: 128 and 16), in
+    /// a multi-thread pool and inline in a single-thread pool.
+    #[test]
+    fn tri_pass_caller_first_matches_rayon_arm() {
+        let mut rng = Rng::new(0x7121_0C1F);
+        for threads in [4usize, 1] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("test pool");
+            for depth in [2usize, 3] {
+                for log_out in [11usize, 12, 13, 14, 16] {
+                    let n = 1usize << (log_out + depth);
+                    let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+                    let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+                    let rhos: Vec<F128> = (0..depth).map(|_| rng.f128()).collect();
+                    let mut r_next = vec![F128::ONE; log_out];
+                    for s in r_next[1..].iter_mut() {
+                        *s = rng.f128();
+                    }
+                    let run = |caller_first: bool| {
+                        let mut a_o = vec![LA_POISON; n >> depth];
+                        let mut b_o = vec![LA_POISON; n >> depth];
+                        let out = pool.install(|| {
+                            fold_cascade_t_into_packed_prefix_arm(
+                                &a, &b, false, false, None, &mut a_o, &mut b_o, &rhos, &r_next,
+                                caller_first,
+                            )
+                        });
+                        (out, a_o, b_o)
+                    };
+                    let (cf, rb) = (run(true), run(false));
+                    assert!(cf == rb, "threads {threads} depth {depth} log_out {log_out}");
+                }
+            }
+        }
     }
 
     #[test]
