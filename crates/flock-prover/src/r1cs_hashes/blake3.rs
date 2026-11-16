@@ -1909,6 +1909,39 @@ pub(crate) fn test_block_witness_z(
     z
 }
 
+/// Streamed first-pass band schedule of the ranked witness driver, in
+/// groups-per-segment units (each unit is 16 streamed position tiles across
+/// all 8 segments); see the driver for why the tail bands taper.
+fn stream_band_schedule() -> &'static [usize] {
+    const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
+    const TAPERED_SCHEDULE: &[usize] =
+        &[64, 448, 512, 512, 512, 512, 512, 512, 448, 64];
+    // A/B-CONTROL: set to `false` for the official-harness control
+    // build. The env kill switch exists for same-binary diagnostics.
+    const STREAM_TAPER_DEFAULT: bool = true;
+    let tapered =
+        STREAM_TAPER_DEFAULT && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
+    if tapered {
+        TAPERED_SCHEDULE
+    } else {
+        UNIFORM_SCHEDULE
+    }
+}
+
+/// The `(r_start, r_count)` ranges, in position tiles, the ranked witness
+/// driver publishes to the streamed first pass (band offset and size × 16).
+fn stream_band_ranges() -> Vec<(usize, usize)> {
+    let mut offset = 0usize;
+    stream_band_schedule()
+        .iter()
+        .map(|&gps| {
+            let range = (offset * 16, gps * 16);
+            offset += gps;
+            range
+        })
+        .collect()
+}
+
 fn build_block_witness_ab_stream_into(
     cv: &[u32; 8],
     m: &[u32; 16],
@@ -4273,19 +4306,7 @@ pub(crate) mod witgen_simd {
             // A/B (`FLOCK_NO_STREAM_TAPER=1`).
             // Tail band of 64 gps keeps 8 hetero slabs (WITGEN_HETERO_SLAB =
             // 64 jobs) so its drain still parallelizes across the pool.
-            const UNIFORM_SCHEDULE: &[usize] = &[512; 8];
-            const TAPERED_SCHEDULE: &[usize] =
-                &[64, 448, 512, 512, 512, 512, 512, 512, 448, 64];
-            // A/B-CONTROL: set to `false` for the official-harness control
-            // build. The env kill switch exists for same-binary diagnostics.
-            const STREAM_TAPER_DEFAULT: bool = true;
-            let tapered =
-                STREAM_TAPER_DEFAULT && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
-            let schedule = if tapered {
-                TAPERED_SCHEDULE
-            } else {
-                UNIFORM_SCHEDULE
-            };
+            let schedule = super::stream_band_schedule();
             debug_assert_eq!(schedule.iter().sum::<usize>(), groups_per_segment);
             // Item A (continuous claim queue): replace the 8–9 per-band full
             // join barriers with ONE queue over all slabs in band order plus
@@ -5269,6 +5290,22 @@ impl Blake3Setup {
                 // Untimed: the two GPU objects the timed prove still made on
                 // first use (see `gpu_commit::ENV_NO_WARM_GPU_SPARES`).
                 flock_core::gpu_commit::warm_gpu_spares();
+                // Untimed: encode the timed prove's streamed bands and early
+                // prefix now; the timed prove only commits them (see
+                // `gpu_commit::ENV_NO_PREENCODED_BANDS`). Their encoders read
+                // the zero-tail-lane geometry the prove publishes, so publish
+                // the same one around the encode.
+                let padding = self.r1cs.padding_spec();
+                let num_ntts = self.pcs_params.num_ntts();
+                let _gpu_zero_lanes = flock_core::gpu_commit::GpuZeroTailLanes::scope(
+                    num_ntts,
+                    flock_core::ntt::additive_ntt_f128::ZeroOddTailLanes::lanes_for_padding(
+                        num_ntts,
+                        padding.k_log,
+                        padding.useful_bits_per_block,
+                    ),
+                );
+                flock_core::gpu_commit::preencode_streamed_bands(&self.pcs_params, &stream_band_ranges());
             }
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
@@ -6509,6 +6546,24 @@ mod tests {
             assert_eq!(c_ref, z, "C is not identity at n_blocks={n_blocks}");
             assert!(r1cs.satisfies_packed(&z));
         }
+    }
+
+    /// The warm-up pre-encodes exactly the ranges the ranked witness driver
+    /// publishes: contiguous, in band order, multiples of four tiles, one per
+    /// schedule band, covering the whole first pass (4,096 groups per segment
+    /// × 16 position tiles).
+    #[test]
+    fn stream_band_ranges_tile_the_first_pass() {
+        let ranges = stream_band_ranges();
+        assert_eq!(ranges.len(), stream_band_schedule().len());
+        let mut next = 0usize;
+        for (&(r_start, r_count), &gps) in ranges.iter().zip(stream_band_schedule()) {
+            assert_eq!(r_start, next);
+            assert_eq!(r_count, gps * 16);
+            assert!(r_count > 0 && r_start % 4 == 0 && r_count % 4 == 0);
+            next += r_count;
+        }
+        assert_eq!(next, 4096 * 16);
     }
 
     #[test]

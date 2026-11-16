@@ -3160,6 +3160,42 @@ pub fn warm_gpu_spares() {
     imp::warm_gpu_spares(WARM_DONE_EVENTS);
 }
 
+/// Kill switch for the warm-up's pre-encoded streamed bands
+/// (`FLOCK_NO_PREENCODED_BANDS`, any value; read once). With the switch
+/// unset, the untimed warm-up encodes (but does not commit) the timed
+/// prove's streamed first-pass band command buffers and its early
+/// GPU-prefix command buffer: the same pipeline,
+/// bindings, parameters, dispatch and completion signal the timed prove
+/// would encode, over the same latched buffers. The timed prove then only
+/// commits each one at the moment it would have committed a fresh one, in
+/// the same order, so the GPU runs identical work and proof bytes are
+/// unchanged; a band whose range, plan or buffers differ from the
+/// pre-encoded one is encoded afresh as before. Removes the bands' Metal
+/// encoding (~1 ms of witness-thread CPU on an M4 at 10 threads) and the
+/// serial encode tail behind the last witness slab from the timed window.
+pub const ENV_NO_PREENCODED_BANDS: &str = "FLOCK_NO_PREENCODED_BANDS";
+
+/// Encode the streamed bands `ranges` (position tiles, as the witness driver
+/// publishes them) and the early prefix ahead of the timed prove (see
+/// [`ENV_NO_PREENCODED_BANDS`]). Untimed warm-up only; a no-op off the
+/// ranked GPU shape, without a latched commit, or killed. The caller
+/// publishes the timed prove's zero-tail-lane geometry around the call.
+pub fn preencode_streamed_bands(params: &crate::pcs::commit::PcsParams, ranges: &[(usize, usize)]) {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os(ENV_NO_PREENCODED_BANDS).is_some())
+        || !gpu_commit_enabled()
+        || !is_ranked_gpu_shape(params)
+        || rayon::current_num_threads() <= 1
+        || std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
+    {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::preencode_streamed_bands(params.k_code(), params.n_leaves(), 1usize << params.log_msg_len(), ranges);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = ranges;
+}
+
 impl FromZFirstPassStream {
     /// Publish `r_start..r_start+r_count` (in position tiles). Ranges must be
     /// contiguous, ordered, and multiples of four for the tuned g4 kernel.
@@ -11018,7 +11054,7 @@ kernel void blake3_pow_race_tail(
     /// Immutable selection for one logical from-z first pass. Every full,
     /// streamed, and blocking/reprime dispatch goes through this helper, so
     /// the candidate and exact rollback cannot silently diverge by path.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
@@ -12036,6 +12072,181 @@ kernel void blake3_pow_race_tail(
         /// The split the bands skipped zeros for (0 when none were skipped).
         /// A graph for any other split re-primes from z first.
         zero_store_k: usize,
+        /// Band command buffers the warm-up encoded for this stream's
+        /// buffers and split (`ENV_NO_PREENCODED_BANDS`), not yet committed.
+        pre_bands: Vec<PreBand>,
+        /// The warm-up's encoded early prefix for `early_k`, with the
+        /// zero-tail-lane value it was encoded under and, for a fine split,
+        /// the layer-4 gate value its event signal carries.
+        pre_cb2: Option<(Id, usize, Option<u64>)>,
+    }
+
+    /// One pre-encoded (retained, uncommitted) streamed band.
+    pub(crate) struct PreBand {
+        r_start: usize,
+        r_count: usize,
+        plan: FromZFirstPassPlan,
+        cb: Id,
+        sig: Option<DoneSig>,
+    }
+
+    /// The warm-up's pre-encoded streamed bands and early prefix, with every
+    /// input their encoding read (see `super::ENV_NO_PREENCODED_BANDS`).
+    pub(crate) struct PreBands {
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        early_k: usize,
+        lanes: usize,
+        bands: Vec<PreBand>,
+        /// The early prefix and, for a fine split, its layer-4 gate value.
+        cb2: Option<(Id, Option<u64>)>,
+    }
+
+    // SAFETY: process-persistent Metal objects; access is serialized by the
+    // mutex below and by the stream's `&mut self`.
+    unsafe impl Send for PreBands {}
+
+    static PRE_BANDS: Mutex<Option<PreBands>> = Mutex::new(None);
+
+    /// Release pre-encoded command buffers that were never committed. Their
+    /// completion signals never ran, so each event re-enters the pool below
+    /// its armed value and the pool's value-only-grows rule still holds.
+    /// A discarded fine prefix's gate value is simply never used: the next
+    /// fine encode takes a larger one and publishes it itself.
+    unsafe fn discard_pre_bands(gpu: &Gpu, bands: Vec<PreBand>, cb2: Option<Id>) {
+        unsafe {
+            for b in bands {
+                gpu.release(b.cb);
+                Gpu::recycle_done(b.sig);
+            }
+            if let Some(cb) = cb2 {
+                gpu.release(cb);
+            }
+        }
+    }
+
+    /// Body of [`super::preencode_streamed_bands`]: encode, retain and park
+    /// the bands (and the early prefix) exactly as the timed stream would
+    /// encode them, over the latched z wrap the stream will use.
+    pub(crate) fn preencode_streamed_bands(log_d: usize, n_leaves: usize, z_len: usize, ranges: &[(usize, usize)]) {
+        use std::sync::atomic::Ordering;
+        let Ok(gpu) = gpu() else { return };
+        let latch = latch_lock();
+        let LatchState::On(state) = &*latch else {
+            return;
+        };
+        let z_bytes = z_len * core::mem::size_of::<F128>();
+        let Some(&(_, _, z_buf)) = state.wraps.first().filter(|w| w.1 == z_bytes) else {
+            return;
+        };
+        // Same split and dead-store choices as `begin_from_z_first_pass_stream`.
+        let early_k = if std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some() {
+            0
+        } else {
+            match hybrid_cpu_sixteenths() {
+                k if k % 16 != 0 && k < 256 => k,
+                _ => 0,
+            }
+        };
+        let zero_store_from = if early_k > 0 {
+            from_z_zero_store_from(gpu, log_d, early_k, super::GPU_DEAD_STORE_ADMITTED.load(Ordering::Acquire))
+        } else {
+            0
+        };
+        let plan = FromZFirstPassPlan::new(log_d).with_zero_store_from(zero_store_from);
+        let total_r = 1usize << (log_d - 4);
+        let mut pre = PreBands {
+            z_buf,
+            staging: state.staging,
+            tw_buf: state.tw_buf,
+            tree_buf: state.tree_buf,
+            log_d,
+            n_leaves,
+            early_k,
+            lanes: super::GPU_ZERO_TAIL_LANES.load(Ordering::SeqCst),
+            bands: Vec::with_capacity(ranges.len()),
+            cb2: None,
+        };
+        let mut armed = 0usize;
+        unsafe {
+            let pool = gpu.pool_push();
+            for &(r_start, r_count) in ranges {
+                if r_count == 0
+                    || r_start + r_count > total_r
+                    || !r_start.is_multiple_of(4)
+                    || !r_count.is_multiple_of(4)
+                {
+                    continue;
+                }
+                let byte_offset = r_start * 64 * core::mem::size_of::<F128>();
+                let encoded = (|| -> Result<(Id, Option<DoneSig>), String> {
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    plan.encode_range(gpu, enc, state.staging, state.tw_buf, z_buf, log_d, byte_offset, r_count);
+                    gpu.end_encoding(enc);
+                    let sig = gpu.arm_done(cb);
+                    Ok((gpu.retain(cb), sig))
+                })();
+                match encoded {
+                    Ok((cb, sig)) => {
+                        armed += usize::from(sig.is_some());
+                        pre.bands.push(PreBand { r_start, r_count, plan, cb, sig });
+                    }
+                    Err(_) => break,
+                }
+            }
+            // A fine split's encoder takes a fresh layer-4 gate value and
+            // publishes it; keep that value so the commit re-publishes it
+            // exactly where the timed encode would have.
+            if early_k > 0 {
+                if let Ok(cb2) = encode_hybrid_prefix_cb2(
+                    gpu,
+                    state.staging,
+                    state.tw_buf,
+                    state.tree_buf,
+                    log_d,
+                    n_leaves,
+                    early_k,
+                ) {
+                    let gate = (decode_hybrid_split(early_k).1 > 0)
+                        .then(|| FINE_SPLIT_WAIT.load(Ordering::Acquire));
+                    pre.cb2 = Some((gpu.retain(cb2), gate));
+                }
+            }
+            gpu.pool_pop(pool);
+        }
+        drop(latch);
+        // The bands took their completion events from the pool now instead
+        // of in the timed prove; park as many fresh ones so the timed prove's
+        // other signal users find the pool exactly as full as before.
+        if armed > 0 {
+            let mut fresh = Vec::with_capacity(armed);
+            for _ in 0..armed {
+                let ev: Id = unsafe {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newSharedEvent")
+                };
+                if ev.is_null() {
+                    break;
+                }
+                fresh.push((ev as usize, 0u64));
+            }
+            DONE_POOL.lock().unwrap_or_else(|e| e.into_inner()).extend(fresh);
+        }
+        if debug_enabled() {
+            eprintln!(
+                "[gpu-commit] pre-encoded {} streamed bands (early prefix: {}, k={early_k}, zero-store-from {zero_store_from})",
+                pre.bands.len(),
+                pre.cb2.is_some()
+            );
+        }
+        let prev = PRE_BANDS.lock().unwrap_or_else(|e| e.into_inner()).replace(pre);
+        if let Some(p) = prev {
+            unsafe { discard_pre_bands(gpu, p.bands, p.cb2.map(|(cb, _)| cb)) };
+        }
     }
 
     // SAFETY: all captured Metal objects are process-persistent and Metal's
@@ -12104,23 +12315,38 @@ kernel void blake3_pow_race_tail(
             // r_start+r without modifying the proven full-range kernel.
             let byte_offset = r_start * 64 * core::mem::size_of::<F128>();
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            let result = unsafe {
+            let plan = FromZFirstPassPlan::new(self.log_d).with_zero_store_from(self.zero_store_from);
+            // A band the warm-up encoded for exactly this range, plan and
+            // these buffers (checked at stream creation) is committed as is.
+            let pre = self
+                .pre_bands
+                .iter()
+                .position(|b| b.r_start == r_start && b.r_count == r_count && b.plan == plan)
+                .map(|i| self.pre_bands.swap_remove(i));
+            let result = if let Some(b) = pre {
+                unsafe {
+                    let pool = self.gpu.pool_push();
+                    self.gpu.commit_async(b.cb);
+                    crate::tmark::mark("band committed");
+                    self.gpu.pool_pop(pool);
+                }
+                Ok((b.cb, b.sig))
+            } else {
+                unsafe {
                 let pool = self.gpu.pool_push();
                 let result = (|| -> Result<(Id, Option<DoneSig>), String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
-                    FromZFirstPassPlan::new(self.log_d)
-                        .with_zero_store_from(self.zero_store_from)
-                        .encode_range(
-                            self.gpu,
-                            enc,
-                            self.staging,
-                            self.tw_buf,
-                            self.z_buf,
-                            self.log_d,
-                            byte_offset,
-                            r_count,
-                        );
+                    plan.encode_range(
+                        self.gpu,
+                        enc,
+                        self.staging,
+                        self.tw_buf,
+                        self.z_buf,
+                        self.log_d,
+                        byte_offset,
+                        r_count,
+                    );
                     self.gpu.end_encoding(enc);
                     let sig = self.gpu.arm_done(cb);
                     // `commandBuffer` is autoreleased. Retain it before
@@ -12133,6 +12359,7 @@ kernel void blake3_pow_race_tail(
                 })();
                 self.gpu.pool_pop(pool);
                 result
+                }
             };
             match result {
                 Ok(cb) => {
@@ -12156,21 +12383,44 @@ kernel void blake3_pow_race_tail(
                 && self.early_cb2.is_none()
                 && self.next_r == total_r
             {
+                // The warm-up's encoded prefix for this split, when the
+                // zero-tail-lane geometry it read is still the published one.
+                let lanes = super::GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst);
+                let pre_cb2 = match self.pre_cb2.take() {
+                    Some((cb2, l, gate)) if l == lanes => Some((cb2, gate)),
+                    Some((cb2, _, _)) => {
+                        unsafe { discard_pre_bands(self.gpu, Vec::new(), Some(cb2)) };
+                        None
+                    }
+                    None => None,
+                };
                 let result = unsafe {
                     let pool = self.gpu.pool_push();
                     let result = (|| -> Result<Id, String> {
-                        let cb2 = encode_hybrid_prefix_cb2(
-                            self.gpu,
-                            self.staging,
-                            self.tw_buf,
-                            self.tree_buf,
-                            self.log_d,
-                            self.n_leaves,
-                            self.early_k,
-                        )?;
                         // Retain across the pool: completion is consumed by
                         // `finish` (same idiom as the streamed tiles above).
-                        let cb2 = self.gpu.retain(cb2);
+                        let cb2 = match pre_cb2 {
+                            Some((cb2, gate)) => {
+                                // The fine encoder published its gate value
+                                // right before this commit; so does this.
+                                if let Some(v) = gate {
+                                    FINE_SPLIT_WAIT.store(v, std::sync::atomic::Ordering::Release);
+                                }
+                                cb2
+                            }
+                            None => {
+                                let cb2 = encode_hybrid_prefix_cb2(
+                                    self.gpu,
+                                    self.staging,
+                                    self.tw_buf,
+                                    self.tree_buf,
+                                    self.log_d,
+                                    self.n_leaves,
+                                    self.early_k,
+                                )?;
+                                self.gpu.retain(cb2)
+                            }
+                        };
                         self.gpu.commit_async(cb2);
                         crate::tmark::mark("early cb2 committed");
                         Ok(cb2)
@@ -12311,6 +12561,16 @@ kernel void blake3_pow_race_tail(
     impl Drop for FromZFirstPassStream {
         fn drop(&mut self) {
             let _ = self.wait_pending();
+            let unused = std::mem::take(&mut self.pre_bands);
+            let unused_cb2 = self.pre_cb2.take().map(|(cb, _, _)| cb);
+            if debug_enabled() && (!unused.is_empty() || unused_cb2.is_some()) {
+                eprintln!(
+                    "[gpu-commit] pre-encoded bands unused: {} (early prefix unused: {})",
+                    unused.len(),
+                    unused_cb2.is_some()
+                );
+            }
+            unsafe { discard_pre_bands(self.gpu, unused, unused_cb2) };
             if let Some((cb2, _)) = self.early_cb2.take() {
                 let _ = unsafe { self.gpu.wait_cb(cb2) };
                 unsafe { self.gpu.release(cb2) };
@@ -12439,6 +12699,34 @@ kernel void blake3_pow_race_tail(
         if window_trace_enabled() {
             eprintln!("[gpu-window] dead-store: bands store dead-lane zeros from sixteenth {zero_store_from} (split {early_k})");
         }
+        // The warm-up's pre-encoded bands, when encoded over exactly these
+        // buffers and this split; anything else is released unused.
+        let pre = PRE_BANDS.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let (pre_bands, pre_cb2) = match pre {
+            Some(p)
+                if p.z_buf == z_buf
+                    && p.staging == state.staging
+                    && p.tw_buf == state.tw_buf
+                    && p.tree_buf == state.tree_buf
+                    && p.log_d == params.k_code()
+                    && p.n_leaves == params.n_leaves()
+                    && p.early_k == early_k =>
+            {
+                (p.bands, p.cb2.map(|(cb, gate)| (cb, p.lanes, gate)))
+            }
+            Some(p) => {
+                unsafe { discard_pre_bands(gpu, p.bands, p.cb2.map(|(cb, _)| cb)) };
+                (Vec::new(), None)
+            }
+            None => (Vec::new(), None),
+        };
+        if debug_enabled() {
+            eprintln!(
+                "[gpu-commit] stream begin: {} pre-encoded bands adopted (early prefix: {})",
+                pre_bands.len(),
+                pre_cb2.is_some()
+            );
+        }
         Some(FromZFirstPassStream {
             gpu,
             z_buf,
@@ -12461,6 +12749,8 @@ kernel void blake3_pow_race_tail(
             early_graph: None,
             zero_store_from,
             zero_store_k: if zero_store_from > 0 { early_k } else { 0 },
+            pre_bands,
+            pre_cb2,
         })
     }
 
