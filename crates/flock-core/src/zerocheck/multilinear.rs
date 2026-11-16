@@ -4500,6 +4500,130 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
         // the K arm's buffers into its own, submitted before the CPU queue,
         // which starts at `cpu_base`. During the arm's first launch (oracle)
         // `cpu_base == 0` and the queue is exactly the incumbent one.
+        // Late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1` keeps the record's join
+        // below): in an admitted prove the launch, the share and the CPU
+        // queue are the record's. If the GPU's buffer is complete when the
+        // queue has drained, that is all. If not, the CPU does not wait: it
+        // folds the GPU's chunks itself from the top of the share downward
+        // and asks at every claim whether the buffer has completed.
+        //
+        // The seam: the boundary `lo` and the completion flag change only
+        // under the claim lock; once completion is seen the boundary never
+        // moves again. The kernel skips a chunk only at or above a boundary
+        // value the CPU wrote, and every value written is the chunk the CPU
+        // claimed with it, so a chunk below the final `lo` was never skipped
+        // (the completed buffer folded it) and never claimed (no CPU write).
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let loop_arm = match prefix {
+            Some((pa, pb))
+                if gpu
+                    && crate::gpu_commit::zc_t56_loop_admitted()
+                    && packed
+                    && bpacked
+                    && depth == 2
+                    && hi_size == crate::gpu_commit::zc_t56::HI
+                    && chunk_out == crate::gpu_commit::zc_t56::OUT
+                    && per_chunk == crate::gpu_commit::zc_t56::IN_A
+                    && per_chunk_b == crate::gpu_commit::zc_t56::IN_B =>
+            {
+                let chunks =
+                    (pa.len() / per_chunk).min(pb.len() / per_chunk_b).min(crate::gpu_commit::gpu_zc_t56_cap());
+                Some((pa, pb, chunks))
+            }
+            _ => None,
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some((pa, pb, share)) = loop_arm {
+            let fold = |x_hi: usize| {
+                // SAFETY: exclusive per-chunk ownership (queue index or
+                // claim); the queue join publishes the writes.
+                let (a_o, b_o) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                        std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    )
+                };
+                let (a_in, b_in) = inputs(x_hi);
+                let outv = chunk(&a_in, &b_in, a_o, b_o);
+                // SAFETY: exclusive owner of partials[x_hi].
+                unsafe {
+                    *partials_base.ptr().add(x_hi) = outv;
+                }
+            };
+            // The record's launch and queue: the GPU's share first, the CPU
+            // folds the chunks after it in ascending order.
+            let job = crate::gpu_commit::launch_zc_t56_loop(pa, pb, share, rhos[0], rhos[1], eq_lo);
+            let cpu_base = job.as_ref().map_or(0, |j| j.chunks());
+            crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| fold(cpu_base + i));
+            if let Some(job) = job {
+                let mut lo = cpu_base;
+                let mut gpu_done = job.done();
+                if !gpu_done {
+                    // The GPU is late: steal from the top of its share.
+                    let claims = std::sync::Mutex::new((cpu_base, false));
+                    crate::epool::run_hetero_chunks(cpu_base, |_| {
+                        let x_hi = {
+                            let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                            if g.1 || g.0 == 0 {
+                                return;
+                            }
+                            if job.done() {
+                                g.1 = true;
+                                return;
+                            }
+                            // Test builds only (see `t56_loop_hold`, the
+                            // constant 0 otherwise): do not steal below
+                            // chunk `n`; wait for the GPU instead, so a slow
+                            // GPU still keeps `min(n, share)` chunks and
+                            // that path can be checked.
+                            if g.0 <= t56_loop_hold() {
+                                while !job.done() {
+                                    std::hint::spin_loop();
+                                }
+                                g.1 = true;
+                                return;
+                            }
+                            job.set_cut(g.0 - 1);
+                            g.0 -= 1;
+                            g.0
+                        };
+                        fold(x_hi);
+                    });
+                    (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+                    // Without the completion seen, the CPU folded every
+                    // chunk and nothing of the GPU's is read.
+                    assert!(gpu_done || lo == 0, "5+6 steal ended early");
+                }
+                // A buffer that signalled and still reports an error is not
+                // trusted (the record's join checks the status too): the CPU
+                // folds what it had left to the GPU; `finish` turns the arm
+                // off.
+                let gpu_ok = gpu_done && !job.failed();
+                if gpu_done && !gpu_ok {
+                    crate::epool::run_hetero_chunks(lo, &fold);
+                }
+                let taken = if gpu_ok { lo } else { 0 };
+                for c in 0..taken {
+                    partials[c] = job.part(c);
+                }
+                if taken > 0 {
+                    let (a, b) = job.outputs();
+                    gpu_prefix = Some(KGpuPrefix { a, b, len_a: taken * chunk_out, len_b: taken * chunk_out });
+                }
+                job.finish(taken, hi_size);
+            }
+            return {
+                let mut s = [F128::ZERO; 26];
+                for (x_hi, outv) in partials.iter().enumerate() {
+                    let eq_h = eq_hi[x_hi];
+                    for (slot, &v) in s.iter_mut().zip(outv.iter()) {
+                        *slot += eq_h * v;
+                    }
+                }
+                let (m1, minf, la, la2) = tri_finish(&s, r_next);
+                (m1, minf, la, la2, gpu_prefix)
+            };
+        }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let gpu_job = match prefix {
             Some((pa, pb))
@@ -4635,6 +4759,25 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     }
     let (m1, minf, la, la2) = tri_finish(&s, r_next);
     (m1, minf, la, la2, gpu_prefix)
+}
+
+/// Test hook of the 5+6 arm's late-GPU steal (see its claim queue). It exists only
+/// in a build made with `FLOCK_ZC_T56_TEST_HOOK` set in the BUILD
+/// environment (`option_env!`): such a build holds at chunk
+/// `FLOCK_ZC_T56_LOOP_HOLD` (run time), or at the build variable's value when
+/// that is unset. In every other build this is the constant 0 and nothing in
+/// the process environment can change the claim queue.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn t56_loop_hold() -> usize {
+    const HOOK: Option<&str> = option_env!("FLOCK_ZC_T56_TEST_HOOK");
+    let Some(built) = HOOK else { return 0 };
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLOCK_ZC_T56_LOOP_HOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| built.parse().unwrap_or(0))
+    })
 }
 
 /// Kill switch for the shared inversion of the tri-cascade finish:

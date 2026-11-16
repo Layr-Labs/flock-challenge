@@ -137,6 +137,8 @@ constant uint T56_IN_A = 31232u;
 constant uint T56_IN_B = 28672u;
 constant uint T56_OUT = 8192u;
 
+struct T56Params { uint tg_base; uint pad0; uint pad1; uint pad2; };
+
 kernel void zc_t56_fold(
     device const uint4* a_in   [[buffer(0)]],
     device const uint4* b_in   [[buffer(1)]],
@@ -144,11 +146,24 @@ kernel void zc_t56_fold(
     device uint4*       b_out  [[buffer(3)]],
     device const uint4* consts [[buffer(4)]],
     device ulong4*      banks  [[buffer(5)]],
-    uint tg  [[threadgroup_position_in_grid]],
+    constant T56Params& p      [[buffer(6)]],
+    device const uint*  cut    [[buffer(7)]],
+    uint tg_rel [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]])
 {
     threadgroup uint4 nib[1024];
     threadgroup ulong4 red[256];
+    // `tg_base`: first threadgroup of this dispatch in the pass's grid.
+    // `cut[0]`: the lowest chunk the CPU has taken (late-GPU steal); a group
+    // of a chunk at or above it returns at once. One thread reads the word
+    // into threadgroup memory, so every thread of the group takes the same
+    // branch whatever the CPU writes meanwhile (threads of one group must
+    // not part ways before the barriers and SIMD shuffles below).
+    threadgroup uint cut_tg;
+    const uint tg = p.tg_base + tg_rel;
+    if (lid == 0u) { cut_tg = cut[0]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((tg >> 2) >= cut_tg) { return; }
     for (uint i = lid; i < 1024u; i += 256u) { nib[i] = consts[i]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -336,6 +351,14 @@ struct ZcT56 {
     /// read by the next tri pass.
     out_a: Id,
     out_b: Id,
+    /// The kernel's skip boundary (one word; `u32::MAX` = none).
+    cut_buf: Id,
+    /// Closed loop: one step per completed encoder; grows across proves.
+    ev: Id,
+    next_value: u64,
+    /// Closed loop: the previous launch's command buffer, left in flight
+    /// (skipping its stolen tail) and retired by [`zc_t56_retire`].
+    inflight: Id,
     cap: usize,
 }
 
@@ -353,8 +376,8 @@ const ZC_T56_DISABLED: u8 = 2;
 static ZC_T56_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 unsafe fn zc_t56_alloc(gpu: &Gpu, cap: usize) -> Result<ZcT56, String> {
-    let mut made: Vec<Id> = Vec::with_capacity(4);
-    for len in [CONSTS * 16, cap * BANKS * 32, cap * OUT * 16, cap * OUT * 16] {
+    let mut made: Vec<Id> = Vec::with_capacity(5);
+    for len in [CONSTS * 16, cap * BANKS * 32, cap * OUT * 16, cap * OUT * 16, 16] {
         match unsafe { gpu.new_buffer(len) } {
             Ok(b) => made.push(b),
             Err(e) => {
@@ -365,7 +388,24 @@ unsafe fn zc_t56_alloc(gpu: &Gpu, cap: usize) -> Result<ZcT56, String> {
             }
         }
     }
-    Ok(ZcT56 { consts_buf: made[0], banks_buf: made[1], out_a: made[2], out_b: made[3], cap })
+    let ev: Id = unsafe { send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newSharedEvent") };
+    if ev.is_null() {
+        for b in made {
+            unsafe { gpu.release(b) };
+        }
+        return Err("newSharedEvent failed".into());
+    }
+    Ok(ZcT56 {
+        consts_buf: made[0],
+        banks_buf: made[1],
+        out_a: made[2],
+        out_b: made[3],
+        cut_buf: made[4],
+        ev,
+        next_value: 0,
+        inflight: NIL,
+        cap,
+    })
 }
 
 /// An in-flight 5+6 GPU prefix.
@@ -458,6 +498,9 @@ pub(crate) fn launch_zc_t56_prefix(
         }
         (k.out_a, k.out_b)
     };
+    // A closed-loop buffer still in flight writes the buffers this launch
+    // reuses.
+    zc_t56_retire();
     let mut slot = match ZC_T56_STATE.lock() {
         Ok(s) => s,
         Err(_) => {
@@ -499,6 +542,11 @@ pub(crate) fn launch_zc_t56_prefix(
             gpu.set_buffer(enc, state.out_b, 0, 3);
             gpu.set_buffer(enc, state.consts_buf, 0, 4);
             gpu.set_buffer(enc, state.banks_buf, 0, 5);
+            // The static form: one dispatch from threadgroup 0, no skips.
+            let params = [0u32; 4];
+            gpu.set_bytes(enc, core::slice::from_raw_parts(params.as_ptr().cast::<u8>(), 16), 6);
+            gpu.buffer_contents(state.cut_buf).cast::<u32>().write_volatile(u32::MAX);
+            gpu.set_buffer(enc, state.cut_buf, 0, 7);
             gpu.dispatch(enc, (4 * chunks) as u64, 256);
             gpu.end_encoding(enc);
             let cb = gpu.retain(cb);
@@ -520,6 +568,212 @@ pub(crate) fn launch_zc_t56_prefix(
                 None
             }
         }
+    }
+}
+
+/// Whether a timed prove may run the closed loop: the loop is on and the
+/// oracle launch (the static form, in the warm-up prove) admitted the arm.
+pub(crate) fn zc_t56_loop_admitted() -> bool {
+    super::gpu_zc_t56_loop_enabled() && ZC_T56_MODE.load(std::sync::atomic::Ordering::Relaxed) == ZC_T56_ADMITTED
+}
+
+/// An in-flight launch with the late-GPU steal (see `ENV_NO_ZC_T56_LOOP`):
+/// the record's single dispatch over chunks `0..chunks`, followed by one
+/// shared-event signal. The signal follows the encoder, so once it is seen
+/// every chunk the kernel did not skip is folded and visible to the host.
+pub(crate) struct ZcT56Loop {
+    gpu: &'static Gpu,
+    cb: Id,
+    ev: Id,
+    base: u64,
+    chunks: usize,
+    out_a: *const F128,
+    out_b: *const F128,
+    banks: *const [u64; 4],
+    cut: *mut u32,
+    submitted: std::time::Instant,
+}
+
+// SAFETY: the pointers name the arm's process-lifetime shared buffers, which
+// nothing rewrites before the job is retired; event reads are thread-safe.
+unsafe impl Send for ZcT56Loop {}
+unsafe impl Sync for ZcT56Loop {}
+
+impl ZcT56Loop {
+    /// Chunks offered to the GPU.
+    pub(crate) fn chunks(&self) -> usize {
+        self.chunks
+    }
+
+    /// Whether the buffer is complete: every chunk below the steal boundary
+    /// the kernel last read is folded and visible to the host.
+    pub(crate) fn done(&self) -> bool {
+        let done = unsafe { self.gpu.event_signaled_value(self.ev) } > self.base;
+        // Order the reads of the buffer's outputs after this read.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        done
+    }
+
+    /// Publish the CPU's steal boundary: the GPU skips chunks `>= hi`.
+    pub(crate) fn set_cut(&self, hi: usize) {
+        unsafe { self.cut.write_volatile(hi as u32) };
+    }
+
+    /// Whether the command buffer ended in an error (a status read, never a
+    /// wait). A failed buffer does not signal its event, so [`Self::done`]
+    /// stays false and the CPU folds every chunk; this is asked once more
+    /// when completion was seen and when the job is retired.
+    pub(crate) fn failed(&self) -> bool {
+        unsafe { self.gpu.cb_status(self.cb) == 5 }
+    }
+
+    /// The 26 slots of complete chunk `c`.
+    pub(crate) fn part(&self, c: usize) -> [F128; SLOTS] {
+        debug_assert!(c < self.chunks);
+        zc_t56::finish_banks(unsafe { std::slice::from_raw_parts(self.banks.add(c * BANKS), BANKS) })
+    }
+
+    /// The arm's output buffers (chunk `c` at `c * OUT`).
+    pub(crate) fn outputs(&self) -> (*const F128, *const F128) {
+        (self.out_a, self.out_b)
+    }
+
+    /// Retire the job without waiting for it: the remaining groups return at
+    /// the steal boundary and the buffer is parked until [`zc_t56_retire`].
+    /// `taken` = leading chunks left to the GPU, for the trace.
+    pub(crate) fn finish(self, taken: usize, hi_size: usize) {
+        self.set_cut(0);
+        if self.failed() {
+            // As the record's join on a failed buffer: the arm is off for
+            // the process (this prove's chunks were all folded by the CPU).
+            ZC_T56_MODE.store(ZC_T56_DISABLED, std::sync::atomic::Ordering::Relaxed);
+            if super::gpu_zc_t56_debug() {
+                eprintln!("[zc-t56-gpu] command buffer failed; arm disabled, the CPU folded the prefix");
+            }
+        }
+        if super::gpu_zc_t56_debug() {
+            eprintln!(
+                "[zc-t56-gpu] loop (proves {}): {taken} of {hi_size} 5+6 chunks left to the GPU (offered {}), {:.2} ms after submit",
+                ZC_T56_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                self.chunks,
+                self.submitted.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        unsafe {
+            let mut slot = ZC_T56_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            match slot.as_mut() {
+                Some(st) if st.inflight.is_null() => st.inflight = self.cb,
+                _ => {
+                    let _ = self.gpu.wait_cb(self.cb);
+                    self.gpu.release(self.cb);
+                }
+            }
+        }
+    }
+}
+
+/// Wait out and release a closed-loop command buffer left in flight. Called
+/// before anything rewrites the buffers it reads or writes: the K pass
+/// launch (its outputs are this arm's inputs) and this arm's launches.
+pub(crate) fn zc_t56_retire() {
+    let Ok(gpu) = gpu() else { return };
+    let mut slot = ZC_T56_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(st) = slot.as_mut()
+        && !st.inflight.is_null()
+    {
+        unsafe {
+            let _ = gpu.wait_cb(st.inflight);
+            gpu.release(st.inflight);
+        }
+        st.inflight = NIL;
+    }
+}
+
+/// Closed-loop launch over chunks `0..chunks` (see `ENV_NO_ZC_T56_LOOP`);
+/// arguments as [`launch_zc_t56_prefix`]. Only for an admitted arm whose
+/// buffers the oracle launch sized; `None` = the CPU folds every chunk.
+pub(crate) fn launch_zc_t56_loop(
+    pre_a: &[F128],
+    pre_b: &[F128],
+    chunks: usize,
+    rho_a: F128,
+    rho_b: F128,
+    eq_lo: &[F128],
+) -> Option<ZcT56Loop> {
+    if !zc_t56_loop_admitted()
+        || chunks == 0
+        || chunks > zc_t56::HI
+        || pre_a.len() < chunks * IN_A
+        || pre_b.len() < chunks * IN_B
+        || eq_lo.len() != zc_t56::LO
+    {
+        return None;
+    }
+    let gpu = gpu().ok()?;
+    let pso = zc_t56_pso(gpu)?;
+    let (k_a, k_b) = {
+        let k = ZC_K_STATE.get().and_then(|s| s.as_ref())?;
+        let k = k.lock().ok()?;
+        let same = unsafe {
+            gpu.buffer_contents(k.out_a).cast::<F128>().cast_const() == pre_a.as_ptr()
+                && gpu.buffer_contents(k.out_b).cast::<F128>().cast_const() == pre_b.as_ptr()
+        };
+        if !same || k.chunks * k.per_chunk_a < chunks * IN_A || k.chunks * k.per_chunk_b < chunks * IN_B {
+            return None;
+        }
+        (k.out_a, k.out_b)
+    };
+    zc_t56_retire();
+    let mut slot = ZC_T56_STATE.lock().ok()?;
+    let state = slot.as_mut()?;
+    if state.cap < chunks {
+        return None;
+    }
+    unsafe {
+        let consts = std::slice::from_raw_parts_mut(gpu.buffer_contents(state.consts_buf).cast::<F128>(), CONSTS);
+        zc_t56::consts_into(consts, rho_a, rho_b, eq_lo);
+        let cut = gpu.buffer_contents(state.cut_buf).cast::<u32>();
+        cut.write_volatile(zc_t56::HI as u32);
+        let base = state.next_value;
+        // Skipped whether or not the buffer encodes: a value that is never
+        // signalled is never waited for.
+        state.next_value = base + 1;
+        let (ev, out_a, out_b, consts_buf, banks_buf, cut_buf) =
+            (state.ev, state.out_a, state.out_b, state.consts_buf, state.banks_buf, state.cut_buf);
+        let pool = gpu.pool_push();
+        let submitted = (|| -> Result<Id, String> {
+            let cb = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb)?;
+            gpu.set_pipeline(enc, pso);
+            gpu.set_buffer(enc, k_a, 0, 0);
+            gpu.set_buffer(enc, k_b, 0, 1);
+            gpu.set_buffer(enc, out_a, 0, 2);
+            gpu.set_buffer(enc, out_b, 0, 3);
+            gpu.set_buffer(enc, consts_buf, 0, 4);
+            gpu.set_buffer(enc, banks_buf, 0, 5);
+            let params = [0u32; 4];
+            gpu.set_bytes(enc, core::slice::from_raw_parts(params.as_ptr().cast::<u8>(), 16), 6);
+            gpu.set_buffer(enc, cut_buf, 0, 7);
+            gpu.dispatch(enc, (4 * chunks) as u64, 256);
+            gpu.end_encoding(enc);
+            gpu.encode_signal_event(cb, ev, base + 1);
+            let cb = gpu.retain(cb);
+            gpu.commit_async(cb);
+            Ok(cb)
+        })();
+        gpu.pool_pop(pool);
+        submitted.ok().map(|cb| ZcT56Loop {
+            gpu,
+            cb,
+            ev,
+            base,
+            chunks,
+            out_a: gpu.buffer_contents(out_a).cast::<F128>().cast_const(),
+            out_b: gpu.buffer_contents(out_b).cast::<F128>().cast_const(),
+            banks: gpu.buffer_contents(banks_buf).cast::<[u64; 4]>().cast_const(),
+            cut,
+            submitted: std::time::Instant::now(),
+        })
     }
 }
 

@@ -1040,6 +1040,28 @@ pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
 /// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
 pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 128;
 
+/// Kill switch for the 5+6 arm's late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1`:
+/// the record's join, where the CPU queue, having folded the chunks after the
+/// GPU's share, waits for the GPU's buffer). With it on, the launch, the
+/// share, the dispatch and the CPU queue are the record's; only the join
+/// differs. If the GPU's buffer is complete when the queue has drained,
+/// nothing else happens. If it is not, the CPU does not wait: it folds the
+/// GPU's chunks itself from the top of the share downward, lowering the
+/// kernel's skip boundary as it goes, and asks at every claim whether the
+/// buffer has completed; from that moment every chunk below the boundary is
+/// the GPU's. The GPU keeps the leading chunks, which the next tri pass reads
+/// in place as before. Same kernel and same values per chunk, so which side
+/// folds a chunk cannot change a bit. Read once per process.
+pub const ENV_NO_ZC_T56_LOOP: &str = "FLOCK_NO_ZC_T56_LOOP";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_zc_t56_loop_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !env_is_one(ENV_NO_ZC_T56_LOOP)
+    });
+    *ON && gpu_zc_t56_enabled()
+}
+
 /// Whether the 5+6 arm may run: no kill switch, a non-zero cap, GPU commit
 /// enabled.
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
@@ -24493,6 +24515,9 @@ kernel void zc_ab_finish(
     ) -> Option<ZcKJob> {
         use std::sync::atomic::Ordering;
         let debug = super::gpu_zc_k_debug();
+        // A closed-loop 5+6 buffer of the previous prove still in flight
+        // reads the output buffers this launch rewrites.
+        zc_t56_retire();
         let mode = ZC_K_MODE.load(Ordering::Relaxed);
         // The round-one view and the round-two premapped anchors view are
         // consumed here whether or not they are used.
@@ -24820,8 +24845,8 @@ kernel void zc_ab_finish(
     pub(crate) use t0_metal::{T0_HI, T0_IN, T0_OUT, ZcT0Job, zc_t0_fire, zc_t0_park, zc_t0_prewarm, zc_t0_verdict};
     mod t56_metal;
     pub(crate) use t56_metal::{
-        ZcT56Job, ZcT56Result, launch_zc_t56_prefix, zc_t56_prewarm, zc_t56_prewarm_wanted, zc_t56_verdict,
-        zc_t56_wait,
+        ZcT56Job, ZcT56Result, launch_zc_t56_loop, launch_zc_t56_prefix, zc_t56_loop_admitted,
+        zc_t56_prewarm, zc_t56_prewarm_wanted, zc_t56_retire, zc_t56_verdict, zc_t56_wait,
     };
 
     // -----------------------------------------------------------------------
@@ -26957,7 +26982,8 @@ pub(crate) use imp::{T0_HI, T0_IN, T0_OUT, ZcT0Job, zc_t0_fire, zc_t0_prewarm, z
 /// Zerocheck 5+6 GPU prefix arm (see `ENV_NO_ZC_T56_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
-    ZcT56Job, ZcT56Result, launch_zc_t56_prefix, zc_t56_prewarm, zc_t56_prewarm_wanted, zc_t56_verdict, zc_t56_wait,
+    ZcT56Job, ZcT56Result, launch_zc_t56_loop, launch_zc_t56_prefix, zc_t56_loop_admitted,
+    zc_t56_prewarm, zc_t56_prewarm_wanted, zc_t56_verdict, zc_t56_wait,
 };
 
 /// ZC-window GPU idle fill (see `ENV_NO_ZC_IDLE_FILL`).
