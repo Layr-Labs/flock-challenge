@@ -2460,6 +2460,14 @@ pub(crate) fn gpu_tw_prefetch_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_TW_PREFETCH").is_none())
 }
 
+/// Kill switch for the 6+5+5-bit table windows of the four multi-use twiddles
+/// in the zero-root from-z library: `FLOCK_NO_ZERO_ROOT_W655` (any value)
+/// keeps the library text without them, byte for byte. Same field products.
+pub(crate) fn gpu_zero_root_w655_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZERO_ROOT_W655").is_none())
+}
+
 /// Kill switch for the four-bit-shift table bases in the zero-root from-z
 /// library: `FLOCK_NO_ZERO_ROOT_SHL4_BASES` (any value) keeps
 /// `FROM_Z_ZERO_ROOT_MSL_SOURCE` as written. Both write the same bytes.
@@ -5803,11 +5811,181 @@ kernel void export_from_z_zero_root_tabs(
     /// instead of `4 * bank` single-bit steps, unless
     /// `FLOCK_NO_ZERO_ROOT_SHL4_BASES` is set. Same base values.
     pub(crate) fn zero_root_msl_source() -> &'static str {
+        if super::gpu_zero_root_w655_enabled() {
+            zero_root_w655_source()
+        } else {
+            zero_root_base_source()
+        }
+    }
+
+    /// The library text without the 6+5+5 windows (the kill-switch text).
+    pub(crate) fn zero_root_base_source() -> &'static str {
         if super::gpu_zero_root_shl4_bases_enabled() {
             zero_root_shl4_bases_source()
         } else {
             FROM_Z_ZERO_ROOT_MSL_SOURCE
         }
+    }
+
+    /// [`zero_root_base_source`] with the production kernel's never-read
+    /// 4,096 B residency pad turned into live tables. The pass has eleven
+    /// twiddles, the same in every group; compact twiddles 0..3 are used by
+    /// 4, 2, 2 and 2 of a tile's 17 products. Those four get 128-entry
+    /// tables per 16-bit piece (windows of 6, 5 and 5 bits: three lookups
+    /// instead of four nibble lookups), the other seven keep their 64-entry
+    /// nibble tables: 4 * 128 + 7 * 64 = 960 entries, and with the 44 bases
+    /// the group allocates the same 16,064 B. Every entry is the same reduced
+    /// field element `twiddle * (window value << window offset)`, so every
+    /// product and every stored byte is the same. The test-only exporter and
+    /// its builder are untouched. Falls back to the base text if an anchor
+    /// is missing.
+    pub(crate) fn zero_root_w655_source() -> &'static str {
+        static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        SRC.get_or_init(|| {
+            let src = zero_root_base_source();
+            let kernel_anchor = "kernel void ntt_fused_reg4_from_zg4_zero_root(";
+            let helpers = r#"static inline uint4 gf_mulx_w655(uint4 v) {
+    uint carry = v.w >> 31;
+    uint4 r;
+    r.w = (v.w << 1) | (v.z >> 31);
+    r.z = (v.z << 1) | (v.y >> 31);
+    r.y = (v.y << 1) | (v.x >> 31);
+    r.x = (v.x << 1) ^ (carry * 0x87u);
+    return r;
+}
+
+static inline uint4 gf_shl4_w655(uint4 a) {
+    uint h = a.w >> 28;
+    uint4 r;
+    r.w = (a.w << 4) | (a.z >> 28);
+    r.z = (a.z << 4) | (a.y >> 28);
+    r.y = (a.y << 4) | (a.x >> 28);
+    r.x = (a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// v * twiddle through one 128-entry table: per 16-bit piece h of v, entry
+// [h & 63], entry [64 + ((h >> 6) & 31)] and entry [96 + (h >> 11)].
+static inline uint4 gf_mul_w655_zero_root(
+    uint4 v,
+    threadgroup const uint4* tab)
+{
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = gf_shl16_zero_root(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tab[h & 63u]
+             ^ tab[64u + ((h >> 6) & 31u)]
+             ^ tab[96u + (h >> 11)];
+    }
+    return acc;
+}
+
+// Table image of the 6+5+5 form, 960 entries. Compact twiddles 0..3: 128
+// entries each at tabs[128 k]: [v] = t * v for the 6-bit v, [64 + v] =
+// t * (v << 6) and [96 + v] = t * (v << 11) for the 5-bit v. Compact
+// twiddles 4..10: the 64-entry nibble image of build_zero_root_tabs at
+// tabs[512 + 64 (c - 4)]. Three stages, every thread reaches every barrier:
+// (1) the sixteen bit bases t * x^j of the four wide twiddles go to
+// tabs[512 + 16 k + j] (scratch, overwritten in stage 3) and the nibble-bank
+// bases of the other seven to bases[]; (2) each thread XORs its own 6-bit and
+// 5-bit entries from the bit bases; (3) the nibble tables, as before.
+static inline void build_zero_root_tabs_w655(
+    device const uint4* twiddles,
+    threadgroup uint4* bases,
+    threadgroup uint4* tabs,
+    uint lid)
+{
+    {
+        uint k = lid >> 4;
+        uint j = lid & 15u;
+        uint4 p = twiddles[zero_root_raw_twiddle(k)];
+        for (uint m = 0u; m < (j >> 2); m++) {
+            p = gf_shl4_w655(p);
+        }
+        for (uint m = 0u; m < (j & 3u); m++) {
+            p = gf_mulx_w655(p);
+        }
+        tabs[512u + lid] = p;
+    }
+    if (lid < 28u) {
+        uint c = 4u + (lid >> 2);
+        uint bank = lid & 3u;
+        uint4 p = twiddles[zero_root_raw_twiddle(c)];
+        for (uint m = 0u; m < bank; m++) {
+            p = gf_shl4_w655(p);
+        }
+        bases[lid] = p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        uint v5 = lid & 31u;
+        uint off = lid < 32u ? 6u : 11u;
+        for (uint k = 0u; k < 4u; k++) {
+            threadgroup const uint4* sb = &tabs[512u + 16u * k];
+            uint4 a = uint4(0u);
+            for (uint bit = 0u; bit < 6u; bit++) {
+                a ^= sb[bit] & uint4(0u - ((lid >> bit) & 1u));
+            }
+            uint4 b = uint4(0u);
+            for (uint bit = 0u; bit < 5u; bit++) {
+                b ^= sb[off + bit] & uint4(0u - ((v5 >> bit) & 1u));
+            }
+            tabs[128u * k + lid] = a;
+            tabs[128u * k + 64u + lid] = b;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < 32u) {
+        uint bank = lid >> 3;
+        uint nibble = lid & 7u;
+        for (uint c = 0u; c < 7u; c++) {
+            uint4 p = bases[(c << 2) | bank];
+            uint4 value = uint4(0u);
+            for (uint bit = 0u; bit < 3u; bit++) {
+                if ((nibble >> bit) & 1u) {
+                    value ^= p;
+                }
+                p = gf_mulx_w655(p);
+            }
+            uint index = 512u + c * 64u + bank * 16u + nibble;
+            tabs[index] = value;
+            tabs[index + 8u] = value ^ p;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+"#;
+            let decl_old = "    threadgroup uint4 tabs[11u * 64u];\n    // Residency only";
+            let decl_new = "    threadgroup uint4 tabs[960u];\n    // Formerly residency only";
+            let pad_old = "    threadgroup uint4 pad[256u];\n";
+            let build_old = "    build_zero_root_tabs(twiddles, bases, tabs, lid);
+    if (P.log_d == 77u) {          // unreachable; keeps `pad` allocated
+        pad[lid % 256u] = tabs[lid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tabs[lid] ^= pad[(lid + 1u) % 256u];
+    }
+";
+            let build_new = "    build_zero_root_tabs_w655(twiddles, bases, tabs, lid);\n";
+            let mul_old = "                ^ gf_mul_tab4_zero_root(elems[EV], &tabs[(CT) * 64u]); \\\n";
+            let mul_new = "                ^ ((CT) < 4u \\
+                    ? gf_mul_w655_zero_root(elems[EV], &tabs[(CT) * 128u]) \\
+                    : gf_mul_tab4_zero_root(elems[EV], &tabs[512u + ((CT) - 4u) * 64u])); \\\n";
+            for anchor in [kernel_anchor, decl_old, pad_old, build_old, mul_old] {
+                if src.matches(anchor).count() != 1 {
+                    debug_assert!(false, "zero-root w655 anchor: {anchor}");
+                    return src.to_owned();
+                }
+            }
+            src.replacen(kernel_anchor, &format!("{helpers}{kernel_anchor}"), 1)
+                .replacen(decl_old, decl_new, 1)
+                .replacen(pad_old, "", 1)
+                .replacen(build_old, build_new, 1)
+                .replacen(mul_old, mul_new, 1)
+        })
     }
 
     pub(crate) fn zero_root_shl4_bases_source() -> &'static str {
@@ -7493,6 +7671,95 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                     "dead-store dirty buffers: k = 2 (e0 14) and k = 3, m = 5 (e0 12) byte-equal over 0xA5 and \
                      stale dead slots; without the dead-lane s = 4 pass the stale slots change the codeword"
                 );
+                for b in [tw, z, staging, tree] {
+                    gpu.release(b);
+                }
+                gpu.pool_pop(pool);
+            }
+        }
+
+        /// The 6+5+5-window zero-root text against the kill-switch text on the
+        /// ranked fixture: same threadgroup allocation (16,064 B) and a
+        /// byte-equal full first pass, with the compact grid and without it.
+        /// `W655_PROBE_ROUNDS` > 0 also prints interleaved GPU-ms medians.
+        #[test]
+        #[ignore = "1.5 GiB of buffers; publishes the process-global geometry"]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn zero_root_w655_matches_base_text() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let rounds: usize = std::env::var("W655_PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            unsafe {
+                let pool = gpu.pool_push();
+                let (tw, z, staging, tree) = ranked_fixture(gpu);
+                let _g = super::super::GpuZeroTailLanes::scope(64, 7);
+                let kernel = "ntt_fused_reg4_from_zg4_zero_root";
+                let base_src = zero_root_base_source();
+                let new_src = zero_root_w655_source();
+                assert_ne!(base_src, new_src, "an anchor of the w655 text is missing");
+                assert!(new_src.contains("build_zero_root_tabs_w655(twiddles, bases, tabs, lid);"));
+                assert!(!new_src.contains("threadgroup uint4 pad[256u];"));
+                let pso_base = compile_supplemental_pipeline(gpu, base_src, kernel).unwrap();
+                let pso_new = compile_supplemental_pipeline(gpu, new_src, kernel).unwrap();
+                let (ub, un) = (gpu.pipeline_resources(pso_base), gpu.pipeline_resources(pso_new));
+                eprintln!("w655 resources: base {ub:?}, new {un:?}");
+                assert_eq!(ub.0, 16_064);
+                assert_eq!(un.0, 16_064, "the w655 text must keep the allocation");
+                let first = |pso: Id, binding: u32| {
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_pipeline(enc, pso);
+                    gpu.set_buffer(enc, staging, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    set_ntt_params(gpu, enc, NttParams { log_d: 20, l: 0, f: 4, s: 16 }, None);
+                    gpu.set_buffer(enc, z, 0, 3);
+                    gpu.set_bytes(enc, &binding.to_ne_bytes(), 4);
+                    gpu.dispatch(enc, (N_LEAVES / 16 / 4) as u64, 64);
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let (s, e) = cb_gpu_interval(gpu, cb);
+                    (e - s) * 1e3
+                };
+                let codeword = || std::slice::from_raw_parts(gpu.buffer_contents(staging).cast::<u8>(), CW_BYTES);
+                for binding in [1u32, 0u32, 1u32 | (14 << 8)] {
+                    std::ptr::write_bytes(gpu.buffer_contents(staging), 0xA5, CW_BYTES);
+                    first(pso_base, binding);
+                    let reference = codeword().to_vec();
+                    std::ptr::write_bytes(gpu.buffer_contents(staging), 0xA5, CW_BYTES);
+                    first(pso_new, binding);
+                    assert!(codeword() == &reference[..], "w655 first pass differs (binding {binding:#x})");
+                    assert!(reference.iter().any(|&b| b != 0xA5));
+                }
+                if rounds > 0 {
+                    for _ in 0..6 {
+                        first(pso_base, 1);
+                        first(pso_new, 1);
+                    }
+                    let mut t = [Vec::new(), Vec::new()];
+                    for r in 0..rounds {
+                        for k in 0..2 {
+                            let v = (k + r) % 2;
+                            let mut b = f64::MAX;
+                            for _ in 0..5 {
+                                b = b.min(first(if v == 0 { pso_base } else { pso_new }, 1));
+                            }
+                            t[v].push(b);
+                        }
+                    }
+                    for v in t.iter_mut() {
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    }
+                    eprintln!(
+                        "w655 probe, full first pass GPU ms (median of {rounds} best-of-5): base {:.3}, w655 {:.3}",
+                        t[0][rounds / 2],
+                        t[1][rounds / 2]
+                    );
+                }
+                for p in [pso_base, pso_new] {
+                    gpu.release(p);
+                }
                 for b in [tw, z, staging, tree] {
                     gpu.release(b);
                 }
