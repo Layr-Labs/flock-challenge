@@ -552,6 +552,30 @@ impl Gate {
         self.state.fetch_sub(1, Ordering::Release);
     }
 
+    /// [`Gate::run`] without the late-helper count; returns whether the
+    /// gate admitted this thread (and so ran the body).
+    fn try_run(&self) -> bool {
+        if !self.enter() {
+            return false;
+        }
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: admitted by `enter`; the drain waits for our `leave`
+            // before its frame (the body's referent) can go away.
+            unsafe { (self.body.call)(self.body.data) }
+        }))
+        .is_ok();
+        if !ok {
+            self.panicked.store(true, Ordering::Relaxed);
+        }
+        self.state.fetch_sub(1, Ordering::Release);
+        true
+    }
+
+    /// Whether the drain has closed the gate (scheduling hint only).
+    fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Relaxed) & GATE_CLOSED != 0
+    }
+
     /// Drain side: admit no more helpers, then wait for the admitted ones to
     /// leave. Returns whether any admitted helper's body panicked.
     fn close_and_wait(&self) -> bool {
@@ -2081,4 +2105,71 @@ mod tests {
             assert_eq!(seen.into_inner().unwrap(), (0..100).collect::<Vec<_>>());
         });
     }
+}
+
+/// Caller-first chunk drain on the main pool: the spawned grind drain's shape
+/// (`challenger::cpu_grind_spawned`) for chunk work that borrows the caller's
+/// frame. The calling thread claims indices from an atomic cursor at once,
+/// while one job posted with `rayon::spawn` fans out to up to `n_chunks - 1`
+/// other pool threads, each claiming from the same cursor as soon as it runs.
+/// The caller never parks on a pool latch: once its own claim loop finds the
+/// cursor spent, it closes the drain's [`Gate`] and waits (spinning, then
+/// yielding) only for pool threads the gate already admitted, i.e. those
+/// that may still hold a chunk. A pool thread that runs the job later finds
+/// the cursor spent or the gate closed and touches nothing of the caller's
+/// frame. No thread spins waiting for work.
+///
+/// Scheduling only: every index in `0..n_chunks` runs exactly once, so when
+/// `f(i)` writes only chunk `i`'s outputs and does not depend on which
+/// thread runs it, the outputs equal those of any other drain of the same
+/// chunks. Every write is visible to the caller on return (each admitted
+/// thread leaves the gate with `Release`; the close waits with `Acquire`). A
+/// panic in `f` on a pool thread is re-raised on the caller. Runs inline
+/// when `n_chunks <= 1` or the main pool is single-threaded. `f` must not
+/// itself block on other pool work.
+pub(crate) fn run_chunks_caller_first<F>(n_chunks: usize, f: &F)
+where
+    F: Fn(usize) + Sync,
+{
+    let main_threads = rayon::current_num_threads();
+    if n_chunks <= 1 || main_threads <= 1 {
+        for i in 0..n_chunks {
+            f(i);
+        }
+        return;
+    }
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let claim = || loop {
+        let i = cursor.fetch_add(1, Ordering::Relaxed);
+        if i >= n_chunks {
+            break;
+        }
+        f(i);
+    };
+    let gate = Arc::new(Gate {
+        state: AtomicUsize::new(0),
+        panicked: AtomicBool::new(false),
+        body: JobPtr::new(&claim),
+    });
+    let close = CloseOnDrop(Arc::clone(&gate));
+    let helpers = (main_threads - 1).min(n_chunks - 1);
+    {
+        let gate = Arc::clone(&gate);
+        let cursor = Arc::clone(&cursor);
+        rayon::spawn(move || {
+            let spent = || gate.is_closed() || cursor.load(Ordering::Relaxed) >= n_chunks;
+            if spent() {
+                return;
+            }
+            (0..helpers).into_par_iter().with_max_len(1).for_each(|_| {
+                if !spent() {
+                    gate.try_run();
+                }
+            });
+        });
+    }
+    claim();
+    // Explicit: closing the gate and waiting for admitted pool threads is the
+    // safety condition for `claim`'s borrow, as in `drain_hetero`.
+    drop(close);
 }
