@@ -2336,15 +2336,22 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let deltas_base = crate::epool::SyncPtr(unsafe { compact.deltas.full_overwrite_ptr().add(delta_base) });
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
-        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
-        // exclusively owns its anchors/deltas ranges and both partial slots.
+    // One chunk of the sweep. `stolen` = a chunk of the R2-CS offer the CPU
+    // took back from a late GPU (`gpu_commit::ENV_NO_ZC_R2_STEAL`): it is
+    // walked as a chunk after the prefix is, with the full walk into its own
+    // compact ranges and slots.
+    let walk = |x_hi: usize, stolen: bool| {
+        // SAFETY: the queue (or the steal's claim) hands out each x_hi
+        // exactly once; chunk x_hi exclusively owns its anchors/deltas ranges
+        // and both partial slots.
         let (anchors, deltas) = unsafe {
             (
                 anchors_base.ptr().add(x_hi * anchor_chunk_stride),
                 deltas_base.ptr().add(x_hi * delta_chunk_stride),
             )
         };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = stolen;
         let pair_idx_base = x_hi * lo_size;
         let row_base = pair_idx_base * 2;
         let mut out = [F128::ZERO; 8];
@@ -2353,7 +2360,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         // R2-CS: the arm owns this prefix chunk outright (compact state,
         // products, lookahead terms); its slots are filled after the join.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if r2cs && x_hi < gpu_prefix {
+        if r2cs && x_hi < gpu_prefix && !stolen {
             // SAFETY: exclusive owner of both partial slots (see above).
             unsafe {
                 *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
@@ -2365,7 +2372,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         #[cfg(target_arch = "aarch64")]
         {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let full = x_hi >= gpu_prefix;
+            let full = x_hi >= gpu_prefix || stolen;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let full = true;
             unsafe {
@@ -2560,7 +2567,83 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 eq_h * out[7],
             ];
         }
-    });
+    };
+    // One instance of the chunk body for the sweep and the steal.
+    let walk: &(dyn Fn(usize, bool) + Sync) = &walk;
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| walk(x_hi, false));
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
+
+    // Late-GPU steal (`gpu_commit::ENV_NO_ZC_R2_STEAL`; without it the join
+    // below waits). The sweep has walked every chunk after the R2-CS offer.
+    // If the GPU's buffer is complete, that is all. If not, the CPU walks
+    // the offered chunks itself from the top of the offer downward and asks
+    // at every claim whether the buffer has completed.
+    //
+    // The seam: the boundary and the completion flag change only under the
+    // claim lock, and once completion is seen the boundary never moves
+    // again. The kernel skips a chunk only at or above a boundary value the
+    // CPU wrote, and every value written is the chunk the CPU claimed with
+    // it; so a chunk below the final boundary was never skipped (the
+    // completed buffer stored it) and never claimed (no CPU write), and a
+    // chunk at or above it was walked in full by the CPU, whose stores and
+    // the kernel's for the same chunk are the same bytes at the same places.
+    // `cs_taken` = the leading chunks left to the GPU.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut cs_taken = gpu_prefix;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if r2cs
+        && let Some(job) = gpu_job.as_ref()
+        && job.steal_armed()
+        && !job.steal_done()
+    {
+        let t_steal = crate::gpu_commit::gpu_zc_r2_debug().then(std::time::Instant::now);
+        let claims = std::sync::Mutex::new((gpu_prefix, false));
+        // One claim per queue index, on the main pool only: a chunk claimed
+        // just before the buffer completes delays the join by its whole
+        // walk, and an efficiency core's walk is the long one.
+        let steal = |_: usize| {
+            let x_hi = {
+                let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                if g.1 || g.0 == 0 {
+                    return;
+                }
+                if job.steal_done() {
+                    g.1 = true;
+                    return;
+                }
+                // Test builds only (see `r2_steal_hold`, the constant 0
+                // otherwise): do not steal below chunk `n`; wait for the GPU
+                // instead, so a slow GPU keeps exactly `min(n, offer)` chunks.
+                if g.0 <= r2_steal_hold() {
+                    while !job.steal_done() {
+                        std::hint::spin_loop();
+                    }
+                    g.1 = true;
+                    return;
+                }
+                job.steal_cut(g.0 - 1);
+                g.0 -= 1;
+                g.0
+            };
+            walk(x_hi, true);
+        };
+        crate::epool::run_chunks_with_helper(gpu_prefix, &steal, None);
+        let (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+        // Without the completion seen, the CPU walked every offered chunk
+        // and nothing of the GPU's is read; the join below then only waits
+        // for the buffer's remaining groups to return at the boundary.
+        assert!(gpu_done || lo == 0, "round-two steal ended early");
+        cs_taken = lo;
+        if let Some(t) = t_steal {
+            eprintln!(
+                "[zc-r2] steal: {lo} of {gpu_prefix} offered chunks left to the GPU, the CPU took {} in {:.2} ms (buffer {})",
+                gpu_prefix - lo,
+                t.elapsed().as_secs_f64() * 1e3,
+                if gpu_done { "complete" } else { "not complete" },
+            );
+        }
+    }
 
     // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
     // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
@@ -2569,7 +2652,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // to skip it.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
-        let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
         let calib = job.is_calibration();
         let prefix = job.cpu_split();
         let res = crate::gpu_commit::zc_r2_wait(
@@ -2602,8 +2684,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 // R2-CS: the arm owned these chunks outright, so their
                 // lookahead slots 2..6 are its [W0, W3, W4, W5] as well, and its
                 // head-pair flag joins the CPU walk's. (Without `r2cs` the CPU
-                // walked them after all: the incumbent merge.)
-                for (x_hi, (v, w)) in vals.iter().zip(&lookahead).enumerate() {
+                // walked them after all: the incumbent merge. After a steal
+                // only the chunks left to the GPU: the CPU filled the slots
+                // of the ones it took.)
+                for (x_hi, (v, w)) in vals.iter().zip(&lookahead).enumerate().take(cs_taken) {
                     partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
                     if r2cs {
                         la_partials[x_hi] = [v[2], v[3], w[0], w[1], w[2], w[3]];
@@ -2624,10 +2708,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 // recovered too when the CPU sweep skipped them. R2-CS: the
                 // sweep skipped these chunks outright, so the redo writes their
                 // real compact state and lookahead slots with the sweep's own
-                // walk.
+                // walk (after a steal: of the chunks that were left to the
+                // GPU).
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
-                for x_hi in 0..prefix {
+                for x_hi in 0..prefix.min(cs_taken) {
                     let pair_idx_base = x_hi * lo_size;
                     let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
@@ -3525,7 +3610,77 @@ fn fold2_compact_and_round45_into_packed_b(
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
     };
+    // Late-GPU steal (`gpu_commit::ENV_NO_ZC_K_STEAL` keeps the record's
+    // join below): on a steal-form launch the share, the launch and the CPU
+    // queue are the record's. If the GPU's buffer is complete when the queue
+    // has drained, that is all. If not, the CPU does not wait: it folds the
+    // GPU's chunks itself from the top of the share downward with the same
+    // chunk body, and asks at every claim whether the buffer has completed.
+    //
+    // The seam: the boundary `lo` and the completion flag change only under
+    // the claim lock; once completion is seen the boundary never moves
+    // again. A threadgroup of the kernel skips its superblock only when its
+    // chunk is at or above a boundary value the CPU wrote, and every value
+    // written is the chunk the CPU claimed with it, so a chunk below the
+    // final `lo` was never skipped (the completed buffer folded it whole)
+    // and never claimed (no CPU write). The K prefix handed on is chunks
+    // `0..lo`; the 5+6 pass reads every chunk above it from `a_out` /
+    // `b_out`, where the CPU wrote it.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let steal_claims =
+        gpu_job.as_ref().filter(|j| j.steal_form()).map(|_| std::sync::Mutex::new((cpu_base, false)));
+    // Test builds only (see `zc_k_steal_force`, the constant 0 otherwise):
+    // take chunks from the top of the GPU's share first, while it runs.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    if let (Some(job), Some(claims)) = (gpu_job.as_ref(), steal_claims.as_ref()) {
+        let forced = crate::gpu_commit::zc_k_steal_force().min(cpu_base);
+        if forced > 0 {
+            crate::epool::run_hetero_chunks(forced, |_| {
+                let x_hi = {
+                    let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                    job.set_cut(g.0 - 1);
+                    g.0 -= 1;
+                    g.0
+                };
+                chunk_body(x_hi);
+            });
+        }
+    }
     crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let steal_kept: Option<(usize, bool)> = match (gpu_job.as_ref(), steal_claims) {
+        (Some(job), Some(claims)) => {
+            let lo0 = claims.lock().unwrap_or_else(|e| e.into_inner()).0;
+            let done = job.done();
+            if done || lo0 == 0 {
+                Some((if done { lo0 } else { 0 }, done))
+            } else {
+                // The GPU is late: steal from the top of its share.
+                crate::epool::run_hetero_chunks(lo0, |_| {
+                    let x_hi = {
+                        let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.1 || g.0 == 0 {
+                            return;
+                        }
+                        if job.done() {
+                            g.1 = true;
+                            return;
+                        }
+                        job.set_cut(g.0 - 1);
+                        g.0 -= 1;
+                        g.0
+                    };
+                    chunk_body(x_hi);
+                });
+                let (lo, done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+                // Without the completion seen, the CPU folded every chunk and
+                // nothing of the GPU's is read.
+                assert!(done || lo == 0, "K steal ended early");
+                Some((if done { lo } else { 0 }, done))
+            }
+        }
+        _ => None,
+    };
 
     // Join the GPU prefix (it was submitted first and is normally done).
     #[allow(unused_mut)]
@@ -3534,7 +3689,11 @@ fn fold2_compact_and_round45_into_packed_b(
     if let Some(job) = gpu_job {
         let calibration = job.calibration();
         let chunks = job.chunks();
-        match crate::gpu_commit::zc_k_wait(job, hi_size) {
+        let joined = match steal_kept {
+            Some((kept, done)) => crate::gpu_commit::zc_k_steal_join(job, kept, done, hi_size),
+            None => crate::gpu_commit::zc_k_wait(job, hi_size),
+        };
+        match joined {
             crate::gpu_commit::ZcKResult::Prefix { parts, a, b, len_a, len_b, b_ones } => {
                 if !b_ones {
                     // A b output of the GPU's chunks that the pack skips is
@@ -3564,13 +3723,20 @@ fn fold2_compact_and_round45_into_packed_b(
                         }
                     }
                 } else {
-                    partials[..chunks].copy_from_slice(&parts);
-                    gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
+                    // The GPU's chunks: all of its share, or the chunks the
+                    // steal left to it (the CPU wrote the rest).
+                    let kept = parts.len();
+                    partials[..kept].copy_from_slice(&parts);
+                    if kept > 0 {
+                        gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
+                    }
                 }
             }
             crate::gpu_commit::ZcKResult::Failed => {
                 // The GPU failed after admission: the CPU folds the prefix
-                // chunks with the same kernel (the arm is now disabled).
+                // chunks with the same kernel (the arm is now disabled; a
+                // chunk the steal already folded is rewritten with the same
+                // values).
                 crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
             }
         }
@@ -4759,6 +4925,25 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     }
     let (m1, minf, la, la2) = tri_finish(&s, r_next);
     (m1, minf, la, la2, gpu_prefix)
+}
+
+/// Test hook of round two's late-GPU steal (see its claim queue). It exists
+/// only in a build made with `FLOCK_ZC_R2_STEAL_TEST_HOOK` set in the BUILD
+/// environment (`option_env!`): such a build holds at chunk
+/// `FLOCK_ZC_R2_STEAL_HOLD` (run time), or at the build variable's value when
+/// that is unset. In every other build this is the constant 0 and nothing in
+/// the process environment can change the claim queue.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn r2_steal_hold() -> usize {
+    const HOOK: Option<&str> = option_env!("FLOCK_ZC_R2_STEAL_TEST_HOOK");
+    let Some(built) = HOOK else { return 0 };
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLOCK_ZC_R2_STEAL_HOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| built.parse().unwrap_or(0))
+    })
 }
 
 /// Test hook of the 5+6 arm's late-GPU steal (see its claim queue). It exists only
