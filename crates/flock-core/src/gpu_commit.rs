@@ -328,6 +328,29 @@ mod zc_byte_fold_gate_tests {
         assert_eq!(tune(true), Some(64));
         assert_eq!(tune(false), Some(56));
     }
+
+    /// C fold tune fix (`ENV_NO_ZC_FOLD_TUNE_FIX`): the M4 warm-up window
+    /// (24 of 64 claims, GPU replay 4.66 ms, head 1744.42 ms across the
+    /// warm-up's commit retune, cold suffix 12.09 ms) pins the record's
+    /// formula at the cap; its AB head (13.81 ms, probe draining 128 of 96
+    /// steady AB chunks) and a warm suffix replay give the balanced share.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn tune_fix_inputs_leave_the_cap_for_the_balanced_share() {
+        use super::imp::{zc_fold_balanced_share, zc_tune_fixed_math};
+        assert_eq!(zc_fold_balanced_share(24, 64, 4.66, 1744.42, 12.09, 1.0, true), Some(64));
+        let (head, suffix, frac, cold) = zc_tune_fixed_math(13.81, 0.75, 9.9, 12.09).unwrap();
+        assert!((frac - 0.75).abs() < 1e-12 && (cold - 9.9 / 12.09).abs() < 1e-12);
+        assert!((head - 13.81 * 0.75 * 9.9 / 12.09).abs() < 1e-9 && suffix == 9.9);
+        assert_eq!(zc_fold_balanced_share(24, 64, 4.66, head, suffix, 1.0, true), Some(55));
+        // Unreported AB fraction counts as 1; a slower replay never raises
+        // the head; missing inputs keep the record's inputs.
+        assert_eq!(zc_tune_fixed_math(10.0, 0.0, 9.0, 12.0).map(|t| t.2), Some(1.0));
+        assert_eq!(zc_tune_fixed_math(10.0, 1.0, 13.0, 12.0).map(|t| t.3), Some(1.0));
+        assert!(zc_tune_fixed_math(0.0, 0.75, 9.9, 12.09).is_none());
+        assert!(zc_tune_fixed_math(13.81, 0.75, 0.0, 12.09).is_none());
+        assert!(zc_tune_fixed_math(13.81, 0.75, 9.9, f64::NAN).is_none());
+    }
 }
 
 /// Diagnostic trace for the zerocheck fold arm (`FLOCK_ZC_GPU_DEBUG=1`).
@@ -18398,6 +18421,139 @@ kernel void lc_fold_stripes_factored_b4(
         }
     }
 
+    /// C fold tune fix (`FLOCK_NO_ZC_FOLD_TUNE_FIX=1` restores the record's
+    /// inputs). The zerocheck split is tuned once, from the warm-up prove's
+    /// window, by the balanced formula below. Its `head` was the wall from
+    /// the commit-tail submit to the CPU suffix, and in the warm-up that
+    /// span holds the process's one-time setup between the commit join and
+    /// zerocheck (about 1.73 s on the M4) and the AB arm's oracle probe (the
+    /// CPU computes every AB chunk, 128 instead of 96), so the formula
+    /// always hit its 64/64 cap and the timed prove's CPU then idled about
+    /// 4 ms in round one. The fix changes only the formula's inputs:
+    /// - `head` is timed from the start of round one's AB completion (the
+    ///   setup gap is outside it), scaled by the AB queue's steady share of
+    ///   this prove's CPU chunks (96/128 while the AB arm probes, 1 when it
+    ///   is off), and by the CPU's warm/cold price ratio below;
+    /// - the CPU price is the minimum of two warm replays of the same suffix
+    ///   (results discarded), matching the GPU side's warm replays.
+    /// Formula, bias and cap are the record's; only the warm-up does more
+    /// work, and the split never changes bytes. Read once.
+    pub const ENV_NO_ZC_FOLD_TUNE_FIX: &str = "FLOCK_NO_ZC_FOLD_TUNE_FIX";
+
+    fn zc_fold_tune_fix_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var(ENV_NO_ZC_FOLD_TUNE_FIX).is_ok_and(|v| v == "1"))
+    }
+
+    /// Warm-up inputs of the fixed tune, gathered around the process's first
+    /// zerocheck window and consumed by its drain (see
+    /// [`ENV_NO_ZC_FOLD_TUNE_FIX`]).
+    struct ZcTuneInputs {
+        /// Start of round one's AB completion.
+        ab_start: Option<std::time::Instant>,
+        /// Steady CPU AB chunks over this prove's (0 = not reported).
+        ab_frac: f64,
+        /// AB completion start to the CPU suffix start, ms.
+        head_ab_ms: f64,
+        /// Minimum warm replay of the window's CPU suffix, ms.
+        suffix_replay_ms: f64,
+    }
+
+    static ZC_TUNE_IN: Mutex<ZcTuneInputs> = Mutex::new(ZcTuneInputs {
+        ab_start: None,
+        ab_frac: 0.0,
+        head_ab_ms: 0.0,
+        suffix_replay_ms: 0.0,
+    });
+
+    fn zc_tune_inputs() -> std::sync::MutexGuard<'static, ZcTuneInputs> {
+        ZC_TUNE_IN.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The zerocheck split is still untuned (the warm-up window) and the fix
+    /// is on: the round-one code then gathers the fixed tune's inputs.
+    pub(crate) fn zc_fold_tune_pending() -> bool {
+        zc_fold_tune_fix_enabled()
+            && FoldArm::Zc.claim_override().is_none()
+            && ZC_FOLD_TUNED_CLAIMS.load(std::sync::atomic::Ordering::Relaxed) == usize::MAX
+    }
+
+    /// Round one's AB completion starts (warm-up window only).
+    pub(crate) fn zc_fold_tune_note_ab_start() {
+        if zc_fold_tune_pending() {
+            zc_tune_inputs().ab_start = Some(std::time::Instant::now());
+        }
+    }
+
+    /// The AB completion's CPU queue: `steady` chunks in an admitted prove,
+    /// `now` chunks in this one (warm-up window only).
+    pub(crate) fn zc_fold_tune_note_ab_chunks(steady: usize, now: usize) {
+        if zc_fold_tune_pending() && now > 0 && steady <= now {
+            zc_tune_inputs().ab_frac = steady as f64 / now as f64;
+        }
+    }
+
+    /// Wall from the AB completion start to `suffix_start`, ms (0 when the
+    /// start was not recorded).
+    pub(crate) fn zc_fold_tune_head_ab_ms(suffix_start: std::time::Instant) -> f64 {
+        zc_tune_inputs()
+            .ab_start
+            .map_or(0.0, |t| suffix_start.saturating_duration_since(t).as_secs_f64() * 1e3)
+    }
+
+    /// Whether this caller runs the window's warm suffix replays: true at
+    /// most once per process, and only while the tune is pending (so a
+    /// warm-up window that never publishes cannot put replays into a timed
+    /// prove).
+    pub(crate) fn zc_fold_tune_take_replays() -> bool {
+        static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        zc_fold_tune_pending() && !TAKEN.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The window's measured head and warm suffix replay (warm-up only).
+    pub(crate) fn zc_fold_tune_note_suffix(head_ab_ms: f64, suffix_replay_ms: f64) {
+        let mut t = zc_tune_inputs();
+        t.head_ab_ms = head_ab_ms;
+        t.suffix_replay_ms = suffix_replay_ms;
+    }
+
+    /// The fixed tune's `(head, suffix)` for a sample whose cold suffix took
+    /// `suffix_ms`, or `None` (record inputs) when the fix is off or any
+    /// input is missing. Consumes the gathered inputs.
+    fn zc_fold_tune_fixed_inputs(suffix_ms: f64) -> Option<(f64, f64, f64, f64)> {
+        if !zc_fold_tune_fix_enabled() {
+            return None;
+        }
+        let mut t = zc_tune_inputs();
+        let (head_ab, frac, replay) = (t.head_ab_ms, t.ab_frac, t.suffix_replay_ms);
+        *t = ZcTuneInputs {
+            ab_start: None,
+            ab_frac: 0.0,
+            head_ab_ms: 0.0,
+            suffix_replay_ms: 0.0,
+        };
+        drop(t);
+        zc_tune_fixed_math(head_ab, frac, replay, suffix_ms)
+    }
+
+    /// `(head, suffix, frac, cold)` of the fixed tune from the warm-up
+    /// window's AB head, AB chunk fraction, warm suffix replay and cold
+    /// suffix (all ms but `frac`); `None` when a needed input is missing.
+    pub(crate) fn zc_tune_fixed_math(
+        head_ab_ms: f64,
+        ab_frac: f64,
+        suffix_replay_ms: f64,
+        suffix_ms: f64,
+    ) -> Option<(f64, f64, f64, f64)> {
+        let ok = |v: f64| v.is_finite() && v > 0.0;
+        if !(ok(head_ab_ms) && ok(suffix_replay_ms) && ok(suffix_ms)) {
+            return None;
+        }
+        let frac = if ok(ab_frac) { ab_frac.min(1.0) } else { 1.0 };
+        let cold = (suffix_replay_ms / suffix_ms).min(1.0);
+        Some((head_ab_ms * frac * cold, suffix_replay_ms, frac, cold))
+    }
+
     /// Publish a balanced split from one observed prove (zerocheck arm —
     /// the lincheck arm's ratio gate publishes from `finish_xor_into`).
     ///
@@ -18435,16 +18591,31 @@ kernel void lc_fold_stripes_factored_b4(
         } else {
             1.0
         };
+        // Tune fix (`ENV_NO_ZC_FOLD_TUNE_FIX`): steady inputs gathered in
+        // the warm-up window; same formula, bias and cap.
+        let fixed = (arm == FoldArm::Zc)
+            .then(|| zc_fold_tune_fixed_inputs(suffix_ms))
+            .flatten();
+        let (head_in, suffix_in) = fixed.map_or((head_ms, suffix_ms), |(h, s, _, _)| (h, s));
+        if let Some((h, s, frac, cold)) = fixed
+            && arm.debug()
+        {
+            eprintln!(
+                "{} tune fix: head {head_ms:.2} -> {h:.2} ms (AB frac {frac:.3}, cold {cold:.3}), \
+                 suffix {suffix_ms:.2} -> {s:.2} ms",
+                arm.tag(),
+            );
+        }
         let Some(g) = zc_fold_balanced_share(
-            claim_lo, n_claims, gpu_ms, head_ms, suffix_ms, bias, byte_fold,
+            claim_lo, n_claims, gpu_ms, head_in, suffix_in, bias, byte_fold,
         ) else {
             return;
         };
         arm.tuned().store(g, std::sync::atomic::Ordering::Relaxed);
         if arm.debug() {
             eprintln!(
-                "{} split {claim_lo}/{n_claims} gpu={gpu_ms:.2}ms head={head_ms:.2}ms \
-                 suffix={suffix_ms:.2}ms -> {g}/{n_claims}",
+                "{} split {claim_lo}/{n_claims} gpu={gpu_ms:.2}ms head={head_in:.2}ms \
+                 suffix={suffix_in:.2}ms -> {g}/{n_claims}",
                 arm.tag(),
             );
         }
@@ -20185,6 +20356,76 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         *ON
     }
 
+    /// L1 tail (`FLOCK_NO_L1_TAIL=1`, exact, keeps the incumbent tail). The
+    /// L1 commit waits after its transform until the GPU has hashed the last
+    /// leaf batch and then every internal level (18 single-level parent
+    /// dispatches behind the cover-completing batch): about 0.5 ms on the M4,
+    /// on the opening's serial path. Two changes shorten it:
+    /// - the parent chain runs the fused three-level kernel the main commit
+    ///   tree already uses (`parent_hash3`, or its vec4 form when built) for
+    ///   every level whose input has at least 256 nodes, and single-level
+    ///   dispatches above, so levels 1..12 take 4 dispatches instead of 12;
+    /// - once the leaves still uncovered fit in one batch, each finished
+    ///   range is submitted at once instead of waiting for the batch to fill,
+    ///   so the GPU hashes the last ranges while the transform still runs and
+    ///   the cover-completing buffer carries the last range alone.
+    /// Same kernels per node and the same flat-tree slots; only the dispatch
+    /// grouping and the submit points change. Read once.
+    pub const ENV_NO_L1_TAIL: &str = "FLOCK_NO_L1_TAIL";
+
+    fn l1_tail_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var(ENV_NO_L1_TAIL).is_ok_and(|v| v == "1"))
+    }
+
+    /// Encode the flat tree's internal levels from the level that starts at
+    /// node `read_start` and holds `read_len` nodes up to the root: fused
+    /// three-level dispatches while a level has at least 256 nodes (when
+    /// `fused` and the main tree's pipeline exists), single levels after.
+    unsafe fn encode_l1_parent_chain(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        pso_parent: Id,
+        mut read_start: usize,
+        mut read_len: usize,
+        fused: bool,
+    ) {
+        unsafe {
+            let pso3 = if gpu.pso_parent3_v4.is_null() {
+                gpu.pso_parent3
+            } else {
+                gpu.pso_parent3_v4
+            };
+            if fused && !pso3.is_null() && read_len >= 256 {
+                gpu.set_pipeline(enc, pso3);
+                while read_len >= 256 {
+                    let l1 = read_start + read_len;
+                    let l2 = l1 + read_len / 2;
+                    let l3 = l2 + read_len / 4;
+                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, l1 * 32, 1);
+                    gpu.set_buffer(enc, tree_buf, l2 * 32, 2);
+                    gpu.set_buffer(enc, tree_buf, l3 * 32, 3);
+                    gpu.dispatch(enc, (read_len / 256) as u64, 128);
+                    read_start = l3;
+                    read_len /= 8;
+                }
+            }
+            gpu.set_pipeline(enc, pso_parent);
+            while read_len > 1 {
+                let write_start = read_start + read_len;
+                let n_out = read_len / 2;
+                gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                let tpg = 256u64.min(n_out as u64);
+                gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                read_start = write_start;
+                read_len = n_out;
+            }
+        }
+    }
+
     /// `true` iff the sorted `ranges` tile `[0, num_leaves)` exactly.
     fn l1_ranges_cover_exactly(ranges: &mut [(usize, usize)], num_leaves: usize) -> bool {
         ranges.sort_unstable();
@@ -20335,8 +20576,13 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             // final batch (with the internal levels encoded behind it) then
             // enters the queue from inside the transform's own parallel
             // region, before the NTT join returns.
+            // L1 tail (`ENV_NO_L1_TAIL`): once the leaves still uncovered fit
+            // in one batch, every finished range goes to the GPU at once.
+            let last_window = l1_tail_enabled()
+                && self.num_leaves - inner.covered_leaves < self.batch_leaves();
             if inner.pending_leaves >= self.batch_leaves()
                 || inner.covered_leaves == self.num_leaves
+                || last_window
             {
                 self.submit_pending(&mut inner);
             }
@@ -20422,23 +20668,21 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         }
                     }
                     if encode_parents {
-                        self.gpu.set_pipeline(enc, self.pso_parent);
                         let mut read_start = 0usize;
                         let mut read_len = self.num_leaves;
                         for _ in 0..local_levels {
                             read_start += read_len;
                             read_len >>= 1;
                         }
-                        while read_len > 1 {
-                            let write_start = read_start + read_len;
-                            let n_out = read_len / 2;
-                            self.gpu.set_buffer(enc, self.tree_buf, read_start * 32, 0);
-                            self.gpu.set_buffer(enc, self.tree_buf, write_start * 32, 1);
-                            let tpg = 256u64.min(n_out as u64);
-                            self.gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                            read_start = write_start;
-                            read_len = n_out;
-                        }
+                        encode_l1_parent_chain(
+                            self.gpu,
+                            enc,
+                            self.tree_buf,
+                            self.pso_parent,
+                            read_start,
+                            read_len,
+                            l1_tail_enabled(),
+                        );
                     }
                     self.gpu.end_encoding(enc);
                     let sig = self.gpu.arm_done(cb);
@@ -23806,6 +24050,11 @@ kernel void zc_ab_finish(
         /// CPU computes every chunk; the GPU's are compared, then discarded).
         pub(crate) fn cpu_base(&self) -> usize {
             if self.calibration { 0 } else { self.chunks }
+        }
+
+        /// The GPU's chunk share once admitted (also during the probe).
+        pub(crate) fn gpu_chunks(&self) -> usize {
+            self.chunks
         }
     }
 
@@ -27192,6 +27441,14 @@ pub(crate) use imp::zfold::{ZfJob as ZFoldJob, launch as zfold_launch};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix};
+
+/// Round-one C fold tune fix: warm-up input hooks (see
+/// `ENV_NO_ZC_FOLD_TUNE_FIX`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    zc_fold_tune_head_ab_ms, zc_fold_tune_note_ab_chunks, zc_fold_tune_note_ab_start,
+    zc_fold_tune_note_suffix, zc_fold_tune_take_replays,
+};
 
 /// eq-direct staging for the two fold arms (see `ENV_NO_EQ_DIRECT`): the
 /// producers build eq_outer straight into the arms' persistent upload

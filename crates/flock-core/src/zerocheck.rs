@@ -686,6 +686,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             };
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
             let t_ab = std::time::Instant::now();
+            // C fold tune fix (`gpu_commit::ENV_NO_ZC_FOLD_TUNE_FIX`): the
+            // warm-up window times its head from here.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            crate::gpu_commit::zc_fold_tune_note_ab_start();
             // ZC entry overlap (`FLOCK_NO_ZC_ENTRY_OVERLAP=1` restores the
             // serial order): the round-two GPU staging runs beside the AB
             // completion's table set-up, and the C fold runs on this thread

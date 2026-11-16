@@ -3794,6 +3794,12 @@ impl AbGpuPrefix {
         }
     }
 
+    /// The GPU's chunk share once admitted (also during the probe).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_chunks(&self) -> usize {
+        self.job.gpu_chunks()
+    }
+
     /// Join the GPU. Admitted prove: writes the GPU's partials into
     /// `partials[..cpu_base()]` and returns `true`. Oracle probe: compares
     /// the GPU's partials with the CPU's complete `partials` (verdict kept for
@@ -4146,6 +4152,13 @@ where
             // queue below is exactly the incumbent one.
             let cpu_base = gpu_prefix.as_ref().map_or(0, AbGpuPrefix::cpu_base);
             let cpu_chunks = hi_size - cpu_base;
+            // C fold tune fix: this prove's CPU queue length against an
+            // admitted prove's (the warm-up probe drains every chunk).
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            crate::gpu_commit::zc_fold_tune_note_ab_chunks(
+                hi_size - gpu_prefix.as_ref().map_or(0, AbGpuPrefix::gpu_chunks),
+                cpu_chunks,
+            );
             // Tail split (`FLOCK_NO_ZC_AB_TAIL_SPLIT=1` kills): the last
             // `split` chunks of the queue are claimed as two half-ranges of
             // `x_outer_lo` each, halving the queue's ragged-tail grain. The
@@ -4448,6 +4461,28 @@ fn round1_c_inner_fold_columns(
             claim_lo,
         );
         let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
+        // C fold tune fix (`gpu_commit::ENV_NO_ZC_FOLD_TUNE_FIX`), warm-up
+        // window only: the head from the AB completion start, and the
+        // minimum of two warm replays of this same suffix (discarded) as
+        // the CPU price; the drain below publishes the split from them.
+        if crate::gpu_commit::zc_fold_tune_take_replays() {
+            let head_ab_ms = crate::gpu_commit::zc_fold_tune_head_ab_ms(t_suffix);
+            let mut replay_ms = f64::INFINITY;
+            for _ in 0..2 {
+                let t = std::time::Instant::now();
+                let again = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
+                    c_lincheck,
+                    m,
+                    k_log,
+                    useful_bits,
+                    eq_outer.as_slice(),
+                    claim_lo,
+                );
+                replay_ms = replay_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(again);
+            }
+            crate::gpu_commit::zc_fold_tune_note_suffix(head_ab_ms, replay_ms);
+        }
         match job.finish_xor_into(&mut out, head_ms, suffix_ms) {
             Ok(()) => return out,
             Err(e) => {
