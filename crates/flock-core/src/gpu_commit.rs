@@ -3083,6 +3083,42 @@ pub fn warm_gpu_spares() {
     imp::warm_gpu_spares(WARM_DONE_EVENTS);
 }
 
+/// Kill switch for the warm-up's pre-encoded streamed bands
+/// (`FLOCK_NO_PREENCODED_BANDS`, any value; read once). With the switch
+/// unset, the untimed warm-up encodes (but does not commit) the timed
+/// prove's streamed first-pass band command buffers and its early
+/// GPU-prefix command buffer: the same pipeline,
+/// bindings, parameters, dispatch and completion signal the timed prove
+/// would encode, over the same latched buffers. The timed prove then only
+/// commits each one at the moment it would have committed a fresh one, in
+/// the same order, so the GPU runs identical work and proof bytes are
+/// unchanged; a band whose range, plan or buffers differ from the
+/// pre-encoded one is encoded afresh as before. Removes the bands' Metal
+/// encoding (~1 ms of witness-thread CPU on an M4 at 10 threads) and the
+/// serial encode tail behind the last witness slab from the timed window.
+pub const ENV_NO_PREENCODED_BANDS: &str = "FLOCK_NO_PREENCODED_BANDS";
+
+/// Encode the streamed bands `ranges` (position tiles, as the witness driver
+/// publishes them) and the early prefix ahead of the timed prove (see
+/// [`ENV_NO_PREENCODED_BANDS`]). Untimed warm-up only; a no-op off the
+/// ranked GPU shape, without a latched commit, or killed. The caller
+/// publishes the timed prove's zero-tail-lane geometry around the call.
+pub fn preencode_streamed_bands(params: &crate::pcs::commit::PcsParams, ranges: &[(usize, usize)]) {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os(ENV_NO_PREENCODED_BANDS).is_some())
+        || !gpu_commit_enabled()
+        || !is_ranked_gpu_shape(params)
+        || rayon::current_num_threads() <= 1
+        || std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
+    {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::preencode_streamed_bands(params.k_code(), params.n_leaves(), 1usize << params.log_msg_len(), ranges);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = ranges;
+}
+
 impl FromZFirstPassStream {
     /// Publish `r_start..r_start+r_count` (in position tiles). Ranges must be
     /// contiguous, ordered, and multiples of four for the tuned g4 kernel.
@@ -10941,7 +10977,7 @@ kernel void blake3_pow_race_tail(
     /// Immutable selection for one logical from-z first pass. Every full,
     /// streamed, and blocking/reprime dispatch goes through this helper, so
     /// the candidate and exact rollback cannot silently diverge by path.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) struct FromZFirstPassPlan {
         grouped: bool,
         zero_root: bool,
@@ -11959,6 +11995,181 @@ kernel void blake3_pow_race_tail(
         /// The split the bands skipped zeros for (0 when none were skipped).
         /// A graph for any other split re-primes from z first.
         zero_store_k: usize,
+        /// Band command buffers the warm-up encoded for this stream's
+        /// buffers and split (`ENV_NO_PREENCODED_BANDS`), not yet committed.
+        pre_bands: Vec<PreBand>,
+        /// The warm-up's encoded early prefix for `early_k`, with the
+        /// zero-tail-lane value it was encoded under and, for a fine split,
+        /// the layer-4 gate value its event signal carries.
+        pre_cb2: Option<(Id, usize, Option<u64>)>,
+    }
+
+    /// One pre-encoded (retained, uncommitted) streamed band.
+    pub(crate) struct PreBand {
+        r_start: usize,
+        r_count: usize,
+        plan: FromZFirstPassPlan,
+        cb: Id,
+        sig: Option<DoneSig>,
+    }
+
+    /// The warm-up's pre-encoded streamed bands and early prefix, with every
+    /// input their encoding read (see `super::ENV_NO_PREENCODED_BANDS`).
+    pub(crate) struct PreBands {
+        z_buf: Id,
+        staging: Id,
+        tw_buf: Id,
+        tree_buf: Id,
+        log_d: usize,
+        n_leaves: usize,
+        early_k: usize,
+        lanes: usize,
+        bands: Vec<PreBand>,
+        /// The early prefix and, for a fine split, its layer-4 gate value.
+        cb2: Option<(Id, Option<u64>)>,
+    }
+
+    // SAFETY: process-persistent Metal objects; access is serialized by the
+    // mutex below and by the stream's `&mut self`.
+    unsafe impl Send for PreBands {}
+
+    static PRE_BANDS: Mutex<Option<PreBands>> = Mutex::new(None);
+
+    /// Release pre-encoded command buffers that were never committed. Their
+    /// completion signals never ran, so each event re-enters the pool below
+    /// its armed value and the pool's value-only-grows rule still holds.
+    /// A discarded fine prefix's gate value is simply never used: the next
+    /// fine encode takes a larger one and publishes it itself.
+    unsafe fn discard_pre_bands(gpu: &Gpu, bands: Vec<PreBand>, cb2: Option<Id>) {
+        unsafe {
+            for b in bands {
+                gpu.release(b.cb);
+                Gpu::recycle_done(b.sig);
+            }
+            if let Some(cb) = cb2 {
+                gpu.release(cb);
+            }
+        }
+    }
+
+    /// Body of [`super::preencode_streamed_bands`]: encode, retain and park
+    /// the bands (and the early prefix) exactly as the timed stream would
+    /// encode them, over the latched z wrap the stream will use.
+    pub(crate) fn preencode_streamed_bands(log_d: usize, n_leaves: usize, z_len: usize, ranges: &[(usize, usize)]) {
+        use std::sync::atomic::Ordering;
+        let Ok(gpu) = gpu() else { return };
+        let latch = latch_lock();
+        let LatchState::On(state) = &*latch else {
+            return;
+        };
+        let z_bytes = z_len * core::mem::size_of::<F128>();
+        let Some(&(_, _, z_buf)) = state.wraps.first().filter(|w| w.1 == z_bytes) else {
+            return;
+        };
+        // Same split and dead-store choices as `begin_from_z_first_pass_stream`.
+        let early_k = if std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some() {
+            0
+        } else {
+            match hybrid_cpu_sixteenths() {
+                k if k % 16 != 0 && k < 256 => k,
+                _ => 0,
+            }
+        };
+        let zero_store_from = if early_k > 0 {
+            from_z_zero_store_from(gpu, log_d, early_k, super::GPU_DEAD_STORE_ADMITTED.load(Ordering::Acquire))
+        } else {
+            0
+        };
+        let plan = FromZFirstPassPlan::new(log_d).with_zero_store_from(zero_store_from);
+        let total_r = 1usize << (log_d - 4);
+        let mut pre = PreBands {
+            z_buf,
+            staging: state.staging,
+            tw_buf: state.tw_buf,
+            tree_buf: state.tree_buf,
+            log_d,
+            n_leaves,
+            early_k,
+            lanes: super::GPU_ZERO_TAIL_LANES.load(Ordering::SeqCst),
+            bands: Vec::with_capacity(ranges.len()),
+            cb2: None,
+        };
+        let mut armed = 0usize;
+        unsafe {
+            let pool = gpu.pool_push();
+            for &(r_start, r_count) in ranges {
+                if r_count == 0
+                    || r_start + r_count > total_r
+                    || !r_start.is_multiple_of(4)
+                    || !r_count.is_multiple_of(4)
+                {
+                    continue;
+                }
+                let byte_offset = r_start * 64 * core::mem::size_of::<F128>();
+                let encoded = (|| -> Result<(Id, Option<DoneSig>), String> {
+                    let cb = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb)?;
+                    plan.encode_range(gpu, enc, state.staging, state.tw_buf, z_buf, log_d, byte_offset, r_count);
+                    gpu.end_encoding(enc);
+                    let sig = gpu.arm_done(cb);
+                    Ok((gpu.retain(cb), sig))
+                })();
+                match encoded {
+                    Ok((cb, sig)) => {
+                        armed += usize::from(sig.is_some());
+                        pre.bands.push(PreBand { r_start, r_count, plan, cb, sig });
+                    }
+                    Err(_) => break,
+                }
+            }
+            // A fine split's encoder takes a fresh layer-4 gate value and
+            // publishes it; keep that value so the commit re-publishes it
+            // exactly where the timed encode would have.
+            if early_k > 0 {
+                if let Ok(cb2) = encode_hybrid_prefix_cb2(
+                    gpu,
+                    state.staging,
+                    state.tw_buf,
+                    state.tree_buf,
+                    log_d,
+                    n_leaves,
+                    early_k,
+                ) {
+                    let gate = (decode_hybrid_split(early_k).1 > 0)
+                        .then(|| FINE_SPLIT_WAIT.load(Ordering::Acquire));
+                    pre.cb2 = Some((gpu.retain(cb2), gate));
+                }
+            }
+            gpu.pool_pop(pool);
+        }
+        drop(latch);
+        // The bands took their completion events from the pool now instead
+        // of in the timed prove; park as many fresh ones so the timed prove's
+        // other signal users find the pool exactly as full as before.
+        if armed > 0 {
+            let mut fresh = Vec::with_capacity(armed);
+            for _ in 0..armed {
+                let ev: Id = unsafe {
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, gpu.device, c"newSharedEvent")
+                };
+                if ev.is_null() {
+                    break;
+                }
+                fresh.push((ev as usize, 0u64));
+            }
+            DONE_POOL.lock().unwrap_or_else(|e| e.into_inner()).extend(fresh);
+        }
+        if debug_enabled() {
+            eprintln!(
+                "[gpu-commit] pre-encoded {} streamed bands (early prefix: {}, k={early_k}, zero-store-from {zero_store_from})",
+                pre.bands.len(),
+                pre.cb2.is_some()
+            );
+        }
+        let prev = PRE_BANDS.lock().unwrap_or_else(|e| e.into_inner()).replace(pre);
+        if let Some(p) = prev {
+            unsafe { discard_pre_bands(gpu, p.bands, p.cb2.map(|(cb, _)| cb)) };
+        }
     }
 
     // SAFETY: all captured Metal objects are process-persistent and Metal's
@@ -12027,23 +12238,38 @@ kernel void blake3_pow_race_tail(
             // r_start+r without modifying the proven full-range kernel.
             let byte_offset = r_start * 64 * core::mem::size_of::<F128>();
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            let result = unsafe {
+            let plan = FromZFirstPassPlan::new(self.log_d).with_zero_store_from(self.zero_store_from);
+            // A band the warm-up encoded for exactly this range, plan and
+            // these buffers (checked at stream creation) is committed as is.
+            let pre = self
+                .pre_bands
+                .iter()
+                .position(|b| b.r_start == r_start && b.r_count == r_count && b.plan == plan)
+                .map(|i| self.pre_bands.swap_remove(i));
+            let result = if let Some(b) = pre {
+                unsafe {
+                    let pool = self.gpu.pool_push();
+                    self.gpu.commit_async(b.cb);
+                    crate::tmark::mark("band committed");
+                    self.gpu.pool_pop(pool);
+                }
+                Ok((b.cb, b.sig))
+            } else {
+                unsafe {
                 let pool = self.gpu.pool_push();
                 let result = (|| -> Result<(Id, Option<DoneSig>), String> {
                     let cb = self.gpu.command_buffer()?;
                     let enc = self.gpu.compute_encoder(cb)?;
-                    FromZFirstPassPlan::new(self.log_d)
-                        .with_zero_store_from(self.zero_store_from)
-                        .encode_range(
-                            self.gpu,
-                            enc,
-                            self.staging,
-                            self.tw_buf,
-                            self.z_buf,
-                            self.log_d,
-                            byte_offset,
-                            r_count,
-                        );
+                    plan.encode_range(
+                        self.gpu,
+                        enc,
+                        self.staging,
+                        self.tw_buf,
+                        self.z_buf,
+                        self.log_d,
+                        byte_offset,
+                        r_count,
+                    );
                     self.gpu.end_encoding(enc);
                     let sig = self.gpu.arm_done(cb);
                     // `commandBuffer` is autoreleased. Retain it before
@@ -12056,6 +12282,7 @@ kernel void blake3_pow_race_tail(
                 })();
                 self.gpu.pool_pop(pool);
                 result
+                }
             };
             match result {
                 Ok(cb) => {
@@ -12079,21 +12306,44 @@ kernel void blake3_pow_race_tail(
                 && self.early_cb2.is_none()
                 && self.next_r == total_r
             {
+                // The warm-up's encoded prefix for this split, when the
+                // zero-tail-lane geometry it read is still the published one.
+                let lanes = super::GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst);
+                let pre_cb2 = match self.pre_cb2.take() {
+                    Some((cb2, l, gate)) if l == lanes => Some((cb2, gate)),
+                    Some((cb2, _, _)) => {
+                        unsafe { discard_pre_bands(self.gpu, Vec::new(), Some(cb2)) };
+                        None
+                    }
+                    None => None,
+                };
                 let result = unsafe {
                     let pool = self.gpu.pool_push();
                     let result = (|| -> Result<Id, String> {
-                        let cb2 = encode_hybrid_prefix_cb2(
-                            self.gpu,
-                            self.staging,
-                            self.tw_buf,
-                            self.tree_buf,
-                            self.log_d,
-                            self.n_leaves,
-                            self.early_k,
-                        )?;
                         // Retain across the pool: completion is consumed by
                         // `finish` (same idiom as the streamed tiles above).
-                        let cb2 = self.gpu.retain(cb2);
+                        let cb2 = match pre_cb2 {
+                            Some((cb2, gate)) => {
+                                // The fine encoder published its gate value
+                                // right before this commit; so does this.
+                                if let Some(v) = gate {
+                                    FINE_SPLIT_WAIT.store(v, std::sync::atomic::Ordering::Release);
+                                }
+                                cb2
+                            }
+                            None => {
+                                let cb2 = encode_hybrid_prefix_cb2(
+                                    self.gpu,
+                                    self.staging,
+                                    self.tw_buf,
+                                    self.tree_buf,
+                                    self.log_d,
+                                    self.n_leaves,
+                                    self.early_k,
+                                )?;
+                                self.gpu.retain(cb2)
+                            }
+                        };
                         self.gpu.commit_async(cb2);
                         crate::tmark::mark("early cb2 committed");
                         Ok(cb2)
@@ -12234,6 +12484,16 @@ kernel void blake3_pow_race_tail(
     impl Drop for FromZFirstPassStream {
         fn drop(&mut self) {
             let _ = self.wait_pending();
+            let unused = std::mem::take(&mut self.pre_bands);
+            let unused_cb2 = self.pre_cb2.take().map(|(cb, _, _)| cb);
+            if debug_enabled() && (!unused.is_empty() || unused_cb2.is_some()) {
+                eprintln!(
+                    "[gpu-commit] pre-encoded bands unused: {} (early prefix unused: {})",
+                    unused.len(),
+                    unused_cb2.is_some()
+                );
+            }
+            unsafe { discard_pre_bands(self.gpu, unused, unused_cb2) };
             if let Some((cb2, _)) = self.early_cb2.take() {
                 let _ = unsafe { self.gpu.wait_cb(cb2) };
                 unsafe { self.gpu.release(cb2) };
@@ -12362,6 +12622,34 @@ kernel void blake3_pow_race_tail(
         if window_trace_enabled() {
             eprintln!("[gpu-window] dead-store: bands store dead-lane zeros from sixteenth {zero_store_from} (split {early_k})");
         }
+        // The warm-up's pre-encoded bands, when encoded over exactly these
+        // buffers and this split; anything else is released unused.
+        let pre = PRE_BANDS.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let (pre_bands, pre_cb2) = match pre {
+            Some(p)
+                if p.z_buf == z_buf
+                    && p.staging == state.staging
+                    && p.tw_buf == state.tw_buf
+                    && p.tree_buf == state.tree_buf
+                    && p.log_d == params.k_code()
+                    && p.n_leaves == params.n_leaves()
+                    && p.early_k == early_k =>
+            {
+                (p.bands, p.cb2.map(|(cb, gate)| (cb, p.lanes, gate)))
+            }
+            Some(p) => {
+                unsafe { discard_pre_bands(gpu, p.bands, p.cb2.map(|(cb, _)| cb)) };
+                (Vec::new(), None)
+            }
+            None => (Vec::new(), None),
+        };
+        if debug_enabled() {
+            eprintln!(
+                "[gpu-commit] stream begin: {} pre-encoded bands adopted (early prefix: {})",
+                pre_bands.len(),
+                pre_cb2.is_some()
+            );
+        }
         Some(FromZFirstPassStream {
             gpu,
             z_buf,
@@ -12384,6 +12672,8 @@ kernel void blake3_pow_race_tail(
             early_graph: None,
             zero_store_from,
             zero_store_k: if zero_store_from > 0 { early_k } else { 0 },
+            pre_bands,
+            pre_cb2,
         })
     }
 
@@ -17262,6 +17552,137 @@ kernel void lc_fold_stripes_factored_b4(
 }
 "#;
 
+    /// Commit-tail GPU eq build (see [`ENV_NO_ZC_GPU_EQ`]): row `h` of the
+    /// C fold's eq table is `out[h * L + l] = lo[l] * hi[h]` (`L = 1 <<
+    /// lo_log`), the same tensor product the CPU builder forms with
+    /// `scale_slice_into`. One threadgroup per row: the row multiplier
+    /// `s = hi[h]` is expanded once into its 128 monomial products `s * x^i`
+    /// (a 256-bit shift and the T56 arm's reduction) and its 16-bank nibble
+    /// table (`[b*32 + n] = s * (n at byte b)`, `[b*32 + 16 + n] =
+    /// s * ((n << 4) at byte b)`, by F2-linearity; kept word-planar), then
+    /// every lane is 32 table XORs. Each step is an exact GF(2^128) product
+    /// or XOR, so the row is bit-identical to the CPU's. About 0.2 ms of
+    /// M4 GPU time for the ranked 2^18 lanes.
+    const ZC_EQ_ROWS_MSL_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct EqU256 { ulong r0; ulong r1; ulong r2; ulong r3; };
+
+// Reduce a 256-bit carry-less product mod x^128 + x^7 + x^2 + x + 1 (the
+// T56 arm's reduction).
+static inline uint4 eq_gf_reduce(EqU256 p) {
+    ulong h0 = p.r2, h1 = p.r3;
+    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
+             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
+    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
+    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
+    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+}
+
+// s * x^i for 0 <= i < 128: shift the 128-bit value into 256 bits, reduce.
+static inline uint4 eq_mul_xi(uint4 s, uint i) {
+    const ulong lo = (ulong(s.y) << 32) | ulong(s.x);
+    const ulong hi = (ulong(s.w) << 32) | ulong(s.z);
+    const uint b = i & 63u;
+    ulong w0 = lo, w1 = hi, w2 = 0ul;
+    if (b != 0u) {
+        w0 = lo << b;
+        w1 = (hi << b) | (lo >> (64u - b));
+        w2 = hi >> (64u - b);
+    }
+    EqU256 p;
+    if (i < 64u) {
+        p.r0 = w0; p.r1 = w1; p.r2 = w2; p.r3 = 0ul;
+    } else {
+        p.r0 = 0ul; p.r1 = w0; p.r2 = w1; p.r3 = w2;
+    }
+    return eq_gf_reduce(p);
+}
+
+// x * s through the 16 byte-bank nibble tables of s, stored word-planar
+// (entry e's word w at nibw[w * 512 + e]): the lanes of a lookup then touch
+// at most 16 consecutive words of one plane (measured 2.5x faster than
+// 16-byte entries on the M4).
+static inline uint4 eq_mul_tab16(uint4 x, threadgroup const uint* nibw) {
+    uint4 acc = uint4(0u);
+    const uint w[4] = { x.x, x.y, x.z, x.w };
+    for (uint word = 0u; word < 4u; word++) {
+        for (uint j = 0u; j < 4u; j++) {
+            const uint b = (w[word] >> (8u * j)) & 0xffu;
+            const uint e0 = (word * 4u + j) * 32u + (b & 15u);
+            const uint e1 = (word * 4u + j) * 32u + 16u + (b >> 4u);
+            acc.x ^= nibw[e0] ^ nibw[e1];
+            acc.y ^= nibw[512u + e0] ^ nibw[512u + e1];
+            acc.z ^= nibw[1024u + e0] ^ nibw[1024u + e1];
+            acc.w ^= nibw[1536u + e0] ^ nibw[1536u + e1];
+        }
+    }
+    return acc;
+}
+
+// lohi = lo[0 .. L) followed by hi[0 .. H); grid = H threadgroups.
+kernel void zc_eq_rows(
+    device const uint4* lohi   [[buffer(0)]],
+    device uint4*       out    [[buffer(1)]],
+    constant uint&      lo_log [[buffer(2)]],
+    uint h   [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup uint4 mono[128];
+    threadgroup uint nibw[4 * 512];
+    const uint L = 1u << lo_log;
+    const uint4 s = lohi[L + h];
+    for (uint i = lid; i < 128u; i += tgs) {
+        mono[i] = eq_mul_xi(s, i);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = lid; e < 512u; e += tgs) {
+        const uint base = (e >> 5) * 8u + ((e >> 4) & 1u) * 4u;
+        const uint n = e & 15u;
+        uint4 v = uint4(0u);
+        if ((n & 1u) != 0u) { v ^= mono[base]; }
+        if ((n & 2u) != 0u) { v ^= mono[base + 1u]; }
+        if ((n & 4u) != 0u) { v ^= mono[base + 2u]; }
+        if ((n & 8u) != 0u) { v ^= mono[base + 3u]; }
+        nibw[e] = v.x;
+        nibw[512u + e] = v.y;
+        nibw[1024u + e] = v.z;
+        nibw[1536u + e] = v.w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device uint4* row = out + ulong(h) * ulong(L);
+    for (uint l = lid; l < L; l += tgs) {
+        row[l] = eq_mul_tab16(lohi[l], nibw);
+    }
+}
+"#;
+
+    /// Threads per threadgroup of the eq row kernel.
+    const ZC_EQ_ROWS_TG: usize = 256;
+
+    /// Commit-tail GPU eq build (`FLOCK_NO_ZC_GPU_EQ=1` restores the
+    /// record's CPU build). At commit-graph completion the round-one C
+    /// fold's 2^18-lane eq table was built on the CPU (a parallel tensor
+    /// product, about 0.1 ms) before its GPU prefix could be submitted, on
+    /// the runner's serial path from the Merkle root to zerocheck. Now the
+    /// CPU builds only the two 2^9-lane tensor halves (serial, about 2 us)
+    /// straight into a small upload buffer, and the prefix's own command
+    /// buffer runs [`ZC_EQ_ROWS_MSL_SOURCE`] into `eq_buf` ahead of the
+    /// fold, with a completion signal behind the row kernel. CPU readers of
+    /// the table (the C fold's suffix, milliseconds later) wait for that
+    /// signal; if the buffer failed they rebuild the table with the
+    /// record's builder. Same products, same bytes, same layout. Read once.
+    pub const ENV_NO_ZC_GPU_EQ: &str = "FLOCK_NO_ZC_GPU_EQ";
+
+    fn zc_gpu_eq_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var(ENV_NO_ZC_GPU_EQ).is_ok_and(|v| v == "1"))
+    }
+
     /// Output partials produced by the GPU fold. Fixed so the buffer set and
     /// the reduce dispatch are size-stable across proves.
     const ZC_FOLD_CHUNKS: usize = 64;
@@ -17295,6 +17716,11 @@ kernel void lc_fold_stripes_factored_b4(
         /// eq_outer upload (n_outer x 16 B).
         eq_buf: Id,
         eq_cap: usize,
+        /// GPU eq build (`ENV_NO_ZC_GPU_EQ`): the row kernel (`NIL` when
+        /// killed or when its compile failed) and its `lo ‖ hi` upload.
+        pso_eq_rows: Id,
+        eqh_buf: Id,
+        eqh_cap: usize,
         /// ZC_FOLD_CHUNKS x k x 16 B scratch.
         part_buf: Id,
         part_cap: usize,
@@ -17331,6 +17757,9 @@ kernel void lc_fold_stripes_factored_b4(
         /// Owned eq table when the build could not stage into `eq_buf`;
         /// `None` = the table lives in `eq_buf`.
         eq_owned: Option<Vec<F128>>,
+        /// The table is being written into `eq_buf` by the GPU, ahead of the
+        /// fold in `cb` (see [`ENV_NO_ZC_GPU_EQ`]).
+        eq_gpu: Option<GpuEqRows>,
     }
 
     /// Abandon a parked commit-tail-fill prefix: wait out its command
@@ -17340,9 +17769,144 @@ kernel void lc_fold_stripes_factored_b4(
         if let Some(staged) = state.staged.take() {
             unsafe {
                 let _ = state.gpu.wait_cb(staged.cb);
+                // The row buffer ran ahead of the fold on the same queue; its
+                // view releases it on drop.
+                if let Some(rows) = &staged.eq_gpu {
+                    let _ = state.gpu.wait_cb(rows.cb);
+                }
                 state.gpu.release(staged.cb);
             }
         }
+    }
+
+    /// The GPU eq build ahead of a C-fold prefix (see [`ENV_NO_ZC_GPU_EQ`]):
+    /// the row kernel's own command buffer (retained; committed just before
+    /// the fold's on the same queue, which reads `eq_buf` after it,
+    /// hazard-tracked) and the eq point, kept for the exact CPU rebuild
+    /// should that buffer fail. A completion signal between two encoders of
+    /// one buffer was measured to reach the CPU only when the whole buffer
+    /// (the fold) completed, hence the separate buffer.
+    pub(crate) struct GpuEqRows {
+        cb: Id,
+        point: Vec<F128>,
+    }
+
+    impl Drop for GpuEqRows {
+        fn drop(&mut self) {
+            if let Ok(gpu) = gpu() {
+                unsafe { gpu.release(self.cb) };
+            }
+        }
+    }
+
+    /// An eq table the GPU writes into `eq_buf` ahead of the prefix fold.
+    /// The first CPU read waits for the row kernel; nothing reads it before.
+    pub(crate) struct GpuEqTable {
+        stage: FoldEqStage,
+        rows: GpuEqRows,
+        ready: std::sync::OnceLock<()>,
+    }
+    // SAFETY: `rows.cb` is a retained Metal object (thread-safe); the table
+    // bytes follow `FoldEqStage`'s rules, and the GPU's writes complete
+    // before the first CPU read returns (`settle`).
+    unsafe impl Send for GpuEqTable {}
+    unsafe impl Sync for GpuEqTable {}
+
+    impl GpuEqTable {
+        /// Block until the row kernel's buffer finished (status yield-polled
+        /// for 2 ms, then the blocking wait). A failed buffer is complete when
+        /// this returns, so the GPU no longer writes `eq_buf`; the rows are
+        /// then rebuilt with the record's builder.
+        fn settle(&self) {
+            let landed = match gpu() {
+                Ok(gpu) => unsafe { wait_eq_rows(gpu, self.rows.cb) },
+                Err(_) => false,
+            };
+            let ok = landed && !zc_gpu_eq_fail_injected();
+            if !ok {
+                if super::gpu_zerocheck_debug() {
+                    eprintln!("[gpu-zc] GPU eq rows failed; CPU rebuild");
+                }
+                // The window's fold prefix may have read unwritten rows: its
+                // drain reports failure and the CPU redoes those claims.
+                ZC_GPU_EQ_FAILED.store(true, std::sync::atomic::Ordering::Release);
+                // SAFETY: see `FoldEqStage`; the failed row buffer is
+                // complete. A fold still reading `eq_buf` is discarded.
+                let out = unsafe { std::slice::from_raw_parts_mut(self.stage.ptr, self.stage.len) };
+                crate::lincheck::build_eq_table_optimized_into(&self.rows.point, out);
+            }
+        }
+    }
+
+    /// Fallback-test hook (`FLOCK_ZC_GPU_EQ_FAIL=1`, exact '1'): treat every
+    /// timed window's GPU eq rows as failed after they landed, driving the
+    /// CPU rebuild and the prefix redo end to end. Read once.
+    fn zc_gpu_eq_fail_injected() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("FLOCK_ZC_GPU_EQ_FAIL").is_ok_and(|v| v == "1"))
+    }
+
+    /// Set when a window's GPU eq rows failed (see [`GpuEqTable::settle`]);
+    /// that window's Zc prefix drain then fails so its output is never used.
+    static ZC_GPU_EQ_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// True once the eq row buffer `cb` completed (its shared-storage writes
+    /// are then visible); false only for a failed buffer that has finished.
+    unsafe fn wait_eq_rows(gpu: &Gpu, cb: Id) -> bool {
+        unsafe {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+            loop {
+                let status = gpu.cb_status(cb);
+                if status >= 4 {
+                    return status == 4;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return gpu.wait_cb(cb).is_ok();
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// GPU eq build warm-up oracle (see [`ENV_NO_ZC_GPU_EQ`]): 0 = not yet
+    /// checked in this process, 1 = the first GPU-built table equalled the
+    /// record's builder, 2 = it did not (the CPU build stays from then on).
+    static ZC_GPU_EQ_ORACLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    /// First GPU eq build in the process (the untimed warm-up prove): wait
+    /// for the rows, compare every lane with the record's builder and publish
+    /// the verdict. On a mismatch the caller drops the prefix (its fold read
+    /// those rows) and takes the record's path for this and every later
+    /// window.
+    fn gpu_eq_oracle(job: &ZcFoldJob, rows: &GpuEqRows) -> bool {
+        let Some(state) = job.guard.as_ref().and_then(|r| r.as_ref().ok()) else {
+            return false;
+        };
+        let gpu = state.gpu;
+        let want = crate::lincheck::build_eq_table_optimized(&rows.point);
+        let ok = unsafe { wait_eq_rows(gpu, rows.cb) } && {
+            // SAFETY: the row buffer completed; `eq_buf` holds the table.
+            let got = unsafe {
+                std::slice::from_raw_parts(
+                    gpu.buffer_contents(state.eq_buf).cast::<F128>().cast_const(),
+                    want.len(),
+                )
+            };
+            got == &want[..]
+        };
+        ZC_GPU_EQ_ORACLE.store(if ok { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
+        if super::gpu_zerocheck_debug() {
+            let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, rows.cb) };
+            if ok {
+                eprintln!(
+                    "[gpu-zc] eq row oracle: GPU rows EQUAL the CPU builder's ({} lanes, row kernel {gpu_ms:.3} ms)",
+                    want.len()
+                );
+            } else {
+                eprintln!("[gpu-zc] eq row oracle MISMATCH -> CPU eq build for the process");
+            }
+        }
+        ok
     }
     // SAFETY: Metal objects are thread-safe; every access is serialized by
     // the ZC_FOLD mutex, and the one prove in flight owns the lease.
@@ -17526,6 +18090,38 @@ kernel void lc_fold_stripes_factored_b4(
             } else {
                 NIL
             };
+            // GPU eq build kernel: own source and library; any failure keeps
+            // the record's CPU build (NIL).
+            let pso_eq_rows = if zc_gpu_eq_enabled() {
+                let pool = gpu.pool_push();
+                let built = compile_supplemental_pipeline(gpu, ZC_EQ_ROWS_MSL_SOURCE, "zc_eq_rows")
+                    .and_then(|pso| {
+                        let max: u64 = send!(
+                            gpu.api,
+                            unsafe extern "C" fn(Id, Sel) -> u64,
+                            pso,
+                            c"maxTotalThreadsPerThreadgroup"
+                        );
+                        if max >= ZC_EQ_ROWS_TG as u64 {
+                            Ok(pso)
+                        } else {
+                            gpu.release(pso);
+                            Err(format!("max {max} threads per threadgroup"))
+                        }
+                    });
+                gpu.pool_pop(pool);
+                match built {
+                    Ok(pso) => pso,
+                    Err(e) => {
+                        if super::gpu_zerocheck_debug() {
+                            eprintln!("[gpu-zc] eq row kernel unavailable; CPU eq build: {e}");
+                        }
+                        NIL
+                    }
+                }
+            } else {
+                NIL
+            };
             Ok(ZcFold {
                 gpu,
                 pso_fold,
@@ -17534,6 +18130,9 @@ kernel void lc_fold_stripes_factored_b4(
                 pso_lc_factored_b4,
                 eq_buf: NIL,
                 eq_cap: 0,
+                pso_eq_rows,
+                eqh_buf: NIL,
+                eqh_cap: 0,
                 part_buf: NIL,
                 part_cap: 0,
                 out_buf: NIL,
@@ -17620,6 +18219,9 @@ kernel void lc_fold_stripes_factored_b4(
     pub(crate) enum FoldEqTable {
         Owned(Vec<F128>),
         Staged(FoldEqStage),
+        /// Written into `eq_buf` by the GPU ahead of the prefix fold (see
+        /// [`ENV_NO_ZC_GPU_EQ`]); the first read waits for the row kernel.
+        GpuBuilt(GpuEqTable),
     }
 
     impl FoldEqTable {
@@ -17631,6 +18233,11 @@ kernel void lc_fold_stripes_factored_b4(
                 FoldEqTable::Staged(s) => unsafe {
                     std::slice::from_raw_parts(s.ptr.cast_const(), s.len)
                 },
+                FoldEqTable::GpuBuilt(t) => {
+                    t.ready.get_or_init(|| t.settle());
+                    // SAFETY: as `Staged`, once the GPU's writes completed.
+                    unsafe { std::slice::from_raw_parts(t.stage.ptr.cast_const(), t.stage.len) }
+                }
             }
         }
     }
@@ -17750,6 +18357,103 @@ kernel void lc_fold_stripes_factored_b4(
 
             assert_eq!(staged, generic);
             assert_eq!(build_fold_eq_table_owned(&point, true), generic);
+        }
+
+        fn mix(x: u64) -> u64 {
+            let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        /// Run the GPU eq row kernel over `lo ‖ hi` (`lo.len() = 1 << lo_log`).
+        unsafe fn gpu_eq_rows_for_test(gpu: &Gpu, pso: Id, lo: &[F128], hi: &[F128]) -> Vec<F128> {
+            unsafe {
+                let lo_log = lo.len().trailing_zeros();
+                assert_eq!(lo.len(), 1usize << lo_log);
+                let n = lo.len() * hi.len();
+                let lohi_buf = gpu.new_buffer((lo.len() + hi.len()) * 16).unwrap();
+                let out_buf = gpu.new_buffer(n * 16).unwrap();
+                let lohi = std::slice::from_raw_parts_mut(
+                    gpu.buffer_contents(lohi_buf).cast::<F128>(),
+                    lo.len() + hi.len(),
+                );
+                lohi[..lo.len()].copy_from_slice(lo);
+                lohi[lo.len()..].copy_from_slice(hi);
+                std::ptr::write_bytes(gpu.buffer_contents(out_buf), 0xa5, n * 16);
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, lohi_buf, 0, 0);
+                gpu.set_buffer(enc, out_buf, 0, 1);
+                gpu.set_bytes(enc, &lo_log.to_ne_bytes(), 2);
+                gpu.dispatch(enc, hi.len() as u64, ZC_EQ_ROWS_TG as u64);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let got =
+                    std::slice::from_raw_parts(gpu.buffer_contents(out_buf).cast::<F128>(), n)
+                        .to_vec();
+                gpu.release(lohi_buf);
+                gpu.release(out_buf);
+                got
+            }
+        }
+
+        /// The GPU eq build (`ENV_NO_ZC_GPU_EQ`) writes the CPU builder's
+        /// bytes: whole tables at the ranked and other shapes, and raw row
+        /// products on edge operands (0, 1, x^127, all ones, single bits).
+        #[test]
+        fn gpu_eq_rows_match_the_cpu_builder() {
+            let Ok(gpu) = gpu() else {
+                return;
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let pso = compile_supplemental_pipeline(gpu, ZC_EQ_ROWS_MSL_SOURCE, "zc_eq_rows")
+                    .expect("eq row kernel compiles");
+                let (_, _, max_threads) = gpu.pipeline_resources(pso);
+                assert!(max_threads >= ZC_EQ_ROWS_TG as u64, "max threads {max_threads}");
+                for (d, seed) in [(18usize, 1u64), (18, 2), (17, 3), (14, 4), (9, 5), (2, 6)] {
+                    let point: Vec<F128> = (0..d as u64)
+                        .map(|i| F128 {
+                            lo: mix(seed * 1000 + 2 * i),
+                            hi: mix(seed * 1000 + 2 * i + 1),
+                        })
+                        .collect();
+                    let cpu = crate::lincheck::build_eq_table_optimized(&point);
+                    let a = d / 2;
+                    let lo = crate::lincheck::build_eq_table_optimized(&point[..a]);
+                    let hi = crate::lincheck::build_eq_table_optimized(&point[a..]);
+                    let got = gpu_eq_rows_for_test(gpu, pso, &lo, &hi);
+                    assert!(got == cpu, "GPU eq rows differ from the CPU builder at d={d}");
+                }
+                let mut edge = vec![
+                    F128::ZERO,
+                    F128::ONE,
+                    F128 { lo: 0, hi: 1 << 63 },
+                    F128 { lo: u64::MAX, hi: u64::MAX },
+                    F128 { lo: 1 << 63, hi: 0 },
+                    F128 { lo: 0, hi: 1 },
+                    F128 { lo: 0x87, hi: 0 },
+                    F128 { lo: 0, hi: 0xff00_0000_0000_0000 },
+                ];
+                for i in 0..120u64 {
+                    edge.push(F128 {
+                        lo: mix(77 + 2 * i),
+                        hi: mix(78 + 2 * i),
+                    });
+                }
+                let lo = edge.clone();
+                let hi = edge;
+                let got = gpu_eq_rows_for_test(gpu, pso, &lo, &hi);
+                for (h, &s) in hi.iter().enumerate() {
+                    for (l, &x) in lo.iter().enumerate() {
+                        assert_eq!(got[h * lo.len() + l], x * s, "row {h} lane {l}");
+                    }
+                }
+                gpu.release(pso);
+                gpu.pool_pop(pool);
+            }
         }
     }
 
@@ -17908,6 +18612,15 @@ kernel void lc_fold_stripes_factored_b4(
             // the caller redoes the prefix claims on the CPU exactly.
             if self.arm == FoldArm::Lincheck && lincheck_fold_fail_drain() {
                 return Err("FLOCK_LINCHECK_GPU_FAIL_DRAIN injected".to_string());
+            }
+            // GPU eq build (`ENV_NO_ZC_GPU_EQ`): if this window's row buffer
+            // failed, the prefix may have folded rows that were never
+            // written; its output is not consumed and the caller redoes the
+            // prefix claims on the CPU over the rebuilt table.
+            if self.arm == FoldArm::Zc
+                && ZC_GPU_EQ_FAILED.swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Err("GPU eq rows failed".to_string());
             }
             assert_eq!(dst.len(), self.k);
             // SAFETY: the command buffer completed, so the shared-storage
@@ -18485,6 +19198,23 @@ kernel void lc_fold_stripes_factored_b4(
         plan: &ZcFoldPlan,
         arm_sig: bool,
     ) -> Result<(Id, Option<DoneSig>), String> {
+        unsafe { zc_fold_submit_rows(gpu, state, plan, arm_sig, None).map(|(cb, sig, _)| (cb, sig)) }
+    }
+
+    /// [`zc_fold_submit_sig`], with the GPU eq build (`ENV_NO_ZC_GPU_EQ`)
+    /// when `eq_rows = Some((lo_log, n_hi))`: the row kernel over the
+    /// `lo ‖ hi` upload into `eq_buf` in its own command buffer (returned
+    /// third, retained; the CPU's table readers wait on it), committed just
+    /// before the fold's, which reads `eq_buf` after it (same queue, tracked
+    /// buffer). Every fallible step precedes both commits, so an error leaves
+    /// no GPU work in flight.
+    unsafe fn zc_fold_submit_rows(
+        gpu: &Gpu,
+        state: &ZcFold,
+        plan: &ZcFoldPlan,
+        arm_sig: bool,
+        eq_rows: Option<(u32, usize)>,
+    ) -> Result<(Id, Option<DoneSig>, Option<Id>), String> {
         unsafe {
             let params = ZcFoldParams {
                 k: plan.k as u32,
@@ -18502,6 +19232,20 @@ kernel void lc_fold_stripes_factored_b4(
                 reduce_params.as_ptr().cast::<u8>(),
                 core::mem::size_of_val(&reduce_params),
             );
+            let cb_eq = match eq_rows {
+                Some((lo_log, n_hi)) => {
+                    let cb_eq = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb_eq)?;
+                    gpu.set_pipeline(enc, state.pso_eq_rows);
+                    gpu.set_buffer(enc, state.eqh_buf, 0, 0);
+                    gpu.set_buffer(enc, state.eq_buf, 0, 1);
+                    gpu.set_bytes(enc, &lo_log.to_ne_bytes(), 2);
+                    gpu.dispatch(enc, n_hi as u64, ZC_EQ_ROWS_TG as u64);
+                    gpu.end_encoding(enc);
+                    Some(cb_eq)
+                }
+                None => None,
+            };
             let cb = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb)?;
             gpu.set_pipeline(enc, plan.pso_fold);
@@ -18521,9 +19265,14 @@ kernel void lc_fold_stripes_factored_b4(
             gpu.dispatch(enc, (plan.k / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
             gpu.end_encoding(enc);
             let sig = if arm_sig { gpu.arm_done(cb) } else { None };
+            let cb_eq = cb_eq.map(|c| {
+                let c = gpu.retain(c);
+                gpu.commit_async(c);
+                c
+            });
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
-            Ok((cb, sig))
+            Ok((cb, sig, cb_eq))
         }
     }
 
@@ -18706,16 +19455,55 @@ kernel void lc_fold_stripes_factored_b4(
         if !super::gpu_zerocheck_enabled() {
             return false;
         }
-        let eq_outer = zc_fold_eq_table(&r[k_log..]);
-        let Some(job) = launch_fold_prefix(
-            FoldArm::Zc,
-            z_packed,
-            m,
-            k_log,
-            useful_bits,
-            eq_outer.as_slice(),
-        ) else {
-            return false;
+        // GPU eq build (`ENV_NO_ZC_GPU_EQ`): the CPU writes only the tensor
+        // halves and the prefix's command buffer builds the rows into
+        // `eq_buf`. Under test the record's owned build stays, for the
+        // reason `fold_eq_table` gives.
+        let mut gpu_launch = None;
+        if zc_gpu_eq_enabled()
+            && !cfg!(test)
+            && ZC_GPU_EQ_ORACLE.load(std::sync::atomic::Ordering::Relaxed) != 2
+        {
+            let Some((job, rows)) = launch_fold_prefix_src(
+                FoldArm::Zc,
+                z_packed,
+                m,
+                k_log,
+                useful_bits,
+                EqSrc::GpuRows(&r[k_log..]),
+            ) else {
+                return false;
+            };
+            match rows {
+                Some(rows) if ZC_GPU_EQ_ORACLE.load(std::sync::atomic::Ordering::Relaxed) == 0 => {
+                    if gpu_eq_oracle(&job, &rows) {
+                        gpu_launch = Some((job, None, Some(rows)));
+                    }
+                    // else: `job` and `rows` drop here (the job waits out its
+                    // buffer) and the record's path below runs.
+                }
+                rows => gpu_launch = Some((job, None, rows)),
+            }
+        }
+        let (job, eq_owned, eq_gpu) = if let Some(launched) = gpu_launch {
+            launched
+        } else {
+            let eq_outer = zc_fold_eq_table(&r[k_log..]);
+            let Some(job) = launch_fold_prefix(
+                FoldArm::Zc,
+                z_packed,
+                m,
+                k_log,
+                useful_bits,
+                eq_outer.as_slice(),
+            ) else {
+                return false;
+            };
+            let eq_owned = match eq_outer {
+                FoldEqTable::Owned(v) => Some(v),
+                FoldEqTable::Staged(_) | FoldEqTable::GpuBuilt(_) => None,
+            };
+            (job, eq_owned, None)
         };
         // `ZcFoldJob` implements `Drop` (releases `cb`), so it cannot be
         // destructured. Wrap it and read the fields out exactly once — the
@@ -18734,10 +19522,6 @@ kernel void lc_fold_stripes_factored_b4(
             )
         };
         let eq_len = 1usize << (m - k_log);
-        let eq_owned = match eq_outer {
-            FoldEqTable::Owned(v) => Some(v),
-            FoldEqTable::Staged(_) => None,
-        };
         match guard.as_mut().and_then(|r| r.as_mut().ok()) {
             Some(state) => {
                 state.staged = Some(ZcFoldStaged {
@@ -18752,6 +19536,7 @@ kernel void lc_fold_stripes_factored_b4(
                     z_len: z_packed.len(),
                     eq_len,
                     eq_owned,
+                    eq_gpu,
                 });
                 true
             }
@@ -18805,12 +19590,20 @@ kernel void lc_fold_stripes_factored_b4(
             return None;
         }
         let staged = state.staged.take()?;
-        let eq = match staged.eq_owned {
-            Some(v) => FoldEqTable::Owned(v),
-            None => FoldEqTable::Staged(FoldEqStage {
-                ptr: unsafe { state.gpu.buffer_contents(state.eq_buf).cast::<F128>() },
-                len: staged.eq_len,
+        let stage = FoldEqStage {
+            ptr: unsafe { state.gpu.buffer_contents(state.eq_buf).cast::<F128>() },
+            len: staged.eq_len,
+        };
+        let eq = match (staged.eq_owned, staged.eq_gpu) {
+            (Some(v), _) => FoldEqTable::Owned(v),
+            // The rows may still be in flight: the view waits for their
+            // buffer on first read.
+            (None, Some(rows)) => FoldEqTable::GpuBuilt(GpuEqTable {
+                stage,
+                rows,
+                ready: std::sync::OnceLock::new(),
             }),
+            (None, None) => FoldEqTable::Staged(stage),
         };
         let submitted = staged.submitted;
         let job = ZcFoldJob {
@@ -18923,6 +19716,17 @@ kernel void lc_fold_stripes_factored_b4(
         launch_fold_prefix(FoldArm::Lincheck, z_packed, m, k_log, useful_bits, eq_outer)
     }
 
+    /// Where a fold prefix's eq table comes from.
+    #[derive(Clone, Copy)]
+    enum EqSrc<'a> {
+        /// A CPU-built table (copied into `eq_buf` unless built in place).
+        Table(&'a [F128]),
+        /// The eq point: the CPU writes the two tensor halves into the
+        /// upload buffer and the prefix's command buffer builds the rows
+        /// (see [`ENV_NO_ZC_GPU_EQ`]).
+        GpuRows(&'a [F128]),
+    }
+
     fn launch_fold_prefix(
         arm: FoldArm,
         z_packed: &[u8],
@@ -18931,6 +19735,22 @@ kernel void lc_fold_stripes_factored_b4(
         useful_bits: usize,
         eq_outer: &[F128],
     ) -> Option<ZcFoldJob> {
+        launch_fold_prefix_src(arm, z_packed, m, k_log, useful_bits, EqSrc::Table(eq_outer))
+            .map(|(job, _)| job)
+    }
+
+    /// [`launch_fold_prefix`] with the eq source spelled out. With
+    /// [`EqSrc::GpuRows`] the table lands in `eq_buf` either way: built by
+    /// the GPU (`Some` rows returned) or, when the row kernel is
+    /// unavailable, by the record's CPU builder in place before the submit.
+    fn launch_fold_prefix_src(
+        arm: FoldArm,
+        z_packed: &[u8],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        eq: EqSrc<'_>,
+    ) -> Option<(ZcFoldJob, Option<GpuEqRows>)> {
         let k = 1usize << k_log;
         if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) || m <= k_log + 3 {
             return None;
@@ -18976,7 +19796,7 @@ kernel void lc_fold_stripes_factored_b4(
         }
 
         let submitted = std::time::Instant::now();
-        let (cb, plan, sig) = {
+        let (cb, plan, sig, eq_rows) = {
             let state = guard.as_mut()?.as_mut().ok()?;
             // Any parked commit-tail-fill prefix that was not adopted by
             // now is stale (mismatched fingerprint or a non-adopting
@@ -19019,7 +19839,8 @@ kernel void lc_fold_stripes_factored_b4(
             }
             unsafe {
                 let pool = gpu.pool_push();
-                let built = (|| -> Result<(Id, ZcFoldPlan, Option<DoneSig>), String> {
+                type Built = (Id, ZcFoldPlan, Option<DoneSig>, Option<GpuEqRows>);
+                let built = (|| -> Result<Built, String> {
                     let z_buf = state.wrap_z(z_packed)?;
                     let (mut eq_buf, mut eq_cap) = (state.eq_buf, state.eq_cap);
                     state.ensure(&mut eq_buf, &mut eq_cap, n_outer * 16)?;
@@ -19033,20 +19854,57 @@ kernel void lc_fold_stripes_factored_b4(
                     state.ensure(&mut out_buf, &mut out_cap, k * 16)?;
                     state.out_buf = out_buf;
                     state.out_cap = out_cap;
-                    // eq-direct (see `fold_eq_stage`): a staged table was
-                    // built in place in `eq_buf`, so src == dst and the
-                    // upload already happened at build time — an overlapping
-                    // copy_nonoverlapping would be UB, not a no-op. The
-                    // grow-only `ensure` above re-requests the exact size the
-                    // stage reserved, so it cannot have moved the buffer out
-                    // from under a staged pointer.
                     let eq_dst = gpu.buffer_contents(state.eq_buf);
-                    if !std::ptr::eq(eq_outer.as_ptr().cast::<u8>(), eq_dst.cast_const()) {
-                        std::ptr::copy_nonoverlapping(
-                            eq_outer.as_ptr().cast::<u8>(),
-                            eq_dst,
-                            n_outer * 16,
-                        );
+                    // GPU eq build (`ENV_NO_ZC_GPU_EQ`): the two tensor
+                    // halves go straight into the upload buffer, built by
+                    // the record's builder (serial at 2^9 lanes); the row
+                    // kernel is encoded ahead of the fold below. Without the
+                    // kernel, the record's builder fills `eq_buf` in place.
+                    let mut eq_rows_plan: Option<(u32, usize)> = None;
+                    match eq {
+                        EqSrc::GpuRows(point) => {
+                            assert_eq!(1usize << point.len(), n_outer);
+                            let a = point.len() / 2;
+                            if !state.pso_eq_rows.is_null() && a >= 1 {
+                                let (n_lo, n_hi) = (1usize << a, 1usize << (point.len() - a));
+                                let (mut eqh_buf, mut eqh_cap) = (state.eqh_buf, state.eqh_cap);
+                                state.ensure(&mut eqh_buf, &mut eqh_cap, (n_lo + n_hi) * 16)?;
+                                state.eqh_buf = eqh_buf;
+                                state.eqh_cap = eqh_cap;
+                                // SAFETY: the upload buffer holds n_lo + n_hi
+                                // lanes; no GPU work reads it (any parked
+                                // prefix was retired above).
+                                let lohi = std::slice::from_raw_parts_mut(
+                                    gpu.buffer_contents(state.eqh_buf).cast::<F128>(),
+                                    n_lo + n_hi,
+                                );
+                                let (lo, hi) = lohi.split_at_mut(n_lo);
+                                crate::lincheck::build_eq_table_optimized_into(&point[..a], lo);
+                                crate::lincheck::build_eq_table_optimized_into(&point[a..], hi);
+                                eq_rows_plan = Some((a as u32, n_hi));
+                            } else {
+                                // SAFETY: `eq_buf` holds n_outer lanes and no
+                                // GPU work reads it (parked prefix retired).
+                                let out = std::slice::from_raw_parts_mut(eq_dst.cast::<F128>(), n_outer);
+                                crate::lincheck::build_eq_table_optimized_into(point, out);
+                            }
+                        }
+                        // eq-direct (see `fold_eq_stage`): a staged table was
+                        // built in place in `eq_buf`, so src == dst and the
+                        // upload already happened at build time — an
+                        // overlapping copy_nonoverlapping would be UB, not a
+                        // no-op. The grow-only `ensure` above re-requests the
+                        // exact size the stage reserved, so it cannot have
+                        // moved the buffer out from under a staged pointer.
+                        EqSrc::Table(eq_outer) => {
+                            if !std::ptr::eq(eq_outer.as_ptr().cast::<u8>(), eq_dst.cast_const()) {
+                                std::ptr::copy_nonoverlapping(
+                                    eq_outer.as_ptr().cast::<u8>(),
+                                    eq_dst,
+                                    n_outer * 16,
+                                );
+                            }
+                        }
                     }
                     let plan = ZcFoldPlan {
                         z_buf,
@@ -19075,8 +19933,16 @@ kernel void lc_fold_stripes_factored_b4(
                     // its exact status drain and GPU timestamps.
                     let arm_sig = arm == FoldArm::Lincheck
                         && arm.tuned().load(std::sync::atomic::Ordering::Relaxed) != usize::MAX;
-                    let (cb, sig) = zc_fold_submit_sig(gpu, state, &plan, arm_sig)?;
-                    Ok((cb, plan, sig))
+                    let (cb, sig, cb_eq) =
+                        zc_fold_submit_rows(gpu, state, &plan, arm_sig, eq_rows_plan)?;
+                    let eq_rows = match (cb_eq, eq) {
+                        (Some(cb), EqSrc::GpuRows(point)) => Some(GpuEqRows {
+                            cb,
+                            point: point.to_vec(),
+                        }),
+                        _ => None,
+                    };
+                    Ok((cb, plan, sig, eq_rows))
                 })();
                 gpu.pool_pop(pool);
                 match built {
@@ -19092,17 +19958,20 @@ kernel void lc_fold_stripes_factored_b4(
         };
         arm.submits()
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(ZcFoldJob {
-            guard,
-            cb,
-            plan,
-            k,
-            claim_lo,
-            n_claims,
-            submitted,
-            arm,
-            sig,
-        })
+        Some((
+            ZcFoldJob {
+                guard,
+                cb,
+                plan,
+                k,
+                claim_lo,
+                n_claims,
+                submitted,
+                arm,
+                sig,
+            },
+            eq_rows,
+        ))
     }
 
     #[cfg(test)]
@@ -20131,6 +21000,76 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         *ON
     }
 
+    /// L1 tail (`FLOCK_NO_L1_TAIL=1`, exact, keeps the incumbent tail). The
+    /// L1 commit waits after its transform until the GPU has hashed the last
+    /// leaf batch and then every internal level (18 single-level parent
+    /// dispatches behind the cover-completing batch): about 0.5 ms on the M4,
+    /// on the opening's serial path. Two changes shorten it:
+    /// - the parent chain runs the fused three-level kernel the main commit
+    ///   tree already uses (`parent_hash3`, or its vec4 form when built) for
+    ///   every level whose input has at least 256 nodes, and single-level
+    ///   dispatches above, so levels 1..12 take 4 dispatches instead of 12;
+    /// - once the leaves still uncovered fit in one batch, each finished
+    ///   range is submitted at once instead of waiting for the batch to fill,
+    ///   so the GPU hashes the last ranges while the transform still runs and
+    ///   the cover-completing buffer carries the last range alone.
+    /// Same kernels per node and the same flat-tree slots; only the dispatch
+    /// grouping and the submit points change. Read once.
+    pub const ENV_NO_L1_TAIL: &str = "FLOCK_NO_L1_TAIL";
+
+    fn l1_tail_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var(ENV_NO_L1_TAIL).is_ok_and(|v| v == "1"))
+    }
+
+    /// Encode the flat tree's internal levels from the level that starts at
+    /// node `read_start` and holds `read_len` nodes up to the root: fused
+    /// three-level dispatches while a level has at least 256 nodes (when
+    /// `fused` and the main tree's pipeline exists), single levels after.
+    unsafe fn encode_l1_parent_chain(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        pso_parent: Id,
+        mut read_start: usize,
+        mut read_len: usize,
+        fused: bool,
+    ) {
+        unsafe {
+            let pso3 = if gpu.pso_parent3_v4.is_null() {
+                gpu.pso_parent3
+            } else {
+                gpu.pso_parent3_v4
+            };
+            if fused && !pso3.is_null() && read_len >= 256 {
+                gpu.set_pipeline(enc, pso3);
+                while read_len >= 256 {
+                    let l1 = read_start + read_len;
+                    let l2 = l1 + read_len / 2;
+                    let l3 = l2 + read_len / 4;
+                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, l1 * 32, 1);
+                    gpu.set_buffer(enc, tree_buf, l2 * 32, 2);
+                    gpu.set_buffer(enc, tree_buf, l3 * 32, 3);
+                    gpu.dispatch(enc, (read_len / 256) as u64, 128);
+                    read_start = l3;
+                    read_len /= 8;
+                }
+            }
+            gpu.set_pipeline(enc, pso_parent);
+            while read_len > 1 {
+                let write_start = read_start + read_len;
+                let n_out = read_len / 2;
+                gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                let tpg = 256u64.min(n_out as u64);
+                gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                read_start = write_start;
+                read_len = n_out;
+            }
+        }
+    }
+
     /// `true` iff the sorted `ranges` tile `[0, num_leaves)` exactly.
     fn l1_ranges_cover_exactly(ranges: &mut [(usize, usize)], num_leaves: usize) -> bool {
         ranges.sort_unstable();
@@ -20281,8 +21220,13 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             // final batch (with the internal levels encoded behind it) then
             // enters the queue from inside the transform's own parallel
             // region, before the NTT join returns.
+            // L1 tail (`ENV_NO_L1_TAIL`): once the leaves still uncovered fit
+            // in one batch, every finished range goes to the GPU at once.
+            let last_window = l1_tail_enabled()
+                && self.num_leaves - inner.covered_leaves < self.batch_leaves();
             if inner.pending_leaves >= self.batch_leaves()
                 || inner.covered_leaves == self.num_leaves
+                || last_window
             {
                 self.submit_pending(&mut inner);
             }
@@ -20368,23 +21312,21 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         }
                     }
                     if encode_parents {
-                        self.gpu.set_pipeline(enc, self.pso_parent);
                         let mut read_start = 0usize;
                         let mut read_len = self.num_leaves;
                         for _ in 0..local_levels {
                             read_start += read_len;
                             read_len >>= 1;
                         }
-                        while read_len > 1 {
-                            let write_start = read_start + read_len;
-                            let n_out = read_len / 2;
-                            self.gpu.set_buffer(enc, self.tree_buf, read_start * 32, 0);
-                            self.gpu.set_buffer(enc, self.tree_buf, write_start * 32, 1);
-                            let tpg = 256u64.min(n_out as u64);
-                            self.gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                            read_start = write_start;
-                            read_len = n_out;
-                        }
+                        encode_l1_parent_chain(
+                            self.gpu,
+                            enc,
+                            self.tree_buf,
+                            self.pso_parent,
+                            read_start,
+                            read_len,
+                            l1_tail_enabled(),
+                        );
                     }
                     self.gpu.end_encoding(enc);
                     let sig = self.gpu.arm_done(cb);
