@@ -1772,15 +1772,21 @@ pub(crate) fn pow_race_tail_wanted() -> bool {
 }
 
 /// Build the race tail's library and pipeline and the result slots now, on
-/// the calling thread. Called last on the warm-up's pipeline-build helper
-/// thread (`ab_completion_gpu_prewarm`), so the compile never sits on the
-/// path to ready; a launch only reads the outcome and never waits for it.
+/// the calling thread, then (segmented race scan and its GPU-side cut on, see
+/// [`ENV_NO_SEG2_GPU_CUT`]) the cut kernel's library and pipeline. Called
+/// last on the warm-up's pipeline-build helper thread
+/// (`ab_completion_gpu_prewarm`), so the compile never sits on the path to
+/// ready; a launch only reads the outcome and never waits for it.
 pub(crate) fn gpu_pow_race_tail_prewarm() {
     if !pow_race_tail_wanted() {
         return;
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     imp::pow_race_tail_prewarm();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if grind_seg2_enabled() && seg2_gpu_cut_enabled() {
+        imp::pow_seg_cut_prewarm();
+    }
 }
 
 /// Race grind result slots (see [`gpu_pow_race_launch`]).
@@ -1976,6 +1982,30 @@ pub(crate) const GRIND_SEG2_SEGMENTS: usize = 4;
 pub(crate) fn grind_seg2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GRIND_SEG2).is_none());
     *ON && gpu_grind_enabled() && grind_lat_enabled() && !POW_RACE_OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Kill switch for the segmented race scan's GPU-side cut
+/// (`FLOCK_NO_SEG2_GPU_CUT`, any value: every segment runs
+/// `blake3_pow_scan_v2`, as before). With the switch unset the segments run
+/// `blake3_pow_scan_seg_cut`: the same scan of the same segment, and a thread
+/// that stores a match also stores 0 into the `best` words of every later
+/// segment of the same launch. The segments run one after another in one
+/// command buffer, so each later segment then returns at its first
+/// `id >= best` check instead of scanning its range for a match that is never
+/// read: a segment's word is read only after its signal and only when every
+/// lower segment's word is still empty, so once a segment holds a match no
+/// later word is read. Same smallest qualifying nonce: the matching
+/// segment's own word is written exactly as before, and only words above it
+/// are cut. The kernel is its own small library (the grind source plus the
+/// kernel), built after the race tail on the warm-up's pipeline-build helper
+/// thread ([`gpu_pow_race_tail_prewarm`]); until it is built, and when it is
+/// rejected, the segments keep `blake3_pow_scan_v2`. Read once per process.
+pub const ENV_NO_SEG2_GPU_CUT: &str = "FLOCK_NO_SEG2_GPU_CUT";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn seg2_gpu_cut_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_SEG2_GPU_CUT).is_none());
+    *ON
 }
 
 /// Encode the next segmented race launch's command buffer ahead of it.
@@ -2366,6 +2396,19 @@ pub(crate) fn gpu_tw_prefetch_enabled() -> bool {
 pub(crate) fn gpu_zero_root_shl4_bases_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZERO_ROOT_SHL4_BASES").is_none())
+}
+
+/// Kill switch for the layer-one byte table of the zero-root from-z library
+/// (`FLOCK_NO_BAND_BYTE_TABLE`, any value: the incumbent text). With it
+/// unset, the 4,096 B of threadgroup memory the first-pass kernel allocates
+/// for residency hold a 256-entry byte table `b * w` of its layer-one
+/// twiddle, filled from that twiddle's nibble banks 0 and 1, and layer one's
+/// four products read it: a 16-step byte Horner with one lookup per byte
+/// instead of the nibble Horner's 32 lookups. Same products, same
+/// threadgroup bytes per group (same residency). Read once per process.
+pub(crate) fn gpu_band_byte_table_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_BAND_BYTE_TABLE").is_none())
 }
 
 /// Kill switch for the two-tiles-per-thread g4 NTT pass
@@ -5619,10 +5662,131 @@ kernel void export_from_z_zero_root_tabs(
     /// instead of `4 * bank` single-bit steps, unless
     /// `FLOCK_NO_ZERO_ROOT_SHL4_BASES` is set. Same base values.
     pub(crate) fn zero_root_msl_source() -> &'static str {
-        if super::gpu_zero_root_shl4_bases_enabled() {
+        let base = if super::gpu_zero_root_shl4_bases_enabled() {
             zero_root_shl4_bases_source()
         } else {
             FROM_Z_ZERO_ROOT_MSL_SOURCE
+        };
+        if super::gpu_band_byte_table_enabled() {
+            // Both switches are read once, so `base` is the same text on
+            // every call of this process.
+            static SRC: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            if let Some(s) = SRC.get_or_init(|| with_zero_root_byte_table(base)) {
+                return s;
+            }
+        }
+        base
+    }
+
+    const BAND_BYTE_HELPERS: &str = r#"static inline uint4 gf_shl8_zero_root(uint4 a) {
+    uint h = a.w >> 24;
+    uint4 r;
+    r.w = (a.w << 8) | (a.z >> 24);
+    r.z = (a.z << 8) | (a.y >> 24);
+    r.y = (a.y << 8) | (a.x >> 24);
+    r.x = (a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
+// v * w from the byte table btab[b] = b(x) * w (16-step Horner, one lookup per byte).
+static inline uint4 gf_mul_btab_zero_root(uint4 v, threadgroup const uint4* btab) {
+    uint4 acc = uint4(0u);
+    for (int i = 15; i >= 0; i--) {
+        acc = gf_shl8_zero_root(acc);
+        acc ^= btab[(v[i >> 2] >> ((i & 3) * 8)) & 255u];
+    }
+    return acc;
+}
+
+"#;
+
+    const BAND_PAD_DECL: &str = r#"    // Residency only, never read: 4,096 B, so the group allocates 16,064 B
+    // of threadgroup memory and five groups share a core instead of six.
+    // Sixteen live F128 columns per lane want the lower residency: measured
+    // on an M4 GPU, 25.2 ms per full pass versus 36.7 ms at 11,968 B (six
+    // groups up to 13.5 KiB, five from 13.8 KiB at 25.2 ms, four from
+    // 16.8 KiB at 25.5 ms, three at 21.6 KiB at 31.1 ms).
+    threadgroup uint4 pad[256u];
+"#;
+    const BAND_BTAB_DECL: &str = r#"    // Layer one's byte table b * w (4,096 B: the group still allocates
+    // 16,064 B, so five groups share a core as with the residency pad).
+    threadgroup uint4 btab0[256u];
+"#;
+    const BAND_PAD_USE: &str = r#"    build_zero_root_tabs(twiddles, bases, tabs, lid);
+    if (P.log_d == 77u) {          // unreachable; keeps `pad` allocated
+        pad[lid % 256u] = tabs[lid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tabs[lid] ^= pad[(lid + 1u) % 256u];
+    }
+"#;
+    const BAND_BTAB_FILL: &str = r#"    build_zero_root_tabs(twiddles, bases, tabs, lid);
+    // btab0[b] = (b & 15) * w ^ (b >> 4) * w * x^4: nibble banks 0 and 1 of
+    // compact twiddle 0, complete after the build's last barrier.
+    for (uint b = lid; b < 256u; b += 64u) {
+        btab0[b] = tabs[b & 15u] ^ tabs[16u + (b >> 4)];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+"#;
+    const BAND_BYTE_BFLY: &str = r#"        #define BYTE_BFLY(EU, EV) { \
+            uint4 nu = elems[EU] ^ gf_mul_btab_zero_root(elems[EV], btab0); \
+            elems[EU] = nu; \
+            elems[EV] ^= nu; \
+        }
+"#;
+
+    /// The layer-one byte table (see [`super::gpu_band_byte_table_enabled`])
+    /// spliced into a zero-root source: the byte Horner helpers, the table in
+    /// place of the residency pad (same 4,096 B), its fill from the nibble
+    /// banks 0 and 1 of compact twiddle 0 behind the nibble build's last
+    /// barrier plus one barrier, and layer one's four compact-0 butterflies
+    /// on the byte table. `None` if any anchor is not found exactly once (the
+    /// incumbent text is then kept).
+    fn with_zero_root_byte_table(src: &str) -> Option<String> {
+        let mul_anchor = "static inline uint4 gf_mul_tab4_zero_root(";
+        let tab_anchor = "        #define TAB_BFLY(EU, EV, CT) {";
+        let edits: [(&str, String); 9] = [
+            (mul_anchor, format!("{BAND_BYTE_HELPERS}{mul_anchor}")),
+            (BAND_PAD_DECL, BAND_BTAB_DECL.to_owned()),
+            (BAND_PAD_USE, BAND_BTAB_FILL.to_owned()),
+            (tab_anchor, format!("{BAND_BYTE_BFLY}{tab_anchor}")),
+            ("        #undef TAB_BFLY\n", "        #undef TAB_BFLY\n        #undef BYTE_BFLY\n".to_owned()),
+            ("        TAB_BFLY(8, 12, 0)\n", "        BYTE_BFLY(8, 12)\n".to_owned()),
+            ("        TAB_BFLY(9, 13, 0)\n", "        BYTE_BFLY(9, 13)\n".to_owned()),
+            ("        TAB_BFLY(10, 14, 0)\n", "        BYTE_BFLY(10, 14)\n".to_owned()),
+            ("        TAB_BFLY(11, 15, 0)\n", "        BYTE_BFLY(11, 15)\n".to_owned()),
+        ];
+        let mut out = src.to_owned();
+        for (old, new) in edits.iter() {
+            if out.matches(old).count() != 1 {
+                return None;
+            }
+            out = out.replacen(old, new, 1);
+        }
+        Some(out)
+    }
+
+    #[cfg(test)]
+    mod band_byte_table_tests {
+        use super::*;
+
+        /// The splice applies to both zero-root bases, keeps the group's
+        /// threadgroup bytes, and moves exactly layer one's four compact-0
+        /// butterflies to the byte table; the production source carries it
+        /// whenever the switch is unset.
+        #[test]
+        fn byte_table_splice_moves_only_layer_one() {
+            for base in [FROM_Z_ZERO_ROOT_MSL_SOURCE, zero_root_shl4_bases_source()] {
+                let s = with_zero_root_byte_table(base).expect("zero-root byte-table anchors");
+                assert!(!s.contains("pad["));
+                assert_eq!(s.matches("threadgroup uint4 btab0[256u];").count(), 1);
+                assert_eq!(s.matches("        BYTE_BFLY(").count(), 4);
+                assert_eq!(s.matches("        TAB_BFLY(").count() + 4, base.matches("        TAB_BFLY(").count());
+                assert_eq!(s.matches(", 0)\n").count() + 4, base.matches(", 0)\n").count());
+            }
+            assert_eq!(
+                zero_root_msl_source().contains("btab0"),
+                super::super::gpu_band_byte_table_enabled()
+            );
         }
     }
 
@@ -9292,6 +9456,38 @@ kernel void blake3_pow_race_tail(
     atomic_store_explicit(best, 0xffffffffu, memory_order_relaxed);
     word[0] = (tag << 24u) | (b < params.len ? b : 0xffffffu);
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, POW_RACE_SCOPE_SYSTEM);
+}
+"#;
+
+    // Segmented race scan's GPU-side cut (`ENV_NO_SEG2_GPU_CUT`): compiled
+    // after `POW_MSL_SOURCE` (its `PowParams` and compression) into its own
+    // library by `pow_seg_cut_prewarm`; the grind library stays
+    // `POW_MSL_SOURCE` alone. `blake3_pow_scan_v2`'s loop, and a thread that
+    // stores a match also stores 0 into the `later` words that follow its
+    // segment's `best` word (the later segments' words of the same launch).
+    const POW_SEG_CUT_MSL_SOURCE: &str = r#"
+kernel void blake3_pow_scan_seg_cut(
+    constant uint* pre         [[buffer(0)]],
+    device atomic_uint* best   [[buffer(1)]],
+    constant PowParams& params [[buffer(2)]],
+    constant uint& later       [[buffer(3)]],
+    uint t [[thread_position_in_grid]],
+    uint grid [[threads_per_grid]])
+{
+    for (uint id = t; id < params.len; id += grid) {
+        if (id >= atomic_load_explicit(best, memory_order_relaxed)) return;
+        uint nonce_lo = params.start_lo + id;
+        uint carry = nonce_lo < params.start_lo ? 1u : 0u;
+        uint nonce_hi = params.start_hi + carry;
+        uint cv0 = pow_compress0_pre(pre, nonce_lo, nonce_hi);
+        if (pow_has_leading_zero_bits(cv0, params.bits)) {
+            atomic_fetch_min_explicit(best, id, memory_order_relaxed);
+            for (uint j = 1u; j <= later; j++) {
+                atomic_store_explicit(best + j, 0u, memory_order_relaxed);
+            }
+            return;
+        }
+    }
 }
 "#;
 
@@ -16217,6 +16413,9 @@ kernel void blake3_pow_race_tail(
     const SEG_ARGS_STRIDE: usize = 256;
     /// Per set: segment `k`'s `best` word at `4 k`.
     const SEG_SLOT_STRIDE: usize = 64;
+    // The cut kernel writes the words after its own up to segment
+    // `SEG_K - 1`: they stay inside the launch's set.
+    const _: () = assert!(4 * SEG_K <= SEG_SLOT_STRIDE);
 
     struct SegRace {
         ev: Id,
@@ -16280,16 +16479,23 @@ kernel void blake3_pow_race_tail(
         const POW_V2_GRID: u64 = 1 << 16;
         let base = st.next_value;
         st.next_value = base + SEG_K as u64;
+        // The GPU-side cut's pipeline once built (`pow_seg_cut_prewarm`),
+        // else the plain scan.
+        let cut = POW_SEG_CUT.get().copied().unwrap_or(0) as Id;
         unsafe {
             let pool = gpu.pool_push();
             let cb = (|| -> Option<Id> {
                 let cb = gpu.command_buffer().ok()?;
                 for k in 0..SEG_K {
                     let enc = gpu.compute_encoder(cb).ok()?;
-                    gpu.set_pipeline(enc, gpu.pso_pow);
+                    gpu.set_pipeline(enc, if cut.is_null() { gpu.pso_pow } else { cut });
                     gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE, 0);
                     gpu.set_buffer(enc, st.slots, i * SEG_SLOT_STRIDE + 4 * k, 1);
                     gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE + 128 + 16 * k, 2);
+                    if !cut.is_null() {
+                        // Words after this segment's own: the later segments.
+                        gpu.set_bytes(enc, &((SEG_K - 1 - k) as u32).to_ne_bytes(), 3);
+                    }
                     gpu.dispatch(enc, POW_V2_GRID / POW_V2_TG, POW_V2_TG);
                     gpu.end_encoding(enc);
                     gpu.encode_signal_event(cb, st.ev, base + k as u64 + 1);
@@ -16303,6 +16509,92 @@ kernel void blake3_pow_race_tail(
 
     fn seg_lock() -> std::sync::MutexGuard<'static, Option<SegRace>> {
         SEG_RACE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `blake3_pow_scan_seg_cut`'s pipeline (see `super::ENV_NO_SEG2_GPU_CUT`)
+    /// as an address, 0 when rejected. Set once by `pow_seg_cut_prewarm`;
+    /// encodes only `get` it, so they never wait for the build.
+    static POW_SEG_CUT: OnceLock<usize> = OnceLock::new();
+
+    /// Build the cut kernel's library and pipeline now, on the calling
+    /// thread (see `super::gpu_pow_race_tail_prewarm`). Once per process.
+    pub(crate) fn pow_seg_cut_prewarm() {
+        let _ = POW_SEG_CUT.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let pso = pow_seg_cut_build().map_or(0, |p| p as usize);
+            if super::pow_race_trace() {
+                eprintln!(
+                    "[grind] seg2: gpu cut {} after {:.1} ms",
+                    if pso != 0 { "ready" } else { "unavailable" },
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            pso
+        });
+    }
+
+    fn pow_seg_cut_build() -> Option<Id> {
+        const POW_V2_TG: u64 = 256;
+        let gpu = gpu().ok()?;
+        if !gpu.pow_v2 || gpu.pso_pow.is_null() {
+            return None;
+        }
+        unsafe {
+            let api = &gpu.api;
+            let pool = gpu.pool_push();
+            let pso = (|| -> Option<Id> {
+                let src = api.nsstring(&format!("{POW_MSL_SOURCE}\n{POW_SEG_CUT_MSL_SOURCE}")).ok()?;
+                let mut err: Id = NIL;
+                let library: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    gpu.device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if library.is_null() {
+                    return None;
+                }
+                let mut pso: Id = NIL;
+                if let Ok(ns) = api.nsstring("blake3_pow_scan_seg_cut") {
+                    let function: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if !function.is_null() {
+                        let mut pso_err: Id = NIL;
+                        pso = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            gpu.device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        gpu.release(function);
+                    }
+                }
+                gpu.release(library);
+                if pso.is_null() {
+                    return None;
+                }
+                // The segments dispatch 256-thread groups.
+                let max_threads: u64 =
+                    send!(api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup");
+                if max_threads < POW_V2_TG {
+                    gpu.release(pso);
+                    return None;
+                }
+                Some(pso)
+            })();
+            gpu.pool_pop(pool);
+            pso
+        }
     }
 
     /// Encode the next launch's buffer now (off the Metal arm's path).
