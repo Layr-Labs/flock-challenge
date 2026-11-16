@@ -402,6 +402,29 @@ pub const ENV_NO_LC_GPU_WAKE: &str = "FLOCK_NO_LC_GPU_WAKE";
 /// (a buffer that errors never signals and is caught by the status poll).
 pub const ENV_NO_GPU_DONE_EVENT: &str = "FLOCK_NO_GPU_DONE_EVENT";
 
+/// Kill switch for the signal hand-over at three critical joins
+/// (`FLOCK_NO_JOIN_SIGNAL=1`: each waits for the command buffer's completed
+/// status, as before, and arms no signal). The commit's cb3 join (a blocking
+/// wait), the round-one AB prefix join and the K pass prefix join (status
+/// spins) saw completion about 150 us after the GPU's last work (the status
+/// flips through a completion-handler round trip, as does
+/// `waitUntilCompleted`). Their buffers now arm the record's completion
+/// signal behind their last encoder (see [`ENV_NO_GPU_DONE_EVENT`]) and the
+/// timed joins return once it is visible (8-30 us here), polling the status
+/// too: a buffer that fails never signals, its status ends the poll and the
+/// record's error path runs (arm off, the CPU redoes the prefix; the commit
+/// returns its error). A join still waiting at its deadline takes the
+/// blocking wait. The warm-up oracle launches keep the status wait (they
+/// read GPU timestamps) but arm the signal too, so the timed launches find
+/// their events in the pool. Same buffers, same kernels, same outputs; only
+/// when the CPU sees the end changes. Read once per process.
+pub const ENV_NO_JOIN_SIGNAL: &str = "FLOCK_NO_JOIN_SIGNAL";
+
+pub(crate) fn join_signal_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_JOIN_SIGNAL));
+    *ON
+}
+
 pub(crate) fn gpu_done_event_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !std::env::var(ENV_NO_GPU_DONE_EVENT).is_ok_and(|v| v == "1")
@@ -2799,6 +2822,28 @@ mod z_pin_gate_tests {
 /// same-binary latency control.
 pub const ENV_NO_HYBRID_CB2_SPIN: &str = "FLOCK_NO_HYBRID_CB2_SPIN";
 
+/// Kill switch for band batching (`FLOCK_NO_BAND_BATCH=1`, exact: every
+/// streamed first-pass range gets its own command buffer, as before). With
+/// batching, a range published while two band buffers are still in flight
+/// (one running, one queued behind it) is encoded into a held buffer instead
+/// of a buffer of its own; the held buffer is committed with the next range
+/// published once at most one band buffer is in flight, with the final
+/// range, or when the bands are drained. The GPU runs the same dispatch per
+/// range in the same order, but starts fewer buffers: a buffer queued behind
+/// another starts about 47 us after it ends (M1 Max, timed prove), and the
+/// bands, cb2 and cb3 are one GPU chain that sets the commit's end. The
+/// queued buffer keeps the GPU fed while a batch is held. Read once.
+pub const ENV_NO_BAND_BATCH: &str = "FLOCK_NO_BAND_BATCH";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn band_batch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var(ENV_NO_BAND_BATCH).is_ok_and(|v| v == "1"))
+}
+
 fn hybrid_cb2_spin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -3318,6 +3363,68 @@ fn wait_for_nonzero_wall_ms(
 /// the prover; last writer wins, which is the most recent prove).
 pub fn note_precompute_branch_wall_ms(ms: f64) {
     PRECOMPUTE_BRANCH_WALL_MS.store(ms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the commit join's AB arm (the CPU's other job group) is running:
+/// set by the prover at the join's start and cleared when that arm returns.
+/// The CPU tail hash (`ENV_NO_HYBRID_CPU_TAIL_HASH`) starts only once the
+/// arm is done, so it never takes cores from it.
+static AB_ARM_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The prover's commit join: the AB arm starts (`true`) or returns (`false`).
+pub fn note_ab_arm_running(running: bool) {
+    AB_ARM_RUNNING.store(running, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn ab_arm_done() -> bool {
+    !AB_ARM_RUNNING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Kill switch for the CPU tail hash (`FLOCK_NO_HYBRID_CPU_TAIL_HASH`, any
+/// value: cb3 hashes the whole CPU suffix on the GPU behind cb2, as before).
+/// With it on, when the hybrid CPU NTT is done and its AB sibling has
+/// returned while the GPU prefix (cb2) is still running, the CPU hashes its
+/// own suffix itself, in 1,024-leaf units (leaves and ten parent levels,
+/// the tree's own CPU kernels) from the top of the suffix downward, instead
+/// of idling. The moment cb2 completes, the CPU stops claiming units and
+/// encodes cb3 over the suffix's still unhashed leaves only (up to the
+/// 1,024-leaf level); every unit is hashed by exactly one side. If the CPU
+/// hashed the whole suffix, there is no cb3. After the join the CPU
+/// recomputes the suffix's levels 11..16 from the 1,024-leaf roots (a few
+/// hundred parent hashes), then the top levels as before. Same leaf bytes,
+/// same BLAKE3 nodes in the same flat-tree slots, so the root is unchanged.
+/// Not during the split tuner's sweep (its arms are priced with cb3 on the
+/// GPU). Read once per process.
+pub const ENV_NO_HYBRID_CPU_TAIL_HASH: &str = "FLOCK_NO_HYBRID_CPU_TAIL_HASH";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn hybrid_cpu_tail_hash_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_HYBRID_CPU_TAIL_HASH).is_none());
+    *ON
+}
+
+/// Test hook of the CPU tail hash: 1,024-leaf units the CPU hashes before it
+/// looks at cb2 (so a fast GPU still leaves it a chosen share; `usize::MAX`
+/// or any count past the suffix = all of it), and the path is taken even if
+/// cb2 is already complete. It exists only in a build made with
+/// `FLOCK_HYBRID_TAIL_HASH_TEST_HOOK` set in the BUILD environment
+/// (`option_env!`): such a build takes `FLOCK_HYBRID_TAIL_HASH_FORCE` (run
+/// time), or the build variable's value when that is unset. In every other
+/// build this is the constant 0 and nothing in the process environment can
+/// change the path.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn hybrid_tail_hash_force() -> usize {
+    const HOOK: Option<&str> = option_env!("FLOCK_HYBRID_TAIL_HASH_TEST_HOOK");
+    let Some(built) = HOOK else { return 0 };
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLOCK_HYBRID_TAIL_HASH_FORCE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| built.trim().parse().unwrap_or(0))
+    })
 }
 
 /// Process-local lifecycle of the broad exact-contention calibration. The
@@ -8523,6 +8630,294 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
         }
     }
 
+    /// Kill switch for the prefix ladder (`FLOCK_NO_PREFIX_LADDER=1`, exact):
+    /// the main commit's GPU prefix then encodes its aligned subtrees' parent
+    /// levels above level 3 one subtree at a time, as before. With the
+    /// ladder, those levels take one fused three-level dispatch per round
+    /// over every subtree still at least 256 nodes wide (the binary
+    /// decomposition's subtrees are adjacent and largest first, so the
+    /// round's inputs are one contiguous run from node 0 of the level, in
+    /// whole 256-node groups that never straddle two subtrees), then one
+    /// dispatch for every subtree's levels below 256 nodes (`parent_top`,
+    /// one threadgroup per subtree) instead of one dispatch per level per
+    /// subtree: about 40 dispatches become 4 in cb2, on the commit's
+    /// critical path. Same parent compression per node, same flat-tree
+    /// slots, and every read behind the dispatch that wrote it (one serial
+    /// encoder). Read once.
+    pub const ENV_NO_PREFIX_LADDER: &str = "FLOCK_NO_PREFIX_LADDER";
+
+    /// Kill switch for the ladder's top kernel alone (`FLOCK_NO_MERKLE_TOP=1`,
+    /// exact): its library is not built and the levels below 256 nodes keep
+    /// one single-level dispatch each. The library is built from source on
+    /// its own helper thread at the first GPU use; until it exists the ladder
+    /// encodes those single levels (never waits for it). Read once.
+    pub const ENV_NO_MERKLE_TOP: &str = "FLOCK_NO_MERKLE_TOP";
+
+    fn prefix_ladder_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var(ENV_NO_PREFIX_LADDER).is_ok_and(|v| v == "1"))
+    }
+
+    fn merkle_top_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var(ENV_NO_MERKLE_TOP).is_ok_and(|v| v == "1"))
+    }
+
+    /// One threadgroup per subtree top: from a level of `n_in` nodes (a power
+    /// of two, 2..=128) up to the subtree's root, each level written to its
+    /// flat-tree slots, the next level read from threadgroup memory. The node
+    /// math is `rec_parent_hash`'s (and `parent_hash`'s): one compression of
+    /// left || right, IV, counter 0, block_len 64, flags PARENT. Appended to
+    /// the recursive library's header text (constants and `b3_compress`).
+    const PARENT_TOP_KERNEL: &str = r#"
+struct TopParams {
+    uint level_start;   // first node of the input level
+    uint level_len;     // nodes in the whole input level
+    uint local_start;   // first input node of this subtree, within the level
+    uint n_in;          // input nodes of this subtree (power of two, 2..128)
+};
+
+kernel void parent_top(device uint* tree             [[buffer(0)]],
+                       constant TopParams* params    [[buffer(1)]],
+                       uint tgid [[threadgroup_position_in_grid]],
+                       uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint lv[64u * 8u];
+    const TopParams p = params[tgid];
+    uint level_start = p.level_start;
+    uint level_len = p.level_len;
+    uint local_start = p.local_start;
+    uint n = p.n_in;
+    bool first = true;
+    while (n > 1u) {
+        const uint n_out = n >> 1;
+        const uint write_start = level_start + level_len;
+        uint cv[8] = {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        if (lid < n_out) {
+            uint block[16];
+            if (first) {
+                const uint base = (level_start + local_start + 2u * lid) * 8u;
+                for (uint i = 0u; i < 16u; i++) block[i] = tree[base + i];
+            } else {
+                for (uint i = 0u; i < 8u; i++) {
+                    block[i] = lv[(2u * lid) * 8u + i];
+                    block[8u + i] = lv[(2u * lid + 1u) * 8u + i];
+                }
+            }
+            for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+            b3_compress(cv, block, 64u, B3_PARENT);
+            const uint o = (write_start + (local_start >> 1) + lid) * 8u;
+            for (uint i = 0u; i < 8u; i++) tree[o + i] = cv[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < n_out) {
+            for (uint i = 0u; i < 8u; i++) lv[lid * 8u + i] = cv[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        level_start = write_start;
+        level_len >>= 1;
+        local_start >>= 1;
+        n = n_out;
+        first = false;
+    }
+}
+"#;
+
+    /// `parent_top`'s per-threadgroup parameters (the MSL `TopParams`).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct TopParams {
+        level_start: u32,
+        level_len: u32,
+        local_start: u32,
+        n_in: u32,
+    }
+
+    /// The top kernel's pipeline once built (0 = the build failed); unset
+    /// while the helper thread is still building it.
+    static PARENT_TOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    /// At the first GPU use (the warm-up prove), build the top kernel's
+    /// library on a helper thread, once per process. Nothing ever waits for
+    /// it: the ladder encodes single levels until it exists.
+    fn parent_top_prewarm_once(gpu: &'static Gpu) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if !prefix_ladder_enabled() || !merkle_top_enabled() {
+                return;
+            }
+            let gpu_u = gpu as *const Gpu as usize;
+            let _ = std::thread::Builder::new()
+                .name("merkle-top-build".into())
+                .spawn(move || {
+                    unsafe extern "C" {
+                        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+                    }
+                    unsafe {
+                        let _ = pthread_set_qos_class_self_np(0x11, 0);
+                    }
+                    // SAFETY: `gpu` is the process-lifetime GPU context.
+                    let gpu = unsafe { &*(gpu_u as *const Gpu) };
+                    let pso = unsafe { build_parent_top(gpu) }.map_or(0, |p| p as usize);
+                    let _ = PARENT_TOP.set(pso);
+                });
+        });
+    }
+
+    unsafe fn build_parent_top(gpu: &Gpu) -> Result<Id, String> {
+        let cut = REC_MERKLE_MSL_SOURCE
+            .find("kernel void leaf_hash128")
+            .ok_or("recursive library header not found")?;
+        let src = format!("{}{}", &REC_MERKLE_MSL_SOURCE[..cut], PARENT_TOP_KERNEL);
+        unsafe {
+            let pool = gpu.pool_push();
+            let r = compile_supplemental_pipeline(gpu, &src, "parent_top").and_then(|pso| {
+                let max: u64 =
+                    send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup");
+                if max < 64 {
+                    gpu.release(pso);
+                    Err("parent_top cannot run 64-thread groups".into())
+                } else {
+                    Ok(pso)
+                }
+            });
+            gpu.pool_pop(pool);
+            r
+        }
+    }
+
+    /// The top kernel's pipeline, if built (never waits).
+    fn parent_top_pso() -> Option<Id> {
+        PARENT_TOP.get().copied().filter(|&p| p != 0).map(|p| p as Id)
+    }
+
+    /// Encode subtree tops: one `parent_top` dispatch when its pipeline
+    /// exists, else one single-level `parent_hash` dispatch per level per
+    /// top (the incumbent tail). Each top is `(level_start, level_len,
+    /// local_start, n_in)` with `n_in` a power of two in 2..=128.
+    unsafe fn encode_merkle_tops(gpu: &Gpu, enc: Id, tree_buf: Id, pso_single: Id, tops: &[(usize, usize, usize, usize)]) {
+        if tops.is_empty() {
+            return;
+        }
+        unsafe {
+            if let Some(pso) = parent_top_pso() {
+                let params: Vec<TopParams> = tops
+                    .iter()
+                    .map(|&(a, b, c, d)| TopParams {
+                        level_start: a as u32,
+                        level_len: b as u32,
+                        local_start: c as u32,
+                        n_in: d as u32,
+                    })
+                    .collect();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, tree_buf, 0, 0);
+                let bytes = core::slice::from_raw_parts(
+                    params.as_ptr().cast::<u8>(),
+                    params.len() * core::mem::size_of::<TopParams>(),
+                );
+                gpu.set_bytes(enc, bytes, 1);
+                gpu.dispatch(enc, tops.len() as u64, 64);
+                return;
+            }
+            gpu.set_pipeline(enc, pso_single);
+            for &(mut level_start, mut level_len, mut local_start, mut local_len) in tops {
+                while local_len > 1 {
+                    let write_level_start = level_start + level_len;
+                    let n_out = local_len / 2;
+                    gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
+                    gpu.set_buffer(enc, tree_buf, (write_level_start + local_start / 2) * 32, 1);
+                    let tpg = 256u64.min(n_out as u64);
+                    gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                    level_start = write_level_start;
+                    level_len /= 2;
+                    local_start /= 2;
+                    local_len = n_out;
+                }
+            }
+        }
+    }
+
+    /// The prefix ladder (see [`ENV_NO_PREFIX_LADDER`]): every aligned
+    /// subtree of `[0, prefix_leaves)` above level 3, the same nodes and slots
+    /// as one [`encode_merkle_subtree_above3`] per subtree. Returns `false`
+    /// without encoding anything when the plan's invariants do not hold (the
+    /// caller then runs the per-subtree path).
+    unsafe fn encode_prefix_ladder(gpu: &Gpu, enc: Id, tree_buf: Id, n_leaves: usize, prefix_leaves: usize) -> bool {
+        let pso3 = if gpu.pso_parent3_v4.is_null() {
+            gpu.pso_parent3
+        } else {
+            gpu.pso_parent3_v4
+        };
+        if pso3.is_null() || !n_leaves.is_power_of_two() || n_leaves < 8 || n_leaves > 1 << 26 {
+            return false;
+        }
+        // Per subtree, at its current level: (level_start, level_len,
+        // local_start, local_len), as in `encode_merkle_subtree_above3`.
+        let mut subs: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut start = 0usize;
+        while start < prefix_leaves {
+            let mut size = 1usize << (prefix_leaves - start).ilog2();
+            while start % size != 0 {
+                size >>= 1;
+            }
+            if size < 256 {
+                return false;
+            }
+            subs.push((n_leaves + n_leaves / 2 + n_leaves / 4, n_leaves / 8, start / 8, size / 8));
+            start += size;
+        }
+        // Plan the rounds: each round's active subtrees must be a prefix of
+        // the list whose input ranges tile `[0, total)` of one level, every
+        // range a multiple of 256 nodes.
+        let mut rounds: Vec<(usize, usize, usize)> = Vec::new(); // (level_start, level_len, input nodes)
+        let mut plan = subs.clone();
+        loop {
+            let active = plan.iter().take_while(|s| s.3 >= 256).count();
+            if active == 0 {
+                break;
+            }
+            if plan[active..].iter().any(|s| s.3 >= 256) {
+                return false;
+            }
+            let (level_start, level_len) = (plan[0].0, plan[0].1);
+            let mut next = 0usize;
+            for s in &plan[..active] {
+                if s.0 != level_start || s.1 != level_len || s.2 != next || s.3 % 256 != 0 {
+                    return false;
+                }
+                next += s.3;
+            }
+            if next > level_len {
+                return false;
+            }
+            rounds.push((level_start, level_len, next));
+            for s in &mut plan[..active] {
+                let l3 = s.0 + s.1 + s.1 / 2 + s.1 / 4;
+                *s = (l3, s.1 / 8, s.2 / 8, s.3 / 8);
+            }
+        }
+        let tops: Vec<(usize, usize, usize, usize)> = plan.into_iter().filter(|s| s.3 > 1).collect();
+        if tops.iter().any(|s| !s.3.is_power_of_two() || s.3 > 128) {
+            return false;
+        }
+        unsafe {
+            gpu.set_pipeline(enc, pso3);
+            for &(level_start, level_len, n_in) in &rounds {
+                let l1 = level_start + level_len;
+                let l2 = l1 + level_len / 2;
+                let l3 = l2 + level_len / 4;
+                gpu.set_buffer(enc, tree_buf, level_start * 32, 0);
+                gpu.set_buffer(enc, tree_buf, l1 * 32, 1);
+                gpu.set_buffer(enc, tree_buf, l2 * 32, 2);
+                gpu.set_buffer(enc, tree_buf, l3 * 32, 3);
+                gpu.dispatch(enc, (n_in / 256) as u64, 128);
+            }
+            encode_merkle_tops(gpu, enc, tree_buf, gpu.pso_parent, &tops);
+        }
+        true
+    }
+
     /// GPU-prefix NTT passes from layer `l_from` over `num / den` of the
     /// positions plus the prefix's aligned Merkle subtrees. With the hybrid
     /// fused final leaf selected, the final pass and leaf/level-1..3 hashing
@@ -8574,6 +8969,9 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
                 encode_final_leaf_prefix(gpu, enc, staging, tw_buf, tree_buf, log_d, prefix_leaves);
             } else {
                 encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, l_from, log_d, num, den);
+            }
+            if fused && prefix_ladder_enabled() && encode_prefix_ladder(gpu, enc, tree_buf, n_leaves, prefix_leaves) {
+                return;
             }
             let mut start = 0usize;
             while start < prefix_leaves {
@@ -9558,8 +9956,9 @@ kernel void blake3_pow_race_tail(
             return Err("gpu commit disabled".into());
         }
         let gpu = GPU.get_or_init(init_gpu).as_ref().map_err(|e| e.clone());
-        if gpu.is_ok() {
+        if let Ok(g) = gpu {
             zc_ab_prewarm_once();
+            parent_top_prewarm_once(g);
         }
         gpu
     }
@@ -10570,6 +10969,26 @@ kernel void blake3_pow_race_tail(
             }
         }
 
+        /// `dispatchThreadgroupsWithIndirectBuffer:` — the threadgroup count is
+        /// read from `buf` at `offset` (three u32) when the dispatch runs.
+        pub(crate) unsafe fn dispatch_indirect(&self, enc: Id, buf: Id, offset: u64, threads_per_group: u64) {
+            unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel, Id, u64, MtlSize),
+                    enc,
+                    c"dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:",
+                    buf,
+                    offset,
+                    MtlSize {
+                        width: threads_per_group,
+                        height: 1,
+                        depth: 1
+                    }
+                );
+            }
+        }
+
         #[cfg(test)]
         pub(crate) unsafe fn pipeline_resources(&self, pso: Id) -> (u64, u64, u64) {
             unsafe {
@@ -10876,6 +11295,30 @@ kernel void blake3_pow_race_tail(
                     }
                     std::hint::spin_loop();
                 }
+            }
+        }
+
+        /// Join an already-committed buffer whose completion signal `sig` is
+        /// armed (`super::ENV_NO_JOIN_SIGNAL`): return once the signal is
+        /// visible or the status has completed, spinning for `spin_ms`, then
+        /// yielding (a sibling may take the core) until 10 ms after the call,
+        /// then the exact blocking wait. A failed buffer never signals: its
+        /// status ends the poll and its error is returned.
+        pub(crate) unsafe fn join_cb_sig(&self, cb: Id, sig: Option<&DoneSig>, spin_ms: f64) -> Result<(), String> {
+            unsafe {
+                let start = std::time::Instant::now();
+                while start.elapsed().as_secs_f64() * 1e3 < spin_ms {
+                    if let Some(s) = sig
+                        && self.done_signaled(s)
+                    {
+                        return self.done_status(cb);
+                    }
+                    if self.cb_status(cb) >= 4 {
+                        return self.done_status(cb);
+                    }
+                    std::hint::spin_loop();
+                }
+                self.yield_wait_cb_until_sig(cb, sig, start + std::time::Duration::from_millis(10))
             }
         }
 
@@ -11725,6 +12168,97 @@ kernel void blake3_pow_race_tail(
         }
     }
 
+    /// cb3 for the CPU tail hash (see `super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
+    /// the leaves of `[suffix_start, suffix_start + 1024 u)` and their parents
+    /// up to the 1,024-leaf unit roots, where `u` (the GPU's units) is read
+    /// from `args` when each dispatch runs (indirect dispatch: three u32 per
+    /// dispatch, the counts written by [`write_tail_counts`]). Every dispatch
+    /// covers whole units from the suffix's start, with the same kernels,
+    /// buffer offsets and slots as [`encode_merkle_suffix_impl`]. Returns the
+    /// threadgroups per unit of each dispatch, in order.
+    pub(crate) unsafe fn encode_merkle_suffix_units_indirect(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves: usize,
+        suffix_start: usize,
+        args: Id,
+    ) -> Vec<u32> {
+        const UNIT_LEVELS: usize = 10;
+        let unit = 1usize << UNIT_LEVELS;
+        debug_assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
+        let mut per_unit: Vec<u32> = Vec::with_capacity(12);
+        unsafe {
+            let pso_leaf = if gpu.pso_leaf_v4.is_null() {
+                gpu.pso_leaf
+            } else {
+                gpu.pso_leaf_v4
+            };
+            let mut level_start = 0usize;
+            let mut level_len = n_leaves;
+            let mut local_start = suffix_start;
+            let mut done = 0usize;
+            let mut next_arg = |per: u32, per_unit: &mut Vec<u32>| -> u64 {
+                per_unit.push(per);
+                ((per_unit.len() - 1) * 12) as u64
+            };
+            if super::select_gpu_leaf_parent3(!gpu.pso_leaf_parent3.is_null()) {
+                gpu.set_pipeline(enc, gpu.pso_leaf_parent3);
+                gpu.set_buffer(enc, codeword_buf, suffix_start * 1024, 0);
+                gpu.set_buffer(enc, tree_buf, local_start * 32, 1);
+                gpu.set_buffer(enc, tree_buf, (level_len + local_start / 2) * 32, 2);
+                gpu.set_buffer(enc, tree_buf, (level_len + level_len / 2 + local_start / 4) * 32, 3);
+                gpu.set_buffer(
+                    enc,
+                    tree_buf,
+                    (level_len + level_len / 2 + level_len / 4 + local_start / 8) * 32,
+                    4,
+                );
+                let off = next_arg((unit / 256) as u32, &mut per_unit);
+                gpu.dispatch_indirect(enc, args, off, 256);
+                level_start += level_len + level_len / 2 + level_len / 4;
+                level_len /= 8;
+                local_start /= 8;
+                done = 3;
+            } else {
+                gpu.set_pipeline(enc, pso_leaf);
+                gpu.set_buffer(enc, codeword_buf, suffix_start * 1024, 0);
+                gpu.set_buffer(enc, tree_buf, suffix_start * 32, 1);
+                let off = next_arg((unit / 256) as u32, &mut per_unit);
+                gpu.dispatch_indirect(enc, args, off, 256);
+            }
+            while done < UNIT_LEVELS {
+                // Per unit: `unit >> (done + 1)` parents at the next level.
+                let n_out = unit >> (done + 1);
+                let tpg = n_out.min(256);
+                gpu.set_pipeline(enc, gpu.pso_parent);
+                gpu.set_buffer(enc, tree_buf, (level_start + local_start) * 32, 0);
+                gpu.set_buffer(enc, tree_buf, (level_start + level_len + local_start / 2) * 32, 1);
+                let off = next_arg((n_out / tpg) as u32, &mut per_unit);
+                gpu.dispatch_indirect(enc, args, off, tpg as u64);
+                level_start += level_len;
+                level_len /= 2;
+                local_start /= 2;
+                done += 1;
+            }
+        }
+        per_unit
+    }
+
+    /// The indirect counts of [`encode_merkle_suffix_units_indirect`] for
+    /// `units` GPU units (non-increasing over a launch).
+    unsafe fn write_tail_counts(args: *mut u32, per_unit: &[u32], units: usize) {
+        for (i, &p) in per_unit.iter().enumerate() {
+            unsafe {
+                args.add(3 * i).write_volatile(p * units as u32);
+                args.add(3 * i + 1).write_volatile(1);
+                args.add(3 * i + 2).write_volatile(1);
+            }
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The kernels have no bounds check. Non-power-of-two suffix counts must
     /// launch exactly `count` threads, not a rounded or truncated 256-wide grid.
     fn exact_merkle_threads(count: usize) -> usize {
@@ -12011,6 +12545,9 @@ kernel void blake3_pow_race_tail(
         /// Committed bands with their completion signals
         /// (`ENV_NO_GPU_DONE_EVENT`).
         pending: Vec<(Id, Option<DoneSig>)>,
+        /// Band buffer (retained, not committed) holding the ranges published
+        /// while two band buffers were in flight (`super::ENV_NO_BAND_BATCH`).
+        held: Option<Id>,
         failed: Option<String>,
         owns_lease: bool,
         started: std::time::Instant,
@@ -12104,11 +12641,28 @@ kernel void blake3_pow_race_tail(
             // r_start+r without modifying the proven full-range kernel.
             let byte_offset = r_start * 64 * core::mem::size_of::<F128>();
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            // Band batching (`super::ENV_NO_BAND_BATCH`): hold this range
+            // while a band buffer is queued behind the running one; never the
+            // final range.
+            let hold = self.next_r + r_count < total_r && super::band_batch_enabled() && self.two_bands_in_flight();
             let result = unsafe {
                 let pool = self.gpu.pool_push();
-                let result = (|| -> Result<(Id, Option<DoneSig>), String> {
-                    let cb = self.gpu.command_buffer()?;
-                    let enc = self.gpu.compute_encoder(cb)?;
+                let result = (|| -> Result<Option<(Id, Option<DoneSig>)>, String> {
+                    // `commandBuffer` is autoreleased. Retain it before
+                    // popping this short-lived pool because completion is
+                    // deliberately deferred until witness generation ends
+                    // (and a held buffer outlives the call).
+                    let cb = match self.held.take() {
+                        Some(cb) => cb,
+                        None => self.gpu.retain(self.gpu.command_buffer()?),
+                    };
+                    let enc = match self.gpu.compute_encoder(cb) {
+                        Ok(enc) => enc,
+                        Err(e) => {
+                            self.gpu.release(cb);
+                            return Err(e);
+                        }
+                    };
                     FromZFirstPassPlan::new(self.log_d)
                         .with_zero_store_from(self.zero_store_from)
                         .encode_range(
@@ -12122,23 +12676,25 @@ kernel void blake3_pow_race_tail(
                             r_count,
                         );
                     self.gpu.end_encoding(enc);
+                    if hold {
+                        self.held = Some(cb);
+                        crate::tmark::mark("band held");
+                        return Ok(None);
+                    }
                     let sig = self.gpu.arm_done(cb);
-                    // `commandBuffer` is autoreleased. Retain it before
-                    // popping this short-lived pool because completion is
-                    // deliberately deferred until witness generation ends.
-                    let cb = self.gpu.retain(cb);
                     self.gpu.commit_async(cb);
                     crate::tmark::mark("band committed");
-                    Ok((cb, sig))
+                    Ok(Some((cb, sig)))
                 })();
                 self.gpu.pool_pop(pool);
                 result
             };
             match result {
-                Ok(cb) => {
+                Ok(Some(cb)) => {
                     self.pending.push(cb);
                     self.next_r += r_count;
                 }
+                Ok(None) => self.next_r += r_count,
                 Err(e) => self.failed = Some(e),
             }
 
@@ -12229,7 +12785,33 @@ kernel void blake3_pow_race_tail(
             }
         }
 
+        /// Whether the band buffer before the last committed one is still in
+        /// flight: on the serial queue, one band is then running and one is
+        /// queued behind it.
+        fn two_bands_in_flight(&self) -> bool {
+            let n = self.pending.len();
+            n >= 2 && {
+                let (cb, sig) = self.pending[n - 2];
+                !unsafe { self.gpu.cb_done(cb, sig.as_ref()) }
+            }
+        }
+
+        /// Commit the held band buffer, if any (`super::ENV_NO_BAND_BATCH`).
+        fn commit_held(&mut self) {
+            if let Some(cb) = self.held.take() {
+                unsafe {
+                    let pool = self.gpu.pool_push();
+                    let sig = self.gpu.arm_done(cb);
+                    self.gpu.commit_async(cb);
+                    self.gpu.pool_pop(pool);
+                    self.pending.push((cb, sig));
+                }
+                crate::tmark::mark("band committed");
+            }
+        }
+
         fn wait_pending(&mut self) -> Result<(), String> {
+            self.commit_held();
             let mut result = self.failed.take().map_or(Ok(()), Err);
             let trace = window_trace_enabled();
             let host_at_entry = self.started.elapsed().as_secs_f64() * 1e3;
@@ -12450,6 +13032,7 @@ kernel void blake3_pow_race_tail(
             next_r: 0,
             unordered: Vec::new(),
             pending: Vec::with_capacity(8),
+            held: None,
             failed: None,
             owns_lease: true,
             started: std::time::Instant::now(),
@@ -13117,6 +13700,205 @@ kernel void blake3_pow_race_tail(
         }
     }
 
+    /// 1,024-leaf units of the CPU tail hash (`super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
+    /// one unit is its leaves and ten parent levels, rooted at level 10.
+    const TAIL_UNIT_LEVELS: usize = 10;
+
+    /// Process-lifetime indirect-count buffer of the CPU tail hash's cb3.
+    static TAIL_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    /// The CPU tail hash's join (see `super::ENV_NO_HYBRID_CPU_TAIL_HASH`),
+    /// in place of cb3 over the whole suffix. cb3 is committed at once behind
+    /// cb2, as before, but over the suffix's GPU units only: its dispatches
+    /// read the unit count when they run. The pool's workers hash 1,024-leaf
+    /// units from the top of the suffix downward while this thread watches
+    /// cb2, and every claim lowers the count first. Once cb2 is complete
+    /// (after at least `force` units in a test build) the claims stop.
+    ///
+    /// Every unit is hashed by at least one side: cb3's dispatches each read
+    /// a count no lower than the final one, so they cover every unit below
+    /// the lowest claim at every level, from their own lower levels; the CPU
+    /// hashes every unit it claimed, leaves and parents, from the codeword
+    /// rows alone. A unit that both hash (claimed after cb3 read a count) is
+    /// the same bytes written to the same slots by both, and neither side
+    /// reads a node the other writes. After cb2, cb3 and the workers are
+    /// done, the suffix's levels 11..16 are recomputed here from the unit
+    /// roots; the caller then rebuilds the top levels as before.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn hybrid_cpu_tail_hash_join(
+        gpu: &Gpu,
+        cb2: Id,
+        staging: Id,
+        tree_buf: Id,
+        tree_base: crate::epool::SyncPtr<Hash>,
+        n_leaves: usize,
+        suffix_start: usize,
+        force: usize,
+    ) -> Result<(), String> {
+        let unit = 1usize << TAIL_UNIT_LEVELS;
+        assert!(n_leaves.is_power_of_two() && n_leaves >= 1 << 16);
+        assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
+        let total_units = (n_leaves - suffix_start) / unit;
+        let force_units = force.min(total_units);
+        let args = match TAIL_ARGS.get() {
+            Some(&b) => b as Id,
+            None => {
+                let b = unsafe { gpu.new_buffer(16 * 12)? };
+                *TAIL_ARGS.get_or_init(|| b as usize) as Id
+            }
+        };
+        let args_ptr = unsafe { gpu.buffer_contents(args).cast::<u32>() };
+        // cb3, committed now behind cb2 (no launch gap at cb2's end).
+        let (cb3, per_unit, sig3) = unsafe {
+            let cb3 = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(cb3)?;
+            let per_unit =
+                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args);
+            gpu.end_encoding(enc);
+            // The join below returns on this signal (`super::ENV_NO_JOIN_SIGNAL`).
+            let sig3 = if super::join_signal_enabled() { gpu.arm_done(cb3) } else { None };
+            write_tail_counts(args_ptr, &per_unit, total_units);
+            let cb3 = gpu.retain(cb3);
+            gpu.commit_async(cb3);
+            (cb3, per_unit, sig3)
+        };
+        crate::tmark::mark("cb3 committed (tail)");
+        let bytes_base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(staging).cast::<u8>() });
+        let args_base = crate::epool::SyncPtr(args_ptr);
+        let per_unit = &per_unit;
+        // (next unclaimed top, exclusive; claims stopped)
+        let claims = std::sync::Mutex::new((n_leaves, false));
+        // Raw handles cross the scope as integers (the body runs on this
+        // thread; the workers get the claims and the byte/tree/args bases).
+        let cb2_u = cb2 as usize;
+        let t_tail = std::time::Instant::now();
+        let mut h = n_leaves;
+        // Claim one unit: lower cb3's count first, then hash it.
+        let claim = move |g: &mut (usize, bool)| -> usize {
+            g.0 -= unit;
+            // SAFETY: the args buffer is the arm's; counts only decrease.
+            unsafe { write_tail_counts(args_base.ptr(), per_unit, (g.0 - suffix_start) / unit) };
+            g.0
+        };
+        let hash_unit = move |start: usize| {
+            // SAFETY: `start..start + unit` was claimed by this thread alone;
+            // its codeword rows are final (the CPU NTT is done); cb3 may hash
+            // the same unit only with the same bytes into the same slots.
+            unsafe {
+                let bytes = core::slice::from_raw_parts(bytes_base.ptr().add(start * 1024), unit * 1024);
+                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, TAIL_UNIT_LEVELS);
+            }
+        };
+        rayon::scope(|sc| {
+            for _ in 0..rayon::current_num_threads() {
+                let claims = &claims;
+                sc.spawn(move |_| loop {
+                    let start = {
+                        let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.1 || g.0 <= suffix_start {
+                            break;
+                        }
+                        claim(&mut g)
+                    };
+                    hash_unit(start);
+                });
+            }
+            // This thread: stop the claims at cb2's completion.
+            let cb2_done = || unsafe { gpu.cb_status(cb2_u as Id) >= 4 };
+            let mut spins = 0u32;
+            loop {
+                {
+                    let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.0 <= suffix_start {
+                        g.1 = true;
+                        h = suffix_start;
+                        break;
+                    }
+                    let claimed = (n_leaves - g.0) / unit;
+                    if claimed >= force_units && cb2_done() {
+                        g.1 = true;
+                        h = g.0;
+                        break;
+                    }
+                    if claimed < force_units {
+                        // Test builds only: help with the forced units (a
+                        // pool with no free worker must not stall here).
+                        let start = claim(&mut g);
+                        drop(g);
+                        hash_unit(start);
+                        continue;
+                    }
+                }
+                spins = spins.wrapping_add(1);
+                if spins % 64 == 0 {
+                    std::thread::yield_now();
+                } else {
+                    core::hint::spin_loop();
+                }
+            }
+        });
+        let tail_ms = t_tail.elapsed().as_secs_f64() * 1e3;
+        crate::tmark::mark("tail hash workers done");
+        gpu.wait_cb(cb2)?;
+        // cb3's tree writes are read only below, after this join: on its
+        // signal every write is complete and visible. The window trace reads
+        // cb3's GPU timestamps, so it keeps the status wait.
+        let r = if super::join_signal_enabled() && !window_trace_enabled() {
+            gpu.join_cb_sig(cb3, sig3.as_ref(), 0.0)
+        } else {
+            gpu.wait_cb(cb3)
+        };
+        if r.is_ok() {
+            Gpu::recycle_done(sig3);
+        }
+        if window_trace_enabled() {
+            let (s3, e3) = cb_gpu_interval(gpu, cb3);
+            let (s2, e2) = cb_gpu_interval(gpu, cb2);
+            eprintln!(
+                "[gpu-window] tail hash: CPU took {} of {total_units} suffix units in {tail_ms:.2} ms; \
+                 cb3 start {:.3} ms after cb2's end, gpu dur {:.2} ms; cb2 gpu dur {:.2} ms",
+                (n_leaves - h) / unit,
+                (s3 - e2) * 1e3,
+                (e3 - s3) * 1e3,
+                (e2 - s2) * 1e3,
+            );
+        }
+        {
+            let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
+            crate::tmark::mark_gpu("cb2 gpu start", "cb2 gpu end", cb2_s, cb2_e);
+        }
+        gpu.release(cb3);
+        r?;
+        crate::tmark::mark("cb3 host woke");
+        // The suffix's levels 11..16 from the unit roots. Level `l`'s first
+        // node is rounded down, so a node over the GPU prefix's last 256ths
+        // and the suffix's first is rebuilt too: its children on the prefix
+        // side are cb2's (every aligned block inside the prefix lies inside
+        // one of cb2's greedy subtrees, each complete up to its root).
+        let mut ls = 0usize;
+        let mut ll = n_leaves;
+        for _ in 0..TAIL_UNIT_LEVELS {
+            ls += ll;
+            ll /= 2;
+        }
+        let mut lo = suffix_start >> TAIL_UNIT_LEVELS;
+        while ll > 16 {
+            let ws = ls + ll;
+            let wlo = lo / 2;
+            // SAFETY: every GPU write of the tree is complete (cb2 and cb3
+            // joined above) and every CPU unit is done (the scope joined).
+            unsafe {
+                let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * wlo), ll - 2 * wlo);
+                let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + wlo), ll / 2 - wlo);
+                crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+            }
+            ls = ws;
+            ll /= 2;
+            lo = wlo;
+        }
+        Ok(())
+    }
+
     unsafe fn run_commit_graph_from_z_hybrid_impl(
         gpu: &Gpu,
         z_buf: Id,
@@ -13227,6 +14009,29 @@ kernel void blake3_pow_race_tail(
                     // Same clock as the command buffers' GPU timestamps.
                     let cpu_done_s = crate::tmark::now_ns() as f64 * 1e-9;
                     crate::tmark::mark("hybrid cpu ntt done");
+                    // CPU tail hash (see `super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
+                    // only while cb2 still runs once the AB sibling has
+                    // returned (the CPU is idle only then), never in the
+                    // tuner's sweep.
+                    let tail_force = super::hybrid_tail_hash_force();
+                    let tail = !hybrid_arm_recording()
+                        && super::hybrid_cpu_tail_hash_enabled()
+                        && (tail_force > 0 || {
+                            super::help_pool_until(|| super::ab_arm_done() || gpu.cb_status(cb2) >= 4);
+                            gpu.cb_status(cb2) < 4
+                        });
+                    if tail {
+                        hybrid_cpu_tail_hash_join(
+                            gpu,
+                            cb2,
+                            staging,
+                            tree_buf,
+                            tree_base,
+                            n_leaves,
+                            suffix_leaf_start,
+                            tail_force,
+                        )?;
+                    } else {
                     let cb3 = gpu.command_buffer()?;
                     let enc = gpu.compute_encoder(cb3)?;
                     encode_merkle_suffix_selected(
@@ -13286,6 +14091,7 @@ kernel void blake3_pow_race_tail(
                             (cb2_e - cb2_s) * 1e3,
                             (cb3_e - cb2_s) * 1e3
                         );
+                    }
                     }
                     if fine_m > 0 {
                         // The boundary sixteenth is split between the GPU's
@@ -20378,6 +21184,24 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         *ON.get_or_init(|| !std::env::var(ENV_NO_L1_TAIL).is_ok_and(|v| v == "1"))
     }
 
+    /// Kill switch for the L1 window hold (`FLOCK_NO_L1_WINDOW_HOLD=1`,
+    /// exact: in the last window every finished range is submitted at once,
+    /// as the L1 tail does). With the hold, a last-window range that finishes
+    /// while two of the session's buffers are in flight (one running, one
+    /// queued behind it) stays pending and goes with the next submit: the
+    /// next range finished once at most one is in flight, or the
+    /// cover-completing batch. In the timed prove the GPU is behind in that
+    /// window (4096-leaf ranges of ~19 us of work each, M1 Max), and each
+    /// buffer queued behind another starts ~44 us after it ends, on the
+    /// opening's serial path. Same ranges, same dispatches per range, same
+    /// order; only the buffer boundaries move. Read once.
+    pub const ENV_NO_L1_WINDOW_HOLD: &str = "FLOCK_NO_L1_WINDOW_HOLD";
+
+    fn l1_window_hold_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var(ENV_NO_L1_WINDOW_HOLD).is_ok_and(|v| v == "1"))
+    }
+
     /// Encode the flat tree's internal levels from the level that starts at
     /// node `read_start` and holds `read_len` nodes up to the root: fused
     /// three-level dispatches while a level has at least 256 nodes (when
@@ -20580,11 +21404,25 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             // in one batch, every finished range goes to the GPU at once.
             let last_window = l1_tail_enabled()
                 && self.num_leaves - inner.covered_leaves < self.batch_leaves();
+            // L1 window hold (`ENV_NO_L1_WINDOW_HOLD`): not while a buffer
+            // of this session is queued behind the running one.
+            let window_submit = last_window && !(l1_window_hold_enabled() && self.two_in_flight(&inner));
             if inner.pending_leaves >= self.batch_leaves()
                 || inner.covered_leaves == self.num_leaves
-                || last_window
+                || window_submit
             {
                 self.submit_pending(&mut inner);
+            }
+        }
+
+        /// Whether the session's buffer before the last committed one is
+        /// still in flight: on the serial queue, one is then running and one
+        /// is queued behind it.
+        fn two_in_flight(&self, inner: &L1OverlapInner) -> bool {
+            let n = inner.cbs.len();
+            n >= 2 && {
+                let (cb, sig) = inner.cbs[n - 2];
+                !unsafe { self.gpu.cb_done(cb, sig.as_ref()) }
             }
         }
 
@@ -24033,6 +24871,8 @@ kernel void zc_ab_finish(
         /// second reads the tables the first wrote, hazard-tracked).
         cb_tables: Id,
         cb: Id,
+        /// `cb`'s completion signal (`super::ENV_NO_JOIN_SIGNAL`).
+        sig: Option<DoneSig>,
         chunks: usize,
         /// top' block per threadgroup and threadgroups per chunk.
         tops_per_group: usize,
@@ -24179,7 +25019,7 @@ kernel void zc_ab_finish(
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let pool = gpu.pool_push();
-            let submitted = (|| -> Result<(Id, Id), String> {
+            let submitted = (|| -> Result<(Id, Id, Option<DoneSig>), String> {
                 // Command buffer 1: the table build (own GPU wall in the
                 // diagnostics).
                 let cb_tables = gpu.command_buffer()?;
@@ -24208,17 +25048,21 @@ kernel void zc_ab_finish(
                 gpu.set_bytes(enc, pb, 4);
                 gpu.dispatch(enc, chunks as u64, 64);
                 gpu.end_encoding(enc);
+                // Armed in the warm-up's oracle launch too, so the timed
+                // launch finds its event in the pool.
+                let sig = if super::join_signal_enabled() { gpu.arm_done(cb) } else { None };
                 let cb_tables = gpu.retain(cb_tables);
                 let cb = gpu.retain(cb);
                 gpu.commit_async(cb_tables);
                 gpu.commit_async(cb);
-                Ok((cb_tables, cb))
+                Ok((cb_tables, cb, sig))
             })();
             gpu.pool_pop(pool);
             match submitted {
-                Ok((cb_tables, cb)) => Some(ZcAbJob {
+                Ok((cb_tables, cb, sig)) => Some(ZcAbJob {
                     cb_tables,
                     cb,
+                    sig,
                     chunks,
                     tops_per_group,
                     groups_per_chunk,
@@ -24253,7 +25097,17 @@ kernel void zc_ab_finish(
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
             // the table build; the table build's status is checked too.
-            let ok = gpu.spin_wait_cb(job.cb, 2.0).and_then(|()| gpu.wait_cb(job.cb_tables));
+            // A timed join returns on the buffer's signal; the oracle launch
+            // waits for the status (it reads the GPU's timestamps).
+            let ok = if job.calibration || !super::join_signal_enabled() {
+                gpu.spin_wait_cb(job.cb, 2.0)
+            } else {
+                gpu.join_cb_sig(job.cb, job.sig.as_ref(), 2.0)
+            }
+            .and_then(|()| gpu.wait_cb(job.cb_tables));
+            if ok.is_ok() {
+                Gpu::recycle_done(job.sig);
+            }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let (tables_ms, gather_ms) = if ok.is_ok() {
                 (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
@@ -24704,6 +25558,8 @@ kernel void zc_ab_finish(
     /// An in-flight K pass GPU prefix.
     pub(crate) struct ZcKJob {
         cb: Id,
+        /// `cb`'s completion signal (`super::ENV_NO_JOIN_SIGNAL`).
+        sig: Option<DoneSig>,
         /// Views released at the join (the deltas one may be the round-one
         /// arm's retained view).
         views: [Id; 2],
@@ -25212,7 +26068,7 @@ kernel void zc_ab_finish(
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let pool = gpu.pool_push();
-            let submitted = (|| -> Result<Id, String> {
+            let submitted = (|| -> Result<(Id, Option<DoneSig>), String> {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
                 gpu.set_pipeline(enc, state.fold_pso);
@@ -25235,14 +26091,18 @@ kernel void zc_ab_finish(
                 gpu.set_bytes(enc, pb, 3);
                 gpu.dispatch(enc, chunks as u64, 8);
                 gpu.end_encoding(enc);
+                // Armed in the warm-up's oracle launch too, so the timed
+                // launch finds its event in the pool.
+                let sig = if super::join_signal_enabled() { gpu.arm_done(cb) } else { None };
                 let cb = gpu.retain(cb);
                 gpu.commit_async(cb);
-                Ok(cb)
+                Ok((cb, sig))
             })();
             gpu.pool_pop(pool);
             match submitted {
-                Ok(cb) => Some(ZcKJob {
+                Ok((cb, sig)) => Some(ZcKJob {
                     cb,
+                    sig,
                     views: [a_view, d_view],
                     chunks,
                     per_chunk_a,
@@ -25275,7 +26135,16 @@ kernel void zc_ab_finish(
         };
         unsafe {
             let waited = std::time::Instant::now();
-            let ok = gpu.spin_wait_cb(job.cb, 2.0);
+            // A timed join returns on the buffer's signal; the oracle launch
+            // waits for the status (`super::ENV_NO_JOIN_SIGNAL`).
+            let ok = if job.calibration || !super::join_signal_enabled() {
+                gpu.spin_wait_cb(job.cb, 2.0)
+            } else {
+                gpu.join_cb_sig(job.cb, job.sig.as_ref(), 2.0)
+            };
+            if ok.is_ok() {
+                Gpu::recycle_done(job.sig);
+            }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let gpu_ms = if ok.is_ok() { zc_fold_gpu_wall_ms(gpu, job.cb) } else { 0.0 };
             gpu.release(job.cb);

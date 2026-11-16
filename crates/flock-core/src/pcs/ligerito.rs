@@ -7727,6 +7727,31 @@ fn zfold_debug_any() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_ZF_DEBUG").is_some())
 }
 
+/// Kill switch for the z-fold arm's wide signalled chunks
+/// (`FLOCK_NO_ZF_WIDE_CHUNK=1`, exact: the record's 8-block chunks). The GPU
+/// share is encoded as one encoder per chunk with a completion signal behind
+/// each, so the CPU queue can take finished GPU blocks while the GPU still
+/// runs. Each boundary (encoder end, signal, next encoder, and the partly
+/// idle tail of the chunk's last threadgroups) cost about 45 us of GPU time
+/// here: 32 chunks of 8 blocks kept the GPU busy 4.4 ms for its ~112 blocks.
+/// With 32-block chunks it is 3.2 ms and the GPU takes ~130 blocks. The
+/// coarser grain costs the steal only at the meeting point: the CPU steals
+/// from the top, lowering the boundary word, so the in-flight chunk ends at
+/// that word and its signal follows; its blocks' CPU remainder lands later.
+/// Same kernel, same blocks, same outputs; only how many blocks share a
+/// signal changes. Read once.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ENV_NO_ZF_WIDE_CHUNK: &str = "FLOCK_NO_ZF_WIDE_CHUNK";
+
+/// Blocks per signalled z-fold chunk (see [`ENV_NO_ZF_WIDE_CHUNK`]).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zfold_default_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if std::env::var(ENV_NO_ZF_WIDE_CHUNK).is_ok_and(|v| v == "1") { 8 } else { 32 }
+    })
+}
+
 /// Diagnostic tuning knobs (unset in ranked runs).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn zfold_env_usize(name: &str, default: usize) -> usize {
@@ -8172,7 +8197,7 @@ fn materialize_direct_fold8(
                             &challenges,
                             block_len,
                             zfold_env_usize("FLOCK_ZF_GPU_BLOCKS", n_blocks),
-                            zfold_env_usize("FLOCK_ZF_CHUNK", 8),
+                            zfold_env_usize("FLOCK_ZF_CHUNK", zfold_default_chunk()),
                         ));
                         zf_launch_ns.store(
                             tl.elapsed().as_nanos() as u64,
