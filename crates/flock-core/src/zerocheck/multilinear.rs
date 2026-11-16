@@ -3527,7 +3527,7 @@ fn fold2_compact_and_round45_into_packed_b(
     // prepared form, one table shared by every chunk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
-    // The scaled table in seven pieces (`FLOCK_NO_ZC_K_FOLD7`) for the packed
+    // The scaled table in seven pieces (`FLOCK_ZC_K_FOLD7=1`, off by default) for the packed
     // chunks on the performance-core workers: one lookup fewer per tree, the
     // same values (none when a byte bank is not linear).
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
