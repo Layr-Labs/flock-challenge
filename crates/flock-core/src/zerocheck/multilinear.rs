@@ -2584,6 +2584,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     crate::epool::run_hetero_chunks(hi_size, |x_hi| chunk_body(x_hi, false));
+    // Diagnostic run: the CPU sweep of round two is done.
+    crate::tmark::mark("zc r2 cpu end");
 
     // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
     // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
@@ -3551,6 +3553,8 @@ fn fold2_compact_and_round45_into_packed_b(
         }
     };
     crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
+    // Diagnostic run: the CPU share of the K pass is done.
+    crate::tmark::mark("zc k cpu end");
 
     // Join the GPU prefix (it was submitted first and is normally done).
     #[allow(unused_mut)]
