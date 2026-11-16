@@ -195,7 +195,11 @@ impl BlockR1cs {
             || self.b_0.num_cols != k
             || self.b_0.rows.len() != k
             || self.c_0.rows.len() != k
-            || !c0_is_identity_scan(k, &self.c_0)
+            || !(if std::env::var_os("FLOCK_NO_C0_IDENTITY_CACHED").is_some() {
+                c0_is_identity_scan(k, &self.c_0)
+            } else {
+                self.c0_is_identity()
+            })
         {
             return None;
         }

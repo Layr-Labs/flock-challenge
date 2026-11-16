@@ -1038,7 +1038,7 @@ pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
 
 /// The 5+6 arm's default share, in 5+6 chunks (of 512), when
 /// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
-pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 128;
+pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 192;
 
 /// Kill switch for the 5+6 arm's late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1`:
 /// the record's join, where the CPU queue, having folded the chunks after the
