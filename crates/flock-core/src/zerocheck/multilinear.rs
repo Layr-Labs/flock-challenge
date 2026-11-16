@@ -2257,6 +2257,25 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let tail_compact = false;
     compact.tail_compact = tail_compact;
+    // Full chunks (the suffix after the round-two GPU prefix, stolen prefix
+    // chunks, every chunk without the arm) on the window-scaled walk
+    // (`FLOCK_NO_R2_FULL_XB` keeps the prepared-weight walk): it needs the
+    // fixed medium weights (`horner_weights`, which also pins the ranked
+    // periodic block shape), the dead pairs skipped and the odd groups'
+    // weights a constant multiple of the even ones' (checked when the table
+    // is built). Same state bytes and slots as the prepared-weight walk.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let xb_rho = if horner_weights && skip_dead && kernels::aarch64::r2_full_xb_enabled() {
+        kernels::aarch64::r2_full_xb_rho_prep(eq_lo)
+    } else {
+        None
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let xb_rho_addr = xb_rho.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let full_xb = xb_rho_addr != 0;
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let full_xb = false;
     // Head-compacted layout on top: every chunk's producer must be one of the
     // two ranked walks that write it (the full lookahead walk, or the
     // prescaled ranked-invariant walk on GPU-offloaded chunks).
@@ -2377,7 +2396,31 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 let t = table.data.as_ptr().cast::<u8>();
                 let ap = a_packed.as_ptr().add(row_base * n_chunks);
                 let bp = b_packed.as_ptr().add(row_base * n_chunks);
-                if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                if full && full_xb {
+                    // Full chunk on the window-scaled walk
+                    // (`FLOCK_NO_R2_FULL_XB`): the seven-piece table on the
+                    // performance-core workers, the byte banks on the helpers.
+                    #[cfg(target_feature = "sha3")]
+                    kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_xb(
+                        t,
+                        if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                            fold7_addr as *const u8
+                        } else {
+                            core::ptr::null()
+                        },
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        xb_rho_addr as *const F128,
+                        lo_size,
+                        degen,
+                        tail_compact,
+                        head_fail_ptr,
+                        out.as_mut_ptr(),
+                    );
+                } else if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
                     kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
                         t,
                         fold7_addr as *const u8,
@@ -4399,6 +4442,20 @@ fn tri0_gpu_queue(
     job.finish(taken, hi_size);
 }
 
+/// Caller-first main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, any value,
+/// restores the rayon `par_chunks_mut` collect; c1fbbc9e's piece). The tri
+/// passes below the hetero floor run through
+/// [`crate::epool::run_caller_first_chunks`]: the calling thread starts on
+/// chunk 0 at once and never parks on a pool latch. Same `x_hi` chunk grid
+/// and chunk closure; each chunk writes its own output range and its own
+/// `partials[x_hi]`, combined in index order, so bytes are identical. Read
+/// once per process.
+fn zc_tri_caller_first_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TRI_CF").is_none());
+    *ON
+}
+
 /// [`fold_cascade_t_into_packed_prefix`] with the 5+6 GPU prefix arm when
 /// `gpu` is set (see `gpu_commit::ENV_NO_ZC_T56_GPU`): on the ranked packed
 /// b-one-packed depth-two pass whose `prefix` is the K arm's, the GPU folds
@@ -4762,6 +4819,30 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
         vec![chunk(&a_in, &b_in, a_out, b_out)]
+    } else if zc_tri_caller_first_enabled() {
+        // The `par_chunks_mut(chunk_out)` grid below: `hi_size` chunks.
+        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_caller_first_chunks(hi_size, &|x_hi| {
+            // SAFETY: the drain runs each `x_hi` exactly once; its output
+            // ranges are disjoint per chunk, and the drain publishes every
+            // write before the combine below reads them.
+            let (a_o, b_o) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let (a_in, b_in) = inputs(x_hi);
+            let outv = chunk(&a_in, &b_in, a_o, b_o);
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = outv;
+            }
+        });
+        partials
     } else {
         use rayon::prelude::*;
         a_out
@@ -5635,6 +5716,39 @@ fn fold_and_compute_round_pair_into_with_n_hi(
             .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
                 (s1 + c1, sinf + cinf)
             })
+    } else if hi_size > 1 && zc_tail_caller_first_enabled() {
+        // Caller-first drain of the same `x_hi` chunk grid (see
+        // `zc_tail_caller_first_enabled`): each chunk writes its own output
+        // ranges and its own partial slot; the sums are XORs of the same
+        // per-chunk terms, so the order cannot change a bit.
+        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
+        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
+        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_caller_first_chunks(hi_size, &|x_hi| {
+            // SAFETY: the drain runs each `x_hi` exactly once; output ranges
+            // are disjoint per chunk and published before the sum below.
+            let (a_o, b_o) = unsafe {
+                (
+                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
+                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
+                )
+            };
+            let (p1, pinf) = chunk_partial(
+                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
+                a_o,
+                b_o,
+            );
+            let eq_h = eq_hi[x_hi];
+            // SAFETY: exclusive owner of partials[x_hi].
+            unsafe {
+                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
+            }
+        });
+        partials
+            .iter()
+            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| (s1 + c1, sinf + cinf))
     } else {
         a_out
             .par_chunks_mut(chunk_out)
@@ -5657,6 +5771,18 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     };
 
     (r_next[0] * sum1, sum_inf)
+}
+
+/// Caller-first main-pool zerocheck tail rounds below the hetero floor
+/// (`FLOCK_NO_ZC_TAIL_CF`, any value, restores the rayon
+/// `par_chunks_mut` reduce): the calling thread starts on chunk 0 at once and
+/// never parks on a pool latch (the lincheck wide rounds' caller-first, one
+/// phase later). Same chunk grid and chunk closure; the message sums are XORs
+/// of the same per-chunk terms. Read once per process.
+fn zc_tail_caller_first_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_CF").is_none());
+    *ON
 }
 
 /// Serial reference — identical I/O contract to
