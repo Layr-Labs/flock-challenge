@@ -1530,6 +1530,416 @@ fn race_with_launch_polls_prep(
     won
 }
 
+// ---------------------------------------------------------------------------
+// Split race (`FLOCK_NO_POW_SPLIT`).
+//
+// The record's race (wide policy, the 17..=19-bit fold grinds once the GPU
+// latch is on): the Metal arm scans `[0, 2^(bits+2))` in four segments and
+// the CPU arm scans ascending from nonce 0. Each arm reports only the
+// smallest qualifying nonce of what it scanned in full, so whichever answers
+// first wins; below the answer the two arms hash the same nonces, and the
+// loser's work is dropped.
+//
+// The split race gives the arms disjoint sets. The CPU takes every nonce
+// below `x0` and, beyond it, the first `q` nonces of every `4q`; the GPU
+// takes the other three quarters. A nonce is returned only when it is the
+// smallest qualifying nonce of the union:
+// - a CPU match `n_c` (every CPU nonce below it scanned) once the GPU has
+//   confirmed that none of its nonces below `n_c` qualifies;
+// - a GPU match `n_g` (no GPU nonce below it qualifies) once the CPU has
+//   scanned every CPU nonce below `n_g` without a match.
+// That is the record's nonce. If neither arm answers inside the GPU's span
+// (`x0 + 4 * 2^bits`, missed with probability ~e^-4) or the launch dies, the
+// race returns `None` and the caller runs the record's race from nonce 0.
+// ---------------------------------------------------------------------------
+
+/// CPU-only prefix of the split race: the CPU covers the GPU's launch latency.
+pub(crate) const POW_SPLIT_X0: u64 = 1 << 15;
+/// log2 of the split race's sub-block; the GPU takes three of every four.
+pub(crate) const POW_SPLIT_Q_LOG: u32 = 12;
+/// Grind sizes the split race serves (the wide race's 17..=19-bit grinds).
+pub(crate) const POW_SPLIT_MIN_BITS: u32 = 17;
+pub(crate) const POW_SPLIT_MAX_BITS: u32 = 19;
+/// GPU segments per launch; segment `k` spans nonces `[x0 + k 2^bits, x0 + (k + 1) 2^bits)`.
+pub(crate) const POW_SPLIT_SEGMENTS: usize = 4;
+
+/// Exact kill switch for the split race: `FLOCK_NO_POW_SPLIT=1` keeps the
+/// record's race. Read once.
+pub(crate) fn pow_split_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FLOCK_NO_POW_SPLIT").is_ok_and(|v| v == "1"))
+}
+
+/// Nonce partition of the split race (`x0`, `q = 2^q_log`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PowSplitGeom {
+    pub(crate) x0: u64,
+    pub(crate) q_log: u32,
+}
+
+impl PowSplitGeom {
+    pub(crate) const RANKED: Self = Self { x0: POW_SPLIT_X0, q_log: POW_SPLIT_Q_LOG };
+
+    fn q(self) -> u64 {
+        1u64 << self.q_log
+    }
+
+    /// The CPU's `v`-th nonce (ascending).
+    pub(crate) fn cpu_nonce(self, v: u64) -> u64 {
+        if v < self.x0 {
+            v
+        } else {
+            let w = v - self.x0;
+            self.x0 + ((w >> self.q_log) << (self.q_log + 2)) + (w & (self.q() - 1))
+        }
+    }
+
+    /// How many CPU nonces lie below `n`.
+    pub(crate) fn cpu_count_below(self, n: u64) -> u64 {
+        if n <= self.x0 {
+            n
+        } else {
+            let u = n - self.x0;
+            let p = u >> (self.q_log + 2);
+            let s = u & ((self.q() << 2) - 1);
+            self.x0 + (p << self.q_log) + s.min(self.q())
+        }
+    }
+
+    /// The GPU's `g`-th nonce (ascending).
+    pub(crate) fn gpu_nonce(self, g: u64) -> u64 {
+        let q3 = 3 * self.q();
+        let p = g / q3;
+        self.x0 + (p << (self.q_log + 2)) + self.q() + (g - p * q3)
+    }
+
+    /// How many GPU nonces lie below `n`.
+    pub(crate) fn gpu_count_below(self, n: u64) -> u64 {
+        if n <= self.x0 {
+            0
+        } else {
+            let u = n - self.x0;
+            let p = u >> (self.q_log + 2);
+            let s = u & ((self.q() << 2) - 1);
+            p * 3 * self.q() + s.saturating_sub(self.q())
+        }
+    }
+
+    /// GPU ids per segment of a `bits` grind (a whole number of `3q` periods
+    /// whenever `bits >= q_log + 2`).
+    pub(crate) fn seg_ids(self, bits: u32) -> u64 {
+        3u64 << (bits - 2)
+    }
+
+    /// First nonce past the GPU's span (all `POW_SPLIT_SEGMENTS` segments).
+    pub(crate) fn span_end(self, bits: u32) -> u64 {
+        self.x0 + ((POW_SPLIT_SEGMENTS as u64) << bits)
+    }
+}
+
+/// Confirmed state of the split race's GPU arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PowSplitPoll {
+    /// No GPU nonce below this one qualifies (all of them scanned).
+    Covered(u64),
+    /// The smallest qualifying GPU nonce (none below it qualifies).
+    Match(u64),
+    /// The launch failed or vanished: the caller reruns the record's race.
+    Dead,
+}
+
+/// GPU arm of the split race. `poll` never waits; `cut(n)` says the CPU holds
+/// a definitive match at the CPU nonce `n`, so GPU nonces above `n` need no
+/// scan (the arm may then report `Covered` at or past `n` once every GPU
+/// nonce below `n` is confirmed empty).
+pub(crate) trait PowSplitArm {
+    fn poll(&self) -> PowSplitPoll;
+    fn cut(&self, n: u64);
+}
+
+/// The split race's exact answer rule over the two arms' confirmed states:
+/// `cpu_done` CPU nonces (indices `0..cpu_done`) are scanned without a match,
+/// `cpu_match` is the smallest CPU match once every CPU nonce below it is
+/// scanned. `Some(Ok(n))` = the smallest qualifying nonce of the union,
+/// `Some(Err(()))` = give up (the caller reruns the record's race), `None` =
+/// not yet decided.
+pub(crate) fn pow_split_decide(
+    geom: PowSplitGeom,
+    bits: u32,
+    gpu: PowSplitPoll,
+    cpu_done: u64,
+    cpu_match: Option<u64>,
+) -> Option<Result<u64, ()>> {
+    let span_end = geom.span_end(bits);
+    match (gpu, cpu_match) {
+        (PowSplitPoll::Dead, _) => Some(Err(())),
+        // Each nonce is the smallest of its own set: the smaller one is the
+        // union's smallest (no nonce of the other set lies below it).
+        (PowSplitPoll::Match(g), Some(c)) => Some(Ok(g.min(c))),
+        (PowSplitPoll::Match(g), None) => {
+            (geom.cpu_count_below(g) <= cpu_done).then_some(Ok(g))
+        }
+        (PowSplitPoll::Covered(b), Some(c)) => {
+            if b >= c {
+                Some(Ok(c))
+            } else if b >= span_end {
+                Some(Err(()))
+            } else {
+                None
+            }
+        }
+        (PowSplitPoll::Covered(b), None) => {
+            // Both arms exhausted the GPU's span without a match.
+            (b >= span_end && cpu_done >= geom.cpu_count_below(span_end)).then_some(Err(()))
+        }
+    }
+}
+
+/// CPU arm + answer rule of the split race (see the section comment). The
+/// calling thread, the main pool and the efficiency-core helpers scan the
+/// CPU's nonces in ascending windows of 480-index chunks, as the caller-first
+/// race scan does; the calling thread alone polls `arm` and decides. `posted`
+/// runs once, right after the first window is posted. `None` = rerun the
+/// record's race.
+pub(crate) fn race_split(
+    state_digest: &[u8; 32],
+    bits: u32,
+    geom: PowSplitGeom,
+    arm: &dyn PowSplitArm,
+    posted: &mut dyn FnMut(),
+) -> Option<u64> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    const PENDING: u64 = u64::MAX;
+    const NO_MATCH: u64 = u64::MAX - 1;
+    const FINE_SUB: u64 = 96;
+    struct Window {
+        digest: [u8; 32],
+        bits: u32,
+        geom: PowSplitGeom,
+        chunk: u64,
+        fine_stop: bool,
+        /// CPU indices `[base, end)` of the window.
+        base: u64,
+        end: u64,
+        results: Box<[AtomicU64]>,
+        next: AtomicUsize,
+        /// Chunks at or past the bound are not claimed (a lower chunk holds a
+        /// match, or the GPU's match makes them useless).
+        bound: AtomicUsize,
+        stop: Arc<AtomicBool>,
+    }
+    impl Window {
+        /// Smallest match among CPU indices `[v, v + len)`, ascending; `None`
+        /// in the outer option = abandoned on stop.
+        fn scan(&self, v: u64, len: u64, gpu_stop: &mut dyn FnMut() -> bool) -> Option<Option<u64>> {
+            let q = 1u64 << self.geom.q_log;
+            let mut v = v;
+            let end = v + len;
+            let mut first = true;
+            while v < end {
+                // One run of consecutive nonces: up to the next CPU sub-block
+                // boundary (the prefix below x0 is one run).
+                let run_end = if v < self.geom.x0 {
+                    end.min(self.geom.x0)
+                } else {
+                    let w = v - self.geom.x0;
+                    end.min(self.geom.x0 + ((w >> self.geom.q_log) + 1) * q)
+                };
+                let n0 = self.geom.cpu_nonce(v);
+                let run = run_end - v;
+                let mut off = 0u64;
+                while off < run {
+                    if !first && self.fine_stop && (self.stop.load(Ordering::Relaxed) || gpu_stop()) {
+                        return None;
+                    }
+                    first = false;
+                    let piece = if self.fine_stop { FINE_SUB.min(run - off) } else { run - off };
+                    if let Some(n) = pow_scan(&self.digest, n0 + off, piece, self.bits, HashKind::Blake3) {
+                        return Some(Some(n));
+                    }
+                    off += piece;
+                }
+                v = run_end;
+            }
+            Some(None)
+        }
+
+        fn work_until(&self, gpu_stop: &mut dyn FnMut() -> bool) {
+            let n_chunks = self.results.len();
+            loop {
+                if self.stop.load(Ordering::Relaxed) || gpu_stop() {
+                    return;
+                }
+                let c = self.next.fetch_add(1, Ordering::Relaxed);
+                if c >= n_chunks || c >= self.bound.load(Ordering::Relaxed) {
+                    return;
+                }
+                let v = self.base + c as u64 * self.chunk;
+                match self.scan(v, self.chunk.min(self.end - v), gpu_stop) {
+                    Some(Some(n)) => {
+                        self.results[c].store(n, Ordering::Release);
+                        self.bound.fetch_min(c, Ordering::Relaxed);
+                    }
+                    Some(None) => self.results[c].store(NO_MATCH, Ordering::Release),
+                    None => return,
+                }
+            }
+        }
+    }
+
+    let chunk: u64 = if crate::gpu_commit::grind_chunk480_enabled() { 480 } else { 960 };
+    let fine_stop = grind_race_fine_stop_enabled();
+    // CPU indices the rule can need: those below the GPU's span end.
+    let cpu_limit = geom.cpu_count_below(geom.span_end(bits));
+    let window_len: u64 = (1u64 << (bits.min(24) - 1)).max(chunk);
+    let helpers = rayon::current_num_threads().saturating_sub(1).max(1);
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Decision state, touched by the calling thread only.
+    struct Rule<'a> {
+        geom: PowSplitGeom,
+        bits: u32,
+        arm: &'a dyn PowSplitArm,
+        /// CPU indices `0..cpu_done` scanned without a match.
+        cpu_done: u64,
+        /// Smallest CPU match, once every CPU index below it is scanned.
+        cpu_match: Option<u64>,
+        /// CPU indices the rule can still need (lowered by a GPU match).
+        cpu_cap: u64,
+        cut_sent: bool,
+        answer: Option<Result<u64, ()>>,
+    }
+    impl Rule<'_> {
+        /// Poll the GPU once and apply the rule; returns the answer once decided.
+        fn step(&mut self) -> Option<Result<u64, ()>> {
+            if self.answer.is_some() {
+                return self.answer;
+            }
+            let gpu = self.arm.poll();
+            if let PowSplitPoll::Match(g) = gpu {
+                self.cpu_cap = self.cpu_cap.min(self.geom.cpu_count_below(g));
+            }
+            self.answer = pow_split_decide(self.geom, self.bits, gpu, self.cpu_done, self.cpu_match);
+            if self.answer.is_none()
+                && !self.cut_sent
+                && let (Some(c), PowSplitPoll::Covered(_)) = (self.cpu_match, gpu)
+            {
+                // The CPU match waits on GPU nonces below it only.
+                self.arm.cut(c);
+                self.cut_sent = true;
+            }
+            self.answer
+        }
+    }
+    let mut rule = Rule {
+        geom,
+        bits,
+        arm,
+        cpu_done: 0,
+        cpu_match: None,
+        cpu_cap: cpu_limit,
+        cut_sent: false,
+        answer: None,
+    };
+    let mut posted = Some(posted);
+    let mut base = 0u64;
+    while rule.answer.is_none() && rule.cpu_match.is_none() && rule.cpu_done < rule.cpu_cap {
+        let len = (cpu_limit - base).min(window_len);
+        let n_chunks = usize::try_from(len.div_ceil(chunk)).ok()?;
+        // Chunks whose CPU indices all lie at or past `cap` are never needed.
+        let cap_chunks = |cap: u64| -> usize {
+            if cap <= base {
+                0
+            } else {
+                usize::try_from((cap - base).div_ceil(chunk)).unwrap_or(usize::MAX).min(n_chunks)
+            }
+        };
+        let window = Arc::new(Window {
+            digest: *state_digest,
+            bits,
+            geom,
+            chunk,
+            fine_stop,
+            base,
+            end: base + len,
+            results: (0..n_chunks).map(|_| AtomicU64::new(PENDING)).collect(),
+            next: AtomicUsize::new(0),
+            bound: AtomicUsize::new(cap_chunks(rule.cpu_cap)),
+            stop: Arc::clone(&stop),
+        });
+        {
+            let window = Arc::clone(&window);
+            rayon::spawn(move || {
+                use rayon::prelude::*;
+                (0..helpers)
+                    .into_par_iter()
+                    .with_max_len(1)
+                    .for_each(|_| window.work_until(&mut || false));
+            });
+        }
+        if let Some(ep) = crate::epool::epool() {
+            let window = Arc::clone(&window);
+            ep.spawn_broadcast(move |_| window.work_until(&mut || false));
+        }
+        if let Some(posted) = posted.take() {
+            posted();
+        }
+        // The calling thread claims chunks too, polling the GPU at every claim
+        // and sub-block; a GPU match lowers the window's bound.
+        window.work_until(&mut || {
+            let decided = rule.step().is_some();
+            window.bound.fetch_min(cap_chunks(rule.cpu_cap), Ordering::Relaxed);
+            if decided {
+                stop.store(true, Ordering::Release);
+            }
+            decided
+        });
+        // Walk the window in ascending order: confirm empty chunks, take the
+        // first match (every lower chunk is then scanned in full), and wait
+        // (polling the GPU) only for chunks another thread has claimed.
+        let mut c = 0usize;
+        while c < n_chunks && rule.answer.is_none() && rule.cpu_match.is_none() {
+            if c >= cap_chunks(rule.cpu_cap) {
+                // Every CPU index the rule can still need is confirmed.
+                rule.cpu_done = rule.cpu_done.max(rule.cpu_cap);
+                break;
+            }
+            match window.results[c].load(Ordering::Acquire) {
+                NO_MATCH => {
+                    rule.cpu_done = (base + (c as u64 + 1) * chunk).min(base + len);
+                    c += 1;
+                }
+                PENDING => {
+                    // Claimed by another thread (every chunk below the bound
+                    // is claimed by someone: the cursor is ascending), or not
+                    // yet claimed while a lowered bound races the claims.
+                    if rule.step().is_some() {
+                        break;
+                    }
+                    window.bound.fetch_min(cap_chunks(rule.cpu_cap), Ordering::Relaxed);
+                    std::hint::spin_loop();
+                }
+                n => rule.cpu_match = Some(n),
+            }
+        }
+        base += len;
+        if base >= cpu_limit && rule.cpu_match.is_none() {
+            rule.cpu_done = rule.cpu_done.max(cpu_limit);
+        }
+    }
+    // The CPU part is settled (a definitive CPU match, or every CPU index the
+    // rule can need confirmed empty): wait for the GPU to confirm.
+    while rule.step().is_none() {
+        std::hint::spin_loop();
+    }
+    stop.store(true, Ordering::Release);
+    match rule.answer {
+        Some(Ok(n)) => Some(n),
+        _ => None,
+    }
+}
+
 /// Smallest and largest grind (in bits, inclusive) that the spawned drain
 /// takes: from 8 bits up it beats the sequential scan (below, the scan ends
 /// before a pool thread joins), and up to 16 bits, the largest CPU-only
@@ -1666,6 +2076,39 @@ fn gpu_blake3_pow_nonce(state_digest: &[u8; 32], bits: u32) -> Result<u64, Strin
         // needs, so `FLOCK_NO_GPACK3=1` or `FLOCK_NO_RACE_CALLER_SCAN=1` also
         // keep the worker's scan). No launch (item off, tail unavailable, no
         // free slot) keeps the worker's race below.
+        // Split race (`FLOCK_NO_POW_SPLIT=1` keeps the record's race): the
+        // segmented launch over the GPU's three quarters of the nonces and
+        // the caller-first CPU scan over the other quarter, with the exact
+        // smallest-nonce rule across both (see `race_split`). `None` (launch
+        // unavailable or dead, or no answer in the GPU's span) drops the
+        // launch and runs the record's race below from nonce 0.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if pow_split_enabled()
+            && crate::gpu_commit::race_caller_scan_enabled()
+            && grind_worker::available()
+            && (POW_SPLIT_MIN_BITS..=POW_SPLIT_MAX_BITS).contains(&bits)
+            && let Some(job) = crate::gpu_commit::gpu_pow_split_launch(state_digest, bits)
+        {
+            let t_iter = grind_trace_enabled().then(std::time::Instant::now);
+            let won = race_split(
+                state_digest,
+                bits,
+                PowSplitGeom::RANKED,
+                &job,
+                &mut crate::gpu_commit::gpu_pow_split_prepare,
+            );
+            if let Some(t) = t_iter {
+                eprintln!(
+                    "[grind] bits={bits} split: {} wall={:.3} ms",
+                    if won.is_some() { "answered" } else { "fell back" },
+                    t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            drop(job);
+            if let Some(n) = won {
+                return Ok(n);
+            }
+        }
         // Segmented race scan (`gpu_commit::ENV_NO_GRIND_SEG2`): the same
         // launch from the calling thread, cut into segments that publish at
         // the first match and stop when the CPU arm answers first.
@@ -3369,5 +3812,221 @@ mod grind_lat_tests {
             assert_eq!(pow_race_verdict(5, true, age), PowRaceVerdict::Off);
             assert_eq!(pow_race_verdict(5, false, age), PowRaceVerdict::Off);
         }
+    }
+}
+
+#[cfg(test)]
+mod pow_split_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const SMALL: PowSplitGeom = PowSplitGeom { x0: 128, q_log: 3 };
+
+    fn is_cpu(g: PowSplitGeom, n: u64) -> bool {
+        n < g.x0 || ((n - g.x0) >> g.q_log) & 3 == 0
+    }
+
+    #[test]
+    fn pow_split_geometry_partitions_the_nonces() {
+        for g in [SMALL, PowSplitGeom { x0: 64, q_log: 2 }, PowSplitGeom::RANKED] {
+            let (mut c, mut k) = (0u64, 0u64);
+            let top = g.x0 + (64u64 << g.q_log) + 7;
+            for n in 0..top {
+                assert_eq!(g.cpu_count_below(n), c, "cpu count {g:?} {n}");
+                assert_eq!(g.gpu_count_below(n), k, "gpu count {g:?} {n}");
+                if is_cpu(g, n) {
+                    assert_eq!(g.cpu_nonce(c), n);
+                    c += 1;
+                } else {
+                    assert_eq!(g.gpu_nonce(k), n);
+                    k += 1;
+                }
+            }
+        }
+        // Segment k of a b-bit grind holds the GPU nonces of [x0 + k 2^b, x0 + (k+1) 2^b).
+        let g = PowSplitGeom::RANKED;
+        for bits in POW_SPLIT_MIN_BITS..=POW_SPLIT_MAX_BITS {
+            let s = g.seg_ids(bits);
+            assert_eq!(s % (3 << g.q_log), 0);
+            for k in 0..=POW_SPLIT_SEGMENTS as u64 {
+                assert_eq!(g.gpu_count_below(g.x0 + (k << bits)), k * s);
+            }
+            assert!(g.span_end(bits) < 1u64 << 32);
+        }
+    }
+
+    #[test]
+    fn pow_split_rule_takes_only_the_union_minimum() {
+        let g = SMALL;
+        let bits = 9;
+        // A GPU match waits for the CPU below it, then wins.
+        let n_g = g.gpu_nonce(100);
+        assert_eq!(pow_split_decide(g, bits, PowSplitPoll::Match(n_g), g.cpu_count_below(n_g) - 1, None), None);
+        assert_eq!(pow_split_decide(g, bits, PowSplitPoll::Match(n_g), g.cpu_count_below(n_g), None), Some(Ok(n_g)));
+        // A CPU match waits for the GPU below it.
+        let n_c = g.cpu_nonce(300);
+        assert_eq!(pow_split_decide(g, bits, PowSplitPoll::Covered(n_c - 1), 0, Some(n_c)), None);
+        assert_eq!(pow_split_decide(g, bits, PowSplitPoll::Covered(n_c), 0, Some(n_c)), Some(Ok(n_c)));
+        // Both: the smaller one.
+        assert_eq!(pow_split_decide(g, bits, PowSplitPoll::Match(n_g), 0, Some(n_c)), Some(Ok(n_g.min(n_c))));
+        // Dead launch, or nothing in the span: give up.
+        assert_eq!(pow_split_decide(g, bits, PowSplitPoll::Dead, 0, Some(n_c)), Some(Err(())));
+        let end = g.span_end(bits);
+        assert_eq!(
+            pow_split_decide(g, bits, PowSplitPoll::Covered(end + 8), g.cpu_count_below(end), None),
+            Some(Err(()))
+        );
+        assert_eq!(pow_split_decide(g, bits, PowSplitPoll::Covered(end + 8), g.cpu_count_below(end) - 1, None), None);
+    }
+
+    /// CPU stand-in for the Metal arm: one thread scans the GPU ids in
+    /// ascending order (optionally slowed down), stops at its first match,
+    /// at the span end, or once past a cut.
+    struct EmuArm {
+        geom: PowSplitGeom,
+        scanned: AtomicU64,
+        found: AtomicU64,
+        cut: AtomicU64,
+        quit: AtomicBool,
+        dead: bool,
+    }
+
+    impl PowSplitArm for EmuArm {
+        fn poll(&self) -> PowSplitPoll {
+            if self.dead {
+                return PowSplitPoll::Dead;
+            }
+            let f = self.found.load(Ordering::Acquire);
+            if f != u64::MAX {
+                return PowSplitPoll::Match(self.geom.gpu_nonce(f));
+            }
+            PowSplitPoll::Covered(self.geom.gpu_nonce(self.scanned.load(Ordering::Acquire)))
+        }
+
+        fn cut(&self, n: u64) {
+            self.cut.store(n, Ordering::Release);
+        }
+    }
+
+    fn reference(digest: &[u8; 32], bits: u32) -> u64 {
+        (0u64..).find(|&n| pow_has_leading_zero_bits(digest, n, bits, HashKind::Blake3)).unwrap()
+    }
+
+    fn run_emulated(digest: [u8; 32], bits: u32, geom: PowSplitGeom, delay: u32, dead: bool) -> Option<u64> {
+        let arm = std::sync::Arc::new(EmuArm {
+            geom,
+            scanned: AtomicU64::new(0),
+            found: AtomicU64::new(u64::MAX),
+            cut: AtomicU64::new(u64::MAX),
+            quit: AtomicBool::new(false),
+            dead,
+        });
+        let worker = {
+            let arm = std::sync::Arc::clone(&arm);
+            std::thread::spawn(move || {
+                let total = POW_SPLIT_SEGMENTS as u64 * geom.seg_ids(bits);
+                for g in 0..total {
+                    if arm.quit.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let n = geom.gpu_nonce(g);
+                    if n >= arm.cut.load(Ordering::Acquire) {
+                        return;
+                    }
+                    for _ in 0..delay {
+                        std::hint::black_box(n);
+                    }
+                    if pow_has_leading_zero_bits(&digest, n, bits, HashKind::Blake3) {
+                        arm.found.store(g, Ordering::Release);
+                        return;
+                    }
+                    arm.scanned.store(g + 1, Ordering::Release);
+                }
+            })
+        };
+        let got = race_split(&digest, bits, geom, &*arm, &mut || {});
+        arm.quit.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        got
+    }
+
+    fn digest(seed: u64) -> [u8; 32] {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        std::array::from_fn(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+    }
+
+    /// The split race returns the record's nonce (the smallest qualifying
+    /// one) whenever it answers, with the GPU arm fast, slow or dead, and
+    /// gives up only when the answer lies past the GPU's span (or the arm
+    /// is dead).
+    #[test]
+    fn race_split_returns_the_smallest_nonce() {
+        let mut answered = 0;
+        for seed in 0..96u64 {
+            let d = digest(seed);
+            let bits = 9 + (seed % 3) as u32;
+            let want = reference(&d, bits);
+            let delay = [0u32, 50, 2000][(seed % 3) as usize];
+            match run_emulated(d, bits, SMALL, delay, false) {
+                Some(n) => {
+                    assert_eq!(n, want, "seed {seed} bits {bits} delay {delay}");
+                    answered += 1;
+                }
+                None => assert!(want >= SMALL.span_end(bits), "gave up below the span: seed {seed} want {want}"),
+            }
+            assert_eq!(run_emulated(d, bits, SMALL, 0, true), None, "dead arm must give up");
+        }
+        assert!(answered > 80, "answered only {answered} of 96");
+    }
+
+    /// Same at the ranked geometry and grind sizes.
+    #[test]
+    fn race_split_returns_the_smallest_nonce_ranked() {
+        for seed in 0..4u64 {
+            let d = digest(1000 + seed);
+            let bits = POW_SPLIT_MIN_BITS;
+            let want = reference(&d, bits);
+            for delay in [0u32, 200] {
+                if let Some(n) = run_emulated(d, bits, PowSplitGeom::RANKED, delay, false) {
+                    assert_eq!(n, want, "seed {seed} delay {delay}");
+                } else {
+                    assert!(want >= PowSplitGeom::RANKED.span_end(bits));
+                }
+            }
+        }
+    }
+
+    /// The Metal arm: the split race over a real launch gives the record's
+    /// nonce at every split grind size.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn race_split_metal_returns_the_smallest_nonce() {
+        if crate::gpu_commit::gpu_pow_split_launch(&digest(7), POW_SPLIT_MIN_BITS).is_none() {
+            eprintln!("skipping: split launch unavailable");
+            return;
+        }
+        let mut answered = 0;
+        for seed in 0..12u64 {
+            let d = digest(5000 + seed);
+            let bits = POW_SPLIT_MIN_BITS + (seed % 3) as u32;
+            let want = reference(&d, bits);
+            crate::gpu_commit::gpu_pow_split_prepare();
+            let job = crate::gpu_commit::gpu_pow_split_launch(&d, bits).expect("split launch");
+            let got = race_split(&d, bits, PowSplitGeom::RANKED, &job, &mut crate::gpu_commit::gpu_pow_split_prepare);
+            drop(job);
+            match got {
+                Some(n) => {
+                    assert_eq!(n, want, "seed {seed} bits {bits}");
+                    answered += 1;
+                }
+                None => assert!(want >= PowSplitGeom::RANKED.span_end(bits), "seed {seed} gave up at {want}"),
+            }
+        }
+        assert!(answered >= 10, "answered only {answered}");
     }
 }
