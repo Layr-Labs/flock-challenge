@@ -1413,6 +1413,73 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
     }
 }
 
+/// Lane abtf2: [`bstatic_horner_window_unit_impl`] for a unit written with
+/// CACHED stores into a small buffer that is read straight back (the
+/// deferred-tail completion). The incumbent impl sends `nt_store = false` to
+/// the per-chunk rows (its cached arm is a kill switch); this runs the same
+/// fused unit instance as the non-temporal arm, instantiated with `NT =
+/// false` (the store flavour only; `unit_nt` is tested byte-equal to the
+/// flag form for both flavours). Every kill switch the non-temporal arm
+/// honours, and an unset/disabled rows-const switch, keep the per-chunk rows.
+/// `nt_store` is ignored (always cached).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+pub(crate) fn bstatic_horner_window_unit_cached_impl<const V: u32, const HOIST: bool>(
+    x_outer: usize,
+    window_mask: usize,
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    partials: [&'static [[u8; 64]; 248]; 2],
+    out_unit: &mut [u8],
+    _nt_store: bool,
+) {
+    let per_chunk = |out_unit: &mut [u8]| {
+        bstatic_horner_window_unit_per_chunk::<V, HOIST>(
+            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, false,
+        )
+    };
+    if !ab_rows_nt_const_enabled() {
+        return per_chunk(out_unit);
+    }
+    if const { V & !ABV_TRANSFORM_TRIM == AB_UNIT_MAIN && HOIST } {
+        if ab_z_out3_enabled() && ab_fuse_enabled() {
+            const BASE: u32 = AB_UNIT_MAIN | ABV_Z_OUT3;
+            if const { V & ABV_TRANSFORM_TRIM != 0 } {
+                bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM | ABV_TRANSFORM_TRIM }, true, false>(
+                    x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                )
+            } else {
+                bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM }, true, false>(
+                    x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                )
+            }
+        } else {
+            per_chunk(out_unit)
+        }
+    } else if const { V & !ABV_TRANSFORM_TRIM == AB_UNIT_HELPER } {
+        if ab_fuse_e_enabled() {
+            if const { V & ABV_TRANSFORM_TRIM != 0 } {
+                bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM | ABV_TRANSFORM_TRIM }, HOIST, false>(
+                    x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                )
+            } else {
+                bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM }, HOIST, false>(
+                    x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                )
+            }
+        } else {
+            per_chunk(out_unit)
+        }
+    } else {
+        bstatic_horner_window_unit_nt::<V, HOIST, false>(
+            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+        )
+    }
+}
+
 /// [`bstatic_horner_window_unit_impl`] as one
 /// [`bstatic_horner_window_rows_impl`] call per chunk (the same rows, checks
 /// and stores), each row testing `nt_store`.
