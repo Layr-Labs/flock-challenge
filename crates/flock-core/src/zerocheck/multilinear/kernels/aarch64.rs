@@ -1440,11 +1440,15 @@ pub(crate) fn r2_on_efficiency_helper() -> bool {
 }
 
 /// Whether the K pass's packed CPU chunks on the performance-core workers fold
-/// through the seven-piece table (`FLOCK_NO_ZC_K_FOLD7=1` keeps the byte banks
-/// everywhere). Read once per process.
+/// through the seven-piece table. Off by default: the byte banks are faster
+/// on the CPU K pass (ranked-size probe `k_tail_compact_timing` on an M5 Pro,
+/// 8 threads: 8.37-8.40 ms with the byte banks vs 8.58-8.61 ms with fold7,
+/// three alternations), and the runner read the fold7 group +1.8 +- 1.7 ms
+/// slower (0xArion d4c5ba19). `FLOCK_ZC_K_FOLD7=1` opts in. Same field
+/// elements either way. Read once per process.
 pub(crate) fn zc_k_fold7_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_FOLD7").is_none())
+    *ON.get_or_init(|| std::env::var_os("FLOCK_ZC_K_FOLD7").is_some_and(|v| v == *"1"))
 }
 
 /// The packed dead-tail instance of
@@ -1499,15 +1503,48 @@ pub(crate) fn r2_fold7_table(data: &[F128]) -> Option<Vec<F128>> {
             }
         }
     }
-    let single = |bit: u32| data[(bit / 8) as usize * 256 + (1usize << (bit % 8))];
-    let mut out = vec![F128::ZERO; FOLD7_ENTRIES];
+    // Each 9/10-bit piece crosses exactly one byte-bank boundary. The
+    // validated banks already contain every sum for either side, so join
+    // them directly rather than rebuilding the sum from an output parent.
+    // Keep the original builder available for fresh-process A/B checks.
+    static BANK_JOIN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_FOLD7_BANK_JOIN").is_none()
+    });
+    if !*BANK_JOIN {
+        let single = |bit: u32| data[(bit / 8) as usize * 256 + (1usize << (bit % 8))];
+        let mut out = vec![F128::ZERO; FOLD7_ENTRIES];
+        for p in 0..7 {
+            let base = FOLD7_BASES[p];
+            let end = FOLD7_BASES.get(p + 1).copied().unwrap_or(FOLD7_ENTRIES);
+            for v in 1..end - base {
+                out[base + v] =
+                    out[base + (v & (v - 1))] + single(FOLD7_SHIFTS[p] + v.trailing_zeros());
+            }
+        }
+        return Some(out);
+    }
+    let mut out = Vec::with_capacity(FOLD7_ENTRIES);
     for p in 0..7 {
-        let base = FOLD7_BASES[p];
+        let shift = FOLD7_SHIFTS[p] as usize;
+        let offset = shift % 8;
+        let low_count = 1usize << (8 - offset);
         let end = FOLD7_BASES.get(p + 1).copied().unwrap_or(FOLD7_ENTRIES);
-        for v in 1..end - base {
-            out[base + v] = out[base + (v & (v - 1))] + single(FOLD7_SHIFTS[p] + v.trailing_zeros());
+        let high_count = (end - FOLD7_BASES[p]) / low_count;
+        let low_bank = &data[(shift / 8) * 256..(shift / 8 + 1) * 256];
+        let high_bank = &data[(shift / 8 + 1) * 256..(shift / 8 + 2) * 256];
+        // The high-zero row and each row's low-zero entry are copies, not
+        // XORs: the guard above establishes that every bank's entry 0 is 0.
+        for low in 0..low_count {
+            out.push(low_bank[low << offset]);
+        }
+        for &high in &high_bank[1..high_count] {
+            out.push(high);
+            for low in 1..low_count {
+                out.push(low_bank[low << offset] + high);
+            }
         }
     }
+    debug_assert_eq!(out.len(), FOLD7_ENTRIES);
     Some(out)
 }
 
@@ -9163,6 +9200,53 @@ mod tests {
                     assert!(got.2.iter().all(|v| *v != poison), "slots written: {at}");
                 }
             }
+        }
+    }
+
+    /// Every table entry, including each piece boundary, matches the original
+    /// lowest-set-bit recurrence. Invalid byte banks still decline the table.
+    #[test]
+    fn fold7_bank_join_matches_recurrence() {
+        fn reference(data: &[F128]) -> Vec<F128> {
+            let mut out = vec![F128::ZERO; FOLD7_ENTRIES];
+            for p in 0..7 {
+                let base = FOLD7_BASES[p];
+                let end = FOLD7_BASES.get(p + 1).copied().unwrap_or(FOLD7_ENTRIES);
+                for v in 1..end - base {
+                    let bit = FOLD7_SHIFTS[p] + v.trailing_zeros();
+                    out[base + v] = out[base + (v & (v - 1))]
+                        + data[(bit / 8) as usize * 256 + (1usize << (bit % 8))];
+                }
+            }
+            out
+        }
+        let mut state = 0x6261_6e6b_6a6f_696e;
+        for case in 0..196 {
+            let singles: Vec<F128> = (0..64)
+                .map(|i| match case {
+                    0..=63 if i == case => F128::new(1, 1 << i),
+                    0..=64 => F128::ZERO,
+                    65 => F128::new(u64::MAX, u64::MAX),
+                    _ => F128::new(splitmix64(&mut state), splitmix64(&mut state)),
+                })
+                .collect();
+            let table = linear_byte_banks(&singles);
+            let expected = reference(&table);
+            assert_eq!(r2_fold7_table(&table).as_ref(), Some(&expected), "case {case}");
+            let mut extended = table.clone();
+            extended.extend_from_slice(&[F128::ONE; 17]);
+            assert_eq!(r2_fold7_table(&extended).as_ref(), Some(&expected));
+            for bank in 0..8 {
+                let mut bent = table.clone();
+                bent[bank * 256 + 0x81].lo ^= 1;
+                assert!(r2_fold7_table(&bent).is_none());
+                bent = table.clone();
+                bent[bank * 256].hi ^= 1;
+                assert!(r2_fold7_table(&bent).is_none());
+            }
+        }
+        for len in [0, 1, 255, 1024, 2047] {
+            assert!(r2_fold7_table(&vec![F128::ZERO; len]).is_none());
         }
     }
 
