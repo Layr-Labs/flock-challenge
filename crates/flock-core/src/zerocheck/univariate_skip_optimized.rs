@@ -1785,7 +1785,23 @@ impl AbUnitScratch {
 
     fn with_pairing(unit_bytes: usize, paired: bool) -> Self {
         let slots = if paired { 2 } else { 1 };
-        let storage = vec![0u8; 2 * slots * unit_bytes + 64];
+        let len = 2 * slots * unit_bytes + 64;
+        // Lane abpr: reuse this thread's previous scratch allocation when its
+        // length matches, instead of allocating
+        // and zeroing a fresh one per drain. Its bytes are initialized (zeroed
+        // once, then only written by producers) but may hold an earlier
+        // drain's rows: `primed` still starts false for both slots, so the
+        // producer's first fill of each slot writes every byte (the
+        // `Round1AbProducer` contract) before the transform or the stripe
+        // emitter reads it. Different unit/pairing layouts may have the same
+        // total length; this is safe because alignment and layout are rebuilt
+        // and each new slot is cold-filled. A mismatched length or an empty
+        // cache falls back to a fresh zeroed allocation. Nested drains can
+        // only take a parked allocation, never an outer drain's live one.
+        let storage = AB_UNIT_SCRATCH_CACHE
+            .with(|cell| cell.take())
+            .filter(|v| v.len() == len && ab_unit_scratch_reuse_enabled())
+            .unwrap_or_else(|| vec![0u8; len]);
         let offset = storage.as_ptr().align_offset(64);
         assert!(offset < 64);
         Self {
@@ -1821,6 +1837,35 @@ impl AbUnitScratch {
         self.primed[0] = true;
         (a, b)
     }
+}
+
+impl Drop for AbUnitScratch {
+    fn drop(&mut self) {
+        // Park the initialized allocation for this thread's next drain. Only
+        // the bytes are kept; `primed` is never carried over.
+        let storage = core::mem::take(&mut self.storage);
+        if !storage.is_empty() && ab_unit_scratch_reuse_enabled() {
+            let _ = AB_UNIT_SCRATCH_CACHE.try_with(|cell| cell.set(Some(storage)));
+        }
+    }
+}
+
+std::thread_local! {
+    /// Lane abpr: one parked [`AbUnitScratch`] allocation per thread.
+    static AB_UNIT_SCRATCH_CACHE: std::cell::Cell<Option<Vec<u8>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Kill switch for the per-thread A/B unit scratch reuse:
+/// `FLOCK_NO_AB_UNIT_SCRATCH_REUSE=1` allocates and zeroes a fresh scratch
+/// per drain worker again. Read once per process.
+pub const ENV_NO_AB_UNIT_SCRATCH_REUSE: &str = "FLOCK_NO_AB_UNIT_SCRATCH_REUSE";
+
+fn ab_unit_scratch_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_AB_UNIT_SCRATCH_REUSE).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 /// Kill switch for the per-worker window-rows plan: any value of
@@ -2827,6 +2872,7 @@ fn process_one_x_hi_with_precomputed_ab(
     split_ab_c: bool,
     direct_ab_rows: bool,
     c_drain4: bool,
+    c_drain8: bool,
     state: &mut WorkerStateWithSHatV,
 ) {
     state.partial_ab.iter_mut().for_each(|p| *p = F128::ZERO);
@@ -2888,12 +2934,18 @@ fn process_one_x_hi_with_precomputed_ab(
                 .expect("sixteen 64-byte c rows per x_outer_lo");
             let c_tables = &mask_tables
                 [x_outer_lo * C_MASK_TABLE_STRIDE..(x_outer_lo + 1) * C_MASK_TABLE_STRIDE];
-            kernels::accumulate_c_banks_with_policy(
+            kernels::accumulate_c_banks_with_drain_lanes(
                 c_rows,
                 n_b_med,
                 c_tables,
                 &mut state.partial_c,
-                c_drain4,
+                if c_drain8 {
+                    8
+                } else if c_drain4 {
+                    4
+                } else {
+                    1
+                },
             );
         }
     } else {
@@ -3600,6 +3652,65 @@ fn seeded_sweep_hoisted<const U: bool>(
     let ab = ab_inner.as_ptr();
     let tp = tables.as_ptr();
     let bp = banks.as_mut_ptr();
+
+    // The ranked seeded sweep is `w`-major with 128 consecutive `u` banks per
+    // 64 KiB table. Prepare the fourteen 4 KiB row bases once per table and
+    // reuse them across those 128 calls; the incumbent kernel prepared the
+    // same bases inside every call. Traversal, gathers and bank updates stay
+    // in exactly the same order. The two padding windows have the scored
+    // residual spans 2..16 and 0..14 respectively.
+    #[cfg(target_arch = "aarch64")]
+    if U
+        && kernels::ab_completion_table_hoist_enabled()
+        && bank_bits == 7
+        && within_outer_mask == 1
+        && spans[0] == (2, 16, true)
+        && spans[1] == (0, 14, true)
+        && range.start.is_multiple_of(1usize << bank_bits)
+        && range.end.is_multiple_of(1usize << bank_bits)
+    {
+        let n_banks = 1usize << bank_bits;
+        for w in (range.start >> bank_bits)..(range.end >> bank_bits) {
+            // SAFETY: the sweep admission checked the final table image. Each
+            // prepared pointer is one of its sixteen 4 KiB rows.
+            let table = unsafe { tp.add(w * CONVERT_TABLE_SIZE).cast::<u8>() };
+            let rows0 = core::array::from_fn(|b| unsafe { table.add(b * 256 * 16) });
+            let rows2 = core::array::from_fn(|b| unsafe { table.add((b + 2) * 256 * 16) });
+            for u in 0..n_banks {
+                let x_outer_lo = (w << bank_bits) | u;
+                let chunk_byte_base = ((x_outer_lo << N_INNER) | x_hi_inner) * N_CHUNKS;
+                // SAFETY: the hoist admission checked the last row block and
+                // all earlier offsets grow monotonically; `u` selects one of
+                // the 128 disjoint in-bounds banks.
+                let (chunk_rows, bank) = unsafe {
+                    (
+                        &*ab.add(chunk_byte_base).cast::<[[u8; 64]; 1 << N_MEDIUM]>(),
+                        &mut *bp.add(u * ELL).cast::<[F128; ELL]>(),
+                    )
+                };
+                let window = (x_outer_lo | x_hi_outer) & 1;
+                unsafe {
+                    if window == 0 {
+                        kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16_prepared::<U>(
+                            chunk_rows,
+                            2,
+                            &rows2,
+                            bank,
+                        );
+                    } else {
+                        kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16_prepared::<U>(
+                            chunk_rows,
+                            0,
+                            &rows0,
+                            bank,
+                        );
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     for x_outer_lo in range {
         let within_hash_outer = (x_outer_lo | x_hi_outer) & within_outer_mask;
         // SAFETY: `within_hash_outer <= within_outer_mask < HOIST_MAX_WINDOWS`.
@@ -4570,7 +4681,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
         let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
         res_c_s[lane] = c_s_inv * naive;
     }
-    let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+    let round1_c_opt = ntt_extend_k6_c_tail(&res_c_s, inv_table);
     (round1_c_opt, s_hat_v_c, quad, fold4, recovered_ab)
 }
 
@@ -4640,8 +4751,79 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
         let naive = (F128::ONE + prefix) * s_hat_v_c[lane] + prefix * s_hat_v_c[ELL + lane];
         res_c_s[lane] = c_s_inv * naive;
     }
-    let round1_c_opt = ntt_extend_f128_vec_ghash(&res_c_s, inv_table);
+    let round1_c_opt = ntt_extend_k6_c_tail(&res_c_s, inv_table);
     (round1_c_opt, s_hat_v_c, quad, fold8, recovered_ab)
+}
+
+/// Kill switch for the round-one C tail trim (`FLOCK_NO_ZC_C_TAIL_TRIM`, any
+/// value). The trim is two exact changes to the serial work that runs on the
+/// calling thread after the C fold's GPU prefix lands:
+/// - the three S-to-Lambda extensions of the ranked C tail (C message,
+///   identity-prefix and output-window AB recovery) run as one matrix-vector
+///   product each ([`ntt_extend_k6_c_tail`]) instead of the bit-plane
+///   [`ntt_extend_f128_vec_ghash`];
+/// - the GPU prefix joins the CPU suffix with a plain loop on the calling
+///   thread instead of a rayon split (`gpu_commit::ZcFoldJob::finish_xor_into`,
+///   zerocheck arm only).
+///
+/// The switch restores both. Read once per process.
+pub const ENV_NO_ZC_C_TAIL_TRIM: &str = "FLOCK_NO_ZC_C_TAIL_TRIM";
+
+pub(crate) fn zc_c_tail_trim_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_C_TAIL_TRIM).is_none())
+}
+
+/// The standard `k_skip = 6` S-to-Lambda extension as a 64 x 64 matrix over
+/// F128, bank-major and padded to 128 lanes for
+/// [`crate::field::f128_slice::fold_bank_major_64x128_rows2`]: entry
+/// `[z * 128 + l]` is `phi8(M[l][z])`, where `M[.][z]` is the table's image of
+/// the single input bit `z` (`apply(e_z)`); lanes `64..128` are zero. Built
+/// once per process from the protocol-fixed table; `None` for any other table.
+fn ntt_extend_matrix_k6(inv_table: &InvNttTableByteSingleGf8) -> Option<&'static [F128]> {
+    if !core::ptr::eq(inv_table, InvNttTableByteSingleGf8::cached_standard_k6())
+        || inv_table.ell != ELL
+        || inv_table.n_chunks * 8 != ELL
+    {
+        return None;
+    }
+    static MATRIX: OnceLock<Vec<F128>> = OnceLock::new();
+    Some(MATRIX.get_or_init(|| {
+        let mut matrix = vec![F128::ZERO; ELL * 2 * ELL];
+        let mut image = [F8::ZERO; ELL];
+        for z in 0..ELL {
+            let mut bits = [0u8; ELL / 8];
+            bits[z / 8] = 1 << (z % 8);
+            inv_table.apply(&bits, &mut image);
+            for (lane, value) in image.iter().enumerate() {
+                matrix[z * 2 * ELL + lane] = phi8(*value);
+            }
+        }
+        matrix
+    }))
+}
+
+/// [`ntt_extend_f128_vec_ghash`] for the ranked round-one C tail, as one
+/// matrix-vector product: `out[l] = sum_z phi8(M[l][z]) * in_s[z]`.
+///
+/// Exact: the bit-plane form computes `sum_b x^b phi8(T(bits_b)[l])` with
+/// `bits_b[z] = bit b of in_s[z]`. `T` (the table's apply) and `phi8` are
+/// GF(2)-linear, so that is `sum_b sum_z bit_b(in_s[z]) x^b phi8(M[l][z])`
+/// `= sum_z phi8(M[l][z]) * sum_b bit_b(in_s[z]) x^b`, and the inner sum is
+/// `in_s[z]` itself (`x^b`, b < 128, is the F128 element with only bit b set).
+/// Same field element, computed with 4,096 exact products instead of 8,192
+/// plus 128 bit-plane passes. Falls back to the bit-plane form for any shape
+/// or table but the ranked one, and under [`ENV_NO_ZC_C_TAIL_TRIM`].
+fn ntt_extend_k6_c_tail(in_s: &[F128], inv_table: &InvNttTableByteSingleGf8) -> Vec<F128> {
+    if zc_c_tail_trim_enabled()
+        && let Ok(weights) = <&[F128; ELL]>::try_from(in_s)
+        && let Some(matrix) = ntt_extend_matrix_k6(inv_table)
+    {
+        let mut out = [F128::ZERO; 2 * ELL];
+        crate::field::f128_slice::fold_bank_major_64x128_rows2(weights, matrix, &mut out);
+        return out[..ELL].to_vec();
+    }
+    ntt_extend_f128_vec_ghash(in_s, inv_table)
 }
 
 /// Recover the optimized-convention round-one AB contribution of the first
@@ -4673,7 +4855,7 @@ fn round1_identity_prefix_ab_recovery(
     for value in &mut recovered_s {
         *value *= c_s_inv;
     }
-    ntt_extend_f128_vec_ghash(&recovered_s, inv_table)
+    ntt_extend_k6_c_tail(&recovered_s, inv_table)
 }
 
 /// Window 30 has only row 240 live, with a fixed 49-bit B mask. Fixed B
@@ -4693,7 +4875,7 @@ fn add_round1_output_window_ab_recovery(
     for lane in 0..ELL {
         s[lane] = weight * c_inner[ROW * ELL + lane];
     }
-    let extended = ntt_extend_f128_vec_ghash(&s, inv_table);
+    let extended = ntt_extend_k6_c_tail(&s, inv_table);
     let mut beta = [F8::ZERO; ELL];
     inv_table.apply(&0x0001_ffff_ffff_ffffu64.to_le_bytes(), &mut beta);
     for lane in 0..ELL {
@@ -5351,6 +5533,12 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
     let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
     let c_drain4 = std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none();
+    // The ranked Apple shape has enough independent table lookups to fill an
+    // eight-lane window. Keep every other target/shape on the frontier's
+    // four-lane policy; the flag is a narrow same-binary ranked control.
+    let c_drain8 = cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        && m == 32
+        && std::env::var_os("FLOCK_NO_ZC_C_DRAIN8").is_none();
 
     // The challenge-independent AB transform finishes while the commitment is
     // still running. Its challenge-weighted completion is therefore a live
@@ -5378,6 +5566,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
             split_ab_c,
             direct_ab_rows,
             c_drain4,
+            c_drain8,
             &mut state,
         );
         // SAFETY: the queue hands out each x_hi exactly once, so this task is
@@ -5798,6 +5987,54 @@ mod tests {
     use super::*;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
+
+    /// The matrix form of the round-one C tail's extension equals the
+    /// bit-plane form on zero, unit, single-entry and dense random inputs, and
+    /// only the process-wide standard table takes it.
+    #[test]
+    fn zc_extend_matrix_matches_bit_plane_extension() {
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let matrix = ntt_extend_matrix_k6(table).expect("standard table takes the matrix");
+        assert_eq!(matrix.len(), ELL * 2 * ELL);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut cases: Vec<[F128; ELL]> = vec![[F128::ZERO; ELL]];
+        for z in 0..ELL {
+            let mut unit = [F128::ZERO; ELL];
+            unit[z] = F128::ONE;
+            cases.push(unit);
+            let mut single = [F128::ZERO; ELL];
+            single[z] = F128::new(next(), next());
+            cases.push(single);
+        }
+        for _ in 0..64 {
+            cases.push(core::array::from_fn(|_| F128::new(next(), next())));
+        }
+        cases.push([F128::new(u64::MAX, u64::MAX); ELL]);
+        for input in &cases {
+            let want = ntt_extend_f128_vec_ghash(input, table);
+            let mut out = [F128::ZERO; 2 * ELL];
+            crate::field::f128_slice::fold_bank_major_64x128_rows2(input, matrix, &mut out);
+            assert_eq!(&out[..ELL], want.as_slice());
+            assert!(out[ELL..].iter().all(|value| *value == F128::ZERO));
+            assert_eq!(ntt_extend_k6_c_tail(input, table), want);
+        }
+        // Another table instance (same contents) never takes the cached matrix.
+        let other = InvNttTableByteSingleGf8::new(
+            &AdditiveNttGf8::new(6, F8::ZERO),
+            &AdditiveNttGf8::new(6, F8(1u8 << 6)),
+        );
+        assert!(ntt_extend_matrix_k6(&other).is_none());
+        assert_eq!(
+            ntt_extend_k6_c_tail(&cases[3], &other),
+            ntt_extend_f128_vec_ghash(&cases[3], &other)
+        );
+    }
 
     #[test]
     fn apple_fixed_inverse_selectors_are_literal_and_fail_closed() {
@@ -6866,6 +7103,71 @@ mod tests {
         }
         // Arms x (representations x unit sizes that divide the buffer).
         assert_eq!(checked, 5 * (1 + 3 * 2 + 3 * 3));
+    }
+
+    /// Lane abpr: a reused scratch allocation never carries `primed`, so a
+    /// producer that skips constant bytes when primed still writes every
+    /// byte on a new drain; a different shape gets a fresh zeroed buffer.
+    #[test]
+    fn ab_unit_scratch_reuse_resets_primed_and_keys_length() {
+        const UNIT: usize = 1024;
+        for paired in [false, true] {
+            let first_ptr = {
+                let mut s = AbUnitScratch::with_pairing(UNIT, paired);
+                for unit in 0..4 {
+                    s.fill(unit, |a, b, _| unsafe {
+                        core::ptr::write_bytes(a, 0xa1, UNIT);
+                        core::ptr::write_bytes(b, 0xb1, UNIT);
+                    });
+                }
+                s.storage.as_ptr()
+            };
+            let mut s = AbUnitScratch::with_pairing(UNIT, paired);
+            if ab_unit_scratch_reuse_enabled() {
+                assert_eq!(s.storage.as_ptr(), first_ptr, "same thread, same shape reuses");
+            }
+            assert_eq!(s.primed, [false; 2], "primed never carried over");
+            let mut seen = Vec::new();
+            for unit in 0..2 {
+                let (a, b) = s.fill(unit, |a, b, primed| {
+                    seen.push(primed);
+                    unsafe {
+                        core::ptr::write_bytes(a, 0x22, UNIT);
+                        core::ptr::write_bytes(b, 0x33, UNIT);
+                    }
+                });
+                assert!(a.iter().all(|&x| x == 0x22) && b.iter().all(|&x| x == 0x33));
+            }
+            assert_eq!(seen, if paired { vec![false, false] } else { vec![false, true] });
+            drop(s);
+            let other = AbUnitScratch::with_pairing(2 * UNIT, paired);
+            assert!(other.storage.iter().all(|&x| x == 0), "new shape is fresh and zeroed");
+        }
+    }
+
+    #[test]
+    fn ab_unit_scratch_reuse_equal_length_different_layout() {
+        const UNIT: usize = 1024;
+        let mut old = AbUnitScratch::with_pairing(UNIT, true);
+        for unit in 0..2 {
+            old.fill(unit, |a, b, _| unsafe {
+                core::ptr::write_bytes(a, 0xa1, UNIT);
+                core::ptr::write_bytes(b, 0xb1, UNIT);
+            });
+        }
+        drop(old);
+        // Paired UNIT and unpaired 2*UNIT have equal total storage lengths.
+        let mut new = AbUnitScratch::with_pairing(2 * UNIT, false);
+        assert_eq!(new.primed, [false; 2]);
+        let (a, b) = new.fill(0, |a, b, primed| {
+            assert!(!primed);
+            unsafe {
+                core::ptr::write_bytes(a, 0x12, 2 * UNIT);
+                core::ptr::write_bytes(b, 0x34, 2 * UNIT);
+            }
+        });
+        assert!(a.iter().all(|&x| x == 0x12));
+        assert!(b.iter().all(|&x| x == 0x34));
     }
 
     /// Primed scratch slots: a producer that skips the constant half of a
@@ -9573,6 +9875,7 @@ mod tests {
                 }
                 let mut got_unscaled = start;
                 let mut got_scaled = start;
+                let mut got_prepared = start;
                 // SAFETY: fixed-size rows, bank and a full 16 x 256 table;
                 // `first + 14 <= 16`.
                 unsafe {
@@ -9582,9 +9885,18 @@ mod tests {
                     kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16::<false>(
                         &rows, first, &table, &mut got_scaled,
                     );
+                    let base = table.as_ptr().cast::<u8>().add(first * 256 * 16);
+                    let table_rows = core::array::from_fn(|b| base.add(b * 256 * 16));
+                    kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16_prepared::<true>(
+                        &rows,
+                        first,
+                        &table_rows,
+                        &mut got_prepared,
+                    );
                 }
                 assert_eq!(got_unscaled, defined, "unscaled trial={trial} first={first}");
                 assert_eq!(got_scaled, defined, "scaled trial={trial} first={first}");
+                assert_eq!(got_prepared, defined, "prepared trial={trial} first={first}");
                 if first % 2 != 0 {
                     // The general kernel requires an even start.
                     continue;
@@ -9611,6 +9923,57 @@ mod tests {
             .collect();
         assert_eq!(routed, [(0, 14), (1, 15), (2, 16)]);
         assert!(spans().all(|(first, end)| !kernels::seeded_pair16_route::<false>(first, end)));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn ab_completion_ranked_table_hoist_matches_per_index_sweep() {
+        let mut rng = Rng::new(0xAB70_0157);
+        let n_lo = 9usize;
+        let n_lo_and_inner = n_lo + N_INNER;
+        let big_lo_size = 1usize << n_lo;
+        let bank_bits = 7usize;
+        let n_banks = 1usize << bank_bits;
+        let representation = Round1AbRepresentation::Blake3IdentityPrefixOmitted {
+            output_window: true,
+        };
+        let counts = [16u8, 15];
+        let ab_inner: Vec<u8> = (0..big_lo_size * (1 << N_INNER) * N_CHUNKS)
+            .map(|_| rng.next_u64() as u8)
+            .collect();
+        let tables = rng.f128_vec((big_lo_size >> bank_bits) * CONVERT_TABLE_SIZE);
+        let eq_bot = rng.f128_vec(n_banks);
+        let eq_hi_val = rng.f128();
+        let start_banks = rng.f128_vec(n_banks * ELL);
+        let mut want_banks = start_banks.clone();
+        let mut got_banks = start_banks;
+        let mut want = [F128::ZERO; ELL];
+        let mut got = want;
+        for (hoist, banks, partial) in [
+            (false, &mut want_banks, &mut want),
+            (true, &mut got_banks, &mut got),
+        ] {
+            process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded_with(
+                0,
+                0..big_lo_size,
+                big_lo_size,
+                n_lo_and_inner,
+                1,
+                &counts,
+                &ab_inner,
+                representation,
+                &eq_bot,
+                eq_hi_val,
+                &tables,
+                bank_bits,
+                true,
+                banks,
+                partial,
+                hoist,
+            );
+        }
+        assert_eq!(got_banks, want_banks);
+        assert_eq!(got, want);
     }
 
     /// The gather is an XOR chain over convert rows, so the pre-scaled table
@@ -10090,6 +10453,33 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn fused_c_eight_lane_drain_matches_scalar_oracle() {
+        let mut rng = Rng::new(0xC0DE_D8A1);
+        for n_b_med in 0..=(1 << N_MEDIUM) {
+            let mut c_block = [0u8; (1 << N_MEDIUM) * 64];
+            for byte in c_block.iter_mut() {
+                *byte = (rng.next_u64() & 0xff) as u8;
+            }
+            let mask_tables = build_c_mask_tables(&[rng.f128()]);
+            let seed: [[F128; ELL]; N_C_BANKS] =
+                core::array::from_fn(|_| core::array::from_fn(|_| rng.f128()));
+
+            let mut got = seed;
+            kernels::accumulate_c_banks_with_drain_lanes(
+                &c_block,
+                n_b_med,
+                &mask_tables,
+                &mut got,
+                8,
+            );
+            let mut want = seed;
+            kernels::accumulate_c_banks_scalar(&c_block, n_b_med, &mask_tables, &mut want);
+            assert_eq!(got, want, "eight-lane drain mismatch at n_b_med={n_b_med}");
         }
     }
 
