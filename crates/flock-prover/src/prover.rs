@@ -34,6 +34,10 @@ use flock_core::r1cs::{BlockR1cs, Round1PinnedOnePrefixStatement};
 use flock_core::zerocheck;
 use crate::r1cs_hashes::blake3::Blake3IdentityPrefixWitness;
 
+#[cfg(target_arch = "aarch64")]
+#[path = "stripe_trim.rs"]
+mod stripe_trim;
+
 /// Exact rollback for C1. A cleared ranked-worker environment selects the
 /// structurally guarded omission; literal `1` retains the complete AB
 /// producer and its original completion reads.
@@ -1093,6 +1097,8 @@ struct AbStripeEmitter<'a> {
     segments: Option<StripeSegmentProgram>,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     checks: Box<[(usize, u64, u64)]>,
+    /// Leading Pair ops whose B words are covered by the constant-one receipt.
+    identity_pairs: usize,
 }
 
 impl<'a> AbStripeEmitter<'a> {
@@ -1140,6 +1146,24 @@ impl<'a> AbStripeEmitter<'a> {
             program,
             segments,
             checks: crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter().copied().collect(),
+            identity_pairs: 0,
+        }
+    }
+
+    /// Reuse the existing statement and producer receipt, including its
+    /// buffer binding, before dropping any constant-one B reads.
+    fn trim_identity_prefix(&mut self, contract: Option<Round1PinnedOnePrefixStatement>) {
+        if contract.is_none()
+            || std::env::var_os("FLOCK_NO_STRIPE_TRIM").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        if let Some(segments) = &self.segments {
+            // The receipt covers precisely the first 1,024 bits per block.
+            self.identity_pairs = segments.pairs.iter()
+                .take_while(|&&(off, _)| off as usize + 16 <= 1024 / 8)
+                .count();
         }
     }
 
@@ -1248,6 +1272,11 @@ impl<'a> AbStripeEmitter<'a> {
         let programmed = if let Some(program) = self.program.as_deref() {
             unsafe {
                 match &self.segments {
+                    Some(segments) if self.identity_pairs != 0 => {
+                        emit_root_rows_ab_s256_segments_impl::<true>(
+                            a.cast(), b.cast(), dst.as_mut_ptr(), segments, self.identity_pairs,
+                        )
+                    }
                     Some(segments) => emit_root_rows_ab_s256_segments(a.cast(), b.cast(), dst.as_mut_ptr(), segments),
                     None => emit_root_rows_ab_s256(a.cast(), b.cast(), dst.as_mut_ptr(), program),
                 }
@@ -1545,8 +1574,25 @@ unsafe fn emit_root_rows_ab_s256(a: *const u8, b: *const u8, dst: *mut u8, ops: 
 /// # Safety
 /// As [`emit_root_rows_ab_s256`] for the row program `prog` was built from.
 #[cfg(target_arch = "aarch64")]
-#[inline(never)]
+#[inline(always)]
 unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut u8, prog: &StripeSegmentProgram) {
+    unsafe { emit_root_rows_ab_s256_segments_impl::<false>(a, b, dst, prog, 0) }
+}
+
+/// `TRIM` selects a separate loop before any row is emitted.
+///
+/// # Safety
+/// As the segment emitter. The first `identity_pairs` Pair ops must also
+/// have B equal to all ones in every lane when `TRIM` is set.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn emit_root_rows_ab_s256_segments_impl<const TRIM: bool>(
+    a: *const u8,
+    b: *const u8,
+    dst: *mut u8,
+    prog: &StripeSegmentProgram,
+    identity_pairs: usize,
+) {
     use core::arch::aarch64::*;
     const LANE: usize = AB_STRIPE_WORDS * 8;
     // The gather indices, the distance-1 keep mask and the distance-1 shifts
@@ -1612,138 +1658,7 @@ unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut 
     /// table registers `v28..v31`. 88 instructions.
     #[inline(always)]
     unsafe fn pair_op<const OFF: usize, const OUT: usize>(pa: *const u8, pb: *const u8, out: *mut u8, k: &Consts) {
-        // SAFETY: the caller guarantees the 16-byte reads of the eight lanes
-        // and the 128-byte write; v16..v31 are declared clobbered.
-        unsafe {
-            core::arch::asm!(
-                "ldr q16, [{pa}, #{o0}]",
-                "ldr q24, [{pb}, #{o0}]",
-                "ldr q17, [{pa}, #{o1}]",
-                "ldr q25, [{pb}, #{o1}]",
-                "ldr q18, [{pa}, #{o2}]",
-                "ldr q26, [{pb}, #{o2}]",
-                "ldr q19, [{pa}, #{o3}]",
-                "ldr q27, [{pb}, #{o3}]",
-                "ldr q20, [{pa}, #{o4}]",
-                "ldr q28, [{pb}, #{o4}]",
-                "ldr q21, [{pa}, #{o5}]",
-                "ldr q29, [{pb}, #{o5}]",
-                "ldr q22, [{pa}, #{o6}]",
-                "ldr q30, [{pb}, #{o6}]",
-                "ldr q23, [{pa}, #{o7}]",
-                "ldr q31, [{pb}, #{o7}]",
-                "and v16.16b, v16.16b, v24.16b",
-                "and v17.16b, v17.16b, v25.16b",
-                "and v18.16b, v18.16b, v26.16b",
-                "and v19.16b, v19.16b, v27.16b",
-                "and v20.16b, v20.16b, v28.16b",
-                "and v21.16b, v21.16b, v29.16b",
-                "and v22.16b, v22.16b, v30.16b",
-                "and v23.16b, v23.16b, v31.16b",
-                "mov v24.16b, v16.16b",
-                "sli v24.16b, v20.16b, #4",
-                "sri v20.16b, v16.16b, #4",
-                "mov v25.16b, v17.16b",
-                "sli v25.16b, v21.16b, #4",
-                "sri v21.16b, v17.16b, #4",
-                "mov v26.16b, v18.16b",
-                "sli v26.16b, v22.16b, #4",
-                "sri v22.16b, v18.16b, #4",
-                "mov v27.16b, v19.16b",
-                "sli v27.16b, v23.16b, #4",
-                "sri v23.16b, v19.16b, #4",
-                "shl v16.16b, v26.16b, #2",
-                "bit v16.16b, v24.16b, {m33:v}.16b",
-                "ushr v24.16b, v24.16b, #2",
-                "bif v24.16b, v26.16b, {m33:v}.16b",
-                "shl v17.16b, v27.16b, #2",
-                "bit v17.16b, v25.16b, {m33:v}.16b",
-                "ushr v25.16b, v25.16b, #2",
-                "bif v25.16b, v27.16b, {m33:v}.16b",
-                "shl v18.16b, v22.16b, #2",
-                "bit v18.16b, v20.16b, {m33:v}.16b",
-                "ushr v20.16b, v20.16b, #2",
-                "bif v20.16b, v22.16b, {m33:v}.16b",
-                "shl v19.16b, v23.16b, #2",
-                "bit v19.16b, v21.16b, {m33:v}.16b",
-                "ushr v21.16b, v21.16b, #2",
-                "bif v21.16b, v23.16b, {m33:v}.16b",
-                "shl v26.16b, v17.16b, #1",
-                "bit v26.16b, v16.16b, {m55:v}.16b",
-                "ushr v16.16b, v16.16b, #1",
-                "bif v16.16b, v17.16b, {m55:v}.16b",
-                "shl v27.16b, v25.16b, #1",
-                "bit v27.16b, v24.16b, {m55:v}.16b",
-                "ushr v24.16b, v24.16b, #1",
-                "bif v24.16b, v25.16b, {m55:v}.16b",
-                "shl v22.16b, v19.16b, #1",
-                "bit v22.16b, v18.16b, {m55:v}.16b",
-                "ushr v18.16b, v18.16b, #1",
-                "bif v18.16b, v19.16b, {m55:v}.16b",
-                "shl v23.16b, v21.16b, #1",
-                "bit v23.16b, v20.16b, {m55:v}.16b",
-                "ushr v20.16b, v20.16b, #1",
-                "bif v20.16b, v21.16b, {m55:v}.16b",
-                "zip1 v28.2d, v26.2d, v16.2d",
-                "zip1 v29.2d, v27.2d, v24.2d",
-                "zip1 v30.2d, v22.2d, v18.2d",
-                "zip1 v31.2d, v23.2d, v20.2d",
-                "tbl v17.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i0:v}.16b",
-                "tbl v25.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i1:v}.16b",
-                "tbl v19.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i2:v}.16b",
-                "tbl v21.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i3:v}.16b",
-                "stnp q17, q25, [{out}, #{s0}]",
-                "stnp q19, q21, [{out}, #{s1}]",
-                "zip2 v28.2d, v26.2d, v16.2d",
-                "zip2 v29.2d, v27.2d, v24.2d",
-                "zip2 v30.2d, v22.2d, v18.2d",
-                "zip2 v31.2d, v23.2d, v20.2d",
-                "tbl v17.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i0:v}.16b",
-                "tbl v25.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i1:v}.16b",
-                "tbl v19.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i2:v}.16b",
-                "tbl v21.16b, {{v28.16b, v29.16b, v30.16b, v31.16b}}, {i3:v}.16b",
-                "stnp q17, q25, [{out}, #{s2}]",
-                "stnp q19, q21, [{out}, #{s3}]",
-                pa = in(reg) pa,
-                pb = in(reg) pb,
-                out = in(reg) out,
-                o0 = const OFF + 0 * LANE,
-                o1 = const OFF + 1 * LANE,
-                o2 = const OFF + 2 * LANE,
-                o3 = const OFF + 3 * LANE,
-                o4 = const OFF + 4 * LANE,
-                o5 = const OFF + 5 * LANE,
-                o6 = const OFF + 6 * LANE,
-                o7 = const OFF + 7 * LANE,
-                s0 = const OUT,
-                s1 = const OUT + 32,
-                s2 = const OUT + 64,
-                s3 = const OUT + 96,
-                m33 = in(vreg) k.m33,
-                m55 = in(vreg) k.m55,
-                i0 = in(vreg) k.idx[0],
-                i1 = in(vreg) k.idx[1],
-                i2 = in(vreg) k.idx[2],
-                i3 = in(vreg) k.idx[3],
-                out("v16") _,
-                out("v17") _,
-                out("v18") _,
-                out("v19") _,
-                out("v20") _,
-                out("v21") _,
-                out("v22") _,
-                out("v23") _,
-                out("v24") _,
-                out("v25") _,
-                out("v26") _,
-                out("v27") _,
-                out("v28") _,
-                out("v29") _,
-                out("v30") _,
-                out("v31") _,
-                options(nostack, preserves_flags),
-            );
-        }
+        unsafe { stripe_trim::pair_op::<false, OFF, OUT>(pa, pb, out, k.m33, k.m55, k.idx) }
     }
     /// The Split op on the two words at `pa + OFF` / `pb + OFF` (the first
     /// where `msk` is set, else the second), writing its 64-byte row at
@@ -1889,7 +1804,19 @@ unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut 
                 vld1q_u8(IDX[3].as_ptr()),
             ],
         };
-        for &(off, out) in prog.pairs.iter() {
+        let pairs = if TRIM {
+            let (ones, rest) = prog.pairs.split_at(identity_pairs);
+            for &(off, out) in ones {
+                stripe_trim::pair_op::<true, 0, 0>(
+                    a.add(off as usize), b.add(off as usize), dst.add(out as usize),
+                    k.m33, k.m55, k.idx,
+                );
+            }
+            rest
+        } else {
+            &prog.pairs[..]
+        };
+        for &(off, out) in pairs {
             pair_op::<0, 0>(a.add(off as usize), b.add(off as usize), dst.add(out as usize), &k);
         }
         for &(off, out) in prog.fulls.iter() {
@@ -3072,7 +2999,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 && std::env::var_os("FLOCK_NO_STRIPE_IN_AB").is_none();
             let pre = if stripe_in_ab {
                 let base = ab_producer.expect("checked above");
-                let emitter = AbStripeEmitter::new(
+                let mut emitter = AbStripeEmitter::new(
                     flock_core::epool::SyncPtr(stripe_ptr as *mut u8),
                     stripe_len,
                     1usize << k_log,
@@ -3080,6 +3007,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     fixed_root_rows.is_some(),
                     &input_mismatch,
                 );
+                emitter.trim_identity_prefix(identity_prefix_contract);
                 // `primed`: the scratch pair has been filled before by this
                 // producer, which may then leave its per-block constants in
                 // place.  Either way the pair holds the unit's complete a and
