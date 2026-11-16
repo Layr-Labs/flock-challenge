@@ -4929,6 +4929,41 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
 // Convenience API: Blake3Setup
 // ---------------------------------------------------------------------------
 
+/// Kill switch for the ready cool-down: `FLOCK_NO_READY_COOLDOWN=1`.
+pub const ENV_NO_READY_COOLDOWN: &str = "FLOCK_NO_READY_COOLDOWN";
+
+/// Idle at the end of the untimed warm-up with the GPU keep-warm bridge paused.
+const READY_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(300);
+/// Bridge back on this long before the keep-alive and the ready file.
+const READY_COOLDOWN_GPU_LEAD: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Ready cool-down. Ranked worker only, untimed (it runs inside the warm-up
+/// `prove_fast` call, before the worker publishes its ready file and before
+/// the seed exists), and it touches no prover state: it pauses the GPU
+/// keep-warm bridge, sleeps, resumes the bridge and waits a short lead so the
+/// GPU is busy again when the keep-alive is lit and readiness is reported.
+///
+/// Why: the timed proof follows the warm-up proof directly and is sensitive
+/// to the heat built up just before it. On an Apple M5 Pro, one extra untimed
+/// warm-up proof made the timed proof 7.6 % slower, three made it 11.4 %
+/// slower. A long idle is worse (900 ms: -15 %, 1.3 s: -27 %), and keeping the
+/// keep-warm bridge running through the idle does not help, but a short idle
+/// with the bridge paused and resumed 50 ms before ready read +0.4 % median /
+/// +0.9 % paired over 40 interleaved fresh-worker pairs on a quiet machine.
+fn ready_cooldown() {
+    if std::env::var_os(ENV_NO_READY_COOLDOWN).is_some_and(|v| v == "1") {
+        return;
+    }
+    flock_core::gpu_commit::gpu_keepwarm_prove_started();
+    let cool = std::env::var("FLOCK_EXP_COOL_OVERRIDE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(READY_COOLDOWN, std::time::Duration::from_millis);
+    std::thread::sleep(cool);
+    flock_core::gpu_commit::gpu_keepwarm_resume();
+    std::thread::sleep(READY_COOLDOWN_GPU_LEAD);
+}
+
 /// Bundles the monolithic BLAKE3 compression R1CS + PCS params sized for
 /// `n_blocks` compressions. Mirrors [`super::sha2::Sha256Setup`].
 #[derive(Clone, Debug)]
@@ -5281,6 +5316,13 @@ impl Blake3Setup {
             // it, so the P cluster is never idle between the warm-up tail and
             // the seed. The start below is then a no-op.
             // `FLOCK_NO_PARK_KEEPALIVE=1` restores the incumbent order.
+            // Ready cool-down (`FLOCK_NO_READY_COOLDOWN=1` kills): after every
+            // untimed warm-up step, idle briefly with the GPU keep-warm bridge
+            // paused, then resume the bridge a short lead before the keep-alive
+            // and the ready file. See `ready_cooldown`.
+            if crate::seed_pipe::is_ranked_worker() {
+                ready_cooldown();
+            }
             if crate::seed_pipe::is_ranked_worker() && crate::seed_pipe::park_keepalive_enabled() {
                 flock_core::cpu_keepalive::keepalive_start();
             }
