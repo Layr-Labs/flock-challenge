@@ -569,18 +569,41 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
     convert: &[F128],
     bank: &mut [F128; 64],
 ) {
+    debug_assert!(first_b_med + 14 <= 16);
+    debug_assert_eq!(convert.len(), 16 * 256);
+
+    unsafe {
+        let t0 = (convert.as_ptr() as *const u8).add(first_b_med * 256 * 16);
+        let table_rows = core::array::from_fn(|b| t0.add(b * 256 * 16));
+        accumulate_convert_ab_nomul_seeded_pair16_prepared::<U>(
+            chunk_ab_bytes,
+            first_b_med,
+            &table_rows,
+            bank,
+        );
+    }
+}
+
+/// [`accumulate_convert_ab_nomul_seeded_pair16`] with its fourteen table-row
+/// bases prepared by the caller. This lets the ranked `w`-major sweep form the
+/// bases once and reuse them for all 128 low-bank indices of the same table.
+#[inline(always)]
+pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16_prepared<const U: bool>(
+    chunk_ab_bytes: &[[u8; 64]; 16],
+    first_b_med: usize,
+    table_rows: &[*const u8; 14],
+    bank: &mut [F128; 64],
+) {
     use core::arch::aarch64::*;
 
     debug_assert!(first_b_med + 14 <= 16);
-    debug_assert_eq!(convert.len(), 16 * 256);
 
     // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
     // Rows `first_b_med..first_b_med + 14` and their 4 KiB tables are in
     // bounds; each pass reads 16 bytes per row at lane offset 0, 16, 32 or 48
     // and writes sixteen 16-byte bank slots.
     unsafe {
-        let t0 = (convert.as_ptr() as *const u8).add(first_b_med * 256 * 16);
-        let t: [*const u8; 14] = core::array::from_fn(|b| t0.add(b * 256 * 16));
+        let t = table_rows;
         let mut mid = (chunk_ab_bytes.as_ptr() as *const u8).add((first_b_med + 7) * 64);
         let mut slot = bank.as_mut_ptr() as *mut u8;
         for _ in 0..4 {

@@ -5720,11 +5720,10 @@ pub(crate) struct LigeroWitness {
     pub mat: Vec<F128>,
     pub tree: Vec<Hash>,
     /// Zero-copy flat tree `(address, node count)` inside the persistent GPU
-    /// L1 tree buffer, set only by [`ligero_commit_with_tree_view`] when the
-    /// overlapped L1 Merkle session completes (then `tree` stays empty). The
-    /// buffer is next written by the following prove's L1 commit, so the
-    /// witness must be dropped before that — the ranked open drops it at the
-    /// end of its first recursive level.
+    /// Recursive tree buffer, set when an overlapped L1/L2 Merkle session
+    /// completes without copying (then `tree` stays empty). Each shape has a
+    /// distinct persistent buffer, next written by the following prove's
+    /// same-level commit, after the ranked open has dropped this witness.
     tree_view: Option<(usize, usize)>,
     pub block_len: usize,
     pub num_interleaved: usize,
@@ -5830,6 +5829,16 @@ fn ligero_commit_select(
     )) && recursive_from_message_shape
         && level_enabled
         && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
+    // L1 opts in through the explicit caller because its view lifetime is
+    // unusually long. L2 is also safe: it has a distinct persistent tree
+    // buffer and its witness dies before the next proof's L2 commit. Skipping
+    // the 4 MiB copy is part of the L2 overlap arm; its kill switch prevents
+    // a session from existing and therefore restores the owned CPU tree.
+    let allow_tree_view = allow_tree_view
+        || matches!(
+            (log_msg_cols, log_num_interleaved, log_inv_rate),
+            (13, 3, 3)
+        );
     ligero_commit_impl_view(
         poly,
         log_msg_cols,
@@ -5856,6 +5865,32 @@ fn recursive_subtree_merkle_enabled() -> bool {
         std::env::var("FLOCK_NO_PCS_SUBTREE").map_or(true, |v| v != "1")
     });
     *ON
+}
+
+/// Incumbent CPU builder for recursive commitment trees. Kept in one helper
+/// so the L2 overlap admission race measures and returns precisely the same
+/// pooled/subtree path used by its rollback arm.
+fn recursive_merkle_cpu(data: &[u8], block_len: usize, kind: HashKind) -> Vec<Hash> {
+    // Recursive 128-byte-leaf trees (2^10..2^16 leaves, L2..L5 on the
+    // ranked shape) are built as aligned subtrees in one P+E chunk queue.
+    let leaf_size_bytes = data.len() / block_len;
+    let lb = block_len.trailing_zeros() as usize;
+    let sub_log = if recursive_subtree_merkle_enabled()
+        && (10..=16).contains(&lb)
+        && leaf_size_bytes == 128
+    {
+        (lb - 6).clamp(5, 10)
+    } else {
+        0
+    };
+    let tree = crate::scratch::take_hash_tree(2 * block_len - 1);
+    if sub_log > 0 && lb <= 10 && op_small_merkle_serial_enabled() {
+        merkle::merkle_tree_into_subtrees_serial(tree, data, block_len, kind, sub_log)
+    } else if sub_log > 0 {
+        merkle::merkle_tree_into_subtrees(tree, data, block_len, kind, sub_log)
+    } else {
+        merkle::merkle_tree_into(tree, data, block_len, kind)
+    }
 }
 
 /// [`ligero_commit`] whose overlapped-L1 GPU tree may be returned as a
@@ -5938,18 +5973,18 @@ fn ligero_commit_impl_view(
     let mut mat = crate::scratch::take_f128(codeword_len);
     let alloc_elapsed = alloc_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     let mut fill_elapsed = std::time::Duration::ZERO;
-    // L1 NTT/Merkle-leaf overlap: the transform fires a per-finalized-chunk
+    // L1/L2 NTT/Merkle-leaf overlap: the transform fires a per-finalized-chunk
     // callback with a never-touched-again guarantee, so each chunk's disjoint
     // leaf range is hashed on the otherwise idle GPU while the CPU is still
     // producing the remaining chunks. Transcript-legal (no observe/sample
     // between NTT start and the root observe); `begin` pays every init/wrap
     // cost before the race clocks below and returns `None` whenever the
-    // incumbent must run instead (kill switch `FLOCK_NO_L1_MERKLE_OVERLAP=1`,
-    // `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, latch Off, non-L1 shape, any Metal
+    // incumbent must run instead (per-level overlap kill switch,
+    // `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, latch Off, other shape, any Metal
     // failure).
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
     let overlap = if fuse_from_message && kind == HashKind::Blake3 && leaf_size_bytes == 128 {
-        crate::gpu_commit::gpu_l1_merkle_overlap_begin(
+        crate::gpu_commit::gpu_recursive_merkle_overlap_begin(
             mat.as_ptr().cast::<u8>(),
             codeword_len * core::mem::size_of::<F128>(),
             block_len,
@@ -5960,14 +5995,14 @@ fn ligero_commit_impl_view(
     let ntt_start = timing.then(std::time::Instant::now);
     let mut raced_tree: Option<Vec<Hash>> = None;
     let mut race_ran = false;
-    let mut overlap_session: Option<crate::gpu_commit::L1MerkleOverlap> = None;
+    let mut overlap_session: Option<crate::gpu_commit::RecursiveMerkleOverlap> = None;
     match overlap {
         // First eligible L1 commit of the process (the warmup prove):
         // dual-run overlapped-then-incumbent and latch the faster arm. The
         // race's tree (the incumbent arm's) lands in `raced_tree`; `None`
         // there means the CPU builder below, exactly the incumbent fallback.
         Some(session) if session.measuring() => {
-            raced_tree = l1_overlap_warmup_race(
+            raced_tree = recursive_overlap_warmup_race(
                 session,
                 poly,
                 &mut mat,
@@ -6047,7 +6082,18 @@ fn ligero_commit_impl_view(
                 .or_else(|| crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len))
         }
     } else if matches!(kind, HashKind::Blake3) && leaf_size_bytes == 128 {
-        crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
+        // A view caller reads the whole-tree offload's buffer in place, as it
+        // does the overlap arm's (`FLOCK_NO_L1_WHOLE_TREE_VIEW=1` copies).
+        match (allow_tree_view && crate::gpu_commit::l1_whole_tree_view_enabled())
+            .then(|| crate::gpu_commit::gpu_recursive_merkle_blake3_view(data_bytes, block_len))
+            .flatten()
+        {
+            Some(view) => {
+                tree_view = Some(view);
+                Some(Vec::new())
+            }
+            None => crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len),
+        }
     } else {
         None
     };
@@ -6057,44 +6103,7 @@ fn ligero_commit_impl_view(
         // copy-out is pooled inside `gpu_recursive_merkle_blake3`): same
         // fault/munmap argument, byte-identical output.
         None => {
-            // Recursive 128-byte-leaf trees (2^10..2^16 leaves, L2..L5 on the
-            // ranked shape) are built as 64 aligned subtrees (32 at 2^10) in
-            // one P+E chunk queue instead of a leaf pass plus one parallel
-            // region per wide level and a serial tail: same kernels per node,
-            // byte-identical tree. A/B-CONTROL: FLOCK_NO_PCS_SUBTREE=1.
-            let lb = block_len.trailing_zeros() as usize;
-            let sub_log = if recursive_subtree_merkle_enabled()
-                && (10..=16).contains(&lb)
-                && leaf_size_bytes == 128
-            {
-                (lb - 6).clamp(5, 10)
-            } else {
-                0
-            };
-            if sub_log > 0 && lb <= 10 && op_small_merkle_serial_enabled() {
-                merkle::merkle_tree_into_subtrees_serial(
-                    crate::scratch::take_hash_tree(2 * block_len - 1),
-                    data_bytes,
-                    block_len,
-                    kind,
-                    sub_log,
-                )
-            } else if sub_log > 0 {
-                merkle::merkle_tree_into_subtrees(
-                    crate::scratch::take_hash_tree(2 * block_len - 1),
-                    data_bytes,
-                    block_len,
-                    kind,
-                    sub_log,
-                )
-            } else {
-                merkle::merkle_tree_into(
-                    crate::scratch::take_hash_tree(2 * block_len - 1),
-                    data_bytes,
-                    block_len,
-                    kind,
-                )
-            }
+            recursive_merkle_cpu(data_bytes, block_len, kind)
         }
     };
     let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
@@ -6138,8 +6147,8 @@ fn ligero_commit_impl_view(
 /// tree is byte-compared against the incumbent's; any mismatch or failure
 /// latches Off. Returns an INCUMBENT-arm GPU tree (`None` → the caller's CPU
 /// builder), so the warmup prove's bytes never depend on the overlapped arm.
-fn l1_overlap_warmup_race(
-    session: crate::gpu_commit::L1MerkleOverlap,
+fn recursive_overlap_warmup_race(
+    session: crate::gpu_commit::RecursiveMerkleOverlap,
     poly: &[F128],
     mat: &mut [F128],
     num_interleaved: usize,
@@ -6158,7 +6167,11 @@ fn l1_overlap_warmup_race(
         let data_bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(mat.as_ptr().cast::<u8>(), core::mem::size_of_val(mat))
         };
-        let tree = crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len);
+        let tree = if block_len == 1 << 18 {
+            crate::gpu_commit::gpu_recursive_merkle_blake3(data_bytes, block_len)
+        } else {
+            Some(recursive_merkle_cpu(data_bytes, block_len, HashKind::Blake3))
+        };
         (tree, t.elapsed().as_secs_f64() * 1e3)
     };
 
@@ -6166,7 +6179,7 @@ fn l1_overlap_warmup_race(
     let (primer_tree, _) = run_incumbent(mat);
     let Some(mut incumbent_tree) = primer_tree else {
         // No incumbent GPU tree — nothing to overlap with; latch Off.
-        crate::gpu_commit::l1_overlap_report(f64::INFINITY, 0.0, None);
+        crate::gpu_commit::recursive_overlap_report(block_len, f64::INFINITY, 0.0, None);
         return None;
     };
 
@@ -6189,13 +6202,18 @@ fn l1_overlap_warmup_race(
     for _round in 0..3 {
         // Overlapped arm.
         let Some(s) = next_session.take().or_else(|| {
-            crate::gpu_commit::gpu_l1_merkle_overlap_begin(
+            crate::gpu_commit::gpu_recursive_merkle_overlap_begin(
                 mat.as_ptr().cast::<u8>(),
                 core::mem::size_of_val(&*mat),
                 block_len,
             )
         }) else {
-            crate::gpu_commit::l1_overlap_report(f64::INFINITY, wall_b, None);
+            crate::gpu_commit::recursive_overlap_report(
+                block_len,
+                f64::INFINITY,
+                wall_b,
+                None,
+            );
             return Some(incumbent_tree);
         };
         settle();
@@ -6207,26 +6225,55 @@ fn l1_overlap_warmup_race(
             log_inv_rate,
             |offset, chunk| s.chunk_ready(offset, chunk.len()),
         );
-        let tree_a = s.finish();
-        wall_a = wall_a.min(t.elapsed().as_secs_f64() * 1e3);
-        let Some(tree_a) = tree_a else {
-            crate::gpu_commit::l1_overlap_report(f64::INFINITY, wall_b, None);
-            return Some(incumbent_tree);
+        let round_equal = if block_len == 1 << 16 {
+            // The timed L2 arm returns a zero-copy view, so time and compare
+            // that exact arm. The distinct L2 GPU buffer remains untouched
+            // until the next overlap iteration, after this comparison.
+            let Some((addr, len)) = s.finish_view() else {
+                crate::gpu_commit::recursive_overlap_report(
+                    block_len,
+                    f64::INFINITY,
+                    wall_b,
+                    None,
+                );
+                return Some(incumbent_tree);
+            };
+            wall_a = wall_a.min(t.elapsed().as_secs_f64() * 1e3);
+            let view = unsafe { core::slice::from_raw_parts(addr as *const Hash, len) };
+            view == incumbent_tree.as_slice()
+        } else {
+            let Some(tree_a) = s.finish() else {
+                crate::gpu_commit::recursive_overlap_report(
+                    block_len,
+                    f64::INFINITY,
+                    wall_b,
+                    None,
+                );
+                return Some(incumbent_tree);
+            };
+            wall_a = wall_a.min(t.elapsed().as_secs_f64() * 1e3);
+            let round_equal = tree_a == incumbent_tree;
+            crate::scratch::give_hash_tree(tree_a);
+            round_equal
         };
-        equal &= tree_a == incumbent_tree;
-        crate::scratch::give_hash_tree(tree_a);
+        equal &= round_equal;
 
         // Incumbent arm.
         settle();
         let (tree_b, round_wall_b) = run_incumbent(mat);
         let Some(tree_b) = tree_b else {
-            crate::gpu_commit::l1_overlap_report(wall_a, f64::INFINITY, None);
+            crate::gpu_commit::recursive_overlap_report(
+                block_len,
+                wall_a,
+                f64::INFINITY,
+                None,
+            );
             return Some(incumbent_tree);
         };
         wall_b = wall_b.min(round_wall_b);
         crate::scratch::give_hash_tree(std::mem::replace(&mut incumbent_tree, tree_b));
     }
-    crate::gpu_commit::l1_overlap_report(wall_a, wall_b, Some(equal));
+    crate::gpu_commit::recursive_overlap_report(block_len, wall_a, wall_b, Some(equal));
     Some(incumbent_tree)
 }
 
@@ -9383,6 +9430,385 @@ fn sample_distinct_queries_with<Ch: Challenger>(
     out
 }
 
+/// Query overlap (`FLOCK_NO_QUERY_OVERLAP=1`, exact, keeps the serial order):
+/// the opening's query positions are drawn one Fiat-Shamir squeeze at a time
+/// on the calling thread (one finalization of the transcript per query, tens
+/// of microseconds per level), and only then does the per-query work of the
+/// open (the C2 dual's lane folds and local inverse stages, the opened rows)
+/// start on the pool. With the overlap, each batch of newly drawn distinct
+/// positions is handed to the pool while the calling thread keeps drawing,
+/// so that work runs inside the draw instead of after it. Read once.
+pub const ENV_NO_QUERY_OVERLAP: &str = "FLOCK_NO_QUERY_OVERLAP";
+
+/// Unclaimed positions that make the calling thread spawn another draining
+/// job: an L0 position folds 64-lane rows and copies a 1 KiB row (several
+/// microseconds, so the jobs never catch up and one spawn per pool thread
+/// suffices), a deeper level's position folds 8-lane rows (under a
+/// microsecond), against roughly half a microsecond of drawing per position.
+const L0_QUERY_OVERLAP_BACKLOG: usize = 1;
+const LEVEL_QUERY_OVERLAP_BACKLOG: usize = 32;
+
+fn query_overlap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var(ENV_NO_QUERY_OVERLAP).is_ok_and(|v| v == "1"))
+        && rayon::current_num_threads() > 1
+}
+
+/// [`sample_distinct_queries`] with per-query work overlapped on the pool.
+///
+/// The calling thread makes exactly the draws of [`sample_distinct_queries`]
+/// (same squeezes, same first-occurrence dedupe, same sort), then runs
+/// `post_draw` (the draws that follow the positions in the transcript), so
+/// the transcript is unchanged. Each newly kept position is published to a
+/// claim cursor; once `backlog` published positions are unclaimed, the
+/// calling thread spawns one draining job (at most one per other pool thread
+/// at a time). A job claims published positions one at a time, runs
+/// `work(q)` on each, and returns once it has caught up with the draws, so
+/// no thread ever waits for a draw. After the draws the calling thread sorts
+/// the positions and runs `side(&sorted)` itself; beside it (as the other arm
+/// of a join) the positions still unclaimed are claimed, the positions other
+/// threads hold are waited for (each one `work` call), and `finish` runs over
+/// every position's `work` value in sorted order. Every position runs `work`
+/// exactly once, on whichever thread claimed it. Returns the sorted
+/// positions, `work(q)` for each of them in sorted order, and the values of
+/// `post_draw`, `side` and `finish`. `work` must be a pure function of `q`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn sample_distinct_queries_overlapped<Ch, T, W, Z, P, R, S, G, F, U, K>(
+    challenger: &mut Ch,
+    block_len: usize,
+    count: usize,
+    backlog: usize,
+    work: &W,
+    post_draw: P,
+    side: S,
+    finish: F,
+    mut take: K,
+) -> (Vec<usize>, Vec<U>, Z, R, G)
+where
+    Ch: Challenger,
+    T: Send + Sync,
+    W: Fn(usize) -> T + Sync,
+    Z: Sync,
+    P: FnOnce(&mut Ch) -> Z,
+    R: Send,
+    S: FnOnce(&[usize]) -> R + Send,
+    G: Send,
+    F: FnOnce(&[usize], &Z, &[&T]) -> G + Send,
+    K: FnMut(&mut T) -> U,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    assert!(
+        count <= block_len,
+        "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
+    );
+    assert!(backlog >= 1);
+    let slot_vec: Vec<std::sync::OnceLock<T>> =
+        (0..count).map(|_| std::sync::OnceLock::new()).collect();
+    let arrival_vec: Vec<AtomicUsize> = (0..count).map(|_| AtomicUsize::new(0)).collect();
+    let (slots, arrival) = (&slot_vec, &arrival_vec);
+    // Each counter on its own cache line: the drawing thread stores
+    // `published` once per kept position while the jobs update the others.
+    #[repr(align(128))]
+    struct Line(AtomicUsize);
+    let published = &Line(AtomicUsize::new(0)).0;
+    let claimed = &Line(AtomicUsize::new(0)).0;
+    let done = &Line(AtomicUsize::new(0)).0;
+    let active = &Line(AtomicUsize::new(0)).0;
+    // While the calling thread draws, at most one job per other performance
+    // core, so the draws (the transcript's serial spine) keep a performance
+    // core of their own; after the draws, one per other pool thread.
+    let max_active = rayon::current_num_threads().saturating_sub(1).max(1);
+    let max_drawing = match query_overlap_pcores() {
+        p if p >= 2 => max_active.min(p - 1),
+        _ => max_active,
+    };
+    let drawing = &std::sync::atomic::AtomicBool::new(true);
+    // Claim one published position and run its work; false once the cursor
+    // has reached the draws.
+    let claim_one = move || loop {
+        let c = claimed.load(Ordering::Relaxed);
+        if c >= published.load(Ordering::Acquire) {
+            return false;
+        }
+        if claimed
+            .compare_exchange_weak(c, c + 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let q = arrival[c].load(Ordering::Relaxed);
+            let _ = slots[c].set(work(q));
+            done.fetch_add(1, Ordering::Release);
+            return true;
+        }
+    };
+    let drain = move || while claim_one() {};
+    let mut sorted: Vec<usize> = Vec::new();
+    let mut order: Vec<usize> = Vec::new();
+    let mut tail: Option<(Z, R, G)> = None;
+    rayon::in_place_scope(|s| {
+        // A job first hands the next job to the pool while at least two
+        // published positions are unclaimed and the cap allows, so the
+        // thread wake-ups of the fan-out happen on the pool, not on the
+        // drawing thread, which only starts a job when none is running.
+        #[allow(clippy::too_many_arguments)]
+        fn job<'s, C: Fn() -> bool + Sync + Send + Copy + 's>(
+            s: &rayon::Scope<'s>,
+            claim_one: C,
+            published: &'s AtomicUsize,
+            claimed: &'s AtomicUsize,
+            active: &'s AtomicUsize,
+            drawing: &'s std::sync::atomic::AtomicBool,
+            max_drawing: usize,
+            max_active: usize,
+        ) {
+            loop {
+                let cap = if drawing.load(Ordering::Relaxed) { max_drawing } else { max_active };
+                let unclaimed =
+                    published.load(Ordering::Relaxed).saturating_sub(claimed.load(Ordering::Relaxed));
+                if unclaimed >= 2 && active.load(Ordering::Relaxed) < cap {
+                    active.fetch_add(1, Ordering::Relaxed);
+                    s.spawn(move |s| {
+                        job(s, claim_one, published, claimed, active, drawing, max_drawing, max_active)
+                    });
+                }
+                if !claim_one() {
+                    break;
+                }
+            }
+            active.fetch_sub(1, Ordering::Relaxed);
+        }
+        let start_job = || {
+            active.fetch_add(1, Ordering::Relaxed);
+            s.spawn(move |s| job(s, claim_one, published, claimed, active, drawing, max_drawing, max_active));
+        };
+        let mut kept = 0usize;
+        let keep = |q: usize, kept: &mut usize| {
+            arrival[*kept].store(q, Ordering::Relaxed);
+            *kept += 1;
+            published.store(*kept, Ordering::Release);
+            if active.load(Ordering::Relaxed) == 0
+                && *kept - claimed.load(Ordering::Relaxed) >= backlog
+            {
+                start_job();
+            }
+        };
+        // The set only answers membership, so either set keeps the same
+        // positions in the same order as `sample_distinct_queries`.
+        if query_probe_set_enabled() && count <= 256 && block_len < u32::MAX as usize {
+            QueryProbeSet::with(|seen| {
+                while kept < count {
+                    let v = challenger.sample_f128();
+                    let q = (v.lo as usize) % block_len;
+                    if seen.insert(q) {
+                        keep(q, &mut kept);
+                    }
+                }
+            });
+        } else {
+            let mut seen = std::collections::HashSet::with_capacity(count);
+            while kept < count {
+                let v = challenger.sample_f128();
+                let q = (v.lo as usize) % block_len;
+                if seen.insert(q) {
+                    keep(q, &mut kept);
+                }
+            }
+        }
+        // The draws are done: the cap rises to every other pool thread.
+        drawing.store(false, Ordering::Relaxed);
+        if claimed.load(Ordering::Relaxed) < count {
+            start_job();
+        }
+        let z = post_draw(challenger);
+        // Distinct keys: the arrival permutation that sorts them is unique.
+        order = (0..count).collect();
+        order.sort_unstable_by_key(|&i| arrival[i].load(Ordering::Relaxed));
+        sorted = order.iter().map(|&i| arrival[i].load(Ordering::Relaxed)).collect();
+        let (sorted, order, z_ref) = (&sorted, &order, &z);
+        let (r, g) = rayon::join(
+            || side(sorted),
+            move || {
+                drain();
+                // Every position is claimed; wait for the ones other threads
+                // hold (each one `work` call).
+                while done.load(Ordering::Acquire) < count {
+                    std::hint::spin_loop();
+                }
+                let refs: Vec<&T> = order
+                    .iter()
+                    .map(|&i| slots[i].get().expect("every kept position ran its query work"))
+                    .collect();
+                finish(sorted, z_ref, &refs)
+            },
+        );
+        tail = Some((z, r, g));
+    });
+    // The scope joined every draining job; the values stay in their slots
+    // (one buffer, dropped at once) and `take` moves out what the caller keeps.
+    let mut slot_vec = slot_vec;
+    let results = order
+        .iter()
+        .map(|&i| take(slot_vec[i].get_mut().expect("every kept position ran its query work")))
+        .collect();
+    let (z, r, g) = tail.expect("the scope body ran");
+    (sorted, results, z, r, g)
+}
+
+/// Performance-core count (`hw.perflevel0.logicalcpu` through the
+/// `sysctlbyname` syscall: the ranked sandbox denies spawning `sysctl`), or 0
+/// when unknown. Read once.
+fn query_overlap_pcores() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            unsafe extern "C" {
+                fn sysctlbyname(
+                    name: *const core::ffi::c_char,
+                    oldp: *mut core::ffi::c_void,
+                    oldlenp: *mut usize,
+                    newp: *mut core::ffi::c_void,
+                    newlen: usize,
+                ) -> core::ffi::c_int;
+            }
+            let mut n: i32 = 0;
+            let mut len = core::mem::size_of::<i32>();
+            let rc = unsafe {
+                sysctlbyname(
+                    c"hw.perflevel0.logicalcpu".as_ptr(),
+                    (&raw mut n).cast(),
+                    &raw mut len,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc == 0 && len == core::mem::size_of::<i32>() && n > 0 {
+                return n as usize;
+            }
+        }
+        0
+    })
+}
+
+/// Read every sibling on `q`'s authentication path in the leaves-first flat
+/// `tree` (the nodes [`merkle::merkle_multi_proof`] reads for `q`), so a later
+/// multi-proof over a set containing `q` finds them in cache. Reads only.
+fn touch_merkle_path(tree: &[Hash], num_leaves: usize, q: usize) {
+    let (mut start, mut len, mut p) = (0usize, num_leaves, q);
+    while len > 1 {
+        // A load of the node's first byte brings its cache line in.
+        std::hint::black_box(tree[start + (p ^ 1)][0]);
+        start += len;
+        len >>= 1;
+        p >>= 1;
+    }
+}
+
+#[cfg(test)]
+mod query_overlap_tests {
+    use super::*;
+
+    const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// What one overlapped draw reports: the sorted positions, the per-position
+    /// values in sorted order, the post-draw sample, what `side` saw, and what
+    /// `finish` saw (positions, post-draw sample, values in order).
+    type Overlapped = (
+        Vec<usize>,
+        Vec<(usize, u64)>,
+        F128,
+        Vec<usize>,
+        (Vec<usize>, F128, Vec<(usize, u64)>),
+    );
+
+    /// Object-safe view of the two concrete challengers the test drives.
+    trait ChallengerBox: Send {
+        fn serial(&mut self, block_len: usize, count: usize) -> Vec<usize>;
+        fn overlapped(&mut self, block_len: usize, count: usize, backlog: usize) -> Overlapped;
+        fn next(&mut self) -> F128;
+    }
+
+    impl<C: Challenger + Send> ChallengerBox for C {
+        fn serial(&mut self, block_len: usize, count: usize) -> Vec<usize> {
+            sample_distinct_queries(self, block_len, count)
+        }
+        fn overlapped(&mut self, block_len: usize, count: usize, backlog: usize) -> Overlapped {
+            sample_distinct_queries_overlapped(
+                self,
+                block_len,
+                count,
+                backlog,
+                &|q| (q, (q as u64).wrapping_mul(MIX)),
+                |ch: &mut C| ch.sample_f128(),
+                |sorted| sorted.to_vec(),
+                |sorted, z, parts| (sorted.to_vec(), *z, parts.iter().map(|p| **p).collect()),
+                |part| *part,
+            )
+        }
+        fn next(&mut self) -> F128 {
+            self.sample_f128()
+        }
+    }
+
+    fn make(kind: usize, seed: u64) -> Box<dyn ChallengerBox> {
+        if kind == 0 {
+            let mut ch = crate::challenger::FsChallenger::with_hash(b"query-overlap", HashKind::Blake3);
+            ch.observe_bytes(&seed.to_le_bytes());
+            Box::new(ch)
+        } else {
+            Box::new(crate::challenger::RandomChallenger::new(seed))
+        }
+    }
+
+    fn check_all() {
+        // (count, block_len): the ranked level shapes, an exhaustive draw,
+        // the HashSet path (count > 256) and an empty draw.
+        let shapes = [
+            (218usize, 1usize << 20),
+            (106, 1 << 18),
+            (93, 1 << 16),
+            (60, 1 << 13),
+            (300, 1 << 12),
+            (16, 16),
+            (0, 16),
+        ];
+        for seed in 0..6u64 {
+            for &(count, block_len) in &shapes {
+                for backlog in [1usize, 4, 16, 32] {
+                    for kind in 0..2 {
+                        let what = format!("kind {kind} seed {seed} count {count} backlog {backlog}");
+                        let mut a = make(kind, seed);
+                        let mut b = make(kind, seed);
+                        let want = a.serial(block_len, count);
+                        let want_z = a.next();
+                        let (got, parts, z, side_saw, (fin_sorted, fin_z, fin_parts)) =
+                            b.overlapped(block_len, count, backlog);
+                        let want_parts: Vec<(usize, u64)> =
+                            want.iter().map(|&q| (q, (q as u64).wrapping_mul(MIX))).collect();
+                        assert_eq!(got, want, "{what}: positions");
+                        assert_eq!(parts, want_parts, "{what}: values out of order");
+                        assert_eq!(z, want_z, "{what}: post-draw sample");
+                        assert_eq!(side_saw, want, "{what}: side");
+                        assert_eq!(fin_sorted, want, "{what}: finish positions");
+                        assert_eq!(fin_z, want_z, "{what}: finish sample");
+                        assert_eq!(fin_parts, want_parts, "{what}: finish values");
+                        assert_eq!(a.next(), b.next(), "{what}: transcript diverged");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overlapped_queries_match_serial_draws() {
+        // On a plain thread (global pool) and inside pools of several sizes.
+        check_all();
+        for threads in [1usize, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(check_all);
+        }
+    }
+}
+
 /// Build a single octopus multi-proof for all `queries` against `tree`.
 fn op_serial_opens_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -10205,12 +10631,51 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
 
     // Open L0; lane-fold weights = r_lane_fold.
     let num_queries_0 = config.queries[0];
-    let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
-    let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+    // Decided before the draws (it reads no transcript state), so the query
+    // overlap below knows whether the C2 dual's per-query work is wanted.
     let use_c2 = c2::enabled(
         use_lazy_l1_ood,
         std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
     );
+    let l0_depth = if config.recursive_ks.first().copied() == Some(3) {
+        3
+    } else {
+        2
+    };
+    // Query overlap (see `ENV_NO_QUERY_OVERLAP`): the dual's per-query lane
+    // folds and inverse stages and the opened rows run on the pool while the
+    // calling thread draws the positions; the multi-proof follows the draws
+    // on the calling thread while the pool finishes. Same draws, same values.
+    let overlapped_l0 = (use_c2 && query_overlap_enabled()).then(|| {
+        let prep = c2::DualPrep::new(l0_depth, n1 + log_inv_rate_0, &r_lane_fold);
+        sample_distinct_queries_overlapped(
+            challenger,
+            l0_block_len,
+            num_queries_0,
+            L0_QUERY_OVERLAP_BACKLOG,
+            &|q| {
+                touch_merkle_path(l0_tree, l0_block_len, q);
+                (prep.query(q, l0_row), l0_row(q).to_vec())
+            },
+            |ch: &mut Ch| ch.sample_f128_vec(ceil_log2(num_queries_0)),
+            |sorted| merkle_multi_proof_for(l0_tree, l0_block_len, sorted),
+            |sorted, alpha, parts| {
+                let duals: Vec<&c2::DualQuery> = parts.iter().map(|p| &p.0).collect();
+                c2::Dual::from_prepared(&prep, log_inv_rate_0, sorted, alpha, &duals)
+            },
+            |part| std::mem::take(&mut part.1),
+        )
+    });
+    let (queries_0, alpha_0, overlapped_l0) = match overlapped_l0 {
+        Some((queries, rows, alpha, merkle_proof, dual)) => {
+            (queries, alpha, Some(((merkle_proof, rows), dual)))
+        }
+        None => {
+            let queries = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
+            let alpha = challenger.sample_f128_vec(ceil_log2(num_queries_0));
+            (queries, alpha, None)
+        }
+    };
     let open_l0 = || {
         use rayon::prelude::*;
         rayon::join(
@@ -10219,12 +10684,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         )
     };
     let _t = std::time::Instant::now();
-    let ((merkle_proof_0, opened_rows_0), sparse_l0, full_l0) = if use_c2 {
-        let l0_depth = if config.recursive_ks.first().copied() == Some(3) {
-            3
-        } else {
-            2
-        };
+    let ((merkle_proof_0, opened_rows_0), sparse_l0, full_l0) = if let Some((opened, dual)) =
+        overlapped_l0
+    {
+        (opened, Some(dual), None)
+    } else if use_c2 {
         let (dual, opened) = rayon::join(
             || {
                 c2::Dual::new_sync(
@@ -10553,11 +11017,42 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let nonce_i = challenger.grind_pow(config.grinding_bits[i + 1] as u32);
         grinding_nonces.push(nonce_i);
         let num_queries_i = config.queries[i + 1];
-        let queries_i = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
-        let alpha_i = challenger.sample_f128_vec(ceil_log2(num_queries_i));
+        // Reads no transcript state, so it is decided before the draws.
         let use_deep_c2 = use_c2
             && config.recursive_ks.get(i + 1).copied() == Some(3)
             && n_next > 3;
+        // Query overlap (see `ENV_NO_QUERY_OVERLAP` and the L0 open above).
+        let overlapped_i = (use_deep_c2 && query_overlap_enabled()).then(|| {
+            let log_inv_rate_i = config.log_inv_rates[i + 1];
+            let prep = c2::DualPrep::new(3, n_next + log_inv_rate_i, &level_rs);
+            sample_distinct_queries_overlapped(
+                challenger,
+                wtns_prev.block_len,
+                num_queries_i,
+                LEVEL_QUERY_OVERLAP_BACKLOG,
+                &|q| {
+                    touch_merkle_path(wtns_prev.nodes(), wtns_prev.block_len, q);
+                    (prep.query(q, |r| wtns_prev.row(r)), wtns_prev.row(q).to_vec())
+                },
+                |ch: &mut Ch| ch.sample_f128_vec(ceil_log2(num_queries_i)),
+                |sorted| merkle_multi_proof_for(wtns_prev.nodes(), wtns_prev.block_len, sorted),
+                |sorted, alpha, parts| {
+                    let duals: Vec<&c2::DualQuery> = parts.iter().map(|p| &p.0).collect();
+                    c2::Dual::from_prepared(&prep, log_inv_rate_i, sorted, alpha, &duals)
+                },
+                |part| std::mem::take(&mut part.1),
+            )
+        });
+        let (queries_i, alpha_i, overlapped_i) = match overlapped_i {
+            Some((queries, rows, alpha, merkle_proof, dual)) => {
+                (queries, alpha, Some(((merkle_proof, rows), dual)))
+            }
+            None => {
+                let queries = sample_distinct_queries(challenger, wtns_prev.block_len, num_queries_i);
+                let alpha = challenger.sample_f128_vec(ceil_log2(num_queries_i));
+                (queries, alpha, None)
+            }
+        };
         let open_i = || {
             use rayon::prelude::*;
             if op_serial_opens_enabled() {
@@ -10577,7 +11072,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             )
         };
         let _t = std::time::Instant::now();
-        let ((merkle_proof_i, opened_rows_i), sparse_deep_i) = if use_deep_c2 {
+        let ((merkle_proof_i, opened_rows_i), sparse_deep_i) = if let Some((opened, dual)) =
+            overlapped_i
+        {
+            (opened, Some(dual))
+        } else if use_deep_c2 {
             let (dual, opened) = rayon::join(
                 || {
                     c2::Dual::new_sync(
