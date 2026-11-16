@@ -1492,11 +1492,36 @@ pub(crate) fn r2_fold7_table(data: &[F128]) -> Option<Vec<F128>> {
     if data.len() < 8 * 256 {
         return None;
     }
+    static SPANS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let spans = *SPANS.get_or_init(|| std::env::var_os("FLOCK_NO_FOLD7_GUARD_SPANS").is_none());
     for bank in data[..8 * 256].chunks_exact(256) {
-        for x in 1..256usize {
-            if bank[x] != bank[x & (x - 1)] + bank[x & x.wrapping_neg()] {
-                return None;
+        if !spans {
+            for x in 1..256usize {
+                if bank[x] != bank[x & (x - 1)] + bank[x & x.wrapping_neg()] {
+                    return None;
+                }
             }
+            continue;
+        }
+        if bank[0] != F128::ZERO {
+            return None;
+        }
+        let mut mismatch = F128::ZERO;
+        for bit in 0..8 {
+            let width = 1usize << bit;
+            let basis = bank[width];
+            // The previous span contains exactly the lower-bit subsets. Its
+            // join with this basis must give the next span. Index zero is
+            // tautological after the explicit bank[0] check above.
+            for x in 1..width {
+                let expected = bank[x] + basis;
+                let actual = bank[width + x];
+                mismatch.lo |= expected.lo ^ actual.lo;
+                mismatch.hi |= expected.hi ^ actual.hi;
+            }
+        }
+        if mismatch != F128::ZERO {
+            return None;
         }
     }
     let single = |bit: u32| data[(bit / 8) as usize * 256 + (1usize << (bit % 8))];
@@ -9205,6 +9230,27 @@ mod tests {
         let mut offset = table.clone();
         offset[5 * 256] = F128::ONE;
         assert!(r2_fold7_table(&offset).is_none());
+    }
+
+    #[test]
+    fn fold7_guard_span_checks_reject_every_corrupted_entry() {
+        let mut state = 0x4755_4152_4453_504e;
+        let singles: Vec<F128> = (0..64)
+            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+            .collect();
+        let table = linear_byte_banks(&singles);
+        assert!(r2_fold7_table(&table).is_some());
+        for i in 0..8 * 256 {
+            let mut malformed = table.clone();
+            malformed[i].lo ^= 1;
+            assert!(r2_fold7_table(&malformed).is_none(), "entry {i}");
+        }
+        let mut longer = table.clone();
+        longer.extend([F128::ONE; 13]);
+        assert_eq!(r2_fold7_table(&longer), r2_fold7_table(&table));
+        for len in [0, 1, 255, 256, 2047] {
+            assert!(r2_fold7_table(&table[..len]).is_none());
+        }
     }
 
     /// Eight byte banks, GF(2)-linear in each byte, whose single-bit entries
