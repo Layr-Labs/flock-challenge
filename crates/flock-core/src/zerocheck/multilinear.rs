@@ -1885,6 +1885,101 @@ fn lookahead_n_hi(n_vars: usize) -> usize {
     COMPACT_RECONSTRUCTION_N_HI.min(n_vars.saturating_sub(1))
 }
 
+/// `(hi_size, bytes of A per chunk)` of the lookahead round-two sweep over
+/// `2^m`-bit A/B buffers (k_skip = 6): the chunking
+/// [`uni_skip_fold_and_round_pair_compact_padded_lookahead_for`] walks, for
+/// the round-two A/B rebuild (`univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`).
+pub(crate) fn round2_lookahead_chunk_geometry(m: usize) -> Option<(usize, usize)> {
+    const K_SKIP: usize = 6;
+    if m < K_SKIP + 7 || m >= usize::BITS as usize {
+        return None;
+    }
+    let n_vars = m - K_SKIP - 1;
+    let hi_size = 1usize << lookahead_n_hi(n_vars);
+    let lo_size = (1usize << n_vars) / hi_size;
+    // Two rows of eight bytes per pair.
+    Some((hi_size, 2 * lo_size * 8))
+}
+
+/// Round-two A/B rebuild: this worker's scratch for one chunk's rebuilt a
+/// rows followed by its b rows (allocated on first use, kept for the
+/// thread's life).
+struct R2AbScratch {
+    ptr: core::cell::Cell<*mut u8>,
+    /// Bytes of each of the two halves.
+    bytes: core::cell::Cell<usize>,
+    /// The rebuild whose producer last filled every unit slot (0 = none).
+    primed_id: core::cell::Cell<u64>,
+}
+
+impl R2AbScratch {
+    const ALIGN: usize = 16384;
+}
+
+impl Drop for R2AbScratch {
+    fn drop(&mut self) {
+        let ptr = self.ptr.get();
+        if !ptr.is_null() {
+            let layout = std::alloc::Layout::from_size_align(2 * self.bytes.get(), Self::ALIGN).expect("layout");
+            // SAFETY: allocated below with this layout.
+            unsafe { std::alloc::dealloc(ptr, layout) };
+        }
+    }
+}
+
+thread_local! {
+    static R2_AB_SCRATCH: R2AbScratch = const {
+        R2AbScratch {
+            ptr: core::cell::Cell::new(core::ptr::null_mut()),
+            bytes: core::cell::Cell::new(0),
+            primed_id: core::cell::Cell::new(0),
+        }
+    };
+}
+
+/// Rebuild chunk `x_hi`'s a and b rows (`chunk_bytes` each) through the
+/// round-two A/B rebuild's producer into this thread's scratch. Returns the
+/// rows' addresses, valid until this thread's next call.
+fn r2_rebuild_chunk(
+    rebuild: &crate::zerocheck::univariate_skip_optimized::Round2AbRebuild,
+    x_hi: usize,
+    chunk_bytes: usize,
+) -> (*const u8, *const u8) {
+    R2_AB_SCRATCH.with(|s| {
+        if s.bytes.get() != chunk_bytes {
+            let old = s.ptr.replace(core::ptr::null_mut());
+            if !old.is_null() {
+                let layout =
+                    std::alloc::Layout::from_size_align(2 * s.bytes.get(), R2AbScratch::ALIGN).expect("layout");
+                // SAFETY: allocated below with this layout.
+                unsafe { std::alloc::dealloc(old, layout) };
+            }
+            let layout = std::alloc::Layout::from_size_align(2 * chunk_bytes, R2AbScratch::ALIGN).expect("layout");
+            // SAFETY: non-zero size.
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            s.ptr.set(ptr);
+            s.bytes.set(chunk_bytes);
+            s.primed_id.set(0);
+        }
+        let a = s.ptr.get();
+        // SAFETY: the allocation holds `2 * chunk_bytes` bytes.
+        let b = unsafe { a.add(chunk_bytes) };
+        let unit = rebuild.unit_bytes;
+        let units = chunk_bytes / unit;
+        let primed = s.primed_id.get() == rebuild.id;
+        for j in 0..units {
+            // SAFETY: slot `j` of both halves holds `unit` bytes; the
+            // registering prove is running (round two holds its rebuild).
+            unsafe { rebuild.produce_into(x_hi * units + j, a.add(j * unit), b.add(j * unit), primed) };
+        }
+        s.primed_id.set(rebuild.id);
+        (a.cast_const(), b.cast_const())
+    })
+}
+
 /// Round-two compact producer **plus** the deferred round-three coefficients.
 ///
 /// The compact state, the round-two wire message and every store are
@@ -2066,6 +2161,35 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size, n_pairs);
     assert!(lo_size >= 2, "lookahead sweep pairs two x_lo per group");
+    // Round-two A/B rebuild (`univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`):
+    // the AB arm published only chunks `..rebuild_from` of A and B, and every
+    // walk below rebuilds a later chunk's rows into worker scratch before it
+    // reads them (the GPU arm reads the prefix only). A prefix that is not
+    // whole chunks of this sweep gets the rest published first: the record
+    // path.
+    let chunk_ab_bytes = 2 * lo_size * n_chunks;
+    let rebuild = crate::zerocheck::univariate_skip_optimized::round2_ab_rebuild_take(a_packed, b_packed).and_then(|r| {
+        if r.published.is_multiple_of(chunk_ab_bytes) && chunk_ab_bytes.is_multiple_of(r.unit_bytes) {
+            Some(r)
+        } else {
+            r.complete_globals();
+            crate::zerocheck::univariate_skip_optimized::round2_ab_rebuild_latch_off();
+            None
+        }
+    });
+    let rebuild_from = rebuild.map_or(hi_size, |r| r.published / chunk_ab_bytes);
+    // Chunk `x_hi`'s a and b rows: in the buffers, or (past the published
+    // prefix) rebuilt into this worker's scratch, valid until its next
+    // rebuild.
+    let r2_rows = |x_hi: usize| -> (*const u8, *const u8) {
+        match &rebuild {
+            Some(r) if x_hi >= rebuild_from => r2_rebuild_chunk(r, x_hi, chunk_ab_bytes),
+            // SAFETY: chunk `x_hi` lies inside both buffers.
+            _ => unsafe {
+                (a_packed.as_ptr().add(x_hi * chunk_ab_bytes), b_packed.as_ptr().add(x_hi * chunk_ab_bytes))
+            },
+        }
+    };
     // `eq₂(2y) = (1+r₁)·eq₃(y)` and `eq₂(2y+1) = r₁·eq₃(y)`, so the sweep uses
     // the odd lane as the group's single weight and the two constants below
     // put every aggregate back on its own scale, once, off the hot path.
@@ -2201,6 +2325,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         useful_pairs_inclusive,
         cs_layout,
         cs_live,
+        rebuild_from,
     );
     // R2-CS owns this timed launch's prefix chunks (the CPU skips them).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2327,9 +2452,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         eprintln!(
             "[zc-r2] round-two layout: head_compact={} tail_compact={tail_compact} skip_dead={skip_dead} \
              odd_on_gpu={odd_on_gpu} horner_weights={horner_weights} prescale={horner_prescale} \
-             gpu_prefix={gpu_prefix}/{hi_size} calibration={} r2cs={r2cs}",
+             gpu_prefix={gpu_prefix}/{hi_size} calibration={} r2cs={r2cs} ab_rebuild_from={}",
             compact.head_compact,
             gpu_job.as_ref().is_some_and(|j| j.is_calibration()),
+            if rebuild.is_some() { rebuild_from.to_string() } else { "off".to_string() },
         );
     }
     let anchors_base = crate::epool::SyncPtr(unsafe { compact.anchors.as_mut_ptr().add(anchor_base) });
@@ -2375,8 +2501,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
             let full = true;
             unsafe {
                 let t = table.data.as_ptr().cast::<u8>();
-                let ap = a_packed.as_ptr().add(row_base * n_chunks);
-                let bp = b_packed.as_ptr().add(row_base * n_chunks);
+                // Round-two A/B rebuild: a chunk past the published prefix
+                // reads its rows from this worker's scratch, rebuilt now.
+                debug_assert_eq!(row_base * n_chunks, x_hi * chunk_ab_bytes);
+                let (ap, bp) = r2_rows(x_hi);
                 if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
                     kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
                         t,
@@ -2533,15 +2661,30 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         #[cfg(not(target_arch = "aarch64"))]
         {
             let anchors = unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
+            // Round-two A/B rebuild: past the published prefix, the rebuilt
+            // chunk (its rows from 0).
+            let (rows_a, rows_b, rows_base) = if rebuild.is_some() && x_hi >= rebuild_from {
+                let (pa, pb) = r2_rows(x_hi);
+                // SAFETY: the scratch holds `chunk_ab_bytes` bytes of each.
+                unsafe {
+                    (
+                        std::slice::from_raw_parts(pa, chunk_ab_bytes),
+                        std::slice::from_raw_parts(pb, chunk_ab_bytes),
+                        0,
+                    )
+                }
+            } else {
+                (a_packed, b_packed, row_base)
+            };
             out = round2_lookahead_chunk_scalar(
-                a_packed,
-                b_packed,
+                rows_a,
+                rows_b,
                 table,
                 anchors,
                 deltas,
                 eq_lo,
                 lo_size,
-                row_base,
+                rows_base,
                 pair_idx_base,
                 pair_in_block_mask,
                 useful_pairs_inclusive,
@@ -2654,7 +2797,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
-                    let row_base = pair_idx_base * 2;
+                    let (ap, bp) = r2_rows(x_hi);
                     let mut out = [F128::ZERO; 8];
                     let (anchors, deltas, dead, tail, head) = if r2cs {
                         unsafe {
@@ -2672,8 +2815,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     unsafe {
                         fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                             table.data.as_ptr().cast::<u8>(),
-                            a_packed.as_ptr().add(row_base * n_chunks),
-                            b_packed.as_ptr().add(row_base * n_chunks),
+                            ap,
+                            bp,
                             anchors,
                             deltas,
                             eq_lo.as_ptr(),
@@ -2720,14 +2863,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     if cs_redo_all {
         for x_hi in 0..hi_size {
             let pair_idx_base = x_hi * lo_size;
-            let row_base = pair_idx_base * 2;
+            let (ap, bp) = r2_rows(x_hi);
             let mut out = [F128::ZERO; 8];
             // SAFETY: every writer has joined; chunk x_hi's ranges, serially.
             unsafe {
                 fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                     table.data.as_ptr().cast::<u8>(),
-                    a_packed.as_ptr().add(row_base * n_chunks),
-                    b_packed.as_ptr().add(row_base * n_chunks),
+                    ap,
+                    bp,
                     anchors_base.ptr().add(x_hi * anchor_chunk_stride),
                     deltas_base.ptr().add(x_hi * delta_chunk_stride),
                     eq_lo.as_ptr(),
@@ -2773,14 +2916,14 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         // adds no queue instantiation to the build.
         for x_hi in 0..hi_size {
             let pair_idx_base = x_hi * lo_size;
-            let row_base = pair_idx_base * 2;
+            let (ap, bp) = r2_rows(x_hi);
             let mut out = [F128::ZERO; 8];
             // SAFETY: chunk x_hi's anchor and delta ranges, one chunk at a time.
             unsafe {
                 fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                     table.data.as_ptr().cast::<u8>(),
-                    a_packed.as_ptr().add(row_base * n_chunks),
-                    b_packed.as_ptr().add(row_base * n_chunks),
+                    ap,
+                    bp,
                     a_base.add(x_hi * a_stride),
                     d_base.add(x_hi * d_stride),
                     eq_lo.as_ptr(),
@@ -6911,6 +7054,76 @@ mod tests {
         crate::scratch::give_f128(standard_held);
         crate::scratch::give_f128(lookahead_held);
         crate::scratch::clear();
+    }
+
+    /// Round-two A/B rebuild (`univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`):
+    /// with only a prefix of whole chunks in the buffers (the rest garbage)
+    /// and the producer registered, the lookahead sweep returns the same
+    /// message, lookahead and compact state as over the complete buffers, it
+    /// takes the registration, and it never publishes the rest: the walk
+    /// read the rebuilt rows. Several prefixes, ranked and dense.
+    #[test]
+    fn round2_ab_rebuild_matches_complete_buffers() {
+        use crate::zerocheck::univariate_skip_optimized::{Round1AbProducer, round2_ab_rebuild_scope};
+        for (m, ranked) in [(20usize, true), (16, false), (25, true)] {
+            let f = la_fixture(m, 0x2AB0_0001 ^ (m as u64), ranked);
+            let (hi_size, chunk_bytes) = round2_lookahead_chunk_geometry(m).expect("geometry");
+            assert_eq!(hi_size * chunk_bytes, f.a_packed.len());
+            let (want, want_m1, want_mi, want_la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, None,
+            );
+            // Units of one chunk, or of half a chunk when it splits evenly.
+            let unit_bytes = if chunk_bytes.is_multiple_of(32) { chunk_bytes / 2 } else { chunk_bytes };
+            for cap in [0usize, 1, hi_size * 43 / 100, hi_size - 1] {
+                let published = cap * chunk_bytes;
+                let mut a = f.a_packed.clone();
+                let mut b = f.b_packed.clone();
+                a[published..].fill(0xA5);
+                b[published..].fill(0x5A);
+                let (a_ptr, b_ptr) = (a.as_mut_ptr() as usize, b.as_mut_ptr() as usize);
+                let produce = |unit: usize, sa: *mut u8, sb: *mut u8, _primed: bool| {
+                    let at = unit * unit_bytes;
+                    let (da, db) = if sa.is_null() {
+                        // SAFETY: the test's buffers, one unit each.
+                        unsafe { ((a_ptr as *mut u8).add(at), (b_ptr as *mut u8).add(at)) }
+                    } else {
+                        (sa, sb)
+                    };
+                    // SAFETY: `unit_bytes` bytes at both ends.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(f.a_packed.as_ptr().add(at), da, unit_bytes);
+                        core::ptr::copy_nonoverlapping(f.b_packed.as_ptr().add(at), db, unit_bytes);
+                    }
+                };
+                let len = a.len();
+                // SAFETY: the buffers outlive the scope; only `produce`
+                // writes them (null scratch only).
+                let scope = unsafe {
+                    round2_ab_rebuild_scope(
+                        a_ptr as *const u8,
+                        b_ptr as *const u8,
+                        len,
+                        published,
+                        Round1AbProducer { unit_bytes, produce: &produce },
+                    )
+                };
+                let (got, got_m1, got_mi, got_la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                    &a, &b, f.m, 6, &f.table, &f.mlv, &f.padding, None,
+                );
+                assert_eq!((got_m1, got_mi, got_la), (want_m1, want_mi, want_la), "message, m={m} cap={cap}");
+                assert_eq!(got.anchors, want.anchors, "anchors, m={m} cap={cap}");
+                assert_eq!(&got.deltas[..], &want.deltas[..], "deltas, m={m} cap={cap}");
+                assert!(
+                    crate::zerocheck::univariate_skip_optimized::round2_ab_rebuild_take(&a, &b).is_none(),
+                    "round two must take its registration"
+                );
+                drop(scope);
+                assert!(a[published..].iter().all(|&x| x == 0xA5), "a rows published, m={m} cap={cap}");
+                assert!(b[published..].iter().all(|&x| x == 0x5A), "b rows published, m={m} cap={cap}");
+                got.recycle();
+            }
+            want.recycle();
+        }
     }
 
     /// T1 — the core oracle. Round-two message identical, and the deferred

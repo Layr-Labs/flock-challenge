@@ -32,6 +32,36 @@ pub(crate) const GROUPS: usize = OUT / 8;
 /// F128 entries of the per-launch constants: the `rho_a` and `rho_b`
 /// nibble tables (512 each), then `eq_odd` ([`GROUPS`]).
 pub(crate) const CONSTS: usize = 1024 + GROUPS;
+/// F128 entries of the flat-fold kernel's constants (see [`ENV_NO_T56_SKIP`]):
+/// [`CONSTS`], then the nibble table of `rho_a * rho_b` (512).
+pub(crate) const CONSTS_FLAT: usize = CONSTS + 512;
+
+/// Kill switch for the 5+6 kernel's flat fold (`FLOCK_NO_T56_SKIP=1`,
+/// exactly `1`: the record kernel text and constants). With it on, each
+/// output folds its four inputs `x0..x3` as
+/// `x0 + rho_a (x0 + x1) + rho_b (x0 + x2) + (rho_a rho_b) (x0 + x1 + x2 + x3)`:
+/// three table products that need nothing of each other, by `rho_a`,
+/// `rho_b` and a third nibble table of `rho_a * rho_b` (constants
+/// `CONSTS..CONSTS_FLAT`). The record kernel folds the pairs first,
+/// `f0 = x0 + rho_a (x0 + x1)`, `f1 = x2 + rho_a (x2 + x3)`, and then
+/// `f0 + rho_b (f0 + f1)`, whose product waits for both pair products; the
+/// flat form skips that wait. Since `f0 + f1 = (x0 + x2) + rho_a (x0 + x1 +
+/// x2 + x3)`, distributivity makes the two forms the same field element, so
+/// every output and slot is unchanged. Same three table products per array
+/// and output. Read once per process, before the arm's pipeline build.
+pub const ENV_NO_T56_SKIP: &str = "FLOCK_NO_T56_SKIP";
+
+/// Whether the 5+6 kernel takes the flat fold (no `FLOCK_NO_T56_SKIP=1`).
+pub(crate) fn flat_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_T56_SKIP).as_deref() != Some(std::ffi::OsStr::new("1")))
+}
+
+/// F128 entries of the constants the selected kernel reads.
+pub(crate) fn consts_len() -> usize {
+    if flat_enabled() { CONSTS_FLAT } else { CONSTS }
+}
+
 /// Raw slot-bank entries per chunk (four threadgroups of 32), each an
 /// unreduced 256-bit sum `[r0, r1, r2, r3]`.
 pub(crate) const BANKS: usize = 128;
@@ -54,30 +84,46 @@ pub(crate) const SLOT: [u8; 32] = [
 pub(crate) fn consts_into(out: &mut [F128], rho_a: F128, rho_b: F128, eq_lo: &[F128]) {
     assert_eq!(out.len(), CONSTS);
     assert_eq!(eq_lo.len(), LO);
-    let mut i = 0;
-    for rho in [rho_a, rho_b] {
-        let mut pw = [F128::ZERO; 128];
-        pw[0] = rho;
-        for p in 1..128 {
-            pw[p] = crate::field::mul_by_x(pw[p - 1]);
-        }
-        for bank in 0..16 {
-            for half in 0..2 {
-                for n in 0..16usize {
-                    let mut v = F128::ZERO;
-                    for b in 0..4 {
-                        if (n >> b) & 1 == 1 {
-                            v += pw[8 * bank + 4 * half + b];
-                        }
-                    }
-                    out[i] = v;
-                    i += 1;
-                }
-            }
-        }
-    }
+    nib_table_into(&mut out[..512], rho_a);
+    nib_table_into(&mut out[512..1024], rho_b);
     for y in 0..GROUPS {
         out[1024 + y] = eq_lo[4 * y + 3];
+    }
+}
+
+/// The constants of the kernel [`flat_enabled`] selects: [`consts_into`]'s,
+/// then (flat fold) the nibble table of `rho_a * rho_b`. `out` holds
+/// [`consts_len`] entries.
+pub(crate) fn launch_consts_into(out: &mut [F128], rho_a: F128, rho_b: F128, eq_lo: &[F128]) {
+    assert_eq!(out.len(), consts_len());
+    consts_into(&mut out[..CONSTS], rho_a, rho_b, eq_lo);
+    if out.len() == CONSTS_FLAT {
+        nib_table_into(&mut out[CONSTS..], rho_a * rho_b);
+    }
+}
+
+/// One challenge's nibble table, 512 entries in the layout `mul_rho16` reads.
+fn nib_table_into(out: &mut [F128], rho: F128) {
+    assert_eq!(out.len(), 512);
+    let mut pw = [F128::ZERO; 128];
+    pw[0] = rho;
+    for p in 1..128 {
+        pw[p] = crate::field::mul_by_x(pw[p - 1]);
+    }
+    let mut i = 0;
+    for bank in 0..16 {
+        for half in 0..2 {
+            for n in 0..16usize {
+                let mut v = F128::ZERO;
+                for b in 0..4 {
+                    if (n >> b) & 1 == 1 {
+                        v += pw[8 * bank + 4 * half + b];
+                    }
+                }
+                out[i] = v;
+                i += 1;
+            }
+        }
     }
 }
 
@@ -96,7 +142,9 @@ pub(crate) fn finish_banks(banks: &[[u64; 4]]) -> [F128; SLOTS] {
 #[cfg(test)]
 pub(crate) mod emu {
     //! Line-by-line transliteration of `zc_t56_fold` (one threadgroup's
-    //! eight simdgroups run lane by lane).
+    //! eight simdgroups run lane by lane), in the record form and in the flat
+    //! form (`flat`, see [`ENV_NO_T56_SKIP`]; `consts` then holds
+    //! [`CONSTS_FLAT`] entries).
     use super::*;
     use crate::field::F256Unreduced as U256k;
 
@@ -204,9 +252,26 @@ pub(crate) mod emu {
         ao: &mut [F128],
         bo: &mut [F128],
         consts: &[F128],
+        flat: bool,
     ) -> [U256k; 32] {
         let nib = &consts[..1024];
-        let eq_odd = &consts[1024..];
+        let eq_odd = &consts[1024..CONSTS];
+        // Flat form: the four-input fold with three independent table
+        // products, the third by the `rho_a * rho_b` table.
+        let fold = |x0: F128, x1: F128, x2: F128, x3: F128| -> F128 {
+            if flat {
+                let nab = &consts[CONSTS..CONSTS_FLAT];
+                let d = x4(x4(x0, x1), x4(x2, x3));
+                x4(
+                    x4(x0, mul_rho16(x4(x0, x1), &nib[..512])),
+                    x4(mul_rho16(x4(x0, x2), &nib[512..]), mul_rho16(d, nab)),
+                )
+            } else {
+                let f0 = x4(x0, mul_rho16(x4(x0, x1), &nib[..512]));
+                let f1 = x4(x2, mul_rho16(x4(x2, x3), &nib[..512]));
+                x4(f0, mul_rho16(x4(f0, f1), &nib[512..]))
+            }
+        };
         let mut red = [U256k::ZERO; 256];
         for sg in 0..8 {
             let mut acc_a = [U256k::ZERO; 32];
@@ -222,12 +287,8 @@ pub(crate) mod emu {
                     let lid = 32 * sg + lane;
                     let o = (quarter << 11) + (j << 8) + lid;
                     let ([a0, a1, a2, a3], [b0, b1, b2, b3]) = load(ai, bi, o);
-                    let fa0 = x4(a0, mul_rho16(x4(a0, a1), &nib[..512]));
-                    let fa1 = x4(a2, mul_rho16(x4(a2, a3), &nib[..512]));
-                    let fa = x4(fa0, mul_rho16(x4(fa0, fa1), &nib[512..]));
-                    let fb0 = x4(b0, mul_rho16(x4(b0, b1), &nib[..512]));
-                    let fb1 = x4(b2, mul_rho16(x4(b2, b3), &nib[..512]));
-                    let fbv = x4(fb0, mul_rho16(x4(fb0, fb1), &nib[512..]));
+                    let fa = fold(a0, a1, a2, a3);
+                    let fbv = fold(b0, b1, b2, b3);
                     ao[o] = fa;
                     bo[o] = fbv;
                     wa[lane] = gf_reduce(clmul128(eq_odd[o >> 3], fa));
@@ -284,17 +345,20 @@ pub(crate) mod emu {
 
     /// The kernel over one chunk (its four threadgroups) plus the CPU's
     /// bank finish: outputs into `ao`, `bo`; returns the chunk's slots.
+    /// `flat`: the flat-fold kernel (`consts` of [`CONSTS_FLAT`] entries).
     pub(crate) fn emulate_chunk(
         ai: &[F128],
         bi: &[F128],
         ao: &mut [F128],
         bo: &mut [F128],
         consts: &[F128],
+        flat: bool,
     ) -> [F128; SLOTS] {
         assert_eq!((ai.len(), bi.len(), ao.len(), bo.len()), (IN_A, IN_B, OUT, OUT));
+        assert_eq!(consts.len(), if flat { CONSTS_FLAT } else { CONSTS });
         let mut banks = Vec::with_capacity(BANKS);
         for quarter in 0..4 {
-            let tg = fold_threadgroup(quarter, ai, bi, ao, bo, consts);
+            let tg = fold_threadgroup(quarter, ai, bi, ao, bo, consts, flat);
             banks.extend(tg.iter().map(|u| [u.r0, u.r1, u.r2, u.r3]));
         }
         finish_banks(&banks)
@@ -353,14 +417,61 @@ mod tests {
             let mut s = seed.rotate_left(17) | 1;
             let rhos = [rand(&mut s), rand(&mut s)];
             let eq_lo: Vec<F128> = (0..LO).map(|_| rand(&mut s)).collect();
-            let mut consts = vec![F128::ZERO; CONSTS];
-            consts_into(&mut consts, rhos[0], rhos[1], &eq_lo);
-            let (mut ga, mut gb) = (vec![F128::ZERO; OUT], vec![F128::ZERO; OUT]);
-            let slots = emu::emulate_chunk(&pa, &pb, &mut ga, &mut gb, &consts);
             let (mut ca, mut cb) = (vec![F128::ZERO; OUT], vec![F128::ZERO; OUT]);
             let want = crate::zerocheck::multilinear::tri_chunk_scalar(&a, &b, &mut ca, &mut cb, &rhos, &eq_lo);
-            assert!(ga == ca && gb == cb, "outputs differ");
-            assert_eq!(slots, want);
+            // The record form, then the flat fold (its constants extend the
+            // record's: same first `CONSTS` entries, then the `rho_a rho_b`
+            // table).
+            let mut consts = vec![F128::ZERO; CONSTS_FLAT];
+            consts_into(&mut consts[..CONSTS], rhos[0], rhos[1], &eq_lo);
+            let record = consts[..CONSTS].to_vec();
+            nib_table_into(&mut consts[CONSTS..], rhos[0] * rhos[1]);
+            assert_eq!(&consts[..CONSTS], &record[..]);
+            for (flat, cs) in [(false, &record[..]), (true, &consts[..])] {
+                let (mut ga, mut gb) = (vec![F128::ZERO; OUT], vec![F128::ZERO; OUT]);
+                let slots = emu::emulate_chunk(&pa, &pb, &mut ga, &mut gb, cs, flat);
+                assert!(ga == ca && gb == cb, "outputs differ (flat {flat})");
+                assert_eq!(slots, want, "slots differ (flat {flat})");
+            }
+        }
+    }
+
+    /// The flat fold equals the pairwise fold for every input pattern the
+    /// layouts produce (ones, zeros, a lone input) and for random inputs,
+    /// and the `rho_a rho_b` table is that product's table.
+    #[test]
+    fn t56_flat_fold_matches_pairwise_fold() {
+        let mut s = 0x5eed_7a56_u64;
+        let (ra, rb) = (rand(&mut s), rand(&mut s));
+        let mut t = vec![F128::ZERO; 1536];
+        nib_table_into(&mut t[..512], ra);
+        nib_table_into(&mut t[512..1024], rb);
+        nib_table_into(&mut t[1024..], ra * rb);
+        let tab = |x: F128, k: usize| -> F128 {
+            let mut v = F128::ZERO;
+            for (i, byte) in x.lo.to_le_bytes().into_iter().chain(x.hi.to_le_bytes()).enumerate() {
+                v += t[512 * k + 32 * i + (byte & 15) as usize] + t[512 * k + 32 * i + 16 + (byte >> 4) as usize];
+            }
+            v
+        };
+        for _ in 0..64 {
+            let x = rand(&mut s);
+            assert_eq!(tab(x, 0), ra * x);
+            assert_eq!(tab(x, 1), rb * x);
+            assert_eq!(tab(x, 2), ra * rb * x);
+        }
+        let (o, z) = (F128::ONE, F128::ZERO);
+        let r = |s: &mut u64| rand(s);
+        let mut cases = vec![[o, o, o, o], [r(&mut s), z, z, z], [r(&mut s), r(&mut s), r(&mut s), o], [z, z, z, z]];
+        for _ in 0..64 {
+            cases.push([r(&mut s), r(&mut s), r(&mut s), r(&mut s)]);
+        }
+        for [x0, x1, x2, x3] in cases {
+            let f0 = x0 + tab(x0 + x1, 0);
+            let f1 = x2 + tab(x2 + x3, 0);
+            let pair = f0 + tab(f0 + f1, 1);
+            let flat = x0 + tab(x0 + x1, 0) + tab(x0 + x2, 1) + tab(x0 + x1 + x2 + x3, 2);
+            assert_eq!(flat, pair);
         }
     }
 

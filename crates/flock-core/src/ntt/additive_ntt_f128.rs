@@ -560,6 +560,20 @@ fn ranked_suffix_hetero_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_RANKED_SUFFIX_HETERO").is_none())
 }
 
+/// Kill switch for running a fine hybrid split's full-block deep pass before
+/// its boundary wait (`FLOCK_NO_FINE_DEEP_FIRST=1`): restores the one deep
+/// pass over the boundary and the full blocks after the wait. The full
+/// layer-4 blocks' layer-10 sub-NTTs do not depend on the GPU's boundary
+/// layers 4..8, so they run while the GPU is still on them instead of after
+/// (measured on M4: a fine split's CPU suffix took ~12 ms longer than the
+/// coarse split one sixteenth larger, the workers idling at the wait). Each
+/// sub-NTT is the same kernel with the same absolute twiddles on disjoint
+/// rows, so every output byte is identical. Read once per process.
+fn fine_deep_first_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_FINE_DEEP_FIRST").is_none())
+}
+
 // ---------------------------------------------------------------------------
 // Static zero-lane skip (commit NTT).
 // ---------------------------------------------------------------------------
@@ -1656,6 +1670,36 @@ impl AdditiveNttF128 {
         }
         let sb_end = b_start << 4;
         let sb_start = sb_end - fine_m;
+        if fine_deep_first_enabled() {
+            // The full blocks' sub-NTTs first, then the boundary's (see
+            // `fine_deep_first_enabled`).
+            let full_lo = b_start << (DEEP_LAYER - 4);
+            self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                data,
+                num_ntts,
+                DEEP_LAYER,
+                log_d,
+                full_lo,
+                16 << (DEEP_LAYER - 4),
+                odd_tail,
+                &finish_chunk,
+            );
+            wait_boundary()?;
+            self.forward_transform_interleaved_block_range(
+                data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
+            );
+            self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                data,
+                num_ntts,
+                DEEP_LAYER,
+                log_d,
+                sb_start << (DEEP_LAYER - 8),
+                full_lo,
+                odd_tail,
+                &finish_chunk,
+            );
+            return Ok(());
+        }
         wait_boundary()?;
         self.forward_transform_interleaved_block_range(
             data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,

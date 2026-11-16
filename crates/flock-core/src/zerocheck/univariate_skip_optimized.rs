@@ -1049,6 +1049,178 @@ pub struct Round1AbProducer<'a> {
     pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync),
 }
 
+/// Kill switch of the round-two A/B rebuild: with
+/// `FLOCK_NO_R2_AB_REBUILD=1` the round-one AB precompute publishes every
+/// deferred A/B row to the global buffers and round two reads them there
+/// (the record path). By default a deferred-producer prove whose round-two
+/// GPU arm reads at most the R2-CS share ceiling's prefix
+/// (`gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT` of round two's chunks)
+/// publishes only that prefix, and round two's CPU walk rebuilds every later
+/// chunk's rows from the same producer into worker scratch and reads them
+/// there (see [`round2_ab_rebuild_scope`]). Same rows, same proof. Read once
+/// per process.
+pub const ENV_NO_R2_AB_REBUILD: &str = "FLOCK_NO_R2_AB_REBUILD";
+
+fn r2_ab_rebuild_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_R2_AB_REBUILD).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Set once something in this process found the rebuild's published prefix
+/// short of what a reader wanted (a GPU share above it, a shape mismatch):
+/// every later prove takes the record path.
+static R2_AB_REBUILD_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Latch the round-two A/B rebuild off for the rest of the process.
+pub(crate) fn round2_ab_rebuild_latch_off() {
+    R2_AB_REBUILD_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+type AbProduceFn = dyn Fn(usize, *mut u8, *mut u8, bool) + Sync;
+
+/// One prove's round-two A/B rebuild (see [`round2_ab_rebuild_scope`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Round2AbRebuild {
+    a: usize,
+    b: usize,
+    len: usize,
+    /// Leading bytes of A (and of B) whose rows the AB arm published.
+    pub(crate) published: usize,
+    pub(crate) unit_bytes: usize,
+    /// The producer, its lifetime erased: only reachable while the scope
+    /// that registered it lives (see [`round2_ab_rebuild_scope`]).
+    produce: &'static AbProduceFn,
+    /// Unique per registration (a worker scratch filled for one id is not
+    /// primed for another).
+    pub(crate) id: u64,
+}
+
+impl Round2AbRebuild {
+    /// Write unit `unit`'s rows into the scratch pair (`primed` as in
+    /// [`Round1AbProducer`]); units at or past the published prefix leave the
+    /// global rows unwritten.
+    ///
+    /// # Safety
+    /// Both scratch pointers valid for `unit_bytes` bytes; the registering
+    /// scope is alive.
+    #[inline(always)]
+    pub(crate) unsafe fn produce_into(&self, unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool) {
+        (self.produce)(unit, a_scratch, b_scratch, primed)
+    }
+
+    /// Publish every row past the prefix to the global buffers (the record
+    /// path's buffers, for a reader that reads them there).
+    pub(crate) fn complete_globals(&self) {
+        use rayon::prelude::*;
+        let produce = self.produce;
+        (self.published / self.unit_bytes..self.len / self.unit_bytes)
+            .into_par_iter()
+            .with_min_len(64)
+            .for_each(|unit| produce(unit, core::ptr::null_mut(), core::ptr::null_mut(), false));
+    }
+}
+
+static R2_AB_REBUILDS: std::sync::Mutex<Vec<Round2AbRebuild>> = std::sync::Mutex::new(Vec::new());
+static R2_AB_REBUILD_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Registration of a prove's round-two A/B rebuild; dropping it withdraws
+/// the registration (round two normally takes it first).
+pub struct Round2AbRebuildScope<'a> {
+    id: u64,
+    _producer: core::marker::PhantomData<&'a ()>,
+}
+
+impl Drop for Round2AbRebuildScope<'_> {
+    fn drop(&mut self) {
+        let mut list = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|r| r.id != self.id);
+    }
+}
+
+/// Bytes of A (and of B) the AB arm must publish for the next prove when
+/// round two rebuilds the rest; `None` = the record path (publish every
+/// row). `total_bytes` is the byte length of each buffer (`2^m / 8`). The
+/// prefix is the R2-CS share ceiling's chunks of the lookahead sweep, and is
+/// offered only while the round-two GPU arm's next launch reads within it
+/// (`gpu_commit::zc_r2_gpu_read_bound`; a launch that would read past it
+/// anyway is clamped to it and latches the rebuild off).
+pub fn round2_ab_rebuild_published_bytes(total_bytes: usize) -> Option<usize> {
+    if !r2_ab_rebuild_enabled() || R2_AB_REBUILD_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    if !total_bytes.is_power_of_two() {
+        return None;
+    }
+    let m = (total_bytes * 8).trailing_zeros() as usize;
+    let (hi_size, chunk_bytes) = crate::zerocheck::multilinear::round2_lookahead_chunk_geometry(m)?;
+    if hi_size * chunk_bytes != total_bytes {
+        return None;
+    }
+    let cap = hi_size * crate::gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT / 100;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_reads = crate::gpu_commit::zc_r2_gpu_read_bound(hi_size);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let gpu_reads = 0usize;
+    (cap > 0 && cap < hi_size && gpu_reads <= cap).then_some(cap * chunk_bytes)
+}
+
+/// Register a prove's round-two A/B rebuild: the AB arm publishes only the
+/// leading `published` bytes of `a_packed` / `b_packed`, and round two (which
+/// takes this registration, matched by the buffers' addresses and length)
+/// rebuilds every later chunk's rows through `producer` into worker scratch.
+/// A reader that needs the global rows past the prefix publishes them first
+/// (`Round2AbRebuild::complete_globals`).
+///
+/// # Safety
+/// While the scope lives: both buffers are valid for `len` bytes and written
+/// by nothing but `producer`; `producer` keeps the [`Round1AbProducer`]
+/// contract, except that called with non-null scratch for a unit at or past
+/// `published / unit_bytes` it writes only the scratch pair, and called with
+/// null scratch it writes the unit's global rows. The leading `published`
+/// bytes of both buffers are complete before round two runs.
+pub unsafe fn round2_ab_rebuild_scope<'a>(
+    a_packed: *const u8,
+    b_packed: *const u8,
+    len: usize,
+    published: usize,
+    producer: Round1AbProducer<'a>,
+) -> Round2AbRebuildScope<'a> {
+    assert!(producer.unit_bytes > 0 && published.is_multiple_of(producer.unit_bytes));
+    assert!(published <= len && len.is_multiple_of(producer.unit_bytes));
+    let id = R2_AB_REBUILD_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: the registration (the only holder of this reference) is
+    // withdrawn when the scope drops, before `'a` ends; round two copies it
+    // out only while the prove that owns the scope runs.
+    let produce: &'static AbProduceFn = unsafe {
+        core::mem::transmute::<&'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync + 'a), &'static AbProduceFn>(
+            producer.produce,
+        )
+    };
+    let mut list = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+    list.push(Round2AbRebuild {
+        a: a_packed as usize,
+        b: b_packed as usize,
+        len,
+        published,
+        unit_bytes: producer.unit_bytes,
+        produce,
+        id,
+    });
+    Round2AbRebuildScope { id, _producer: core::marker::PhantomData }
+}
+
+/// Take the round-two A/B rebuild registered for these buffers, if any
+/// (once: a later round two over a recycled allocation finds nothing).
+pub(crate) fn round2_ab_rebuild_take(a_packed: &[u8], b_packed: &[u8]) -> Option<Round2AbRebuild> {
+    let mut list = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+    let at = list.iter().position(|r| {
+        r.a == a_packed.as_ptr() as usize && r.b == b_packed.as_ptr() as usize && r.len == a_packed.len() && r.len == b_packed.len()
+    })?;
+    Some(list.swap_remove(at))
+}
+
 /// Same-binary control for the fused producer path: with exactly
 /// `FLOCK_NO_ZC_AB_PRODUCER_FUSED=1` every unit is produced up front (no
 /// scratch) and the incumbent precompute then reads the buffers.
