@@ -1301,6 +1301,23 @@ pub(crate) fn zc_t0_park() {
 /// changes when the GPU work is issued.
 pub const ENV_NO_L1_MERKLE_OVERLAP: &str = "FLOCK_NO_L1_MERKLE_OVERLAP";
 
+/// Kill switch for the L2 overlap (`FLOCK_NO_L2_OVERLAP`, any value: the
+/// opening's L2 recursive commit, 2^16 leaves of 128 bytes, hashes its
+/// Merkle tree on the CPU after its NTT, as before). With it unset the L2
+/// commit takes the same NTT/Merkle-leaf overlap session as L1: each
+/// finalized NTT chunk's leaves are hashed on the GPU while the CPU still
+/// transforms the rest, on the session's cached no-copy view of the pooled
+/// matrix, with the session's completion-signal join. Same leaf and parent
+/// kernels, same flat-tree slots: the tree is bit-identical to the CPU
+/// builder's. The plain whole-tree L2 offload (measured net negative for its
+/// post-transform round trip) stays off. Read once per process.
+pub const ENV_NO_L2_OVERLAP: &str = "FLOCK_NO_L2_OVERLAP";
+
+pub(crate) fn l2_overlap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_L2_OVERLAP).is_none());
+    *ON
+}
+
 pub(crate) fn gpu_l1_merkle_overlap_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_L1_MERKLE_OVERLAP).is_none());
@@ -2863,6 +2880,25 @@ pub const ENV_NO_BAND_BATCH: &str = "FLOCK_NO_BAND_BATCH";
 fn band_batch_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var(ENV_NO_BAND_BATCH).is_ok_and(|v| v == "1"))
+}
+
+/// Kill switch for one compute encoder per held band buffer
+/// (`FLOCK_NO_BAND_ENC_MERGE=1`: one encoder per range, as the record). With
+/// band batching ([`ENV_NO_BAND_BATCH`]) several witness ranges go into one
+/// held command buffer, but each range still opened and ended its own compute
+/// encoder (the timed prove: 10 encoders in 3 band buffers). The ranges a held
+/// buffer collects now share its one encoder: a held range leaves the encoder
+/// open (retained across the autorelease pool, like the buffer) and the next
+/// range encodes into it; the encoder is ended just before the buffer is
+/// committed. Same range kernels, same dispatches, same order on the same
+/// serial queue (a default compute encoder runs its dispatches in order, as
+/// consecutive encoders do), so the staging bytes are the record's. Read once
+/// per process.
+pub const ENV_NO_BAND_ENC_MERGE: &str = "FLOCK_NO_BAND_ENC_MERGE";
+
+fn band_enc_merge_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| band_batch_enabled() && !std::env::var(ENV_NO_BAND_ENC_MERGE).is_ok_and(|v| v == "1"))
 }
 
 fn hybrid_cb2_spin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
@@ -12569,6 +12605,9 @@ kernel void blake3_pow_race_tail(
         /// Band buffer (retained, not committed) holding the ranges published
         /// while two band buffers were in flight (`super::ENV_NO_BAND_BATCH`).
         held: Option<Id>,
+        /// The held buffer's open compute encoder (retained), shared by the
+        /// ranges it collects (`super::ENV_NO_BAND_ENC_MERGE`).
+        held_enc: Option<Id>,
         failed: Option<String>,
         owns_lease: bool,
         started: std::time::Instant,
@@ -12677,12 +12716,17 @@ kernel void blake3_pow_race_tail(
                         Some(cb) => cb,
                         None => self.gpu.retain(self.gpu.command_buffer()?),
                     };
-                    let enc = match self.gpu.compute_encoder(cb) {
-                        Ok(enc) => enc,
-                        Err(e) => {
-                            self.gpu.release(cb);
-                            return Err(e);
-                        }
+                    // A held buffer's open encoder is shared by the ranges it
+                    // collects (`super::ENV_NO_BAND_ENC_MERGE`); it is retained.
+                    let (enc, retained) = match self.held_enc.take() {
+                        Some(enc) => (enc, true),
+                        None => match self.gpu.compute_encoder(cb) {
+                            Ok(enc) => (enc, false),
+                            Err(e) => {
+                                self.gpu.release(cb);
+                                return Err(e);
+                            }
+                        },
                     };
                     FromZFirstPassPlan::new(self.log_d)
                         .with_zero_store_from(self.zero_store_from)
@@ -12696,7 +12740,18 @@ kernel void blake3_pow_race_tail(
                             byte_offset,
                             r_count,
                         );
+                    if hold && super::band_enc_merge_enabled() {
+                        // Keep the encoder open for the next range; retain it
+                        // across the autorelease pool like the buffer.
+                        self.held_enc = Some(if retained { enc } else { self.gpu.retain(enc) });
+                        self.held = Some(cb);
+                        crate::tmark::mark("band held");
+                        return Ok(None);
+                    }
                     self.gpu.end_encoding(enc);
+                    if retained {
+                        self.gpu.release(enc);
+                    }
                     if hold {
                         self.held = Some(cb);
                         crate::tmark::mark("band held");
@@ -12823,6 +12878,12 @@ kernel void blake3_pow_race_tail(
             if let Some(cb) = self.held.take() {
                 unsafe {
                     let pool = self.gpu.pool_push();
+                    // End the held buffer's shared encoder first
+                    // (`super::ENV_NO_BAND_ENC_MERGE`).
+                    if let Some(enc) = self.held_enc.take() {
+                        self.gpu.end_encoding(enc);
+                        self.gpu.release(enc);
+                    }
                     let sig = self.gpu.arm_done(cb);
                     self.gpu.commit_async(cb);
                     self.gpu.pool_pop(pool);
@@ -13055,6 +13116,7 @@ kernel void blake3_pow_race_tail(
             unordered: Vec::new(),
             pending: Vec::with_capacity(8),
             held: None,
+            held_enc: None,
             failed: None,
             owns_lease: true,
             started: std::time::Instant::now(),
@@ -21395,8 +21457,11 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     /// The exact recursive shapes worth offloading. L1 (2^18 leaves) wins
     /// ~0.9 ms per timed prove; L2 (2^16 leaves) was measured NET NEGATIVE
     /// (GPU 1.06 ms vs CPU 0.81 ms — the fixed wrap/submit/wait roundtrip
-    /// dominates at 16 MiB) and is deliberately excluded.
-    const REC_MERKLE_SHAPES: [usize; 1] = [1usize << 18];
+    /// dominates at 16 MiB) and is deliberately excluded from the whole-tree
+    /// offload. The second shape (L2) is used ONLY by the NTT/Merkle-leaf
+    /// overlap session (see `super::ENV_NO_L2_OVERLAP`), where the leaves are
+    /// hashed while the transform still runs, on the session's cached wrap.
+    const REC_MERKLE_SHAPES: [usize; 2] = [1usize << 18, 1usize << 16];
 
     /// Process-lifetime Metal state for the recursive Merkle offload.
     struct RecMerkle {
@@ -21588,7 +21653,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
 
     pub(crate) fn gpu_recursive_merkle_blake3(data: &[u8], num_leaves: usize) -> Option<Vec<Hash>> {
         if !super::gpu_recursive_merkle_enabled()
-            || !REC_MERKLE_SHAPES.contains(&num_leaves)
+            || num_leaves != REC_MERKLE_SHAPES[0]
             || data.len() != num_leaves * 128
         {
             return None;
@@ -21920,7 +21985,9 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         data_len: usize,
         num_leaves: usize,
     ) -> Option<L1MerkleOverlapSession> {
-        if !REC_MERKLE_SHAPES.contains(&num_leaves) || data_len != num_leaves * 128 {
+        let shape_ok = num_leaves == REC_MERKLE_SHAPES[0]
+            || (num_leaves == REC_MERKLE_SHAPES[1] && super::l2_overlap_enabled());
+        if !shape_ok || data_len != num_leaves * 128 {
             return None;
         }
         let gpu = gpu().ok()?;

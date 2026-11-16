@@ -634,6 +634,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         };
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
     flock_core::tmark::mark("open start");
+    flock_core::tmark::diag::at(flock_core::tmark::diag::OPEN_START);
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
     // Publish-prefix pre-encode: `commitment` / `zc_proof` / `lc_proof` are
@@ -700,6 +701,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     }
     flock_core::epool::set_linger_phase(false);
     flock_core::tmark::mark("open returned");
+    flock_core::tmark::diag::at(flock_core::tmark::diag::OPEN_END);
     if phase_timing {
         let wall = t_open.elapsed().as_secs_f64() * 1e3;
         let cpu = process_cpu_ms() - cpu_open0.unwrap_or(0.0);
@@ -2804,6 +2806,7 @@ fn commit_with_round1_ab_precompute(
     );
 
     flock_core::tmark::mark("commit join end");
+    flock_core::tmark::diag::at(flock_core::tmark::diag::COMMIT_END);
     if run_ranked_exact_tune {
         if std::env::var_os("FLOCK_NO_TUNE_REPLAY_BACKING").is_none() {
             *replay_backing.lock().unwrap() = Some(
@@ -3215,6 +3218,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let (commitment, prover_data, ab_inner) = pre_zerocheck;
     bind_statement(challenger, r1cs, &commitment);
     flock_core::tmark::mark("zc start");
+    flock_core::tmark::diag::at(flock_core::tmark::diag::ZC_START);
     // Lincheck GPU wake (see `flock_core::gpu_commit::ENV_NO_LC_GPU_WAKE`):
     // zerocheck's tail wakes the idle GPU ahead of the lincheck prefix.
     flock_core::gpu_commit::lc_gpu_wake_arm(true);
@@ -3285,6 +3289,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
 
     flock_core::gpu_commit::lc_gpu_wake_arm(false);
     flock_core::tmark::mark("zc end");
+    flock_core::tmark::diag::at(flock_core::tmark::diag::ZC_END);
     let cpu_lc0 = phase_timing.then(process_cpu_ms);
     let t_lc = std::time::Instant::now();
     let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);

@@ -809,6 +809,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
+    crate::tmark::diag::at(crate::tmark::diag::ZC_R1);
     if zc_timing {
         eprintln!(
             "[zc-timing] round1 URM: {:.2} ms cpu={:.1}",
@@ -900,6 +901,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         (compact, m1, mi, None)
     };
 
+    crate::tmark::diag::at(crate::tmark::diag::ZC_R2);
     if zc_timing {
         eprintln!(
             "[zc-timing] round2 fused fold: {:.2} ms cpu={:.1}",
@@ -1063,6 +1065,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }
+            crate::tmark::diag::at(crate::tmark::diag::ZC_K);
             compact_mlv.recycle_after_k();
             multilinear_msgs.push((m4_1, m4_inf));
             challenger.observe_f128(m4_1);
@@ -1415,6 +1418,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }
+            crate::tmark::diag::at(crate::tmark::diag::ZC_K);
             compact_mlv.recycle();
             multilinear_msgs.push((m4_1, m4_inf));
             challenger.observe_f128(m4_1);

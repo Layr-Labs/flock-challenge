@@ -5377,6 +5377,9 @@ impl Blake3Setup {
         );
         let out = setup.prove_fast_inner(blocks, &mut challenger);
         flock_core::cpu_keepalive::pool_spin_release();
+        // Diagnostic run DIAG5: return late, at the time that encodes this
+        // worker's arm and its total or stage span (`tmark::diag`).
+        flock_core::tmark::diag::hold();
         out
     }
 
