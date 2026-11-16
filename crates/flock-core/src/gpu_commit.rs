@@ -17897,7 +17897,17 @@ kernel void lc_fold_stripes_factored_b4(
                     self.k,
                 )
             };
+            if self.arm == FoldArm::Zc
+                && crate::zerocheck::univariate_skip_optimized::zc_c_tail_trim_enabled()
             {
+                // Round-one C tail trim: the join is 2^k_log lanes (256 KiB),
+                // a few microseconds of streaming on this thread, while the
+                // rayon split woke pool threads that had parked after the AB
+                // completion. Same XORs into the same lanes.
+                for (a, b) in dst.iter_mut().zip(src.iter()) {
+                    *a += *b;
+                }
+            } else {
                 use rayon::prelude::*;
                 dst.par_chunks_mut(2048)
                     .zip(src.par_chunks(2048))
