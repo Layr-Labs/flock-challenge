@@ -400,6 +400,66 @@ const EPOOL_MIN_CHUNKS: usize = 4;
 /// `n_chunks >= EPOOL_MIN_CHUNKS`. A drain missing any one of these runs
 /// main-pool-only (inline when single-threaded), so the two-pool shape is
 /// never observable in the output, only in which pool claims each chunk.
+/// `true` while the helper pool's workers stay in [`hot_spin_body`].
+static HOT_SPIN: AtomicBool = AtomicBool::new(false);
+/// `FLOCK_NO_EPOOL_HOT`, read by [`hot_spin_arm`].
+static HOT_SPIN_OFF: AtomicBool = AtomicBool::new(false);
+/// Upper bound on one hot spin, should [`hot_spin_release`] never be reached.
+const HOT_SPIN_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read the hot helper spin's kill switch (`FLOCK_NO_EPOOL_HOT`, any value)
+/// and make sure the helper pool exists. Called where the main pool's hot
+/// spin is armed, outside any timed interval.
+pub(crate) fn hot_spin_arm() {
+    HOT_SPIN_OFF.store(std::env::var_os("FLOCK_NO_EPOOL_HOT").is_some(), Ordering::Relaxed);
+    let _ = epool();
+}
+
+/// Keep the helper pool's workers from parking until [`hot_spin_release`].
+/// A helper worker that finds no job sleeps after Rayon's idle rounds, and
+/// every later hetero drain's `spawn_broadcast` then has to wake it before it
+/// can claim a chunk. This hands each helper worker one broadcast job that
+/// loops on `rayon::yield_now`, which runs the worker's pending jobs (its
+/// broadcast queue first, then stolen and injected ones), and yields the core
+/// to the kernel between idle rounds. Later broadcasts therefore run nested
+/// in that job on a worker that is already running. The loop ends at the
+/// release or after [`HOT_SPIN_MAX`]; a worker still busy when the release
+/// comes runs the job later and leaves it at once. Scheduling only: the same
+/// jobs, run by the same pool. Called by the main pool's hot spin at the
+/// witness hand-off, so it engages exactly when that one does.
+pub(crate) fn hot_spin_start() {
+    if HOT_SPIN_OFF.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(ep) = epool() else {
+        return;
+    };
+    if HOT_SPIN.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let deadline = std::time::Instant::now() + HOT_SPIN_MAX;
+    ep.spawn_broadcast(move |_| hot_spin_body(deadline));
+}
+
+fn hot_spin_body(deadline: std::time::Instant) {
+    while HOT_SPIN.load(Ordering::Relaxed) {
+        if let Some(rayon::Yield::Executed) = rayon::yield_now() {
+            continue;
+        }
+        std::thread::yield_now();
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+}
+
+/// End the hot helper spin (idempotent; a no-op when none is running).
+pub(crate) fn hot_spin_release() {
+    if HOT_SPIN.load(Ordering::Relaxed) {
+        HOT_SPIN.store(false, Ordering::Release);
+    }
+}
+
 /// Chunks claimed by the efficiency-core helper pool across all hetero
 /// drains (diagnostic only; relaxed ordering). Read deltas around a window
 /// to prove E-core engagement for that window.
@@ -1447,6 +1507,41 @@ unsafe impl<T> Sync for SyncPtr<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A broadcast and a detached hetero drain issued while the helper
+    /// workers are in the hot spin reach the workers and complete, and the
+    /// spin ends at the release.
+    #[test]
+    fn hot_spin_runs_helper_jobs_and_releases() {
+        let Some(ep) = epool() else {
+            return;
+        };
+        hot_spin_start();
+        let hits = AtomicUsize::new(0);
+        ep.broadcast(|_| {
+            hits.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(hits.load(Ordering::Relaxed), ep.current_num_threads());
+        // A detached hetero drain (its own cursor, so it shares no queue
+        // state with other drains).
+        let (next, sum) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let claim = || loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= 256 {
+                break;
+            }
+            sum.fetch_add(i + 1, Ordering::Relaxed);
+        };
+        drain_hetero(2, &claim, ep, &claim, true);
+        assert_eq!(sum.load(Ordering::Relaxed), 256 * 257 / 2);
+        hot_spin_release();
+        assert!(!HOT_SPIN.load(Ordering::Relaxed));
+        let hits = AtomicUsize::new(0);
+        ep.broadcast(|_| {
+            hits.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(hits.load(Ordering::Relaxed), ep.current_num_threads());
+    }
 
     /// Grind pack 3: the caller-first drain runs every chunk exactly once,
     /// in and out of a pool; and when the body panics on the calling thread,

@@ -2389,6 +2389,25 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let tail_compact = false;
     compact.tail_compact = tail_compact;
+    // Full chunks (the suffix after the round-two GPU prefix, stolen prefix
+    // chunks, every chunk without the arm) on the window-scaled walk
+    // (`FLOCK_NO_R2_FULL_XB` keeps the prepared-weight walk): it needs the
+    // fixed medium weights (`horner_weights`, which also pins the ranked
+    // periodic block shape), the dead pairs skipped and the odd groups'
+    // weights a constant multiple of the even ones' (checked when the table
+    // is built). Same state bytes and slots as the prepared-weight walk.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let xb_rho = if horner_weights && skip_dead && kernels::aarch64::r2_full_xb_enabled() {
+        kernels::aarch64::r2_full_xb_rho_prep(eq_lo)
+    } else {
+        None
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let xb_rho_addr = xb_rho.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let full_xb = xb_rho_addr != 0;
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let full_xb = false;
     // Head-compacted layout on top: every chunk's producer must be one of the
     // two ranked walks that write it (the full lookahead walk, or the
     // prescaled ranked-invariant walk on GPU-offloaded chunks).
@@ -2512,7 +2531,31 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 // reads its rows from this worker's scratch, rebuilt now.
                 debug_assert_eq!(row_base * n_chunks, x_hi * chunk_ab_bytes);
                 let (ap, bp) = r2_rows(x_hi);
-                if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                if full && full_xb {
+                    // Full chunk on the window-scaled walk
+                    // (`FLOCK_NO_R2_FULL_XB`): the seven-piece table on the
+                    // performance-core workers, the byte banks on the helpers.
+                    #[cfg(target_feature = "sha3")]
+                    kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_xb(
+                        t,
+                        if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                            fold7_addr as *const u8
+                        } else {
+                            core::ptr::null()
+                        },
+                        ap,
+                        bp,
+                        anchors,
+                        deltas,
+                        eq_lo.as_ptr(),
+                        xb_rho_addr as *const F128,
+                        lo_size,
+                        degen,
+                        tail_compact,
+                        head_fail_ptr,
+                        out.as_mut_ptr(),
+                    );
+                } else if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
                     kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
                         t,
                         fold7_addr as *const u8,
