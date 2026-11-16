@@ -1939,7 +1939,7 @@ fn zc_k_premap_bytes(n_pairs: usize) -> usize {
     if n_pairs < 16 {
         return 0;
     }
-    let share = crate::gpu_commit::gpu_zc_k_share();
+    let share = crate::gpu_commit::zc_k_premap_share();
     if share == 0 {
         return 0;
     }
@@ -3382,7 +3382,7 @@ fn fold2_compact_and_round45_into_packed_b(
     let gpu_job = {
         let share = crate::gpu_commit::gpu_zc_k_share().min(hi_size);
         if gpu && bpack && compact.tail_compact && share > 0 {
-            let share = crate::gpu_commit::zc_k_launch_share().min(hi_size);
+            let share = crate::gpu_commit::zc_k_launch_share(hi_size).min(hi_size);
             let hc = compact.head_compact;
             let layout = crate::gpu_commit::ZcKLayout {
                 hc,
@@ -3525,6 +3525,8 @@ fn fold2_compact_and_round45_into_packed_b(
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
     };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let t_cpu = std::time::Instant::now();
     crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
 
     // Join the GPU prefix (it was submitted first and is normally done).
@@ -3534,7 +3536,15 @@ fn fold2_compact_and_round45_into_packed_b(
     if let Some(job) = gpu_job {
         let calibration = job.calibration();
         let chunks = job.chunks();
-        match crate::gpu_commit::zc_k_wait(job, hi_size) {
+        let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
+        // The share calibration's CPU price (oracle probe only): sweep K
+        // chunks `start..start + n` again (the same outputs and sums).
+        let cpu_replay = |start: usize, n: usize| -> f64 {
+            let t = std::time::Instant::now();
+            crate::epool::run_hetero_chunks(n, |i| chunk_body(start + i));
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        match crate::gpu_commit::zc_k_wait(job, hi_size, cpu_ms, &cpu_replay) {
             crate::gpu_commit::ZcKResult::Prefix { parts, a, b, len_a, len_b, b_ones } => {
                 if !b_ones {
                     // A b output of the GPU's chunks that the pack skips is

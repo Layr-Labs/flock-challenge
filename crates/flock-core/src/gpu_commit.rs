@@ -1005,6 +1005,86 @@ pub(crate) fn gpu_zc_k_share() -> usize {
     if gpu_commit_enabled() { *SHARE } else { 0 }
 }
 
+/// Kill switch for the K arm's warm-up share calibration
+/// (`FLOCK_NO_ZC_K_SHARE_CALIB`, any value): the timed launches take the fixed
+/// [`ZC_K_GPU_V2_DEFAULT_CHUNKS`], and the oracle probe and the arm's buffers
+/// are sized to it, as before. With it unset, and only for the faster
+/// kernel's default share (no `FLOCK_ZC_K_GPU_CHUNKS`), the warm-up prove's
+/// oracle probe folds [`zc_k_calib_probe`] chunks (so the arm's buffers hold
+/// any calibrated share), its fold is replayed on the GPU to a plateau with a
+/// 256-chunk CPU re-sweep beside each replay, and the share is priced from
+/// the minimum per-chunk GPU and CPU walls of those replays
+/// ([`zc_k_calib_share`]); the timed launches take that share. The oracle's
+/// own CPU sweep is not a price: it runs on output pages the warm-up touches
+/// first, several times slower per chunk than a timed sweep. Each chunk's
+/// outputs and sums are the same field elements on either side, so only the
+/// split moves. Read once per process.
+pub const ENV_NO_ZC_K_SHARE_CALIB: &str = "FLOCK_NO_ZC_K_SHARE_CALIB";
+
+/// Whether the K share is calibrated in the warm-up (see
+/// [`ENV_NO_ZC_K_SHARE_CALIB`]).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_k_share_calib_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        zc_k_share_is_v2_default() && std::env::var_os(ENV_NO_ZC_K_SHARE_CALIB).is_none()
+    });
+    *ON
+}
+
+/// The calibrated K share of this process (`usize::MAX` = not calibrated).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) static ZC_K_TUNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Balance point of a prefix arm whose GPU and CPU fold disjoint whole chunks
+/// with the same per-chunk work, `ratio = u_gpu / u_cpu`: the GPU's `g`
+/// chunks and the CPU's `hi - g` finish together at `g = hi / (1 + ratio)`.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn zc_prefix_balance(ratio: f64, hi: usize) -> Option<f64> {
+    (ratio.is_finite() && ratio > 0.0 && hi > 0).then(|| hi as f64 / (1.0 + ratio))
+}
+
+/// Ceiling of both calibrated shares, 7/8 of the chunks: the warm-up probes
+/// run at it, so the arms' buffers (sized at their first launch) hold any
+/// calibrated share.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn zc_calib_ceiling(hi: usize) -> usize {
+    hi * 7 / 8
+}
+
+/// K share for the calibration ratio: the balance point in whole 5+6 chunks
+/// (4 K chunks, so the 5+6 arm's eligible range loses nothing), clamped to
+/// `[hi/16, 7·hi/8]`. Never 0, so the arm keeps running and keeps the
+/// premapped anchors view R2-CS shares ([`zc_k_premap_share`]). `None` = an
+/// unusable ratio (the constant stays).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_k_calib_share(ratio: f64, hi: usize) -> Option<usize> {
+    let g = zc_prefix_balance(ratio, hi)?;
+    let g = (g / 4.0).round() as usize * 4;
+    Some(g.clamp(hi / 16, zc_calib_ceiling(hi)))
+}
+
+/// The K oracle probe's share while the share is calibrated.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_k_calib_probe(hi: usize) -> usize {
+    zc_calib_ceiling(hi) / 4 * 4
+}
+
+/// Share the round-two premap (and the K view hand-over) covers: the
+/// calibrated share, never less than the requested one ([`gpu_zc_k_share`]),
+/// whose prefix the R2-CS arm's anchors view needs (its ceiling
+/// `zc_r2_cs_max_share` is 37% of the chunks, under 768/2048).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_k_premap_share() -> usize {
+    let share = gpu_zc_k_share();
+    if share == 0 || !zc_k_share_calib_enabled() {
+        return share;
+    }
+    match ZC_K_TUNED.load(std::sync::atomic::Ordering::Relaxed) {
+        usize::MAX => share,
+        tuned => tuned.max(share),
+    }
+}
+
 /// Diagnostic trace for the K pass arm (`FLOCK_ZC_K_GPU_DEBUG=1`, or any
 /// `FLOCK_PHASE_TIMING` run): the oracle verdict and one line per prove.
 pub(crate) fn gpu_zc_k_debug() -> bool {
@@ -24116,21 +24196,34 @@ kernel void zc_ab_finish(
         }
     }
 
-    /// The K arm's share for this launch: the requested one, except that the
-    /// faster kernel's default share falls back to the record's when that
-    /// kernel did not build (source compile failed). Joins the pipeline build,
+    /// The K arm's share for this launch over `hi_size` chunks: the requested
+    /// one, except that the faster kernel's default share falls back to the
+    /// record's when that kernel did not build (source compile failed), and
+    /// that a calibrated share ([`super::ENV_NO_ZC_K_SHARE_CALIB`]) is the
+    /// probe's until the warm-up calibrates it. Joins the pipeline build,
     /// which the launch does anyway.
-    pub(crate) fn zc_k_launch_share() -> usize {
+    pub(crate) fn zc_k_launch_share(hi_size: usize) -> usize {
         let share = super::gpu_zc_k_share();
         if share == 0 || !super::zc_k_share_is_v2_default() {
             return share;
         }
         zc_k_prewarm();
-        if ZC_K_V2_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-            share
-        } else {
-            super::ZC_K_GPU_DEFAULT_CHUNKS
+        if !ZC_K_V2_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            return super::ZC_K_GPU_DEFAULT_CHUNKS;
         }
+        if !super::zc_k_share_calib_enabled() {
+            return share;
+        }
+        match super::ZC_K_TUNED.load(std::sync::atomic::Ordering::Relaxed) {
+            usize::MAX => super::zc_k_calib_probe(hi_size),
+            tuned => tuned,
+        }
+    }
+
+    /// Whether this process calibrates the K share: switch on and the faster
+    /// kernel built (the share it prices).
+    fn zc_k_calib_active() -> bool {
+        super::zc_k_share_calib_enabled() && ZC_K_V2_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn zc_k_init(
@@ -24204,6 +24297,71 @@ kernel void zc_ab_finish(
         }
     }
 
+    /// Kernel parameters of a K launch (`ZcKParams` in the MSL source).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ZcKLaunchParams {
+        sb_per_chunk: u32,
+        eq_hi_off: u32,
+        hc: u32,
+        a_base: u32,
+        a_stride: u32,
+        a_shift: u32,
+        d_base: u32,
+        d_stride: u32,
+        d_shift: u32,
+        pad: [u32; 3],
+    }
+
+    /// Encode and commit the fold and finish of K chunks `0..chunks` over the
+    /// anchors and deltas views (the launch, and the calibration's replays,
+    /// which rewrite the same values). Returns the retained command buffer.
+    unsafe fn zc_k_submit(
+        gpu: &Gpu,
+        state: &ZcK,
+        a_view: Id,
+        d_view: Id,
+        chunks: usize,
+        params: &ZcKLaunchParams,
+    ) -> Result<Id, String> {
+        unsafe {
+            let pb = std::slice::from_raw_parts(
+                (params as *const ZcKLaunchParams).cast::<u8>(),
+                core::mem::size_of::<ZcKLaunchParams>(),
+            );
+            let pool = gpu.pool_push();
+            let submitted = (|| -> Result<Id, String> {
+                let cb = gpu.command_buffer()?;
+                let enc = gpu.compute_encoder(cb)?;
+                gpu.set_pipeline(enc, state.fold_pso);
+                gpu.set_buffer(enc, a_view, 0, 0);
+                gpu.set_buffer(enc, d_view, 0, 1);
+                gpu.set_buffer(enc, state.nib_buf, 0, 2);
+                gpu.set_buffer(enc, state.consts_buf, 0, 3);
+                gpu.set_buffer(enc, state.out_a, 0, 4);
+                gpu.set_buffer(enc, state.out_b, 0, 5);
+                gpu.set_buffer(enc, state.tgp_buf, 0, 6);
+                gpu.set_bytes(enc, pb, 7);
+                gpu.set_buffer(enc, state.flag_buf, 0, 8);
+                gpu.dispatch(enc, (chunks * state.sb_per_chunk) as u64, 256);
+                // Serial dispatches of one encoder: the finish reads the
+                // superblock sums the fold wrote.
+                gpu.set_pipeline(enc, state.finish_pso);
+                gpu.set_buffer(enc, state.tgp_buf, 0, 0);
+                gpu.set_buffer(enc, state.consts_buf, 0, 1);
+                gpu.set_buffer(enc, state.part_buf, 0, 2);
+                gpu.set_bytes(enc, pb, 3);
+                gpu.dispatch(enc, chunks as u64, 8);
+                gpu.end_encoding(enc);
+                let cb = gpu.retain(cb);
+                gpu.commit_async(cb);
+                Ok(cb)
+            })();
+            gpu.pool_pop(pool);
+            submitted
+        }
+    }
+
     /// An in-flight K pass GPU prefix.
     pub(crate) struct ZcKJob {
         cb: Id,
@@ -24215,6 +24373,8 @@ kernel void zc_ab_finish(
         per_chunk_b: usize,
         calibration: bool,
         submitted: std::time::Instant,
+        /// The launch's kernel parameters (the calibration's replays).
+        params: ZcKLaunchParams,
     }
 
     // SAFETY: the handles are only waited/released by the launching thread;
@@ -24587,7 +24747,10 @@ kernel void zc_ab_finish(
                 return None;
             }
         };
-        if state.chunks != chunks
+        // The buffers were sized at the first launch (the warm-up's oracle
+        // probe, at the calibration ceiling when the share is calibrated):
+        // any share up to that capacity fits.
+        if state.chunks < chunks
             || state.per_chunk_a != per_chunk_a
             || state.per_chunk_b != per_chunk_b
             || state.sb_per_chunk != sb_per_chunk
@@ -24688,20 +24851,7 @@ kernel void zc_ab_finish(
             }
             std::ptr::copy_nonoverlapping(eq_hi.as_ptr(), consts.add(2 + n_weights), chunks);
             *gpu.buffer_contents(state.flag_buf).cast::<u32>() = 0;
-            #[repr(C)]
-            struct P {
-                sb_per_chunk: u32,
-                eq_hi_off: u32,
-                hc: u32,
-                a_base: u32,
-                a_stride: u32,
-                a_shift: u32,
-                d_base: u32,
-                d_stride: u32,
-                d_shift: u32,
-                pad: [u32; 3],
-            }
-            let params = P {
+            let params = ZcKLaunchParams {
                 sb_per_chunk: sb_per_chunk as u32,
                 eq_hi_off: (2 + n_weights) as u32,
                 hc: layout.hc as u32,
@@ -24713,37 +24863,7 @@ kernel void zc_ab_finish(
                 d_shift: (layout.d_shift / 16) as u32,
                 pad: [0; 3],
             };
-            let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
-            let pool = gpu.pool_push();
-            let submitted = (|| -> Result<Id, String> {
-                let cb = gpu.command_buffer()?;
-                let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, state.fold_pso);
-                gpu.set_buffer(enc, a_view, 0, 0);
-                gpu.set_buffer(enc, d_view, 0, 1);
-                gpu.set_buffer(enc, state.nib_buf, 0, 2);
-                gpu.set_buffer(enc, state.consts_buf, 0, 3);
-                gpu.set_buffer(enc, state.out_a, 0, 4);
-                gpu.set_buffer(enc, state.out_b, 0, 5);
-                gpu.set_buffer(enc, state.tgp_buf, 0, 6);
-                gpu.set_bytes(enc, pb, 7);
-                gpu.set_buffer(enc, state.flag_buf, 0, 8);
-                gpu.dispatch(enc, (chunks * sb_per_chunk) as u64, 256);
-                // Serial dispatches of one encoder: the finish reads the
-                // superblock sums the fold wrote.
-                gpu.set_pipeline(enc, state.finish_pso);
-                gpu.set_buffer(enc, state.tgp_buf, 0, 0);
-                gpu.set_buffer(enc, state.consts_buf, 0, 1);
-                gpu.set_buffer(enc, state.part_buf, 0, 2);
-                gpu.set_bytes(enc, pb, 3);
-                gpu.dispatch(enc, chunks as u64, 8);
-                gpu.end_encoding(enc);
-                let cb = gpu.retain(cb);
-                gpu.commit_async(cb);
-                Ok(cb)
-            })();
-            gpu.pool_pop(pool);
-            match submitted {
+            match zc_k_submit(gpu, &state, a_view, d_view, chunks, &params) {
                 Ok(cb) => Some(ZcKJob {
                     cb,
                     views: [a_view, d_view],
@@ -24752,6 +24872,7 @@ kernel void zc_ab_finish(
                     per_chunk_b,
                     calibration: mode == ZC_K_UNCALIBRATED,
                     submitted: std::time::Instant::now(),
+                    params,
                 }),
                 Err(e) => {
                     if debug {
@@ -24765,8 +24886,96 @@ kernel void zc_ab_finish(
         }
     }
 
-    /// Join the K pass GPU prefix (after the CPU queue has drained).
-    pub(crate) fn zc_k_wait(job: ZcKJob, hi_size: usize) -> ZcKResult {
+    /// Calibration walls of the K share: the probe's and up to four replays
+    /// (the R2 arm's plateau rule: at least three, stop once one improves the
+    /// best by under 5%).
+    const ZC_K_CALIB_WALLS: usize = 5;
+    /// Chunks per calibration replay: 16384 superblocks fill the GPU at a
+    /// fraction of the probe's wall.
+    const ZC_K_CALIB_REPLAY_CHUNKS: usize = 512;
+    /// CPU chunks swept beside each GPU replay (at most an eighth of them).
+    const ZC_K_CALIB_CPU_CHUNKS: usize = 256;
+
+    /// K share calibration, in the warm-up's oracle probe (joined, its views
+    /// still held). Each replay folds the probe's leading chunks on the GPU
+    /// while `cpu_replay(start, n)` sweeps `n` chunks from `hi_size / 2` on
+    /// the CPU (a range the oracle swept mid-pass and the GPU replay does not
+    /// read; both rewrite the same values) and returns its wall; replays run
+    /// to the GPU plateau. The minimum per-chunk GPU and CPU walls price the
+    /// share ([`super::zc_k_calib_share`], the constant when unusable). The
+    /// oracle's own sweep (`oracle_cpu_ms`) is not a price: it runs on output
+    /// pages the warm-up touches for the first time, several times slower
+    /// per chunk than any timed sweep.
+    unsafe fn zc_k_calibrate(
+        gpu: &Gpu,
+        state: &ZcK,
+        job: &ZcKJob,
+        probe_ms: f64,
+        oracle_cpu_ms: f64,
+        hi_size: usize,
+        cpu_replay: &dyn Fn(usize, usize) -> f64,
+    ) {
+        let replay = job.chunks.min(ZC_K_CALIB_REPLAY_CHUNKS);
+        let (cpu_start, cpu_n) = (hi_size / 2, ZC_K_CALIB_CPU_CHUNKS.min(hi_size / 8));
+        let mut walls = [0.0f64; ZC_K_CALIB_WALLS];
+        let mut cpu_walls = [0.0f64; ZC_K_CALIB_WALLS];
+        let (mut n, mut n_cpu) = (0, 0);
+        let (mut best, mut best_cpu) = (f64::MAX, f64::MAX);
+        if probe_ms > 0.0 && job.chunks > 0 {
+            walls[0] = probe_ms / job.chunks as f64;
+            best = walls[0];
+            n = 1;
+        }
+        while n < walls.len() && replay > 0 && cpu_n > 0 {
+            let Ok(cb) = (unsafe { zc_k_submit(gpu, state, job.views[0], job.views[1], replay, &job.params) }) else {
+                break;
+            };
+            let c_cpu = cpu_replay(cpu_start, cpu_n) / cpu_n as f64;
+            if c_cpu > 0.0 {
+                cpu_walls[n_cpu] = c_cpu;
+                n_cpu += 1;
+                best_cpu = best_cpu.min(c_cpu);
+            }
+            let w = if unsafe { gpu.wait_cb(cb) }.is_ok() { unsafe { zc_fold_gpu_wall_ms(gpu, cb) } } else { 0.0 };
+            unsafe { gpu.release(cb) };
+            if w <= 0.0 {
+                break;
+            }
+            let c = w / replay as f64;
+            walls[n] = c;
+            n += 1;
+            let prev = best;
+            best = best.min(c);
+            if n >= 3 && c > 0.95 * prev {
+                break;
+            }
+        }
+        let ratio = if best < f64::MAX && best_cpu < f64::MAX { best / best_cpu } else { f64::NAN };
+        let share = super::zc_k_calib_share(ratio, hi_size).unwrap_or(super::ZC_K_GPU_V2_DEFAULT_CHUNKS);
+        super::ZC_K_TUNED.store(share, std::sync::atomic::Ordering::Relaxed);
+        if super::gpu_zc_k_debug() {
+            eprintln!(
+                "[zc-k-gpu] share calibration: probe {} chunks, per-chunk GPU walls {:?} ms (replays of {replay}), \
+                 per-chunk CPU walls {:?} ms (sweeps of {cpu_n}), u_gpu={best:.5}ms u_cpu={best_cpu:.5}ms \
+                 (oracle sweep {:.5}ms, not priced) ratio={ratio:.3} -> share {share}/{hi_size}",
+                job.chunks,
+                &walls[..n],
+                &cpu_walls[..n_cpu],
+                oracle_cpu_ms / hi_size.max(1) as f64,
+            );
+        }
+    }
+
+    /// Join the K pass GPU prefix (after the CPU queue has drained; `cpu_ms`
+    /// is that queue's wall, for the debug line). `cpu_replay(start, n)`
+    /// sweeps K chunks `start..start + n` on the CPU again (the same values)
+    /// and returns its wall: the share calibration's CPU price.
+    pub(crate) fn zc_k_wait(
+        job: ZcKJob,
+        hi_size: usize,
+        cpu_ms: f64,
+        cpu_replay: &dyn Fn(usize, usize) -> f64,
+    ) -> ZcKResult {
         use std::sync::atomic::Ordering;
         let debug = super::gpu_zc_k_debug();
         let gpu = match gpu() {
@@ -24782,8 +24991,21 @@ kernel void zc_ab_finish(
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let gpu_ms = if ok.is_ok() { zc_fold_gpu_wall_ms(gpu, job.cb) } else { 0.0 };
             gpu.release(job.cb);
-            for v in job.views {
-                gpu.release(v);
+            // The share calibration's replays read the views: then they are
+            // released after it, else here, as before.
+            // Once per process: an oracle probe repeated after a b-one
+            // fallback (possibly in a timed prove) keeps the first price.
+            let calibrate = ok.is_ok()
+                && job.calibration
+                && zc_k_calib_active()
+                && super::ZC_K_TUNED.load(Ordering::Relaxed) == usize::MAX;
+            let release_views = |views: [Id; 2]| {
+                for v in views {
+                    gpu.release(v);
+                }
+            };
+            if !calibrate {
+                release_views(job.views);
             }
             if let Err(e) = ok {
                 ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
@@ -24793,17 +25015,27 @@ kernel void zc_ab_finish(
                 return ZcKResult::Failed;
             }
             let Some(state_mutex) = ZC_K_STATE.get().and_then(|s| s.as_ref()) else {
+                if calibrate {
+                    release_views(job.views);
+                }
                 ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
                 return ZcKResult::Failed;
             };
             let state = match state_mutex.lock() {
                 Ok(s) => s,
                 Err(_) => {
+                    if calibrate {
+                        release_views(job.views);
+                    }
                     note_poisoned_lock("zc-k wait", false);
                     ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
                     return ZcKResult::Failed;
                 }
             };
+            if calibrate {
+                zc_k_calibrate(gpu, &state, &job, gpu_ms, cpu_ms, hi_size, cpu_replay);
+                release_views(job.views);
+            }
             let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 8]>();
             let parts: Vec<[F128; 8]> = std::slice::from_raw_parts(parts, job.chunks).to_vec();
             let a = gpu.buffer_contents(state.out_a).cast::<F128>().cast_const();
@@ -24814,7 +25046,7 @@ kernel void zc_ab_finish(
                 let fired = ZC_K_FIRED.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!(
                     "[zc-k-gpu] fired: GPU prefix {}/{hi_size} K chunks (CPU folded {}), gpu={gpu_ms:.2}ms \
-                     submit-to-drain={:.2}ms wait={wait_ms:.3}ms fired_proves={fired}",
+                     submit-to-drain={:.2}ms wait={wait_ms:.3}ms cpu_queue={cpu_ms:.2}ms fired_proves={fired}",
                     job.chunks,
                     hi_size - job.chunks,
                     job.submitted.elapsed().as_secs_f64() * 1e3,
@@ -29815,6 +30047,22 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(zc_r2_gate_share(f64::NAN, 2048), 0);
         assert_eq!(zc_r2_gate_share(0.0, 2048), 0);
         assert_eq!(zc_r2_gate_share(-1.0, 2048), 0);
+    }
+
+    #[test]
+    fn zc_share_calib_policy() {
+        // K: hi/(1+ratio) in whole 5+6 chunks (4 K chunks), clamped to
+        // [hi/16, 7hi/8], never 0; unusable ratios keep the constant (None).
+        assert_eq!(zc_k_calib_share(1.0, 2048), Some(1024));
+        assert_eq!(zc_k_calib_share(1.26, 2048), Some(908)); // 906.2 -> 227 x 4
+        assert_eq!(zc_k_calib_share(5.3, 2048), Some(324)); // 325.1 -> 81 x 4
+        assert_eq!(zc_k_calib_share(0.1, 2048), Some(1792)); // ceiling
+        assert_eq!(zc_k_calib_share(20.0, 2048), Some(128)); // floor
+        assert_eq!(zc_k_calib_share(f64::NAN, 2048), None);
+        assert_eq!(zc_k_calib_share(f64::INFINITY, 2048), None);
+        assert_eq!(zc_k_calib_share(0.0, 2048), None);
+        assert_eq!(zc_k_calib_share(-1.0, 2048), None);
+        assert_eq!(zc_k_calib_probe(2048), 1792);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
