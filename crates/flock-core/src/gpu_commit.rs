@@ -402,11 +402,8 @@ pub const ENV_NO_LC_GPU_WAKE: &str = "FLOCK_NO_LC_GPU_WAKE";
 /// (a buffer that errors never signals and is caught by the status poll).
 pub const ENV_NO_GPU_DONE_EVENT: &str = "FLOCK_NO_GPU_DONE_EVENT";
 
-/// Kill switch for the signal hand-over at three critical joins
 /// (`FLOCK_NO_JOIN_SIGNAL=1`: each waits for the command buffer's completed
 /// status, as before, and arms no signal). The commit's cb3 join (a blocking
-/// wait), the round-one AB prefix join and the K pass prefix join (status
-/// spins) saw completion about 150 us after the GPU's last work (the status
 /// flips through a completion-handler round trip, as does
 /// `waitUntilCompleted`). Their buffers now arm the record's completion
 /// signal behind their last encoder (see [`ENV_NO_GPU_DONE_EVENT`]) and the
@@ -26618,6 +26615,7 @@ kernel void zc_t3_products(
         cb: Id,
         pub chunks: usize,
         calibration: bool,
+        sig: Option<DoneSig>,
         submitted: std::time::Instant,
     }
 
@@ -26651,7 +26649,8 @@ kernel void zc_t3_products(
         deltas_buf: Id,
         chunks: usize,
         lo_size: usize,
-    ) -> Result<Id, String> {
+        arm: bool,
+    ) -> Result<(Id, Option<DoneSig>), String> {
         unsafe {
             #[repr(C)]
             struct P {
@@ -26678,9 +26677,10 @@ kernel void zc_t3_products(
             gpu.set_bytes(enc, pb, 6);
             gpu.dispatch(enc, chunks as u64, 256);
             gpu.end_encoding(enc);
+            let sig = if arm { gpu.arm_done(cb) } else { None };
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
-            Ok(cb)
+            Ok((cb, sig))
         }
     }
 
@@ -26809,11 +26809,21 @@ kernel void zc_t3_products(
             )
             .ok()?;
             let deltas_buf = zc_t3_wrap(&mut state, gpu, deltas.as_ptr(), deltas.len()).ok()?;
-            let cb = zc_t3_submit(gpu, &state, anchors_buf, deltas_buf, chunks, lo_size).ok()?;
+            let (cb, sig) = zc_t3_submit(
+                gpu,
+                &state,
+                anchors_buf,
+                deltas_buf,
+                chunks,
+                lo_size,
+                super::join_signal_enabled(),
+            )
+            .ok()?;
             Some(ZcT3Job {
                 cb,
                 chunks,
                 calibration,
+                sig,
                 submitted: std::time::Instant::now(),
             })
         }
@@ -26839,8 +26849,15 @@ kernel void zc_t3_products(
         };
         unsafe {
             // Balanced split ⇒ the GPU is normally already complete when the
-            // CPU worker reaches this join; bounded spin dodges the park.
-            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+            let ok = if job.calibration || !super::join_signal_enabled() {
+                gpu.spin_wait_cb(job.cb, 2.0)
+            } else {
+                gpu.join_cb_sig(job.cb, job.sig.as_ref(), 2.0)
+            };
+            if ok.is_ok() {
+                Gpu::recycle_done(job.sig);
+            }
+            if ok.is_err() {
                 return poison(job.cb);
             }
             let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
@@ -26904,8 +26921,8 @@ kernel void zc_t3_products(
             {
                 let lo_size = state.eq_lo_cap / 16;
                 while n_walls < walls.len() {
-                    let Ok(cb2) =
-                        zc_t3_submit(gpu, &state, anchors_buf, deltas_buf, job.chunks, lo_size)
+                    let Ok((cb2, _)) =
+                        zc_t3_submit(gpu, &state, anchors_buf, deltas_buf, job.chunks, lo_size, false)
                     else {
                         break;
                     };
@@ -27304,6 +27321,7 @@ kernel void zc_loop_products(
         cb: Id,
         pub chunks: usize,
         calibration: bool,
+        sig: Option<DoneSig>,
         lo_size: usize,
         submitted: std::time::Instant,
     }
@@ -27335,7 +27353,8 @@ kernel void zc_loop_products(
         b_buf: Id,
         chunks: usize,
         lo_size: usize,
-    ) -> Result<Id, String> {
+        arm: bool,
+    ) -> Result<(Id, Option<DoneSig>), String> {
         unsafe {
             #[repr(C)]
             struct P {
@@ -27362,9 +27381,10 @@ kernel void zc_loop_products(
             gpu.set_bytes(enc, pb, 6);
             gpu.dispatch(enc, chunks as u64, 256);
             gpu.end_encoding(enc);
+            let sig = if arm { gpu.arm_done(cb) } else { None };
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
-            Ok(cb)
+            Ok((cb, sig))
         }
     }
 
@@ -27503,11 +27523,13 @@ kernel void zc_loop_products(
                 zc_loop_wrap(&mut state, gpu, a.as_ptr().cast::<u8>(), a.len() * 16).ok()?;
             let b_buf =
                 zc_loop_wrap(&mut state, gpu, b.as_ptr().cast::<u8>(), b.len() * 16).ok()?;
-            let cb = zc_loop_submit(gpu, &state, a_buf, b_buf, chunks, lo_size).ok()?;
+            let (cb, sig) =
+                zc_loop_submit(gpu, &state, a_buf, b_buf, chunks, lo_size, super::join_signal_enabled()).ok()?;
             Some(ZcLoopJob {
                 cb,
                 chunks,
                 calibration,
+                sig,
                 lo_size,
                 submitted: std::time::Instant::now(),
             })
@@ -27533,7 +27555,15 @@ kernel void zc_loop_products(
             ZcLoopResult::Failed
         };
         unsafe {
-            if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
+            let ok = if job.calibration || !super::join_signal_enabled() {
+                gpu.spin_wait_cb(job.cb, 2.0)
+            } else {
+                gpu.join_cb_sig(job.cb, job.sig.as_ref(), 2.0)
+            };
+            if ok.is_ok() {
+                Gpu::recycle_done(job.sig);
+            }
+            if ok.is_err() {
                 return poison(job.cb);
             }
             let first_wall = zc_fold_gpu_wall_ms(gpu, job.cb);
@@ -27594,8 +27624,8 @@ kernel void zc_loop_products(
                 (state.wraps.first(), state.wraps.get(1))
             {
                 while n_walls < walls.len() {
-                    let Ok(cb2) =
-                        zc_loop_submit(gpu, &state, a_buf, b_buf, job.chunks, job.lo_size)
+                    let Ok((cb2, _)) =
+                        zc_loop_submit(gpu, &state, a_buf, b_buf, job.chunks, job.lo_size, false)
                     else {
                         break;
                     };
