@@ -99,9 +99,6 @@ pub fn pool_spin_release() {
 /// idle round ends in the kernel yield Rayon's own idle loop makes, instead of
 /// the scalar churn, so a runnable thread (Metal's submit thread, the proving
 /// thread) gets a core as quickly as it does from an idle Rayon worker today.
-/// Three workers (the one the spin never included and two more) leave the
-/// spin here and park as before, so the spinners never occupy the cores of
-/// Metal's two service threads and the proving thread. Scheduling
 /// only: the same jobs, run by the same pool. `FLOCK_NO_HOT_PROVE=1` restores
 /// the release at this point.
 pub fn pool_spin_witness_done() {
@@ -243,13 +240,7 @@ mod imp {
         true
     }
 
-    /// Cores the hot-prove spin leaves alone: one each for Metal's submit
-    /// thread, Metal's completion thread and the proving thread, the three
-    /// threads besides the pool's workers that run on performance cores
-    /// during a prove. The workers with the highest indices (the one the
-    /// spin never included, and two more) park as before, so spinners plus
-    /// those three never exceed the pool's width.
-    const HOT_PROVE_RESERVED: usize = 3;
+    const HOT_PROVE_RESERVED: usize = 2;
 
     fn pool_spin_body(deadline: Instant, leaves_at_witness: bool) {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
