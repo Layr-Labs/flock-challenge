@@ -1072,6 +1072,154 @@ fn lc_tile_rows_enabled() -> bool {
     *ON
 }
 
+/// Kill switch: exactly `FLOCK_NO_LC_TABLE_REGS=1` builds the oblock drain's
+/// per-stripe sum tables through [`build_sum_table`] (the doubling that reads
+/// back every earlier entry); otherwise [`build_sum_table_regs`] writes the
+/// same 256 entries from registers. Read once per process (a plain atomic,
+/// no lazy-cell instance).
+fn lc_table_regs_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0: not read yet, 1: on, 2: off.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("FLOCK_NO_LC_TABLE_REGS").as_deref() != Some(std::ffi::OsStr::new("1"));
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// [`build_sum_table`] written from registers: `table[b]` is the XOR of
+/// `eq8[r]` over the set bits `r` of `b`. The sixteen sums of `eq8[0..4]` stay
+/// in registers; the sixteen rows of sixteen entries (high nibble `g`, row
+/// base `16g`) are visited in Gray-code order of `g`, so each row's high sum
+/// is the previous one plus one `eq8[4 + i]`, and each entry is one XOR and
+/// one store. Nothing is read back from the table. F128 addition is XOR, so
+/// every entry is the same field element the doubling builds.
+///
+/// # Safety
+/// `eq8` must be valid for 8 reads and `table` for 256 writes.
+#[inline(never)]
+unsafe fn build_sum_table_regs(eq8: *const F128, table: *mut F128) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let ld = |i: usize| vld1q_u64(eq8.add(i).cast::<u64>());
+        let x = |a: uint64x2_t, b: uint64x2_t| veorq_u64(a, b);
+        let (e0, e1, e2, e3) = (ld(0), ld(1), ld(2), ld(3));
+        let (e4, e5, e6, e7) = (ld(4), ld(5), ld(6), ld(7));
+        let l1 = e0;
+        let l2 = e1;
+        let l3 = x(e0, e1);
+        let l4 = e2;
+        let l5 = x(e2, l1);
+        let l6 = x(e2, l2);
+        let l7 = x(e2, l3);
+        let l8 = e3;
+        let l9 = x(e3, l1);
+        let l10 = x(e3, l2);
+        let l11 = x(e3, l3);
+        let l12 = x(e3, l4);
+        let l13 = x(e3, l5);
+        let l14 = x(e3, l6);
+        let l15 = x(e3, l7);
+        let st = |i: usize, v: uint64x2_t| vst1q_u64(table.add(i).cast::<u64>(), v);
+        // Row 0: the low sums themselves.
+        st(0, vdupq_n_u64(0));
+        st(1, l1);
+        st(2, l2);
+        st(3, l3);
+        st(4, l4);
+        st(5, l5);
+        st(6, l6);
+        st(7, l7);
+        st(8, l8);
+        st(9, l9);
+        st(10, l10);
+        st(11, l11);
+        st(12, l12);
+        st(13, l13);
+        st(14, l14);
+        st(15, l15);
+        macro_rules! row {
+            ($g:expr, $h:expr) => {{
+                let h = $h;
+                let base = 16 * $g;
+                st(base, h);
+                st(base + 1, x(l1, h));
+                st(base + 2, x(l2, h));
+                st(base + 3, x(l3, h));
+                st(base + 4, x(l4, h));
+                st(base + 5, x(l5, h));
+                st(base + 6, x(l6, h));
+                st(base + 7, x(l7, h));
+                st(base + 8, x(l8, h));
+                st(base + 9, x(l9, h));
+                st(base + 10, x(l10, h));
+                st(base + 11, x(l11, h));
+                st(base + 12, x(l12, h));
+                st(base + 13, x(l13, h));
+                st(base + 14, x(l14, h));
+                st(base + 15, x(l15, h));
+            }};
+        }
+        // Gray-code order of the high nibble: 1, 3, 2, 6, 7, 5, 4, 12, 13,
+        // 15, 14, 10, 11, 9, 8; `h` is the sum of `eq8[4..8]` over `g`'s bits.
+        let mut h = e4;
+        row!(1, h);
+        h = x(h, e5);
+        row!(3, h);
+        h = x(h, e4);
+        row!(2, h);
+        h = x(h, e6);
+        row!(6, h);
+        h = x(h, e4);
+        row!(7, h);
+        h = x(h, e5);
+        row!(5, h);
+        h = x(h, e4);
+        row!(4, h);
+        h = x(h, e7);
+        row!(12, h);
+        h = x(h, e4);
+        row!(13, h);
+        h = x(h, e5);
+        row!(15, h);
+        h = x(h, e4);
+        row!(14, h);
+        h = x(h, e6);
+        row!(10, h);
+        h = x(h, e4);
+        row!(11, h);
+        h = x(h, e5);
+        row!(9, h);
+        h = x(h, e4);
+        row!(8, h);
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn build_sum_table_regs_matches_doubling() {
+    let mut s = 0x51ab_1e5e_ed00_c0deu64;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    for _ in 0..64 {
+        let eq8: Vec<F128> = (0..8).map(|_| F128::new(next(), next())).collect();
+        let mut want = vec![F128::ZERO; 256];
+        build_sum_table(&eq8, &mut want);
+        let mut got = vec![F128::new(next(), next()); 256];
+        unsafe { build_sum_table_regs(eq8.as_ptr(), got.as_mut_ptr()) };
+        assert_eq!(got, want);
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64", target_feature = "sha3"))]
 #[test]
 fn block16_tile_rows_match_per_block_kernel() {
@@ -1544,6 +1692,9 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // block); decided once per fold.
     #[cfg(target_feature = "sha3")]
     let tile_rows = block16 && lc_tile_rows_enabled();
+    // The tables from registers (`FLOCK_NO_LC_TABLE_REGS=1` keeps the
+    // doubling); decided once per fold.
+    let table_regs = lc_table_regs_enabled();
     let fold_tiles = |partial: *mut F128, tile_lo: usize, tile_hi: usize| {
         // TILE_T × 256 F128 tables, L1-resident on stack, built once per tile.
         let mut tables_uninit = core::mem::MaybeUninit::<[[F128; 256]; TILE_T]>::uninit();
@@ -1559,7 +1710,13 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
                         256,
                     )
                 };
-                build_sum_table(&eq_outer[eq_off..eq_off + 8], table_t);
+                let eq8 = &eq_outer[eq_off..eq_off + 8];
+                if table_regs {
+                    // SAFETY: `eq8` holds 8 entries and `table_t` 256.
+                    unsafe { build_sum_table_regs(eq8.as_ptr(), table_t.as_mut_ptr()) };
+                } else {
+                    build_sum_table(eq8, table_t);
+                }
             }
             let z_base = unsafe { z_packed.as_ptr().add(stripe_base * k) };
             let mut bs = 0usize;

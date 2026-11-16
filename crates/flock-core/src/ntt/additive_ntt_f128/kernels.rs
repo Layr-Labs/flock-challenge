@@ -356,6 +356,35 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     }
 }
 
+/// All row groups of one block of the deep subtree's radix-8 lead (see
+/// `AdditiveNttF128::try_deep_radix8_lead`) through the AArch64 vector rows,
+/// in a function of their own so the existing callers of
+/// [`butterfly_fused_3layer_rows`] compile as before. Writes nothing and
+/// returns `false` when the vector rows are off (the caller has checked
+/// [`vector_resident_rows`] first, so this does not happen there).
+///
+/// # Safety
+/// As [`butterfly_fused_3layer_rows`] over rows `0..eighth`; with
+/// `zero_root`, also `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_3layer_lead_rows(ptr, eighth, num_ntts, twiddles, zero_root);
+            return true;
+        }
+    }
+    let _ = (ptr, eighth, num_ntts, twiddles, zero_root);
+    false
+}
+
 /// Whether the AArch64 vector-resident radix-8 row kernels are used.
 ///
 /// `FLOCK_NO_NTT_NEON_ROWS=1` restores the portable `F128`-typed chain in the
