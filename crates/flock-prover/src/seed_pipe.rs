@@ -1512,6 +1512,7 @@ fn speculative_main(
     let line = read_line_fd(real_stdin);
     flock_core::tmark::reset();
     flock_core::tmark::mark("seed read");
+    flock_core::diagx::seed_read();
 
     // The seed's first byte has arrived: this thread is about to forward it and
     // start the speculative prove. Signal the CPU keep-alive down immediately —
