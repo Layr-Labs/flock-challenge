@@ -831,15 +831,6 @@ where
     drop(guard);
 }
 
-/// [`run_hetero_chunks`] whose main-pool workers each run `after` once their
-/// claim loop finds the queue exhausted, while the others are still on their
-/// last chunks; returns once every chunk and every `after` has run.
-/// Efficiency-core helpers run chunks only. Scheduling only: every chunk
-/// index is still claimed exactly once from the same cursor.
-pub(crate) fn run_hetero_chunks_then(n_chunks: usize, f: &(dyn Fn(usize) + Sync), after: &(dyn Fn() + Sync)) {
-    run_chunks_with_helper_arm_after(n_chunks, &f, epool(), detached_enabled(), &after);
-}
-
 /// [`run_hetero_chunks`] plus one caller-thread tail job: the calling thread
 /// drains the shared queue like every other main worker, and the moment its
 /// own claim loop finds the queue exhausted it runs `tail` while the other
