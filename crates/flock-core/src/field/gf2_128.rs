@@ -54,17 +54,43 @@ impl F128 {
         ghash_mul_unreduced(self, rhs)
     }
 
-    /// Multiplicative inverse via Fermat: x^{2^128 − 2}.
-    /// Used in one-time setup (Lagrange weight computation), not in hot paths.
+    /// Multiplicative inverse x^{2^128 - 2}; zero maps to zero as before.
+    /// Used by setup and challenge-dependent interpolation/normalization.
     pub fn inv(self) -> Self {
-        // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
-        let mut r = Self::ONE;
-        let mut cur = self * self; // x^2
-        for _ in 1..128 {
-            r *= cur;
-            cur = cur * cur;
+        static CHAIN: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_F128_INV_CHAIN").is_none()
+        });
+        if !*CHAIN {
+            let mut r = Self::ONE;
+            let mut cur = self * self;
+            for _ in 1..128 {
+                r *= cur;
+                cur = cur * cur;
+            }
+            return r;
         }
-        r
+        #[inline(always)]
+        fn square_n(mut value: F128, n: usize) -> F128 {
+            for _ in 0..n {
+                value = value * value;
+            }
+            value
+        }
+        // t_n = x^(2^n - 1). Joining a and b uses
+        // t_(a+b) = t_a^(2^b) * t_b. The addition chain for 127
+        // takes ten nonsquaring products and 126 squarings; the final
+        // square gives x^(2^128 - 2). All steps also preserve zero.
+        let t2 = square_n(self, 1) * self;
+        let t3 = square_n(t2, 1) * self;
+        let t6 = square_n(t3, 3) * t3;
+        let t7 = square_n(t6, 1) * self;
+        let t14 = square_n(t7, 7) * t7;
+        let t28 = square_n(t14, 14) * t14;
+        let t56 = square_n(t28, 28) * t28;
+        let t63 = square_n(t56, 7) * t7;
+        let t126 = square_n(t63, 63) * t63;
+        let t127 = square_n(t126, 1) * self;
+        square_n(t127, 1)
     }
 }
 
@@ -338,6 +364,39 @@ mod tests {
             acc ^= a.mul_unreduced(*b);
         }
         assert_eq!(direct, acc.reduce());
+    }
+
+    #[test]
+    fn inverse_chain_matches_original_fermat() {
+        fn reference(x: F128) -> F128 {
+            let mut r = F128::ONE;
+            let mut cur = x * x;
+            for _ in 1..128 {
+                r *= cur;
+                cur = cur * cur;
+            }
+            r
+        }
+        let mut rng = Rng::new(0x494e_5643_4841_494e);
+        let mut cases = vec![
+            F128::ZERO,
+            F128::ONE,
+            F128::new(u64::MAX, u64::MAX),
+            F128::new(0x87, 1 << 63),
+        ];
+        for bit in 0..128 {
+            cases.push(if bit < 64 {
+                F128::new(1 << bit, 0)
+            } else {
+                F128::new(0, 1 << (bit - 64))
+            });
+        }
+        cases.extend((0..512).map(|_| rng.next_f128()));
+        for value in cases {
+            let actual = value.inv();
+            assert_eq!(actual, reference(value), "value {value:?}");
+            assert_eq!(value * actual, if value.is_zero() { F128::ZERO } else { F128::ONE });
+        }
     }
 
     #[test]
