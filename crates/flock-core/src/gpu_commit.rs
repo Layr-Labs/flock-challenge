@@ -23384,7 +23384,9 @@ kernel void zc_ab_finish(
             ZC_K_V2_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
             if super::zc_k_v2_enabled() && fold.is_ok() {
                 let v2 = (|| -> Result<Id, String> {
-                    let src = api.nsstring(ZC_K_V2_MSL_SOURCE)?;
+                    // Lean K fold (`FLOCK_NO_ZC_K_LEAN=1` restores the v2 text).
+                    let lean = std::env::var_os("FLOCK_NO_ZC_K_LEAN").as_deref() != Some(std::ffi::OsStr::new("1"));
+                    let src = api.nsstring(if lean { include_str!("gpu_commit/k_lean.metal") } else { ZC_K_V2_MSL_SOURCE })?;
                     let mut err: Id = NIL;
                     let lib: Id = send!(
                         api,
