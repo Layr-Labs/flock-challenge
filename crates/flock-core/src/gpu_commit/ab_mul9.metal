@@ -1,22 +1,19 @@
-// Each aligned plane contains eight radix-16 coefficients. Their integer
-// product has coefficients at most eight, so no carry crosses a digit.
-static inline ulong clmul_plane_pair(uint a0, uint a1, uint b0, uint b1) {
-    const ulong MASK = 0x1111111111111111UL;
-    ulong p0 = (ulong(a0) * ulong(b0)) & MASK;
-    ulong p2 = (ulong(a1) * ulong(b1)) & MASK;
-    ulong pm = (ulong(a0 ^ a1) * ulong(b0 ^ b1)) & MASK;
-    return p0 ^ ((pm ^ p0 ^ p2) << 1) ^ (p2 << 2);
+static inline uint ab_clmul16_leaf(uint a0, uint a1, uint a2, uint b0, uint b1, uint b2) {
+    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
+    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
+    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+    return r0 | r1 | r2;
 }
 
-// Two Karatsuba levels use nine integer products. The result ends at bit 62.
 static inline ulong clmul32(uint a, uint b) {
-    const uint MASK = 0x11111111u;
-    uint a0 = a & MASK, a1 = (a >> 1) & MASK;
-    uint a2 = (a >> 2) & MASK, a3 = (a >> 3) & MASK;
-    uint b0 = b & MASK, b1 = (b >> 1) & MASK;
-    uint b2 = (b >> 2) & MASK, b3 = (b >> 3) & MASK;
-    ulong lo = clmul_plane_pair(a0, a1, b0, b1);
-    ulong hi = clmul_plane_pair(a2, a3, b2, b3);
-    ulong mid = clmul_plane_pair(a0 ^ a2, a1 ^ a3, b0 ^ b2, b1 ^ b3);
-    return lo ^ ((mid ^ lo ^ hi) << 2) ^ (hi << 4);
+    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    uint ah = a >> 16, bh = b >> 16;
+    uint al0 = a & m0, al1 = a & m1, al2 = a & m2;
+    uint ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    uint bl0 = b & m0, bl1 = b & m1, bl2 = b & m2;
+    uint bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = ab_clmul16_leaf(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = ab_clmul16_leaf(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = ab_clmul16_leaf(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
+    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
 }
