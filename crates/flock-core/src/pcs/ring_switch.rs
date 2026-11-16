@@ -2040,27 +2040,6 @@ fn compose_x_ladder_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_COMPOSE_X_LADDER").is_none())
 }
 
-/// Roll back the composed-byte-bank expansion without changing its generators.
-fn compose_nibble_join_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_COMPOSE_NIBBLE_JOIN").is_none())
-}
-
-/// The low and high nibbles select disjoint subsets of these eight generators.
-/// Their XOR gives every byte entry directly, without output-parent loads.
-#[inline(never)]
-fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
-    debug_assert_eq!(g.len(), 8);
-    debug_assert_eq!(out.len(), 256);
-    let low = subset_sums_4([g[0], g[1], g[2], g[3]]);
-    let high = subset_sums_4([g[4], g[5], g[6], g[7]]);
-    for (row, &h) in out.chunks_exact_mut(16).zip(&high) {
-        for (slot, &l) in row.iter_mut().zip(&low) {
-            *slot = l + h;
-        }
-    }
-}
-
 /// Compose the fold byte table with a fixed field multiplier: fills `out`
 /// (length [`FOLD_TABLE_LEN`]) with a table `C` such that
 ///
@@ -2114,20 +2093,16 @@ fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128]
             *gb = fold_one_slot(e_b * e_hi, base);
         }
     }
-    // Per byte position: subset-sum doubling is the rollback. The default
-    // joins two four-bit subset tables and writes all entries directly.
-    let nibble_join = compose_nibble_join_enabled();
+    // Per byte position: subset-sum doubling over that byte's 8 generators.
+    // Every entry is written exactly once (t[0] = 0, then each doubling round
+    // writes the upper half from the lower).
     for k in 0..FOLD_N_BYTES {
         let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
-        if nibble_join {
-            fill_composed_byte_bank(&g[k * 8..k * 8 + 8], t);
-        } else {
-            t[0] = F128::ZERO;
-            for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
-                let half = 1usize << bit;
-                for v in 0..half {
-                    t[v + half] = t[v] + gv;
-                }
+        t[0] = F128::ZERO;
+        for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
+            let half = 1usize << bit;
+            for v in 0..half {
+                t[v + half] = t[v] + gv;
             }
         }
     }
@@ -4018,43 +3993,6 @@ mod tests {
                         "trial={trial} byte={byte} value={value}",
                     );
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn composed_nibble_join_matches_bit_scan_and_doubling() {
-        let mut rng = Rng::new(0x4e49_424a_4f49_4e53);
-        for trial in 0..160usize {
-            let generators: [F128; 8] = if trial < 128 {
-                let mut basis = [F128::ZERO; 8];
-                basis[trial % 8] = if trial < 64 {
-                    F128::new(1 << (trial % 64), 0)
-                } else {
-                    F128::new(0, 1 << (trial % 64))
-                };
-                basis
-            } else {
-                core::array::from_fn(|_| rng.f128())
-            };
-            let mut joined = [F128::new(u64::MAX, u64::MAX); 256];
-            fill_composed_byte_bank(&generators, &mut joined);
-            let mut doubled = [F128::ZERO; 256];
-            for (bit, &generator) in generators.iter().enumerate() {
-                let half = 1usize << bit;
-                for value in 0..half {
-                    doubled[value + half] = doubled[value] + generator;
-                }
-            }
-            assert_eq!(joined, doubled, "doubling trial={trial}");
-            for byte in 0..256 {
-                let mut expected = F128::ZERO;
-                for (bit, &generator) in generators.iter().enumerate() {
-                    if byte & (1 << bit) != 0 {
-                        expected += generator;
-                    }
-                }
-                assert_eq!(joined[byte], expected, "trial={trial} byte={byte}");
             }
         }
     }
