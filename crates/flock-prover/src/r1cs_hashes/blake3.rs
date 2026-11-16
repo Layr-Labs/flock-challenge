@@ -5281,6 +5281,13 @@ impl Blake3Setup {
             // it, so the P cluster is never idle between the warm-up tail and
             // the seed. The start below is then a no-op.
             // `FLOCK_NO_PARK_KEEPALIVE=1` restores the incumbent order.
+            // Diagnostic cool-down arms: idle here, after every untimed
+            // warm-up step and before the keep-alive and the ready file.
+            if crate::seed_pipe::is_ranked_worker() {
+                if let Some(ms) = flock_core::diagx::cool_ms() {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+            }
             if crate::seed_pipe::is_ranked_worker() && crate::seed_pipe::park_keepalive_enabled() {
                 flock_core::cpu_keepalive::keepalive_start();
             }
@@ -5331,6 +5338,9 @@ impl Blake3Setup {
         );
         let out = setup.prove_fast_inner(blocks, &mut challenger);
         flock_core::cpu_keepalive::pool_spin_release();
+        // Diagnostic run: return late, at the time that encodes this worker's
+        // arm and its seed read -> prove end time (`flock_core::diagx`).
+        flock_core::diagx::hold();
         out
     }
 

@@ -1,0 +1,183 @@
+//! Diagnostic channel for one official run (not a candidate).
+//!
+//! Each ranked worker picks one arm from the wall clock, applies the arm's
+//! environment settings before anything reads them, and returns its proof
+//! late: at `seed read + BASE + arm * WIDTH + (prove - LO)` ms, where `prove`
+//! is its own seed read -> prove end time. The published trial times then
+//! decode into (arm, prove time) pairs, so every arm gets readings on the
+//! official runner, interleaved in time with the others. Arm 0 returns at
+//! `seed read + BASE` and calibrates the harness-side constant.
+//!
+//! The channel idea is patternrecognition9-del's and newjordan's, as used by
+//! 0xArion (`29a3e16b`, `d4c5ba19`); this file is Meganpark980320's
+//! `8caa7f18` channel with this run's arms and a wider window.
+//!
+//! Nothing here changes prover arithmetic: the arms only set the record's own
+//! kill switches and the Rayon thread count, and the hold is a sleep after the
+//! proof is complete.
+
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+pub const BASE_MS: u64 = 110;
+pub const LO_MS: u64 = 76;
+pub const WIDTH_MS: u64 = 40;
+pub const GUARD_MS: u64 = 6;
+pub const SLOT_SECS: u64 = 6;
+/// Typical seed read -> prove end of the record on the runner (ms); sizes the
+/// start-pause cut only.
+pub const TYPICAL_MS: u64 = 87;
+
+/// Arms: name and the environment settings applied for the whole process.
+pub const ARMS: [(&str, &[(&str, &str)]); 8] = [
+    ("zero (calibration)", &[]),
+    ("base (record settings)", &[]),
+    ("zerocheck GPU arms off", &[("FLOCK_NO_GPU_ZEROCHECK", "1")]),
+    ("Rayon 12 threads", &[("RAYON_NUM_THREADS", "12")]),
+    (
+        "wait spins off",
+        &[
+            ("FLOCK_NO_HYBRID_CB2_SPIN", "1"),
+            ("FLOCK_NO_RECMERKLE_SPIN", "1"),
+            ("FLOCK_NO_ZCFOLD_SPIN", "1"),
+            ("FLOCK_NO_POOL_SPIN", "1"),
+        ],
+    ),
+    ("250 ms of the start pause moved after the warm-up", &[(COOL_ENV, "250")]),
+    ("450 ms of the start pause moved after the warm-up", &[(COOL_ENV, "450")]),
+    ("650 ms of the start pause moved after the warm-up", &[(COOL_ENV, "650")]),
+];
+
+/// Cool-down arms: the worker takes this many ms out of its start pause and
+/// sleeps them instead at the end of the untimed warm-up, before the
+/// keep-alive is lit and before the ready file is written. Its wall cycle is
+/// unchanged.
+pub const COOL_ENV: &str = "FLOCK_DIAG_COOL_MS";
+
+/// The cool-down of this worker, if its arm sets one.
+pub fn cool_ms() -> Option<u64> {
+    std::env::var(COOL_ENV).ok().and_then(|v| v.parse().ok())
+}
+
+/// 28 six-second slots: base 8, zero 2, each other arm 3, interleaved.
+pub const ROUND: [usize; 28] =
+    [1, 2, 3, 1, 4, 5, 1, 6, 7, 0, 1, 2, 3, 1, 4, 5, 1, 6, 7, 0, 1, 2, 3, 4, 1, 5, 6, 7];
+
+const NONE: usize = usize::MAX;
+static ARM: AtomicUsize = AtomicUsize::new(NONE);
+static SEED_NS: AtomicU64 = AtomicU64::new(0);
+
+fn clock_ns() -> u64 {
+    static T0: OnceLock<Instant> = OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_nanos() as u64 + 1
+}
+
+/// The arm of a wall-clock time in whole seconds.
+pub fn arm_for_secs(secs: u64) -> usize {
+    ROUND[((secs / SLOT_SECS) % ROUND.len() as u64) as usize]
+}
+
+/// Extra time an arm's worker spends after a typical prove, in ms.
+pub fn extra_hold_ms(arm: usize) -> u64 {
+    let planned = if arm == 0 { BASE_MS } else { BASE_MS + arm as u64 * WIDTH_MS + (TYPICAL_MS - LO_MS) };
+    planned.saturating_sub(TYPICAL_MS)
+}
+
+/// Picks this worker's arm and applies its settings. Must run first in the
+/// worker, before any thread exists and before any setting is read. Returns
+/// the start-pause cut, so each worker's wall cycle stays the record's.
+pub fn init(ranked_worker: bool) -> Duration {
+    if !ranked_worker {
+        return Duration::ZERO;
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let arm = arm_for_secs(secs);
+    for (name, value) in ARMS[arm].1 {
+        // SAFETY: called first thing in the worker's `main` (via
+        // `init_perf_thread_pool`), before any other thread exists.
+        unsafe { std::env::set_var(name, value) };
+    }
+    let _ = clock_ns();
+    ARM.store(arm, Ordering::SeqCst);
+    Duration::from_millis(extra_hold_ms(arm) + cool_ms().unwrap_or(0))
+}
+
+/// The seed line has arrived.
+pub fn seed_read() {
+    if ARM.load(Ordering::Relaxed) != NONE {
+        SEED_NS.store(clock_ns(), Ordering::SeqCst);
+    }
+}
+
+/// Offset (ms past `BASE + arm * WIDTH`) that encodes a prove time.
+pub fn offset_ms(arm: usize, prove_ms: f64) -> f64 {
+    if arm == 0 {
+        return 0.0;
+    }
+    let lo = LO_MS as f64;
+    let top = (WIDTH_MS - GUARD_MS) as f64;
+    if prove_ms < lo {
+        top + 1.0
+    } else if prove_ms - lo >= top {
+        top + 3.0
+    } else {
+        prove_ms - lo
+    }
+}
+
+/// Holds the calling thread until this worker's encoded return time. Called
+/// once, after the proof is complete and before it is returned.
+pub fn hold() {
+    let arm = ARM.load(Ordering::SeqCst);
+    let seed = SEED_NS.load(Ordering::SeqCst);
+    if arm == NONE || seed == 0 {
+        return;
+    }
+    let prove_ms = (clock_ns() - seed) as f64 / 1e6;
+    let target_ms = (BASE_MS + arm as u64 * WIDTH_MS) as f64 + offset_ms(arm, prove_ms);
+    let target = seed + (target_ms * 1e6) as u64;
+    loop {
+        let now = clock_ns();
+        if now >= target {
+            break;
+        }
+        let left = target - now;
+        if left > 2_000_000 {
+            std::thread::sleep(Duration::from_nanos(left - 1_500_000));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_counts_and_cut_fit_the_pause() {
+        let mut n = [0usize; 8];
+        for a in ROUND {
+            n[a] += 1;
+        }
+        assert_eq!(n, [2, 8, 3, 3, 3, 3, 3, 3]);
+        for a in 0..ARMS.len() {
+            assert!(extra_hold_ms(a) + 650 < 1300);
+        }
+    }
+
+    #[test]
+    fn offsets_stay_inside_their_window() {
+        for a in 1..ARMS.len() {
+            for p in [60.0, 76.0, 90.0, 109.9, 110.0, 140.0] {
+                let o = offset_ms(a, p);
+                assert!((0.0..WIDTH_MS as f64).contains(&o));
+            }
+        }
+        assert_eq!(offset_ms(0, 90.0), 0.0);
+    }
+}
