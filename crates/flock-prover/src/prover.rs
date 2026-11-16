@@ -2752,6 +2752,9 @@ fn commit_with_round1_ab_precompute(
     );
 
     flock_core::tmark::mark("commit join start");
+    // The CPU tail hash of the hybrid commit waits for this arm (see
+    // `gpu_commit::ENV_NO_HYBRID_CPU_TAIL_HASH`).
+    flock_core::gpu_commit::note_ab_arm_running(true);
     let result = rayon::join(
         || {
             flock_core::tmark::mark("commit arm start");
@@ -2791,6 +2794,7 @@ fn commit_with_round1_ab_precompute(
             // from this arm's measured wall (an Instant read is free; the
             // store is one relaxed atomic per prove).
             flock_core::tmark::mark("ab arm end");
+            flock_core::gpu_commit::note_ab_arm_running(false);
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
             if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
