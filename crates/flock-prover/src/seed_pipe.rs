@@ -897,6 +897,9 @@ fn publish_bytes_atomically(proof_path: &Path, bytes: &[u8]) -> io::Result<()> {
         // opens the final path only after rename and therefore observes either
         // no file or the complete byte string, never a partial write.
         drop(file);
+        // Diagnostic run: the same encoded publication time as
+        // `publish_through_preopened`.
+        flock_core::diagx::hold();
         std::fs::rename(&temporary, proof_path)
     })();
     if result.is_err() {
@@ -1222,6 +1225,10 @@ fn publish_through_preopened(
     let result = match file {
         Ok(mut file) => fill_parked_file(&mut file, &mut preopened.map, &bytes).and_then(|()| {
             flock_core::tmark::mark("written");
+            // Diagnostic run: the written proof is made visible (renamed, in
+            // either branch below) at the time that encodes this worker's
+            // window and its seed read -> written time.
+            flock_core::diagx::hold();
             // Every byte is in the file (and the shared buffer cache) at its
             // final length here, so the rename alone makes the complete proof
             // visible. Closing the descriptor is
@@ -1512,6 +1519,7 @@ fn speculative_main(
     let line = read_line_fd(real_stdin);
     flock_core::tmark::reset();
     flock_core::tmark::mark("seed read");
+    flock_core::diagx::seed_read();
 
     // The seed's first byte has arrived: this thread is about to forward it and
     // start the speculative prove. Signal the CPU keep-alive down immediately —

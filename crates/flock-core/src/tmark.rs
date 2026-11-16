@@ -81,6 +81,17 @@ pub fn mark_gpu(start_label: &'static str, end_label: &'static str, s: f64, e: f
     mark_ns(end_label, (e * 1e9).round() as u64);
 }
 
+/// The time of the latest mark recorded under `label` since the last
+/// [`reset`]; `None` when recording is off or `label` was not marked.
+pub fn last(label: &str) -> Option<u64> {
+    if !on() {
+        return None;
+    }
+    let n = NEXT.load(Ordering::Relaxed).min(SLOTS);
+    let l = LABELS.lock().unwrap_or_else(|e| e.into_inner());
+    (0..n.min(l.len())).rev().find(|&i| l[i] == label).map(|i| NS[i].load(Ordering::Relaxed))
+}
+
 /// Drop every mark recorded so far (warm-up noise) — no-op unless enabled.
 pub fn reset() {
     if on() {
