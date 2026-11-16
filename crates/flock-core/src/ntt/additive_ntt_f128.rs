@@ -4208,7 +4208,8 @@ mod tests {
     fn recursive_from_message_fused3_matches_replicated_transform() {
         const NUM_NTTS: usize = 8;
         let mut rng = Rng::new(0x5241_5445_384D_5347);
-        for (log_d, start_layer) in [(12usize, 2usize), (12, 3)] {
+        // (14, 4) and (12, 5) are the recursive L3 / L4 commit geometries.
+        for (log_d, start_layer) in [(12usize, 2usize), (12, 3), (14, 4), (12, 5)] {
             let ntt = AdditiveNttF128::standard(log_d);
             let msg_len = (1usize << (log_d - start_layer)) * NUM_NTTS;
             let msg = rand_vec(&mut rng, msg_len);

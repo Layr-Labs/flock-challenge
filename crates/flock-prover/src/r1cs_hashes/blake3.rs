@@ -207,6 +207,8 @@ impl Blake3IdentityPrefixWitness {
     }
 }
 
+mod deferred_input;
+
 /// Deferred A/B rows of a ranked streamed witness.
 ///
 /// The ranked witness window is bound by memory traffic shared with the
@@ -223,6 +225,9 @@ impl Blake3IdentityPrefixWitness {
 /// so every skipped constant chunk of a and b is already in place.
 pub(crate) struct DeferredAb<'a> {
     blocks: &'a [Compression],
+    /// Completed immutable z storage, alive until all deferred fills join.
+    /// None preserves the original generator/block input selection.
+    input_z: Option<*const u32>,
     spec_init: Option<u64>,
     gen_ilp: bool,
     a: *mut u32,
@@ -245,11 +250,18 @@ pub(crate) struct DeferredAb<'a> {
     /// instead of by value; `FLOCK_NO_AB_SEED_INPUT_REUSE` restores the
     /// latter.
     seed_in_place: bool,
+    /// Primed input-in-memory fills write the scratch word groups as one
+    /// 16-byte row per block after a register transpose (default) instead
+    /// of single-lane `st4` stores; `FLOCK_NO_PRODUCER_ROWS=1` restores the
+    /// latter.  Same bytes.  Resolved when the handle is created.
+    row_stores: bool,
 }
 
 // SAFETY: `fill_quad` writes only the four blocks of its own quad; distinct
 // quads are disjoint, and the buffers outlive the handle (it borrows the
-// prove call that owns them).
+// prove call that owns them). `input_z`, when present, is read-only completed
+// row-major witness storage. Its owner is moved, never resized or recycled,
+// until the joined deferred producers finish; commit reads it concurrently.
 unsafe impl Send for DeferredAb<'_> {}
 unsafe impl Sync for DeferredAb<'_> {}
 
@@ -292,6 +304,9 @@ impl DeferredAb<'_> {
                     );
                 } else {
                     match (primed, self.copy_drain) {
+                        (true, true) if self.input_mem && self.row_stores => {
+                            witgen_simd::build_quad_split_neon_mem_rows(input, a, b, sa, sb)
+                        }
                         (true, true) if self.input_mem => {
                             witgen_simd::build_quad_split_neon_mem::<true>(input, a, b, sa, sb)
                         }
@@ -313,7 +328,17 @@ impl DeferredAb<'_> {
                     }
                 }
             };
-            // Same input selection as the driver's `process_group`.
+            if let Some(z) = self.input_z {
+                // SAFETY: the handle is minted only after the complete
+                // witness drain joins. Its owner holds `n_quads` complete
+                // row-major quads until every deferred fill has joined. This
+                // quad is read-only and cannot alias the A/B destinations.
+                let words = unsafe { std::slice::from_raw_parts(z.add(q * words), words) };
+                let input = deferred_input::from_quad_words(words);
+                emit(QuadInput::Seeded(&input));
+                return;
+            }
+            // Original input selection is retained as the rollback.
             match self.spec_init {
                 Some(init) if self.gen_ilp && self.seed_in_place => {
                     let mut slot = std::mem::MaybeUninit::uninit();
@@ -3093,6 +3118,46 @@ pub(crate) mod witgen_simd {
         db: *mut u32,
         qa: [V4; 3],
         qb: [V4; 3],
+        // Compile-time fixed by the caller: write each group of four words
+        // as one 16-byte row per block (see [`store_word4`]).
+        row_stores: bool,
+    }
+
+    /// Words `start..start + 4` of all four blocks from four word vectors
+    /// (lane `j` = block `j`) into a block-major buffer `d` (block `j` at
+    /// `d + j * U32_PER_BLOCK`).  Default form: one single-lane `st4` per
+    /// block, each needing its own address register.  With `rows`: a 4x4
+    /// register transpose ([`tr4`], eight vector permutes, the same count as
+    /// the four `st4` lanes take) and one 16-byte store per block at an
+    /// immediate offset from `d`, so no address arithmetic.  Same bytes at
+    /// the same addresses, in the same block order.
+    #[inline(always)]
+    unsafe fn store_word4(rows: bool, d: *mut u32, start: usize, w0: V4, w1: V4, w2: V4, w3: V4) {
+        unsafe {
+            if rows {
+                let (r0, r1, r2, r3) = tr4(w0, w1, w2, w3);
+                vst1q_u32(d.add(start), r0);
+                vst1q_u32(d.add(U32_PER_BLOCK + start), r1);
+                vst1q_u32(d.add(2 * U32_PER_BLOCK + start), r2);
+                vst1q_u32(d.add(3 * U32_PER_BLOCK + start), r3);
+            } else {
+                let w = uint32x4x4_t(w0, w1, w2, w3);
+                vst4q_lane_u32::<0>(d.add(start), w);
+                vst4q_lane_u32::<1>(d.add(U32_PER_BLOCK + start), w);
+                vst4q_lane_u32::<2>(d.add(2 * U32_PER_BLOCK + start), w);
+                vst4q_lane_u32::<3>(d.add(3 * U32_PER_BLOCK + start), w);
+            }
+        }
+    }
+
+    /// [`store_word4`] on four word vectors read from `src` (word `i` at
+    /// `src[4 i..4 i + 4]`, lane `j` = block `j`).
+    #[cfg(test)]
+    pub(super) unsafe fn store_word4_for_test(rows: bool, d: *mut u32, start: usize, src: &[u32; 16]) {
+        unsafe {
+            let w = |i: usize| vld1q_u32(src.as_ptr().add(4 * i));
+            store_word4(rows, d, start, w(0), w(1), w(2), w(3));
+        }
     }
 
     impl W32Pair {
@@ -3104,18 +3169,12 @@ pub(crate) mod witgen_simd {
                         self.qa[WORD % 4] = va;
                         if WORD < 472 { self.qb[WORD % 4] = vb; }
                     } else {
-                        let aa = uint32x4x4_t(self.qa[0], self.qa[1], self.qa[2], va);
                         let start = WORD & !3;
-                        vst4q_lane_u32::<0>(self.da.add(start), aa);
-                        vst4q_lane_u32::<1>(self.da.add(U32_PER_BLOCK + start), aa);
-                        vst4q_lane_u32::<2>(self.da.add(2 * U32_PER_BLOCK + start), aa);
-                        vst4q_lane_u32::<3>(self.da.add(3 * U32_PER_BLOCK + start), aa);
+                        let [q0, q1, q2] = self.qa;
+                        store_word4(self.row_stores, self.da, start, q0, q1, q2, va);
                         if WORD < 472 {
-                            let bb = uint32x4x4_t(self.qb[0], self.qb[1], self.qb[2], vb);
-                            vst4q_lane_u32::<0>(self.db.add(start), bb);
-                            vst4q_lane_u32::<1>(self.db.add(U32_PER_BLOCK + start), bb);
-                            vst4q_lane_u32::<2>(self.db.add(2 * U32_PER_BLOCK + start), bb);
-                            vst4q_lane_u32::<3>(self.db.add(3 * U32_PER_BLOCK + start), bb);
+                            let [p0, p1, p2] = self.qb;
+                            store_word4(self.row_stores, self.db, start, p0, p1, p2, vb);
                         }
                     }
                 } else if self.primed_boundaries && WORD >= 480 {
@@ -3134,17 +3193,11 @@ pub(crate) mod witgen_simd {
                         self.qa[WORD % 4] = va;
                         self.qb[WORD % 4] = vb;
                     } else {
-                        let aa = uint32x4x4_t(self.qa[0], self.qa[1], self.qa[2], va);
-                        let bb = uint32x4x4_t(self.qb[0], self.qb[1], self.qb[2], vb);
                         let start = WORD & !3;
-                        vst4q_lane_u32::<0>(self.da.add(start), aa);
-                        vst4q_lane_u32::<1>(self.da.add(U32_PER_BLOCK + start), aa);
-                        vst4q_lane_u32::<2>(self.da.add(2 * U32_PER_BLOCK + start), aa);
-                        vst4q_lane_u32::<3>(self.da.add(3 * U32_PER_BLOCK + start), aa);
-                        vst4q_lane_u32::<0>(self.db.add(start), bb);
-                        vst4q_lane_u32::<1>(self.db.add(U32_PER_BLOCK + start), bb);
-                        vst4q_lane_u32::<2>(self.db.add(2 * U32_PER_BLOCK + start), bb);
-                        vst4q_lane_u32::<3>(self.db.add(3 * U32_PER_BLOCK + start), bb);
+                        let [q0, q1, q2] = self.qa;
+                        let [p0, p1, p2] = self.qb;
+                        store_word4(self.row_stores, self.da, start, q0, q1, q2, va);
+                        store_word4(self.row_stores, self.db, start, p0, p1, p2, vb);
                     }
                 } else if self.paired {
                     if WORD % 2 == 0 {
@@ -3447,9 +3500,9 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false, false>(inputs, z, a, b, sa, sb)
             } else {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false>(inputs, z, a, b, sa, sb)
             }
         }
     }
@@ -3463,6 +3516,21 @@ pub(crate) mod witgen_simd {
     fn ab_rebuild_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_AB_REBUILD").is_none())
+    }
+
+    /// Kill switch for the block-row scratch stores of the primed producer
+    /// fill ([`build_quad_split_neon_mem_rows`]): `FLOCK_NO_PRODUCER_ROWS=1`
+    /// keeps [`build_quad_split_neon_mem`]`::<true>`. Needs the direct
+    /// scratch form, so also off with `FLOCK_NO_WITGEN_AB_REBUILD`. Read once
+    /// per process. Same a, b and scratch bytes either way.
+    fn ab_row_stores_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            // Default OFF in this tree (a commit-window piece; post-commit
+            // subset of ca9730fe). `FLOCK_PRODUCER_ROWS=1` opts in for lab A/B.
+            std::env::var_os("FLOCK_PRODUCER_ROWS").as_deref() == Some(std::ffi::OsStr::new("1"))
+                && ab_rebuild_enabled()
+        })
     }
 
     /// The copy-drain a/b form of [`build_quad_split_neon`]
@@ -3488,7 +3556,7 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3497,7 +3565,7 @@ pub(crate) mod witgen_simd {
                     sb,
                 )
             } else {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3506,6 +3574,34 @@ pub(crate) mod witgen_simd {
                     sb,
                 )
             }
+        }
+    }
+
+    /// [`build_quad_split_neon_mem`]`::<true>` in its default form (direct
+    /// scratch, `FLOCK_NO_WITGEN_AB_REBUILD` unset) with the scratch word
+    /// groups written as block rows ([`store_word4`]): same arguments, same
+    /// bytes.  The only extra instance of the builder; the cold-scratch fill
+    /// keeps the lane stores.
+    ///
+    /// # Safety
+    /// As [`build_quad_split_neon_mem`]; the caller has checked that
+    /// [`ab_rebuild_enabled`] holds.
+    pub(crate) unsafe fn build_quad_split_neon_mem_rows(
+        inputs: QuadInput<'_>,
+        a: *mut u32,
+        b: *mut u32,
+        sa: *mut u32,
+        sb: *mut u32,
+    ) {
+        unsafe {
+            build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, true>(
+                inputs,
+                core::ptr::null_mut(),
+                a,
+                b,
+                sa,
+                sb,
+            )
         }
     }
 
@@ -3519,7 +3615,7 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false>(
+            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false, false>(
                 inputs, core::ptr::null_mut(), a, b, sa, sb,
             )
         }
@@ -3557,6 +3653,7 @@ pub(crate) mod witgen_simd {
         const ELIDE_B_STAGE_TAIL: bool,
         const PAIR_STAGE_STORES: bool,
         const DIRECT_SCRATCH: bool,
+        const ROW_STORES: bool,
     >(
         inputs: QuadInput<'_>,
         z: *mut u32,
@@ -3568,6 +3665,7 @@ pub(crate) mod witgen_simd {
         const {
             assert!(!MEM || (!WZ && SCRATCH && COPY));
             assert!(!DIRECT_SCRATCH || (!WZ && SCRATCH && COPY));
+            assert!(!ROW_STORES || (DIRECT_SCRATCH && PRIMED));
             assert!(!(WZ && SCRATCH));
             assert!(SCRATCH || !PRIMED);
             assert!(SCRATCH || !COPY);
@@ -3783,6 +3881,7 @@ pub(crate) mod witgen_simd {
                 db: sb,
                 qa: [zero; 3],
                 qb: [zero; 3],
+                row_stores: ROW_STORES,
                 b_end: if ELIDE_B_STAGE_TAIL && !full_scratch {
                     8 * ELIDE_B_TAIL_CHUNK
                 } else {
@@ -4531,12 +4630,31 @@ pub(crate) mod witgen_simd {
             );
         }
 
+        // Admit z-input decoding only from the completed ordinary warm-up
+        // witness, comparing every input field against real blocks. The lazy
+        // backing is never used as an oracle. Failure leaves the old producer.
+        if n_total == 1 << 18
+            && n_blocks == n_total
+            && spec_init.is_none()
+            && crate::seed_pipe::is_ranked_worker()
+            && super::deferred_input::enabled()
+        {
+            // SAFETY: the joined row-major witness owns `z.len() * 4` u32
+            // words and stays immutable while the complete input check runs.
+            let words = unsafe {
+                std::slice::from_raw_parts(z.as_ptr().cast::<u32>(), z.len() * 4)
+            };
+            super::deferred_input::admit(words, blocks);
+        }
+
         // The a/b tokens staged above describe the buffers once the handle
         // has produced every quad, which the prover guarantees before it
         // gives them back.
         let deferred = defer_ab.then(|| super::DeferredAb {
             blocks,
             spec_init,
+            input_z: (spec_init.is_some() && gen_ilp && super::deferred_input::admitted())
+                .then_some(z.as_ptr().cast::<u32>()),
             gen_ilp,
             a: a.as_mut_ptr() as *mut u32,
             b: b.as_mut_ptr() as *mut u32,
@@ -4545,6 +4663,7 @@ pub(crate) mod witgen_simd {
             copy_drain: ab_copy_drain_enabled(),
             input_mem: ab_input_mem_enabled(),
             seed_in_place,
+            row_stores: ab_row_stores_enabled(),
         });
         (z, a, b, z_lincheck, stream, deferred)
     }
@@ -7017,6 +7136,165 @@ mod tests {
         }
     }
 
+    /// Paired full deferred A/B producer timing on the ranked-size backing.
+    /// This is a Linux-capable component probe, not Metal or whole-proof time.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "ranked-size component timing"]
+    fn deferred_ab_witness_input_timing() {
+        use std::time::Instant;
+        const BLOCKS: usize = 1 << 18;
+        const BLOCK_WORDS: usize = K / 32;
+        const QUAD_WORDS: usize = 4 * BLOCK_WORDS;
+        let init = 0x2718_2818_2845_9045u64;
+        let sentinel = vec![([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32); BLOCKS];
+        let mut z = vec![0u32; BLOCKS * BLOCK_WORDS];
+        let put = |words: &mut [u32], bit: usize, value: u32| {
+            let i = bit / 32;
+            let shift = bit % 32;
+            words[i] |= value << shift;
+            if shift != 0 { words[i + 1] |= value >> (32 - shift); }
+        };
+        for i in 0..BLOCKS {
+            let (cv, message, counter, len, flags) = crate::seed_pipe::gen_block_scalar(init, i);
+            let words = &mut z[i * BLOCK_WORDS..(i + 1) * BLOCK_WORDS];
+            for j in 0..8 { put(words, 32 * j, cv[j]); }
+            for j in 0..16 { put(words, M_BASE + 32 * j, message[j]); }
+            put(words, T_LO_BASE, counter as u32);
+            put(words, T_HI_BASE, (counter >> 32) as u32);
+            put(words, BLEN_BASE, len);
+            put(words, FLAGS_BASE, flags);
+        }
+        let mut a = vec![0u32; BLOCKS * BLOCK_WORDS];
+        let mut b = vec![u32::MAX; BLOCKS * BLOCK_WORDS];
+        let quads = BLOCKS / 4;
+        let batches: usize = std::env::var("AB_INPUT_PAIRS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+        let parallel = std::env::var_os("AB_INPUT_PARALLEL").is_some();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(if parallel { 10 } else { 1 }).build().unwrap();
+        for pair in 0..batches + 1 {
+            for arm in if pair % 2 == 0 { [false, true] } else { [true, false] } {
+                let handle = super::DeferredAb {
+                    blocks: &sentinel,
+                    spec_init: Some(init),
+                    input_z: arm.then_some(z.as_ptr()),
+                    gen_ilp: true,
+                    a: a.as_mut_ptr(),
+                    b: b.as_mut_ptr(),
+                    n_quads: quads,
+                    primed_scratch: true,
+                    copy_drain: true,
+                    input_mem: true,
+                    seed_in_place: true,
+                };
+                let start = Instant::now();
+                pool.install(|| {
+                    use rayon::prelude::*;
+                    (0..quads / 64).into_par_iter().for_each_init(
+                        || vec![0u32; 2 * QUAD_WORDS],
+                        |scratch, job| {
+                            for local in 0..64 {
+                                let q = job * 64 + local;
+                                let sa = scratch.as_mut_ptr().cast::<u8>();
+                                let sb = unsafe { scratch.as_mut_ptr().add(QUAD_WORDS) }.cast::<u8>();
+                                handle.fill_quad(q, sa, sb, local > 0);
+                            }
+                        },
+                    );
+                });
+                let ns = start.elapsed().as_nanos();
+                std::hint::black_box((&a, &b));
+                if pair > 0 { println!("AB_INPUT,{},{},{},{}", pair - 1, u8::from(arm), u8::from(parallel), ns); }
+            }
+        }
+    }
+
+
+    /// A completed z witness must supply the exact original inputs even
+    /// when the lazy block backing contains only unrelated sentinels.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn deferred_ab_witness_input_matches_original_and_scratch() {
+        const BLOCK_WORDS: usize = K / 32;
+        const QUAD_WORDS: usize = 4 * BLOCK_WORDS;
+        let mut rng = Rng::new(0xd3fe_2206_1234);
+        for init in [None, Some(0u64), Some(u64::MAX)] {
+            let blocks: Vec<Compression> = (0..16).map(|i| {
+                if let Some(init) = init {
+                    crate::seed_pipe::gen_block_scalar(init, i)
+                } else {
+                    (
+                        std::array::from_fn(|_| rng.next_u32()),
+                        std::array::from_fn(|_| rng.next_u32()),
+                        (u64::from(rng.next_u32()) << 32) | u64::from(rng.next_u32()),
+                        rng.next_u32() | (1 << 31),
+                        rng.next_u32() | (1 << 31),
+                    )
+                }
+            }).collect();
+            let count = blocks.len() * (K / 64);
+            let mut z = vec![0u64; count];
+            let mut a = vec![0u64; count];
+            let mut b = vec![0u64; count];
+            for (i, block) in blocks.iter().enumerate() {
+                let start = i * (K / 64);
+                let end = start + K / 64;
+                build_block_witness_ab_packed_into(
+                    &block.0, &block.1, block.2, block.3, block.4,
+                    &mut z[start..end], &mut a[start..end], &mut b[start..end],
+                );
+            }
+            let as_words = |v: &[u64]| -> Vec<u32> {
+                v.iter().flat_map(|&w| [w as u32, (w >> 32) as u32]).collect()
+            };
+            let z_words = as_words(&z);
+            let a_truth = as_words(&a);
+            let b_truth = as_words(&b);
+            let sentinel = vec![([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32); blocks.len()];
+            let z_before = z_words.clone();
+            for scratch_mode in 0..3 {
+                for input_mem in [false, true] {
+                    let run = |from_z: bool| {
+                        let mut got_a = a_truth.clone();
+                        let mut got_b = b_truth.clone();
+                        let mut scratch = vec![0xdead_beefu32; 2 * QUAD_WORDS];
+                        let mut snapshots = Vec::new();
+                        let handle = super::DeferredAb {
+                            blocks: if from_z { &sentinel } else { &blocks },
+                            spec_init: if from_z { None } else { init },
+                            input_z: from_z.then_some(z_words.as_ptr()),
+                            gen_ilp: true,
+                            a: got_a.as_mut_ptr(),
+                            b: got_b.as_mut_ptr(),
+                            n_quads: blocks.len() / 4,
+                            primed_scratch: true,
+                            copy_drain: true,
+                            input_mem,
+                            seed_in_place: true,
+                        };
+                        for q in 0..blocks.len() / 4 {
+                            if scratch_mode == 0 {
+                                handle.fill_quad(q, std::ptr::null_mut(), std::ptr::null_mut(), false);
+                            } else {
+                                let sa = scratch.as_mut_ptr().cast::<u8>();
+                                let sb = unsafe { scratch.as_mut_ptr().add(QUAD_WORDS) }.cast::<u8>();
+                                handle.fill_quad(q, sa, sb, scratch_mode == 2 && q > 0);
+                                snapshots.push(scratch.clone());
+                            }
+                        }
+                        (got_a, got_b, snapshots)
+                    };
+                    let original = run(false);
+                    assert_eq!(original.0, a_truth);
+                    assert_eq!(original.1, b_truth);
+                    let decoded = run(true);
+                    assert_eq!(decoded, original,
+                        "witness input init={init:?} scratch={scratch_mode} memory={input_mem}");
+                }
+            }
+            assert_eq!(z_words, z_before, "decoder changed immutable witness");
+        }
+    }
+
     /// `DeferredAb::fill_quad` with the input-in-memory kernel on and off
     /// (`FLOCK_NO_WITGEN_AB_INPUT_MEM`): same a, b and scratch bytes for
     /// every quad of a small witness, cold and primed scratch.
@@ -7045,6 +7323,7 @@ mod tests {
             let handle = super::DeferredAb {
                 blocks: &blocks,
                 spec_init,
+                input_z: None,
                 gen_ilp: true,
                 a: a.as_mut_ptr(),
                 b: b.as_mut_ptr(),
@@ -7053,6 +7332,7 @@ mod tests {
                 copy_drain: true,
                 input_mem,
                 seed_in_place: true,
+                row_stores: false,
             };
             for q in 0..n_quads {
                 let sa = scratch.as_mut_ptr().cast::<u8>();
@@ -7067,6 +7347,95 @@ mod tests {
             let off = fill_all(false, spec_init);
             assert!(on == off, "input-mem switch changed bytes (spec_init {spec_init:?})");
             assert!(on.0.iter().any(|&w| w != 0x1111_1111));
+        }
+    }
+
+    /// `DeferredAb::fill_quad` with the primed scratch groups written as
+    /// block rows and as single-lane `st4` stores (`FLOCK_NO_PRODUCER_ROWS`):
+    /// same a, b and scratch bytes for every quad, block and lazy input,
+    /// primed and unprimed handles.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn deferred_ab_fill_quad_row_stores_are_byte_neutral() {
+        const U32S: usize = 4 * (K / 32);
+        let mut rng = Rng::new(0x5eed_a2b2_0005);
+        let blocks: Vec<Compression> = (0..48)
+            .map(|_| {
+                (
+                    std::array::from_fn(|_| rng.next_u32()),
+                    std::array::from_fn(|_| rng.next_u32()),
+                    u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32()),
+                    rng.next_u32(),
+                    rng.next_u32(),
+                )
+            })
+            .collect();
+        let n_quads = blocks.len() / 4;
+        let fill_all = |row_stores: bool, spec_init: Option<u64>, primed_scratch: bool| {
+            let mut a = vec![0x1111_1111u32; n_quads * U32S];
+            let mut b = vec![0x2222_2222u32; n_quads * U32S];
+            let mut scratch = vec![0x3333_3333u32; 2 * U32S];
+            let mut scratches = Vec::new();
+            let handle = super::DeferredAb {
+                blocks: &blocks,
+                spec_init,
+                gen_ilp: true,
+                a: a.as_mut_ptr(),
+                b: b.as_mut_ptr(),
+                n_quads,
+                primed_scratch,
+                copy_drain: true,
+                input_mem: true,
+                seed_in_place: true,
+                row_stores,
+            };
+            for q in 0..n_quads {
+                let sa = scratch.as_mut_ptr().cast::<u8>();
+                let sb = unsafe { scratch.as_mut_ptr().add(U32S) }.cast::<u8>();
+                handle.fill_quad(q, sa, sb, q > 0);
+                scratches.push(scratch.clone());
+            }
+            (a, b, scratches)
+        };
+        for spec_init in [None, Some(0x0123_4567_89ab_cdefu64), Some(u64::MAX)] {
+            for primed_scratch in [true, false] {
+                let rows = fill_all(true, spec_init, primed_scratch);
+                let lanes = fill_all(false, spec_init, primed_scratch);
+                assert!(
+                    rows == lanes,
+                    "row stores changed bytes (spec_init {spec_init:?} primed {primed_scratch})"
+                );
+                assert!(rows.0.iter().any(|&w| w != 0x1111_1111));
+                assert!(rows.1.iter().any(|&w| w != 0x2222_2222));
+            }
+        }
+    }
+
+    /// The two forms of `store_word4` write the same 16 bytes per block and
+    /// nothing else.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn store_word4_row_form_matches_lane_form() {
+        const GUARD: usize = 8;
+        let words = K / 32;
+        let mut rng = Rng::new(0x5eed_a2b2_0006);
+        for start in [0usize, 4, 36, 252, 468, 476] {
+            let src: [u32; 16] = std::array::from_fn(|_| rng.next_u32());
+            let fill = rng.next_u32();
+            let run = |rows: bool| {
+                let mut buf = vec![fill; 4 * words + 2 * GUARD];
+                unsafe {
+                    witgen_simd::store_word4_for_test(rows, buf.as_mut_ptr().add(GUARD), start, &src);
+                }
+                buf
+            };
+            let rows = run(true);
+            assert_eq!(rows, run(false), "start {start}");
+            for j in 0..4 {
+                let at = GUARD + j * words + start;
+                let want: [u32; 4] = std::array::from_fn(|i| src[4 * i + j]);
+                assert_eq!(rows[at..at + 4], want, "start {start} block {j}");
+            }
         }
     }
 
@@ -7089,6 +7458,7 @@ mod tests {
             let handle = super::DeferredAb {
                 blocks: &blocks,
                 spec_init: Some(init),
+                input_z: None,
                 gen_ilp: true,
                 a: a.as_mut_ptr(),
                 b: b.as_mut_ptr(),
@@ -7097,6 +7467,7 @@ mod tests {
                 copy_drain: true,
                 input_mem,
                 seed_in_place: in_place,
+                row_stores: false,
             };
             for q in 0..n_quads {
                 if scratch_mode == 0 {
