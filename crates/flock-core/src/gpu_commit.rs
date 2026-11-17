@@ -2420,6 +2420,29 @@ fn select_gpu_leaf_parent3(pso_ok: bool) -> bool {
     pso_ok && gpu_leaf_parent3_enabled()
 }
 
+/// Kill switch for the leaf + parent3 kernel's straight-line BLAKE3
+/// compression (`FLOCK_NO_LEAF_STRAIGHT=1`, exact `1`: the looped
+/// compression, as before). The kernel behind cb3 (the CPU suffix's leaves on
+/// the GPU, the commit's tail) hashed each 64-byte block with a seven-round
+/// loop that permutes the sixteen message words in place after each round.
+/// With it on, the kernel's compression is the same arithmetic written out
+/// round by round with BLAKE3's fixed message schedule (round r reads the
+/// block permuted r times), the 16-bit rotation as a swap of the word's two
+/// halves and the others as `rotate`: no word moves between rounds. Measured
+/// on an M4 (`leaf_probe`, 16 alternating rounds over 320 units): the
+/// compression alone 10.19 -> 8.43 us per 1,024-leaf unit; the whole kernel,
+/// which the M4 runs at its memory bandwidth, 11.54 -> 11.27 us (16 of 16
+/// lower). Same chaining values, nodes and slots. Only this kernel: the fused
+/// final-pass leaf kernel measured slower with the same form. Read once, when
+/// the kernel is compiled at Gpu init.
+pub const ENV_NO_LEAF_STRAIGHT: &str = "FLOCK_NO_LEAF_STRAIGHT";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn leaf_straight_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_LEAF_STRAIGHT));
+    *ON
+}
+
 #[cfg(test)]
 mod parent3_gate_tests {
     use std::ffi::OsStr;
@@ -5295,6 +5318,65 @@ kernel void zc_k_fold_v2(
 }
 
 "#;
+
+    /// The leaf + parent3 kernel's straight-line compression (see
+    /// `super::ENV_NO_LEAF_STRAIGHT`): the seven rounds written out with
+    /// BLAKE3's message schedule, so no round moves the message words and
+    /// every index is a constant; the 16-bit rotation swaps the two halves,
+    /// the others are `rotate` (left by 32 - n). Same arithmetic as the
+    /// looped form in [`LEAF_PARENT3_MSL_SOURCE`]: same chaining values.
+    const LEAF_STRAIGHT_COMPRESS: &str = r#"#define B3_ROTR(x, n) rotate((uint)(x), (uint)(32u - (n)))
+#define B3_ROT16(x) as_type<uint>(as_type<ushort2>((uint)(x)).yx)
+#define B3_G(a, b, c, d, x, y)                         \
+    a = a + b + (x); d = B3_ROT16(d ^ a);              \
+    c = c + d;       b = B3_ROTR(b ^ c, 12u);          \
+    a = a + b + (y); d = B3_ROTR(d ^ a, 8u);           \
+    c = c + d;       b = B3_ROTR(b ^ c, 7u);
+#define B3_ROUND(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15) \
+    B3_G(v0, v4, v8,  v12, m[s0],  m[s1]);  B3_G(v1, v5, v9,  v13, m[s2],  m[s3]);    \
+    B3_G(v2, v6, v10, v14, m[s4],  m[s5]);  B3_G(v3, v7, v11, v15, m[s6],  m[s7]);    \
+    B3_G(v0, v5, v10, v15, m[s8],  m[s9]);  B3_G(v1, v6, v11, v12, m[s10], m[s11]);   \
+    B3_G(v2, v7, v8,  v13, m[s12], m[s13]); B3_G(v3, v4, v9,  v14, m[s14], m[s15]);
+static void b3_compress(thread uint* cv, thread const uint* m,
+                        uint block_len, uint flags) {
+    uint v0 = cv[0], v1 = cv[1], v2 = cv[2], v3 = cv[3];
+    uint v4 = cv[4], v5 = cv[5], v6 = cv[6], v7 = cv[7];
+    uint v8 = B3_IV[0], v9 = B3_IV[1], v10 = B3_IV[2], v11 = B3_IV[3];
+    uint v12 = 0u, v13 = 0u, v14 = block_len, v15 = flags;
+    B3_ROUND(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+    B3_ROUND(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+    B3_ROUND(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1)
+    B3_ROUND(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6)
+    B3_ROUND(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4)
+    B3_ROUND(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7)
+    B3_ROUND(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13)
+    cv[0] = v0 ^ v8;  cv[1] = v1 ^ v9;  cv[2] = v2 ^ v10; cv[3] = v3 ^ v11;
+    cv[4] = v4 ^ v12; cv[5] = v5 ^ v13; cv[6] = v6 ^ v14; cv[7] = v7 ^ v15;
+}
+#undef B3_ROUND
+#undef B3_G
+#undef B3_ROT16
+#undef B3_ROTR
+"#;
+
+    /// The leaf + parent3 kernel's source as compiled at Gpu init:
+    /// [`LEAF_PARENT3_MSL_SOURCE`] with its looped compression replaced by
+    /// [`LEAF_STRAIGHT_COMPRESS`], unless `FLOCK_NO_LEAF_STRAIGHT=1` or the
+    /// looped text is not found exactly once (then the incumbent text).
+    pub(crate) fn leaf_parent3_msl_source() -> std::borrow::Cow<'static, str> {
+        const START: &str = "static void b3_compress(thread uint* cv, thread const uint* m_in,";
+        const END: &str = "    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];\n}\n";
+        let src = LEAF_PARENT3_MSL_SOURCE;
+        if !super::leaf_straight_enabled() || src.matches(START).count() != 1 || src.matches(END).count() != 1 {
+            return std::borrow::Cow::Borrowed(src);
+        }
+        let a = src.find(START).expect("counted above");
+        let b = src.find(END).expect("counted above") + END.len();
+        if b <= a {
+            return std::borrow::Cow::Borrowed(src);
+        }
+        std::borrow::Cow::Owned(format!("{}{LEAF_STRAIGHT_COMPRESS}{}", &src[..a], &src[b..]))
+    }
 
     /// Supplemental leaf+parent3 fuse (kept out of the embedded metallib so a
     /// missing kernel cannot force a full main-library rebuild). Compiled at
@@ -10248,7 +10330,8 @@ kernel void blake3_pow_race_tail(
                 // gate is open so non-ranked processes skip the MSL frontend.
                 let pso_leaf_parent3 = if super::gpu_leaf_parent3_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(LEAF_PARENT3_MSL_SOURCE)?;
+                        // `super::ENV_NO_LEAF_STRAIGHT`: the straight-line compression.
+                        let src = api.nsstring(&leaf_parent3_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
