@@ -54,9 +54,32 @@ impl F128 {
         ghash_mul_unreduced(self, rhs)
     }
 
-    /// Multiplicative inverse via Fermat: x^{2^128 − 2}.
-    /// Used in one-time setup (Lagrange weight computation), not in hot paths.
+    /// Frobenius square, with no cross products in characteristic two.
+    #[inline]
+    pub(crate) fn square(self) -> Self {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        {
+            // SAFETY: the compile-time feature gate supplies PMULL.
+            unsafe { aarch64::ghash_square_binius(self) }
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        {
+            self * self
+        }
+    }
+
+    /// Multiplicative inverse via an exact addition chain for x^(2^128−2).
+    /// Zero remains zero. The process-cached rollback retains the original
+    /// Fermat loop for same-binary comparisons on every target.
     pub fn inv(self) -> Self {
+        static CHAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*CHAIN.get_or_init(|| std::env::var_os("FLOCK_NO_F128_INV_CHAIN").is_none()) {
+            return self.inv_fermat();
+        }
+        self.inv_addition_chain()
+    }
+
+    fn inv_fermat(self) -> Self {
         // x^{2^128 - 2} = ∏_{i=1..127} x^{2^i}
         let mut r = Self::ONE;
         let mut cur = self * self; // x^2
@@ -65,6 +88,30 @@ impl F128 {
             cur = cur * cur;
         }
         r
+    }
+
+    fn inv_addition_chain(self) -> Self {
+        #[inline]
+        fn square_n(mut a: F128, n: usize) -> F128 {
+            for _ in 0..n {
+                a = a.square();
+            }
+            a
+        }
+        // t_k = self^(2^k−1). The index chain is
+        // 1,2,3,6,12,24,48,96,120,126,127; one last square gives the inverse.
+        // 127 squares and ten general multiplies, including at self=ZERO.
+        let t2 = square_n(self, 1) * self;
+        let t3 = square_n(t2, 1) * self;
+        let t6 = square_n(t3, 3) * t3;
+        let t12 = square_n(t6, 6) * t6;
+        let t24 = square_n(t12, 12) * t12;
+        let t48 = square_n(t24, 24) * t24;
+        let t96 = square_n(t48, 48) * t48;
+        let t120 = square_n(t96, 24) * t24;
+        let t126 = square_n(t120, 6) * t6;
+        let t127 = square_n(t126, 1) * self;
+        square_n(t127, 1)
     }
 }
 
@@ -338,6 +385,55 @@ mod tests {
             acc ^= a.mul_unreduced(*b);
         }
         assert_eq!(direct, acc.reduce());
+    }
+
+    /// Independent binary exponentiation with portable multiplication is
+    /// deliberately different from both production exponentiation schedules.
+    fn inverse_binary_oracle(x: F128) -> F128 {
+        let mut out = F128::ONE;
+        for bit in (0..128).rev() {
+            out = software::ghash_mul(out, out);
+            if bit != 0 {
+                out = software::ghash_mul(out, x);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn inverse_chain_matches_independent_oracle_and_fermat() {
+        let mut rng = Rng::new(0x1a70_1127_0001);
+        let mut cases = vec![F128::ZERO, F128::ONE,
+            F128::new(u64::MAX, u64::MAX), F128::new(0x87, 1 << 63)];
+        for bit in 0..128 {
+            cases.push(if bit < 64 { F128::new(1 << bit, 0) }
+                       else { F128::new(0, 1 << (bit - 64)) });
+        }
+        for byte in 0..256 { cases.push(F128::new(byte, 0)); }
+        for _ in 0..512 { cases.push(rng.next_f128()); }
+        for x in cases {
+            let want = inverse_binary_oracle(x);
+            assert_eq!(x.inv_addition_chain(), want, "chain input={x:?}");
+            assert_eq!(x.inv_fermat(), want, "rollback input={x:?}");
+            assert_eq!(x.inv(), want, "selected input={x:?}");
+            if !x.is_zero() { assert_eq!(software::ghash_mul(x, want), F128::ONE); }
+        }
+    }
+
+    #[test]
+    fn square_matches_independent_polynomial_oracle() {
+        let mut rng = Rng::new(0x5a4a_0001);
+        let mut cases = vec![F128::ZERO, F128::ONE, F128::new(u64::MAX, u64::MAX)];
+        for bit in 0..128 {
+            let basis = if bit < 64 { F128::new(1 << bit, 0) }
+                        else { F128::new(0, 1 << (bit - 64)) };
+            cases.push(basis);
+            cases.push(basis + F128::new(0x87, 1 << 63));
+        }
+        for _ in 0..2048 { cases.push(rng.next_f128()); }
+        for x in cases {
+            assert_eq!(x.square(), software::ghash_mul(x, x), "square input={x:?}");
+        }
     }
 
     #[test]
