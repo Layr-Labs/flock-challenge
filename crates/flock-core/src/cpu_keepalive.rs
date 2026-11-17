@@ -232,7 +232,6 @@ mod imp {
         }
         HOT_PROVE.store(false, Ordering::Relaxed);
         HOT_PROVE_OFF.store(std::env::var_os("FLOCK_NO_HOT_PROVE").is_some(), Ordering::Relaxed);
-        crate::epool::hot_spin_arm();
         let deadline = Instant::now() + MAX_KEEPALIVE;
         rayon::spawn_broadcast(move |ctx| {
             // Leave one core to the seed-pipe thread's hot poll.
@@ -288,7 +287,6 @@ mod imp {
         if POOL_SPIN.load(Ordering::Relaxed) {
             POOL_SPIN.store(false, Ordering::Release);
         }
-        crate::epool::hot_spin_release();
     }
 
     /// `true` from the witness hand-off until the release at proof done.
@@ -301,8 +299,6 @@ mod imp {
             pool_spin_release();
         } else if POOL_SPIN.load(Ordering::Relaxed) {
             HOT_PROVE.store(true, Ordering::Release);
-            // The helper pool's workers stay hot for the same interval.
-            crate::epool::hot_spin_start();
         }
     }
 

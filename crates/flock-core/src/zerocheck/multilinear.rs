@@ -1980,6 +1980,73 @@ fn r2_rebuild_chunk(
     })
 }
 
+/// Any value restores chunk-wide A/B materialization before round two.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn r2_ab_quad_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_AB_QUAD").is_none())
+}
+
+/// Interleave rebuilt ranked A/B quads and the existing full round-two walk.
+/// The original chunk still owns all outputs and partials. Reduction is linear
+/// over XOR, so XORing the eight reduced unit sums equals reducing once after
+/// the original chunk. No producer call may outlive the registering scope.
+///
+/// # Safety
+/// Inputs and outputs satisfy the full kernel's contract for `lo` pairs. The
+/// producer supplies complete 8192-byte A/B units, whose constant primed rows
+/// are identical between quads, and the chunk is exclusively CPU owned.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn r2_rebuild_quad_walk(
+    r: &crate::zerocheck::univariate_skip_optimized::Round2AbRebuild,
+    x_hi: usize, table: *const u8, fold7: usize, anchors: *mut F128,
+    deltas: *mut u8, eq: *const F128, prep: *const F128, lo: usize,
+    pair_base: usize, tail: bool, head: *const std::sync::atomic::AtomicBool,
+) -> [F128; 8] {
+    let unit = r.unit_bytes;
+    assert!(unit > 0 && unit.is_multiple_of(2048));
+    assert!((16 * lo).is_multiple_of(unit));
+    let pairs = unit / 16;
+    let units = 16 * lo / unit;
+    let mut out = [F128::ZERO; 8];
+    for j in 0..units {
+        // One scratch slot is reused. r2_rebuild_chunk marks it primed
+        // only after the first complete write for this registration.
+        let (a, b) = r2_rebuild_chunk(r, x_hi * units + j, unit);
+        let at = j * pairs;
+        let blocks = at / 128;
+        let (anchor_at, delta_at) = if !head.is_null() {
+            (blocks * kernels::aarch64::HC_ANCHORS_PER_BLOCK,
+             blocks * kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK)
+        } else if tail {
+            (blocks * kernels::aarch64::TC_ANCHORS_PER_BLOCK,
+             blocks * kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK)
+        } else {
+            (2 * at, 16 * at)
+        };
+        let mut part = [F128::ZERO; 8];
+        unsafe {
+            let ap = anchors.add(anchor_at);
+            let dp = deltas.add(delta_at);
+            let ep = eq.add(at);
+            let pp = if prep.is_null() { prep } else { prep.add(at) };
+            if fold7 != 0 {
+                kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
+                    table, fold7 as *const u8, a, b, ap, dp, ep, pp,
+                    pairs, pair_base + at, 127, 121, true, true, true,
+                    tail, head, part.as_mut_ptr());
+            } else {
+                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    table, a, b, ap, dp, ep, pp, pairs, pair_base + at,
+                    127, 121, true, true, true, tail, head, part.as_mut_ptr());
+            }
+        }
+        for lane in 0..8 { out[lane] += part[lane]; }
+    }
+    out
+}
+
 /// Round-two compact producer **plus** the deferred round-three coefficients.
 ///
 /// The compact state, the round-two wire message and every store are
@@ -2389,25 +2456,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let tail_compact = false;
     compact.tail_compact = tail_compact;
-    // Full chunks (the suffix after the round-two GPU prefix, stolen prefix
-    // chunks, every chunk without the arm) on the window-scaled walk
-    // (`FLOCK_NO_R2_FULL_XB` keeps the prepared-weight walk): it needs the
-    // fixed medium weights (`horner_weights`, which also pins the ranked
-    // periodic block shape), the dead pairs skipped and the odd groups'
-    // weights a constant multiple of the even ones' (checked when the table
-    // is built). Same state bytes and slots as the prepared-weight walk.
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let xb_rho = if horner_weights && skip_dead && kernels::aarch64::r2_full_xb_enabled() {
-        kernels::aarch64::r2_full_xb_rho_prep(eq_lo)
-    } else {
-        None
-    };
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let xb_rho_addr = xb_rho.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let full_xb = xb_rho_addr != 0;
-    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-    let full_xb = false;
     // Head-compacted layout on top: every chunk's producer must be one of the
     // two ranked walks that write it (the full lookahead walk, or the
     // prescaled ranked-invariant walk on GPU-offloaded chunks).
@@ -2530,32 +2578,28 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 // Round-two A/B rebuild: a chunk past the published prefix
                 // reads its rows from this worker's scratch, rebuilt now.
                 debug_assert_eq!(row_base * n_chunks, x_hi * chunk_ab_bytes);
+                #[cfg(target_feature = "sha3")]
+                let quad = rebuild.as_ref().filter(|r| {
+                    full && m == 32 && x_hi >= rebuild_from && r2_ab_quad_enabled()
+                        && r.unit_bytes == 8192 && chunk_ab_bytes.is_multiple_of(r.unit_bytes)
+                        && periodic_padding && pair_in_block_mask == 127
+                        && useful_pairs_inclusive == 121 && pair_idx_base.is_multiple_of(128)
+                        && degen && skip_dead && eq_prep_addr != 0
+                });
+                #[cfg(not(target_feature = "sha3"))]
+                let quad: Option<&crate::zerocheck::univariate_skip_optimized::Round2AbRebuild> = None;
+                #[cfg(target_feature = "sha3")]
+                if let Some(r) = quad {
+                    let table7 = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                        fold7_addr
+                    } else { 0 };
+                    out = r2_rebuild_quad_walk(r, x_hi, t, table7, anchors, deltas,
+                        eq_lo.as_ptr(), eq_prep_addr as *const F128, lo_size,
+                        pair_idx_base, tail_compact, head_fail_ptr);
+                }
+                if quad.is_none() {
                 let (ap, bp) = r2_rows(x_hi);
-                if full && full_xb {
-                    // Full chunk on the window-scaled walk
-                    // (`FLOCK_NO_R2_FULL_XB`): the seven-piece table on the
-                    // performance-core workers, the byte banks on the helpers.
-                    #[cfg(target_feature = "sha3")]
-                    kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_xb(
-                        t,
-                        if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
-                            fold7_addr as *const u8
-                        } else {
-                            core::ptr::null()
-                        },
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        xb_rho_addr as *const F128,
-                        lo_size,
-                        degen,
-                        tail_compact,
-                        head_fail_ptr,
-                        out.as_mut_ptr(),
-                    );
-                } else if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
                     kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
                         t,
                         fold7_addr as *const u8,
@@ -2704,6 +2748,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         head_fail_ptr,
                         out.as_mut_ptr(),
                     );
+                }
                 }
             }
         }
@@ -7188,6 +7233,101 @@ mod tests {
             }
             want.recycle();
         }
+    }
+
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    fn round2_ab_quad_matches_whole_chunk() {
+        use crate::zerocheck::univariate_skip_optimized::{Round1AbProducer, round2_ab_rebuild_scope, round2_ab_rebuild_take};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const LO: usize = 16384;
+        const UNIT: usize = 8192;
+        let mut rng = Rng::new(0x2AB0_512);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let eq: Vec<_> = (0..LO).map(|_| rng.f128()).collect();
+        let prep = kernels::aarch64::round2_eq_prep(&eq);
+        let fold7 = kernels::aarch64::r2_fold7_table(&table.data).expect("linear table");
+        let mut a = vec![0u8; 3 * LO * 16];
+        let mut b = a.clone();
+        // Generate every unit from its index; only each block's constant
+        // all-ones b head may be retained when scratch is primed.
+        let calls = AtomicUsize::new(0);
+        let first_primed = AtomicUsize::new(0);
+        let produce = |q: usize, sa: *mut u8, sb: *mut u8, primed: bool| {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 && primed {
+                first_primed.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe {
+                for i in 0..UNIT {
+                    let global = q * UNIT + i;
+                    *sa.add(i) = (global.wrapping_mul(73) ^ (global >> 7) ^ (global >> 13)) as u8;
+                    if !primed || i % 2048 >= 128 {
+                        *sb.add(i) = if i % 2048 < 128 { 255 } else {
+                            (global.wrapping_mul(31) ^ (global >> 5) ^ (global >> 11)) as u8
+                        };
+                    }
+                }
+            }
+        };
+        for q in 0..a.len() / UNIT {
+            produce(q, unsafe { a.as_mut_ptr().add(q * UNIT) }, unsafe { b.as_mut_ptr().add(q * UNIT) }, false);
+        }
+        for x_hi in [1usize, 2] {
+            for (tail, head_enabled) in [(false, false), (true, false), (true, true)] {
+                for f7 in [0usize, fold7.as_ptr() as usize] {
+                    calls.store(0, Ordering::Relaxed);
+                    first_primed.store(0, Ordering::Relaxed);
+                    let scope = unsafe { round2_ab_rebuild_scope(a.as_ptr(), b.as_ptr(), a.len(), 0, 0,
+                        Round1AbProducer { unit_bytes: UNIT, produce: &produce }) };
+                    let r = round2_ab_rebuild_take(&a, &b).unwrap();
+                    // Nonzero allocation offsets catch compact pointer rebases.
+                    let mut want_a = vec![LA_POISON; 2 * LO + 512];
+                    let mut got_a = want_a.clone();
+                    let mut want_d = vec![0xA5; 16 * LO + 8192];
+                    let mut got_d = want_d.clone();
+                    let want_head = std::sync::atomic::AtomicBool::new(false);
+                    let got_head = std::sync::atomic::AtomicBool::new(false);
+                    let mut want = [F128::ZERO; 8];
+                    let offset_a = 256;
+                    let offset_d = 4096;
+                    let hp = |h: &std::sync::atomic::AtomicBool| if head_enabled { h as *const _ } else { core::ptr::null() };
+                    unsafe {
+                        let (ap, bp) = r2_rebuild_chunk(&r, x_hi, LO * 16);
+                        if f7 != 0 {
+                            kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
+                                table.data.as_ptr().cast(), f7 as *const u8, ap, bp,
+                                want_a.as_mut_ptr().add(offset_a), want_d.as_mut_ptr().add(offset_d),
+                                eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, 127, 121,
+                                true, true, true, tail, hp(&want_head), want.as_mut_ptr());
+                        } else {
+                            fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                table.data.as_ptr().cast(), ap, bp,
+                                want_a.as_mut_ptr().add(offset_a), want_d.as_mut_ptr().add(offset_d),
+                                eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, 127, 121,
+                                true, true, true, tail, hp(&want_head), want.as_mut_ptr());
+                        }
+                        // A new registration must never inherit primed state.
+                        calls.store(0, Ordering::Relaxed);
+                        R2_AB_SCRATCH.with(|s| s.primed_id.set(0));
+                        let got = r2_rebuild_quad_walk(&r, x_hi, table.data.as_ptr().cast(), f7,
+                            got_a.as_mut_ptr().add(offset_a), got_d.as_mut_ptr().add(offset_d),
+                            eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, tail, hp(&got_head));
+                        assert_eq!(got, want, "all eight sums: x_hi={x_hi} tail={tail} head={head_enabled} f7={f7}");
+                    }
+                    assert_eq!(got_a, want_a, "all live anchors and poison guards");
+                    assert_eq!(got_d, want_d, "all live deltas and poison guards");
+                    assert!(!want_head.load(Ordering::Relaxed));
+                    assert!(!got_head.load(Ordering::Relaxed));
+                    assert_eq!(calls.load(Ordering::Relaxed), LO * 16 / UNIT);
+                    assert_eq!(first_primed.load(Ordering::Relaxed), 0);
+                    assert_eq!(R2_AB_SCRATCH.with(|s| s.bytes.get()), UNIT,
+                        "quad engagement: scratch must hold one producer unit per A/B half");
+                    drop(scope);
+                }
+            }
+        }
+        eprintln!("quad differential: 12 cases, 8 sums, all compact bytes, nonzero offsets, scratch={} bytes", 2 * UNIT);
     }
 
     /// T1 — the core oracle. Round-two message identical, and the deferred
