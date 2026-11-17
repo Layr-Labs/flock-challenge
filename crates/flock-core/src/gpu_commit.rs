@@ -2865,6 +2865,25 @@ fn band_batch_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var(ENV_NO_BAND_BATCH).is_ok_and(|v| v == "1"))
 }
 
+/// Kill switch for one compute encoder per held band buffer
+/// (`FLOCK_NO_BAND_ENC_MERGE=1`: one encoder per range, as the record). With
+/// band batching ([`ENV_NO_BAND_BATCH`]) several witness ranges go into one
+/// held command buffer, but each range still opened and ended its own compute
+/// encoder (the timed prove: 10 encoders in 3 band buffers). The ranges a held
+/// buffer collects now share its one encoder: a held range leaves the encoder
+/// open (retained across the autorelease pool, like the buffer) and the next
+/// range encodes into it; the encoder is ended just before the buffer is
+/// committed. Same range kernels, same dispatches, same order on the same
+/// serial queue (a default compute encoder runs its dispatches in order, as
+/// consecutive encoders do), so the staging bytes are the record's. Read once
+/// per process.
+pub const ENV_NO_BAND_ENC_MERGE: &str = "FLOCK_NO_BAND_ENC_MERGE";
+
+fn band_enc_merge_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| band_batch_enabled() && !std::env::var(ENV_NO_BAND_ENC_MERGE).is_ok_and(|v| v == "1"))
+}
+
 fn hybrid_cb2_spin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -12569,6 +12588,9 @@ kernel void blake3_pow_race_tail(
         /// Band buffer (retained, not committed) holding the ranges published
         /// while two band buffers were in flight (`super::ENV_NO_BAND_BATCH`).
         held: Option<Id>,
+        /// The held buffer's open compute encoder (retained), shared by the
+        /// ranges it collects (`super::ENV_NO_BAND_ENC_MERGE`).
+        held_enc: Option<Id>,
         failed: Option<String>,
         owns_lease: bool,
         started: std::time::Instant,
@@ -12677,12 +12699,17 @@ kernel void blake3_pow_race_tail(
                         Some(cb) => cb,
                         None => self.gpu.retain(self.gpu.command_buffer()?),
                     };
-                    let enc = match self.gpu.compute_encoder(cb) {
-                        Ok(enc) => enc,
-                        Err(e) => {
-                            self.gpu.release(cb);
-                            return Err(e);
-                        }
+                    // A held buffer's open encoder is shared by the ranges it
+                    // collects (`super::ENV_NO_BAND_ENC_MERGE`); it is retained.
+                    let (enc, retained) = match self.held_enc.take() {
+                        Some(enc) => (enc, true),
+                        None => match self.gpu.compute_encoder(cb) {
+                            Ok(enc) => (enc, false),
+                            Err(e) => {
+                                self.gpu.release(cb);
+                                return Err(e);
+                            }
+                        },
                     };
                     FromZFirstPassPlan::new(self.log_d)
                         .with_zero_store_from(self.zero_store_from)
@@ -12696,7 +12723,18 @@ kernel void blake3_pow_race_tail(
                             byte_offset,
                             r_count,
                         );
+                    if hold && super::band_enc_merge_enabled() {
+                        // Keep the encoder open for the next range; retain it
+                        // across the autorelease pool like the buffer.
+                        self.held_enc = Some(if retained { enc } else { self.gpu.retain(enc) });
+                        self.held = Some(cb);
+                        crate::tmark::mark("band held");
+                        return Ok(None);
+                    }
                     self.gpu.end_encoding(enc);
+                    if retained {
+                        self.gpu.release(enc);
+                    }
                     if hold {
                         self.held = Some(cb);
                         crate::tmark::mark("band held");
@@ -12823,6 +12861,12 @@ kernel void blake3_pow_race_tail(
             if let Some(cb) = self.held.take() {
                 unsafe {
                     let pool = self.gpu.pool_push();
+                    // End the held buffer's shared encoder first
+                    // (`super::ENV_NO_BAND_ENC_MERGE`).
+                    if let Some(enc) = self.held_enc.take() {
+                        self.gpu.end_encoding(enc);
+                        self.gpu.release(enc);
+                    }
                     let sig = self.gpu.arm_done(cb);
                     self.gpu.commit_async(cb);
                     self.gpu.pool_pop(pool);
@@ -13055,6 +13099,7 @@ kernel void blake3_pow_race_tail(
             unordered: Vec::new(),
             pending: Vec::with_capacity(8),
             held: None,
+            held_enc: None,
             failed: None,
             owns_lease: true,
             started: std::time::Instant::now(),
