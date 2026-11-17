@@ -3918,7 +3918,9 @@ pub(crate) const ABV_KARA_SLOT: u32 = 8192;
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn ab_kara_slot_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_KARA_SLOT").is_none())
+    // Diagnostic entry: the piece is off by default; set
+    // `FLOCK_ZC_AB_KARA_SLOT=1` to turn it back on.
+    *ON.get_or_init(|| std::env::var_os("FLOCK_ZC_AB_KARA_SLOT").is_some())
 }
 
 /// Build-time choice of [`ab_kara_slot_pair`]'s form: `true` = opaque
