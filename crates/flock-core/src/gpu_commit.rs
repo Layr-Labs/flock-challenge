@@ -3426,6 +3426,25 @@ pub(crate) fn hybrid_cpu_tail_hash_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the CPU tail hash's working coordinator
+/// (`FLOCK_NO_TAILHASH_COORD_WORK=1`, exact `1`: the calling thread spins on
+/// cb2's status while the pool's workers hash, as before). With it on, the
+/// calling thread claims and hashes 1,024-leaf units like the workers instead
+/// of spinning, and every claimer (it and the workers) checks cb2 under the
+/// claim lock before it claims: the first claim attempt after cb2's end stops
+/// the claims, so no thread keeps claiming while the caller finishes a unit.
+/// Same claim order (the top-down count, lowered before each unit), same cb3
+/// counts, same units hashed by one or both sides into the same slots, so the
+/// root is unchanged. Read once per process.
+pub const ENV_NO_TAILHASH_COORD_WORK: &str = "FLOCK_NO_TAILHASH_COORD_WORK";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tailhash_coord_work_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAILHASH_COORD_WORK));
+    *ON
+}
+
 /// Test hook of the CPU tail hash: 1,024-leaf units the CPU hashes before it
 /// looks at cb2 (so a fast GPU still leaves it a chosen share; `usize::MAX`
 /// or any count past the suffix = all of it), and the path is taken even if
@@ -13763,8 +13782,10 @@ kernel void blake3_pow_race_tail(
     /// cb2, as before, but over the suffix's GPU units only: its dispatches
     /// read the unit count when they run. The pool's workers hash 1,024-leaf
     /// units from the top of the suffix downward while this thread watches
-    /// cb2, and every claim lowers the count first. Once cb2 is complete
-    /// (after at least `force` units in a test build) the claims stop.
+    /// cb2 (with `super::ENV_NO_TAILHASH_COORD_WORK` on, this thread hashes
+    /// units too and every claimer checks cb2 before it claims), and every
+    /// claim lowers the count first. Once cb2 is complete (after at least
+    /// `force` units in a test build) the claims stop.
     ///
     /// Every unit is hashed by at least one side: cb3's dispatches each read
     /// a count no lower than the final one, so they cover every unit below
@@ -13823,6 +13844,9 @@ kernel void blake3_pow_race_tail(
         // Raw handles cross the scope as integers (the body runs on this
         // thread; the workers get the claims and the byte/tree/args bases).
         let cb2_u = cb2 as usize;
+        // Working coordinator (`super::ENV_NO_TAILHASH_COORD_WORK`): this
+        // thread hashes units too, and every claimer checks cb2 first.
+        let coord_work = super::tailhash_coord_work_enabled();
         let t_tail = std::time::Instant::now();
         let mut h = n_leaves;
         // Claim one unit: lower cb3's count first, then hash it.
@@ -13841,6 +13865,9 @@ kernel void blake3_pow_race_tail(
                 hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, TAIL_UNIT_LEVELS);
             }
         };
+        // cb2's completion as the caller reads it: its armed signal when
+        // present (`super::ENV_NO_CB2_DONE_SIGNAL`), else the status.
+        let sig2_ref = sig2.as_ref();
         rayon::scope(|sc| {
             for _ in 0..rayon::current_num_threads() {
                 let claims = &claims;
@@ -13850,16 +13877,34 @@ kernel void blake3_pow_race_tail(
                         if g.1 || g.0 <= suffix_start {
                             break;
                         }
+                        // Working coordinator: stop the claims at the first
+                        // claim attempt after cb2's end (the caller may be
+                        // inside a unit of its own and not see it), read as
+                        // the caller reads it.
+                        if coord_work
+                            && (n_leaves - g.0) / unit >= force_units
+                            // SAFETY: the committed cb2 and its signal, both
+                            // held by the caller until after this scope.
+                            && unsafe { gpu.cb_done(cb2_u as Id, sig2_ref) }
+                        {
+                            g.1 = true;
+                            break;
+                        }
                         claim(&mut g)
                     };
                     hash_unit(start);
                 });
             }
-            let cb2_done = || unsafe { gpu.cb_done(cb2_u as Id, sig2.as_ref()) };
+            let cb2_done = || unsafe { gpu.cb_done(cb2_u as Id, sig2_ref) };
             let mut spins = 0u32;
             loop {
                 {
                     let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.1 {
+                        // A worker saw cb2's end (working coordinator).
+                        h = g.0;
+                        break;
+                    }
                     if g.0 <= suffix_start {
                         g.1 = true;
                         h = suffix_start;
@@ -13871,9 +13916,10 @@ kernel void blake3_pow_race_tail(
                         h = g.0;
                         break;
                     }
-                    if claimed < force_units {
-                        // Test builds only: help with the forced units (a
-                        // pool with no free worker must not stall here).
+                    if claimed < force_units || coord_work {
+                        // Test builds: help with the forced units (a pool
+                        // with no free worker must not stall here). Working
+                        // coordinator: hash a unit instead of spinning.
                         let start = claim(&mut g);
                         drop(g);
                         hash_unit(start);
