@@ -232,34 +232,126 @@ mod imp {
         }
         HOT_PROVE.store(false, Ordering::Relaxed);
         HOT_PROVE_OFF.store(std::env::var_os("FLOCK_NO_HOT_PROVE").is_some(), Ordering::Relaxed);
+        // `FLOCK_HOT_RESERVED=n`, read once here (untimed): how many workers
+        // stay out of the hot-prove spin. 3 is the previous behaviour.
+        let reserved = std::env::var("FLOCK_HOT_RESERVED")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(HOT_PROVE_RESERVED);
+        // `FLOCK_NO_HOT_TICKLE`, read once here (untimed). The tickle needs a
+        // pool without sleepers (see [`HOT_TICKLE`]), so it is on only when
+        // every worker spins.
+        HOT_TICKLE.store(
+            reserved == 0 && std::env::var_os("FLOCK_NO_HOT_TICKLE").is_none(),
+            Ordering::Relaxed,
+        );
+        SEED_READ.store(false, Ordering::SeqCst);
         let deadline = Instant::now() + MAX_KEEPALIVE;
         rayon::spawn_broadcast(move |ctx| {
             // Leave one core to the seed-pipe thread's hot poll.
             if ctx.index() + 1 == ctx.num_threads() {
+                if reserved == 0 {
+                    pool_spin_last(deadline);
+                }
                 return;
             }
-            pool_spin_body(deadline, ctx.index() + HOT_PROVE_RESERVED >= ctx.num_threads());
+            pool_spin_body(deadline, ctx.index() + reserved >= ctx.num_threads(), false);
         });
         true
     }
 
-    /// Cores the hot-prove spin leaves alone: one each for Metal's submit
-    /// thread, Metal's completion thread and the proving thread, the three
-    /// threads besides the pool's workers that run on performance cores
-    /// during a prove. The workers with the highest indices (the one the
-    /// spin never included, and two more) park as before, so spinners plus
-    /// those three never exceed the pool's width.
-    const HOT_PROVE_RESERVED: usize = 3;
+    /// Workers the hot-prove spin leaves out (default; `FLOCK_HOT_RESERVED`
+    /// overrides it). It used to be 3: one core each for Metal's submit
+    /// thread, Metal's completion thread and the proving thread, with the
+    /// three highest-index workers parking in Rayon's idle sleep as before.
+    /// A census of that tree's timed prove found every remaining idle park
+    /// of a performance-core worker on exactly those three (85-101 per
+    /// proof, 28-38 each), 90-100 wake signals sent to them by the threads
+    /// that push jobs, and 34-48 kernel waits of pushers on a sleeper's
+    /// lock, while the three threads the cores were kept for run for 4 %,
+    /// 1 % and 0.1 % of the prove. With 0 every worker spins: Rayon then
+    /// has no sleeper, so a push is one atomic load and no worker joins a
+    /// region one wake late. A spinner makes a kernel yield every idle
+    /// round, so a runnable thread outside the pool waits at most one round
+    /// (well under a microsecond) for a core. 1 and 2 are the intermediate
+    /// steps; `FLOCK_HOT_RESERVED=3` restores the previous behaviour.
+    const HOT_PROVE_RESERVED: usize = 0;
 
-    fn pool_spin_body(deadline: Instant, leaves_at_witness: bool) {
+    /// Waiting joiners do not park. The spin keeps *idle* workers on-core,
+    /// but a worker blocked in a `join` or `scope` whose other half was
+    /// stolen is in Rayon's own wait loop: with nothing to steal it parks
+    /// after 32 yield rounds (10-15 us) and resumes one wake after its latch
+    /// is set. The census counts 32-51 such parks per timed proof, 13-30 of
+    /// them on the two workers that carry the phase bodies: wakes of a
+    /// parked thread on the very chain the region's caller waits on. Rayon
+    /// lets a sleepy worker fall asleep only if no job was pushed since it
+    /// announced itself (its jobs event counter), so while this flag is set
+    /// every idle round of a spinner after the witness hand-off makes one
+    /// empty `rayon::join`: the push bumps that counter when somebody is
+    /// sleepy, the sleepy joiner stays in its yield loop and sees its latch
+    /// within a round. A joiner that did park (no spinner was idle then) is
+    /// woken by the next idle spinner instead of by its latch. With parked
+    /// idle workers in the pool each such push would wake one, so the
+    /// tickle is on only with `FLOCK_HOT_RESERVED=0`. It stops with the
+    /// spin. Scheduling only: the joined closures are empty.
+    /// `FLOCK_NO_HOT_TICKLE=1` turns it off.
+    static HOT_TICKLE: AtomicBool = AtomicBool::new(false);
+
+    /// Set by [`signal`] (the seed-pipe thread, the instant the seed is
+    /// read): the last worker may leave its park and join the spin.
+    static SEED_READ: AtomicBool = AtomicBool::new(false);
+    /// `true` while the last worker sits in [`pool_spin_last`]'s park.
+    static LAST_PARKED: AtomicBool = AtomicBool::new(false);
+    /// The last worker's handle, for the one `unpark`.
+    static LAST_THREAD: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
+
+    /// The last worker with no reserved core (`FLOCK_HOT_RESERVED=0`). Until
+    /// the seed is read its core belongs to the seed-pipe thread's poll, so
+    /// it parks here, off-core, exactly where it used to sleep in Rayon's
+    /// idle path; [`signal`] unparks it (one wake, replacing the one Rayon
+    /// sent it for the first injected job). From then on it spins with a
+    /// kernel yield every idle round, never the scalar churn. Bounded by
+    /// the same deadline; [`pool_spin_release`] also unparks it.
+    fn pool_spin_last(deadline: Instant) {
+        let _ = LAST_THREAD.set(std::thread::current());
+        LAST_PARKED.store(true, Ordering::SeqCst);
+        while POOL_SPIN.load(Ordering::Relaxed) && !SEED_READ.load(Ordering::SeqCst) {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::park_timeout(deadline - now);
+        }
+        LAST_PARKED.store(false, Ordering::SeqCst);
+        if SEED_READ.load(Ordering::SeqCst) {
+            pool_spin_body(deadline, false, true);
+        }
+    }
+
+    fn unpark_last() {
+        if LAST_PARKED.load(Ordering::SeqCst)
+            && let Some(t) = LAST_THREAD.get()
+        {
+            t.unpark();
+        }
+    }
+
+    fn pool_spin_body(deadline: Instant, leaves_at_witness: bool, always_yield: bool) {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         while POOL_SPIN.load(Ordering::Relaxed) {
             if let Some(rayon::Yield::Executed) = rayon::yield_now() {
                 continue;
             }
-            if HOT_PROVE.load(Ordering::Relaxed) {
+            let hot = HOT_PROVE.load(Ordering::Relaxed);
+            if always_yield || hot {
                 if leaves_at_witness {
                     break;
+                }
+                if hot && HOT_TICKLE.load(Ordering::Relaxed) {
+                    // One empty join: its push moves Rayon's jobs counter
+                    // (see [`HOT_TICKLE`]). No allocation, no signal, the
+                    // job is popped again by this same call.
+                    rayon::join(|| (), || ());
                 }
                 // After the witness hand-off: yield like an idle Rayon
                 // worker, never park.
@@ -286,6 +378,9 @@ mod imp {
     pub(super) fn pool_spin_release() {
         if POOL_SPIN.load(Ordering::Relaxed) {
             POOL_SPIN.store(false, Ordering::Release);
+            // Only when the seed never came (failure path): at proof done
+            // the last worker has long left its park and this is one load.
+            unpark_last();
         }
     }
 
@@ -349,6 +444,10 @@ mod imp {
     /// the timed window, so the lighter fence is the whole win.
     pub(super) fn signal() {
         RUNNING.swap(false, Ordering::AcqRel);
+        // The seed is read: let a parked last worker join the hot pool
+        // (`FLOCK_HOT_RESERVED=0` only; otherwise nothing is parked here).
+        SEED_READ.store(true, Ordering::SeqCst);
+        unpark_last();
     }
 
     /// Wait until every spin thread has finished. All spin threads are
