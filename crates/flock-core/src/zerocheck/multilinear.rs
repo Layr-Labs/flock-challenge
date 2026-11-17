@@ -295,9 +295,52 @@ fn stash_staged_r2_eq(challenges: &[F128], eq: SplitEqGhash) {
     if !r2_eq_reuse_enabled() {
         return;
     }
+    // Round-two prepared group weights (`FLOCK_NO_R2_PREP_STAGE=1`, exact
+    // `1`, kills): `round2_eq_prep(eq.lo)` is a deterministic function of
+    // the staged table, so build it here too, off the z -> round-two gap.
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    if r2_prep_stage_enabled() {
+        let prep = kernels::aarch64::round2_eq_prep(&eq.lo);
+        if let Ok(mut slot) = STAGED_R2_PREP.lock() {
+            *slot = Some((challenges.to_vec(), eq.n_lo, prep));
+        }
+    }
     if let Ok(mut slot) = STAGED_R2_EQ.lock() {
         *slot = Some((challenges.to_vec(), eq));
     }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+static STAGED_R2_PREP: std::sync::Mutex<Option<(Vec<F128>, usize, Vec<F128>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+fn r2_prep_stage_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var("FLOCK_NO_R2_PREP_STAGE").is_ok_and(|v| v == "1")
+    });
+    *ON
+}
+
+/// The staged `round2_eq_prep` for exactly `(challenges, n_lo)`, else a
+/// fresh build from `eq_lo` (same values either way).
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn take_or_build_r2_prep(challenges: &[F128], n_lo: usize, eq_lo: &[F128]) -> Vec<F128> {
+    #[cfg(target_os = "macos")]
+    if r2_eq_reuse_enabled() && r2_prep_stage_enabled() {
+        if let Ok(mut slot) = STAGED_R2_PREP.lock() {
+            match slot.take() {
+                Some((ch, lo, prep))
+                    if lo == n_lo && ch.as_slice() == challenges && prep.len() == (eq_lo.len() & !1) =>
+                {
+                    crate::tmark::mark("r2 prep adopted");
+                    return prep;
+                }
+                other => *slot = other,
+            }
+        }
+    }
+    kernels::aarch64::round2_eq_prep(eq_lo)
 }
 
 /// Adopt the staged round-two eq split when it matches `(challenges, n_hi)`
@@ -2434,7 +2477,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // by every chunk's ranked loop (passed as an address; null without SHA3,
     // which keeps the full sweep on its parent loop).
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let eq_prep = kernels::aarch64::round2_eq_prep(eq_lo);
+    let eq_prep = take_or_build_r2_prep(&mlv_challenges[1..], eq.n_lo, eq_lo);
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep_addr = eq_prep.as_ptr() as usize;
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
