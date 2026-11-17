@@ -1148,7 +1148,8 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 /// on an M1 Max balances near 740 of the 2048 chunks (13.2 ms at 512, 12.0 at
 /// 640, 11.9 at 768, 13.7 at 896); the runner's GPU is at least 2.1x this
 /// one's, so 768 stays CPU-critical there.
-const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 768;
+/// 1024 since `e363e1c0` (768 -> 1024).
+const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 1024;
 
 pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
 const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
