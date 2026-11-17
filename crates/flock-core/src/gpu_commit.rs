@@ -446,6 +446,15 @@ pub(crate) fn cb2_done_signal_enabled() -> bool {
     *ON
 }
 
+pub const ENV_NO_TAIL_HASH_CALLER_CLAIMS: &str = "FLOCK_NO_TAIL_HASH_CALLER_CLAIMS";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tail_hash_caller_claims_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAIL_HASH_CALLER_CLAIMS));
+    *ON
+}
+
 pub(crate) fn gpu_done_event_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !std::env::var(ENV_NO_GPU_DONE_EVENT).is_ok_and(|v| v == "1")
@@ -13824,7 +13833,6 @@ kernel void blake3_pow_race_tail(
         // thread; the workers get the claims and the byte/tree/args bases).
         let cb2_u = cb2 as usize;
         let t_tail = std::time::Instant::now();
-        let mut h = n_leaves;
         // Claim one unit: lower cb3's count first, then hash it.
         let claim = move |g: &mut (usize, bool)| -> usize {
             g.0 -= unit;
@@ -13841,53 +13849,63 @@ kernel void blake3_pow_race_tail(
                 hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, TAIL_UNIT_LEVELS);
             }
         };
+        let caller_claims = super::tail_hash_caller_claims_enabled();
+        let cb2_done = move || unsafe { gpu.cb_done(cb2_u as Id, sig2.as_ref()) };
+        let run_claims = move |claims: &std::sync::Mutex<(usize, bool)>| loop {
+            let done = caller_claims && cb2_done();
+            let start = {
+                let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                if g.1 || g.0 <= suffix_start {
+                    break;
+                }
+                if done && (n_leaves - g.0) / unit >= force_units {
+                    g.1 = true;
+                    break;
+                }
+                claim(&mut g)
+            };
+            hash_unit(start);
+        };
         rayon::scope(|sc| {
             for _ in 0..rayon::current_num_threads() {
                 let claims = &claims;
-                sc.spawn(move |_| loop {
-                    let start = {
+                sc.spawn(move |_| run_claims(claims));
+            }
+            if caller_claims {
+                run_claims(&claims);
+            } else {
+                let mut spins = 0u32;
+                loop {
+                    {
                         let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
-                        if g.1 || g.0 <= suffix_start {
+                        if g.0 <= suffix_start {
+                            g.1 = true;
                             break;
                         }
-                        claim(&mut g)
-                    };
-                    hash_unit(start);
-                });
-            }
-            let cb2_done = || unsafe { gpu.cb_done(cb2_u as Id, sig2.as_ref()) };
-            let mut spins = 0u32;
-            loop {
-                {
-                    let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
-                    if g.0 <= suffix_start {
-                        g.1 = true;
-                        h = suffix_start;
-                        break;
+                        let claimed = (n_leaves - g.0) / unit;
+                        if claimed >= force_units && cb2_done() {
+                            g.1 = true;
+                            break;
+                        }
+                        if claimed < force_units {
+                            // Test builds only: help with the forced units (a
+                            // pool with no free worker must not stall here).
+                            let start = claim(&mut g);
+                            drop(g);
+                            hash_unit(start);
+                            continue;
+                        }
                     }
-                    let claimed = (n_leaves - g.0) / unit;
-                    if claimed >= force_units && cb2_done() {
-                        g.1 = true;
-                        h = g.0;
-                        break;
+                    spins = spins.wrapping_add(1);
+                    if spins % 64 == 0 {
+                        std::thread::yield_now();
+                    } else {
+                        core::hint::spin_loop();
                     }
-                    if claimed < force_units {
-                        // Test builds only: help with the forced units (a
-                        // pool with no free worker must not stall here).
-                        let start = claim(&mut g);
-                        drop(g);
-                        hash_unit(start);
-                        continue;
-                    }
-                }
-                spins = spins.wrapping_add(1);
-                if spins % 64 == 0 {
-                    std::thread::yield_now();
-                } else {
-                    core::hint::spin_loop();
                 }
             }
         });
+        let h = claims.into_inner().unwrap_or_else(|e| e.into_inner()).0;
         let tail_ms = t_tail.elapsed().as_secs_f64() * 1e3;
         crate::tmark::mark("tail hash workers done");
         if sig2.is_some() && !window_trace_enabled() {
