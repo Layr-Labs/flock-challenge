@@ -16398,6 +16398,7 @@ kernel void blake3_pow_seg_tail(
         // the tilted split is what the dead-store check, the byte
         // verification and publication below see.
         let tilt = super::split_cpu_tilt256();
+        let diag_base = chosen;
         let chosen = if tilt > 0 && chosen != 0 {
             let tilted = tilt_split_toward_cpu(
                 chosen,
@@ -16415,6 +16416,11 @@ kernel void blake3_pow_seg_tail(
         } else {
             chosen
         };
+        // Diagnostic run (self-test print, `FLOCK_TMARK` only): this
+        // worker's arm tilt and the split it publishes.
+        if crate::tmark::env_on() {
+            eprintln!("[diag39] tuned split: tilt +{tilt}/256 base k={diag_base} -> k={chosen}");
+        }
 
         let matches_reference = || {
             cpu_codeword.len() == params.codeword_len_f128()
