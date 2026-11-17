@@ -122,6 +122,11 @@ pub fn init_perf_thread_pool() -> Option<usize> {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or_else(perf_core_count);
+    let n = if is_ranked_worker_process() {
+        n.max(std::thread::available_parallelism().map(|count| count.get()).unwrap_or(n))
+    } else {
+        n
+    };
     // The main/calling thread runs *all* sequential work (seed expansion,
     // Fiat-Shamir observe/sample, proof serialization, multi-proof extract)
     // but rayon's start_handler only tags the pool workers. On Apple Silicon
