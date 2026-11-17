@@ -123,6 +123,11 @@ pub fn pool_spin_commit_done() {
     imp::pool_spin_commit_done();
 }
 
+pub fn epool_hot_seed() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::epool_hot_seed();
+}
+
 /// Stop the keep-alive: signal the spin threads and join them. Idempotent and
 /// safe to call from any thread. Called by the seed-pipe thread the instant its
 /// stdin `read()` returns (before forwarding the seed or starting the
@@ -246,6 +251,8 @@ mod imp {
         }
         HOT_PROVE.store(false, Ordering::Relaxed);
         HOT_PROVE_OFF.store(std::env::var_os("FLOCK_NO_HOT_PROVE").is_some(), Ordering::Relaxed);
+        EPOOL_SEED_OFF.store(std::env::var_os("FLOCK_NO_EPOOL_SEED_HOT").is_some(), Ordering::Relaxed);
+        EPOOL_SEED.store(false, Ordering::Relaxed);
         crate::epool::hot_spin_arm();
         // Reserved workers park again from the commitment's join on, as before
         // the reserved-worker spin (`FLOCK_NO_RESV_PARK=1`, exact `1`, keeps
@@ -275,6 +282,9 @@ mod imp {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut idle: u32 = 0;
         while POOL_SPIN.load(Ordering::Relaxed) {
+            if EPOOL_SEED.load(Ordering::Relaxed) && EPOOL_SEED.swap(false, Ordering::AcqRel) {
+                crate::epool::hot_spin_start();
+            }
             if let Some(rayon::Yield::Executed) = rayon::yield_now() {
                 idle = 0;
                 continue;
@@ -314,6 +324,7 @@ mod imp {
         if POOL_SPIN.load(Ordering::Relaxed) {
             POOL_SPIN.store(false, Ordering::Release);
         }
+        EPOOL_SEED.store(false, Ordering::Relaxed);
         crate::epool::hot_spin_release();
         if RESV_HOT.load(Ordering::Relaxed) {
             RESV_HOT.store(false, Ordering::Release);
@@ -332,6 +343,18 @@ mod imp {
             HOT_PROVE.store(true, Ordering::Release);
             // The helper pool's workers stay hot for the same interval.
             crate::epool::hot_spin_start();
+        }
+    }
+
+    static EPOOL_SEED: AtomicBool = AtomicBool::new(false);
+    static EPOOL_SEED_OFF: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn epool_hot_seed() {
+        if POOL_SPIN.load(Ordering::Relaxed)
+            && !HOT_PROVE_OFF.load(Ordering::Relaxed)
+            && !EPOOL_SEED_OFF.load(Ordering::Relaxed)
+        {
+            EPOOL_SEED.store(true, Ordering::Release);
         }
     }
 
