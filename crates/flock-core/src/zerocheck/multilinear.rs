@@ -4539,7 +4539,7 @@ fn tri0_gpu_queue(
     let claims = std::sync::Mutex::new((0usize, hi_size, 0usize));
     crate::epool::run_hetero_chunks(hi_size, |_| {
         let (x_hi, from_gpu) = {
-            let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = crate::lock_spin(&claims).unwrap_or_else(|e| e.into_inner());
             assert!(g.0 < g.1, "tri pass 0 claim queue overrun");
             if !calibration && job.chunk_ready(g.0) {
                 g.0 += 1;
