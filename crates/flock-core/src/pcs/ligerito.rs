@@ -5436,6 +5436,61 @@ fn transpose_forward_ntt_sparse_retained_with(
     drop_log: usize,
     lean: bool,
 ) -> Option<Vec<F128>> {
+    prepare_c2_retained_transpose(ntt, positions, values, log_d, drop_log, lean)
+        .map(|prepared| prepared.materialize(ntt))
+}
+
+/// Read once per process; any value restores materialize followed by merge.
+fn c2_basis_sink_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_BASIS_SINK").is_none())
+}
+
+fn c2_basis_sink_shape(full_log_d: usize, log_d: usize, drop_log: usize, count: usize) -> bool {
+    c2_prepared_producer_shape(full_log_d, log_d, 8, drop_log, count)
+}
+
+/// Fully initialized transform storage, stopped just before retained emission.
+/// Preparation owns only this allocation; the fold owns combined_basis until join.
+struct C2RetainedPreparation {
+    data: Vec<F128>,
+    log_d: usize,
+    drop_log: usize,
+    low_half_final: bool,
+}
+
+impl C2RetainedPreparation {
+    fn materialize(mut self, ntt: &AdditiveNttF128) -> Vec<F128> {
+        if self.low_half_final {
+            transpose_forward_ntt_factored_final_3layer_low_half(ntt, &mut self.data, self.log_d);
+            self.data.truncate(1usize << (self.log_d - 1));
+            self.data
+        } else {
+            let retained = xor_collapse_cosets(&self.data, self.log_d - self.drop_log);
+            crate::scratch::give_sparse_ntt_data(self.data);
+            retained
+        }
+    }
+
+    fn add_to(self, ntt: &AdditiveNttF128, dst: &mut [F128]) {
+        assert_eq!(dst.len(), 1usize << (self.log_d - self.drop_log));
+        if self.low_half_final {
+            transpose_forward_ntt_factored_final_3layer_add(ntt, &self.data, self.log_d, dst);
+        } else {
+            xor_collapse_cosets_add(&self.data, dst);
+        }
+        crate::scratch::give_sparse_ntt_data(self.data);
+    }
+}
+
+fn prepare_c2_retained_transpose(
+    ntt: &AdditiveNttF128,
+    positions: &[usize],
+    values: &[F128],
+    log_d: usize,
+    drop_log: usize,
+    lean: bool,
+) -> Option<C2RetainedPreparation> {
     if drop_log == 0
         || drop_log >= log_d
         || positions.len() != values.len()
@@ -5443,7 +5498,10 @@ fn transpose_forward_ntt_sparse_retained_with(
     {
         return None;
     }
-    let n = 1usize << log_d;
+    let n = 1usize.checked_shl(log_d.try_into().ok()?)?;
+    if positions.iter().any(|&p| p >= n) || log_d > ntt.log_domain_size() {
+        return None;
+    }
     let k = if log_d >= 12 { 8usize.min(log_d) } else { 0 };
     if log_d - k < drop_log {
         return None;
@@ -5490,9 +5548,7 @@ fn transpose_forward_ntt_sparse_retained_with(
             remaining -= 3;
             transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, remaining);
         }
-        transpose_forward_ntt_factored_final_3layer_low_half(ntt, &mut data, log_d);
-        data.truncate(n >> 1);
-        return Some(data);
+        return Some(C2RetainedPreparation { data, log_d, drop_log, low_half_final });
     }
     while remaining >= drop_log + 3 {
         remaining -= 3;
@@ -5501,9 +5557,7 @@ fn transpose_forward_ntt_sparse_retained_with(
     for layer in (drop_log..remaining).rev() {
         transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, layer);
     }
-    let retained = xor_collapse_cosets(&data, log_d - drop_log);
-    crate::scratch::give_sparse_ntt_data(data);
-    Some(retained)
+    Some(C2RetainedPreparation { data, log_d, drop_log, low_half_final })
 }
 
 /// The same retained row with four multipliers prepared before the row loop.
@@ -5602,6 +5656,84 @@ fn transpose_forward_ntt_factored_final_3layer_low_half(
             }
         });
 }
+
+fn transpose_forward_ntt_factored_final_3layer_add(
+    ntt: &AdditiveNttF128,
+    data: &[F128],
+    log_d: usize,
+    dst: &mut [F128],
+) {
+    use rayon::prelude::*;
+
+    assert!(log_d >= 3);
+    assert_eq!(data.len(), 1usize << log_d);
+    let eighth = data.len() >> 3;
+    let layer_1_twiddles = [ntt.twiddle(1, 0), ntt.twiddle(1, 1)];
+    let layer_2_twiddles: [F128; 4] = core::array::from_fn(|block| ntt.twiddle(2, block));
+    assert_eq!(layer_1_twiddles[0], F128::ZERO);
+    assert_eq!(layer_2_twiddles[0], F128::ZERO);
+    assert_eq!(
+        layer_2_twiddles[3],
+        layer_2_twiddles[1] + layer_2_twiddles[2]
+    );
+    let constants = L0FactoredFinal3Constants {
+        a: layer_2_twiddles[1],
+        d: layer_2_twiddles[2],
+        a_plus_d: layer_2_twiddles[3],
+        b: layer_1_twiddles[1],
+    };
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    let constants = {
+        use core::arch::aarch64::uint64x2_t;
+        use crate::field::gf2_128::aarch64::const_prep;
+        // SAFETY: AES and the little-endian F128 lane layout are required.
+        unsafe {
+            [constants.a, constants.d, constants.a_plus_d, constants.b]
+                .map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t)))
+        }
+    };
+    assert_eq!(dst.len(), data.len() >> 1);
+    let (a, rest) = dst.split_at_mut(eighth);
+    let (b, rest) = rest.split_at_mut(eighth);
+    let (c, d) = rest.split_at_mut(eighth);
+    // Disjoint initialized output lanes; input storage is immutable throughout.
+    a.par_iter_mut().zip(b.par_iter_mut()).zip(c.par_iter_mut()).zip(d.par_iter_mut())
+        .enumerate()
+        .with_min_len(small_ntt_min_jobs(8))
+        .for_each(|(row, (((a, b), c), d))| {
+            let values = core::array::from_fn(|i| data[row + i * eighth]);
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            let retained = l0_factored_final3_prepared_row(values, constants);
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+            let retained = l0_factored_final3_retained_row(values, constants);
+            *a += retained[0];
+            *b += retained[1];
+            *c += retained[2];
+            *d += retained[3];
+        });
+}
+
+fn xor_collapse_cosets_add(data: &[F128], dst: &mut [F128]) {
+    use rayon::prelude::*;
+    let keep = dst.len();
+    assert!(keep.is_power_of_two() && data.len().is_power_of_two() && data.len() >= keep);
+    let add = |base: usize, chunk: &mut [F128]| {
+        for (i, out) in chunk.iter_mut().enumerate() {
+            let mut value = data[base + i];
+            for coset in 1..data.len() / keep {
+                value += data[coset * keep + base + i];
+            }
+            *out += value;
+        }
+    };
+    if keep >= 2 * SMALL_NTT_MIN_ELEMS {
+        dst.par_chunks_mut(SMALL_NTT_MIN_ELEMS).enumerate()
+            .for_each(|(ci, chunk)| add(ci * SMALL_NTT_MIN_ELEMS, chunk));
+    } else {
+        add(0, dst);
+    }
+}
+
 
 fn xor_collapse_cosets(data: &[F128], keep_log: usize) -> Vec<F128> {
     use rayon::prelude::*;
