@@ -2732,13 +2732,19 @@ pub(crate) mod witgen_simd {
     /// spelled out at the call site (stable Rust cannot derive const
     /// arguments from const parameters). The `vsri` shift-right-and-insert
     /// form fuses the shl+shr+orr into one insert instruction, mirroring
-    /// the BLAKE3 rotate idiom in `merkle/blake3_neon_apple.rs`.
+    /// the BLAKE3 rotate idiom in `merkle/blake3_neon_apple.rs`. A rotation
+    /// by 16 swaps the two 16-bit halves of each u32 lane, which is one
+    /// `rev32` on the u16 view, as in that Merkle file's `rotate16`.
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
         unsafe {
             let v = veorq_u32(x, y);
-            vsriq_n_u32(vshlq_n_u32::<M>(v), v, N)
+            if N == 16 {
+                vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(v)))
+            } else {
+                vsriq_n_u32(vshlq_n_u32::<M>(v), v, N)
+            }
         }
     }
 
