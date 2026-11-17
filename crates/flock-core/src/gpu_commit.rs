@@ -920,6 +920,40 @@ pub(crate) const ZC_R2_CS_SHARE_CEIL_PCT: usize = 43;
 /// means the oracle dispatch did not run or its timestamps are broken.
 pub(crate) const ZC_R2_CS_PRICE_FLOOR: f64 = 0.15;
 
+/// Kill switch for the R2-CS ceiling offer (`FLOCK_NO_R2_OFFER_CEIL`, any
+/// value: the timed prefix is the priced share, as before).
+///
+/// The priced share comes from one warm-up sample of each arm (the CPU's
+/// from the warm-up prove's single sweep), and between otherwise identical
+/// processes it lands on either side of the split at which the two arms end
+/// together. Since the late-GPU steal ([`ENV_NO_R2_STEAL`]) the two sides
+/// are not alike: a prefix that is too long is cut in the timed prove itself
+/// (the CPU sweep, once its own chunks are walked, takes the GPU's chunks
+/// from the top of the prefix downward until the GPU signals), while a
+/// prefix that is too short leaves the GPU idle and nothing corrects it. So
+/// with the steal kernel built and the measured share on (the anchors view
+/// and the A/B rebuild's published prefix are then made over the ceiling
+/// already), the share published for the timed proves is the ceiling
+/// ([`ZC_R2_CS_SHARE_CEIL_PCT`] percent of `hi`), never less than the priced
+/// share, and the steal settles the split. Which side walks a chunk cannot
+/// change a bit (the steal's own argument). Read once per process.
+pub const ENV_NO_R2_OFFER_CEIL: &str = "FLOCK_NO_R2_OFFER_CEIL";
+
+/// Chunks of `hi` the ceiling offer publishes as the timed prefix: the
+/// measured share's ceiling. Never above the A/B rebuild's published prefix
+/// (the same expression, `zerocheck::univariate_skip_optimized`) nor above
+/// the anchors view ([`zc_r2_cs_view_chunks`]); a unit test holds both.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_r2_offer_ceil_chunks(hi: usize) -> usize {
+    hi * ZC_R2_CS_SHARE_CEIL_PCT / 100
+}
+
+pub(crate) fn zc_r2_offer_ceil_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_R2_OFFER_CEIL).is_none());
+    *ON && zc_r2_steal_enabled() && zc_r2_cs_measured_share_enabled()
+}
+
 pub(crate) fn zc_r2_cs_measured_share_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| !env_is_one(ENV_NO_ZC_R2_CS_SHARE));
@@ -1178,7 +1212,7 @@ pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
 
 /// The 5+6 arm's default share, in 5+6 chunks (of 512), when
 /// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
-pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 128;
+pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 160;
 
 /// Kill switch for the 5+6 arm's late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1`:
 /// the record's join, where the CPU queue, having folded the chunks after the
@@ -2439,6 +2473,29 @@ fn select_gpu_leaf_parent3(pso_ok: bool) -> bool {
     pso_ok && gpu_leaf_parent3_enabled()
 }
 
+/// Kill switch for the leaf + parent3 kernel's straight-line BLAKE3
+/// compression (`FLOCK_NO_LEAF_STRAIGHT=1`, exact `1`: the looped
+/// compression, as before). The kernel behind cb3 (the CPU suffix's leaves on
+/// the GPU, the commit's tail) hashed each 64-byte block with a seven-round
+/// loop that permutes the sixteen message words in place after each round.
+/// With it on, the kernel's compression is the same arithmetic written out
+/// round by round with BLAKE3's fixed message schedule (round r reads the
+/// block permuted r times), the 16-bit rotation as a swap of the word's two
+/// halves and the others as `rotate`: no word moves between rounds. Measured
+/// on an M4 (`leaf_probe`, 16 alternating rounds over 320 units): the
+/// compression alone 10.19 -> 8.43 us per 1,024-leaf unit; the whole kernel,
+/// which the M4 runs at its memory bandwidth, 11.54 -> 11.27 us (16 of 16
+/// lower). Same chaining values, nodes and slots. Only this kernel: the fused
+/// final-pass leaf kernel measured slower with the same form. Read once, when
+/// the kernel is compiled at Gpu init.
+pub const ENV_NO_LEAF_STRAIGHT: &str = "FLOCK_NO_LEAF_STRAIGHT";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn leaf_straight_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_LEAF_STRAIGHT));
+    *ON
+}
+
 #[cfg(test)]
 mod parent3_gate_tests {
     use std::ffi::OsStr;
@@ -2884,6 +2941,25 @@ fn band_batch_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var(ENV_NO_BAND_BATCH).is_ok_and(|v| v == "1"))
 }
 
+/// Kill switch for one compute encoder per held band buffer
+/// (`FLOCK_NO_BAND_ENC_MERGE=1`: one encoder per range, as the record). With
+/// band batching ([`ENV_NO_BAND_BATCH`]) several witness ranges go into one
+/// held command buffer, but each range still opened and ended its own compute
+/// encoder (the timed prove: 10 encoders in 3 band buffers). The ranges a held
+/// buffer collects now share its one encoder: a held range leaves the encoder
+/// open (retained across the autorelease pool, like the buffer) and the next
+/// range encodes into it; the encoder is ended just before the buffer is
+/// committed. Same range kernels, same dispatches, same order on the same
+/// serial queue (a default compute encoder runs its dispatches in order, as
+/// consecutive encoders do), so the staging bytes are the record's. Read once
+/// per process.
+pub const ENV_NO_BAND_ENC_MERGE: &str = "FLOCK_NO_BAND_ENC_MERGE";
+
+fn band_enc_merge_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| band_batch_enabled() && !std::env::var(ENV_NO_BAND_ENC_MERGE).is_ok_and(|v| v == "1"))
+}
+
 fn hybrid_cb2_spin_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("1"))
 }
@@ -2925,64 +3001,6 @@ pub const ENV_NO_GPU_WAIT_HELP: &str = "FLOCK_NO_GPU_WAIT_HELP";
 pub(crate) fn gpu_wait_help_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_WAIT_HELP).is_none())
-}
-
-/// Kill switch for the hybrid suffix NTT's priority over the round-one AB
-/// arm: `FLOCK_NO_NTT_AB_PRIORITY` (any value) restores the incumbent
-/// schedule. Read once per process.
-///
-/// The commit/AB join runs the hybrid commit's CPU suffix NTT on the commit
-/// arm's worker while every other main-pool worker sits in the AB queue's
-/// claim loop, so the NTT's chunk drains get those workers only once the AB
-/// queue is empty; the NTT then finishes last and the CPU idles while cb3
-/// hashes the suffix. With priority, the NTT's chunk drains run inside an
-/// `epool::PriorityScope`: before its next AB chunk an AB main worker runs
-/// the NTT drain's claim loop, at most [`ntt_ab_priority_helpers`] of them at
-/// a time (the NTT's passes stream the codeword, so a few workers beside the
-/// compute-bound AB arm use the cores better than all of them at once), and
-/// the NTT finishes ahead of cb2 while the AB arm's remainder runs beside
-/// cb2's end and cb3. Four schedule changes go with it: the commit arm's
-/// worker helps the AB queue while it waits for the fine split's boundary
-/// signal; cb3 is committed as soon as the NTT is done while the AB arm is
-/// still running (no CPU tail hash then, as the CPU is busy); the split
-/// sweep prices each sample's CPU arm to cover the AB replay's end, since
-/// the AB arm, not the NTT, is then the CPU work that finishes last; and
-/// before the sweep the CPU touches the staging range the sweep's suffixes
-/// cover, so no sample pays a first touch the timed proves never pay.
-/// Scheduling only: every NTT and AB chunk is claimed exactly once from its
-/// own queue and computes the same bytes, and cb3 encodes the same suffix
-/// hash; the split is byte-verified as before.
-pub const ENV_NO_NTT_AB_PRIORITY: &str = "FLOCK_NO_NTT_AB_PRIORITY";
-
-#[cfg_attr(
-    not(all(target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)]
-pub(crate) fn ntt_ab_priority_enabled() -> bool {
-    ntt_ab_priority_helpers() > 0
-}
-
-/// How many AB main workers may join one NTT chunk queue at a time (see
-/// [`ENV_NO_NTT_AB_PRIORITY`]); 0 when the priority is off.
-/// `FLOCK_NTT_AB_PRIORITY_HELPERS=n` (n >= 1) overrides the default.
-/// Read once per process.
-#[cfg_attr(
-    not(all(target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)]
-pub(crate) fn ntt_ab_priority_helpers() -> usize {
-    const DEFAULT_HELPERS: usize = 4;
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        if std::env::var_os(ENV_NO_NTT_AB_PRIORITY).is_some() {
-            return 0;
-        }
-        std::env::var("FLOCK_NTT_AB_PRIORITY_HELPERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(DEFAULT_HELPERS)
-    })
 }
 
 /// Run pending main-pool jobs on this worker until `done()` holds or the pool
@@ -5372,6 +5390,65 @@ kernel void zc_k_fold_v2(
 }
 
 "#;
+
+    /// The leaf + parent3 kernel's straight-line compression (see
+    /// `super::ENV_NO_LEAF_STRAIGHT`): the seven rounds written out with
+    /// BLAKE3's message schedule, so no round moves the message words and
+    /// every index is a constant; the 16-bit rotation swaps the two halves,
+    /// the others are `rotate` (left by 32 - n). Same arithmetic as the
+    /// looped form in [`LEAF_PARENT3_MSL_SOURCE`]: same chaining values.
+    const LEAF_STRAIGHT_COMPRESS: &str = r#"#define B3_ROTR(x, n) rotate((uint)(x), (uint)(32u - (n)))
+#define B3_ROT16(x) as_type<uint>(as_type<ushort2>((uint)(x)).yx)
+#define B3_G(a, b, c, d, x, y)                         \
+    a = a + b + (x); d = B3_ROT16(d ^ a);              \
+    c = c + d;       b = B3_ROTR(b ^ c, 12u);          \
+    a = a + b + (y); d = B3_ROTR(d ^ a, 8u);           \
+    c = c + d;       b = B3_ROTR(b ^ c, 7u);
+#define B3_ROUND(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15) \
+    B3_G(v0, v4, v8,  v12, m[s0],  m[s1]);  B3_G(v1, v5, v9,  v13, m[s2],  m[s3]);    \
+    B3_G(v2, v6, v10, v14, m[s4],  m[s5]);  B3_G(v3, v7, v11, v15, m[s6],  m[s7]);    \
+    B3_G(v0, v5, v10, v15, m[s8],  m[s9]);  B3_G(v1, v6, v11, v12, m[s10], m[s11]);   \
+    B3_G(v2, v7, v8,  v13, m[s12], m[s13]); B3_G(v3, v4, v9,  v14, m[s14], m[s15]);
+static void b3_compress(thread uint* cv, thread const uint* m,
+                        uint block_len, uint flags) {
+    uint v0 = cv[0], v1 = cv[1], v2 = cv[2], v3 = cv[3];
+    uint v4 = cv[4], v5 = cv[5], v6 = cv[6], v7 = cv[7];
+    uint v8 = B3_IV[0], v9 = B3_IV[1], v10 = B3_IV[2], v11 = B3_IV[3];
+    uint v12 = 0u, v13 = 0u, v14 = block_len, v15 = flags;
+    B3_ROUND(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+    B3_ROUND(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+    B3_ROUND(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1)
+    B3_ROUND(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6)
+    B3_ROUND(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4)
+    B3_ROUND(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7)
+    B3_ROUND(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13)
+    cv[0] = v0 ^ v8;  cv[1] = v1 ^ v9;  cv[2] = v2 ^ v10; cv[3] = v3 ^ v11;
+    cv[4] = v4 ^ v12; cv[5] = v5 ^ v13; cv[6] = v6 ^ v14; cv[7] = v7 ^ v15;
+}
+#undef B3_ROUND
+#undef B3_G
+#undef B3_ROT16
+#undef B3_ROTR
+"#;
+
+    /// The leaf + parent3 kernel's source as compiled at Gpu init:
+    /// [`LEAF_PARENT3_MSL_SOURCE`] with its looped compression replaced by
+    /// [`LEAF_STRAIGHT_COMPRESS`], unless `FLOCK_NO_LEAF_STRAIGHT=1` or the
+    /// looped text is not found exactly once (then the incumbent text).
+    pub(crate) fn leaf_parent3_msl_source() -> std::borrow::Cow<'static, str> {
+        const START: &str = "static void b3_compress(thread uint* cv, thread const uint* m_in,";
+        const END: &str = "    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];\n}\n";
+        let src = LEAF_PARENT3_MSL_SOURCE;
+        if !super::leaf_straight_enabled() || src.matches(START).count() != 1 || src.matches(END).count() != 1 {
+            return std::borrow::Cow::Borrowed(src);
+        }
+        let a = src.find(START).expect("counted above");
+        let b = src.find(END).expect("counted above") + END.len();
+        if b <= a {
+            return std::borrow::Cow::Borrowed(src);
+        }
+        std::borrow::Cow::Owned(format!("{}{LEAF_STRAIGHT_COMPRESS}{}", &src[..a], &src[b..]))
+    }
 
     /// Supplemental leaf+parent3 fuse (kept out of the embedded metallib so a
     /// missing kernel cannot force a full main-library rebuild). Compiled at
@@ -10325,7 +10402,8 @@ kernel void blake3_pow_race_tail(
                 // gate is open so non-ranked processes skip the MSL frontend.
                 let pso_leaf_parent3 = if super::gpu_leaf_parent3_enabled() {
                     (|| -> Result<Id, String> {
-                        let src = api.nsstring(LEAF_PARENT3_MSL_SOURCE)?;
+                        // `super::ENV_NO_LEAF_STRAIGHT`: the straight-line compression.
+                        let src = api.nsstring(&leaf_parent3_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -12665,6 +12743,9 @@ kernel void blake3_pow_race_tail(
         /// Band buffer (retained, not committed) holding the ranges published
         /// while two band buffers were in flight (`super::ENV_NO_BAND_BATCH`).
         held: Option<Id>,
+        /// The held buffer's open compute encoder (retained), shared by the
+        /// ranges it collects (`super::ENV_NO_BAND_ENC_MERGE`).
+        held_enc: Option<Id>,
         failed: Option<String>,
         owns_lease: bool,
         started: std::time::Instant,
@@ -12773,12 +12854,17 @@ kernel void blake3_pow_race_tail(
                         Some(cb) => cb,
                         None => self.gpu.retain(self.gpu.command_buffer()?),
                     };
-                    let enc = match self.gpu.compute_encoder(cb) {
-                        Ok(enc) => enc,
-                        Err(e) => {
-                            self.gpu.release(cb);
-                            return Err(e);
-                        }
+                    // A held buffer's open encoder is shared by the ranges it
+                    // collects (`super::ENV_NO_BAND_ENC_MERGE`); it is retained.
+                    let (enc, retained) = match self.held_enc.take() {
+                        Some(enc) => (enc, true),
+                        None => match self.gpu.compute_encoder(cb) {
+                            Ok(enc) => (enc, false),
+                            Err(e) => {
+                                self.gpu.release(cb);
+                                return Err(e);
+                            }
+                        },
                     };
                     FromZFirstPassPlan::new(self.log_d)
                         .with_zero_store_from(self.zero_store_from)
@@ -12792,7 +12878,18 @@ kernel void blake3_pow_race_tail(
                             byte_offset,
                             r_count,
                         );
+                    if hold && super::band_enc_merge_enabled() {
+                        // Keep the encoder open for the next range; retain it
+                        // across the autorelease pool like the buffer.
+                        self.held_enc = Some(if retained { enc } else { self.gpu.retain(enc) });
+                        self.held = Some(cb);
+                        crate::tmark::mark("band held");
+                        return Ok(None);
+                    }
                     self.gpu.end_encoding(enc);
+                    if retained {
+                        self.gpu.release(enc);
+                    }
                     if hold {
                         self.held = Some(cb);
                         crate::tmark::mark("band held");
@@ -12919,6 +13016,12 @@ kernel void blake3_pow_race_tail(
             if let Some(cb) = self.held.take() {
                 unsafe {
                     let pool = self.gpu.pool_push();
+                    // End the held buffer's shared encoder first
+                    // (`super::ENV_NO_BAND_ENC_MERGE`).
+                    if let Some(enc) = self.held_enc.take() {
+                        self.gpu.end_encoding(enc);
+                        self.gpu.release(enc);
+                    }
                     let sig = self.gpu.arm_done(cb);
                     self.gpu.commit_async(cb);
                     self.gpu.pool_pop(pool);
@@ -13154,6 +13257,7 @@ kernel void blake3_pow_race_tail(
             unordered: Vec::new(),
             pending: Vec::with_capacity(8),
             held: None,
+            held_enc: None,
             failed: None,
             owns_lease: true,
             started: std::time::Instant::now(),
@@ -14248,10 +14352,6 @@ kernel void blake3_pow_race_tail(
                 // tree, same flat-tree slots, so the root is unchanged.
                 if hybrid_gpu_suffix_hash_enabled() {
                     let t_cpu_ntt = std::time::Instant::now();
-                    // See `super::ENV_NO_NTT_AB_PRIORITY`.
-                    let helpers = super::ntt_ab_priority_helpers();
-                    let ntt_first = helpers > 0;
-                    let prio = crate::epool::PriorityScope::new(helpers);
                     if fine_m == 0 {
                         ntt.forward_transform_interleaved_ranked_block_range_and_then(
                             data,
@@ -14278,17 +14378,6 @@ kernel void blake3_pow_race_tail(
                             16 - k_cpu16,
                             fine_m,
                             || {
-                                if ntt_first {
-                                    // The NTT's own queues are done here:
-                                    // help the AB queue until the boundary
-                                    // signal (or a failure) is visible.
-                                    let _off = crate::epool::PriorityScope::new(0);
-                                    super::help_pool_until(|| {
-                                        gpu.event_signaled_value(ev) >= want
-                                            || gpu_cb_failed(gpu, cb2)
-                                            || head_failed()
-                                    });
-                                }
                                 let mut spins = 0u32;
                                 while gpu.event_signaled_value(ev) < want {
                                     if gpu_cb_failed(gpu, cb2) || head_failed() {
@@ -14311,7 +14400,6 @@ kernel void blake3_pow_race_tail(
                             |_elem_offset: usize, _chunk: &[F128]| {},
                         )?;
                     }
-                    drop(prio);
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
                     // Same clock as the command buffers' GPU timestamps.
                     let cpu_done_s = crate::tmark::now_ns() as f64 * 1e-9;
@@ -14319,13 +14407,10 @@ kernel void blake3_pow_race_tail(
                     // CPU tail hash (see `super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
                     // only while cb2 still runs once the AB sibling has
                     // returned (the CPU is idle only then), never in the
-                    // tuner's sweep. With the NTT ahead of a still running
-                    // AB arm, cb3 is queued behind cb2 at once instead.
+                    // tuner's sweep.
                     let tail_force = super::hybrid_tail_hash_force();
                     let sig2 = take_cb2_done(gpu, cb2);
-                    let ab_busy = ntt_first && !super::ab_arm_done();
-                    let tail = !ab_busy
-                        && !hybrid_arm_recording()
+                    let tail = !hybrid_arm_recording()
                         && super::hybrid_cpu_tail_hash_enabled()
                         && (tail_force > 0 || {
                             super::help_pool_until(|| super::ab_arm_done() || gpu.cb_done(cb2, sig2.as_ref()));
@@ -14394,7 +14479,6 @@ kernel void blake3_pow_race_tail(
                     crate::tmark::mark_gpu("cb3 gpu start", "cb3 gpu end", cb3_s, cb3_e);
                     record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
                     record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
-                    note_arm_cb2_start(cb2_s);
                     if cpu_done_s > cb2_e {
                         record_cb3_launch_latency((cb3_s - cpu_done_s) * 1e3);
                     }
@@ -14894,54 +14978,6 @@ kernel void blake3_pow_race_tail(
         static V: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64, f64)>>> =
             std::sync::OnceLock::new();
         V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-    }
-
-    /// cb2's GPU start of the sweep's most recent hybrid sample, in seconds
-    /// on the command buffers' clock (`f64` bits; 0 = none).
-    static ARM_CB2_START_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    fn note_arm_cb2_start(cb2_s: f64) {
-        if hybrid_arm_recording() {
-            ARM_CB2_START_BITS.store(cb2_s.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    /// Sample lengths of the hybrid and fine arm records, taken before a
-    /// sweep sample so [`price_ab_end_into_arms`] can find that sample's rows.
-    fn arm_record_lens() -> (usize, usize) {
-        (
-            hybrid_arm_samples().lock().map_or(usize::MAX, |v| v.len()),
-            fine_arm_samples().lock().map_or(usize::MAX, |v| v.len()),
-        )
-    }
-
-    /// With the NTT ahead of the AB arm (`super::ENV_NO_NTT_AB_PRIORITY`) the
-    /// AB arm is the CPU work that ends last, so a split's window is the later
-    /// of its GPU arm and the AB arm's end. Raise the sample's CPU arm (the
-    /// rows it added since `lens`) to the AB replay's end `ab_end_s`, taken
-    /// on the same clock relative to that sample's cb2 start: the hybrid
-    /// row's `max(gpu, cpu)` then covers it, and the fine row's CPU arm
-    /// becomes at least `ab - cb3`, so `max(cb2, cpu) + cb3` covers it too.
-    fn price_ab_end_into_arms(lens: (usize, usize), ab_end_s: f64) {
-        let cb2_s = f64::from_bits(ARM_CB2_START_BITS.swap(0, std::sync::atomic::Ordering::Relaxed));
-        let ab_ms = (ab_end_s - cb2_s) * 1e3;
-        if !(cb2_s > 0.0 && ab_ms.is_finite()) {
-            return;
-        }
-        if let Ok(mut v) = hybrid_arm_samples().lock() {
-            if v.len() == lens.0.wrapping_add(1) {
-                if let Some(s) = v.last_mut() {
-                    s.2 = s.2.max(ab_ms);
-                }
-            }
-        }
-        if let Ok(mut v) = fine_arm_samples().lock() {
-            if v.len() == lens.1.wrapping_add(1) {
-                if let Some(s) = v.last_mut() {
-                    s.2 = s.2.max(ab_ms - s.3);
-                }
-            }
-        }
     }
 
     fn record_fine_arms(k_split: usize, cb2_ms: f64, cpu_ms: f64, cb3_ms: f64) {
@@ -15842,34 +15878,13 @@ kernel void blake3_pow_race_tail(
             } else {
                 None
             };
-            let ntt_first = super::ntt_ab_priority_enabled();
-            let lens = arm_record_lens();
-            let replay_end_ns = std::sync::atomic::AtomicU64::new(0);
-            let replay_start_ns = std::sync::atomic::AtomicU64::new(0);
             let (score, fp_ms) = sample_ranked_exact_graph(
                 || reprime_for(k),
                 || timed_graph(k),
-                || {
-                    replay_start_ns.store(crate::tmark::now_ns(), Ordering::Relaxed);
-                    replay_ab();
-                    replay_end_ns.store(crate::tmark::now_ns(), Ordering::Relaxed);
-                },
+                &replay_ab,
                 delay,
                 std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some(),
             )?;
-            if dbg {
-                let cb2_s = f64::from_bits(ARM_CB2_START_BITS.load(Ordering::Relaxed));
-                let raw = fine_arm_samples().lock().ok().and_then(|v| v.last().copied());
-                eprintln!(
-                    "[gpu-commit] exact-AB sample k={k}: replay start {:.2} end {:.2} ms after cb2 start, fine row {:?}",
-                    (replay_start_ns.load(Ordering::Relaxed) as f64 * 1e-9 - cb2_s) * 1e3,
-                    (replay_end_ns.load(Ordering::Relaxed) as f64 * 1e-9 - cb2_s) * 1e3,
-                    raw,
-                );
-            }
-            if ntt_first {
-                price_ab_end_into_arms(lens, replay_end_ns.load(Ordering::Relaxed) as f64 * 1e-9);
-            }
             first_pass_ms = Some(fp_ms);
             if dbg {
                 eprintln!(
@@ -15879,28 +15894,6 @@ kernel void blake3_pow_race_tail(
             }
             Ok(score)
         };
-        if super::ntt_ab_priority_enabled() {
-            // The sweep's CPU suffixes reach down to sixteenth `16 - 7`, and
-            // the fine split's boundary sub-blocks one below. Touch every
-            // page of that staging range once (same value written back; no
-            // GPU work uses staging here), so the first sample of each split
-            // does not pay the CPU's first touch of its new range, which no
-            // later prove pays; with the NTT ahead of the AB arm that cost
-            // lands on the AB replay's end the samples are priced by.
-            use rayon::prelude::*;
-            let max_k = RANKED_EXACT_TUNE_CANDIDATES[RANKED_EXACT_TUNE_CANDIDATES.len() - 1];
-            let bytes = params.codeword_len_f128() * core::mem::size_of::<F128>();
-            let from = bytes / 16 * (16 - max_k - 1);
-            let base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(ctx.staging) }.cast::<u8>());
-            (from / 4096..bytes / 4096).into_par_iter().for_each(|page| {
-                // SAFETY: `page * 4096 + 8 <= bytes`, inside the staging
-                // buffer; nothing else accesses staging during the sweep.
-                unsafe {
-                    let p = base.ptr().add(page * 4096).cast::<u64>();
-                    p.write_volatile(p.read_volatile());
-                }
-            });
-        }
         let samples = {
             // Only the sweep's own samples price a split: they are the only
             // graph runs taken beside the A/B replay, which is what makes the
@@ -16114,14 +16107,6 @@ kernel void blake3_pow_race_tail(
                 "[gpu-commit] broad exact-AB {} -> k={} verified={verified}",
                 table.join(" "),
                 if verified { chosen } else { 0 },
-            );
-        }
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
-            let k = if verified { chosen } else { 0 };
-            eprintln!(
-                "[phase-timing] hybrid split: cpu {} of 256 (ntt priority helpers {})",
-                256 - hybrid_prefix256(k),
-                super::ntt_ab_priority_helpers(),
             );
         }
         finish_ranked_exact_contention_tune(params, cpu_tree, if verified { chosen } else { 0 });
@@ -25155,6 +25140,14 @@ kernel void zc_r2_horner_oracle(
                 ZC_R2_CS_MODE.store(ZC_R2_CS_DISABLED, Ordering::Relaxed);
             } else {
                 share = g;
+                // Ceiling offer (`super::ENV_NO_R2_OFFER_CEIL`): with the
+                // steal kernel built, the timed prefix is the ceiling and
+                // the steal settles the split.
+                if super::zc_r2_offer_ceil_enabled()
+                    && ZC_R2_STEAL_KERNEL.load(Ordering::Relaxed)
+                {
+                    share = share.max(super::zc_r2_offer_ceil_chunks(hi_size));
+                }
                 ZC_R2_TUNED.store(share, Ordering::Relaxed);
             }
         }

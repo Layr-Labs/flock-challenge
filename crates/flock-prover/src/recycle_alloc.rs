@@ -120,7 +120,7 @@ fn pop(size: usize) -> *mut u8 {
     let Some(i) = find_class(size, false) else {
         return core::ptr::null_mut();
     };
-    let mut head = CLASSES[i].head.lock().unwrap();
+    let mut head = flock_core::lock_spin_if_armed(&CLASSES[i].head).unwrap();
     let top = *head;
     if top == 0 {
         return core::ptr::null_mut();
@@ -134,7 +134,7 @@ fn push(ptr: *mut u8, size: usize) -> bool {
     let Some(i) = find_class(size, true) else {
         return false;
     };
-    let mut head = CLASSES[i].head.lock().unwrap();
+    let mut head = flock_core::lock_spin_if_armed(&CLASSES[i].head).unwrap();
     unsafe { *(ptr as *mut usize) = *head };
     *head = ptr as usize;
     true

@@ -6039,6 +6039,28 @@ fn round1_shift_reduce_extract_c_packed_serial(
 
 #[cfg(test)]
 mod tests {
+    /// The R2-CS ceiling offer (`gpu_commit::ENV_NO_R2_OFFER_CEIL`) never
+    /// reads past the rows the A/B rebuild publishes, nor past the anchors
+    /// view, at any shape the rebuild accepts.
+    #[test]
+    fn r2_offer_ceil_within_published_prefix() {
+        assert_eq!(crate::gpu_commit::zc_r2_offer_ceil_chunks(2048), 880);
+        for log_hi in 3..=14usize {
+            let hi = 1usize << log_hi;
+            let offer = crate::gpu_commit::zc_r2_offer_ceil_chunks(hi);
+            // The rebuild's cap, as `round2_ab_rebuild_geometry` computes it.
+            let cap = hi * crate::gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT / 100;
+            assert!(offer <= cap, "offer {offer} above the published prefix {cap} (hi {hi})");
+            assert!(offer <= (hi * crate::gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT).div_ceil(100));
+            assert!(offer < hi);
+        }
+        for m in 20..=34usize {
+            if let Some((cap, hi, _)) = round2_ab_rebuild_geometry((1usize << m) / 8) {
+                assert!(crate::gpu_commit::zc_r2_offer_ceil_chunks(hi) <= cap);
+            }
+        }
+    }
+
     use super::*;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;

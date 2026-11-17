@@ -57,128 +57,28 @@ static GUESTS: AtomicUsize = AtomicUsize::new(0);
 /// Publishes `guest` for the duration of `body`, then closes the slot and
 /// waits for any guest still inside it before returning (also on unwind).
 fn with_guest_slot<R>(guest: &GuestFn<'_>, body: impl FnOnce() -> R) -> R {
-    with_slot(&GUEST, &GUESTS, guest, body)
-}
-
-/// Publishes `guest` in `slot` for the duration of `body` (first publisher
-/// wins; a nested drain runs unpublished), then unpublishes and waits until
-/// `hazards` is back at zero, i.e. every thread that entered `guest` through
-/// the slot has left it (also on unwind).
-fn with_slot<R>(
-    slot: &'static std::sync::atomic::AtomicPtr<&'static GuestFn<'static>>,
-    hazards: &'static AtomicUsize,
-    guest: &GuestFn<'_>,
-    body: impl FnOnce() -> R,
-) -> R {
     // SAFETY: lifetime erased only while published; `Close` unpublishes and
     // waits for every guest to leave before `guest`'s borrow ends.
     let erased: &'static GuestFn<'static> =
         unsafe { std::mem::transmute::<&GuestFn<'_>, &'static GuestFn<'static>>(guest) };
     let cell: &&'static GuestFn<'static> = &erased;
     let ptr = cell as *const &'static GuestFn<'static> as *mut &'static GuestFn<'static>;
-    let published = slot
+    let published = GUEST
         .compare_exchange(std::ptr::null_mut(), ptr, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok();
-    struct Close(
-        bool,
-        *mut &'static GuestFn<'static>,
-        &'static std::sync::atomic::AtomicPtr<&'static GuestFn<'static>>,
-        &'static AtomicUsize,
-    );
+    struct Close(bool, *mut &'static GuestFn<'static>);
     impl Drop for Close {
         fn drop(&mut self) {
             if self.0 {
-                let _ = self.2.compare_exchange(self.1, std::ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst);
-                while self.3.load(Ordering::SeqCst) != 0 {
+                let _ = GUEST.compare_exchange(self.1, std::ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst);
+                while GUESTS.load(Ordering::SeqCst) != 0 {
                     std::hint::spin_loop();
                 }
             }
         }
     }
-    let _close = Close(published, ptr, slot, hazards);
+    let _close = Close(published, ptr);
     body()
-}
-
-/// Priority claim loop: the chunk queue of the plain hetero drain (see
-/// [`run_hetero_chunks`]) currently running on a thread inside a
-/// [`PriorityScope`], published for that drain's duration. Before each claim
-/// of their own, the main-pool workers of a stateful drain run it to
-/// exhaustion, at most [`PriorityScope`]'s `helpers` of them at a time, so
-/// the scoped queue gets that many extra workers within one of their chunks
-/// instead of only once their own queue is empty. `PRIORITY_GUESTS` is the
-/// hazard count that makes closing safe (as for [`GUEST`]). Scheduling only:
-/// every chunk of either queue is still claimed exactly once from its own
-/// cursor.
-static PRIORITY: std::sync::atomic::AtomicPtr<&'static GuestFn<'static>> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static PRIORITY_GUESTS: AtomicUsize = AtomicUsize::new(0);
-/// Threads currently inside the priority claim loop through
-/// [`help_priority`], and the most allowed there at once.
-static PRIORITY_HELPERS: AtomicUsize = AtomicUsize::new(0);
-static PRIORITY_CAP: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    /// The `helpers` of this thread's innermost live [`PriorityScope`];
-    /// 0 outside any (or inside one with `helpers == 0`).
-    static PRIORITY_CALLER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// While alive, plain hetero drains started on this thread publish their
-/// claim loop as the priority queue, joined by at most `helpers` stateful
-/// drain workers at a time; `helpers == 0` publishes nothing. The previous
-/// setting is restored on drop.
-pub(crate) struct PriorityScope(usize);
-
-impl PriorityScope {
-    pub(crate) fn new(helpers: usize) -> Self {
-        Self(PRIORITY_CALLER.with(|c| c.replace(helpers)))
-    }
-}
-
-impl Drop for PriorityScope {
-    fn drop(&mut self) {
-        PRIORITY_CALLER.with(|c| c.set(self.0));
-    }
-}
-
-/// Whether this thread is inside a [`PriorityScope`] that publishes.
-#[inline]
-fn priority_caller() -> bool {
-    PRIORITY_CALLER.with(|c| c.get()) > 0
-}
-
-/// [`with_slot`] on the priority slot when this thread is inside a
-/// publishing [`PriorityScope`]; otherwise just `body`.
-fn with_priority_slot<R>(guest: &GuestFn<'_>, body: impl FnOnce() -> R) -> R {
-    let helpers = PRIORITY_CALLER.with(|c| c.get());
-    if helpers == 0 {
-        return body();
-    }
-    PRIORITY_CAP.store(helpers, Ordering::Relaxed);
-    with_slot(&PRIORITY, &PRIORITY_GUESTS, guest, body)
-}
-
-/// Run the published priority queue's claim loop on this thread until that
-/// queue is empty, unless the queue already has its cap of such helpers.
-/// One relaxed load when nothing is published.
-#[inline]
-fn help_priority() {
-    if PRIORITY.load(Ordering::Relaxed).is_null() {
-        return;
-    }
-    if PRIORITY_HELPERS.fetch_add(1, Ordering::Relaxed) >= PRIORITY_CAP.load(Ordering::Relaxed) {
-        PRIORITY_HELPERS.fetch_sub(1, Ordering::Relaxed);
-        return;
-    }
-    PRIORITY_GUESTS.fetch_add(1, Ordering::SeqCst);
-    let p = PRIORITY.load(Ordering::SeqCst);
-    if !p.is_null() {
-        // SAFETY: the publisher cannot return while PRIORITY_GUESTS > 0 and
-        // it unpublishes (SeqCst) before checking PRIORITY_GUESTS.
-        unsafe { (**p)(&|| false) };
-    }
-    PRIORITY_GUESTS.fetch_sub(1, Ordering::SeqCst);
-    PRIORITY_HELPERS.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Claim chunks of the currently draining main-pool queue on this thread
@@ -1430,9 +1330,7 @@ fn run_chunks_with_helper_arm_after<F, A>(
             .with_max_len(1)
             .for_each(|_| worker());
     };
-    // Inside a `PriorityScope`, main-pool workers of a concurrently draining
-    // stateful queue also run `linger_guest` (see `PRIORITY`).
-    with_priority_slot(&linger_guest, || match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+    match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
             let helper_body = || {
@@ -1454,7 +1352,7 @@ fn run_chunks_with_helper_arm_after<F, A>(
             });
         }
         None => with_linger_slot(&linger_guest, drain_main),
-    });
+    }
     spawn_lingerers(main_threads);
 }
 
@@ -1519,20 +1417,9 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
     }
     let next = AtomicUsize::new(0);
     let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
-    let caller = rayon::current_thread_index();
     let worker = || {
-        // A thread that publishes a priority queue and picked this task up
-        // while waiting inside that queue's own drain would hold that drain
-        // until this queue is empty; it leaves this queue to the others. A
-        // pool-worker caller runs the first queue task itself and drains to
-        // the end, so every chunk is still claimed.
-        if caller.is_some() && priority_caller() && rayon::current_thread_index() != caller {
-            return;
-        }
         let mut state = init();
         loop {
-            // A published priority queue goes first (see `PRIORITY`).
-            help_priority();
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n_chunks {
                 break;

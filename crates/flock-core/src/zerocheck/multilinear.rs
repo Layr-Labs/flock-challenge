@@ -1980,6 +1980,80 @@ fn r2_rebuild_chunk(
     })
 }
 
+/// Any value restores chunk-wide A/B materialization before round two.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn r2_ab_quad_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_AB_QUAD").is_none())
+}
+
+/// Interleave rebuilt ranked A/B quads and the existing full round-two walk.
+/// The original chunk still owns all outputs and partials. Reduction is linear
+/// over XOR, so XORing the eight reduced unit sums equals reducing once after
+/// the original chunk. No producer call may outlive the registering scope.
+///
+/// # Safety
+/// Inputs and outputs satisfy the full kernel's contract for `lo` pairs. The
+/// producer supplies complete 8192-byte A/B units, whose constant primed rows
+/// are identical between quads, and the chunk is exclusively CPU owned.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn r2_rebuild_quad_walk(
+    r: &crate::zerocheck::univariate_skip_optimized::Round2AbRebuild,
+    x_hi: usize, table: *const u8, fold7: usize, anchors: *mut F128,
+    deltas: *mut u8, eq: *const F128, prep: *const F128, lo: usize,
+    pair_base: usize, tail: bool, head: *const std::sync::atomic::AtomicBool,
+    xb_rho: *const F128,
+) -> [F128; 8] {
+    let unit = r.unit_bytes;
+    assert!(unit > 0 && unit.is_multiple_of(2048));
+    assert!((16 * lo).is_multiple_of(unit));
+    let pairs = unit / 16;
+    let units = 16 * lo / unit;
+    let mut out = [F128::ZERO; 8];
+    for j in 0..units {
+        // One scratch slot is reused. r2_rebuild_chunk marks it primed
+        // only after the first complete write for this registration.
+        let (a, b) = r2_rebuild_chunk(r, x_hi * units + j, unit);
+        let at = j * pairs;
+        let blocks = at / 128;
+        let (anchor_at, delta_at) = if !head.is_null() {
+            (blocks * kernels::aarch64::HC_ANCHORS_PER_BLOCK,
+             blocks * kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK)
+        } else if tail {
+            (blocks * kernels::aarch64::TC_ANCHORS_PER_BLOCK,
+             blocks * kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK)
+        } else {
+            (2 * at, 16 * at)
+        };
+        let mut part = [F128::ZERO; 8];
+        unsafe {
+            let ap = anchors.add(anchor_at);
+            let dp = deltas.add(delta_at);
+            let ep = eq.add(at);
+            let pp = if prep.is_null() { prep } else { prep.add(at) };
+            if !xb_rho.is_null() {
+                // Each unit contains whole 32-group windows. Their rho
+                // table is common; lambda comes from this unit's eq slice.
+                kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_xb(
+                    table, fold7 as *const u8, a, b, ap, dp, ep, xb_rho,
+                    pairs, true, tail, head, part.as_mut_ptr());
+            } else if fold7 != 0 {
+                kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
+                    table, fold7 as *const u8, a, b, ap, dp, ep, pp,
+                    pairs, pair_base + at, 127, 121, true, true, true,
+                    tail, head, part.as_mut_ptr());
+            } else {
+                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                    table, a, b, ap, dp, ep, pp, pairs, pair_base + at,
+                    127, 121, true, true, true, tail, head, part.as_mut_ptr());
+            }
+        }
+        for lane in 0..8 { out[lane] += part[lane]; }
+    }
+    out
+}
+
 /// Round-two compact producer **plus** the deferred round-three coefficients.
 ///
 /// The compact state, the round-two wire message and every store are
@@ -2530,6 +2604,27 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 // Round-two A/B rebuild: a chunk past the published prefix
                 // reads its rows from this worker's scratch, rebuilt now.
                 debug_assert_eq!(row_base * n_chunks, x_hi * chunk_ab_bytes);
+                #[cfg(target_feature = "sha3")]
+                let quad = rebuild.as_ref().filter(|r| {
+                    full && m == 32 && x_hi >= rebuild_from && r2_ab_quad_enabled()
+                        && r.unit_bytes == 8192 && chunk_ab_bytes.is_multiple_of(r.unit_bytes)
+                        && periodic_padding && pair_in_block_mask == 127
+                        && useful_pairs_inclusive == 121 && pair_idx_base.is_multiple_of(128)
+                        && degen && skip_dead && eq_prep_addr != 0
+                });
+                #[cfg(not(target_feature = "sha3"))]
+                let quad: Option<&crate::zerocheck::univariate_skip_optimized::Round2AbRebuild> = None;
+                #[cfg(target_feature = "sha3")]
+                if let Some(r) = quad {
+                    let table7 = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
+                        fold7_addr
+                    } else { 0 };
+                    out = r2_rebuild_quad_walk(r, x_hi, t, table7, anchors, deltas,
+                        eq_lo.as_ptr(), eq_prep_addr as *const F128, lo_size,
+                        pair_idx_base, tail_compact, head_fail_ptr,
+                        if full_xb { xb_rho_addr as *const F128 } else { core::ptr::null() });
+                }
+                if quad.is_none() {
                 let (ap, bp) = r2_rows(x_hi);
                 if full && full_xb {
                     // Full chunk on the window-scaled walk
@@ -2704,6 +2799,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         head_fail_ptr,
                         out.as_mut_ptr(),
                     );
+                }
                 }
             }
         }
@@ -4512,6 +4608,82 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     (m1, minf, la, la2)
 }
 
+/// Allocate tri-pass partial rows without clearing storage that each chunk
+/// overwrites in full. The legacy switch restores the original zero fill.
+fn tri_partial_storage(len: usize) -> Vec<std::mem::MaybeUninit<[F128; 26]>> {
+    use std::mem::MaybeUninit;
+    #[cfg(test)]
+    {
+        let mode = TRI_PARTIAL_TEST_MODE.with(|m| m.get());
+        if mode == 1 {
+            return vec![MaybeUninit::new([F128::ZERO; 26]); len];
+        }
+        if mode == 2 {
+            return (0..len)
+                .map(|row| MaybeUninit::new(std::array::from_fn(|lane| {
+                    F128::new(
+                        0xa5a5_6b6b_1234_5678 ^ (row as u64).wrapping_mul(0x9e37_79b9),
+                        0x5a5a_9494_fedc_ba98 ^ (lane as u64).wrapping_mul(0x85eb_ca6b),
+                    )
+                })))
+                .collect();
+        }
+        if mode == 3 {
+            return vec![MaybeUninit::uninit(); len];
+        }
+    }
+    static UNCLEARED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_TRI_PARTIALS_UNINIT").is_none()
+    });
+    if *UNCLEARED {
+        vec![MaybeUninit::uninit(); len]
+    } else {
+        vec![MaybeUninit::new([F128::ZERO; 26]); len]
+    }
+}
+
+/// Borrow only the prefix already initialized by the completed CPU queue.
+///
+/// # Safety
+/// Every row in `0..len` must be fully written and no concurrent writer may
+/// touch that prefix for the returned borrow's lifetime.
+unsafe fn tri_partial_prefix(
+    rows: &[std::mem::MaybeUninit<[F128; 26]>],
+    len: usize,
+) -> &[[F128; 26]] {
+    let prefix = &rows[..len];
+    // SAFETY: caller establishes initialization and exclusive completion;
+    // MaybeUninit<T> has exactly T's layout and alignment.
+    unsafe { std::slice::from_raw_parts(prefix.as_ptr().cast(), prefix.len()) }
+}
+
+/// Reuse the allocation after all CPU/GPU owners have initialized their rows.
+///
+/// # Safety
+/// Every element must be fully initialized, with all writes joined. Abandoned
+/// incomplete passes must drop the MaybeUninit vector instead of calling this.
+unsafe fn tri_partials_assume_init(
+    rows: Vec<std::mem::MaybeUninit<[F128; 26]>>,
+) -> Vec<[F128; 26]> {
+    let mut rows = std::mem::ManuallyDrop::new(rows);
+    // SAFETY: caller establishes initialization; element layouts, lengths and
+    // capacities are identical, and ManuallyDrop transfers the allocation once.
+    let initialized: Vec<[F128; 26]> = unsafe {
+        Vec::from_raw_parts(rows.as_mut_ptr().cast(), rows.len(), rows.capacity())
+    };
+    #[cfg(test)]
+    if TRI_PARTIAL_TEST_MODE.with(|m| m.get() != 0) {
+        TRI_PARTIAL_TEST_ROWS.with(|capture| *capture.borrow_mut() = Some(initialized.clone()));
+    }
+    initialized
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TRI_PARTIAL_TEST_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static TRI_PARTIAL_TEST_ROWS: std::cell::RefCell<Option<Vec<[F128; 26]>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Tri pass 0's claim queue with the GPU arm (see
 /// `gpu_commit::ENV_NO_ZC_T0_GPU`). `hi_size` claims, one per queue job,
 /// each under one mutex: `(g0, g1)` = (next chunk to take from the GPU,
@@ -4531,7 +4703,7 @@ fn tri0_gpu_queue(
     chunk_out: usize,
     a_base: crate::epool::SyncPtr<F128>,
     b_base: crate::epool::SyncPtr<F128>,
-    partials_base: crate::epool::SyncPtr<[F128; 26]>,
+    partials_base: crate::epool::SyncPtr<std::mem::MaybeUninit<[F128; 26]>>,
     body: &(dyn Fn(usize) + Sync),
 ) {
     let calibration = job.calibration();
@@ -4539,7 +4711,7 @@ fn tri0_gpu_queue(
     let claims = std::sync::Mutex::new((0usize, hi_size, 0usize));
     crate::epool::run_hetero_chunks(hi_size, |_| {
         let (x_hi, from_gpu) = {
-            let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = crate::lock_spin(&claims).unwrap_or_else(|e| e.into_inner());
             assert!(g.0 < g.1, "tri pass 0 claim queue overrun");
             if !calibration && job.chunk_ready(g.0) {
                 g.0 += 1;
@@ -4569,7 +4741,7 @@ fn tri0_gpu_queue(
             unsafe {
                 std::ptr::copy_nonoverlapping(ga.as_ptr(), a_base.ptr().add(x_hi * chunk_out), chunk_out);
                 std::ptr::copy_nonoverlapping(gb.as_ptr(), b_base.ptr().add(x_hi * chunk_out), chunk_out);
-                *partials_base.ptr().add(x_hi) = slots;
+                partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(slots));
             }
         } else {
             body(x_hi);
@@ -4584,7 +4756,7 @@ fn tri0_gpu_queue(
                 unsafe {
                     std::slice::from_raw_parts(a_base.ptr().add(c * chunk_out).cast_const(), chunk_out) == ga
                         && std::slice::from_raw_parts(b_base.ptr().add(c * chunk_out).cast_const(), chunk_out) == gb
-                        && *partials_base.ptr().add(c) == slots
+                        && (&*partials_base.ptr().add(c)).assume_init_ref() == &slots
                 }
             });
         crate::gpu_commit::zc_t0_verdict(equal, job.offer());
@@ -4722,8 +4894,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
 
     #[allow(unused_mut)]
     let mut gpu_prefix: Option<KGpuPrefix> = None;
+    #[cfg(test)]
+    let hetero = hetero || TRI_PARTIAL_TEST_MODE.with(|m| m.get() != 0);
     let partials: Vec<[F128; 26]> = if hetero {
-        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
+        let mut partials = tri_partial_storage(hi_size);
         let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
@@ -4777,9 +4951,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 };
                 let (a_in, b_in) = inputs(x_hi);
                 let outv = chunk(&a_in, &b_in, a_o, b_o);
-                // SAFETY: exclusive owner of partials[x_hi].
+                // SAFETY: exclusive owner of this row; write a complete value
+                // without forming a reference to uninitialized storage.
                 unsafe {
-                    *partials_base.ptr().add(x_hi) = outv;
+                    partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
                 }
             };
             // The record's launch and queue: the GPU's share first, the CPU
@@ -4836,7 +5011,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 }
                 let taken = if gpu_ok { lo } else { 0 };
                 for c in 0..taken {
-                    partials[c] = job.part(c);
+                    partials[c].write(job.part(c));
                 }
                 if taken > 0 {
                     let (a, b) = job.outputs();
@@ -4845,6 +5020,9 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 job.finish(taken, hi_size);
             }
             return {
+                // SAFETY: the joined CPU suffix/steals and the copied GPU
+                // prefix partition every row; failure paths recompute the rest.
+                let partials = unsafe { tri_partials_assume_init(partials) };
                 let mut s = [F128::ZERO; 26];
                 for (x_hi, outv) in partials.iter().enumerate() {
                     let eq_h = eq_hi[x_hi];
@@ -4892,9 +5070,9 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
             };
             let (a_in, b_in) = inputs(x_hi);
             let outv = chunk(&a_in, &b_in, a_o, b_o);
-            // SAFETY: exclusive owner of partials[x_hi].
+            // SAFETY: exclusive owner; initialize the complete row by value.
             unsafe {
-                *partials_base.ptr().add(x_hi) = outv;
+                partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
             }
         };
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4943,7 +5121,9 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                         let equal = len <= a_out.len()
                             && ga == &a_out[..len]
                             && gb == &b_out[..len]
-                            && parts.as_slice() == &partials[..chunks];
+                            // SAFETY: calibration uses cpu_base=0; the CPU
+                            // queue has completed every row before this oracle.
+                            && parts.as_slice() == unsafe { tri_partial_prefix(&partials, chunks) };
                         crate::gpu_commit::zc_t56_verdict(equal, chunks, hi_size);
                         // With the tri pass 0 arm on, an admitted oracle hands
                         // its buffers (byte-equal to the CPU's outputs above)
@@ -4953,7 +5133,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                             gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
                         }
                     } else {
-                        partials[..chunks].copy_from_slice(&parts);
+                        assert_eq!(parts.len(), chunks);
+                        for (dst, value) in partials[..chunks].iter_mut().zip(parts) {
+                            dst.write(value);
+                        }
                         gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
                     }
                 }
@@ -4965,7 +5148,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 }
             }
         }
-        partials
+        // SAFETY: each CPU row is assigned in full; admitted GPU prefix rows
+        // are copied in full, and any failed prefix was recomputed on the CPU.
+        // The tri0 queue likewise writes each claimed row before returning.
+        unsafe { tri_partials_assume_init(partials) }
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
         vec![chunk(&a_in, &b_in, a_out, b_out)]
@@ -7190,6 +7376,176 @@ mod tests {
         }
     }
 
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    fn round2_ab_quad_matches_whole_chunk() {
+        use crate::zerocheck::univariate_skip_optimized::{Round1AbProducer, round2_ab_rebuild_scope, round2_ab_rebuild_take};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const LO: usize = 16384;
+        const UNIT: usize = 8192;
+        let mut rng = Rng::new(0x2AB0_512);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let eq: Vec<_> = (0..LO).map(|_| rng.f128()).collect();
+        let prep = kernels::aarch64::round2_eq_prep(&eq);
+        let fold7 = kernels::aarch64::r2_fold7_table(&table.data).expect("linear table");
+        let mut a = vec![0u8; 3 * LO * 16];
+        let mut b = a.clone();
+        // Generate every unit from its index; only each block's constant
+        // all-ones b head may be retained when scratch is primed.
+        let calls = AtomicUsize::new(0);
+        let first_primed = AtomicUsize::new(0);
+        let produce = |q: usize, sa: *mut u8, sb: *mut u8, primed: bool| {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 && primed {
+                first_primed.fetch_add(1, Ordering::Relaxed);
+            }
+            unsafe {
+                for i in 0..UNIT {
+                    let global = q * UNIT + i;
+                    *sa.add(i) = (global.wrapping_mul(73) ^ (global >> 7) ^ (global >> 13)) as u8;
+                    if !primed || i % 2048 >= 128 {
+                        *sb.add(i) = if i % 2048 < 128 { 255 } else {
+                            (global.wrapping_mul(31) ^ (global >> 5) ^ (global >> 11)) as u8
+                        };
+                    }
+                }
+            }
+        };
+        for q in 0..a.len() / UNIT {
+            produce(q, unsafe { a.as_mut_ptr().add(q * UNIT) }, unsafe { b.as_mut_ptr().add(q * UNIT) }, false);
+        }
+        for x_hi in [1usize, 2] {
+            for (tail, head_enabled) in [(false, false), (true, false), (true, true)] {
+                for f7 in [0usize, fold7.as_ptr() as usize] {
+                    calls.store(0, Ordering::Relaxed);
+                    first_primed.store(0, Ordering::Relaxed);
+                    let scope = unsafe { round2_ab_rebuild_scope(a.as_ptr(), b.as_ptr(), a.len(), 0, 0,
+                        Round1AbProducer { unit_bytes: UNIT, produce: &produce }) };
+                    let r = round2_ab_rebuild_take(&a, &b).unwrap();
+                    // Nonzero allocation offsets catch compact pointer rebases.
+                    let mut want_a = vec![LA_POISON; 2 * LO + 512];
+                    let mut got_a = want_a.clone();
+                    let mut want_d = vec![0xA5; 16 * LO + 8192];
+                    let mut got_d = want_d.clone();
+                    let want_head = std::sync::atomic::AtomicBool::new(false);
+                    let got_head = std::sync::atomic::AtomicBool::new(false);
+                    let mut want = [F128::ZERO; 8];
+                    let offset_a = 256;
+                    let offset_d = 4096;
+                    let hp = |h: &std::sync::atomic::AtomicBool| if head_enabled { h as *const _ } else { core::ptr::null() };
+                    unsafe {
+                        let (ap, bp) = r2_rebuild_chunk(&r, x_hi, LO * 16);
+                        if f7 != 0 {
+                            kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
+                                table.data.as_ptr().cast(), f7 as *const u8, ap, bp,
+                                want_a.as_mut_ptr().add(offset_a), want_d.as_mut_ptr().add(offset_d),
+                                eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, 127, 121,
+                                true, true, true, tail, hp(&want_head), want.as_mut_ptr());
+                        } else {
+                            fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
+                                table.data.as_ptr().cast(), ap, bp,
+                                want_a.as_mut_ptr().add(offset_a), want_d.as_mut_ptr().add(offset_d),
+                                eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, 127, 121,
+                                true, true, true, tail, hp(&want_head), want.as_mut_ptr());
+                        }
+                        // A new registration must never inherit primed state.
+                        calls.store(0, Ordering::Relaxed);
+                        R2_AB_SCRATCH.with(|s| s.primed_id.set(0));
+                        let got = r2_rebuild_quad_walk(&r, x_hi, table.data.as_ptr().cast(), f7,
+                            got_a.as_mut_ptr().add(offset_a), got_d.as_mut_ptr().add(offset_d),
+                            eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, tail, hp(&got_head), core::ptr::null());
+                        assert_eq!(got, want, "all eight sums: x_hi={x_hi} tail={tail} head={head_enabled} f7={f7}");
+                    }
+                    assert_eq!(got_a, want_a, "all live anchors and poison guards");
+                    assert_eq!(got_d, want_d, "all live deltas and poison guards");
+                    assert!(!want_head.load(Ordering::Relaxed));
+                    assert!(!got_head.load(Ordering::Relaxed));
+                    assert_eq!(calls.load(Ordering::Relaxed), LO * 16 / UNIT);
+                    assert_eq!(first_primed.load(Ordering::Relaxed), 0);
+                    assert_eq!(R2_AB_SCRATCH.with(|s| s.bytes.get()), UNIT,
+                        "quad engagement: scratch must hold one producer unit per A/B half");
+                    drop(scope);
+                }
+            }
+        }
+        eprintln!("quad differential: 12 cases, 8 sums, all compact bytes, nonzero offsets, scratch={} bytes", 2 * UNIT);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    fn round2_ab_quad_preserves_xb_kernel() {
+        use crate::zerocheck::univariate_skip_optimized::{Round1AbProducer, round2_ab_rebuild_scope, round2_ab_rebuild_take};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const LO: usize = 2048;
+        const UNIT: usize = 8192;
+        let mut rng = Rng::new(0x2ab0_5842_512);
+        let table = UniSkipFoldTable::new(6, rng.f128());
+        let mut eq: Vec<_> = (0..LO).map(|_| rng.f128()).collect();
+        let rho = rng.f128();
+        for first in (0..LO / 2).step_by(32) {
+            eq[2 * first + 3] = rho * eq[2 * first + 1];
+            for t in 0..2 {
+                for power in 1..16 {
+                    eq[2 * (first + 2 * power + t) + 1] =
+                        eq[2 * (first + t) + 1] * F128::new(1u64 << power, 0);
+                }
+            }
+        }
+        let prep = kernels::aarch64::round2_eq_prep(&eq);
+        let xb = kernels::aarch64::r2_full_xb_rho_prep(&eq).expect("valid XB weights");
+        let f7 = kernels::aarch64::r2_fold7_table(&table.data).expect("linear table");
+        let a = vec![0u8; 3 * LO * 16];
+        let b = a.clone();
+        let produce = |q: usize, sa: *mut u8, sb: *mut u8, primed: bool| {
+            unsafe {
+                for i in 0..UNIT {
+                    let at = q * UNIT + i;
+                    *sa.add(i) = (at.wrapping_mul(73) ^ (at >> 9)) as u8;
+                    if !primed || i % 2048 >= 128 {
+                        *sb.add(i) = if i % 2048 < 128 { 255 } else {
+                            (at.wrapping_mul(47) ^ (at >> 5)) as u8
+                        };
+                    }
+                }
+            }
+        };
+        for x_hi in [1usize, 2] {
+            for (tail, head) in [(false, false), (true, false), (true, true)] {
+                for pieces in [false, true] {
+                    let scope = unsafe { round2_ab_rebuild_scope(a.as_ptr(), b.as_ptr(), a.len(), 0, 0,
+                        Round1AbProducer { unit_bytes: UNIT, produce: &produce }) };
+                    let r = round2_ab_rebuild_take(&a, &b).unwrap();
+                    let mut want_a = vec![LA_POISON; 2 * LO + 512];
+                    let mut got_a = want_a.clone();
+                    let mut want_d = vec![0xa5u8; 16 * LO + 8192];
+                    let mut got_d = want_d.clone();
+                    let wh = AtomicBool::new(false);
+                    let gh = AtomicBool::new(false);
+                    let hp = |h: &AtomicBool| if head { h as *const _ } else { core::ptr::null() };
+                    let table7 = if pieces { f7.as_ptr() as usize } else { 0 };
+                    let mut want = [F128::ZERO; 8];
+                    unsafe {
+                        let (ap, bp) = r2_rebuild_chunk(&r, x_hi, LO * 16);
+                        kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_xb(
+                            table.data.as_ptr().cast(), table7 as *const u8, ap, bp,
+                            want_a.as_mut_ptr().add(256), want_d.as_mut_ptr().add(4096),
+                            eq.as_ptr(), xb.as_ptr(), LO, true, tail, hp(&wh), want.as_mut_ptr());
+                        let got = r2_rebuild_quad_walk(&r, x_hi, table.data.as_ptr().cast(), table7,
+                            got_a.as_mut_ptr().add(256), got_d.as_mut_ptr().add(4096),
+                            eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, tail, hp(&gh), xb.as_ptr());
+                        assert_eq!(got, want, "XB slots: {x_hi} {tail} {head} {pieces}");
+                    }
+                    assert_eq!(got_a, want_a, "XB anchors and guards");
+                    assert_eq!(got_d, want_d, "XB deltas and guards");
+                    assert_eq!(gh.load(Ordering::Relaxed), wh.load(Ordering::Relaxed));
+                    assert_eq!(R2_AB_SCRATCH.with(|s| s.bytes.get()), UNIT);
+                    drop(scope);
+                }
+            }
+        }
+        eprintln!("XB quad differential: 12 cases, all 8 sums and compact bytes");
+    }
+
     /// T1 — the core oracle. Round-two message identical, and the deferred
     /// quadratic evaluates to the incumbent round-three message at every ρ₁.
     /// Four distinct ρ₁ over-determine a quadratic, so agreement at all of
@@ -8217,6 +8573,101 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Force the real heterogeneous CPU path at small sizes and compare every
+    /// unweighted partial row, not only the final XOR reduction. A repeated
+    /// poison could cancel in the reduction, so retain the full row snapshots.
+    #[test]
+    fn tri_partials_no_clear_matches_zero_and_poison() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TRI_PARTIAL_TEST_MODE.with(|m| m.set(0));
+                TRI_PARTIAL_TEST_ROWS.with(|r| *r.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        let mut rng = Rng::new(0x7472_6970_6172_746c);
+        for (depth, packed, bpacked) in [(2, false, false), (3, false, false), (2, true, false), (2, true, true)] {
+            if packed && !cfg!(all(target_arch = "aarch64", target_feature = "aes")) {
+                continue;
+            }
+            for log_out in [3usize, 8, 11] {
+                let n = 1usize << (log_out + depth);
+                if packed && n < 256 { continue; }
+                let mut a = rng.f128_vec(n);
+                let mut b = rng.f128_vec(n);
+                if packed {
+                    for i in 0..n {
+                        if i % 64 >= 61 {
+                            a[i] = F128::ZERO;
+                            b[i] = F128::ZERO;
+                        } else if bpacked && matches!(i % 64, 0..=3 | 59) {
+                            b[i] = F128::ONE;
+                        }
+                    }
+                    a = a.into_iter().enumerate().filter_map(|(i, v)| (i % 64 <= 60).then_some(v)).collect();
+                    b = b.into_iter().enumerate().filter_map(|(i, v)| {
+                        (i % 64 <= 60 && !(bpacked && matches!(i % 64, 0..=3 | 59))).then_some(v)
+                    }).collect();
+                }
+                let rhos = rng.f128_vec(depth);
+                let mut r_next = rng.f128_vec(log_out);
+                r_next[0] = F128::ONE;
+                r_next[1] = F128::new(7, 13);
+                r_next[2] = F128::new(17, 19);
+                let run = |mode| {
+                    TRI_PARTIAL_TEST_MODE.with(|m| m.set(mode));
+                    TRI_PARTIAL_TEST_ROWS.with(|r| *r.borrow_mut() = None);
+                    let mut a_out = vec![LA_POISON; 1 << log_out];
+                    let mut b_out = vec![LA_POISON; 1 << log_out];
+                    let (m1, mi, la, la2, prefix) = fold_cascade_t_into_packed_prefix_gpu(
+                        &a, &b, packed, bpacked, None, &mut a_out, &mut b_out,
+                        &rhos, &r_next, false,
+                    );
+                    assert!(prefix.is_none());
+                    let rows = TRI_PARTIAL_TEST_ROWS.with(|r| r.borrow_mut().take()).expect("heterogeneous rows captured");
+                    (a_out, b_out, m1, mi, la, la2, rows)
+                };
+                let reference = run(1);
+                assert_eq!(run(2), reference, "poison depth={depth} packed={packed} bpacked={bpacked} log_out={log_out}");
+                assert_eq!(run(3), reference, "uninit depth={depth} packed={packed} bpacked={bpacked} log_out={log_out}");
+            }
+        }
+    }
+
+    /// Model only ownership handoffs, not Metal execution. Each producer
+    /// writes a complete row; read a prefix only after it has been written.
+    #[test]
+    fn tri_partial_storage_prefix_and_failure_handoffs() {
+        const N: usize = 17;
+        let expected: Vec<[F128; 26]> = (0..N).map(|row| {
+            std::array::from_fn(|lane| F128::new((row * 31 + lane + 1) as u64, (row * 71 + lane * 13 + 3) as u64))
+        }).collect();
+        for mode in [1, 2, 3] {
+            TRI_PARTIAL_TEST_MODE.with(|m| m.set(mode));
+            for prefix in [0, 1, N / 2, N] {
+                for failed in [false, true] {
+                    let mut rows = tri_partial_storage(N);
+                    for row in prefix..N { rows[row].write(expected[row]); }
+                    if failed {
+                        // Failed or declined GPU: CPU recomputes its prefix.
+                        for row in 0..prefix { rows[row].write(expected[row]); }
+                    } else {
+                        for row in 0..prefix { rows[row].write(expected[row]); }
+                        // SAFETY: that prefix has just been fully written.
+                        assert_eq!(unsafe { tri_partial_prefix(&rows, prefix) }, &expected[..prefix]);
+                    }
+                    // SAFETY: prefix and suffix partition all complete rows.
+                    assert_eq!(unsafe { tri_partials_assume_init(rows) }, expected);
+                }
+            }
+        }
+        TRI_PARTIAL_TEST_MODE.with(|m| m.set(0));
+        TRI_PARTIAL_TEST_ROWS.with(|r| *r.borrow_mut() = None);
+        // Dropping incomplete storage is safe; it never assumes initialization.
+        drop(tri_partial_storage(N));
     }
 
     #[test]
