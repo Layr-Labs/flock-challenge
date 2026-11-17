@@ -15290,6 +15290,34 @@ kernel void blake3_pow_seg_tail(
     /// The fine split must beat the chosen split's measured window by this.
     const FINE_MARGIN: f64 = 0.005;
 
+    /// Kill switch for the count pricing of fine splits in [`split_from_fit`]
+    /// (`FLOCK_NO_FINE_COUNT_PRICE=1`, exact `1`: the straight lines, or the
+    /// older shares under `FLOCK_TUNE_FIT_FINE_SHARES`, as before). A fine
+    /// split `(k, m)` moves only layers 8..20 of `m` sub-blocks: the GPU's
+    /// layers 4..8 still cover the whole boundary sixteenth (cb2's head) and
+    /// the CPU is spared those four layers of it. With it on, the fit prices
+    /// `m > 0` from the sixteenth `k`'s line values plus `m` steps of the
+    /// work that really moves: [`FINE_COUNT_GPU_SHARE`] of the GPU line's
+    /// slope and [`FINE_COUNT_CPU_SHARE`] of the CPU line's. Only the pick
+    /// among the 256ths changes: same sweep, same samples, same verification
+    /// of the picked split, and a split never changes proof bytes. Read once.
+    pub const ENV_NO_FINE_COUNT_PRICE: &str = "FLOCK_NO_FINE_COUNT_PRICE";
+
+    fn fine_count_price_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var(ENV_NO_FINE_COUNT_PRICE).is_ok_and(|v| v == "1"))
+    }
+
+    /// Field products of cb2 that move with one sub-block, over those of one
+    /// 256th of a whole sixteenth. Per column of 16 elements every pass does
+    /// 32 products; layers 4..8 and 8..12 run the compact grid (121 of 128
+    /// columns), layers 12..16 and the final pass the dense one. Layers 4..8
+    /// stay: (121/128 + 2) / (2 * 121/128 + 2).
+    const FINE_COUNT_GPU_SHARE: f64 = (121.0 / 128.0 + 2.0) / (2.0 * 121.0 / 128.0 + 2.0);
+    /// The CPU suffix's layers per sub-block over a whole sixteenth's: layers
+    /// 8..20 of 4..20.
+    const FINE_COUNT_CPU_SHARE: f64 = 12.0 / 16.0;
+
     /// Per-sample `(k_split, cb2 GPU ms, CPU suffix ms, cb3 GPU ms)` from the
     /// GPU-suffix-hash path, recorded beside [`record_hybrid_arms`]. Unlike
     /// the hybrid arms (whose GPU arm runs to cb3's end and so includes any
@@ -15417,10 +15445,27 @@ kernel void blake3_pow_seg_tail(
         /// `ntt + lat + cb3`, and the AB end. The AB term carries no cb3
         /// launch: cb3 is committed when the NTT is done, whether or not the
         /// AB arm still runs.
+        ///
+        /// A fine split `(k, m)` is priced by the work that moves (see
+        /// [`ENV_NO_FINE_COUNT_PRICE`]): cb2 keeps layers 4..8 of the whole
+        /// boundary sixteenth, so it sheds [`FINE_COUNT_GPU_SHARE`] of its
+        /// slope per sub-block; the NTT, and the AB end behind it on the
+        /// same pool, gain [`FINE_COUNT_CPU_SHARE`] of theirs. cb3 hashes
+        /// the suffix's leaves, which do move one 256th per sub-block.
         fn terms(&self, c: usize, lat: f64) -> (f64, f64, f64) {
             let x = c as f64;
             let line = |l: (f64, f64)| l.0 + l.1 * x;
             let h = line(self.cb3).max(0.0);
+            let m = c % 16;
+            if m != 0 && fine_count_price_enabled() {
+                let x0 = (c - m) as f64;
+                let at = |l: (f64, f64), share: f64| l.0 + l.1 * x0 + share * l.1 * m as f64;
+                return (
+                    at(self.cb2, FINE_COUNT_GPU_SHARE) + h,
+                    at(self.ntt, FINE_COUNT_CPU_SHARE) + lat + h,
+                    at(self.ab, FINE_COUNT_CPU_SHARE),
+                );
+            }
             (line(self.cb2) + h, line(self.ntt) + lat + h, line(self.ab))
         }
     }
@@ -15664,7 +15709,14 @@ kernel void blake3_pow_seg_tail(
             let (k, m) = (c / 16, c % 16);
             let t = m as f64 / 16.0;
             let x0 = 16.0 * k as f64;
-            let (g, cpu) = if m == 0 || !tune_fit_fine_shares_enabled() {
+            let (g, cpu) = if m != 0 && fine_count_price_enabled() {
+                // Count pricing (`ENV_NO_FINE_COUNT_PRICE`): only layers
+                // 8..20 of the `m` sub-blocks change sides.
+                (
+                    line(ag, bg, x0) + FINE_COUNT_GPU_SHARE * bg * m as f64,
+                    line(ac, bc, x0) + FINE_COUNT_CPU_SHARE * bc * m as f64,
+                )
+            } else if m == 0 || !tune_fit_fine_shares_enabled() {
                 // Straight lines through the sub-blocks too: the timed
                 // proofs' arms at fine splits sit on the coarse samples'
                 // lines (measured), not on the boundary-share model.
@@ -21931,10 +21983,14 @@ kernel void zc_eq_rows(
                 let c = 16.0 * k as f64;
                 s.push((k, 58.0 - 0.25 * c, 20.0 + 0.30 * c, 0.4 * k as f64));
             }
+            // Count pricing of the sub-blocks (the default): from k = 4
+            // (cb2 42, cpu 39.2) a sub-block moves 0.757 * 0.25 of cb2 and
+            // 0.75 * 0.30 of the CPU arm, so the arms meet near m = 6.8
+            // (m = 5 with the 0.55 ms launch).
             let fine = super::split_from_fit(&s, true, 0.0).unwrap();
-            assert_eq!(super::decode_hybrid_split(fine), (4, 5));
+            assert_eq!(super::decode_hybrid_split(fine), (4, 7));
             let fine = super::split_from_fit(&s, true, 0.55).unwrap();
-            assert_eq!(super::decode_hybrid_split(fine), (4, 4));
+            assert_eq!(super::decode_hybrid_split(fine), (4, 5));
             // Coarse only: k = 4 (64) beats k = 5 (80).
             assert_eq!(super::split_from_fit(&s, false, 0.0), Some(4));
             // Too few distinct splits, or arms that do not cross: keep the
@@ -21948,8 +22004,11 @@ kernel void zc_eq_rows(
         fn split_from_ab_min_fit_prices_each_split_by_its_earliest_ab_end() {
             // cb2 = 44 - 0.15 c, cb3 = 1, ntt = 0.2 c, AB end = 24 + 0.1 c
             // (256ths), with the first sample of every split stretched by 3:
-            // the window max(cb2 + cb3, ntt + lat + cb3, ab) of the earliest
-            // AB ends is minimal at c = 84, whatever the cb3 launch.
+            // the straight lines' window max(cb2 + cb3, ntt + lat + cb3, ab)
+            // of the earliest AB ends is minimal at c = 84; with the count
+            // pricing of the sub-blocks (the default; from c = 80 cb2 sheds
+            // 0.757 * 0.15 and the AB end gains 0.75 * 0.1 per sub-block) at
+            // c = 85, whatever the cb3 launch.
             let mut s = Vec::new();
             let mut seen = Vec::new();
             for k in [2usize, 3, 4, 5, 5, 4, 3, 2, 6, 6] {
@@ -21960,7 +22019,7 @@ kernel void zc_eq_rows(
             }
             for lat in [0.0, 0.5] {
                 let fine = super::split_from_ab_min_fit(&s, true, lat).unwrap();
-                assert_eq!(super::decode_hybrid_split(fine), (5, 4), "lat {lat}");
+                assert_eq!(super::decode_hybrid_split(fine), (5, 5), "lat {lat}");
             }
             assert_eq!(super::split_from_ab_min_fit(&s, false, 0.0), Some(5));
             // Through split 5 the window is still the GPU's at the largest
