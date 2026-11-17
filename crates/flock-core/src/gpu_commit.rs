@@ -446,6 +446,57 @@ pub(crate) fn cb2_done_signal_enabled() -> bool {
     *ON
 }
 
+/// Round-one C fold join on a done signal (`FLOCK_NO_ZC_FOLD_SIG=1`, exact,
+/// kills). The zerocheck arm of the GPU fold had no completion signal (its
+/// prefix may be staged at the commit tail and adopted at zerocheck entry),
+/// so its join learned of the buffer's end from the status property, and
+/// when the CPU arrived more than 2 ms early, from a blocking
+/// `waitUntilCompleted`: 120-380 us after `GPUEndTime` here, against about
+/// 40 us for the signalled lincheck twin. Once the arm is calibrated and
+/// tuned (timed proves), its buffer arms a done signal behind the reduce,
+/// carried through staging and adoption, and the join polls it like the
+/// other signalled joins (`Gpu::join_cb_sig`). The split tuner's sample
+/// reads GPU timestamps, which are only final at the status completion, so
+/// that one sample is noted at the arm's next launch instead (same inputs,
+/// before any reader). Same buffers, same outputs.
+pub const ENV_NO_ZC_FOLD_SIG: &str = "FLOCK_NO_ZC_FOLD_SIG";
+
+pub(crate) fn zc_fold_sig_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_ZC_FOLD_SIG));
+    *ON
+}
+
+/// Round-two primer drain on a done signal (`FLOCK_NO_R2_PRIMER_SIG=1`,
+/// exact, kills). The ZC idle-fill primer (`ENV_NO_ZC_IDLE_FILL`) is drained
+/// by the round-two launch before it rewrites the primer's buffers, with a
+/// blocking `waitUntilCompleted`. After the GPU goes idle the status flip can
+/// lag far behind the buffer's end (here still pending 10-14 ms after
+/// `GPUEndTime`, then 140-450 us inside the wait, in 7 of 12 proves). The
+/// primer now arms a done signal behind its dispatch and the drain polls it
+/// (`Gpu::join_cb_sig`; a failed buffer never signals and its status ends the
+/// poll). Same buffers, same order, same outputs.
+pub const ENV_NO_R2_PRIMER_SIG: &str = "FLOCK_NO_R2_PRIMER_SIG";
+
+pub(crate) fn r2_primer_sig_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_R2_PRIMER_SIG));
+    *ON
+}
+
+/// Lincheck fold join polls its done signal past 2 ms
+/// (`FLOCK_NO_LC_FOLD_JOIN_SIG=1`, exact, kills). The lincheck arm's join
+/// yield-polls its signal for 2 ms and then falls back to a blocking
+/// `waitUntilCompleted`, which returns only at the late status flip (here
+/// 290 us after `GPUEndTime` when the CPU arrived 3.8 ms early). It now joins
+/// like the other signalled joins (`Gpu::join_cb_sig`: the signal or the
+/// status, yielding up to 10 ms, then the blocking wait). Same buffer, same
+/// checks, same outputs.
+pub const ENV_NO_LC_FOLD_JOIN_SIG: &str = "FLOCK_NO_LC_FOLD_JOIN_SIG";
+
+pub(crate) fn lc_fold_join_sig_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_LC_FOLD_JOIN_SIG));
+    *ON
+}
+
 pub(crate) fn gpu_done_event_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !std::env::var(ENV_NO_GPU_DONE_EVENT).is_ok_and(|v| v == "1")
@@ -1003,6 +1054,26 @@ pub(crate) fn zc_k_handover_enabled() -> bool {
 /// GPU partials against the CPU's own and disables the arm for the process on
 /// any mismatch.
 pub const ENV_NO_GPU_ZC_AB_COMPLETION: &str = "FLOCK_NO_GPU_ZC_AB_COMPLETION";
+
+/// Kill switch for the AB arm's single buffer (`FLOCK_NO_AB_ONE_CB=1`, exact:
+/// the table build is its own command buffer committed ahead of the gather +
+/// finish buffer, as before). With it on, the table build, the gather and
+/// the finish are three serial dispatches of one encoder of one command
+/// buffer (the finish already reads the gather's banks that way; the gather
+/// reads the tables the same way): the same dispatches in the same order,
+/// one buffer switch (median 36 us on an M1 Max timed prove), one command
+/// buffer, one encoder and one commit less on the zerocheck driver thread.
+/// Read once.
+pub const ENV_NO_AB_ONE_CB: &str = "FLOCK_NO_AB_ONE_CB";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ab_one_cb_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var(ENV_NO_AB_ONE_CB).is_ok_and(|v| v == "1"))
+}
 
 /// Fixed GPU chunk share of the round-one AB completion arm (exactness build):
 /// `FLOCK_ZC_AB_GPU_CHUNKS=<n>`, `0` = arm off, clamped to the chunk count.
@@ -13797,6 +13868,24 @@ kernel void blake3_pow_race_tail(
     /// done, the suffix's levels 11..16 are recomputed here from the unit
     /// roots; the caller then rebuilds the top levels as before.
     #[allow(clippy::too_many_arguments)]
+    /// The tail-hash join's caller polls cb2 without holding the claims
+    /// lock. That thread spins until cb2 completes and used to take the
+    /// `claims` mutex on every round, with cb2's status read inside it,
+    /// while every hashing worker needs the same mutex once per unit: a
+    /// census counted up to 136 kernel waits of pool workers on that lock in
+    /// one timed proof (11-136 in half of the runs), each a park and a wake
+    /// on the root-ready chain. The poll now reads an atomic mirror of the
+    /// claim cursor and cb2's completion first and takes the lock only when
+    /// there is something to decide. Same decisions from the same state;
+    /// which units the CPU takes before cb2 ends was timing-dependent
+    /// already and both sides write identical bytes.
+    /// `FLOCK_NO_TAIL_POLL_UNLOCKED=1` restores the lock on every round.
+    fn tail_poll_unlocked_enabled() -> bool {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_TAIL_POLL_UNLOCKED").is_none());
+        *ON
+    }
+
     unsafe fn hybrid_cpu_tail_hash_join(
         gpu: &Gpu,
         cb2: Id,
@@ -13841,6 +13930,12 @@ kernel void blake3_pow_race_tail(
         let per_unit = &per_unit;
         // (next unclaimed top, exclusive; claims stopped)
         let claims = std::sync::Mutex::new((n_leaves, false));
+        // Mirror of the next unclaimed top, written under `claims` at every
+        // claim and read by this thread's poll without the lock (see
+        // `tail_poll_unlocked_enabled`).
+        let top_mirror = std::sync::atomic::AtomicUsize::new(n_leaves);
+        let top_mirror = &top_mirror;
+        let poll_unlocked = tail_poll_unlocked_enabled();
         // Raw handles cross the scope as integers (the body runs on this
         // thread; the workers get the claims and the byte/tree/args bases).
         let cb2_u = cb2 as usize;
@@ -13854,6 +13949,7 @@ kernel void blake3_pow_race_tail(
             g.0 -= unit;
             // SAFETY: the args buffer is the arm's; counts only decrease.
             unsafe { write_tail_counts(args_base.ptr(), per_unit, (g.0 - suffix_start) / unit) };
+            top_mirror.store(g.0, std::sync::atomic::Ordering::Release);
             g.0
         };
         let hash_unit = move |start: usize| {
@@ -13898,7 +13994,16 @@ kernel void blake3_pow_race_tail(
             let cb2_done = || unsafe { gpu.cb_done(cb2_u as Id, sig2_ref) };
             let mut spins = 0u32;
             loop {
-                {
+                // Nothing to decide yet (units left, the forced ones claimed,
+                // cb2 still running): poll without taking `claims`, the lock
+                // the workers need for every unit. Any other state falls
+                // through to the locked decision below, unchanged. A working
+                // coordinator never idles here: it claims and hashes units.
+                let idle_poll = poll_unlocked && !coord_work && {
+                    let top = top_mirror.load(std::sync::atomic::Ordering::Acquire);
+                    top > suffix_start && (n_leaves - top) / unit >= force_units && !cb2_done()
+                };
+                if !idle_poll {
                     let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
                     if g.1 {
                         // A worker saw cb2's end (working coordinator).
@@ -18459,6 +18564,9 @@ kernel void zc_eq_rows(
         /// The table is being written into `eq_buf` by the GPU, ahead of the
         /// fold in `cb` (see [`ENV_NO_ZC_GPU_EQ`]).
         eq_gpu: Option<GpuEqRows>,
+        /// The prefix's done signal (`super::ENV_NO_ZC_FOLD_SIG`), handed
+        /// to the adopting job.
+        sig: Option<DoneSig>,
     }
 
     /// Abandon a parked commit-tail-fill prefix: wait out its command
@@ -18467,13 +18575,16 @@ kernel void zc_eq_rows(
     unsafe fn abandon_staged_prefix(state: &mut ZcFold) {
         if let Some(staged) = state.staged.take() {
             unsafe {
-                let _ = state.gpu.wait_cb(staged.cb);
+                let ok = state.gpu.wait_cb(staged.cb).is_ok();
                 // The row buffer ran ahead of the fold on the same queue; its
                 // view releases it on drop.
                 if let Some(rows) = &staged.eq_gpu {
                     let _ = state.gpu.wait_cb(rows.cb);
                 }
                 state.gpu.release(staged.cb);
+                if ok {
+                    Gpu::recycle_done(staged.sig);
+                }
             }
         }
     }
@@ -19234,8 +19345,43 @@ kernel void zc_eq_rows(
         n_claims: usize,
         submitted: std::time::Instant,
         arm: FoldArm,
-        /// Completion signal (lincheck arm only; see `ENV_NO_GPU_DONE_EVENT`).
+        /// Completion signal (lincheck arm; zerocheck arm once tuned, see
+        /// `super::ENV_NO_ZC_FOLD_SIG`; see `ENV_NO_GPU_DONE_EVENT`).
         sig: Option<DoneSig>,
+    }
+
+    /// A zerocheck-arm tune sample whose join returned on the done signal
+    /// (`super::ENV_NO_ZC_FOLD_SIG`): the buffer's GPU timestamps are final
+    /// only at its status completion, so the sample is noted at the arm's
+    /// next launch, from the same inputs and before any reader of the
+    /// tuned share. Holds the job's retain of `cb`.
+    struct ZcFoldLateNote {
+        cb: usize,
+        claim_lo: usize,
+        n_claims: usize,
+        wall_ms: f64,
+        head_ms: f64,
+        suffix_ms: f64,
+        byte_fold: bool,
+    }
+
+    static ZC_FOLD_LATE_NOTE: Mutex<Option<ZcFoldLateNote>> = Mutex::new(None);
+
+    /// Note a pending [`ZcFoldLateNote`] (its buffer completed a prove ago;
+    /// the wait only reads the final status). Exactly the sample the join
+    /// would have noted: GPU busy wall when available, else the host wall.
+    fn zc_fold_apply_late_note(gpu: &Gpu) {
+        let note = ZC_FOLD_LATE_NOTE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(n) = note else { return };
+        let cb = n.cb as Id;
+        let gpu_ms = unsafe {
+            let ok = gpu.wait_cb(cb).is_ok();
+            let ms = if ok { zc_fold_gpu_wall_ms(gpu, cb) } else { 0.0 };
+            gpu.release(cb);
+            ms
+        };
+        let sample_ms = if gpu_ms > 0.0 { gpu_ms } else { n.wall_ms };
+        fold_note_sample(FoldArm::Zc, n.claim_lo, n.n_claims, sample_ms, n.head_ms, n.suffix_ms, n.byte_fold);
     }
 
     /// Set once the split autotune has consumed a steady-state GPU sample.
@@ -19287,7 +19433,19 @@ kernel void zc_eq_rows(
             // FLOCK_NO_ZCFOLD_SPIN=1 (exact '1') restores the incumbent
             // blocking wait.
             let sig = self.sig.take();
-            let wait = if zc_fold_spin_enabled() {
+            // Zerocheck arm with its done signal (`super::ENV_NO_ZC_FOLD_SIG`):
+            // the signalled join, polled past the 2 ms budget (a failed
+            // buffer never signals; its status ends the poll). Its tune
+            // sample is noted at the next launch (`ZcFoldLateNote`). The
+            // lincheck arm joins the same way (`super::ENV_NO_LC_FOLD_JOIN_SIG`).
+            let zc_sig = self.arm == FoldArm::Zc && sig.is_some() && zc_fold_spin_enabled();
+            let lc_sig = self.arm == FoldArm::Lincheck
+                && sig.is_some()
+                && zc_fold_spin_enabled()
+                && super::lc_fold_join_sig_enabled();
+            let wait = if zc_sig || lc_sig {
+                unsafe { gpu.join_cb_sig(cb, sig.as_ref(), 0.0) }
+            } else if zc_fold_spin_enabled() {
                 unsafe {
                     gpu.yield_wait_cb_until_sig(
                         cb,
@@ -19303,7 +19461,13 @@ kernel void zc_eq_rows(
             }
             let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
             let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
-            unsafe { gpu.release(cb) };
+            // The late note keeps the job's retain of `cb` until it is noted.
+            let mut late_cb = if zc_sig && wait.is_ok() {
+                cb
+            } else {
+                unsafe { gpu.release(cb) };
+                NIL
+            };
             wait?;
             // A/B + fallback-test hook (`FLOCK_LINCHECK_GPU_FAIL_DRAIN=1`):
             // the lincheck arm's drain reports failure AFTER the command
@@ -19319,6 +19483,10 @@ kernel void zc_eq_rows(
             if self.arm == FoldArm::Zc
                 && ZC_GPU_EQ_FAILED.swap(false, std::sync::atomic::Ordering::AcqRel)
             {
+                // No sample is noted for this window (as before).
+                if !late_cb.is_null() {
+                    unsafe { gpu.release(late_cb) };
+                }
                 return Err("GPU eq rows failed".to_string());
             }
             assert_eq!(dst.len(), self.k);
@@ -19506,6 +19674,11 @@ kernel void zc_eq_rows(
                 // already consumed above, so re-encoding the same plan over
                 // the same scratch buffers races with nothing.
                 unsafe {
+                    // (A signal is armed only once calibrated: never here.)
+                    if !late_cb.is_null() {
+                        gpu.release(late_cb);
+                        late_cb = NIL;
+                    }
                     let pool = gpu.pool_push();
                     if zc_fold_measure_fix_enabled() {
                         // MEASUREMENT CORRECTION (kill:
@@ -19566,6 +19739,23 @@ kernel void zc_eq_rows(
                     }
                     gpu.pool_pop(pool);
                 }
+            }
+            if !late_cb.is_null() {
+                let note = ZcFoldLateNote {
+                    cb: late_cb as usize,
+                    claim_lo: self.claim_lo,
+                    n_claims: self.n_claims,
+                    wall_ms,
+                    head_ms,
+                    suffix_ms,
+                    byte_fold: self.plan.byte_fold,
+                };
+                let old = ZC_FOLD_LATE_NOTE.lock().unwrap_or_else(|e| e.into_inner()).replace(note);
+                if let Some(o) = old {
+                    // Never pending here (each launch notes it first).
+                    unsafe { gpu.release(o.cb as Id) };
+                }
+                return Ok(());
             }
             fold_note_sample(
                 self.arm,
@@ -20364,7 +20554,7 @@ kernel void zc_eq_rows(
         // wrapper is never dropped, so ownership transfers without running
         // the drop glue that would release the cb we are parking.
         let job = std::mem::ManuallyDrop::new(job);
-        let (mut guard, cb, plan, k, claim_lo, n_claims, submitted) = unsafe {
+        let (mut guard, cb, plan, k, claim_lo, n_claims, submitted, sig) = unsafe {
             (
                 std::ptr::read(&job.guard),
                 job.cb,
@@ -20373,6 +20563,7 @@ kernel void zc_eq_rows(
                 job.claim_lo,
                 job.n_claims,
                 job.submitted,
+                job.sig,
             )
         };
         let eq_len = 1usize << (m - k_log);
@@ -20391,6 +20582,7 @@ kernel void zc_eq_rows(
                     eq_len,
                     eq_owned,
                     eq_gpu,
+                    sig,
                 });
                 true
             }
@@ -20399,7 +20591,9 @@ kernel void zc_eq_rows(
                 // retire the orphan dispatch.
                 if let Ok(gpu) = gpu() {
                     unsafe {
-                        let _ = gpu.wait_cb(cb);
+                        if gpu.wait_cb(cb).is_ok() {
+                            Gpu::recycle_done(sig);
+                        }
                         gpu.release(cb);
                     }
                 }
@@ -20469,7 +20663,7 @@ kernel void zc_eq_rows(
             n_claims: staged.n_claims,
             submitted,
             arm: FoldArm::Zc,
-            sig: None,
+            sig: staged.sig,
         };
         Some((eq, job, submitted))
     }
@@ -20608,6 +20802,13 @@ kernel void zc_eq_rows(
         let k = 1usize << k_log;
         if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) || m <= k_log + 3 {
             return None;
+        }
+        if arm == FoldArm::Zc
+            && let Ok(g) = gpu()
+        {
+            // The previous prove's signalled-join sample, before its share
+            // is read below (`ZcFoldLateNote`).
+            zc_fold_apply_late_note(g);
         }
         let n_claims = crate::lincheck::oblock_claim_count(m, k_log);
         let claim_lo = arm.claims_for(n_claims);
@@ -20780,12 +20981,15 @@ kernel void zc_eq_rows(
                         // such caller's `expand` reads columns < n_roots only.
                         i_groups: useful.div_ceil(ZC_FOLD_COLS_PER_TG).max(1),
                     };
-                    // Lincheck only: the zerocheck arm's job may be parked
-                    // (commit-tail fill) and adopted, which keeps the plain
-                    // status drain.
-                    // Timed proves only: the warmup's ratio gate keeps
-                    // its exact status drain and GPU timestamps.
-                    let arm_sig = arm == FoldArm::Lincheck
+                    // Lincheck, and the zerocheck arm once calibrated
+                    // (`super::ENV_NO_ZC_FOLD_SIG`; its parked commit-tail
+                    // prefix carries the signal to the adopting job).
+                    // Timed proves only: the warmup's ratio gate and split
+                    // tune keep their exact status drain and GPU timestamps.
+                    let arm_sig = (arm == FoldArm::Lincheck
+                        || (arm == FoldArm::Zc
+                            && super::zc_fold_sig_enabled()
+                            && arm.calibrated().load(std::sync::atomic::Ordering::Relaxed)))
                         && arm.tuned().load(std::sync::atomic::Ordering::Relaxed) != usize::MAX;
                     let (cb, sig, cb_eq) =
                         zc_fold_submit_rows(gpu, state, &plan, arm_sig, eq_rows_plan)?;
@@ -23275,6 +23479,8 @@ kernel void zc_r2_horner_oracle(
         /// release) before anything rewrites the buffers it binds — the next
         /// round-two launch or the next prove's staging, whichever first.
         prefetch_cb: Id,
+        /// The primer's done signal (`super::ENV_NO_R2_PRIMER_SIG`).
+        prefetch_sig: Option<DoneSig>,
         /// R2-CS (`super::ENV_NO_ZC_R2_CS`): the `_cs` Horner PSO (`NIL`
         /// until the calibration launch installs it, see
         /// [`zc_r2_cs_install`]), its partials (eight F128 per physical
@@ -23561,6 +23767,7 @@ kernel void zc_r2_horner_oracle(
                 part_cap: 0,
                 wraps: Vec::new(),
                 prefetch_cb: NIL,
+                prefetch_sig: None,
                 cs_pso: NIL,
                 cs_part_buf: NIL,
                 cs_part_cap: 0,
@@ -23961,6 +24168,29 @@ kernel void zc_r2_horner_oracle(
         signal: Option<u64>,
     ) -> Result<Id, String> {
         unsafe {
+            zc_r2_submit_sig(gpu, state, a_buf, b_buf, chunks, lo_size, mask, useful, horner, cs, signal, false)
+                .map(|(cb, _)| cb)
+        }
+    }
+
+    /// [`zc_r2_submit`], optionally arming a done signal behind everything
+    /// (`super::ENV_NO_R2_PRIMER_SIG`).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn zc_r2_submit_sig(
+        gpu: &Gpu,
+        state: &ZcR2,
+        a_buf: Id,
+        b_buf: Id,
+        chunks: usize,
+        lo_size: usize,
+        mask: u32,
+        useful: u32,
+        horner: bool,
+        cs: Option<&ZcR2CsBind>,
+        signal: Option<u64>,
+        arm_sig: bool,
+    ) -> Result<(Id, Option<DoneSig>), String> {
+        unsafe {
             #[repr(C)]
             struct P {
                 lo_size: u32,
@@ -24028,9 +24258,10 @@ kernel void zc_r2_horner_oracle(
             if let Some(v) = signal {
                 gpu.encode_signal_event(cb, state.steal_ev, v);
             }
+            let sig = if arm_sig { gpu.arm_done(cb) } else { None };
             let cb = gpu.retain(cb);
             gpu.commit_async(cb);
-            Ok(cb)
+            Ok((cb, sig))
         }
     }
 
@@ -24110,7 +24341,16 @@ kernel void zc_r2_horner_oracle(
         }
         let cb = state.prefetch_cb;
         state.prefetch_cb = NIL;
-        let ok = unsafe { gpu.wait_cb(cb) }.is_ok();
+        let sig = state.prefetch_sig.take();
+        let ok = if sig.is_some() {
+            unsafe { gpu.join_cb_sig(cb, sig.as_ref(), 0.0) }
+        } else {
+            unsafe { gpu.wait_cb(cb) }
+        }
+        .is_ok();
+        if ok {
+            Gpu::recycle_done(sig);
+        }
         let filler_gpu_ms = if ok {
             unsafe { zc_fold_gpu_wall_ms(gpu, cb) }
         } else {
@@ -24255,7 +24495,7 @@ kernel void zc_r2_horner_oracle(
                 }
                 let a_buf = zc_r2_wrap(&mut state, gpu, a_packed)?;
                 let b_buf = zc_r2_wrap(&mut state, gpu, b_packed)?;
-                let cb = zc_r2_submit(
+                let (cb, sig) = zc_r2_submit_sig(
                     gpu,
                     &state,
                     a_buf,
@@ -24268,8 +24508,10 @@ kernel void zc_r2_horner_oracle(
                     // The primer never stores compact state (R2-CS probe).
                     None,
                     None,
+                    super::r2_primer_sig_enabled(),
                 )?;
                 state.prefetch_cb = cb;
+                state.prefetch_sig = sig;
                 Ok(())
             })();
             match ok {
@@ -25603,7 +25845,9 @@ kernel void zc_ab_finish(
     /// An in-flight round-one AB completion GPU prefix.
     pub(crate) struct ZcAbJob {
         /// Table build, then gather + finish (same queue, in order; the
-        /// second reads the tables the first wrote, hazard-tracked).
+        /// second reads the tables the first wrote, hazard-tracked). `NIL`
+        /// when the table build is the first dispatch of `cb`
+        /// (`super::ENV_NO_AB_ONE_CB`).
         cb_tables: Id,
         cb: Id,
         /// `cb`'s completion signal (`super::ENV_NO_JOIN_SIGNAL`).
@@ -25754,21 +25998,37 @@ kernel void zc_ab_finish(
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let pool = gpu.pool_push();
+            // One buffer (`super::ENV_NO_AB_ONE_CB`): the table build is the
+            // first serial dispatch of the gather + finish encoder.
+            let one = super::ab_one_cb_enabled();
             let submitted = (|| -> Result<(Id, Id, Option<DoneSig>), String> {
+                let encode_tables = |enc: Id| {
+                    gpu.set_pipeline(enc, state.tables_pso);
+                    gpu.set_buffer(enc, state.consts_buf, ZC_AB_BASIS_OFF * 16, 0);
+                    gpu.set_buffer(enc, state.consts_buf, ZC_AB_ETOP_OFF * 16, 1);
+                    gpu.set_buffer(enc, state.tables_buf, 0, 2);
+                    gpu.dispatch(enc, ZC_AB_TOPS as u64, 256);
+                };
                 // Command buffer 1: the table build (own GPU wall in the
                 // diagnostics).
-                let cb_tables = gpu.command_buffer()?;
-                let enc = gpu.compute_encoder(cb_tables)?;
-                gpu.set_pipeline(enc, state.tables_pso);
-                gpu.set_buffer(enc, state.consts_buf, ZC_AB_BASIS_OFF * 16, 0);
-                gpu.set_buffer(enc, state.consts_buf, ZC_AB_ETOP_OFF * 16, 1);
-                gpu.set_buffer(enc, state.tables_buf, 0, 2);
-                gpu.dispatch(enc, ZC_AB_TOPS as u64, 256);
-                gpu.end_encoding(enc);
+                let cb_tables = if one {
+                    NIL
+                } else {
+                    let cb_tables = gpu.command_buffer()?;
+                    let enc = gpu.compute_encoder(cb_tables)?;
+                    encode_tables(enc);
+                    gpu.end_encoding(enc);
+                    cb_tables
+                };
                 // Command buffer 2: gather, then finish (serial dispatches of
                 // one encoder: the finish reads the banks the gather wrote).
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
+                if one {
+                    // The gather reads the tables this wrote, as the finish
+                    // reads the gather's banks: serial dispatches.
+                    encode_tables(enc);
+                }
                 gpu.set_pipeline(enc, state.gather_pso);
                 gpu.set_buffer(enc, ab_buf, 0, 0);
                 gpu.set_buffer(enc, state.tables_buf, 0, 1);
@@ -25786,9 +26046,11 @@ kernel void zc_ab_finish(
                 // Armed in the warm-up's oracle launch too, so the timed
                 // launch finds its event in the pool.
                 let sig = if super::join_signal_enabled() { gpu.arm_done(cb) } else { None };
-                let cb_tables = gpu.retain(cb_tables);
+                let cb_tables = if one { NIL } else { gpu.retain(cb_tables) };
                 let cb = gpu.retain(cb);
-                gpu.commit_async(cb_tables);
+                if !one {
+                    gpu.commit_async(cb_tables);
+                }
                 gpu.commit_async(cb);
                 Ok((cb_tables, cb, sig))
             })();
@@ -25839,18 +26101,25 @@ kernel void zc_ab_finish(
             } else {
                 gpu.join_cb_sig(job.cb, job.sig.as_ref(), 2.0)
             }
-            .and_then(|()| gpu.wait_cb(job.cb_tables));
+            .and_then(|()| if job.cb_tables.is_null() { Ok(()) } else { gpu.wait_cb(job.cb_tables) });
             if ok.is_ok() {
                 Gpu::recycle_done(job.sig);
             }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
+            // One buffer (`super::ENV_NO_AB_ONE_CB`): its wall is reported as
+            // gather + finish, the tables included.
             let (tables_ms, gather_ms) = if ok.is_ok() {
-                (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
+                (
+                    if job.cb_tables.is_null() { 0.0 } else { zc_fold_gpu_wall_ms(gpu, job.cb_tables) },
+                    zc_fold_gpu_wall_ms(gpu, job.cb),
+                )
             } else {
                 (0.0, 0.0)
             };
             let gpu_ms = tables_ms + gather_ms;
-            gpu.release(job.cb_tables);
+            if !job.cb_tables.is_null() {
+                gpu.release(job.cb_tables);
+            }
             gpu.release(job.cb);
             if let Err(e) = ok {
                 ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
