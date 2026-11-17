@@ -604,6 +604,37 @@ pub(crate) fn lc_gpu_wake_fire(point: u32) {
     }
 }
 
+/// Opening GPU ping (`FLOCK_NO_OPEN_GPU_PING=1`, exact `1`, kills; read
+/// once). Posts one more lincheck-wake leaf dispatch (one threadgroup on the
+/// wake's private scratch pair) from the poster thread at the opening wake
+/// point `FLOCK_OPEN_PING_AT` (default 100: right after lincheck returns,
+/// ahead of the opening's first Metal grind race; 0..5 = before that L0 fold
+/// round's grind). Same no-op guards as the wake (timed proves only). It
+/// touches no prove buffer and nothing waits on it: proof bytes are
+/// unchanged.
+pub const ENV_NO_OPEN_GPU_PING: &str = "FLOCK_NO_OPEN_GPU_PING";
+
+pub fn open_gpu_ping(point: u32) {
+    static AT: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        if env_is_one(ENV_NO_OPEN_GPU_PING) {
+            return u32::MAX;
+        }
+        std::env::var("FLOCK_OPEN_PING_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(100)
+    });
+    if point != *AT || !lc_gpu_wake_enabled() {
+        return;
+    }
+    crate::tmark::mark("open ping");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    match lc_wake_poster() {
+        Some(poster) => {
+            LC_WAKE_POSTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            poster.unpark();
+        }
+        None => imp::lc_gpu_wake(),
+    }
+}
+
 pub(crate) fn gpu_lincheck_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());

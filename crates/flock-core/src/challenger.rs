@@ -1910,7 +1910,25 @@ fn grind_wide_enabled() -> bool {
 /// Smallest grind (in bits) that the Metal arm takes.
 fn gpu_grind_floor_bits() -> u32 {
     if grind_wide_enabled() {
-        GPU_GRIND_WIDE_MIN_BITS
+        // Race floor 16 (`FLOCK_NO_GRIND_FLOOR16=1`, exact `1`, keeps the
+        // record's 17): the 16-bit L0 fold grind also races the Metal scan
+        // against the CPU arm. The race returns the same smallest nonce
+        // either way (the CPU answer is taken only when definitive), so the
+        // transcript and proof bytes are unchanged. `FLOCK_GRIND_WIDE_FLOOR=N`
+        // (14..=19) overrides for A/B. Read once per process (warm-up).
+        static FLOOR: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+            let default = if std::env::var("FLOCK_NO_GRIND_FLOOR16").is_ok_and(|v| v == "1") {
+                GPU_GRIND_WIDE_MIN_BITS
+            } else {
+                GPU_GRIND_WIDE_MIN_BITS - 1
+            };
+            std::env::var("FLOCK_GRIND_WIDE_FLOOR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|b| (GPU_GRIND_MIN_BITS..=GPU_GRIND_CALIBRATION_BITS).contains(b))
+                .unwrap_or(default)
+        });
+        *FLOOR
     } else {
         GPU_GRIND_MIN_BITS
     }

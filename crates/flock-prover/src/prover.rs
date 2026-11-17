@@ -3332,6 +3332,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
     flock_core::tmark::mark("lc returned");
+    flock_core::gpu_commit::open_gpu_ping(100);
     drop(root_stripe_registration);
     flock_core::scratch::give_u8(z_packed_lincheck);
 

@@ -10073,6 +10073,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // round than the worst (j=0) round `fold_grinding_bits` is sized for.
         // Derived from fold_grinding_bits + round index; not stored.
         let bits = fold_bits(0).saturating_sub(j as u32);
+        crate::gpu_commit::open_gpu_ping(j as u32);
         if bits > 0 {
             let _tg = std::time::Instant::now();
             fold_grinding_nonces.push(challenger.grind_pow(bits));
