@@ -57,28 +57,98 @@ static GUESTS: AtomicUsize = AtomicUsize::new(0);
 /// Publishes `guest` for the duration of `body`, then closes the slot and
 /// waits for any guest still inside it before returning (also on unwind).
 fn with_guest_slot<R>(guest: &GuestFn<'_>, body: impl FnOnce() -> R) -> R {
+    with_slot(&GUEST, &GUESTS, guest, body)
+}
+
+fn with_slot<R>(
+    slot: &'static std::sync::atomic::AtomicPtr<&'static GuestFn<'static>>,
+    hazards: &'static AtomicUsize,
+    guest: &GuestFn<'_>,
+    body: impl FnOnce() -> R,
+) -> R {
     // SAFETY: lifetime erased only while published; `Close` unpublishes and
     // waits for every guest to leave before `guest`'s borrow ends.
     let erased: &'static GuestFn<'static> =
         unsafe { std::mem::transmute::<&GuestFn<'_>, &'static GuestFn<'static>>(guest) };
     let cell: &&'static GuestFn<'static> = &erased;
     let ptr = cell as *const &'static GuestFn<'static> as *mut &'static GuestFn<'static>;
-    let published = GUEST
+    let published = slot
         .compare_exchange(std::ptr::null_mut(), ptr, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok();
-    struct Close(bool, *mut &'static GuestFn<'static>);
+    struct Close(
+        bool,
+        *mut &'static GuestFn<'static>,
+        &'static std::sync::atomic::AtomicPtr<&'static GuestFn<'static>>,
+        &'static AtomicUsize,
+    );
     impl Drop for Close {
         fn drop(&mut self) {
             if self.0 {
-                let _ = GUEST.compare_exchange(self.1, std::ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst);
-                while GUESTS.load(Ordering::SeqCst) != 0 {
+                let _ = self.2.compare_exchange(self.1, std::ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst);
+                while self.3.load(Ordering::SeqCst) != 0 {
                     std::hint::spin_loop();
                 }
             }
         }
     }
-    let _close = Close(published, ptr);
+    let _close = Close(published, ptr, slot, hazards);
     body()
+}
+
+static PRIORITY: std::sync::atomic::AtomicPtr<&'static GuestFn<'static>> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static PRIORITY_GUESTS: AtomicUsize = AtomicUsize::new(0);
+static PRIORITY_HELPERS: AtomicUsize = AtomicUsize::new(0);
+static PRIORITY_CAP: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static PRIORITY_CALLER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct PriorityScope(usize);
+
+impl PriorityScope {
+    pub(crate) fn new(helpers: usize) -> Self {
+        Self(PRIORITY_CALLER.with(|c| c.replace(helpers)))
+    }
+}
+
+impl Drop for PriorityScope {
+    fn drop(&mut self) {
+        PRIORITY_CALLER.with(|c| c.set(self.0));
+    }
+}
+
+#[inline]
+fn priority_caller() -> bool {
+    PRIORITY_CALLER.with(|c| c.get()) > 0
+}
+
+fn with_priority_slot<R>(guest: &GuestFn<'_>, body: impl FnOnce() -> R) -> R {
+    let helpers = PRIORITY_CALLER.with(|c| c.get());
+    if helpers == 0 {
+        return body();
+    }
+    PRIORITY_CAP.store(helpers, Ordering::Relaxed);
+    with_slot(&PRIORITY, &PRIORITY_GUESTS, guest, body)
+}
+
+#[inline]
+fn help_priority() {
+    if PRIORITY.load(Ordering::Relaxed).is_null() {
+        return;
+    }
+    if PRIORITY_HELPERS.fetch_add(1, Ordering::Relaxed) >= PRIORITY_CAP.load(Ordering::Relaxed) {
+        PRIORITY_HELPERS.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+    PRIORITY_GUESTS.fetch_add(1, Ordering::SeqCst);
+    let p = PRIORITY.load(Ordering::SeqCst);
+    if !p.is_null() {
+        unsafe { (**p)(&|| false) };
+    }
+    PRIORITY_GUESTS.fetch_sub(1, Ordering::SeqCst);
+    PRIORITY_HELPERS.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Claim chunks of the currently draining main-pool queue on this thread
@@ -1330,7 +1400,7 @@ fn run_chunks_with_helper_arm_after<F, A>(
             .with_max_len(1)
             .for_each(|_| worker());
     };
-    match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+    with_priority_slot(&linger_guest, || match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
             let helper_body = || {
@@ -1352,7 +1422,7 @@ fn run_chunks_with_helper_arm_after<F, A>(
             });
         }
         None => with_linger_slot(&linger_guest, drain_main),
-    }
+    });
     spawn_lingerers(main_threads);
 }
 
@@ -1417,9 +1487,14 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
     }
     let next = AtomicUsize::new(0);
     let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
+    let caller = rayon::current_thread_index();
     let worker = || {
+        if caller.is_some() && priority_caller() && rayon::current_thread_index() != caller {
+            return;
+        }
         let mut state = init();
         loop {
+            help_priority();
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n_chunks {
                 break;

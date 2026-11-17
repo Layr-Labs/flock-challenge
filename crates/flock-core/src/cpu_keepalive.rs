@@ -361,13 +361,22 @@ mod imp {
     }
 
     fn resv_hot_body(deadline: Instant) {
+        let mut idle: u32 = 0;
         while RESV_HOT.load(Ordering::Relaxed) && POOL_SPIN.load(Ordering::Relaxed) {
             if let Some(rayon::Yield::Executed) = rayon::yield_now() {
+                idle = 0;
                 continue;
             }
-            std::thread::yield_now();
-            if Instant::now() >= deadline {
-                break;
+            idle = idle.wrapping_add(1);
+            if idle % HOT_PROVE_YIELD_EVERY == 0 {
+                std::thread::yield_now();
+                if Instant::now() >= deadline {
+                    break;
+                }
+            } else {
+                for _ in 0..16 {
+                    std::hint::spin_loop();
+                }
             }
         }
     }

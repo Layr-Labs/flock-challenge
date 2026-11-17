@@ -3003,6 +3003,36 @@ pub(crate) fn gpu_wait_help_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_WAIT_HELP).is_none())
 }
 
+///
+pub const ENV_NO_NTT_AB_PRIORITY: &str = "FLOCK_NO_NTT_AB_PRIORITY";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ntt_ab_priority_enabled() -> bool {
+    ntt_ab_priority_helpers() > 0
+}
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ntt_ab_priority_helpers() -> usize {
+    const DEFAULT_HELPERS: usize = 4;
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if std::env::var_os(ENV_NO_NTT_AB_PRIORITY).is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_NTT_AB_PRIORITY_HELPERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(DEFAULT_HELPERS)
+    })
+}
+
 /// Run pending main-pool jobs on this worker until `done()` holds or the pool
 /// has nothing to hand out. Returns without waiting in either case; the caller
 /// then performs its ordinary (exact) wait. No-op off a pool worker.
@@ -14352,6 +14382,9 @@ kernel void blake3_pow_race_tail(
                 // tree, same flat-tree slots, so the root is unchanged.
                 if hybrid_gpu_suffix_hash_enabled() {
                     let t_cpu_ntt = std::time::Instant::now();
+                    let helpers = super::ntt_ab_priority_helpers();
+                    let ntt_first = helpers > 0;
+                    let prio = crate::epool::PriorityScope::new(helpers);
                     if fine_m == 0 {
                         ntt.forward_transform_interleaved_ranked_block_range_and_then(
                             data,
@@ -14378,6 +14411,14 @@ kernel void blake3_pow_race_tail(
                             16 - k_cpu16,
                             fine_m,
                             || {
+                                if ntt_first {
+                                    let _off = crate::epool::PriorityScope::new(0);
+                                    super::help_pool_until(|| {
+                                        gpu.event_signaled_value(ev) >= want
+                                            || gpu_cb_failed(gpu, cb2)
+                                            || head_failed()
+                                    });
+                                }
                                 let mut spins = 0u32;
                                 while gpu.event_signaled_value(ev) < want {
                                     if gpu_cb_failed(gpu, cb2) || head_failed() {
@@ -14400,6 +14441,7 @@ kernel void blake3_pow_race_tail(
                             |_elem_offset: usize, _chunk: &[F128]| {},
                         )?;
                     }
+                    drop(prio);
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
                     // Same clock as the command buffers' GPU timestamps.
                     let cpu_done_s = crate::tmark::now_ns() as f64 * 1e-9;
@@ -14407,10 +14449,11 @@ kernel void blake3_pow_race_tail(
                     // CPU tail hash (see `super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
                     // only while cb2 still runs once the AB sibling has
                     // returned (the CPU is idle only then), never in the
-                    // tuner's sweep.
                     let tail_force = super::hybrid_tail_hash_force();
                     let sig2 = take_cb2_done(gpu, cb2);
-                    let tail = !hybrid_arm_recording()
+                    let ab_busy = ntt_first && !super::ab_arm_done();
+                    let tail = !ab_busy
+                        && !hybrid_arm_recording()
                         && super::hybrid_cpu_tail_hash_enabled()
                         && (tail_force > 0 || {
                             super::help_pool_until(|| super::ab_arm_done() || gpu.cb_done(cb2, sig2.as_ref()));
@@ -14479,6 +14522,7 @@ kernel void blake3_pow_race_tail(
                     crate::tmark::mark_gpu("cb3 gpu start", "cb3 gpu end", cb3_s, cb3_e);
                     record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
                     record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
+                    note_arm_cb2_start(cb2_s);
                     if cpu_done_s > cb2_e {
                         record_cb3_launch_latency((cb3_s - cpu_done_s) * 1e3);
                     }
@@ -14978,6 +15022,43 @@ kernel void blake3_pow_race_tail(
         static V: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64, f64)>>> =
             std::sync::OnceLock::new();
         V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    static ARM_CB2_START_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn note_arm_cb2_start(cb2_s: f64) {
+        if hybrid_arm_recording() {
+            ARM_CB2_START_BITS.store(cb2_s.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn arm_record_lens() -> (usize, usize) {
+        (
+            hybrid_arm_samples().lock().map_or(usize::MAX, |v| v.len()),
+            fine_arm_samples().lock().map_or(usize::MAX, |v| v.len()),
+        )
+    }
+
+    fn price_ab_end_into_arms(lens: (usize, usize), ab_end_s: f64) {
+        let cb2_s = f64::from_bits(ARM_CB2_START_BITS.swap(0, std::sync::atomic::Ordering::Relaxed));
+        let ab_ms = (ab_end_s - cb2_s) * 1e3;
+        if !(cb2_s > 0.0 && ab_ms.is_finite()) {
+            return;
+        }
+        if let Ok(mut v) = hybrid_arm_samples().lock() {
+            if v.len() == lens.0.wrapping_add(1) {
+                if let Some(s) = v.last_mut() {
+                    s.2 = s.2.max(ab_ms);
+                }
+            }
+        }
+        if let Ok(mut v) = fine_arm_samples().lock() {
+            if v.len() == lens.1.wrapping_add(1) {
+                if let Some(s) = v.last_mut() {
+                    s.2 = s.2.max(ab_ms - s.3);
+                }
+            }
+        }
     }
 
     fn record_fine_arms(k_split: usize, cb2_ms: f64, cpu_ms: f64, cb3_ms: f64) {
@@ -15878,13 +15959,34 @@ kernel void blake3_pow_race_tail(
             } else {
                 None
             };
+            let ntt_first = super::ntt_ab_priority_enabled();
+            let lens = arm_record_lens();
+            let replay_end_ns = std::sync::atomic::AtomicU64::new(0);
+            let replay_start_ns = std::sync::atomic::AtomicU64::new(0);
             let (score, fp_ms) = sample_ranked_exact_graph(
                 || reprime_for(k),
                 || timed_graph(k),
-                &replay_ab,
+                || {
+                    replay_start_ns.store(crate::tmark::now_ns(), Ordering::Relaxed);
+                    replay_ab();
+                    replay_end_ns.store(crate::tmark::now_ns(), Ordering::Relaxed);
+                },
                 delay,
                 std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some(),
             )?;
+            if dbg {
+                let cb2_s = f64::from_bits(ARM_CB2_START_BITS.load(Ordering::Relaxed));
+                let raw = fine_arm_samples().lock().ok().and_then(|v| v.last().copied());
+                eprintln!(
+                    "[gpu-commit] exact-AB sample k={k}: replay start {:.2} end {:.2} ms after cb2 start, fine row {:?}",
+                    (replay_start_ns.load(Ordering::Relaxed) as f64 * 1e-9 - cb2_s) * 1e3,
+                    (replay_end_ns.load(Ordering::Relaxed) as f64 * 1e-9 - cb2_s) * 1e3,
+                    raw,
+                );
+            }
+            if ntt_first {
+                price_ab_end_into_arms(lens, replay_end_ns.load(Ordering::Relaxed) as f64 * 1e-9);
+            }
             first_pass_ms = Some(fp_ms);
             if dbg {
                 eprintln!(
@@ -15894,6 +15996,19 @@ kernel void blake3_pow_race_tail(
             }
             Ok(score)
         };
+        if super::ntt_ab_priority_enabled() {
+            use rayon::prelude::*;
+            let max_k = RANKED_EXACT_TUNE_CANDIDATES[RANKED_EXACT_TUNE_CANDIDATES.len() - 1];
+            let bytes = params.codeword_len_f128() * core::mem::size_of::<F128>();
+            let from = bytes / 16 * (16 - max_k - 1);
+            let base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(ctx.staging) }.cast::<u8>());
+            (from / 4096..bytes / 4096).into_par_iter().for_each(|page| {
+                unsafe {
+                    let p = base.ptr().add(page * 4096).cast::<u64>();
+                    p.write_volatile(p.read_volatile());
+                }
+            });
+        }
         let samples = {
             // Only the sweep's own samples price a split: they are the only
             // graph runs taken beside the A/B replay, which is what makes the
@@ -16107,6 +16222,14 @@ kernel void blake3_pow_race_tail(
                 "[gpu-commit] broad exact-AB {} -> k={} verified={verified}",
                 table.join(" "),
                 if verified { chosen } else { 0 },
+            );
+        }
+        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            let k = if verified { chosen } else { 0 };
+            eprintln!(
+                "[phase-timing] hybrid split: cpu {} of 256 (ntt priority helpers {})",
+                256 - hybrid_prefix256(k),
+                super::ntt_ab_priority_helpers(),
             );
         }
         finish_ranked_exact_contention_tune(params, cpu_tree, if verified { chosen } else { 0 });
