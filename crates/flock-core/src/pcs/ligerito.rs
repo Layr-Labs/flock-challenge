@@ -10073,6 +10073,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     // path does zero extra work — and mirrors the counter's
                     // documented "prove E-core engagement for that window" use.
                     let helper_before = trace.then(crate::epool::helper_chunks_claimed);
+                    crate::tmark::mark("o:mat start");
                     let (f8, b8, msg) = materialize_direct_fold8(
                         packed_witness.take().unwrap(),
                         b_initial.take().unwrap(),
@@ -10086,6 +10087,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             r,
                         ],
                     );
+                    crate::tmark::mark("o:mat end");
                     if let Some(before) = helper_before {
                         eprintln!(
                             "    [fold8-mat] helper (E-core) blocks claimed: {} / 256",

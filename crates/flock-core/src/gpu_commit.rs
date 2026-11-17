@@ -12725,6 +12725,41 @@ kernel void blake3_pow_race_tail(
         }
     }
 
+    /// Diagnostic run: command buffers whose GPU interval becomes two tmark
+    /// entries at [`tmark_cb_flush`] (after the proof, before its hold), when
+    /// they are long complete. Entries of an older tmark generation (taken
+    /// before the seed read) are released without a mark.
+    static TMARK_CBS: Mutex<Vec<(usize, u64, &'static str, &'static str)>> = Mutex::new(Vec::new());
+
+    pub(crate) unsafe fn tmark_cb_later(gpu: &Gpu, cb: Id, s: &'static str, e: &'static str) {
+        if crate::tmark::on() && !cb.is_null() {
+            let cb = unsafe { gpu.retain(cb) };
+            TMARK_CBS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((cb as usize, crate::tmark::generation(), s, e));
+        }
+    }
+
+    pub(crate) fn tmark_cb_flush() {
+        let list = std::mem::take(&mut *TMARK_CBS.lock().unwrap_or_else(|e| e.into_inner()));
+        if list.is_empty() {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        let generation = crate::tmark::generation();
+        for (cb, g, s, e) in list {
+            unsafe {
+                let cb = cb as Id;
+                if g == generation && gpu.wait_cb(cb).is_ok() {
+                    let (a, b) = cb_gpu_interval(gpu, cb);
+                    crate::tmark::mark_gpu(s, e, a, b);
+                }
+                gpu.release(cb);
+            }
+        }
+    }
+
     pub(crate) struct FromZFirstPassStream {
         gpu: &'static Gpu,
         z_buf: Id,
@@ -25192,6 +25227,12 @@ kernel void zc_r2_horner_oracle(
             ZcR2Result::Failed
         };
         unsafe {
+            // Diagnostic run: the CPU sweep of round two is done; the GPU
+            // arm's interval is read once the proof is finished.
+            if !job.calibration {
+                crate::tmark::mark("zc r2 cpu end");
+                tmark_cb_later(gpu, job.cb, "zc r2 gpu start", "zc r2 gpu end");
+            }
             // R2-CS steal (`super::ENV_NO_R2_STEAL`): the CPU took the chunks
             // from `take` up; with the prefix's signal seen, the GPU's chunks
             // below `take` are complete and visible, and nothing is waited
@@ -27173,6 +27214,12 @@ kernel void zc_ab_finish(
             }
         };
         unsafe {
+            // Diagnostic run: the CPU share of the K pass is done; the GPU
+            // arm's interval is read once the proof is finished.
+            if !job.calibration {
+                crate::tmark::mark("zc k cpu end");
+                tmark_cb_later(gpu, job.cb, "zc k gpu start", "zc k gpu end");
+            }
             let waited = std::time::Instant::now();
             // A timed join returns on the buffer's signal; the oracle launch
             // waits for the status (`super::ENV_NO_JOIN_SIGNAL`).
@@ -29343,6 +29390,13 @@ pub(crate) use imp::{
 /// Opening z-fold GPU arm (see `ENV_NO_GPU_ZFOLD` in `pcs::ligerito`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::zfold::{ZfJob as ZFoldJob, launch as zfold_launch};
+
+/// Diagnostic run: record the GPU intervals of the joined zerocheck arms as
+/// tmark entries (after the proof, before its hold; no-op otherwise).
+pub fn tmark_cb_flush() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::tmark_cb_flush();
+}
 
 /// Commit-tail fill: staged/adopted round-one C-fold prefix (see
 /// `ENV_NO_COMMIT_TAIL_FILL`).
