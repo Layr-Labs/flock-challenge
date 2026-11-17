@@ -541,7 +541,7 @@ pub(crate) fn hot_spin_start() {
     ep.spawn_broadcast(move |_| hot_spin_body(deadline));
 }
 
-const HOT_SPIN_YIELD_EVERY: u32 = 32;
+const HOT_SPIN_YIELD_EVERY: u32 = 64;
 
 fn hot_spin_body(deadline: std::time::Instant) {
     let mut idle: u32 = 0;

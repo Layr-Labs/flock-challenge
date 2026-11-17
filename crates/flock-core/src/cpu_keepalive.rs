@@ -269,7 +269,7 @@ mod imp {
     /// threads besides the pool's workers that run on performance cores
     const HOT_PROVE_RESERVED: usize = 4;
 
-    const HOT_PROVE_YIELD_EVERY: u32 = 32;
+    const HOT_PROVE_YIELD_EVERY: u32 = 64;
 
     fn pool_spin_body(deadline: Instant, leaves_at_witness: bool) {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
