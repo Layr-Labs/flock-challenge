@@ -87,6 +87,26 @@ pub fn pool_spin_release() {
     imp::pool_spin_release();
 }
 
+/// Default kernel-yield period of the hot spinners (see [`hot_yield_every`]).
+pub(crate) const HOT_YIELD_EVERY_DEFAULT: u32 = 64;
+
+/// Kernel-yield period of the hot spinners (the main pool's hot-prove spin and
+/// the helper pool's hot spin): an idle spinner makes the kernel yield on
+/// every `n`-th idle round and spends the other rounds in 16
+/// `std::hint::spin_loop` pauses. `FLOCK_HOT_YIELD_EVERY=n`, clamped to
+/// `1..=4096`; unset or unparsable = [`HOT_YIELD_EVERY_DEFAULT`]; `16` is the
+/// previous fixed period. First read when the hot spin is armed at the tail
+/// of the untimed warm-up, before the worker publishes READY. Scheduling only.
+pub(crate) fn hot_yield_every() -> u32 {
+    static N: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("FLOCK_HOT_YIELD_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(HOT_YIELD_EVERY_DEFAULT, |n| n.clamp(1, 4096))
+    });
+    *N
+}
+
 /// Witness generation has handed its work to the pool. Rayon's workers park
 /// after 32 idle rounds and are woken one by one, one `pthread_cond_signal`
 /// per pushed job, when the next parallel region opens; a census of card R's
@@ -249,13 +269,14 @@ mod imp {
         crate::epool::hot_spin_arm();
         RESV_HOT_OFF.store(std::env::var_os("FLOCK_NO_RESV_HOT").is_some(), Ordering::Relaxed);
         crate::lock_spin_arm();
+        let yield_every = super::hot_yield_every();
         let deadline = Instant::now() + MAX_KEEPALIVE;
         rayon::spawn_broadcast(move |ctx| {
             // Leave one core to the seed-pipe thread's hot poll.
             if ctx.index() + 1 == ctx.num_threads() {
                 return;
             }
-            pool_spin_body(deadline, ctx.index() + HOT_PROVE_RESERVED >= ctx.num_threads());
+            pool_spin_body(deadline, ctx.index() + HOT_PROVE_RESERVED >= ctx.num_threads(), yield_every);
         });
         true
     }
@@ -268,9 +289,8 @@ mod imp {
     /// those three never exceed the pool's width.
     const HOT_PROVE_RESERVED: usize = 3;
 
-    const HOT_PROVE_YIELD_EVERY: u32 = 16;
-
-    fn pool_spin_body(deadline: Instant, leaves_at_witness: bool) {
+    /// `yield_every`: [`super::hot_yield_every`], read before the seed.
+    fn pool_spin_body(deadline: Instant, leaves_at_witness: bool, yield_every: u32) {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut idle: u32 = 0;
         while POOL_SPIN.load(Ordering::Relaxed) {
@@ -283,7 +303,7 @@ mod imp {
                     break;
                 }
                 idle = idle.wrapping_add(1);
-                if idle % HOT_PROVE_YIELD_EVERY == 0 {
+                if idle % yield_every == 0 {
                     std::thread::yield_now();
                     if Instant::now() >= deadline {
                         break;

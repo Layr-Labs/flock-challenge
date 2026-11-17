@@ -425,6 +425,14 @@ pub(crate) fn join_signal_enabled() -> bool {
     *ON
 }
 
+pub const ENV_NO_TAIL_HALF_UNITS: &str = "FLOCK_NO_TAIL_HALF_UNITS";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tail_half_units_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAIL_HALF_UNITS));
+    *ON
+}
+
 /// Serial XOR of a fold prefix into the CPU suffix (`FLOCK_NO_FOLD_SERIAL_XOR`,
 /// any value, kills): the round-one C fold's and the lincheck fold's drains
 /// add the GPU prefix's 2^k_log lanes (256 KiB at the ranked shape) into the
@@ -2146,6 +2154,32 @@ pub const ENV_NO_GRIND_SEG2: &str = "FLOCK_NO_GRIND_SEG2";
 
 /// Segments of the segmented race scan.
 pub(crate) const GRIND_SEG2_SEGMENTS: usize = 4;
+
+/// Kill switch for the segment tails of the segmented race scan
+/// (`FLOCK_NO_GRIND_SEG_TAIL=1`, exact `1`: four segments that report
+/// through shared-event signals between encoders, as before). Those
+/// signals reached the CPU only once the whole command buffer had finished
+/// (M4, timed proofs: every segment's signal first seen 33-72 us after the
+/// buffer's GPU end), so an answer in segment 0 or 1 waited for the later
+/// segments, which the CPU could not cut in time either. With it on, the
+/// scan is cut into [`GRIND_SEG_TAIL_SEGMENTS`] segments in one serial
+/// encoder, each followed by a one-thread tail (`blake3_pow_seg_tail`, built
+/// with the race tail) that publishes the segment's smallest match, or none,
+/// with a system-coherent store as soon as the segment ends, and on a match
+/// sets every later segment's `best` to 0 so their threads return at their
+/// first check. The calling thread reads the words in segment order: a
+/// segment is taken only after every lower one published no match, so the
+/// answer is the block's smallest qualifying nonce, as before. Without the
+/// tail pipeline, the event signals. Read once per process.
+pub const ENV_NO_GRIND_SEG_TAIL: &str = "FLOCK_NO_GRIND_SEG_TAIL";
+
+/// Segments of the segment-tail race scan (see [`ENV_NO_GRIND_SEG_TAIL`]).
+pub(crate) const GRIND_SEG_TAIL_SEGMENTS: usize = 8;
+
+pub(crate) fn grind_seg_tail_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_GRIND_SEG_TAIL));
+    *ON
+}
 
 pub(crate) fn grind_seg2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GRIND_SEG2).is_none());
@@ -9962,6 +9996,31 @@ kernel void blake3_pow_race_tail(
     word[0] = (tag << 24u) | (b < params.len ? b : 0xffffffu);
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, POW_RACE_SCOPE_SYSTEM);
 }
+
+// Segment tail of the segmented race scan (`ENV_NO_GRIND_SEG_TAIL`): one
+// thread behind segment k's scan in the same serial encoder reads the
+// segment's final smallest match and publishes `tag << 24 | code` (code =
+// the match offset in the segment, or 0xFFFFFF for none) with a
+// system-coherent store and a system-scope fence, so the CPU sees it as soon
+// as the segment ends; on a match it first sets every later segment's `best`
+// to 0, so their threads return at their first check.
+kernel void blake3_pow_seg_tail(
+    device atomic_uint* best              [[buffer(1)]],
+    constant PowParams& params            [[buffer(2)]],
+    volatile coherent(system) device uint* word [[buffer(3)]],
+    constant uint& tag                    [[buffer(4)]],
+    device atomic_uint* later             [[buffer(5)]],
+    constant uint& n_later                [[buffer(6)]])
+{
+    uint b = atomic_load_explicit(best, memory_order_relaxed);
+    if (b < params.len) {
+        for (uint j = 0u; j < n_later; j++) {
+            atomic_store_explicit(&later[j], 0u, memory_order_relaxed);
+        }
+    }
+    word[0] = (tag << 24u) | (b < params.len ? b : 0xffffffu);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, POW_RACE_SCOPE_SYSTEM);
+}
 "#;
 
     // -----------------------------------------------------------------------
@@ -12379,9 +12438,9 @@ kernel void blake3_pow_race_tail(
         n_leaves: usize,
         suffix_start: usize,
         args: Id,
+        unit_levels: usize,
     ) -> Vec<u32> {
-        const UNIT_LEVELS: usize = 10;
-        let unit = 1usize << UNIT_LEVELS;
+        let unit = 1usize << unit_levels;
         debug_assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let mut per_unit: Vec<u32> = Vec::with_capacity(12);
         unsafe {
@@ -12423,7 +12482,7 @@ kernel void blake3_pow_race_tail(
                 let off = next_arg((unit / 256) as u32, &mut per_unit);
                 gpu.dispatch_indirect(enc, args, off, 256);
             }
-            while done < UNIT_LEVELS {
+            while done < unit_levels {
                 // Per unit: `unit >> (done + 1)` parents at the next level.
                 let n_out = unit >> (done + 1);
                 let tpg = n_out.min(256);
@@ -14022,9 +14081,9 @@ kernel void blake3_pow_race_tail(
         }
     }
 
-    /// 1,024-leaf units of the CPU tail hash (`super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
-    /// one unit is its leaves and ten parent levels, rooted at level 10.
-    const TAIL_UNIT_LEVELS: usize = 10;
+    fn tail_unit_levels() -> usize {
+        if super::tail_half_units_enabled() { 9 } else { 10 }
+    }
 
     /// Process-lifetime indirect-count buffer of the CPU tail hash's cb3.
     static TAIL_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -14089,7 +14148,8 @@ kernel void blake3_pow_race_tail(
         suffix_start: usize,
         force: usize,
     ) -> Result<(), String> {
-        let unit = 1usize << TAIL_UNIT_LEVELS;
+        let unit_levels = tail_unit_levels();
+        let unit = 1usize << unit_levels;
         assert!(n_leaves.is_power_of_two() && n_leaves >= 1 << 16);
         assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let total_units = (n_leaves - suffix_start) / unit;
@@ -14107,7 +14167,7 @@ kernel void blake3_pow_race_tail(
             let cb3 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb3)?;
             let per_unit =
-                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args);
+                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args, unit_levels);
             gpu.end_encoding(enc);
             // The join below returns on this signal (`super::ENV_NO_JOIN_SIGNAL`).
             let sig3 = if super::join_signal_enabled() { gpu.arm_done(cb3) } else { None };
@@ -14143,7 +14203,7 @@ kernel void blake3_pow_race_tail(
             // the same unit only with the same bytes into the same slots.
             unsafe {
                 let bytes = core::slice::from_raw_parts(bytes_base.ptr().add(start * 1024), unit * 1024);
-                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, TAIL_UNIT_LEVELS);
+                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, unit_levels);
             }
         };
         // cb2's completion as the caller reads it: its armed signal when
@@ -14254,27 +14314,29 @@ kernel void blake3_pow_race_tail(
         gpu.release(cb3);
         r?;
         crate::tmark::mark("cb3 host woke");
-        // The suffix's levels 11..16 from the unit roots. Level `l`'s first
         // node is rounded down, so a node over the GPU prefix's last 256ths
         // and the suffix's first is rebuilt too: its children on the prefix
         // side are cb2's (every aligned block inside the prefix lies inside
         // one of cb2's greedy subtrees, each complete up to its root).
         let mut ls = 0usize;
         let mut ll = n_leaves;
-        for _ in 0..TAIL_UNIT_LEVELS {
+        for _ in 0..unit_levels {
             ls += ll;
             ll /= 2;
         }
-        let mut lo = suffix_start >> TAIL_UNIT_LEVELS;
+        let mut lo = suffix_start >> unit_levels;
         while ll > 16 {
             let ws = ls + ll;
             let wlo = lo / 2;
-            // SAFETY: every GPU write of the tree is complete (cb2 and cb3
-            // joined above) and every CPU unit is done (the scope joined).
-            unsafe {
-                let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * wlo), ll - 2 * wlo);
-                let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + wlo), ll / 2 - wlo);
-                crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+            let mut o = wlo;
+            while o < ll / 2 {
+                let len = 1024.min(ll / 2 - o);
+                unsafe {
+                    let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * o), 2 * len);
+                    let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + o), len);
+                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                }
+                o += len;
             }
             ls = ws;
             ll /= 2;
@@ -17401,6 +17463,10 @@ kernel void blake3_pow_race_tail(
     /// the build.
     static POW_RACE_TAIL: OnceLock<bool> = OnceLock::new();
 
+    /// `blake3_pow_seg_tail` (built with the race tail, see
+    /// `super::ENV_NO_GRIND_SEG_TAIL`); unset keeps the event signals.
+    static SEG_TAIL_PSO: OnceLock<usize> = OnceLock::new();
+
     impl PowRaceSlots {
         pub(crate) const EMPTY: Self = Self {
             tail: NIL,
@@ -17495,12 +17561,18 @@ kernel void blake3_pow_race_tail(
     // ---- Segmented race scan (see `super::ENV_NO_GRIND_SEG2`) ----
 
     const SEG_K: usize = super::GRIND_SEG2_SEGMENTS;
+    /// Segments with segment tails (`super::ENV_NO_GRIND_SEG_TAIL`).
+    const SEG_TAIL_K: usize = super::GRIND_SEG_TAIL_SEGMENTS;
+    /// The larger of the two segment counts (per-set arrays).
+    const SEG_MAX: usize = if SEG_TAIL_K > SEG_K { SEG_TAIL_K } else { SEG_K };
     /// Slot sets: a launch's set is reused only after its buffer completed.
     const SEG_SETS: usize = 3;
     /// Per set: the 24 round-zero words at 0, segment `k`'s parameters at
-    /// `128 + 16 k`.
-    const SEG_ARGS_STRIDE: usize = 256;
-    /// Per set: segment `k`'s `best` word at `4 k`.
+    /// `128 + 16 k`, the launch tag at `SEG_TAG_OFF`.
+    const SEG_ARGS_STRIDE: usize = 512;
+    const SEG_TAG_OFF: usize = 128 + 16 * SEG_MAX;
+    /// Per set: segment `k`'s `best` word at `4 k` (and, segment tails,
+    /// segment `k`'s published word at `4 k` of the words buffer).
     const SEG_SLOT_STRIDE: usize = 64;
 
     struct SegRace {
@@ -17508,8 +17580,13 @@ kernel void blake3_pow_race_tail(
         next_value: u64,
         args: Id,
         slots: Id,
-        /// The one buffer encoded ahead: (set, command buffer, event base).
-        prepared: Option<(usize, Id, u64)>,
+        /// Segment tails' published words (`super::ENV_NO_GRIND_SEG_TAIL`).
+        words: Id,
+        /// Launch tags of the segment tails (1..=255).
+        tag_counter: u32,
+        /// The one buffer encoded ahead: (set, command buffer, event base,
+        /// segment tails).
+        prepared: Option<(usize, Id, u64, bool)>,
         /// Each set's last committed buffer (retained), until it completed.
         inflight: [Id; SEG_SETS],
         next: usize,
@@ -17529,17 +17606,32 @@ kernel void blake3_pow_race_tail(
             }
             let args = gpu.new_buffer(SEG_SETS * SEG_ARGS_STRIDE).ok()?;
             let slots = gpu.new_buffer(SEG_SETS * SEG_SLOT_STRIDE).ok()?;
+            let words = gpu.new_buffer(SEG_SETS * SEG_SLOT_STRIDE).ok()?;
             let w = gpu.buffer_contents(slots).cast::<u32>();
             for i in 0..SEG_SETS * SEG_SLOT_STRIDE / 4 {
                 w.add(i).write_volatile(u32::MAX);
             }
-            Some(SegRace { ev, next_value: 0, args, slots, prepared: None, inflight: [NIL; SEG_SETS], next: 0 })
+            let ww = gpu.buffer_contents(words).cast::<u32>();
+            for i in 0..SEG_SETS * SEG_SLOT_STRIDE / 4 {
+                ww.add(i).write_volatile(0);
+            }
+            Some(SegRace {
+                ev,
+                next_value: 0,
+                args,
+                slots,
+                words,
+                tag_counter: 0,
+                prepared: None,
+                inflight: [NIL; SEG_SETS],
+                next: 0,
+            })
         }
     }
 
     /// A set no buffer is using: never launched, or its last buffer completed.
     unsafe fn seg_set_free(gpu: &Gpu, st: &mut SegRace, i: usize) -> bool {
-        if st.prepared.is_some_and(|(p, _, _)| p == i) {
+        if st.prepared.is_some_and(|(p, _, _, _)| p == i) {
             return false;
         }
         let cb = st.inflight[i];
@@ -17560,9 +17652,44 @@ kernel void blake3_pow_race_tail(
     /// Encode set `i`'s buffer: per segment, the v2 scan over the set's
     /// state, the segment's `best` word and parameters, then the segment's
     /// signal (`base + k + 1`). Retained, not committed.
-    unsafe fn seg_encode(gpu: &Gpu, st: &mut SegRace, i: usize) -> Option<(Id, u64)> {
+    unsafe fn seg_encode(gpu: &Gpu, st: &mut SegRace, i: usize) -> Option<(Id, u64, bool)> {
         const POW_V2_TG: u64 = 256;
         const POW_V2_GRID: u64 = 1 << 16;
+        // Segment tails (`super::ENV_NO_GRIND_SEG_TAIL`): one serial encoder,
+        // each segment's scan followed by its one-thread tail; no signals.
+        if let Some(&tail) = SEG_TAIL_PSO.get()
+            && super::grind_seg_tail_enabled()
+        {
+            let tail = tail as Id;
+            unsafe {
+                let pool = gpu.pool_push();
+                let cb = (|| -> Option<Id> {
+                    let cb = gpu.command_buffer().ok()?;
+                    let enc = gpu.compute_encoder(cb).ok()?;
+                    for k in 0..SEG_TAIL_K {
+                        gpu.set_pipeline(enc, gpu.pso_pow);
+                        gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE, 0);
+                        gpu.set_buffer(enc, st.slots, i * SEG_SLOT_STRIDE + 4 * k, 1);
+                        gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE + 128 + 16 * k, 2);
+                        gpu.dispatch(enc, POW_V2_GRID / POW_V2_TG, POW_V2_TG);
+                        gpu.set_pipeline(enc, tail);
+                        gpu.set_buffer(enc, st.slots, i * SEG_SLOT_STRIDE + 4 * k, 1);
+                        gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE + 128 + 16 * k, 2);
+                        gpu.set_buffer(enc, st.words, i * SEG_SLOT_STRIDE + 4 * k, 3);
+                        gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE + SEG_TAG_OFF, 4);
+                        // The later segments' `best` words (none after the last).
+                        gpu.set_buffer(enc, st.slots, i * SEG_SLOT_STRIDE + 4 * (k + 1).min(SEG_TAIL_K - 1), 5);
+                        let n_later = (SEG_TAIL_K - 1 - k) as u32;
+                        gpu.set_bytes(enc, &n_later.to_le_bytes(), 6);
+                        gpu.dispatch(enc, 1, 1);
+                    }
+                    gpu.end_encoding(enc);
+                    Some(gpu.retain(cb))
+                })();
+                gpu.pool_pop(pool);
+                return cb.map(|cb| (cb, 0, true));
+            }
+        }
         let base = st.next_value;
         st.next_value = base + SEG_K as u64;
         unsafe {
@@ -17582,7 +17709,7 @@ kernel void blake3_pow_race_tail(
                 Some(gpu.retain(cb))
             })();
             gpu.pool_pop(pool);
-            cb.map(|cb| (cb, base))
+            cb.map(|cb| (cb, base, false))
         }
     }
 
@@ -17609,8 +17736,8 @@ kernel void blake3_pow_race_tail(
             let Some(i) = (0..SEG_SETS).map(|k| (next + k) % SEG_SETS).find(|&i| seg_set_free(gpu, st, i)) else {
                 return;
             };
-            if let Some((cb, base)) = seg_encode(gpu, st, i) {
-                st.prepared = Some((i, cb, base));
+            if let Some((cb, base, tails)) = seg_encode(gpu, st, i) {
+                st.prepared = Some((i, cb, base, tails));
             }
         }
     }
@@ -17622,6 +17749,12 @@ kernel void blake3_pow_race_tail(
         ev: Id,
         base: u64,
         slots: *const std::sync::atomic::AtomicU32,
+        /// Segment tails' published words (null: the event signals).
+        words: *const u32,
+        /// This launch's tag in the published words.
+        tag: u32,
+        /// Segments of this launch.
+        n_seg: usize,
         seg: u32,
         start: u64,
         /// Lowest segment not yet found empty.
@@ -17642,9 +17775,17 @@ kernel void blake3_pow_race_tail(
         }
 
         fn zero_from(&self, k: usize) {
-            for j in k..SEG_K {
+            for j in k..self.n_seg {
                 self.slot(j).store(0, std::sync::atomic::Ordering::Relaxed);
             }
+        }
+
+        /// Segment tails: segment `k`'s published word, if this launch's.
+        fn word(&self, k: usize) -> Option<u32> {
+            // SAFETY: the race's process-lifetime words buffer; the GPU
+            // stores each word once per launch with a system-coherent store.
+            let w = unsafe { self.words.add(k).read_volatile() };
+            (w >> 24 == self.tag).then_some(w & 0x00FF_FFFF)
         }
 
         /// The answer once known: `Some(Some(n))` = smallest match, `Some(None)`
@@ -17654,9 +17795,26 @@ kernel void blake3_pow_race_tail(
             if self.settled.load(Ordering::Relaxed) {
                 return None;
             }
+            if !self.words.is_null() {
+                // Segment tails: the words in segment order; a segment's
+                // answer is taken only after every lower one published none.
+                loop {
+                    let k = self.k.load(Ordering::Relaxed);
+                    if k >= self.n_seg {
+                        self.settled.store(true, Ordering::Relaxed);
+                        return Some(None);
+                    }
+                    let Some(code) = self.word(k) else { return None };
+                    if code != super::POW_RACE_NO_MATCH {
+                        self.settled.store(true, Ordering::Relaxed);
+                        return Some(Some(self.start + k as u64 * u64::from(self.seg) + u64::from(code)));
+                    }
+                    self.k.store(k + 1, Ordering::Relaxed);
+                }
+            }
             loop {
                 let k = self.k.load(Ordering::Relaxed);
-                if k >= SEG_K {
+                if k >= self.n_seg {
                     self.settled.store(true, Ordering::Relaxed);
                     return Some(None);
                 }
@@ -17711,11 +17869,17 @@ kernel void blake3_pow_race_tail(
     }
 
     /// Launch the prepared buffer (or encode one now) over `[start, start +
-    /// len)` in [`SEG_K`] equal segments.
+    /// len)` in equal segments: [`SEG_TAIL_K`] with segment tails
+    /// (`super::ENV_NO_GRIND_SEG_TAIL`), else [`SEG_K`] with event signals.
     pub(crate) fn gpu_pow_seg_launch(state_digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<SegRaceJob> {
         const POW_V2_GRID: u32 = 1 << 16;
-        let seg = len / SEG_K as u32;
-        if !(1..=32).contains(&bits) || !len.is_power_of_two() || seg < POW_V2_GRID || len >= super::POW_RACE_NO_MATCH {
+        // As before, on the event signals' four segments; the segment tails'
+        // smaller segments only leave some of the grid's threads idle.
+        if !(1..=32).contains(&bits)
+            || !len.is_power_of_two()
+            || len / (SEG_K as u32) < POW_V2_GRID
+            || len >= super::POW_RACE_NO_MATCH
+        {
             return None;
         }
         let gpu = gpu().ok()?;
@@ -17728,27 +17892,38 @@ kernel void blake3_pow_race_tail(
                 *slot = seg_setup(gpu);
             }
             let st = slot.as_mut()?;
-            let (i, cb, base) = match st.prepared.take() {
+            let (i, cb, base, tails) = match st.prepared.take() {
                 Some(p) => p,
                 None => {
                     let next = st.next;
                     let i = (0..SEG_SETS).map(|k| (next + k) % SEG_SETS).find(|&i| seg_set_free(gpu, st, i))?;
-                    let (cb, base) = seg_encode(gpu, st, i)?;
-                    (i, cb, base)
+                    let (cb, base, tails) = seg_encode(gpu, st, i)?;
+                    (i, cb, base, tails)
                 }
             };
+            let n_seg = if tails { SEG_TAIL_K } else { SEG_K };
+            let seg = len / n_seg as u32;
             let args = gpu.buffer_contents(st.args).add(i * SEG_ARGS_STRIDE);
             let pre = super::pow_round0_pre(state_digest);
             core::ptr::copy_nonoverlapping(pre.as_ptr(), args.cast::<u32>(), pre.len());
-            for k in 0..SEG_K {
+            // This launch's tag (segment tails; stale words carry another).
+            st.tag_counter = st.tag_counter % 255 + 1;
+            let tag = st.tag_counter;
+            args.add(SEG_TAG_OFF).cast::<u32>().write(tag);
+            for k in 0..n_seg {
                 let s0 = start + k as u64 * u64::from(seg);
                 let params = [s0 as u32, (s0 >> 32) as u32, seg, bits];
                 core::ptr::copy_nonoverlapping(params.as_ptr(), args.add(128 + 16 * k).cast::<u32>(), 4);
             }
             let slots = gpu.buffer_contents(st.slots).add(i * SEG_SLOT_STRIDE).cast::<std::sync::atomic::AtomicU32>();
-            for k in 0..SEG_K {
+            for k in 0..n_seg {
                 (*slots.add(k)).store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             }
+            let words = if tails {
+                gpu.buffer_contents(st.words).add(i * SEG_SLOT_STRIDE).cast::<u32>().cast_const()
+            } else {
+                core::ptr::null()
+            };
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             gpu.commit_async(cb);
             st.inflight[i] = cb;
@@ -17759,6 +17934,9 @@ kernel void blake3_pow_race_tail(
                 ev: st.ev,
                 base,
                 slots,
+                words,
+                tag,
+                n_seg,
                 seg,
                 start,
                 k: std::sync::atomic::AtomicUsize::new(0),
@@ -17877,6 +18055,35 @@ kernel void blake3_pow_race_tail(
                             &mut pso_err
                         );
                         gpu.release(function);
+                    }
+                }
+                // The segment tail (`super::ENV_NO_GRIND_SEG_TAIL`), same
+                // library; NIL keeps the segmented scan's event signals.
+                if !pso.is_null()
+                    && super::grind_seg_tail_enabled()
+                    && let Ok(ns) = api.nsstring("blake3_pow_seg_tail")
+                {
+                    let function: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if !function.is_null() {
+                        let mut pso_err: Id = NIL;
+                        let seg: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            gpu.device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        gpu.release(function);
+                        if !seg.is_null() {
+                            let _ = SEG_TAIL_PSO.set(seg as usize);
+                        }
                     }
                 }
                 gpu.release(library);

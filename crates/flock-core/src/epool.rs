@@ -412,6 +412,8 @@ const HOT_SPIN_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 /// spin is armed, outside any timed interval.
 pub(crate) fn hot_spin_arm() {
     HOT_SPIN_OFF.store(std::env::var_os("FLOCK_NO_EPOOL_HOT").is_some(), Ordering::Relaxed);
+    // The spinners' yield period, read here, outside any timed interval.
+    let _ = crate::cpu_keepalive::hot_yield_every();
     let _ = epool();
 }
 
@@ -437,13 +439,14 @@ pub(crate) fn hot_spin_start() {
     if HOT_SPIN.swap(true, Ordering::AcqRel) {
         return;
     }
+    let yield_every = crate::cpu_keepalive::hot_yield_every();
     let deadline = std::time::Instant::now() + HOT_SPIN_MAX;
-    ep.spawn_broadcast(move |_| hot_spin_body(deadline));
+    ep.spawn_broadcast(move |_| hot_spin_body(deadline, yield_every));
 }
 
-const HOT_SPIN_YIELD_EVERY: u32 = 16;
-
-fn hot_spin_body(deadline: std::time::Instant) {
+/// `yield_every`: [`crate::cpu_keepalive::hot_yield_every`], read before the
+/// seed (in [`hot_spin_arm`]).
+fn hot_spin_body(deadline: std::time::Instant, yield_every: u32) {
     let mut idle: u32 = 0;
     while HOT_SPIN.load(Ordering::Relaxed) {
         if let Some(rayon::Yield::Executed) = rayon::yield_now() {
@@ -451,7 +454,7 @@ fn hot_spin_body(deadline: std::time::Instant) {
             continue;
         }
         idle = idle.wrapping_add(1);
-        if idle % HOT_SPIN_YIELD_EVERY == 0 {
+        if idle % yield_every == 0 {
             std::thread::yield_now();
             if std::time::Instant::now() >= deadline {
                 break;
