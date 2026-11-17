@@ -425,6 +425,14 @@ pub(crate) fn join_signal_enabled() -> bool {
     *ON
 }
 
+pub const ENV_NO_TAIL_HALF_UNITS: &str = "FLOCK_NO_TAIL_HALF_UNITS";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tail_half_units_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAIL_HALF_UNITS));
+    *ON
+}
+
 /// Serial XOR of a fold prefix into the CPU suffix (`FLOCK_NO_FOLD_SERIAL_XOR`,
 /// any value, kills): the round-one C fold's and the lincheck fold's drains
 /// add the GPU prefix's 2^k_log lanes (256 KiB at the ranked shape) into the
@@ -1081,6 +1089,23 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
     if gpu_commit_enabled() { *SHARE } else { 0 }
 }
 
+/// Kill switch for submitting the round-one AB completion arm as one command
+/// buffer (`FLOCK_NO_ZC_AB_SCHED`, any value, read once per process): the
+/// table build is committed as its own command buffer ahead of the gather and
+/// finish, as before. With the switch unset, the table build, the gather and
+/// the finish are encoded into a single command buffer (the table build's
+/// encoder first, then the gather and finish encoder), so no other work on the
+/// queue can be scheduled between the build and the gather, and the arm pays
+/// one command buffer's start instead of two. The kernels, their inputs,
+/// their order and every output are the same.
+pub const ENV_NO_ZC_AB_SCHED: &str = "FLOCK_NO_ZC_AB_SCHED";
+
+pub(crate) fn gpu_zc_ab_one_cb_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_AB_SCHED).is_none());
+    *ON
+}
+
 /// Diagnostic trace for the round-one AB completion arm: the warm-up oracle
 /// verdict and, per prove that folds GPU partials, one `[zc-ab-gpu] fired`
 /// line (`FLOCK_ZC_AB_GPU_DEBUG=1`, or any `FLOCK_PHASE_TIMING` run).
@@ -1134,6 +1159,20 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 /// one's, so 768 stays CPU-critical there.
 const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 768;
 
+/// Kill switch for the runner-balanced K share (`FLOCK_NO_ZC_K_SHARE800`, any
+/// value: the faster kernel's default share is [`ZC_K_GPU_V2_DEFAULT_CHUNKS`],
+/// 768, as the record). The official runner reads the K pass CPU-critical
+/// with 768: its K GPU prefix ends about 0.64 ms before the CPU queue (a
+/// disclosed diagnostic run on the M3 Max, i34-9 `c4d5dd3c`), so the GPU idles
+/// at the K join. With CPU and GPU chunk rates from that reading (1280 chunks
+/// in ~8 ms, 768 in ~7.4 ms) the two sides end together near 800 of the 2048
+/// chunks. The default share becomes [`ZC_K_GPU_V2_RUNNER_CHUNKS`] (800, a
+/// multiple of 32). The same chunks and kernels, only the GPU/CPU boundary
+/// moves, so every output is the same field element. An explicit
+/// `FLOCK_ZC_K_GPU_CHUNKS` still wins. Read once per process.
+pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
+const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
+
 /// Kill switch for the K arm's faster fold kernel (`FLOCK_NO_ZC_K_V2`, any
 /// value): the embedded `zc_k_fold` and the record's share
 /// ([`ZC_K_GPU_DEFAULT_CHUNKS`]). With it on, `zc_k_fold_v2` (compiled from
@@ -1168,6 +1207,9 @@ pub(crate) fn gpu_zc_k_share() -> usize {
             return 0;
         }
         match std::env::var_os(ENV_ZC_K_GPU_CHUNKS) {
+            None if zc_k_v2_enabled() && std::env::var_os(ENV_NO_ZC_K_SHARE800).is_none() => {
+                ZC_K_GPU_V2_RUNNER_CHUNKS
+            }
             None if zc_k_v2_enabled() => ZC_K_GPU_V2_DEFAULT_CHUNKS,
             None => ZC_K_GPU_DEFAULT_CHUNKS,
             Some(value) => value
@@ -12655,9 +12697,9 @@ kernel void blake3_pow_seg_tail(
         n_leaves: usize,
         suffix_start: usize,
         args: Id,
+        unit_levels: usize,
     ) -> Vec<u32> {
-        const UNIT_LEVELS: usize = 10;
-        let unit = 1usize << UNIT_LEVELS;
+        let unit = 1usize << unit_levels;
         debug_assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let mut per_unit: Vec<u32> = Vec::with_capacity(12);
         unsafe {
@@ -12699,7 +12741,7 @@ kernel void blake3_pow_seg_tail(
                 let off = next_arg((unit / 256) as u32, &mut per_unit);
                 gpu.dispatch_indirect(enc, args, off, 256);
             }
-            while done < UNIT_LEVELS {
+            while done < unit_levels {
                 // Per unit: `unit >> (done + 1)` parents at the next level.
                 let n_out = unit >> (done + 1);
                 let tpg = n_out.min(256);
@@ -14298,9 +14340,9 @@ kernel void blake3_pow_seg_tail(
         }
     }
 
-    /// 1,024-leaf units of the CPU tail hash (`super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
-    /// one unit is its leaves and ten parent levels, rooted at level 10.
-    const TAIL_UNIT_LEVELS: usize = 10;
+    fn tail_unit_levels() -> usize {
+        if super::tail_half_units_enabled() { 9 } else { 10 }
+    }
 
     /// Process-lifetime indirect-count buffer of the CPU tail hash's cb3.
     static TAIL_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -14365,7 +14407,8 @@ kernel void blake3_pow_seg_tail(
         suffix_start: usize,
         force: usize,
     ) -> Result<(), String> {
-        let unit = 1usize << TAIL_UNIT_LEVELS;
+        let unit_levels = tail_unit_levels();
+        let unit = 1usize << unit_levels;
         assert!(n_leaves.is_power_of_two() && n_leaves >= 1 << 16);
         assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let total_units = (n_leaves - suffix_start) / unit;
@@ -14383,7 +14426,7 @@ kernel void blake3_pow_seg_tail(
             let cb3 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb3)?;
             let per_unit =
-                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args);
+                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args, unit_levels);
             gpu.end_encoding(enc);
             // The join below returns on this signal (`super::ENV_NO_JOIN_SIGNAL`).
             let sig3 = if super::join_signal_enabled() { gpu.arm_done(cb3) } else { None };
@@ -14419,7 +14462,7 @@ kernel void blake3_pow_seg_tail(
             // the same unit only with the same bytes into the same slots.
             unsafe {
                 let bytes = core::slice::from_raw_parts(bytes_base.ptr().add(start * 1024), unit * 1024);
-                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, TAIL_UNIT_LEVELS);
+                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, unit_levels);
             }
         };
         // cb2's completion as the caller reads it: its armed signal when
@@ -14530,27 +14573,29 @@ kernel void blake3_pow_seg_tail(
         gpu.release(cb3);
         r?;
         crate::tmark::mark("cb3 host woke");
-        // The suffix's levels 11..16 from the unit roots. Level `l`'s first
         // node is rounded down, so a node over the GPU prefix's last 256ths
         // and the suffix's first is rebuilt too: its children on the prefix
         // side are cb2's (every aligned block inside the prefix lies inside
         // one of cb2's greedy subtrees, each complete up to its root).
         let mut ls = 0usize;
         let mut ll = n_leaves;
-        for _ in 0..TAIL_UNIT_LEVELS {
+        for _ in 0..unit_levels {
             ls += ll;
             ll /= 2;
         }
-        let mut lo = suffix_start >> TAIL_UNIT_LEVELS;
+        let mut lo = suffix_start >> unit_levels;
         while ll > 16 {
             let ws = ls + ll;
             let wlo = lo / 2;
-            // SAFETY: every GPU write of the tree is complete (cb2 and cb3
-            // joined above) and every CPU unit is done (the scope joined).
-            unsafe {
-                let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * wlo), ll - 2 * wlo);
-                let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + wlo), ll / 2 - wlo);
-                crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+            let mut o = wlo;
+            while o < ll / 2 {
+                let len = 1024.min(ll / 2 - o);
+                unsafe {
+                    let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * o), 2 * len);
+                    let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + o), len);
+                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                }
+                o += len;
             }
             ls = ws;
             ll /= 2;
@@ -26723,7 +26768,9 @@ kernel void zc_ab_finish(
     /// An in-flight round-one AB completion GPU prefix.
     pub(crate) struct ZcAbJob {
         /// Table build, then gather + finish (same queue, in order; the
-        /// second reads the tables the first wrote, hazard-tracked).
+        /// second reads the tables the first wrote, hazard-tracked). With the
+        /// one-buffer submission (`ENV_NO_ZC_AB_SCHED`) `cb_tables` is NIL and
+        /// `cb` holds all three kernels.
         cb_tables: Id,
         cb: Id,
         /// `cb`'s completion signal (`super::ENV_NO_JOIN_SIGNAL`).
@@ -26874,9 +26921,12 @@ kernel void zc_ab_finish(
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let pool = gpu.pool_push();
+            // One command buffer for the whole arm (`ENV_NO_ZC_AB_SCHED`):
+            // the table build's encoder, then the gather and finish encoder.
+            let one_cb = super::gpu_zc_ab_one_cb_enabled();
             let submitted = (|| -> Result<(Id, Id, Option<DoneSig>), String> {
                 // Command buffer 1: the table build (own GPU wall in the
-                // diagnostics).
+                // diagnostics), or the arm's only command buffer.
                 let cb_tables = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb_tables)?;
                 gpu.set_pipeline(enc, state.tables_pso);
@@ -26885,9 +26935,11 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.tables_buf, 0, 2);
                 gpu.dispatch(enc, ZC_AB_TOPS as u64, 256);
                 gpu.end_encoding(enc);
-                // Command buffer 2: gather, then finish (serial dispatches of
-                // one encoder: the finish reads the banks the gather wrote).
-                let cb = gpu.command_buffer()?;
+                // Command buffer 2 (or the same one): gather, then finish
+                // (serial dispatches of one encoder: the finish reads the banks
+                // the gather wrote; the encoder after the table build's reads
+                // the tables it wrote).
+                let cb = if one_cb { cb_tables } else { gpu.command_buffer()? };
                 let enc = gpu.compute_encoder(cb)?;
                 gpu.set_pipeline(enc, state.gather_pso);
                 gpu.set_buffer(enc, ab_buf, 0, 0);
@@ -26906,6 +26958,11 @@ kernel void zc_ab_finish(
                 // Armed in the warm-up's oracle launch too, so the timed
                 // launch finds its event in the pool.
                 let sig = if super::join_signal_enabled() { gpu.arm_done(cb) } else { None };
+                if one_cb {
+                    let cb = gpu.retain(cb);
+                    gpu.commit_async(cb);
+                    return Ok((NIL, cb, sig));
+                }
                 let cb_tables = gpu.retain(cb_tables);
                 let cb = gpu.retain(cb);
                 gpu.commit_async(cb_tables);
@@ -26951,7 +27008,8 @@ kernel void zc_ab_finish(
         unsafe {
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
-            // the table build; the table build's status is checked too.
+            // the table build; the table build's status is checked too (a
+            // one-buffer job has no separate table buffer).
             // A timed join returns on the buffer's signal; the oracle launch
             // waits for the status (it reads the GPU's timestamps).
             let ok = if job.calibration || !super::join_signal_enabled() {
@@ -26959,18 +27017,25 @@ kernel void zc_ab_finish(
             } else {
                 gpu.join_cb_sig(job.cb, job.sig.as_ref(), 2.0)
             }
-            .and_then(|()| gpu.wait_cb(job.cb_tables));
+            .and_then(|()| if job.cb_tables.is_null() { Ok(()) } else { gpu.wait_cb(job.cb_tables) });
             if ok.is_ok() {
                 Gpu::recycle_done(job.sig);
             }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
+            // With one buffer its wall covers the table build as well and is
+            // reported as gather+finish (tables 0).
             let (tables_ms, gather_ms) = if ok.is_ok() {
-                (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
+                (
+                    if job.cb_tables.is_null() { 0.0 } else { zc_fold_gpu_wall_ms(gpu, job.cb_tables) },
+                    zc_fold_gpu_wall_ms(gpu, job.cb),
+                )
             } else {
                 (0.0, 0.0)
             };
             let gpu_ms = tables_ms + gather_ms;
-            gpu.release(job.cb_tables);
+            if !job.cb_tables.is_null() {
+                gpu.release(job.cb_tables);
+            }
             gpu.release(job.cb);
             if let Err(e) = ok {
                 ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
