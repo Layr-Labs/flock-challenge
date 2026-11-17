@@ -417,6 +417,24 @@ impl DeferredAb<'_> {
         unreachable!("deferred A/B handles are minted by the aarch64 SIMD driver only");
     }
 
+    /// The inputs of compressions `first..first + count`, 25 words each
+    /// (cv[8], m[16], counter_lo), as this handle rebuilds their rows (the
+    /// GPU AB arm, `flock_core::gpu_commit::ENV_NO_GPU_AB_ARM`).
+    pub(crate) fn fill_inputs(&self, first: usize, count: usize, dst: &mut [u32]) {
+        use rayon::prelude::*;
+        assert!(first + count <= 4 * self.n_quads && dst.len() >= 25 * count);
+        dst[..25 * count].par_chunks_mut(25).with_min_len(256).enumerate().for_each(|(j, w)| {
+            let i = first + j;
+            let c = match self.spec_init {
+                Some(init) => crate::seed_pipe::gen_block_with(init, i, self.gen_ilp),
+                None => self.blocks[i],
+            };
+            w[..8].copy_from_slice(&c.0);
+            w[8..24].copy_from_slice(&c.1);
+            w[24] = c.2 as u32;
+        });
+    }
+
     /// Produce every quad now, without scratch copies (any route that does
     /// not hand the producer to the AB precompute).
     pub(crate) fn fill_all(&self) {
@@ -5647,6 +5665,34 @@ impl Blake3Setup {
                     }
                     _ => None,
                 };
+                // GPU AB arm (`flock_core::gpu_commit::ENV_NO_GPU_AB_ARM`): the
+                // round-one AB precompute may hand units past the round-two
+                // published prefix to the GPU, which rebuilds their rows from
+                // the same compression inputs (unit `q` is compressions
+                // `4q..4q + 4`). With complete rows (the rebuild-only handle:
+                // every row is in the buffers already) no unit is reserved
+                // for publishing.
+                let gpu_ab_inputs = |first: usize, count: usize, dst: &mut [u32]| {
+                    if let Some(handle) = z_handle {
+                        handle.fill_inputs(first, count, dst);
+                    }
+                };
+                let _gpu_ab_seed = z_handle.map(|_| {
+                    let min_unit = if deferred_ab.is_some() { r2_published_quads } else { 0 };
+                    // SAFETY: both handles reproduce the driver's rows for
+                    // every quad from these inputs (`DeferredAb::fill_quad_to`),
+                    // and the buffers and the writer live until the prove
+                    // below returns, before this scope drops.
+                    unsafe {
+                        flock_core::zerocheck::univariate_skip_optimized::gpu_ab_seed_scope(
+                            a_packed_f128.as_ptr().cast::<u8>(),
+                            b_packed_f128.as_ptr().cast::<u8>(),
+                            ab_bytes,
+                            &gpu_ab_inputs,
+                            min_unit,
+                        )
+                    }
+                });
                 if phase_timing {
                     eprintln!(
                         "[phase-timing] deferred a/b: handle={} producer={} r2_published_quads={}/{} r2_rebuild_only={} r2_registered={}",

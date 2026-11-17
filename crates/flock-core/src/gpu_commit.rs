@@ -3231,6 +3231,135 @@ pub(crate) fn help_pool_until(done: impl Fn() -> bool) -> usize {
     )
 }
 
+/// Kill switch of the round-one AB transform's GPU arm:
+/// `FLOCK_NO_GPU_AB_ARM=1` (exact `1`) keeps every AB unit on the CPU.
+///
+/// The commit window runs the GPU commit graph beside the CPU's round-one AB
+/// precompute, and the split tuner balances the two by moving NTT positions.
+/// The GPU is about three times slower than the P-cores per NTT position but
+/// close to them on the AB transform, so with the arm on the GPU takes a
+/// suffix of the AB units (quads of four compressions) and the tuner hands
+/// the CPU the NTT positions that frees. The GPU regenerates its units' a/b
+/// rows itself from the seed's counter-based generator (no row reaches the
+/// GPU over the bus), transforms them, and writes the same 64-byte blocks
+/// the CPU would into the same output. Units past the round-two published
+/// prefix only, so no reader needs their rows in the a/b buffers. The first
+/// prove of a process (the untimed warm-up) is an oracle: the CPU computes
+/// every unit and the GPU's sample is compared byte for byte; the arm runs
+/// in later proves only after a match. Any Metal failure computes the units
+/// on the CPU. Same bytes, same proof. Read once per process.
+pub const ENV_NO_GPU_AB_ARM: &str = "FLOCK_NO_GPU_AB_ARM";
+
+/// Diagnostic override of the GPU arm's share in 64ths of the AB units:
+/// `FLOCK_GPU_AB_SHARE=<n>`, clamped to `0..=32` (0 = arm off). Unset =
+/// [`GPU_AB_SHARE_64THS`]. Read once per process.
+pub const ENV_GPU_AB_SHARE: &str = "FLOCK_GPU_AB_SHARE";
+
+/// Default share of the AB units the GPU arm takes, in 64ths.
+pub(crate) const GPU_AB_SHARE_64THS: usize = 16;
+
+/// The GPU arm's share in 64ths (0 = off; see [`ENV_NO_GPU_AB_ARM`]).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_share64() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if env_is_one(ENV_NO_GPU_AB_ARM) || !gpu_commit_enabled() {
+            return 0;
+        }
+        std::env::var(ENV_GPU_AB_SHARE)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(GPU_AB_SHARE_64THS, |n| n.min(32))
+    })
+}
+
+/// Diagnostic trace of the GPU AB arm (`FLOCK_GPU_AB_DEBUG`, any value).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_GPU_AB_DEBUG").is_some())
+}
+
+/// GPU AB arm verdict for this process: 0 = no oracle yet, 1 = the warm-up
+/// sample matched the CPU (arm admitted), 2 = off (mismatch or failure).
+static GPU_AB_VERDICT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_verdict() -> u8 {
+    GPU_AB_VERDICT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Turn a missing verdict into "off" (never overrides a recorded one).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_verdict_off_if_unset() {
+    let _ = GPU_AB_VERDICT.compare_exchange(
+        0,
+        2,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_set_verdict(pass: bool) {
+    // A failure is final; a pass never overrides it.
+    let v = if pass { 1 } else { 2 };
+    let _ = GPU_AB_VERDICT.fetch_max(v, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// A deferred GPU AB oracle is running on its own thread (the warm-up's
+/// drain found the arm's pipelines still building): set before the thread
+/// starts, cleared after it recorded the verdict.
+static GPU_AB_ORACLE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_oracle_pending(pending: Option<bool>) -> bool {
+    if let Some(p) = pending {
+        GPU_AB_ORACLE_PENDING.store(p, std::sync::atomic::Ordering::Release);
+    }
+    GPU_AB_ORACLE_PENDING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Wait (untimed callers only: the split tuner) for a deferred oracle's
+/// verdict, at most two seconds; a verdict still missing then keeps the arm
+/// off for the process.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_await_verdict() {
+    let t = std::time::Instant::now();
+    while gpu_ab_oracle_pending(None) {
+        if t.elapsed() > std::time::Duration::from_secs(2) {
+            gpu_ab_set_verdict(false);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+}
+
+/// GPU end time (seconds, the command buffers' clock; `f64` bits, 0 = none)
+/// of the last split-sweep replay's GPU AB launch: set by the arm when the
+/// replay joins it, taken by the sweep's pricing of that sample (see
+/// `imp::price_ab_end_into_arms`).
+static GPU_AB_REPLAY_GPU_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_note_replay_gpu_end(end_s: f64) {
+    GPU_AB_REPLAY_GPU_END.store(end_s.to_bits(), std::sync::atomic::Ordering::Release);
+}
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_take_replay_gpu_end() -> f64 {
+    let s = f64::from_bits(GPU_AB_REPLAY_GPU_END.swap(0, std::sync::atomic::Ordering::AcqRel));
+    if s.is_finite() && s > 0.0 { s } else { 0.0 }
+}
+
+/// Whether the split tuner should price candidates with the GPU AB arm in
+/// the window (admitted arm, non-zero share): its candidates then sit
+/// further CPU-ward.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_ab_arm_admitted() -> bool {
+    gpu_ab_share64() > 0 && gpu_ab_verdict() == 1
+}
+
 #[cfg(test)]
 mod hybrid_cb2_spin_gate_tests {
     use std::ffi::OsStr;
@@ -10450,8 +10579,31 @@ kernel void blake3_pow_seg_tail(
         if let Ok(g) = gpu {
             zc_ab_prewarm_once();
             parent_top_prewarm_once(g);
+            bigab_prewarm_once();
         }
         gpu
+    }
+
+    /// Build the GPU AB arm's library, pipelines and buffers
+    /// (`super::ENV_NO_GPU_AB_ARM`) on a helper thread the moment the GPU
+    /// exists, so the warm-up prove's oracle finds them built. Once per
+    /// process; nothing when the arm is off.
+    fn bigab_prewarm_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if super::gpu_ab_share64() == 0 {
+                return;
+            }
+            let _ = std::thread::Builder::new().name("gpu-ab-prewarm".into()).spawn(|| {
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x11, 0);
+                }
+                bigab_prewarm();
+            });
+        });
     }
 
     /// Ranked worker: the moment the GPU exists (first use, in the warm-up
@@ -15122,6 +15274,13 @@ kernel void blake3_pow_seg_tail(
     /// GPU-only graph (`k = 0`) is the answer, and `k = 0` is sampled too.
     const ARM_SPLIT_MAX_K: usize = 8;
 
+    /// [`ARM_SPLIT_MAX_K`] moved CPU-ward with the sweep's candidates
+    /// ([`ranked_exact_tune_shift`]; the GPU AB arm), at most 15 (coarse rows
+    /// only: a fine split `k + 16 m` with `m > 0` stays above it).
+    fn arm_split_max_k() -> usize {
+        (ARM_SPLIT_MAX_K + ranked_exact_tune_shift()).min(15)
+    }
+
     /// How much the arms' winner must beat the sweep's own split's arm window
     /// before it replaces it: 3% of the commit window. Comfortably above the
     /// ±1 ms repeat the GPU timestamps showed and well below the 8-26%
@@ -15175,7 +15334,7 @@ kernel void blake3_pow_seg_tail(
     /// `k = 0` runs the whole graph on the GPU, so its single arm is the
     /// command buffer's GPU span and its CPU arm is empty (recorded as 0).
     fn record_hybrid_arms(k: usize, gpu_ms: f64, cpu_ms: f64) {
-        if !hybrid_arm_recording() || k > ARM_SPLIT_MAX_K {
+        if !hybrid_arm_recording() || k > arm_split_max_k() {
             return;
         }
         if !(gpu_ms.is_finite() && gpu_ms > 0.0) || !(cpu_ms.is_finite() && cpu_ms >= 0.0) {
@@ -15353,6 +15512,13 @@ kernel void blake3_pow_seg_tail(
     /// row's `max(gpu, cpu)` then covers it, and the fine row's CPU arm
     /// becomes at least `ab - cb3`, so `max(cb2, cpu) + cb3` covers it too.
     fn price_ab_end_into_arms(lens: (usize, usize), ab_end_s: f64) {
+        // The GPU AB arm's replay launch (`super::ENV_NO_GPU_AB_ARM`) is
+        // committed on the commit queue ahead of cb3, and the GPU may run it
+        // beside the first pass and cb2: the GPU is busy until the later of
+        // cb2's end and the launch's end, so the fine row's cb2 column becomes
+        // `max(cb2 end, arm end) - cb2 start` (the hybrid row's `cb3 end - cb2
+        // start` already spans it).
+        let ab_gpu_end = super::gpu_ab_take_replay_gpu_end();
         let cb2_s = f64::from_bits(ARM_CB2_START_BITS.swap(0, std::sync::atomic::Ordering::Relaxed));
         let ab_ms = (ab_end_s - cb2_s) * 1e3;
         if !(cb2_s > 0.0 && ab_ms.is_finite()) {
@@ -15368,6 +15534,9 @@ kernel void blake3_pow_seg_tail(
         if let Ok(mut v) = fine_arm_samples().lock() {
             if v.len() == lens.1.wrapping_add(1) {
                 if let Some(s) = v.last_mut() {
+                    if ab_gpu_end > 0.0 {
+                        s.1 = s.1.max((ab_gpu_end - cb2_s) * 1e3);
+                    }
                     if super::tune_ab_min_enabled() {
                         if let Ok(mut r) = ab_arm_samples().lock() {
                             r.push((s.0, s.1, s.2, s.3, ab_ms));
@@ -15411,7 +15580,7 @@ kernel void blake3_pow_seg_tail(
                 .iter()
                 .filter(|s| {
                     let (k, m) = decode_hybrid_split(s.0);
-                    m == 0 && (1..=ARM_SPLIT_MAX_K).contains(&k)
+                    m == 0 && (1..=arm_split_max_k()).contains(&k)
                 })
                 .collect();
             let mut ks: Vec<usize> = rows.iter().map(|s| s.0).collect();
@@ -15494,7 +15663,7 @@ kernel void blake3_pow_seg_tail(
     }
 
     fn record_fine_arms(k_split: usize, cb2_ms: f64, cpu_ms: f64, cb3_ms: f64) {
-        if !hybrid_arm_recording() || k_split > ARM_SPLIT_MAX_K {
+        if !hybrid_arm_recording() || k_split > arm_split_max_k() {
             return;
         }
         if !(cb2_ms.is_finite() && cb2_ms > 0.0 && cpu_ms.is_finite() && cpu_ms > 0.0 && cb3_ms.is_finite()) {
@@ -15662,7 +15831,7 @@ kernel void blake3_pow_seg_tail(
             .iter()
             .filter(|s| {
                 let (k, m) = decode_hybrid_split(s.0);
-                m == 0 && (1..=ARM_SPLIT_MAX_K).contains(&k)
+                m == 0 && (1..=arm_split_max_k()).contains(&k)
             })
             .collect();
         let mut ks: Vec<usize> = rows.iter().map(|s| s.0).collect();
@@ -15901,35 +16070,69 @@ kernel void blake3_pow_seg_tail(
         extend: bool,
         sample: impl FnMut(usize) -> Result<f64, E>,
     ) -> Result<Vec<[f64; 2]>, E> {
-        collect_ranked_exact_samples_with(extend, sample, |_| false)
+        collect_ranked_exact_samples_with(&RANKED_EXACT_TUNE_CANDIDATES, extend, sample, |_| false)
     }
 
-    /// [`collect_ranked_exact_samples`] that also extends while
+    /// [`collect_ranked_exact_samples`] over `candidates` (the record's
+    /// list, or the GPU AB arm's shifted one, see
+    /// [`ranked_exact_tune_candidates`]) that also extends while
     /// `also_extend(k)` holds for the largest candidate `k` sampled so far.
     fn collect_ranked_exact_samples_with<E>(
+        candidates: &[usize],
         extend: bool,
         mut sample: impl FnMut(usize) -> Result<f64, E>,
         also_extend: impl Fn(usize) -> bool,
     ) -> Result<Vec<[f64; 2]>, E> {
         let mut walls = vec![[0.0; 2]; RANKED_EXACT_INITIAL_CANDIDATES];
-        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate() {
+        for (i, &k) in candidates[..walls.len()].iter().enumerate() {
             walls[i][0] = sample(k)?;
         }
-        for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate().rev() {
+        for (i, &k) in candidates[..walls.len()].iter().enumerate().rev() {
             walls[i][1] = sample(k)?;
         }
-        while extend && walls.len() < RANKED_EXACT_TUNE_CANDIDATES.len() {
+        while extend && walls.len() < candidates.len() {
             let Some(means) = mean_ranked_exact_samples(&walls) else { break };
             let boundary = means[means.len() - 1];
             if !means[..means.len() - 1].iter().all(|&m| boundary < m)
-                && !also_extend(RANKED_EXACT_TUNE_CANDIDATES[walls.len() - 1])
+                && !also_extend(candidates[walls.len() - 1])
             {
                 break;
             }
-            let k = RANKED_EXACT_TUNE_CANDIDATES[walls.len()];
+            let k = candidates[walls.len()];
             walls.push([sample(k)?, sample(k)?]);
         }
         Ok(walls)
+    }
+
+    /// CPU-ward shift of the broad sweep's candidates while the GPU AB arm
+    /// is admitted (`super::ENV_NO_GPU_AB_ARM`), in sixteenths: the GPU time
+    /// the arm takes is paid back with NTT positions, so the balanced split
+    /// sits further CPU-ward (about 14/16 of the arm's share by the window
+    /// model: a quarter of the AB units moves it by about 3.5 sixteenths).
+    /// The sweep keeps the record's size (every worker pays it at start-up).
+    fn ranked_exact_tune_shift() -> usize {
+        match TUNE_SHIFT.load(std::sync::atomic::Ordering::Acquire) {
+            usize::MAX => ranked_exact_tune_shift_now(),
+            shift => shift,
+        }
+    }
+
+    /// The shift fixed for the process when its sweep starts (`usize::MAX`:
+    /// not yet), so a verdict change during the sweep cannot relabel its
+    /// samples or move its default.
+    static TUNE_SHIFT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    fn ranked_exact_tune_shift_now() -> usize {
+        if super::gpu_ab_arm_admitted() { (super::gpu_ab_share64() * 14 / 64).min(7) } else { 0 }
+    }
+
+    /// The broad sweep's candidates: the record's `[2..=7]`, shifted by
+    /// [`ranked_exact_tune_shift`] (same length, same initial four, same
+    /// extension rule).
+    fn ranked_exact_tune_candidates() -> &'static [usize] {
+        const ALL: [usize; 14] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let shift = ranked_exact_tune_shift();
+        &ALL[shift..shift + RANKED_EXACT_TUNE_CANDIDATES.len()]
     }
 
     fn mean_ranked_exact_samples(samples: &[[f64; 2]]) -> Option<Vec<f64>> {
@@ -16278,6 +16481,10 @@ kernel void blake3_pow_seg_tail(
         if !ranked_exact_tune_applicable(params) || !super::claim_ranked_exact_contention_tune() {
             return;
         }
+        // The sweep prices the window with the GPU AB arm when it is admitted:
+        // a warm-up oracle still running on its own thread decides that first.
+        super::gpu_ab_await_verdict();
+        TUNE_SHIFT.store(ranked_exact_tune_shift_now(), std::sync::atomic::Ordering::Release);
 
         let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         let latch = latch_lock();
@@ -16449,7 +16656,7 @@ kernel void blake3_pow_seg_tail(
             // later prove pays; with the NTT ahead of the AB arm that cost
             // lands on the AB replay's end the samples are priced by.
             use rayon::prelude::*;
-            let max_k = RANKED_EXACT_TUNE_CANDIDATES[RANKED_EXACT_TUNE_CANDIDATES.len() - 1];
+            let max_k = *ranked_exact_tune_candidates().last().expect("candidates");
             let bytes = params.codeword_len_f128() * core::mem::size_of::<F128>();
             let from = bytes / 16 * (16 - max_k - 1);
             let base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(ctx.staging) }.cast::<u8>());
@@ -16482,7 +16689,7 @@ kernel void blake3_pow_seg_tail(
             // See `super::ENV_NO_TUNE_AB_MIN`: also sample the next split
             // while the largest one sampled is still GPU-bound.
             let ab_min = super::tune_ab_min_enabled();
-            match collect_ranked_exact_samples_with(extend, sample, |k| {
+            match collect_ranked_exact_samples_with(ranked_exact_tune_candidates(), extend, sample, |k| {
                 ab_min && ab_min_gpu_bound_at(k, tune_cb3_launch_latency_ms())
             }) {
                 Ok(samples) => samples,
@@ -16497,12 +16704,12 @@ kernel void blake3_pow_seg_tail(
                 }
             }
         };
-        let candidates = &RANKED_EXACT_TUNE_CANDIDATES[..samples.len()];
+        let candidates = &ranked_exact_tune_candidates()[..samples.len()];
         let Some(means) = mean_ranked_exact_samples(&samples) else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
         };
-        let Some(swept) = choose_hybrid_k(candidates, &means, DEFAULT_HYBRID_K)
+        let Some(swept) = choose_hybrid_k(candidates, &means, DEFAULT_HYBRID_K + ranked_exact_tune_shift())
         else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
             return;
@@ -16964,8 +17171,16 @@ kernel void blake3_pow_seg_tail(
         };
         // The hybrid prefix's fused final leaf changes the GPU arm's cost, so
         // its tuned split must not be shared with the incumbent prefix.
-        if super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled() {
+        let key = if super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled() {
             key ^ 0x4859_4246_4C45_4146 // "HYBFLEAF"
+        } else {
+            key
+        };
+        // The GPU AB arm moves AB work onto the GPU (`super::ENV_NO_GPU_AB_ARM`):
+        // a split tuned with it never serves a process without it, nor the
+        // reverse, nor another share.
+        if super::gpu_ab_arm_admitted() {
+            key ^ 0x4249_4741_425F_4131 ^ (super::gpu_ab_share64() as u64).rotate_left(40) // "BIGAB_A1"
         } else {
             key
         }
@@ -28093,6 +28308,12 @@ kernel void zc_ab_finish(
     // the K arm's output buffers above.
     // Tri pass 0 GPU arm (see `ENV_NO_ZC_T0_GPU`): chained on the 5+6
     // arm's output buffers.
+    // Round-one AB transform GPU arm (see `ENV_NO_GPU_AB_ARM`).
+    mod bigab_metal;
+    pub(crate) use bigab_metal::{
+        BIGAB_BATCH, BIGAB_RING, BigAbBatch, BigAbJob, BigAbOut, bigab_launch, bigab_prewarm, bigab_ready,
+        bigab_storage_view,
+    };
     mod t0_metal;
     pub(crate) use t0_metal::{T0_HI, T0_IN, T0_OUT, ZcT0Job, zc_t0_fire, zc_t0_park, zc_t0_prewarm, zc_t0_verdict};
     mod t56_metal;
@@ -30227,6 +30448,12 @@ pub(crate) use imp::{
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm, zc_ab_wait};
+
+/// Round-one AB transform GPU arm (see `ENV_NO_GPU_AB_ARM`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::{
+    BIGAB_BATCH, BIGAB_RING, BigAbBatch, BigAbJob, BigAbOut, bigab_launch, bigab_ready, bigab_storage_view,
+};
 
 /// Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -53,6 +53,8 @@ use super::univariate_skip::{
 };
 
 mod kernels;
+mod gpu_arm;
+pub use gpu_arm::{GpuAbInputs, GpuAbSeedScope, gpu_ab_first_unit, gpu_ab_seed_scope};
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
@@ -1590,63 +1592,89 @@ fn precompute_round1_ab_inner_packed_padded_body(
             kernels::static_b_context_is_prepared(static_b_context),
             zc_ab_pre_fast_policy_hoist_enabled(),
         ) && kernels::fast_shift_reduce_enabled();
-        if ranked_fast_policy {
-            // Resolve the process-wide direct-store switch once before the
-            // queue starts. The ranked/default arm is compiled without the
-            // per-chunk OnceLock probe, temporary buffer, or per-row bounce
-            // branches; the kill-switch arm retains the exact old behavior.
-            if nt && ab_pre_nt_direct_enabled() {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, true>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    within_outer_mask,
-                    &b_med_counts,
-                    blake3_static_layout,
-                    static_b_context,
-                    nt,
-                    compact,
-                    representation,
-                    n_chunks,
-                    out_bytes,
-                    tail,
-                    producer,
-                );
-            } else {
-                precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
-                    a_packed,
-                    b_packed,
-                    inv_table,
-                    within_outer_mask,
-                    &b_med_counts,
-                    blake3_static_layout,
-                    static_b_context,
-                    nt,
-                    compact,
-                    representation,
-                    n_chunks,
-                    out_bytes,
-                    tail,
-                    producer,
-                );
+        let out_ptr = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+        // Units `[unit_lo, unit_hi)` of the drain (all of them for
+        // `(0, usize::MAX)`); every unit writes only its own output bytes.
+        let run = |unit_lo: usize, unit_hi: usize| {
+            // SAFETY: the storage is exclusively owned by this call; the
+            // GPU arm writes only units the CPU leaves to it.
+            let out_bytes = unsafe { core::slice::from_raw_parts_mut(out_ptr.ptr(), total_bytes) };
+            // The record's drain for the whole range; the unit-range drain
+            // when the GPU AB arm holds units.
+            macro_rules! drain {
+                ($policy:expr, $direct:literal) => {
+                    if (unit_lo, unit_hi) == (0, usize::MAX) {
+                        precompute_ab_hetero::<{ $policy }, $direct>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            within_outer_mask,
+                            &b_med_counts,
+                            blake3_static_layout,
+                            static_b_context,
+                            nt,
+                            compact,
+                            representation,
+                            n_chunks,
+                            out_bytes,
+                            tail,
+                            producer,
+                        )
+                    } else {
+                        precompute_ab_hetero_range::<{ $policy }, $direct>(
+                            a_packed,
+                            b_packed,
+                            inv_table,
+                            within_outer_mask,
+                            &b_med_counts,
+                            blake3_static_layout,
+                            static_b_context,
+                            nt,
+                            compact,
+                            representation,
+                            n_chunks,
+                            out_bytes,
+                            tail,
+                            producer,
+                            unit_lo,
+                            unit_hi,
+                        )
+                    }
+                };
             }
-        } else {
-            precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_PROCESS }, false>(
-                a_packed,
-                b_packed,
-                inv_table,
-                within_outer_mask,
-                &b_med_counts,
-                blake3_static_layout,
-                static_b_context,
-                nt,
-                compact,
-                representation,
-                n_chunks,
-                out_bytes,
-                tail,
-                producer,
-            );
+            if ranked_fast_policy {
+                // Resolve the process-wide direct-store switch once before the
+                // queue starts. The ranked/default arm is compiled without the
+                // per-chunk OnceLock probe, temporary buffer, or per-row bounce
+                // branches; the kill-switch arm retains the exact old behavior.
+                if nt && ab_pre_nt_direct_enabled() {
+                    drain!(kernels::AB_FAST_POLICY_FORCE_FAST, true);
+                } else {
+                    drain!(kernels::AB_FAST_POLICY_FORCE_FAST, false);
+                }
+            } else {
+                drain!(kernels::AB_FAST_POLICY_PROCESS, false);
+            }
+        };
+        // GPU AB arm (`gpu_commit::ENV_NO_GPU_AB_ARM`): a suffix of the units
+        // on the GPU (or, in a process's first prove, an oracle sample of it
+        // beside the CPU's complete drain).
+        let gpu_arm = gpu_arm::GpuArm::start(gpu_arm::GpuArmCtx {
+            a_packed: a_packed.as_ptr(),
+            b_packed: b_packed.as_ptr(),
+            total_bytes,
+            out: out_ptr.ptr(),
+            producer_unit_bytes: producer.map(|p| p.unit_bytes),
+            provenance_hit,
+            replay: from_backing,
+            shape_ok: m == 32
+                && blake3_static_layout
+                && representation == Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true }
+                && (compact || !token_hit),
+        });
+        run(0, gpu_arm.as_ref().map_or(usize::MAX, gpu_arm::GpuArm::cpu_units));
+        if let Some(gpu_arm) = gpu_arm {
+            gpu_arm.finish(&run);
         }
         return Round1AbInner {
             storage,
@@ -1751,14 +1779,14 @@ fn zc_ab_pre_hetero_enabled() -> bool {
     })
 }
 
-/// Drain the ranked AB precompute through both core clusters. The const policy
-/// lets the ranked arm fold away the process-wide Horner flag inside the hot
-/// row dispatcher. `FORCE_DIRECT` additionally folds away the direct-store
-/// OnceLock lookup and stack-bounce alternative after the caller has checked
-/// both `nt` and the process-wide direct-store kill switch.
+/// [`precompute_ab_hetero`] over the units `[unit_lo, unit_hi)` only (a
+/// unit is 8 KiB of A = eight chunks; the producer's unit on the producer
+/// route), clamped to the transform. The GPU AB arm
+/// (`gpu_commit::ENV_NO_GPU_AB_ARM`) runs the CPU over a prefix and, on a
+/// GPU failure, over the rest. Every chunk writes only its own output.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+fn precompute_ab_hetero_range<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -1773,6 +1801,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     out_bytes: &mut [u8],
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Option<Round1AbProducer<'_>>,
+    unit_lo: usize,
+    unit_hi: usize,
 ) {
     // This is a private specialization contract, but keep it checked in
     // release builds so a future caller cannot accidentally select
@@ -1805,6 +1835,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         assert!(unit_chunks > 0 && unit_bytes.is_multiple_of(OUTER_BYTES));
         assert!(n_chunks.is_multiple_of(unit_chunks));
         let n_units = n_chunks / unit_chunks;
+        let (unit_lo, unit_hi) = (unit_lo.min(n_units), unit_hi.min(n_units));
         // Even, so unit pairs (2u, 2u + 1) always share a job and a thread
         // (the producer may pair them; see `zc_ab_producer_fused_active`).
         // 42 at the ranked shape, unchanged.
@@ -1812,7 +1843,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             0 | 1 => 1,
             u => u & !1,
         };
-        let n_jobs = n_units.div_ceil(units_per_job);
+        let n_jobs = unit_hi.saturating_sub(unit_lo).div_ceil(units_per_job);
         // Every chunk's static-B window run, when each has one: a worker
         // with a unit form then writes those rows with one call per unit.
         let window_runs = ab_window_unit_runs::<FAST_POLICY, FORCE_DIRECT>(
@@ -1841,8 +1872,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             |(a_col, b_col, scratch, window_plan, window_unit), job| {
                 let window_plan = *window_plan;
                 let window_unit = *window_unit;
-                let unit_start = job * units_per_job;
-                let unit_end = (unit_start + units_per_job).min(n_units);
+                let unit_start = unit_lo + job * units_per_job;
+                let unit_end = (unit_start + units_per_job).min(unit_hi);
                 for unit in unit_start..unit_end {
                     let (a_unit, b_unit) =
                         scratch.fill(unit, |a, b, primed| (producer.produce)(unit, a, b, primed));
@@ -1875,7 +1906,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         );
         return;
     }
-    let n_jobs = n_chunks.div_ceil(chunks_per_job);
+    let (chunk_lo, chunk_hi) = (unit_lo.saturating_mul(8).min(n_chunks), unit_hi.saturating_mul(8).min(n_chunks));
+    let n_jobs = (chunk_hi - chunk_lo).div_ceil(chunks_per_job);
     crate::epool::run_hetero_chunks_stateful_with_tail(
         n_jobs,
         || {
@@ -1885,8 +1917,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         },
         |(a_col, b_col, window_plan), job| {
             let window_plan = *window_plan;
-            let chunk_start = job * chunks_per_job;
-            let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
+            let chunk_start = chunk_lo + job * chunks_per_job;
+            let chunk_end = (chunk_start + chunks_per_job).min(chunk_hi);
             let slab_len = chunk_end - chunk_start;
             for offset in 0..slab_len {
                 let x_outer = chunk_start + offset;
@@ -1941,6 +1973,49 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             }
         },
         tail,
+    );
+}
+
+/// Drain the ranked AB precompute through both core clusters. The const policy
+/// lets the ranked arm fold away the process-wide Horner flag inside the hot
+/// row dispatcher. `FORCE_DIRECT` additionally folds away the direct-store
+/// OnceLock lookup and stack-bounce alternative after the caller has checked
+/// both `nt` and the process-wide direct-store kill switch.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+    nt: bool,
+    compact: bool,
+    representation: Round1AbRepresentation,
+    n_chunks: usize,
+    out_bytes: &mut [u8],
+    tail: Option<&(dyn Fn() + Sync)>,
+    producer: Option<Round1AbProducer<'_>>,
+) {
+    precompute_ab_hetero_range::<FAST_POLICY, FORCE_DIRECT>(
+        a_packed,
+        b_packed,
+        inv_table,
+        within_outer_mask,
+        b_med_counts,
+        blake3_static_layout,
+        static_b_context,
+        nt,
+        compact,
+        representation,
+        n_chunks,
+        out_bytes,
+        tail,
+        producer,
+        0,
+        usize::MAX,
     );
 }
 

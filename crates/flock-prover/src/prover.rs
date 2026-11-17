@@ -1272,6 +1272,31 @@ impl<'a> AbStripeEmitter<'a> {
         self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Fill groups `from..` (claimed one at a time through `cursor`) from z
+    /// exactly as [`Self::finish`] does, marking each emitted: the stripe of
+    /// the units the GPU AB arm owns (`flock_core::gpu_commit::ENV_NO_GPU_AB_ARM`),
+    /// whose rows never reach the CPU, filled by the drain's workers while
+    /// the GPU runs instead of after the join.
+    fn help_fill_from(&self, z_packed: &[F128], from: usize, cursor: &std::sync::atomic::AtomicUsize) {
+        let group_f128 = 8 * AB_STRIPE_WORDS / 2;
+        loop {
+            let group = from + cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if group >= self.n_groups {
+                break;
+            }
+            // SAFETY: the cursor hands out each group once, and no producer
+            // emits a group of the GPU's units.
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(self.stripe.ptr().add(group * self.group_bytes), self.group_bytes)
+            };
+            fill_root_lincheck_stripe_group(z_packed, dst, group, group_f128, AB_STRIPE_WORDS, self.rows);
+            if self.fixed_inputs && !fixed_inputs_hold(z_packed, group, group_f128, AB_STRIPE_WORDS) {
+                self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// After every unit was produced (the AB arm has joined its workers):
     /// fill the groups no thread emitted with the incumbent fill job (one
     /// job = `DEFERRED_STRIPE_GROUPS_PER_JOB` groups; jobs with no missing
@@ -3118,9 +3143,19 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                         );
                     }
                 };
+                // GPU AB arm: the drain's workers fill the stripe groups of
+                // the GPU's units from z once the CPU's units are done
+                // (`FLOCK_NO_GPU_AB_STRIPE_TAIL` leaves them to `finish`).
+                let gpu_stripe_cursor = std::sync::atomic::AtomicUsize::new(0);
+                let gpu_stripe_tail = || {
+                    if let Some(u0) = zerocheck::univariate_skip_optimized::gpu_ab_first_unit() {
+                        emitter.help_fill_from(&z_packed, u0.div_ceil(2), &gpu_stripe_cursor);
+                    }
+                };
+                let gpu_stripe_tail_on = std::env::var_os("FLOCK_NO_GPU_AB_STRIPE_TAIL").is_none();
                 run_commit(
                     tail_fill_hook,
-                    None,
+                    gpu_stripe_tail_on.then_some(&gpu_stripe_tail as &(dyn Fn() + Sync)),
                     Some(zerocheck::univariate_skip_optimized::Round1AbProducer {
                         unit_bytes: base.unit_bytes,
                         produce: &produce,
