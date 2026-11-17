@@ -96,9 +96,6 @@ pub fn pool_spin_release() {
 /// more: its workers stay in [`imp::pool_spin_body`] until the proof is done
 /// (the existing [`pool_spin_release`] calls after `prove_fast_inner`) and
 /// find the next region's jobs without having been parked. From here on an
-/// idle round ends in the kernel yield Rayon's own idle loop makes, instead of
-/// the scalar churn, so a runnable thread (Metal's submit thread, the proving
-/// thread) gets a core as quickly as it does from an idle Rayon worker today.
 /// Three workers (the one the spin never included and two more) leave the
 /// spin here and park as before, so the spinners never occupy the cores of
 /// Metal's two service threads and the proving thread. Scheduling
@@ -252,21 +249,30 @@ mod imp {
     /// those three never exceed the pool's width.
     const HOT_PROVE_RESERVED: usize = 3;
 
+    const HOT_PROVE_YIELD_EVERY: u32 = 16;
+
     fn pool_spin_body(deadline: Instant, leaves_at_witness: bool) {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut idle: u32 = 0;
         while POOL_SPIN.load(Ordering::Relaxed) {
             if let Some(rayon::Yield::Executed) = rayon::yield_now() {
+                idle = 0;
                 continue;
             }
             if HOT_PROVE.load(Ordering::Relaxed) {
                 if leaves_at_witness {
                     break;
                 }
-                // After the witness hand-off: yield like an idle Rayon
-                // worker, never park.
-                std::thread::yield_now();
-                if Instant::now() >= deadline {
-                    break;
+                idle = idle.wrapping_add(1);
+                if idle % HOT_PROVE_YIELD_EVERY == 0 {
+                    std::thread::yield_now();
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                } else {
+                    for _ in 0..16 {
+                        std::hint::spin_loop();
+                    }
                 }
                 continue;
             }

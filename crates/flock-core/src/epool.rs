@@ -441,14 +441,25 @@ pub(crate) fn hot_spin_start() {
     ep.spawn_broadcast(move |_| hot_spin_body(deadline));
 }
 
+const HOT_SPIN_YIELD_EVERY: u32 = 16;
+
 fn hot_spin_body(deadline: std::time::Instant) {
+    let mut idle: u32 = 0;
     while HOT_SPIN.load(Ordering::Relaxed) {
         if let Some(rayon::Yield::Executed) = rayon::yield_now() {
+            idle = 0;
             continue;
         }
-        std::thread::yield_now();
-        if std::time::Instant::now() >= deadline {
-            break;
+        idle = idle.wrapping_add(1);
+        if idle % HOT_SPIN_YIELD_EVERY == 0 {
+            std::thread::yield_now();
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        } else {
+            for _ in 0..16 {
+                std::hint::spin_loop();
+            }
         }
     }
 }
