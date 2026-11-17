@@ -14298,6 +14298,13 @@ kernel void blake3_pow_race_tail(
         use rayon::prelude::*;
         let (k_cpu16, fine_m) = decode_hybrid_split(k_split);
         debug_assert!((1..16).contains(&k_cpu16) && fine_m < 16);
+        // Diagnostic run: the CPU share of this proof's split, as a mark whose
+        // distance from "split base" is the value in ms.
+        if crate::tmark::on() {
+            let t = crate::tmark::now_ns();
+            crate::tmark::mark_ns("split base", t);
+            crate::tmark::mark_ns("split k_cpu16", t + k_cpu16 as u64 * 1_000_000);
+        }
         if fine_m > 0 && !hybrid_gpu_suffix_hash_enabled() {
             return Err("fine hybrid split requires the GPU suffix hash path".into());
         }
@@ -25271,6 +25278,11 @@ kernel void zc_r2_horner_oracle(
             let (out, out_w) = if timed_cs { merge(state.cs_part_buf, 8) } else { merge(state.part_buf, 4) };
             let head_bad = timed_cs && *gpu.buffer_contents(state.cs_flag_buf).cast::<u32>() != 0;
             if !job.calibration {
+                // Diagnostic run: the round-two GPU arm's execution interval.
+                if crate::tmark::on() {
+                    let (s, e) = cb_gpu_interval(gpu, job.cb);
+                    crate::tmark::mark_gpu("zc r2 gpu start", "zc r2 gpu end", s, e);
+                }
                 gpu.release(job.cb);
                 if let Some(submitted) = job.submitted {
                     eprintln!(
@@ -27186,6 +27198,11 @@ kernel void zc_ab_finish(
             }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let gpu_ms = if ok.is_ok() { zc_fold_gpu_wall_ms(gpu, job.cb) } else { 0.0 };
+            // Diagnostic run: the K pass GPU arm's execution interval.
+            if ok.is_ok() && !job.calibration && crate::tmark::on() {
+                let (s, e) = cb_gpu_interval(gpu, job.cb);
+                crate::tmark::mark_gpu("zc k gpu start", "zc k gpu end", s, e);
+            }
             gpu.release(job.cb);
             for v in job.views {
                 gpu.release(v);
