@@ -604,6 +604,37 @@ pub(crate) fn lc_gpu_wake_fire(point: u32) {
     }
 }
 
+/// Opening GPU ping (`FLOCK_NO_OPEN_GPU_PING=1`, exact `1`, kills; read
+/// once). Posts one more lincheck-wake leaf dispatch (one threadgroup on the
+/// wake's private scratch pair) from the poster thread at the opening wake
+/// point `FLOCK_OPEN_PING_AT` (default 100: right after lincheck returns,
+/// ahead of the opening's first Metal grind race; 0..5 = before that L0 fold
+/// round's grind). Same no-op guards as the wake (timed proves only). It
+/// touches no prove buffer and nothing waits on it: proof bytes are
+/// unchanged.
+pub const ENV_NO_OPEN_GPU_PING: &str = "FLOCK_NO_OPEN_GPU_PING";
+
+pub fn open_gpu_ping(point: u32) {
+    static AT: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        if env_is_one(ENV_NO_OPEN_GPU_PING) {
+            return u32::MAX;
+        }
+        std::env::var("FLOCK_OPEN_PING_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(100)
+    });
+    if point != *AT || !lc_gpu_wake_enabled() {
+        return;
+    }
+    crate::tmark::mark("open ping");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    match lc_wake_poster() {
+        Some(poster) => {
+            LC_WAKE_POSTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            poster.unpark();
+        }
+        None => imp::lc_gpu_wake(),
+    }
+}
+
 pub(crate) fn gpu_lincheck_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());
@@ -3751,42 +3782,6 @@ pub(crate) fn tailhash_coord_work_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAILHASH_COORD_WORK));
     *ON
-}
-
-/// Kill switch for the CPU tail-hash reserve (`FLOCK_NO_TAIL_HASH_RESERVE=1`,
-/// exact `1`: cb3's count follows the claims down to the lowest claim and the
-/// claims stop at cb2's end, as before). With it on (and the working
-/// coordinator on), cb3's indirect count is published `reserve` units below
-/// the unclaimed top, so the top `reserve` unclaimed units are never offered
-/// to cb3. At cb2's end the count stops moving (the last published count is
-/// the floor) and the claimers keep hashing down to that floor while cb3
-/// runs, instead of leaving the performance cores idle for cb3's whole run.
-/// No new wait: the claim loop, the claim lock and the cb2 check are the
-/// existing ones. Every unit is still hashed by at least one side (cb3 read a
-/// count no lower than the floor; the CPU hashes every unit from the top down
-/// to the floor), and a unit hashed by both is the same bytes into the same
-/// slots, so the root is unchanged. `FLOCK_TAIL_HASH_RESERVE_PCT=<n>` sets the
-/// reserve as a percentage of the suffix's units (default
-/// [`TAIL_HASH_RESERVE_PCT_DEFAULT`]). Read once per process.
-pub const ENV_NO_TAIL_HASH_RESERVE: &str = "FLOCK_NO_TAIL_HASH_RESERVE";
-pub const ENV_TAIL_HASH_RESERVE_PCT: &str = "FLOCK_TAIL_HASH_RESERVE_PCT";
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-const TAIL_HASH_RESERVE_PCT_DEFAULT: usize = 10;
-
-/// The reserve's percentage of the suffix's units: 0 with the kill switch set,
-/// else [`ENV_TAIL_HASH_RESERVE_PCT`] (clamped to 0..=50) or the default.
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn tail_hash_reserve_pct() -> usize {
-    static PCT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        if env_is_one(ENV_NO_TAIL_HASH_RESERVE) {
-            return 0;
-        }
-        std::env::var(ENV_TAIL_HASH_RESERVE_PCT)
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .map_or(TAIL_HASH_RESERVE_PCT_DEFAULT, |v| v.min(50))
-    });
-    *PCT
 }
 
 /// Test hook of the CPU tail hash: 1,024-leaf units the CPU hashes before it
@@ -14429,14 +14424,6 @@ kernel void blake3_pow_seg_tail(
         assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let total_units = (n_leaves - suffix_start) / unit;
         let force_units = force.min(total_units);
-        // CPU tail-hash reserve (`super::ENV_NO_TAIL_HASH_RESERVE`): units of
-        // the unclaimed top never offered to cb3; only with the working
-        // coordinator, and never more than the units above the forced ones.
-        let reserve = if super::tailhash_coord_work_enabled() {
-            (total_units * super::tail_hash_reserve_pct() / 100).min(total_units - force_units)
-        } else {
-            0
-        };
         let args = match TAIL_ARGS.get() {
             Some(&b) => b as Id,
             None => {
@@ -14454,7 +14441,7 @@ kernel void blake3_pow_seg_tail(
             gpu.end_encoding(enc);
             // The join below returns on this signal (`super::ENV_NO_JOIN_SIGNAL`).
             let sig3 = if super::join_signal_enabled() { gpu.arm_done(cb3) } else { None };
-            write_tail_counts(args_ptr, &per_unit, total_units - reserve);
+            write_tail_counts(args_ptr, &per_unit, total_units);
             let cb3 = gpu.retain(cb3);
             gpu.commit_async(cb3);
             (cb3, per_unit, sig3)
@@ -14463,9 +14450,8 @@ kernel void blake3_pow_seg_tail(
         let bytes_base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(staging).cast::<u8>() });
         let args_base = crate::epool::SyncPtr(args_ptr);
         let per_unit = &per_unit;
-        // (next unclaimed top, exclusive; claims stopped; cb3's frozen floor,
-        // usize::MAX until the reserve freezes the count at cb2's end)
-        let claims = std::sync::Mutex::new((n_leaves, false, usize::MAX));
+        // (next unclaimed top, exclusive; claims stopped)
+        let claims = std::sync::Mutex::new((n_leaves, false));
         // Raw handles cross the scope as integers (the body runs on this
         // thread; the workers get the claims and the byte/tree/args bases).
         let cb2_u = cb2 as usize;
@@ -14475,20 +14461,11 @@ kernel void blake3_pow_seg_tail(
         let t_tail = std::time::Instant::now();
         let mut h = n_leaves;
         // Claim one unit: lower cb3's count first, then hash it.
-        let claim = move |g: &mut (usize, bool, usize)| -> usize {
+        let claim = move |g: &mut (usize, bool)| -> usize {
             g.0 -= unit;
-            if g.2 == usize::MAX {
-                // SAFETY: the args buffer is the arm's; counts only decrease.
-                unsafe { write_tail_counts(args_base.ptr(), per_unit, ((g.0 - suffix_start) / unit).saturating_sub(reserve)) };
-            }
+            // SAFETY: the args buffer is the arm's; counts only decrease.
+            unsafe { write_tail_counts(args_base.ptr(), per_unit, (g.0 - suffix_start) / unit) };
             g.0
-        };
-        // Reserve only: at cb2's end the count stops moving; the floor is the
-        // last count published (cb3 read one no lower).
-        let freeze = move |g: &mut (usize, bool, usize)| {
-            if g.2 == usize::MAX {
-                g.2 = suffix_start + ((g.0 - suffix_start) / unit).saturating_sub(reserve) * unit;
-            }
         };
         let hash_unit = move |start: usize| {
             // SAFETY: `start..start + unit` was claimed by this thread alone;
@@ -14511,33 +14488,18 @@ kernel void blake3_pow_seg_tail(
                         if g.1 || g.0 <= suffix_start {
                             break;
                         }
-                        if g.2 != usize::MAX {
-                            // Reserve: frozen; hash down to the floor.
-                            if g.0 <= g.2 {
-                                g.1 = true;
-                                break;
-                            }
-                        } else if coord_work
+                        // Working coordinator: stop the claims at the first
+                        // claim attempt after cb2's end (the caller may be
+                        // inside a unit of its own and not see it), read as
+                        // the caller reads it.
+                        if coord_work
                             && (n_leaves - g.0) / unit >= force_units
                             // SAFETY: the committed cb2 and its signal, both
                             // held by the caller until after this scope.
                             && unsafe { gpu.cb_done(cb2_u as Id, sig2_ref) }
                         {
-                            // Working coordinator: stop the claims at the
-                            // first claim attempt after cb2's end (the caller
-                            // may be inside a unit of its own and not see
-                            // it), read as the caller reads it. With the
-                            // reserve: freeze the count and keep claiming
-                            // down to the floor.
-                            if reserve == 0 {
-                                g.1 = true;
-                                break;
-                            }
-                            freeze(&mut g);
-                            if g.0 <= g.2 {
-                                g.1 = true;
-                                break;
-                            }
+                            g.1 = true;
+                            break;
                         }
                         claim(&mut g)
                     };
@@ -14559,27 +14521,11 @@ kernel void blake3_pow_seg_tail(
                         h = suffix_start;
                         break;
                     }
-                    if g.2 != usize::MAX {
-                        // Reserve: frozen; hash down to the floor.
-                        if g.0 <= g.2 {
-                            g.1 = true;
-                            h = g.0;
-                            break;
-                        }
-                        let start = claim(&mut g);
-                        drop(g);
-                        hash_unit(start);
-                        continue;
-                    }
                     let claimed = (n_leaves - g.0) / unit;
                     if claimed >= force_units && cb2_done() {
-                        if reserve == 0 {
-                            g.1 = true;
-                            h = g.0;
-                            break;
-                        }
-                        freeze(&mut g);
-                        continue;
+                        g.1 = true;
+                        h = g.0;
+                        break;
                     }
                     if claimed < force_units || coord_work {
                         // Test builds: help with the forced units (a pool
@@ -20611,6 +20557,7 @@ kernel void zc_eq_rows(
                         let measured = u_gpu / u_cpu;
                         let ratio = lincheck_fold_forced_ratio().unwrap_or(measured);
                         let g = lincheck_gate_share(ratio, self.n_claims, self.plan.factored_b4);
+                        let g = lincheck_gate_bias(g, self.n_claims, self.plan.factored_b4);
                         self.arm
                             .tuned()
                             .store(g, std::sync::atomic::Ordering::Relaxed);
@@ -20897,6 +20844,32 @@ kernel void zc_eq_rows(
             n_claims * 5 / 8
         };
         share.clamp(0.0, cap as f64) as usize
+    }
+
+    /// Lincheck gate GPU-ward bias (`FLOCK_NO_LC_GATE_BIAS=1`, exact `1`,
+    /// kills; `FLOCK_LC_GATE_BIAS=N` sets it; default 2 claims; read once).
+    /// The gate prices the GPU from warm-up replays of the FULL claim range
+    /// back to back (M4 Pro: 5.4-5.9 ms for 64 claims, 0.086 ms/claim),
+    /// but the timed prove's prefix runs at 0.060 ms/claim (2.47 ms for 41
+    /// claims) next to a CPU suffix that ends 0.2-0.4 ms later, so the
+    /// published share sits CPU-ward of the timed balance point. Measured
+    /// with fixed shares (FLOCK_LINCHECK_GPU_CLAIMS, 20 same-seed rounds):
+    /// lincheck span 39: +0.55 ms, 41: +0.14, 43: best, 45: +0.06, 47: +0.13.
+    /// A nonzero share moves `bias` claims GPU-ward, inside the same cap; a
+    /// share of 0 (GPU off) stays 0. Which device folds which claims never
+    /// changes the bytes.
+    fn lincheck_gate_bias(g: usize, n_claims: usize, factored_b4: bool) -> usize {
+        static BIAS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            if std::env::var("FLOCK_NO_LC_GATE_BIAS").is_ok_and(|v| v == "1") {
+                return 0;
+            }
+            std::env::var("FLOCK_LC_GATE_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+        });
+        if g == 0 {
+            return 0;
+        }
+        let cap = if factored_b4 { n_claims * 3 / 4 } else { n_claims * 5 / 8 };
+        (g + *BIAS).min(cap.max(g))
     }
 
     pub(crate) fn lincheck_gate_share(ratio: f64, n_claims: usize, factored_b4: bool) -> usize {
