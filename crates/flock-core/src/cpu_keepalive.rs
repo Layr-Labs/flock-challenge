@@ -106,6 +106,39 @@ pub fn pool_spin_witness_done() {
     imp::pool_spin_witness_done();
 }
 
+/// The commitment's join is done (root final, round-one A/B precomputed):
+/// the reserved workers [`pool_spin_witness_done`] leaves out of the spin join
+/// it for the rest of the proof. Through the commitment their cores belong to
+/// Metal's submit and completion threads and the proving thread. From
+/// zerocheck on, those threads mostly wait, while every parallel region of
+/// zerocheck, lincheck and the opening otherwise has to wake the reserved
+/// workers out of Rayon's sleep before they can take a share of it. Spinning,
+/// they find each region's jobs through `rayon::yield_now` at once, and an
+/// idle round ends in a kernel yield, so a runnable thread outside the pool
+/// still gets a core within one round. Scheduling only: the same jobs, run by
+/// the same pool. Released with the rest of the spin at proof done.
+/// `FLOCK_NO_RESV_HOT=1` keeps the reserved workers parking as before.
+pub fn pool_spin_commit_done() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::pool_spin_commit_done();
+}
+
+/// The seed has been read: start the efficiency-core helpers' idle spin
+/// (`crate::epool::hot_spin_start`) now instead of at the witness hand-off.
+/// Witness generation drains its hetero work through the same helper pool;
+/// started here, the helpers find that drain's broadcast through
+/// `rayon::yield_now` at once instead of being woken out of Rayon's sleep.
+/// Same spin, same release at proof done, same kill switch
+/// (`FLOCK_NO_EPOOL_HOT`); engaged only with the hot pool spin. Called by the
+/// seed-pipe thread right after it signals the keep-alive down; it only sets
+/// a flag, and the first spinning pool worker that sees it makes the start,
+/// off the seed-pipe thread's path to the seed forward.
+/// `FLOCK_NO_EH_EARLY=1` keeps the start at the hand-off.
+pub fn epool_hot_seed() {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    imp::epool_hot_seed();
+}
+
 /// Stop the keep-alive: signal the spin threads and join them. Idempotent and
 /// safe to call from any thread. Called by the seed-pipe thread the instant its
 /// stdin `read()` returns (before forwarding the seed or starting the
@@ -230,6 +263,9 @@ mod imp {
         HOT_PROVE.store(false, Ordering::Relaxed);
         HOT_PROVE_OFF.store(std::env::var_os("FLOCK_NO_HOT_PROVE").is_some(), Ordering::Relaxed);
         crate::epool::hot_spin_arm();
+        RESV_THIN_OFF.store(std::env::var_os("FLOCK_NO_RESV_THIN").is_some(), Ordering::Relaxed);
+        RESV_HOT_OFF.store(std::env::var_os("FLOCK_NO_RESV_HOT").is_some(), Ordering::Relaxed);
+        EH_EARLY_OFF.store(std::env::var_os("FLOCK_NO_EH_EARLY").is_some(), Ordering::Relaxed);
         let deadline = Instant::now() + MAX_KEEPALIVE;
         rayon::spawn_broadcast(move |ctx| {
             // Leave one core to the seed-pipe thread's hot poll.
@@ -251,10 +287,30 @@ mod imp {
 
     const HOT_PROVE_YIELD_EVERY: u32 = 16;
 
+    /// `FLOCK_NO_EH_EARLY`, read once in [`pool_spin_start`] (untimed).
+    static EH_EARLY_OFF: AtomicBool = AtomicBool::new(false);
+    /// Set by [`epool_hot_seed`] on the seed-pipe thread; the first spinning
+    /// pool worker to see it starts the helpers' spin, so the seed-pipe
+    /// thread itself only makes one store before it forwards the seed.
+    static EH_SEED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn epool_hot_seed() {
+        if EH_EARLY_OFF.load(Ordering::Relaxed)
+            || HOT_PROVE_OFF.load(Ordering::Relaxed)
+            || !POOL_SPIN.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        EH_SEED.store(true, Ordering::Release);
+    }
+
     fn pool_spin_body(deadline: Instant, leaves_at_witness: bool) {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut idle: u32 = 0;
         while POOL_SPIN.load(Ordering::Relaxed) {
+            if EH_SEED.load(Ordering::Relaxed) && EH_SEED.swap(false, Ordering::AcqRel) {
+                crate::epool::hot_spin_start();
+            }
             if let Some(rayon::Yield::Executed) = rayon::yield_now() {
                 idle = 0;
                 continue;
@@ -295,6 +351,10 @@ mod imp {
             POOL_SPIN.store(false, Ordering::Release);
         }
         crate::epool::hot_spin_release();
+        EH_SEED.store(false, Ordering::Relaxed);
+        if RESV_HOT.load(Ordering::Relaxed) {
+            RESV_HOT.store(false, Ordering::Release);
+        }
     }
 
     /// `true` from the witness hand-off until the release at proof done.
@@ -309,6 +369,62 @@ mod imp {
             HOT_PROVE.store(true, Ordering::Release);
             // The helper pool's workers stay hot for the same interval.
             crate::epool::hot_spin_start();
+        }
+    }
+
+    /// `true` from the commitment's join to the release at proof done: the
+    /// workers [`HOT_PROVE_RESERVED`] leaves out of the hot spin idle in
+    /// [`resv_hot_body`] instead of Rayon's sleep (see
+    /// [`super::pool_spin_commit_done`]).
+    static RESV_HOT: AtomicBool = AtomicBool::new(false);
+    /// `FLOCK_NO_RESV_HOT`, read once in [`pool_spin_start`] (untimed).
+    static RESV_HOT_OFF: AtomicBool = AtomicBool::new(false);
+    /// `FLOCK_NO_RESV_THIN`, read once in [`pool_spin_start`] (untimed): the
+    /// reserved workers' idle rounds yield to the kernel every round, as
+    /// before, instead of every [`HOT_PROVE_YIELD_EVERY`]th.
+    static RESV_THIN_OFF: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn pool_spin_commit_done() {
+        if RESV_HOT_OFF.load(Ordering::Relaxed)
+            || !HOT_PROVE.load(Ordering::Acquire)
+            || !POOL_SPIN.load(Ordering::Relaxed)
+            || RESV_HOT.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let deadline = Instant::now() + MAX_KEEPALIVE;
+        rayon::spawn_broadcast(move |ctx| {
+            // The other workers are spinning already.
+            if ctx.index() + HOT_PROVE_RESERVED < ctx.num_threads() {
+                return;
+            }
+            resv_hot_body(deadline);
+        });
+    }
+
+    fn resv_hot_body(deadline: Instant) {
+        // Idle rounds are paced like the hot pool spin's (`pool_spin_body`):
+        // a kernel yield and the deadline check on every
+        // `HOT_PROVE_YIELD_EVERY`th idle round, spin hints on the others.
+        // `FLOCK_NO_RESV_THIN` yields on every idle round, as before.
+        let every = if RESV_THIN_OFF.load(Ordering::Relaxed) { 1 } else { HOT_PROVE_YIELD_EVERY };
+        let mut idle: u32 = 0;
+        while RESV_HOT.load(Ordering::Relaxed) && POOL_SPIN.load(Ordering::Relaxed) {
+            if let Some(rayon::Yield::Executed) = rayon::yield_now() {
+                idle = 0;
+                continue;
+            }
+            idle = idle.wrapping_add(1);
+            if idle % every == 0 {
+                std::thread::yield_now();
+                if Instant::now() >= deadline {
+                    break;
+                }
+            } else {
+                for _ in 0..16 {
+                    std::hint::spin_loop();
+                }
+            }
         }
     }
 
