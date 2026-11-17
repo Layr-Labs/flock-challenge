@@ -1148,10 +1148,15 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 /// on an M1 Max balances near 740 of the 2048 chunks (13.2 ms at 512, 12.0 at
 /// 640, 11.9 at 768, 13.7 at 896); the runner's GPU is at least 2.1x this
 /// one's, so 768 stays CPU-critical there.
-const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 768;
+const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 1024;
 
 pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
-const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
+/// Share offered to the GPU on the ranked runner (the M1-Max board note put
+/// the balance near 1100 of 2048 with a 2.1x-faster GPU; the 5+6-era reading
+/// that anchored 800 predates the late-GPU steal below, which now guards the
+/// GPU-late side as well: with the steal, an over-offered share is taken back
+/// by the CPU at the drain, so the share only names the starting split).
+const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 1024;
 
 /// Kill switch for the K arm's faster fold kernel (`FLOCK_NO_ZC_K_V2`, any
 /// value): the embedded `zc_k_fold` and the record's share
@@ -1233,8 +1238,11 @@ pub const ENV_NO_ZC_T56_GPU: &str = "FLOCK_NO_ZC_T56_GPU";
 pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
 
 /// The 5+6 arm's default share, in 5+6 chunks (of 512), when
-/// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
-pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 160;
+/// `FLOCK_ZC_T56_GPU_CHUNKS` is unset. 224 of 512: the K arm's prefix now
+/// covers 1024/2048 K chunks, which bounds the 5+6 chunks wholly inside it
+/// at 256, and the arm's late-GPU steal settles an over-offered share from
+/// the top, so the cap names the offer rather than a commitment.
+pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 224;
 
 /// Kill switch for the 5+6 arm's late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1`:
 /// the record's join, where the CPU queue, having folded the chunks after the
@@ -1249,6 +1257,30 @@ pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 160;
 /// in place as before. Same kernel and same values per chunk, so which side
 /// folds a chunk cannot change a bit. Read once per process.
 pub const ENV_NO_ZC_T56_LOOP: &str = "FLOCK_NO_ZC_T56_LOOP";
+
+/// Kill switch for the cascade-K arm's late-GPU steal
+/// (`FLOCK_NO_ZC_K_LOOP=1`: the record's join, where the CPU queue, having
+/// folded the chunks after the GPU's share, waits for the GPU's buffer).
+/// With it on, the launch, the share, the dispatch and the CPU queue are the
+/// record's; only the join differs. If the GPU's buffer is complete when the
+/// queue has drained, nothing else happens. If it is not, the CPU does not
+/// wait: it folds the GPU's chunks itself from the top of the share
+/// downward, into the arm's own output buffers (the layouts the oracle
+/// compares), lowering the fold and finish kernels' skip boundary as it
+/// goes, and asks at every claim whether the buffer has completed; from
+/// that moment every chunk below the boundary is the GPU's. The finish
+/// kernel leaves a stolen chunk's partial slot alone, so the join reads the
+/// CPU's weighted slot unchanged. Same kernels and same values per chunk,
+/// so which side folds a chunk cannot change a bit. Read once per process.
+pub const ENV_NO_ZC_K_LOOP: &str = "FLOCK_NO_ZC_K_LOOP";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_k_loop_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !env_is_one(ENV_NO_ZC_K_LOOP)
+    });
+    *ON
+}
 
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 pub(crate) fn gpu_zc_t56_loop_enabled() -> bool {
@@ -1622,14 +1654,14 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
 /// CPU waiting on cb2. In harness-style runs on an M4 the tuned split's
 /// timed CPU suffix is done 4-12 ms (median about 7) before cb2 ends. A
 /// small tilt moves a little of the prefix's NTT and leaf work to the side
-/// that waits. One 256th is 4,096 of the 2^20 leaves; four are a quarter of
+/// that waits. One 256th is 4,096 of the 2^20 leaves; twelve are three quarters of
 /// the sixteenth the sweep steps by, and on the M4 the sweep's own samples
-/// grow the CPU arm by about 0.4 ms per 256th, so four stay well inside the
-/// wait there.
+/// grow the CPU arm by about 0.4 ms per 256th, so twelve (about 4.8 ms) stay
+/// inside the median wait there.
 ///
 /// The pure-GPU split and invalid values are left alone; without the fine
-/// path the tilted share is rounded to whole sixteenths (so four 256ths
-/// change nothing there). Every split computes the same codeword and tree,
+/// path the tilted share is rounded to whole sixteenths (so twelve 256ths
+/// move a coarse split by one sixteenth there). Every split computes the same codeword and tree,
 /// so the proof bytes are unchanged. Read once per process.
 pub const ENV_NO_SPLIT_CPU_TILT: &str = "FLOCK_NO_SPLIT_CPU_TILT";
 
@@ -1640,8 +1672,9 @@ pub const ENV_NO_SPLIT_CPU_TILT: &str = "FLOCK_NO_SPLIT_CPU_TILT";
 pub const ENV_SPLIT_CPU_TILT: &str = "FLOCK_SPLIT_CPU_TILT";
 
 /// Default CPU-ward tilt of the tuned commit split, in 256ths of the
-/// position range (see [`ENV_NO_SPLIT_CPU_TILT`]).
-pub(crate) const SPLIT_CPU_TILT_256: usize = 4;
+/// position range (see [`ENV_NO_SPLIT_CPU_TILT`]): twelve. The previous
+/// default of four is `FLOCK_SPLIT_CPU_TILT=4`.
+pub(crate) const SPLIT_CPU_TILT_256: usize = 12;
 
 /// The tilt in 256ths (see [`ENV_NO_SPLIT_CPU_TILT`]).
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
@@ -5260,6 +5293,7 @@ kernel void zc_k_fold(
     device uint4*       tg_part [[buffer(6)]],
     constant ZcKParams& p       [[buffer(7)]],
     device atomic_uint* flag    [[buffer(8)]],
+    device const uint*  cut     [[buffer(9)]],
     uint tg  [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     ushort sl [[thread_index_in_simdgroup]],
@@ -5267,6 +5301,13 @@ kernel void zc_k_fold(
 {
     threadgroup uint4 nib[256];
     threadgroup uint4 sred[8][8];
+    // `cut[0]`: the lowest chunk the CPU has taken (late-GPU steal, the
+    // 5+6 arm's seam): one thread reads the word, the barrier publishes
+    // it, and a group of a chunk at or above it returns before any load.
+    threadgroup uint cut_tg = 0u;
+    if (lid == 0u) { cut_tg = cut[0]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tg / p.sb_per_chunk >= cut_tg) { return; }
     nib[lid] = nib_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -5361,9 +5402,15 @@ kernel void zc_k_finish(
     device const uint4* consts  [[buffer(1)]],
     device uint4*       part    [[buffer(2)]],
     constant ZcKParams& p       [[buffer(3)]],
+    device const uint*  cut     [[buffer(4)]],
     uint chunk [[threadgroup_position_in_grid]],
     uint k     [[thread_index_in_threadgroup]])
 {
+    // Late-GPU steal: a chunk at or above the CPU's boundary was folded
+    // (and weighted) by the CPU straight into `part`; this finish leaves
+    // its slot alone. The eight threads each read the word themselves:
+    // there is no threadgroup barrier in this kernel.
+    if (chunk >= cut[0]) { return; }
     uint4 s = uint4(0u);
     for (uint j = 0u; j < p.sb_per_chunk; j++) {
         s ^= tg_part[(ulong(chunk) * ulong(p.sb_per_chunk) + ulong(j)) * 8ul + ulong(k)];
@@ -5507,6 +5554,7 @@ kernel void zc_k_fold_v2(
     device uint4*       tg_part [[buffer(6)]],
     constant ZcKParams& p       [[buffer(7)]],
     device atomic_uint* flag    [[buffer(8)]],
+    device const uint*  cut     [[buffer(9)]],
     uint tg  [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     ushort sl [[thread_index_in_simdgroup]],
@@ -5515,6 +5563,13 @@ kernel void zc_k_fold_v2(
     threadgroup uint4 nib[256];
     threadgroup uint4 rtab[512];
     threadgroup uint4 sred[8][8];
+    // `cut[0]`: the lowest chunk the CPU has taken (late-GPU steal, the
+    // 5+6 arm's seam): one thread reads the word, the barrier publishes
+    // it, and a group of a chunk at or above it returns before any load.
+    threadgroup uint cut_tg = 0u;
+    if (lid == 0u) { cut_tg = cut[0]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tg / p.sb_per_chunk >= cut_tg) { return; }
     nib[lid] = nib_dev[lid];
     rtab[lid] = nib_dev[256u + lid];
     rtab[256u + lid] = nib_dev[512u + lid];
@@ -10286,7 +10341,7 @@ kernel void blake3_pow_seg_tail(
     const METALLIB: &[u8] = include_bytes!("gpu_shaders.metallib");
 
     /// FNV-1a (64-bit) of `MSL_SOURCE` when `gpu_shaders.metallib` was built.
-    const METALLIB_MSL_FNV1A: u64 = 0x5fb2352f09873ad7;
+    const METALLIB_MSL_FNV1A: u64 = 0xb5a8c376b550d36d;
 
     const fn fnv1a64(s: &str) -> u64 {
         let bytes = s.as_bytes();
@@ -21899,7 +21954,7 @@ kernel void zc_eq_rows(
         #[test]
         fn cpu_tilt_moves_the_split_by_256ths() {
             use super::{hybrid_split_valid, split_cpu_share256 as c, tilt_split_toward_cpu as t};
-            assert_eq!(crate::gpu_commit::SPLIT_CPU_TILT_256, 4);
+            assert_eq!(crate::gpu_commit::SPLIT_CPU_TILT_256, 12);
             assert_eq!(t(5, 0, true), 5);
             // Coarse k=5 (cpu 80/256) + 4 -> k=5, m=4 (cpu 84/256).
             assert_eq!(t(5, 4, true), 5 + 16 * 4);
@@ -27118,6 +27173,9 @@ kernel void zc_ab_finish(
         part_buf: Id,
         /// Set by the GPU when a b output the b-one pack skips is not one.
         flag_buf: Id,
+        /// The fold and finish kernels' late-GPU steal boundary (`u32::MAX`
+        /// = none): the lowest chunk the CPU has taken over.
+        cut_buf: Id,
         /// Scratch output of the round-two premap touch dispatch.
         touch_buf: Id,
         chunks: usize,
@@ -27209,9 +27267,36 @@ kernel void zc_ab_finish(
                 }
             };
             let library = try_embedded_metallib(api, device);
-            if library.is_null() {
-                return Err("embedded metallib unavailable".into());
-            }
+            // The embedded metallib is unavailable (a stale container on an
+            // older runtime, or the dispatch-data path rejected it): compile
+            // the same source here, on the thread the prewarm already builds
+            // the faster fold on. Untimed either way - init runs before the
+            // warm-up prove - and the kernels, the argument tables and the
+            // pipelines are the source's own.
+            let owned;
+            let library = if !library.is_null() {
+                library
+            } else {
+                let src = api.nsstring(MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let lib: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if lib.is_null() {
+                    return Err(format!(
+                        "embedded metallib unavailable and source compile failed: {}",
+                        api.error_string(err)
+                    ));
+                }
+                owned = lib;
+                owned
+            };
             let pool = (api.pool_push)();
             let make_pipeline = |name: &str| -> Result<Id, String> {
                 let ns = api.nsstring(name)?;
@@ -27408,6 +27493,7 @@ kernel void zc_ab_finish(
                 chunks * 8 * 16,
                 16,
                 8 * 16,
+                16,
             ] {
                 match gpu.new_buffer(len) {
                     Ok(b) => made.push(b),
@@ -27432,6 +27518,7 @@ kernel void zc_ab_finish(
                 part_buf: made[5],
                 flag_buf: made[6],
                 touch_buf: made[7],
+                cut_buf: made[8],
                 chunks,
                 per_chunk_a,
                 per_chunk_b,
@@ -27454,11 +27541,25 @@ kernel void zc_ab_finish(
         per_chunk_b: usize,
         calibration: bool,
         submitted: std::time::Instant,
+        /// The kernels' steal boundary word (late-GPU steal): the lowest
+        /// chunk the CPU has taken over. `chunks` = none.
+        cut: *mut u32,
+        /// The arm's process-lifetime output buffers, for the CPU's stolen
+        /// chunks: `a` at `c * per_chunk_a`, `b` at `c * per_chunk_b` and
+        /// the eq_hi-weighted partial slot `c`, exactly the layouts the
+        /// oracle launch compares against the CPU's own outputs.
+        out_a: *mut F128,
+        out_b: *mut F128,
+        part: *mut [F128; 8],
     }
 
     // SAFETY: the handles are only waited/released by the launching thread;
-    // Metal objects are themselves thread-safe.
+    // Metal objects are themselves thread-safe. The steal pointers name the
+    // arm's process-lifetime shared buffers, which nothing rewrites before
+    // the join; the late-GPU seam's claim lock and the hetero queue's join
+    // order every write the CPU's stolen chunks make to them.
     unsafe impl Send for ZcKJob {}
+    unsafe impl Sync for ZcKJob {}
 
     impl ZcKJob {
         /// First chunk the CPU queue folds: zero during the oracle probe (the
@@ -27474,6 +27575,48 @@ kernel void zc_ab_finish(
         /// GPU prefix length in chunks.
         pub(crate) fn chunks(&self) -> usize {
             self.chunks
+        }
+
+        /// The arm's packed output strides (a: 244 per 256 outputs,
+        /// b: 56 per 64), for the CPU's stolen chunks.
+        pub(crate) fn per_chunk_a(&self) -> usize {
+            self.per_chunk_a
+        }
+
+        pub(crate) fn per_chunk_b(&self) -> usize {
+            self.per_chunk_b
+        }
+
+        /// Whether the buffer is complete (a poll, never a wait): the armed
+        /// signal when present, else (and always for a failure) the buffer
+        /// status. A failed buffer counts as done; the join below reports
+        /// the failure and the CPU folds the whole prefix.
+        pub(crate) fn done(&self) -> bool {
+            match gpu() {
+                Ok(g) => unsafe { g.cb_done(self.cb, self.sig.as_ref()) },
+                Err(_) => true,
+            }
+        }
+
+        /// Publish the CPU's steal boundary: the GPU's fold and finish skip
+        /// chunks `>= hi`, and a skipped chunk keeps whatever the CPU wrote
+        /// to its outputs and its partial slot.
+        pub(crate) fn set_cut(&self, hi: usize) {
+            unsafe { self.cut.write_volatile(hi as u32) };
+        }
+
+        /// Whether the command buffer ended in an error (a status read).
+        pub(crate) fn failed(&self) -> bool {
+            match gpu() {
+                Ok(g) => unsafe { g.cb_status(self.cb) == 5 },
+                Err(_) => true,
+            }
+        }
+
+        /// The arm's output pointers for the CPU's stolen chunks (see the
+        /// struct fields). Valid until the join; the steal runs before it.
+        pub(crate) fn steal_ptrs(&self) -> (*mut F128, *mut F128, *mut [F128; 8]) {
+            (self.out_a, self.out_b, self.part)
         }
     }
 
@@ -27966,15 +28109,22 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.out_b, 0, 5);
                 gpu.set_buffer(enc, state.tgp_buf, 0, 6);
                 gpu.set_bytes(enc, pb, 7);
+                // Late-GPU steal: no chunk is skipped at the launch (the
+                // word is `chunks`); the CPU lowers it only under the
+                // driver's claim lock once its own queue has drained.
+                gpu.buffer_contents(state.cut_buf).cast::<u32>().write_volatile(chunks as u32);
                 gpu.set_buffer(enc, state.flag_buf, 0, 8);
+                gpu.set_buffer(enc, state.cut_buf, 0, 9);
                 gpu.dispatch(enc, (chunks * sb_per_chunk) as u64, 256);
                 // Serial dispatches of one encoder: the finish reads the
-                // superblock sums the fold wrote.
+                // superblock sums the fold wrote; it skips the CPU's chunks
+                // so their partial slots (written by the CPU) are kept.
                 gpu.set_pipeline(enc, state.finish_pso);
                 gpu.set_buffer(enc, state.tgp_buf, 0, 0);
                 gpu.set_buffer(enc, state.consts_buf, 0, 1);
                 gpu.set_buffer(enc, state.part_buf, 0, 2);
                 gpu.set_bytes(enc, pb, 3);
+                gpu.set_buffer(enc, state.cut_buf, 0, 4);
                 gpu.dispatch(enc, chunks as u64, 8);
                 gpu.end_encoding(enc);
                 // Armed in the warm-up's oracle launch too, so the timed
@@ -27995,6 +28145,10 @@ kernel void zc_ab_finish(
                     per_chunk_b,
                     calibration: mode == ZC_K_UNCALIBRATED,
                     submitted: std::time::Instant::now(),
+                    cut: gpu.buffer_contents(state.cut_buf).cast::<u32>(),
+                    out_a: gpu.buffer_contents(state.out_a).cast::<F128>(),
+                    out_b: gpu.buffer_contents(state.out_b).cast::<F128>(),
+                    part: gpu.buffer_contents(state.part_buf).cast::<[F128; 8]>(),
                 }),
                 Err(e) => {
                     if debug {

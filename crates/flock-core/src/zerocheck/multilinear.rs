@@ -3662,11 +3662,20 @@ fn fold2_compact_and_round45_into_packed_b(
         let _ = pack;
         false
     };
+    // The one-table kernel reads its group weights `eq_lo[2t + 1]` either in
+    // prepared form (one table shared by every chunk), or — when the
+    // challenges satisfy the window relation — as the window scales
+    // `lambda * x^{2j}` (`FLOCK_NO_ZC_K_XB=1` keeps the prepared form), in
+    // which case no table is built or streamed at all.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let k_xb =
         one_table && kernels::aarch64::zc_k_xb_enabled() && kernels::aarch64::k_full_xb_weights(eq_lo, lo_size);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let k_shifts = k_xb && kernels::aarch64::zc_k_xb_shifts_enabled();
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let k_xb = false;
+    // Diagnostic trace (`FLOCK_ZC_K_XB_DEBUG=1`): whether the window-scaled
+    // K weights armed, and the first window's relation if they did not.
     if std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some() && one_table {
         let n_groups = lo_size / 2;
         let armed = k_xb;
@@ -3746,14 +3755,36 @@ fn fold2_compact_and_round45_into_packed_b(
     let cpu_base = gpu_job.as_ref().map_or(0, crate::gpu_commit::ZcKJob::cpu_base);
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3")))]
     let cpu_base = 0usize;
-    let chunk_body = |x_hi: usize| {
+    // A late-GPU steal's destination: the K arm's process-lifetime output
+    // buffers and its packed strides. Chunk `x_hi`'s outputs land at
+    // `x_hi * per_a` / `x_hi * per_b` of `a` / `b` and its eq_hi-weighted
+    // partial slot at `part + x_hi` - the layouts the oracle launch
+    // compares, so the join reads a stolen chunk unchanged.
+    struct KSteal {
+        a: *mut F128,
+        b: *mut F128,
+        part: *mut [F128; 8],
+        per_a: usize,
+        per_b: usize,
+    }
+    // SAFETY: the pointers name the K arm's process-lifetime buffers; the
+    // seam's claim lock and the hetero queue's join order every write, and
+    // nothing else reads them before the join below.
+    unsafe impl Sync for KSteal {}
+
+    // `dst = None`: the pass's own output buffers and partial slots.
+    let chunk_body = |x_hi: usize, dst: Option<&KSteal>| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them. Packed: each of a
         // chunk's `out_chunk / 256` superblocks takes 244 entries.
         let (a_ptr, b_ptr) = unsafe {
-            let o = if pack { x_hi * out_chunk / 256 * 244 } else { x_hi * out_chunk };
-            let ob = if bpack { x_hi * out_chunk / 64 * b_block } else { o };
-            (a_base.ptr().add(o), b_base.ptr().add(ob))
+            if let Some(st) = dst {
+                (st.a.add(x_hi * st.per_a), st.b.add(x_hi * st.per_b))
+            } else {
+                let o = if pack { x_hi * out_chunk / 256 * 244 } else { x_hi * out_chunk };
+                let ob = if bpack { x_hi * out_chunk / 64 * b_block } else { o };
+                (a_base.ptr().add(o), b_base.ptr().add(ob))
+            }
         };
         // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
         let pair_base = 2 * x_hi * out_chunk;
@@ -3794,24 +3825,38 @@ fn fold2_compact_and_round45_into_packed_b(
                 (true, true) if one_table && pack => {
                     let ok = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
                         if k_xb {
-                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true>(
+                            if k_shifts {
+                                kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true, true>(
                                 fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
                                 degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
                             )
+                            } else {
+                                kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true, false>(
+                                fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
+                                degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                            }
                         } else {
-                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false>(
+                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false, false>(
                                 fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
                                 degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
                             )
                         }
                     } else {
                         if k_xb {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true>(
+                            if k_shifts {
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, true>(
                                 t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
                                 compact.tail_compact, compact.head_compact, compact.head_b,
                             )
+                            } else {
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, false>(
+                                t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                                compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                            }
                         } else {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false, false>(
                                 t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
                                 compact.tail_compact, compact.head_compact, compact.head_b,
                             )
@@ -3824,12 +3869,19 @@ fn fold2_compact_and_round45_into_packed_b(
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
                     if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true>(
+                        if k_shifts {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true, true>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             compact.tail_compact, compact.head_compact, compact.head_b,
-                        );
+                        )
+                        } else {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                        };
                     } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             compact.tail_compact, compact.head_compact, compact.head_b,
                         );
@@ -3838,12 +3890,19 @@ fn fold2_compact_and_round45_into_packed_b(
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => {
                     if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true>(
+                        if k_shifts {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true, true>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             false, false, F128::ZERO,
-                        );
+                        )
+                        } else {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            false, false, F128::ZERO,
+                        )
+                        };
                     } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             false, false, F128::ZERO,
                         );
@@ -3878,10 +3937,66 @@ fn fold2_compact_and_round45_into_packed_b(
         let eq_h = eq_hi[x_hi];
         // SAFETY: each queue job owns its partial slot exclusively.
         unsafe {
-            crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
+            let slot = match dst {
+                Some(st) => st.part.add(x_hi).cast(),
+                None => partials_base.ptr().add(x_hi),
+            };
+            crate::field::f128_slice::scale_slice_into(&mut *slot, &outv, eq_h);
         }
     };
-    crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
+    crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i, None));
+
+    // Late-GPU steal of the K arm (`FLOCK_NO_ZC_K_LOOP=1` keeps the record's
+    // join below): the 5+6 arm's seam, ported. The launch, the share and the
+    // CPU queue above are the record's. If the GPU's buffer is complete when
+    // the queue has drained, that is all. If not, the CPU does not wait: it
+    // folds the GPU's chunks itself from the top of the share downward,
+    // lowering the fold and finish kernels' skip boundary as it goes, and
+    // asks at every claim whether the buffer has completed; from that moment
+    // every chunk below the boundary is the GPU's. A stolen chunk's outputs
+    // and its weighted partial slot are written into the arm's own buffers,
+    // so the join reads them unchanged, and a b output the pack skips that is
+    // not one still fails the pass through the CPU queue's own flag. Which
+    // side folds a chunk cannot change a bit.
+    //
+    // The seam: the boundary and the completion flag change only under the
+    // claim lock; once completion is seen the boundary never moves again.
+    // The kernel skips a chunk only at or above a boundary value the CPU
+    // wrote, and every value written is the chunk the CPU claimed with it,
+    // so a chunk below the final boundary was never skipped (the completed
+    // buffer folded it) and never claimed (no CPU write).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    if let Some(job) = gpu_job
+        .as_ref()
+        .filter(|j| !j.calibration() && crate::gpu_commit::zc_k_loop_enabled())
+    {
+        if !job.done() {
+            let (a, b, part) = job.steal_ptrs();
+            let steal = KSteal { a, b, part, per_a: job.per_chunk_a(), per_b: job.per_chunk_b() };
+            let claims = std::sync::Mutex::new((cpu_base, false));
+            crate::epool::run_hetero_chunks(cpu_base, |_| {
+                let x_hi = {
+                    let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.1 || g.0 == 0 {
+                        return;
+                    }
+                    if job.done() {
+                        g.1 = true;
+                        return;
+                    }
+                    job.set_cut(g.0 - 1);
+                    g.0 -= 1;
+                    g.0
+                };
+                chunk_body(x_hi, Some(&steal));
+            });
+            let (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+            // Without the completion seen, the CPU folded every chunk of the
+            // share and nothing of the GPU's is read; a failed buffer counts
+            // as done here (the join reports it and folds the prefix).
+            assert!(gpu_done || lo == 0, "K steal ended early: {lo} chunks unclaimed");
+        }
+    }
 
     // Join the GPU prefix (it was submitted first and is normally done).
     #[allow(unused_mut)]
@@ -3927,7 +4042,7 @@ fn fold2_compact_and_round45_into_packed_b(
             crate::gpu_commit::ZcKResult::Failed => {
                 // The GPU failed after admission: the CPU folds the prefix
                 // chunks with the same kernel (the arm is now disabled).
-                crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
+                crate::epool::run_hetero_chunks(cpu_base, |i| chunk_body(i, None));
             }
         }
     }
