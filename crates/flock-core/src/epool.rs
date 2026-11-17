@@ -511,7 +511,12 @@ const HOT_SPIN_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 /// and make sure the helper pool exists. Called where the main pool's hot
 /// spin is armed, outside any timed interval.
 pub(crate) fn hot_spin_arm() {
-    HOT_SPIN_OFF.store(std::env::var_os("FLOCK_NO_EPOOL_HOT").is_some(), Ordering::Relaxed);
+    // Off by default: the runner reading of i34-9's spin ablation (6d3d6b82,
+    // arm FLOCK_NO_EPOOL_HOT=1: 91.86 ms median vs 92.04 for the record, p25
+    // 91.20 vs 91.60) shows the helpers' hot spin costs time on the M3 Max.
+    // `FLOCK_EPOOL_HOT=1` restores it; `FLOCK_NO_EPOOL_HOT` still forces it off.
+    let on = std::env::var_os("FLOCK_EPOOL_HOT").is_some_and(|v| v == "1");
+    HOT_SPIN_OFF.store(!on || std::env::var_os("FLOCK_NO_EPOOL_HOT").is_some(), Ordering::Relaxed);
     let _ = epool();
 }
 
