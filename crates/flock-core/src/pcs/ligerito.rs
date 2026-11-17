@@ -7756,6 +7756,26 @@ fn zfold_default_chunk() -> usize {
     })
 }
 
+/// Kill switch for submitting the z-fold GPU share from a main-pool worker
+/// only: `FLOCK_NO_ZF_LAUNCH_MAIN=1` (any value) restores the record, where
+/// the drain's first claimant submits whichever pool it belongs to. That
+/// first claimant is often an efficiency-core helper lingering from the
+/// previous drain (`QOS_CLASS_UTILITY`). On the M4, where the main pool and
+/// the helpers oversubscribe the cores, such a helper was descheduled in the
+/// middle of the submit (4.0 ms inside its 192-byte constant copy, 6.3 ms in
+/// all), and the GPU folded no block of that drain (+1.7 ms). Now a helper
+/// that claims first just folds its block and the first main-pool claimant
+/// submits (the calling thread starts claiming at once). Same job, same
+/// blocks, same outputs; only the submitting thread changes. Read once.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const ENV_NO_ZF_LAUNCH_MAIN: &str = "FLOCK_NO_ZF_LAUNCH_MAIN";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn zfold_launch_main_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZF_LAUNCH_MAIN).is_none())
+}
+
 /// Diagnostic tuning knobs (unset in ranked runs).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn zfold_env_usize(name: &str, default: usize) -> usize {
@@ -8271,6 +8291,9 @@ fn materialize_direct_fold8(
             std::sync::OnceLock::new();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let zf_launch_claimed = std::sync::atomic::AtomicBool::new(!zf_want);
+        // Only a main-pool worker submits (see `ENV_NO_ZF_LAUNCH_MAIN`).
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let zf_launch_main_only = zfold_launch_main_only();
         let zf_ns_full = std::sync::atomic::AtomicU64::new(0);
         let zf_ns_bonly = std::sync::atomic::AtomicU64::new(0);
         let zf_launch_ns = std::sync::atomic::AtomicU64::new(0);
@@ -8282,7 +8305,11 @@ fn materialize_direct_fold8(
             |st: &mut (Vec<F128>, Vec<F128>), block| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 if zf_want {
-                    if !zf_launch_claimed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    if !zf_launch_claimed.load(std::sync::atomic::Ordering::Relaxed)
+                        && !(zf_launch_main_only
+                            && crate::epool::epool().is_some_and(|p| p.current_thread_index().is_some()))
+                        && !zf_launch_claimed.swap(true, std::sync::atomic::Ordering::AcqRel)
+                    {
                         let tl = std::time::Instant::now();
                         let _ = zf_cell.set(crate::gpu_commit::zfold_launch(
                             &packed_witness,

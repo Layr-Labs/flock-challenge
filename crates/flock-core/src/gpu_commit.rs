@@ -425,14 +425,6 @@ pub(crate) fn join_signal_enabled() -> bool {
     *ON
 }
 
-pub const ENV_NO_TAIL_HALF_UNITS: &str = "FLOCK_NO_TAIL_HALF_UNITS";
-
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn tail_half_units_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAIL_HALF_UNITS));
-    *ON
-}
-
 /// Serial XOR of a fold prefix into the CPU suffix (`FLOCK_NO_FOLD_SERIAL_XOR`,
 /// any value, kills): the round-one C fold's and the lincheck fold's drains
 /// add the GPU prefix's 2^k_log lanes (256 KiB at the ranked shape) into the
@@ -1089,23 +1081,6 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
     if gpu_commit_enabled() { *SHARE } else { 0 }
 }
 
-/// Kill switch for submitting the round-one AB completion arm as one command
-/// buffer (`FLOCK_NO_ZC_AB_SCHED`, any value, read once per process): the
-/// table build is committed as its own command buffer ahead of the gather and
-/// finish, as before. With the switch unset, the table build, the gather and
-/// the finish are encoded into a single command buffer (the table build's
-/// encoder first, then the gather and finish encoder), so no other work on the
-/// queue can be scheduled between the build and the gather, and the arm pays
-/// one command buffer's start instead of two. The kernels, their inputs,
-/// their order and every output are the same.
-pub const ENV_NO_ZC_AB_SCHED: &str = "FLOCK_NO_ZC_AB_SCHED";
-
-pub(crate) fn gpu_zc_ab_one_cb_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_AB_SCHED).is_none());
-    *ON
-}
-
 /// Diagnostic trace for the round-one AB completion arm: the warm-up oracle
 /// verdict and, per prove that folds GPU partials, one `[zc-ab-gpu] fired`
 /// line (`FLOCK_ZC_AB_GPU_DEBUG=1`, or any `FLOCK_PHASE_TIMING` run).
@@ -1607,6 +1582,60 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_WARMUP_LATCH_CACHE).is_none())
 }
 
+/// Kill switch for the commit split's CPU-ward tilt
+/// (`FLOCK_NO_SPLIT_CPU_TILT=1`, exact `1`: the ranked tune's final decision
+/// is published as the record makes it).
+///
+/// With the tilt on, [`SPLIT_CPU_TILT_256`] 256ths of CPU share are added to
+/// the ranked exact-AB tune's final decision: after the sweep, the arm
+/// re-pricing, the line fit and the fine refinement, and before the
+/// dead-store check, the byte verification and publication. The sweep, the
+/// tables it builds and its byte verification are the record's; only the
+/// published split moves, and the moved split is the one the warm-up
+/// verifies.
+///
+/// Why a fixed tilt: the sweep prices both arms beside an A/B replay of
+/// round one's precompute, a different load from the timed prove's, and a
+/// timed prove whose GPU prefix (cb2) ends after the CPU suffix leaves the
+/// CPU waiting on cb2. In harness-style runs on an M4 the tuned split's
+/// timed CPU suffix is done 4-12 ms (median about 7) before cb2 ends. A
+/// small tilt moves a little of the prefix's NTT and leaf work to the side
+/// that waits. One 256th is 4,096 of the 2^20 leaves; four are a quarter of
+/// the sixteenth the sweep steps by, and on the M4 the sweep's own samples
+/// grow the CPU arm by about 0.4 ms per 256th, so four stay well inside the
+/// wait there.
+///
+/// The pure-GPU split and invalid values are left alone; without the fine
+/// path the tilted share is rounded to whole sixteenths (so four 256ths
+/// change nothing there). Every split computes the same codeword and tree,
+/// so the proof bytes are unchanged. Read once per process.
+pub const ENV_NO_SPLIT_CPU_TILT: &str = "FLOCK_NO_SPLIT_CPU_TILT";
+
+/// Diagnostic override of the tilt: `FLOCK_SPLIT_CPU_TILT=<n>` 256ths,
+/// clamped to `0..=64` (`0` = no tilt); unset or unparsable = the default
+/// [`SPLIT_CPU_TILT_256`]. Ignored under [`ENV_NO_SPLIT_CPU_TILT`]. Read once
+/// per process.
+pub const ENV_SPLIT_CPU_TILT: &str = "FLOCK_SPLIT_CPU_TILT";
+
+/// Default CPU-ward tilt of the tuned commit split, in 256ths of the
+/// position range (see [`ENV_NO_SPLIT_CPU_TILT`]).
+pub(crate) const SPLIT_CPU_TILT_256: usize = 4;
+
+/// The tilt in 256ths (see [`ENV_NO_SPLIT_CPU_TILT`]).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn split_cpu_tilt256() -> usize {
+    static N: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if env_is_one(ENV_NO_SPLIT_CPU_TILT) {
+            return 0;
+        }
+        std::env::var(ENV_SPLIT_CPU_TILT)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(SPLIT_CPU_TILT_256, |n| n.min(64))
+    });
+    *N
+}
+
 /// Kill switch for the sandbox-aware cache directory fallback:
 /// `FLOCK_NO_CACHE_DIR_FALLBACK=1` pins the incumbent
 /// `std::env::temp_dir()` location unconditionally.
@@ -1961,6 +1990,28 @@ pub const ENV_NO_GRIND_LAT: &str = "FLOCK_NO_GRIND_LAT";
 pub(crate) fn grind_lat_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !env_is_one(ENV_NO_GRIND_LAT))
+}
+
+/// Kill switch for the grind scan's straight-line compression
+/// (`FLOCK_NO_POW_STRAIGHT=1`, exact `1`: the two-buffer looped schedule, as
+/// before). `blake3_pow_scan_v2`'s `pow_compress0_pre` finished round zero
+/// and ran rounds one to six as a loop that gathers the sixteen message words
+/// into the other buffer after each round. With it on, the same arithmetic
+/// is written out round by round with BLAKE3's fixed message schedule over
+/// the message `state || nonce || 0^6`: no word moves between rounds, the six
+/// zero words are constants, and the 16-bit rotation swaps the word's halves.
+/// M4 (`pow_probe`, 16 alternating rounds, 2^24 attempts at 32 bits on the
+/// production grid): 0.477 -> 0.398 ns per attempt (2.10 -> 2.51 G attempts
+/// per second, 16 of 16 lower); every form returns the same smallest nonce
+/// (8 digests at 14, 16 and 18 bits). Same chaining value word, so every
+/// grind returns the same nonce. Read once, when the grind kernel is compiled
+/// at Gpu init.
+pub const ENV_NO_POW_STRAIGHT: &str = "FLOCK_NO_POW_STRAIGHT";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn pow_straight_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_POW_STRAIGHT));
+    *ON
 }
 
 /// Whether this process builds the race tail: the item and everything the
@@ -9861,6 +9912,65 @@ kernel void ntt_g5(device uint4* data                [[buffer(0)]],
     // one bounded ascending block and atomically records the smallest matching
     // offset, so the host can advance block-by-block without weakening the
     // challenger's globally-smallest-nonce rule.
+    /// The grind scan's straight-line `pow_compress0_pre` (see
+    /// `super::ENV_NO_POW_STRAIGHT`): round zero's last quarter-round, then
+    /// rounds one to six written out with BLAKE3's message schedule over the
+    /// message `state || nonce || 0^6`, whose six zero words are constants;
+    /// the 16-bit rotation swaps the halves, the others are `rotate` (left by
+    /// 32 - n). Same arithmetic as the looped form: same cv0.
+    const POW_PRE_STRAIGHT: &str = r#"#define PW_ROTR(x, n) rotate((uint)(x), (uint)(32u - (n)))
+#define PW_ROT16(x) as_type<uint>(as_type<ushort2>((uint)(x)).yx)
+#define PW_G(a, b, c, d, x, y)                         \
+    a = a + b + (x); d = PW_ROT16(d ^ a);              \
+    c = c + d;       b = PW_ROTR(b ^ c, 12u);          \
+    a = a + b + (y); d = PW_ROTR(d ^ a, 8u);           \
+    c = c + d;       b = PW_ROTR(b ^ c, 7u);
+#define PW_ROUND(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15) \
+    PW_G(v0, v4, v8,  v12, w[s0],  w[s1]);  PW_G(v1, v5, v9,  v13, w[s2],  w[s3]);    \
+    PW_G(v2, v6, v10, v14, w[s4],  w[s5]);  PW_G(v3, v7, v11, v15, w[s6],  w[s7]);    \
+    PW_G(v0, v5, v10, v15, w[s8],  w[s9]);  PW_G(v1, v6, v11, v12, w[s10], w[s11]);   \
+    PW_G(v2, v7, v8,  v13, w[s12], w[s13]); PW_G(v3, v4, v9,  v14, w[s14], w[s15]);
+static inline uint pow_compress0_pre(constant uint* pre, uint nonce_lo, uint nonce_hi) {
+    uint v0 = pre[0], v1 = pre[1], v2 = pre[2], v3 = pre[3];
+    uint v4 = pre[4], v5 = pre[5], v6 = pre[6], v7 = pre[7];
+    uint v8 = pre[8], v9 = pre[9], v10 = pre[10], v11 = pre[11];
+    uint v12 = pre[12], v13 = pre[13], v14 = pre[14], v15 = pre[15];
+    const uint w[16] = {pre[16], pre[17], pre[18], pre[19], pre[20], pre[21], pre[22], pre[23],
+                        nonce_lo, nonce_hi, 0u, 0u, 0u, 0u, 0u, 0u};
+    PW_G(v0, v5, v10, v15, nonce_lo, nonce_hi);
+    PW_ROUND(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+    PW_ROUND(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1)
+    PW_ROUND(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6)
+    PW_ROUND(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4)
+    PW_ROUND(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7)
+    PW_ROUND(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13)
+    return v0 ^ v8;
+}
+#undef PW_ROUND
+#undef PW_G
+#undef PW_ROT16
+#undef PW_ROTR
+"#;
+
+    /// The grind library's source as compiled at Gpu init: [`POW_MSL_SOURCE`]
+    /// with `pow_compress0_pre` replaced by [`POW_PRE_STRAIGHT`], unless
+    /// `FLOCK_NO_POW_STRAIGHT=1` or the looped function is not found exactly
+    /// once (then the incumbent text). `blake3_pow_scan` (v1) is unchanged.
+    pub(crate) fn pow_msl_source() -> std::borrow::Cow<'static, str> {
+        const START: &str = "static inline uint pow_compress0_pre(constant uint* pre, uint nonce_lo, uint nonce_hi) {";
+        const END: &str = "    return v[0] ^ v[8u];\n}\n";
+        let src = POW_MSL_SOURCE;
+        if !super::pow_straight_enabled() || src.matches(START).count() != 1 {
+            return std::borrow::Cow::Borrowed(src);
+        }
+        let a = src.find(START).expect("counted above");
+        let Some(rel) = src[a..].find(END) else {
+            return std::borrow::Cow::Borrowed(src);
+        };
+        let b = a + rel + END.len();
+        std::borrow::Cow::Owned(format!("{}{POW_PRE_STRAIGHT}{}", &src[..a], &src[b..]))
+    }
+
     const POW_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -10725,7 +10835,8 @@ kernel void blake3_pow_seg_tail(
                     // ranked commitment GPU.  The grind gate will see NIL and
                     // permanently retain the exact CPU implementation.
                     (|| -> Result<(Id, Id), String> {
-                        let src = api.nsstring(POW_MSL_SOURCE)?;
+                        // `super::ENV_NO_POW_STRAIGHT`: the straight-line compression.
+                        let src = api.nsstring(&pow_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -12513,9 +12624,9 @@ kernel void blake3_pow_seg_tail(
         n_leaves: usize,
         suffix_start: usize,
         args: Id,
-        unit_levels: usize,
     ) -> Vec<u32> {
-        let unit = 1usize << unit_levels;
+        const UNIT_LEVELS: usize = 10;
+        let unit = 1usize << UNIT_LEVELS;
         debug_assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let mut per_unit: Vec<u32> = Vec::with_capacity(12);
         unsafe {
@@ -12557,7 +12668,7 @@ kernel void blake3_pow_seg_tail(
                 let off = next_arg((unit / 256) as u32, &mut per_unit);
                 gpu.dispatch_indirect(enc, args, off, 256);
             }
-            while done < unit_levels {
+            while done < UNIT_LEVELS {
                 // Per unit: `unit >> (done + 1)` parents at the next level.
                 let n_out = unit >> (done + 1);
                 let tpg = n_out.min(256);
@@ -14156,9 +14267,9 @@ kernel void blake3_pow_seg_tail(
         }
     }
 
-    fn tail_unit_levels() -> usize {
-        if super::tail_half_units_enabled() { 9 } else { 10 }
-    }
+    /// 1,024-leaf units of the CPU tail hash (`super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
+    /// one unit is its leaves and ten parent levels, rooted at level 10.
+    const TAIL_UNIT_LEVELS: usize = 10;
 
     /// Process-lifetime indirect-count buffer of the CPU tail hash's cb3.
     static TAIL_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -14223,8 +14334,7 @@ kernel void blake3_pow_seg_tail(
         suffix_start: usize,
         force: usize,
     ) -> Result<(), String> {
-        let unit_levels = tail_unit_levels();
-        let unit = 1usize << unit_levels;
+        let unit = 1usize << TAIL_UNIT_LEVELS;
         assert!(n_leaves.is_power_of_two() && n_leaves >= 1 << 16);
         assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let total_units = (n_leaves - suffix_start) / unit;
@@ -14242,7 +14352,7 @@ kernel void blake3_pow_seg_tail(
             let cb3 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb3)?;
             let per_unit =
-                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args, unit_levels);
+                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args);
             gpu.end_encoding(enc);
             // The join below returns on this signal (`super::ENV_NO_JOIN_SIGNAL`).
             let sig3 = if super::join_signal_enabled() { gpu.arm_done(cb3) } else { None };
@@ -14278,7 +14388,7 @@ kernel void blake3_pow_seg_tail(
             // the same unit only with the same bytes into the same slots.
             unsafe {
                 let bytes = core::slice::from_raw_parts(bytes_base.ptr().add(start * 1024), unit * 1024);
-                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, unit_levels);
+                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, TAIL_UNIT_LEVELS);
             }
         };
         // cb2's completion as the caller reads it: its armed signal when
@@ -14389,29 +14499,27 @@ kernel void blake3_pow_seg_tail(
         gpu.release(cb3);
         r?;
         crate::tmark::mark("cb3 host woke");
+        // The suffix's levels 11..16 from the unit roots. Level `l`'s first
         // node is rounded down, so a node over the GPU prefix's last 256ths
         // and the suffix's first is rebuilt too: its children on the prefix
         // side are cb2's (every aligned block inside the prefix lies inside
         // one of cb2's greedy subtrees, each complete up to its root).
         let mut ls = 0usize;
         let mut ll = n_leaves;
-        for _ in 0..unit_levels {
+        for _ in 0..TAIL_UNIT_LEVELS {
             ls += ll;
             ll /= 2;
         }
-        let mut lo = suffix_start >> unit_levels;
+        let mut lo = suffix_start >> TAIL_UNIT_LEVELS;
         while ll > 16 {
             let ws = ls + ll;
             let wlo = lo / 2;
-            let mut o = wlo;
-            while o < ll / 2 {
-                let len = 1024.min(ll / 2 - o);
-                unsafe {
-                    let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * o), 2 * len);
-                    let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + o), len);
-                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                }
-                o += len;
+            // SAFETY: every GPU write of the tree is complete (cb2 and cb3
+            // joined above) and every CPU unit is done (the scope joined).
+            unsafe {
+                let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * wlo), ll - 2 * wlo);
+                let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + wlo), ll / 2 - wlo);
+                crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
             }
             ls = ws;
             ll /= 2;
@@ -15105,6 +15213,31 @@ kernel void blake3_pow_seg_tail(
     #[inline]
     fn hybrid_split_valid(k_split: usize) -> bool {
         k_split < 16 || (k_split < 256 && k_split % 16 != 0)
+    }
+
+    /// CPU share of a stored split in 256ths of the position range
+    /// (`16 k + m` for `k + 16 m`); 0 for the pure-GPU split.
+    fn split_cpu_share256(k_split: usize) -> usize {
+        let (k, m) = decode_hybrid_split(k_split);
+        16 * k + m
+    }
+
+    /// `k_split` with `tilt256` more 256ths of CPU share (see
+    /// `super::ENV_NO_SPLIT_CPU_TILT`). The pure-GPU split and invalid values
+    /// are returned unchanged. The share is clamped to the storable hybrid
+    /// range (at least one sixteenth, at most 255/256); without the fine path
+    /// it is rounded to the nearest whole sixteenth (1..=15).
+    fn tilt_split_toward_cpu(k_split: usize, tilt256: usize, allow_fine: bool) -> usize {
+        if tilt256 == 0 || k_split == 0 || !hybrid_split_valid(k_split) {
+            return k_split;
+        }
+        let c = (split_cpu_share256(k_split) + tilt256).clamp(16, 255);
+        if allow_fine {
+            let (k, m) = (c / 16, c % 16);
+            k + 16 * m
+        } else {
+            ((c + 8) / 16).clamp(1, 15)
+        }
     }
 
     /// The cheapest sample's `(gpu, cpu)` arms for split `k`.
@@ -16233,6 +16366,27 @@ kernel void blake3_pow_seg_tail(
                 arms.join(" "),
             );
         }
+        // CPU-ward tilt of the final decision (`super::ENV_NO_SPLIT_CPU_TILT`):
+        // the tilted split is what the dead-store check, the byte
+        // verification and publication below see.
+        let tilt = super::split_cpu_tilt256();
+        let chosen = if tilt > 0 && chosen != 0 {
+            let tilted = tilt_split_toward_cpu(
+                chosen,
+                tilt,
+                hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled(),
+            );
+            if dbg {
+                eprintln!(
+                    "[gpu-commit] split tilt +{tilt}/256: k={chosen} (cpu {}/256) -> k={tilted} (cpu {}/256)",
+                    split_cpu_share256(chosen),
+                    split_cpu_share256(tilted),
+                );
+            }
+            tilted
+        } else {
+            chosen
+        };
 
         let matches_reference = || {
             cpu_codeword.len() == params.codeword_len_f128()
@@ -21529,6 +21683,51 @@ kernel void zc_eq_rows(
     mod hybrid_balance_tests {
         use super::{ARM_SPLIT_MARGIN, arm_window_ms, split_from_arms};
 
+        /// The CPU-ward tilt moves coarse and fine splits by whole 256ths,
+        /// keeps the pure-GPU split and invalid values, clamps to the
+        /// storable range, rounds to whole sixteenths without the fine path,
+        /// and always returns a storable split with at least the input's
+        /// CPU share.
+        #[test]
+        fn cpu_tilt_moves_the_split_by_256ths() {
+            use super::{hybrid_split_valid, split_cpu_share256 as c, tilt_split_toward_cpu as t};
+            assert_eq!(crate::gpu_commit::SPLIT_CPU_TILT_256, 4);
+            assert_eq!(t(5, 0, true), 5);
+            // Coarse k=5 (cpu 80/256) + 4 -> k=5, m=4 (cpu 84/256).
+            assert_eq!(t(5, 4, true), 5 + 16 * 4);
+            assert_eq!(c(t(5, 4, true)), 84);
+            // Fine 6 + 16*9 (cpu 105) + 4 -> 6 + 16*13 (cpu 109).
+            assert_eq!(c(6 + 16 * 9), 105);
+            assert_eq!(t(6 + 16 * 9, 4, true), 6 + 16 * 13);
+            // Fine -> next coarse when the share lands on a whole sixteenth.
+            assert_eq!(t(6 + 16 * 12, 4, true), 7);
+            // Fine carries into the next sixteenth.
+            assert_eq!(t(6 + 16 * 14, 4, true), 7 + 16 * 2);
+            // Without the fine path four 256ths round back to the same k.
+            for k in 1..16usize {
+                assert_eq!(t(k, 4, false), k);
+            }
+            assert_eq!(t(5, 8, false), 6);
+            // Pure GPU and invalid values unchanged; clamp at 255/256.
+            assert_eq!(t(0, 4, true), 0);
+            assert_eq!(t(16, 4, true), 16);
+            assert_eq!(t(15 + 16 * 14, 4, true), 15 + 16 * 15);
+            assert_eq!(c(t(15 + 16 * 14, 4, true)), 255);
+            for k in 1..16usize {
+                for m in 0..16usize {
+                    let s = if m == 0 { k } else { k + 16 * m };
+                    for tilt in [1usize, 3, 4, 8, 16, 64] {
+                        let fine = t(s, tilt, true);
+                        let coarse = t(s, tilt, false);
+                        assert!(hybrid_split_valid(fine), "{s} +{tilt}");
+                        assert!((1..16).contains(&coarse), "{s} +{tilt}");
+                        assert!(c(fine) >= c(s), "{s} +{tilt}");
+                        assert_eq!(c(fine), (c(s) + tilt).min(255), "{s} +{tilt}");
+                    }
+                }
+            }
+        }
+
         #[test]
         fn theil_sen_ignores_one_outlier() {
             let xs = [32.0, 48.0, 64.0, 80.0, 32.0, 48.0, 64.0, 80.0];
@@ -26308,9 +26507,7 @@ kernel void zc_ab_finish(
     /// An in-flight round-one AB completion GPU prefix.
     pub(crate) struct ZcAbJob {
         /// Table build, then gather + finish (same queue, in order; the
-        /// second reads the tables the first wrote, hazard-tracked). With the
-        /// one-buffer submission (`ENV_NO_ZC_AB_SCHED`) `cb_tables` is NIL and
-        /// `cb` holds all three kernels.
+        /// second reads the tables the first wrote, hazard-tracked).
         cb_tables: Id,
         cb: Id,
         /// `cb`'s completion signal (`super::ENV_NO_JOIN_SIGNAL`).
@@ -26461,12 +26658,9 @@ kernel void zc_ab_finish(
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let pool = gpu.pool_push();
-            // One command buffer for the whole arm (`ENV_NO_ZC_AB_SCHED`):
-            // the table build's encoder, then the gather and finish encoder.
-            let one_cb = super::gpu_zc_ab_one_cb_enabled();
             let submitted = (|| -> Result<(Id, Id, Option<DoneSig>), String> {
                 // Command buffer 1: the table build (own GPU wall in the
-                // diagnostics), or the arm's only command buffer.
+                // diagnostics).
                 let cb_tables = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb_tables)?;
                 gpu.set_pipeline(enc, state.tables_pso);
@@ -26475,11 +26669,9 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.tables_buf, 0, 2);
                 gpu.dispatch(enc, ZC_AB_TOPS as u64, 256);
                 gpu.end_encoding(enc);
-                // Command buffer 2 (or the same one): gather, then finish
-                // (serial dispatches of one encoder: the finish reads the banks
-                // the gather wrote; the encoder after the table build's reads
-                // the tables it wrote).
-                let cb = if one_cb { cb_tables } else { gpu.command_buffer()? };
+                // Command buffer 2: gather, then finish (serial dispatches of
+                // one encoder: the finish reads the banks the gather wrote).
+                let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
                 gpu.set_pipeline(enc, state.gather_pso);
                 gpu.set_buffer(enc, ab_buf, 0, 0);
@@ -26498,11 +26690,6 @@ kernel void zc_ab_finish(
                 // Armed in the warm-up's oracle launch too, so the timed
                 // launch finds its event in the pool.
                 let sig = if super::join_signal_enabled() { gpu.arm_done(cb) } else { None };
-                if one_cb {
-                    let cb = gpu.retain(cb);
-                    gpu.commit_async(cb);
-                    return Ok((NIL, cb, sig));
-                }
                 let cb_tables = gpu.retain(cb_tables);
                 let cb = gpu.retain(cb);
                 gpu.commit_async(cb_tables);
@@ -26548,8 +26735,7 @@ kernel void zc_ab_finish(
         unsafe {
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
-            // the table build; the table build's status is checked too (a
-            // one-buffer job has no separate table buffer).
+            // the table build; the table build's status is checked too.
             // A timed join returns on the buffer's signal; the oracle launch
             // waits for the status (it reads the GPU's timestamps).
             let ok = if job.calibration || !super::join_signal_enabled() {
@@ -26557,25 +26743,18 @@ kernel void zc_ab_finish(
             } else {
                 gpu.join_cb_sig(job.cb, job.sig.as_ref(), 2.0)
             }
-            .and_then(|()| if job.cb_tables.is_null() { Ok(()) } else { gpu.wait_cb(job.cb_tables) });
+            .and_then(|()| gpu.wait_cb(job.cb_tables));
             if ok.is_ok() {
                 Gpu::recycle_done(job.sig);
             }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
-            // With one buffer its wall covers the table build as well and is
-            // reported as gather+finish (tables 0).
             let (tables_ms, gather_ms) = if ok.is_ok() {
-                (
-                    if job.cb_tables.is_null() { 0.0 } else { zc_fold_gpu_wall_ms(gpu, job.cb_tables) },
-                    zc_fold_gpu_wall_ms(gpu, job.cb),
-                )
+                (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
             } else {
                 (0.0, 0.0)
             };
             let gpu_ms = tables_ms + gather_ms;
-            if !job.cb_tables.is_null() {
-                gpu.release(job.cb_tables);
-            }
+            gpu.release(job.cb_tables);
             gpu.release(job.cb);
             if let Err(e) = ok {
                 ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);

@@ -96,6 +96,9 @@ pub fn pool_spin_release() {
 /// more: its workers stay in [`imp::pool_spin_body`] until the proof is done
 /// (the existing [`pool_spin_release`] calls after `prove_fast_inner`) and
 /// find the next region's jobs without having been parked. From here on an
+/// Three workers (the one the spin never included and two more) leave the
+/// spin here and park as before, so the spinners never occupy the cores of
+/// Metal's two service threads and the proving thread. Scheduling
 /// only: the same jobs, run by the same pool. `FLOCK_NO_HOT_PROVE=1` restores
 /// the release at this point.
 pub fn pool_spin_witness_done() {
@@ -114,7 +117,10 @@ pub fn pool_spin_witness_done() {
 /// idle round ends in a kernel yield, so a runnable thread outside the pool
 /// still gets a core within one round. Scheduling only: the same jobs, run by
 /// the same pool. Released with the rest of the spin at proof done.
-/// `FLOCK_NO_RESV_HOT=1` keeps the reserved workers parking as before.
+/// `FLOCK_NO_RESV_HOT=1` keeps the reserved workers parking as before. By
+/// default the reserved workers now park (the reserved-worker spin does not
+/// start); `FLOCK_NO_RESV_PARK=1` restores the spin. Both are read once, in
+/// the untimed pool spin start.
 pub fn pool_spin_commit_done() {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     imp::pool_spin_commit_done();
@@ -244,7 +250,11 @@ mod imp {
         HOT_PROVE.store(false, Ordering::Relaxed);
         HOT_PROVE_OFF.store(std::env::var_os("FLOCK_NO_HOT_PROVE").is_some(), Ordering::Relaxed);
         crate::epool::hot_spin_arm();
-        RESV_HOT_OFF.store(std::env::var_os("FLOCK_NO_RESV_HOT").is_some(), Ordering::Relaxed);
+        // Reserved workers park again from the commitment's join on, as before
+        // the reserved-worker spin (`FLOCK_NO_RESV_PARK=1`, exact `1`, keeps
+        // the record's spin). Scheduling only: the same jobs, the same pool.
+        let resv_park = !std::env::var("FLOCK_NO_RESV_PARK").is_ok_and(|v| v == "1");
+        RESV_HOT_OFF.store(resv_park || std::env::var_os("FLOCK_NO_RESV_HOT").is_some(), Ordering::Relaxed);
         crate::lock_spin_arm();
         let deadline = Instant::now() + MAX_KEEPALIVE;
         rayon::spawn_broadcast(move |ctx| {
@@ -260,7 +270,10 @@ mod imp {
     /// Cores the hot-prove spin leaves alone: one each for Metal's submit
     /// thread, Metal's completion thread and the proving thread, the three
     /// threads besides the pool's workers that run on performance cores
-    const HOT_PROVE_RESERVED: usize = 4;
+    /// during a prove. The workers with the highest indices (the one the
+    /// spin never included, and two more) park as before, so spinners plus
+    /// those three never exceed the pool's width.
+    const HOT_PROVE_RESERVED: usize = 3;
 
     const HOT_PROVE_YIELD_EVERY: u32 = 16;
 
