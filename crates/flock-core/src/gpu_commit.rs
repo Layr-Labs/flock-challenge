@@ -3061,6 +3061,37 @@ pub(crate) fn ntt_ab_priority_helpers() -> usize {
     })
 }
 
+/// Kill switch for the split sweep's AB-end pricing under the NTT priority
+/// (see [`ENV_NO_NTT_AB_PRIORITY`]): `FLOCK_NO_TUNE_AB_MIN` (any value)
+/// restores the incumbent pricing and extension rule. Read once per process.
+///
+/// With the NTT ahead of the AB arm, a split's commit window is the latest of
+/// three ends: the GPU's `cb2 + cb3`, the NTT's `ntt + launch + cb3`, and the
+/// AB arm's end. The incumbent folds the AB end into each sample's CPU arm
+/// and adds cb3's launch to it; but cb3 is committed once the NTT is done, so
+/// the AB end never waits for that launch, and an AB replay that a contended
+/// sample stretched raises its split's CPU arm by the whole stretch. With
+/// this on, the sweep keeps the three terms apart: cb2, cb3 and the NTT get
+/// lines through every sample, the AB end a line through each split's
+/// earliest AB end (a contended sample can only end later), and the AB term
+/// carries no cb3 launch. The sweep also samples the next candidate split
+/// whenever the fitted terms still leave the largest split sampled to the
+/// GPU (`cb2 + cb3` above the AB and NTT ends there), not only when that
+/// split's mean host wall is the smallest: one stretched sample at the
+/// boundary split then cannot end the sweep below the crossing. Tuner inputs
+/// only: the chosen split is byte-verified as before, and the fit still
+/// chooses within the sampled range.
+pub const ENV_NO_TUNE_AB_MIN: &str = "FLOCK_NO_TUNE_AB_MIN";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn tune_ab_min_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ntt_ab_priority_enabled() && std::env::var_os(ENV_NO_TUNE_AB_MIN).is_none())
+}
+
 /// Run pending main-pool jobs on this worker until `done()` holds or the pool
 /// has nothing to hand out. Returns without waiting in either case; the caller
 /// then performs its ordinary (exact) wait. No-op off a pool worker.
@@ -15100,10 +15131,129 @@ kernel void blake3_pow_race_tail(
         if let Ok(mut v) = fine_arm_samples().lock() {
             if v.len() == lens.1.wrapping_add(1) {
                 if let Some(s) = v.last_mut() {
+                    if super::tune_ab_min_enabled() {
+                        if let Ok(mut r) = ab_arm_samples().lock() {
+                            r.push((s.0, s.1, s.2, s.3, ab_ms));
+                        }
+                    }
                     s.2 = s.2.max(ab_ms - s.3);
                 }
             }
         }
+    }
+
+    /// Per-sample `(k_split, cb2 GPU ms, CPU suffix NTT ms, cb3 GPU ms, AB
+    /// replay end in ms after cb2's GPU start)` of the split sweep, recorded
+    /// by [`price_ab_end_into_arms`] before it raises the fine row's CPU arm
+    /// (only under `super::ENV_NO_TUNE_AB_MIN`'s pricing).
+    fn ab_arm_samples() -> &'static std::sync::Mutex<Vec<(usize, f64, f64, f64, f64)>> {
+        static V: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64, f64, f64)>>> =
+            std::sync::OnceLock::new();
+        V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// Lines of the window's terms over the CPU share `x` in 256ths, fitted
+    /// through the sweep's samples (see `super::ENV_NO_TUNE_AB_MIN`): cb2,
+    /// cb3 and the NTT take Theil-Sen lines through every coarse sample, the
+    /// AB end one through each sampled split's earliest AB end (a contended
+    /// sample only ever ends later). `None` with fewer than three sampled
+    /// splits, or unless the prefix shrinks and the NTT grows with the CPU
+    /// share (otherwise the lines describe noise, not the arms).
+    struct AbMinLines {
+        cb2: (f64, f64),
+        ntt: (f64, f64),
+        cb3: (f64, f64),
+        ab: (f64, f64),
+        lo: usize,
+        hi: usize,
+    }
+
+    impl AbMinLines {
+        fn fit(samples: &[(usize, f64, f64, f64, f64)]) -> Option<Self> {
+            let rows: Vec<&(usize, f64, f64, f64, f64)> = samples
+                .iter()
+                .filter(|s| {
+                    let (k, m) = decode_hybrid_split(s.0);
+                    m == 0 && (1..=ARM_SPLIT_MAX_K).contains(&k)
+                })
+                .collect();
+            let mut ks: Vec<usize> = rows.iter().map(|s| s.0).collect();
+            ks.sort_unstable();
+            ks.dedup();
+            if ks.len() < 3 {
+                return None;
+            }
+            let xs: Vec<f64> = rows.iter().map(|s| 16.0 * s.0 as f64).collect();
+            let col = |f: fn(&(usize, f64, f64, f64, f64)) -> f64| rows.iter().map(|s| f(s)).collect::<Vec<f64>>();
+            let cb2 = theil_sen(&xs, &col(|s| s.1))?;
+            let ntt = theil_sen(&xs, &col(|s| s.2))?;
+            let cb3 = theil_sen(&xs, &col(|s| s.3))?;
+            let kx: Vec<f64> = ks.iter().map(|&k| 16.0 * k as f64).collect();
+            let ab_min: Vec<f64> = ks
+                .iter()
+                .map(|&k| rows.iter().filter(|s| s.0 == k).map(|s| s.4).fold(f64::INFINITY, f64::min))
+                .collect();
+            let ab = theil_sen(&kx, &ab_min)?;
+            let all = [cb2.0, cb2.1, ntt.0, ntt.1, cb3.0, cb3.1, ab.0, ab.1];
+            if !(cb2.1 < 0.0 && ntt.1 > 0.0 && all.iter().all(|v| v.is_finite())) {
+                return None;
+            }
+            Some(AbMinLines { cb2, ntt, cb3, ab, lo: 16 * ks[0], hi: 16 * ks[ks.len() - 1] })
+        }
+
+        /// `(gpu, ntt, ab)` ends at CPU share `c` (256ths): `cb2 + cb3`,
+        /// `ntt + lat + cb3`, and the AB end. The AB term carries no cb3
+        /// launch: cb3 is committed when the NTT is done, whether or not the
+        /// AB arm still runs.
+        fn terms(&self, c: usize, lat: f64) -> (f64, f64, f64) {
+            let x = c as f64;
+            let line = |l: (f64, f64)| l.0 + l.1 * x;
+            let h = line(self.cb3).max(0.0);
+            (line(self.cb2) + h, line(self.ntt) + lat + h, line(self.ab))
+        }
+    }
+
+    /// Whether the window at split `k` (sixteenths, the largest sampled so
+    /// far) is still the GPU's by the fitted terms: `cb2 + cb3` above both
+    /// the AB end and `ntt + lat + cb3`. The window then shrinks toward a
+    /// larger CPU share, past the sampled range (see
+    /// `super::ENV_NO_TUNE_AB_MIN`).
+    fn ab_min_gpu_bound_at(k: usize, lat: f64) -> bool {
+        let rows = ab_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        let Some(l) = AbMinLines::fit(&rows) else { return false };
+        if !lat.is_finite() || l.hi != 16 * k {
+            return false;
+        }
+        let (gpu, ntt, ab) = l.terms(16 * k, lat);
+        gpu > ab.max(ntt)
+    }
+
+    /// The split, in the storable `k + 16 * m` form, that minimises the
+    /// window `max(cb2 + cb3, ntt + lat + cb3, ab)` of [`AbMinLines`] over
+    /// the sampled range, or `None` to keep the incumbent pricing (see
+    /// `super::ENV_NO_TUNE_AB_MIN`).
+    fn split_from_ab_min_fit(
+        samples: &[(usize, f64, f64, f64, f64)],
+        allow_fine: bool,
+        lat: f64,
+    ) -> Option<usize> {
+        let l = AbMinLines::fit(samples)?;
+        if !lat.is_finite() {
+            return None;
+        }
+        let mut best = (0usize, f64::INFINITY);
+        for c in (l.lo..=l.hi).step_by(if allow_fine { 1 } else { 16 }) {
+            let (gpu, ntt, ab) = l.terms(c, lat);
+            let w = gpu.max(ntt).max(ab);
+            if w < best.1 {
+                best = (c, w);
+            }
+        }
+        let (k, m) = (best.0 / 16, best.0 % 16);
+        if k == 0 || k >= 16 {
+            return None;
+        }
+        Some(k + 16 * m)
     }
 
     fn record_fine_arms(k_split: usize, cb2_ms: f64, cpu_ms: f64, cb3_ms: f64) {
@@ -15512,7 +15662,17 @@ kernel void blake3_pow_race_tail(
     /// the boundary has the strictly smallest mean, stopping at k=7.
     fn collect_ranked_exact_samples<E>(
         extend: bool,
+        sample: impl FnMut(usize) -> Result<f64, E>,
+    ) -> Result<Vec<[f64; 2]>, E> {
+        collect_ranked_exact_samples_with(extend, sample, |_| false)
+    }
+
+    /// [`collect_ranked_exact_samples`] that also extends while
+    /// `also_extend(k)` holds for the largest candidate `k` sampled so far.
+    fn collect_ranked_exact_samples_with<E>(
+        extend: bool,
         mut sample: impl FnMut(usize) -> Result<f64, E>,
+        also_extend: impl Fn(usize) -> bool,
     ) -> Result<Vec<[f64; 2]>, E> {
         let mut walls = vec![[0.0; 2]; RANKED_EXACT_INITIAL_CANDIDATES];
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate() {
@@ -15524,7 +15684,9 @@ kernel void blake3_pow_race_tail(
         while extend && walls.len() < RANKED_EXACT_TUNE_CANDIDATES.len() {
             let Some(means) = mean_ranked_exact_samples(&walls) else { break };
             let boundary = means[means.len() - 1];
-            if !means[..means.len() - 1].iter().all(|&m| boundary < m) {
+            if !means[..means.len() - 1].iter().all(|&m| boundary < m)
+                && !also_extend(RANKED_EXACT_TUNE_CANDIDATES[walls.len() - 1])
+            {
                 break;
             }
             let k = RANKED_EXACT_TUNE_CANDIDATES[walls.len()];
@@ -16076,8 +16238,16 @@ kernel void blake3_pow_race_tail(
             if let Ok(mut v) = cb3_launch_latency_samples().lock() {
                 v.clear();
             }
+            if let Ok(mut v) = ab_arm_samples().lock() {
+                v.clear();
+            }
             let _recording = ArmRecordScope::enter();
-            match collect_ranked_exact_samples(extend, sample) {
+            // See `super::ENV_NO_TUNE_AB_MIN`: also sample the next split
+            // while the largest one sampled is still GPU-bound.
+            let ab_min = super::tune_ab_min_enabled();
+            match collect_ranked_exact_samples_with(extend, sample, |k| {
+                ab_min && ab_min_gpu_bound_at(k, tune_cb3_launch_latency_ms())
+            }) {
                 Ok(samples) => samples,
                 Err(e) => {
                     if dbg {
@@ -16117,12 +16287,25 @@ kernel void blake3_pow_race_tail(
             None => swept,
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        let ab_rows = if super::tune_ab_min_enabled() {
+            ab_arm_samples().lock().map(|v| v.clone()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let fit = if tune_fit_enabled() && chosen != 0 {
-            split_from_fit(
-                &fine_samples,
-                hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled(),
-                tune_cb3_launch_latency_ms(),
-            )
+            let allow_fine = hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled();
+            let lat = tune_cb3_launch_latency_ms();
+            // See `super::ENV_NO_TUNE_AB_MIN`; without its samples (switch
+            // set, or no NTT priority) this is the incumbent fit.
+            let ab_fit = split_from_ab_min_fit(&ab_rows, allow_fine, lat);
+            if dbg && super::tune_ab_min_enabled() {
+                eprintln!(
+                    "[gpu-commit] ab-min fit: {ab_fit:?} over {} samples, incumbent fit {:?}",
+                    ab_rows.len(),
+                    split_from_fit(&fine_samples, allow_fine, lat),
+                );
+            }
+            ab_fit.or_else(|| split_from_fit(&fine_samples, allow_fine, lat))
         } else {
             None
         };
@@ -21336,6 +21519,39 @@ kernel void zc_eq_rows(
             assert_eq!(super::split_from_fit(&s[..1], true, 0.0), None);
             let flat: Vec<_> = s.iter().map(|r| (r.0, 40.0, 40.0 - r.0 as f64, 1.0)).collect();
             assert_eq!(super::split_from_fit(&flat, true, 0.0), None);
+        }
+
+        #[test]
+        fn split_from_ab_min_fit_prices_each_split_by_its_earliest_ab_end() {
+            // cb2 = 44 - 0.15 c, cb3 = 1, ntt = 0.2 c, AB end = 24 + 0.1 c
+            // (256ths), with the first sample of every split stretched by 3:
+            // the window max(cb2 + cb3, ntt + lat + cb3, ab) of the earliest
+            // AB ends is minimal at c = 84, whatever the cb3 launch.
+            let mut s = Vec::new();
+            let mut seen = Vec::new();
+            for k in [2usize, 3, 4, 5, 5, 4, 3, 2, 6, 6] {
+                let c = 16.0 * k as f64;
+                let stretch = if seen.contains(&k) { 0.0 } else { 3.0 };
+                seen.push(k);
+                s.push((k, 44.0 - 0.15 * c, 0.2 * c, 1.0, 24.0 + 0.1 * c + stretch));
+            }
+            for lat in [0.0, 0.5] {
+                let fine = super::split_from_ab_min_fit(&s, true, lat).unwrap();
+                assert_eq!(super::decode_hybrid_split(fine), (5, 4), "lat {lat}");
+            }
+            assert_eq!(super::split_from_ab_min_fit(&s, false, 0.0), Some(5));
+            // Through split 5 the window is still the GPU's at the largest
+            // split sampled; through split 6 it is not.
+            let l = super::AbMinLines::fit(&s[..8]).unwrap();
+            let (gpu, ntt, ab) = l.terms(l.hi, 0.0);
+            assert!(l.hi == 80 && gpu > ab.max(ntt), "{gpu} {ntt} {ab}");
+            let l = super::AbMinLines::fit(&s).unwrap();
+            let (gpu, ntt, ab) = l.terms(l.hi, 0.0);
+            assert!(l.hi == 96 && gpu < ab.max(ntt), "{gpu} {ntt} {ab}");
+            // Too few distinct splits, or an NTT that does not grow: no fit.
+            assert_eq!(super::split_from_ab_min_fit(&s[..2], true, 0.0), None);
+            let flat: Vec<_> = s.iter().map(|r| (r.0, r.1, 5.0, r.3, r.4)).collect();
+            assert_eq!(super::split_from_ab_min_fit(&flat, true, 0.0), None);
         }
 
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
