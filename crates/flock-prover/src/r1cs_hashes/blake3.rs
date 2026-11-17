@@ -2730,15 +2730,60 @@ pub(crate) mod witgen_simd {
 
     /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR. M = 32 − N is
     /// spelled out at the call site (stable Rust cannot derive const
-    /// arguments from const parameters). The `vsri` shift-right-and-insert
-    /// form fuses the shl+shr+orr into one insert instruction, mirroring
-    /// the BLAKE3 rotate idiom in `merkle/blake3_neon_apple.rs`.
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
         unsafe {
             let v = veorq_u32(x, y);
-            vsriq_n_u32(vshlq_n_u32::<M>(v), v, N)
+            if N == 16 {
+                vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(v)))
+            } else if N == 8 && cfg!(target_endian = "little") {
+                let indices = [1u8, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
+                vreinterpretq_u32_u8(vqtbl1q_u8(
+                    vreinterpretq_u8_u32(v), vld1q_u8(indices.as_ptr()),
+                ))
+            } else {
+                vsriq_n_u32(vshlq_n_u32::<M>(v), v, N)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn rotate8_byte_permutation_matches_scalar() {
+        fn check<const N: i32, const M: i32>(x: [u32; 4], y: [u32; 4]) {
+            let got: [u32; 4] = unsafe {
+                core::mem::transmute(xor_rotr::<N, M>(
+                    vld1q_u32(x.as_ptr()), vld1q_u32(y.as_ptr()),
+                ))
+            };
+            let want = core::array::from_fn(|i| (x[i] ^ y[i]).rotate_right(N as u32));
+            assert_eq!(got, want, "rotation {N}: x={x:?} y={y:?}");
+        }
+        let mut state = 0x5238_5749_544e_4553u64;
+        for case in 0..1154usize {
+            let x = core::array::from_fn(|lane| {
+                if case < 128 {
+                    if lane == case / 32 { 1u32 << (case % 32) } else { 0 }
+                } else if case == 128 {
+                    u32::MAX
+                } else if case == 129 {
+                    0
+                } else {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (state >> 32) as u32
+                }
+            });
+            let y = core::array::from_fn(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state >> 32) as u32
+            });
+            for mask in [[0; 4], y] {
+                check::<8, 24>(x, mask);
+                check::<16, 16>(x, mask);
+                check::<12, 20>(x, mask);
+                check::<7, 25>(x, mask);
+            }
         }
     }
 
