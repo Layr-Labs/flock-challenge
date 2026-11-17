@@ -8210,7 +8210,7 @@ fn materialize_direct_fold8(
                     }
                     let job = zf_cell.get().and_then(|j| j.as_ref());
                     let (block, from_gpu) = {
-                        let mut g = zf_claims.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut g = crate::lock_spin(&zf_claims).unwrap_or_else(|e| e.into_inner());
                         assert!(g.0 < g.1, "z-fold claim queue overrun");
                         if job.is_some_and(|job| job.block_ready(g.0)) {
                             g.0 += 1;
