@@ -901,6 +901,40 @@ pub(crate) const ZC_R2_CS_SHARE_CEIL_PCT: usize = 43;
 /// means the oracle dispatch did not run or its timestamps are broken.
 pub(crate) const ZC_R2_CS_PRICE_FLOOR: f64 = 0.15;
 
+/// Kill switch for the R2-CS ceiling offer (`FLOCK_NO_R2_OFFER_CEIL`, any
+/// value: the timed prefix is the priced share, as before).
+///
+/// The priced share comes from one warm-up sample of each arm (the CPU's
+/// from the warm-up prove's single sweep), and between otherwise identical
+/// processes it lands on either side of the split at which the two arms end
+/// together. Since the late-GPU steal ([`ENV_NO_R2_STEAL`]) the two sides
+/// are not alike: a prefix that is too long is cut in the timed prove itself
+/// (the CPU sweep, once its own chunks are walked, takes the GPU's chunks
+/// from the top of the prefix downward until the GPU signals), while a
+/// prefix that is too short leaves the GPU idle and nothing corrects it. So
+/// with the steal kernel built and the measured share on (the anchors view
+/// and the A/B rebuild's published prefix are then made over the ceiling
+/// already), the share published for the timed proves is the ceiling
+/// ([`ZC_R2_CS_SHARE_CEIL_PCT`] percent of `hi`), never less than the priced
+/// share, and the steal settles the split. Which side walks a chunk cannot
+/// change a bit (the steal's own argument). Read once per process.
+pub const ENV_NO_R2_OFFER_CEIL: &str = "FLOCK_NO_R2_OFFER_CEIL";
+
+/// Chunks of `hi` the ceiling offer publishes as the timed prefix: the
+/// measured share's ceiling. Never above the A/B rebuild's published prefix
+/// (the same expression, `zerocheck::univariate_skip_optimized`) nor above
+/// the anchors view ([`zc_r2_cs_view_chunks`]); a unit test holds both.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_r2_offer_ceil_chunks(hi: usize) -> usize {
+    hi * ZC_R2_CS_SHARE_CEIL_PCT / 100
+}
+
+pub(crate) fn zc_r2_offer_ceil_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_R2_OFFER_CEIL).is_none());
+    *ON && zc_r2_steal_enabled() && zc_r2_cs_measured_share_enabled()
+}
+
 pub(crate) fn zc_r2_cs_measured_share_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| !env_is_one(ENV_NO_ZC_R2_CS_SHARE));
@@ -24844,6 +24878,14 @@ kernel void zc_r2_horner_oracle(
                 ZC_R2_CS_MODE.store(ZC_R2_CS_DISABLED, Ordering::Relaxed);
             } else {
                 share = g;
+                // Ceiling offer (`super::ENV_NO_R2_OFFER_CEIL`): with the
+                // steal kernel built, the timed prefix is the ceiling and
+                // the steal settles the split.
+                if super::zc_r2_offer_ceil_enabled()
+                    && ZC_R2_STEAL_KERNEL.load(Ordering::Relaxed)
+                {
+                    share = share.max(super::zc_r2_offer_ceil_chunks(hi_size));
+                }
                 ZC_R2_TUNED.store(share, Ordering::Relaxed);
             }
         }
