@@ -1148,7 +1148,7 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 /// on an M1 Max balances near 740 of the 2048 chunks (13.2 ms at 512, 12.0 at
 /// 640, 11.9 at 768, 13.7 at 896); the runner's GPU is at least 2.1x this
 /// one's, so 768 stays CPU-critical there.
-const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 768;
+const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 1024;
 
 pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
 const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
@@ -2994,6 +2994,14 @@ pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
 pub(crate) fn gpu_t3_bytetab_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB").is_none())
+}
+
+/// Kill switch for the peeled first Horner step of the GPU table products
+/// (g4x2 passes, final pass): `FLOCK_NO_GPU_MULPEEL` (any value) keeps the
+/// incumbent loops. Both forms write the same bytes.
+pub(crate) fn gpu_mulpeel_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_MULPEEL").is_none())
 }
 
 /// Hybrid-split GPU prefix uses the fused final NTT pass + Merkle leaf kernel
@@ -6205,6 +6213,130 @@ kernel void export_from_z_zero_root_tabs(
 }
 "#;
 
+    // Peeled first Horner step of the GPU table products, as (incumbent text,
+    // peeled text). Each product starts from a zero accumulator, and its
+    // first step (i = 7) shifts that zero (`gf_shl16(0) = 0`) before XORing
+    // in the lookups of the top 16-bit digit, `(v[3] >> 16) & 0xffff =
+    // v.w >> 16`. The peeled form starts the accumulator at those lookups and
+    // runs the loop for i = 6..0 only: the same table entries are XORed into
+    // the same accumulators, so every product is unchanged.
+    const MULPEEL_BYTE16_X2: (&str, &str) = (
+        "    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    }
+",
+        "    uint ha = vb.w >> 16;
+    uint4 b = tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+    ha = va.w >> 16;
+    uint4 a = tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+    for (int i = 6; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    }
+",
+    );
+
+    /// `gf_mul_mid3_x2`: the first step writes `.xy` and `.z` of a zero
+    /// accumulator, `.w` stays zero.
+    const MULPEEL_MID3_X2: (&str, &str) = (
+        "    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        const uint la = ha & 255u, ua = 256u + (ha >> 8);
+        const uint lb = hb & 255u, ub = 256u + (hb >> 8);
+        a.xy ^= t2[la] ^ t2[ua];
+        a.z  ^= t1[la] ^ t1[ua];
+        b.xy ^= t2[lb] ^ t2[ub];
+        b.z  ^= t1[lb] ^ t1[ub];
+    }
+",
+        "    uint ha = vb.w >> 16;
+    uint4 b = uint4(t2[ha & 255u] ^ t2[256u + (ha >> 8)], t1[ha & 255u] ^ t1[256u + (ha >> 8)], 0u);
+    ha = va.w >> 16;
+    uint4 a = uint4(t2[ha & 255u] ^ t2[256u + (ha >> 8)], t1[ha & 255u] ^ t1[256u + (ha >> 8)], 0u);
+    for (int i = 6; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        const uint la = ha & 255u, ua = 256u + (ha >> 8);
+        const uint lb = hb & 255u, ub = 256u + (hb >> 8);
+        a.xy ^= t2[la] ^ t2[ua];
+        a.z  ^= t1[la] ^ t1[ua];
+        b.xy ^= t2[lb] ^ t2[ub];
+        b.z  ^= t1[lb] ^ t1[ub];
+    }
+",
+    );
+
+    /// `gf_mul_short2_x2`: the first step writes `.xy` of a zero
+    /// accumulator, `.zw` stay zero.
+    const MULPEEL_SHORT2_X2: (&str, &str) = (
+        "    uint4 a = uint4(0u);
+    uint4 b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a.xy ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+        b.xy ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    }
+",
+        "    uint ha = vb.w >> 16;
+    uint4 b = uint4(tab[ha & 255u] ^ tab[256u + (ha >> 8)], 0u, 0u);
+    ha = va.w >> 16;
+    uint4 a = uint4(tab[ha & 255u] ^ tab[256u + (ha >> 8)], 0u, 0u);
+    for (int i = 6; i >= 0; i--) {
+        a = gf_shl16(a);
+        b = gf_shl16(b);
+        ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a.xy ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
+        b.xy ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    }
+",
+    );
+
+    /// Text that occurs once per peeled loop and in no incumbent source.
+    const MULPEEL_MARK: &str = "for (int i = 6; i >= 0; i--)";
+
+    /// `base` with every loop of `loops` peeled (built once into `cell`), or
+    /// `base` itself when `FLOCK_NO_GPU_MULPEEL` is set or any loop's
+    /// incumbent text does not occur exactly once.
+    fn mulpeel_source(
+        base: &'static str,
+        cell: &'static std::sync::OnceLock<Option<String>>,
+        loops: &[(&str, &str)],
+    ) -> &'static str {
+        if !super::gpu_mulpeel_enabled() {
+            return base;
+        }
+        cell.get_or_init(|| splice_exact(base, loops)).as_deref().unwrap_or(base)
+    }
+
+    /// `NTT_G4X2_TWL_MSL_SOURCE` with the peeled `gf_mul_byte16_x2`; the base
+    /// of the prefetch g4x2 and zero-lane g4x2 sources.
+    fn g4x2_twl_source() -> &'static str {
+        static CELL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        mulpeel_source(NTT_G4X2_TWL_MSL_SOURCE, &CELL, &[MULPEEL_BYTE16_X2])
+    }
+
     /// The zero-root library source in use: `FROM_Z_ZERO_ROOT_MSL_SOURCE` with
     /// the table bases formed by `bank` four-bit shifts (`gf_shl4_zero_root`)
     /// instead of `4 * bank` single-bit steps, unless
@@ -6323,11 +6455,13 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// failure leaves `ntt_fused_reg4g4` in place.
     /// The g4x2 library source in use: the twiddle-prefetch form unless
     /// `FLOCK_NO_GPU_TW_PREFETCH` is set.
+    /// Both with the peeled `gf_mul_byte16_x2` (`MULPEEL_BYTE16_X2`).
     fn g4x2_msl_source() -> &'static str {
         if super::gpu_tw_prefetch_enabled() {
-            NTT_G4X2_TWL_MSL_SOURCE
+            g4x2_twl_source()
         } else {
-            NTT_G4X2_MSL_SOURCE
+            static CELL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            mulpeel_source(NTT_G4X2_MSL_SOURCE, &CELL, &[MULPEEL_BYTE16_X2])
         }
     }
 
@@ -6401,7 +6535,7 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// the 7 zero columns of every odd tile are never loaded or stored.
     /// `None` if an anchor drifted (the encoders then keep the dense grid).
     pub(crate) fn g4x2_zero_lane_msl_source() -> Option<String> {
-        let base = NTT_G4X2_TWL_MSL_SOURCE;
+        let base = g4x2_twl_source();
         // Column c of block B -> (position, lane): tile pair q = c / 121, the
         // pair's first 64 columns are the even tile's lanes, the next 57 the
         // odd tile's lanes 0..56. Recomputed at the stores (not held live
@@ -6987,8 +7121,17 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
         Some(src.replacen(old, T3_BYTETAB2, 1))
     }
 
+    /// `NTT_FINAL_T3_MSL_SOURCE` with its three byte-table products peeled
+    /// (`MULPEEL_*`), then the sub-layer 3 / sub-layer 2 table splices. The
+    /// fused final-leaf source starts with this text.
     fn final_t3_msl_source() -> std::borrow::Cow<'static, str> {
-        let mut s = std::borrow::Cow::Borrowed(NTT_FINAL_T3_MSL_SOURCE);
+        static CELL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let base = mulpeel_source(
+            NTT_FINAL_T3_MSL_SOURCE,
+            &CELL,
+            &[MULPEEL_BYTE16_X2, MULPEEL_MID3_X2, MULPEEL_SHORT2_X2],
+        );
+        let mut s = std::borrow::Cow::Borrowed(base);
         if super::gpu_t3_bytetab_enabled() {
             if let Some(x) = with_t3_bytetab3(&s) {
                 s = std::borrow::Cow::Owned(x);
@@ -11232,6 +11375,17 @@ kernel void blake3_pow_seg_tail(
                 } else {
                     NIL
                 };
+                if window_trace_enabled() {
+                    let peeled = |live: bool, src: &str| if live { src.matches(MULPEEL_MARK).count() } else { 0 };
+                    eprintln!(
+                        "[gpu-window] mulpeel {}: peeled loops per built pipeline: g4x2 {} zl {} final {} leaf {}",
+                        if super::gpu_mulpeel_enabled() { "on" } else { "off" },
+                        peeled(!pso_ntt4g4x2.is_null(), &g4x2_pipeline_msl_source()),
+                        peeled(!pso_ntt4g4x2_zl.is_null(), &g4x2_zero_lane_msl_source().unwrap_or_default()),
+                        peeled(!pso_ntt5t3.is_null(), &final_t3_msl_source()),
+                        peeled(!pso_final_leaf.is_null(), &final_leaf_pipeline_msl_source()),
+                    );
+                }
                 Ok(Gpu {
                     api,
                     device,
@@ -14811,6 +14965,17 @@ kernel void blake3_pow_seg_tail(
                             (cb2_e - cb2_s) * 1e3,
                             (cb3_e - cb2_s) * 1e3
                         );
+                        if let Some(h) = fine_head_of(cb2) {
+                            let (hs, he) = cb_gpu_interval(gpu, h);
+                            let (cs, ce) = cb_gpu_interval(gpu, cb2);
+                            eprintln!(
+                                "[gpu-window] cb2 parts: head gpu dur {:.3} ms, cb2 own gpu dur {:.3} ms, \
+                                 head end to cb2 start {:.3} ms",
+                                (he - hs) * 1e3,
+                                (ce - cs) * 1e3,
+                                (cs - he) * 1e3
+                            );
+                        }
                     }
                     }
                     if fine_m > 0 {
