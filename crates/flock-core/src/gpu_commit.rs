@@ -1622,14 +1622,14 @@ pub(crate) fn warmup_latch_cache_enabled() -> bool {
 /// CPU waiting on cb2. In harness-style runs on an M4 the tuned split's
 /// timed CPU suffix is done 4-12 ms (median about 7) before cb2 ends. A
 /// small tilt moves a little of the prefix's NTT and leaf work to the side
-/// that waits. One 256th is 4,096 of the 2^20 leaves; four are a quarter of
+/// that waits. One 256th is 4,096 of the 2^20 leaves; twelve are three quarters of
 /// the sixteenth the sweep steps by, and on the M4 the sweep's own samples
-/// grow the CPU arm by about 0.4 ms per 256th, so four stay well inside the
-/// wait there.
+/// grow the CPU arm by about 0.4 ms per 256th, so twelve (about 4.8 ms) stay
+/// inside the median wait there.
 ///
 /// The pure-GPU split and invalid values are left alone; without the fine
-/// path the tilted share is rounded to whole sixteenths (so four 256ths
-/// change nothing there). Every split computes the same codeword and tree,
+/// path the tilted share is rounded to whole sixteenths (so twelve 256ths
+/// move a coarse split by one sixteenth there). Every split computes the same codeword and tree,
 /// so the proof bytes are unchanged. Read once per process.
 pub const ENV_NO_SPLIT_CPU_TILT: &str = "FLOCK_NO_SPLIT_CPU_TILT";
 
@@ -1640,8 +1640,9 @@ pub const ENV_NO_SPLIT_CPU_TILT: &str = "FLOCK_NO_SPLIT_CPU_TILT";
 pub const ENV_SPLIT_CPU_TILT: &str = "FLOCK_SPLIT_CPU_TILT";
 
 /// Default CPU-ward tilt of the tuned commit split, in 256ths of the
-/// position range (see [`ENV_NO_SPLIT_CPU_TILT`]).
-pub(crate) const SPLIT_CPU_TILT_256: usize = 4;
+/// position range (see [`ENV_NO_SPLIT_CPU_TILT`]): twelve. The previous
+/// default of four is `FLOCK_SPLIT_CPU_TILT=4`.
+pub(crate) const SPLIT_CPU_TILT_256: usize = 12;
 
 /// The tilt in 256ths (see [`ENV_NO_SPLIT_CPU_TILT`]).
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
@@ -21899,7 +21900,7 @@ kernel void zc_eq_rows(
         #[test]
         fn cpu_tilt_moves_the_split_by_256ths() {
             use super::{hybrid_split_valid, split_cpu_share256 as c, tilt_split_toward_cpu as t};
-            assert_eq!(crate::gpu_commit::SPLIT_CPU_TILT_256, 4);
+            assert_eq!(crate::gpu_commit::SPLIT_CPU_TILT_256, 12);
             assert_eq!(t(5, 0, true), 5);
             // Coarse k=5 (cpu 80/256) + 4 -> k=5, m=4 (cpu 84/256).
             assert_eq!(t(5, 4, true), 5 + 16 * 4);
