@@ -1418,6 +1418,18 @@ pub(crate) fn r2_fold7_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_FOLD7").is_none())
 }
 
+/// Whether the ranked round-two producers write their 16 B/pair delta slots
+/// with the non-temporal pair hint (`FLOCK_NO_R2_NT_DELTAS=1` restores the
+/// incumbent write-back `stp`). The deltas' only reader is the cascade K
+/// pass, which runs far past L2; the anchors beside them are already
+/// non-temporal. The store bytes are identical either way. Read once per
+/// process; the head-rewrite producers below the tail-compacted layout keep
+/// the plain form regardless.
+pub(crate) fn r2_nt_deltas_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_NT_DELTAS").is_none())
+}
+
 /// Whether the calling thread is one of the efficiency-core helpers
 /// (`flock-ecore-*`, see `epool`), cached per thread. Their L1 data cache
 /// (64 KiB) holds the 32 KiB byte banks but not the 64 KiB seven-piece table,
@@ -1462,7 +1474,9 @@ pub(crate) fn zc_k_fold7_enabled() -> bool {
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7<
+    const XB: bool,
+>(
     table7: *const u8,
     rho2: F128,
     anchors: *const F128,
@@ -1479,11 +1493,50 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
     head_b: F128,
 ) -> bool {
     unsafe {
-        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, true>(
+        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, true, XB>(
             table7, rho2, anchors, deltas, a_out, b_out, eq_prep, out_pairs, degen, out, bpack,
             tail_compact, head_compact, head_b,
         )
     }
+}
+
+/// Whether the one-table fused K kernel scales its group rows by the
+/// window weights `lambda * x^{2j}` instead of reading each group's
+/// prepared weight pair (`FLOCK_NO_ZC_K_XB=1` keeps the prepared weights).
+/// Read once per process; the arm only runs when
+/// [`k_full_xb_weights`] confirms the relation for the actual challenges.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) fn zc_k_xb_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_XB").is_none())
+}
+
+/// Whether the one-table fused K kernel's group weights `eq_lo[2t + 1]`
+/// factor as `lambda * x^{2 j}` inside every window of eight groups
+/// (`t = first + j`, `lambda = eq_lo[2 first + 1]`), so the kernel can
+/// scale each group's rows by `x^{2 j}` alone ([`mul_xb_q`], no load) and
+/// fold the window's `lambda` into its sums once. The relation holds when
+/// the eq's low dimensions are the beta-folded protocol constants; it is
+/// checked here for the actual challenge vector, so any shape that does
+/// not satisfy it keeps the incumbent prepared weights.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) fn k_full_xb_weights(eq_lo: &[F128], lo_size: usize) -> bool {
+    let n_groups = lo_size / 2;
+    if n_groups == 0 || !n_groups.is_multiple_of(8) {
+        return false;
+    }
+    for first in (0..n_groups).step_by(8) {
+        let lambda = eq_lo[2 * first + 1];
+        if lambda == F128::ZERO {
+            return false;
+        }
+        for j in 1..8 {
+            if eq_lo[2 * (first + j) + 1] != lambda * F128::new(1u64 << (2 * j), 0) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The seven-piece table ([`FOLD7_ENTRIES`]) of the eight byte banks at the
@@ -1961,6 +2014,7 @@ unsafe fn r2_pair_fold_and_store<const F7: bool>(
     degen: bool,
     b_ones: core::arch::aarch64::uint64x2_t,
     skip_dead: bool,
+    nt_deltas: bool,
 ) -> (
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
@@ -2013,14 +2067,22 @@ unsafe fn r2_pair_fold_and_store<const F7: bool>(
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_rows_g::<F7>(table_data, a0_code, a1_code);
             store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b_ones);
-            store_delta_a_only_gpr(deltas.add(x_lo * 16), a0_code, a1_code);
+            if nt_deltas {
+                store_delta_a_only_gpr_nt(deltas.add(x_lo * 16), a0_code, a1_code);
+            } else {
+                store_delta_a_only_gpr(deltas.add(x_lo * 16), a0_code, a1_code);
+            }
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_rows_g::<F7>(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt(anchors.add(2 * x_lo), a0, b0);
-        store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+        if nt_deltas {
+            store_delta_pair_gpr_nt(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+        } else {
+            store_delta_pair_gpr(deltas.add(x_lo * 16), a0_code, a1_code, b0_code, b1_code);
+        }
         (a0, a1, b0, b1, false)
     }
 }
@@ -2039,6 +2101,7 @@ unsafe fn r2_pair_fold_and_store_off<const F7: bool, const CODE: usize, const AN
     deltas: *mut u8,
     degen: bool,
     b_ones: core::arch::aarch64::uint64x2_t,
+    nt_deltas: bool,
 ) -> (
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
@@ -2055,14 +2118,22 @@ unsafe fn r2_pair_fold_and_store_off<const F7: bool, const CODE: usize, const AN
         if degen && (b0_code & b1_code) == u64::MAX {
             let (a0, a1) = fold_two_rows_g::<F7>(table_data, a0_code, a1_code);
             store_anchor_pair_nt_off::<ANC>(anchors, a0, b_ones);
-            store_delta_a_only_gpr_off::<CODE>(deltas, a0_code, a1_code);
+            if nt_deltas {
+                store_delta_a_only_gpr_nt_off::<CODE>(deltas, a0_code, a1_code);
+            } else {
+                store_delta_a_only_gpr_off::<CODE>(deltas, a0_code, a1_code);
+            }
             return (a0, a1, b_ones, b_ones, true);
         }
 
         let (a0, a1, b0, b1) =
             fold_four_rows_g::<F7>(table_data, a0_code, a1_code, b0_code, b1_code);
         store_anchor_pair_nt_off::<ANC>(anchors, a0, b0);
-        store_delta_pair_gpr_off::<CODE>(deltas, a0_code, a1_code, b0_code, b1_code);
+        if nt_deltas {
+            store_delta_pair_gpr_nt_off::<CODE>(deltas, a0_code, a1_code, b0_code, b1_code);
+        } else {
+            store_delta_pair_gpr_off::<CODE>(deltas, a0_code, a1_code, b0_code, b1_code);
+        }
         (a0, a1, b0, b1, false)
     }
 }
@@ -2451,11 +2522,11 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
 
                 let rows0 = r2_pair_fold_and_store::<F7>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo0, pad0, degen, b_ones,
-                    skip_dead,
+                    skip_dead, false,
                 );
                 let rows1 = r2_pair_fold_and_store::<F7>(
                     table_data, a_packed, b_packed, anchors, deltas, x_lo1, pad1, degen, b_ones,
-                    skip_dead,
+                    skip_dead, false,
                 );
                 process_group!(rows0, rows1, vld1q_u64(eq_lo.add(x_lo1).cast::<u64>()), pad1)
             }};
@@ -2619,6 +2690,9 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
         assert!(!tail_compact || (ranked_periodic && skip_dead));
         assert!(!head || (tail_compact && ASM_OFF));
         let head_inline = head && r2_head_inline_enabled();
+        // The tail-compacted ranked producers write their delta slots
+        // non-temporally when `FLOCK_NO_R2_NT_DELTAS` is unset.
+        let nt_deltas = tail_compact && r2_nt_deltas_enabled();
         // One head group (`$i` < `HC_HEAD_PAIRS / 2`) of block `$block`,
         // its rows at `$a`, `$b`: its two folded pairs and whether both
         // pairs' b rows are all ones.
@@ -2628,10 +2702,12 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                 let head_d = deltas0.add(HC_DELTA_BYTES_PER_BLOCK * $block + 16 * $i);
                 if head_inline {
                     r2_head_group_fold_and_store_inline::<F7>(
-                        table_data, $a, $b, head_a, head_d, degen, b_ones,
+                        table_data, $a, $b, head_a, head_d, degen, b_ones, nt_deltas,
                     )
                 } else {
-                    r2_head_group_fold_and_store::<F7>(table_data, $a, $b, head_a, head_d, degen, b_ones)
+                    r2_head_group_fold_and_store::<F7>(
+                        table_data, $a, $b, head_a, head_d, degen, b_ones, nt_deltas,
+                    )
                 }
             }};
         }
@@ -2668,10 +2744,10 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                         } else {
                             (
                                 r2_pair_fold_and_store_off::<F7, 0, 0>(
-                                    table_data, pa, pb, pn, pd, degen, b_ones,
+                                    table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas,
                                 ),
                                 r2_pair_fold_and_store_off::<F7, 16, 32>(
-                                    table_data, pa, pb, pn, pd, degen, b_ones,
+                                    table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas,
                                 ),
                             )
                         };
@@ -2687,10 +2763,10 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_impl<
                         } else {
                             (
                                 r2_pair_fold_and_store_off::<F7, 32, 64>(
-                                    table_data, pa, pb, pn, pd, degen, b_ones,
+                                    table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas,
                                 ),
                                 r2_pair_fold_and_store_off::<F7, 48, 96>(
-                                    table_data, pa, pb, pn, pd, degen, b_ones,
+                                    table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas,
                                 ),
                             )
                         };
@@ -2933,6 +3009,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
         assert!(!head || tail_compact);
         assert!(lo_size.is_multiple_of(128));
         let head_inline = head && r2_head_inline_enabled();
+        let nt_deltas = tail_compact && r2_nt_deltas_enabled();
         let mut head_ok = true;
         let zero = vdupq_n_u64(0);
         let tri_zero = TriNeon {
@@ -3045,11 +3122,11 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                             let (ha, hb) = (pa.wrapping_add(32 * $i), pb.wrapping_add(32 * $i));
                             let (r0, r1, ones) = if head_inline {
                                 r2_head_group_fold_and_store_inline::<F7>(
-                                    table_data, ha, hb, head_a, head_d, degen, b_ones,
+                                    table_data, ha, hb, head_a, head_d, degen, b_ones, nt_deltas,
                                 )
                             } else {
                                 r2_head_group_fold_and_store::<F7>(
-                                    table_data, ha, hb, head_a, head_d, degen, b_ones,
+                                    table_data, ha, hb, head_a, head_d, degen, b_ones, nt_deltas,
                                 )
                             };
                             head_ok &= ones;
@@ -3057,10 +3134,10 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                         } else {
                             (
                                 r2_pair_fold_and_store_off::<F7, $c0, $n0>(
-                                    table_data, pa, pb, pn, pd, degen, b_ones,
+                                    table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas,
                                 ),
                                 r2_pair_fold_and_store_off::<F7, $c1, $n1>(
-                                    table_data, pa, pb, pn, pd, degen, b_ones,
+                                    table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas,
                                 ),
                             )
                         }
@@ -3099,7 +3176,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                     let x_lo0 = 2 * (64 * block + 60);
                     let rows0 = r2_pair_fold_and_store::<F7>(
                         table_data, a_packed, b_packed, anchors, deltas, x_lo0, false, degen, b_ones,
-                        true,
+                        true, nt_deltas,
                     );
                     products!(rows0, (zero, zero, zero, zero, false), true, |v| mul_xb_q(v, xb, k87));
                 }
@@ -3337,6 +3414,54 @@ unsafe fn store_delta_pair_gpr_off<const OFF: usize>(
     }
 }
 
+/// [`store_delta_pair_gpr`] at the constant byte offset `OFF` from `dst`,
+/// with the non-temporal pair hint.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_pair_gpr_nt_off<const OFF: usize>(
+    dst: *mut u8,
+    a0: u64,
+    a1: u64,
+    b0: u64,
+    b1: u64,
+) {
+    unsafe {
+        core::arch::asm!(
+            "eor {ta}, {a0}, {a1}",
+            "eor {tb}, {b0}, {b1}",
+            "stnp {ta}, {tb}, [{dst}, #{off}]",
+            dst = in(reg) dst,
+            off = const OFF,
+            a0 = in(reg) a0,
+            a1 = in(reg) a1,
+            b0 = in(reg) b0,
+            b1 = in(reg) b1,
+            ta = out(reg) _,
+            tb = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// [`store_delta_a_only_gpr`] at the constant byte offset `OFF` from `dst`,
+/// with the non-temporal pair hint.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_a_only_gpr_nt_off<const OFF: usize>(dst: *mut u8, a0: u64, a1: u64) {
+    unsafe {
+        core::arch::asm!(
+            "eor {ta}, {a0}, {a1}",
+            "stnp {ta}, xzr, [{dst}, #{off}]",
+            dst = in(reg) dst,
+            off = const OFF,
+            a0 = in(reg) a0,
+            a1 = in(reg) a1,
+            ta = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// [`store_delta_a_only_gpr`] at the constant byte offset `OFF` from `dst`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -3347,6 +3472,45 @@ unsafe fn store_delta_a_only_gpr_off<const OFF: usize>(dst: *mut u8, a0: u64, a1
             "stp {ta}, xzr, [{dst}, #{off}]",
             dst = in(reg) dst,
             off = const OFF,
+            a0 = in(reg) a0,
+            a1 = in(reg) a1,
+            ta = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// [`store_delta_pair_gpr`] with the non-temporal pair hint: the same 16
+/// bytes at `dst`, bypassing the write-allocate of the incumbent `stp`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_pair_gpr_nt(dst: *mut u8, a0: u64, a1: u64, b0: u64, b1: u64) {
+    unsafe {
+        core::arch::asm!(
+            "eor {ta}, {a0}, {a1}",
+            "eor {tb}, {b0}, {b1}",
+            "stnp {ta}, {tb}, [{dst}]",
+            dst = in(reg) dst,
+            a0 = in(reg) a0,
+            a1 = in(reg) a1,
+            b0 = in(reg) b0,
+            b1 = in(reg) b1,
+            ta = out(reg) _,
+            tb = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// [`store_delta_a_only_gpr`] with the non-temporal pair hint.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_delta_a_only_gpr_nt(dst: *mut u8, a0: u64, a1: u64) {
+    unsafe {
+        core::arch::asm!(
+            "eor {ta}, {a0}, {a1}",
+            "stnp {ta}, xzr, [{dst}]",
+            dst = in(reg) dst,
             a0 = in(reg) a0,
             a1 = in(reg) a1,
             ta = out(reg) _,
@@ -5542,6 +5706,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     const DEAD_TAIL: bool,
     const PACK: bool,
     const F7: bool,
+    const XB: bool,
 >(
     table_r1: *const u8,
     rho2: F128,
@@ -5586,6 +5751,34 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
         // Slots: p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5'.
         let mut acc = LookaheadTriAcc::zero();
+        // Window-scaled weights (`XB`): `eq_prep` is the challenge vector
+        // itself, each window of eight groups scales its rows by
+        // `x^{2j}` alone and the window's `lambda = eq_lo[2 first + 1]`
+        // is folded into the chunk sums once, at the window end.
+        let mut wacc = LookaheadTriAcc::zero();
+        let mut sums = LookaheadTriAcc::zero();
+        let mut xb_q = vdupq_n_u64(1);
+        let mut win_first = 0usize;
+        let mut in_window = 0usize;
+        let k87 = vdupq_n_u64(0x87);
+        macro_rules! k_xb_step {
+            () => {{
+                xb_q = vshlq_n_u64::<2>(xb_q);
+                in_window += 1;
+                if in_window == 8 {
+                    let lambda = vld1q_u64(eq_prep.add(2 * win_first + 1).cast::<u64>());
+                    let lambda_sw = swap_halves_q(lambda);
+                    for (sum, w) in sums.0.iter_mut().zip(wacc.0.iter()) {
+                        let v = reduce_tri_binius_xor_q(w.ll, w.cross, w.hh, zero);
+                        tri_acc_sw(sum, lambda, lambda_sw, v);
+                    }
+                    wacc = LookaheadTriAcc::zero();
+                    xb_q = vdupq_n_u64(1);
+                    in_window = 0;
+                    win_first += 8;
+                }
+            }};
+        }
         let allfused = zc_k_allfused_enabled();
         // b-one pack: block `blk`'s b outputs 4..58 at `B_PACK_BLOCK * blk`,
         // its output 60 after them; `b_ok` collects the checks of the
@@ -5716,26 +5909,47 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 } else {
                     store_pair_nt_off::<32>(bo, b2, b3);
                 }
-                // The group weight `w = eq_lo[2t + 1]` as its prepared pair.
-                let wp = eq_prep.add(2 * t).cast::<u64>();
-                let (w_p0, w_p1) = (vld1q_u64(wp), vld1q_u64(wp.add(2)));
-                let acc = &mut acc.0;
+                // The group weight `w = eq_lo[2t + 1]`: as its prepared pair,
+                // or (`XB`) as the window scale `x^{2j}` with the window's
+                // `lambda` folded into the chunk sums at the window end.
+                let acc = if XB { &mut wacc.0 } else { &mut acc.0 };
                 if b_flat
                     && is_zero_q(vorrq_u64(
                         vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
                         vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
                     ))
                 {
-                    // `w` = (p0.lo, p1.lo).
-                    let w = vzip1q_u64(w_p0, w_p1);
-                    tri_acc_q_crossfused(&mut acc[0], w, a1);
-                    tri_acc_q_crossfused(&mut acc[2], w, a3);
-                    tri_acc_q_crossfused(&mut acc[4], w, a2);
+                    if XB {
+                        acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb_q, k87));
+                        acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb_q, k87));
+                        acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb_q, k87));
+                    } else {
+                        // `w` = (p0.lo, p1.lo).
+                        let wp = eq_prep.add(2 * t).cast::<u64>();
+                        let (w_p0, w_p1) = (vld1q_u64(wp), vld1q_u64(wp.add(2)));
+                        let w = vzip1q_u64(w_p0, w_p1);
+                        tri_acc_q_crossfused(&mut acc[0], w, a1);
+                        tri_acc_q_crossfused(&mut acc[2], w, a3);
+                        tri_acc_q_crossfused(&mut acc[4], w, a2);
+                    }
                 } else {
-                    let a0w = mul_prep86_q(w_p0, w_p1, a0, k86);
-                    let a1w = mul_prep86_q(w_p0, w_p1, a1, k86);
-                    let a2w = mul_prep86_q(w_p0, w_p1, a2, k86);
-                    let a3w = mul_prep86_q(w_p0, w_p1, a3, k86);
+                    let (a0w, a1w, a2w, a3w) = if XB {
+                        (
+                            mul_xb_q(a0, xb_q, k87),
+                            mul_xb_q(a1, xb_q, k87),
+                            mul_xb_q(a2, xb_q, k87),
+                            mul_xb_q(a3, xb_q, k87),
+                        )
+                    } else {
+                        let wp = eq_prep.add(2 * t).cast::<u64>();
+                        let (w_p0, w_p1) = (vld1q_u64(wp), vld1q_u64(wp.add(2)));
+                        (
+                            mul_prep86_q(w_p0, w_p1, a0, k86),
+                            mul_prep86_q(w_p0, w_p1, a1, k86),
+                            mul_prep86_q(w_p0, w_p1, a2, k86),
+                            mul_prep86_q(w_p0, w_p1, a3, k86),
+                        )
+                    };
                     tri_acc_q_crossfused(&mut acc[0], a1w, b1);
                     tri_acc_q_crossfused(&mut acc[1], veorq_u64(a0w, a1w), veorq_u64(b0, b1));
                     tri_acc_q_crossfused(&mut acc[2], a3w, b3);
@@ -5746,6 +5960,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     kacc!(&mut acc[5], e_aw, e_b);
                     kacc!(&mut acc[6], o_aw, o_b);
                     kacc!(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                }
+                if XB {
+                    k_xb_step!();
                 }
             }};
         }
@@ -5833,14 +6050,22 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     store_pair_nt_off::<0>(bo, bv0, zero);
                     store_pair_nt_off::<32>(bo, zero, zero);
                 }
-                let wp = eq_prep.add(2 * t).cast::<u64>();
-                let a0w = mul_prep86_q(vld1q_u64(wp), vld1q_u64(wp.add(2)), av0, k86);
+                let a0w = if XB {
+                    mul_xb_q(av0, xb_q, k87)
+                } else {
+                    let wp = eq_prep.add(2 * t).cast::<u64>();
+                    mul_prep86_q(vld1q_u64(wp), vld1q_u64(wp.add(2)), av0, k86)
+                };
                 let (ll, cross, hh) = clmul_products_q(a0w, bv0);
+                let slots = if XB { &mut wacc.0 } else { &mut acc.0 };
                 for slot in [1usize, 5, 7] {
-                    let t = &mut acc.0[slot];
+                    let t = &mut slots[slot];
                     t.ll = veorq_u64(t.ll, ll);
                     t.cross = veorq_u64(t.cross, cross);
                     t.hh = veorq_u64(t.hh, hh);
+                }
+                if XB {
+                    k_xb_step!();
                 }
             }
         } else {
@@ -5861,8 +6086,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
             }
         }
 
-        let sums = acc.reduce();
-        for (k, v) in sums.into_iter().enumerate() {
+        let reduced = if XB { sums.reduce() } else { acc.reduce() };
+        for (k, v) in reduced.into_iter().enumerate() {
             *out.add(k) = v;
         }
         b_ok
@@ -5938,6 +6163,7 @@ unsafe fn r2_head_group_fold_and_store<const F7: bool>(
     head_d: *mut u8,
     degen: bool,
     b_ones: core::arch::aarch64::uint64x2_t,
+    nt_deltas: bool,
 ) -> (
     (
         core::arch::aarch64::uint64x2_t,
@@ -5981,7 +6207,11 @@ unsafe fn r2_head_group_fold_and_store<const F7: bool>(
             b = in(vreg) r1.0,
             options(nostack, preserves_flags),
         );
-        store_delta_pair_gpr(head_d, a00, a01, a10, a11);
+        if nt_deltas {
+            store_delta_pair_gpr_nt(head_d, a00, a01, a10, a11);
+        } else {
+            store_delta_pair_gpr(head_d, a00, a01, a10, a11);
+        }
         (r0, r1, ones0 & ones1)
     }
 }
@@ -6011,6 +6241,7 @@ unsafe fn r2_head_group_fold_and_store_inline<const F7: bool>(
     head_d: *mut u8,
     degen: bool,
     b_ones: core::arch::aarch64::uint64x2_t,
+    nt_deltas: bool,
 ) -> (
     (
         core::arch::aarch64::uint64x2_t,
@@ -6067,7 +6298,11 @@ unsafe fn r2_head_group_fold_and_store_inline<const F7: bool>(
             b = in(vreg) r1.0,
             options(nostack, preserves_flags),
         );
-        store_delta_pair_gpr(head_d, a00, a01, a10, a11);
+        if nt_deltas {
+            store_delta_pair_gpr_nt(head_d, a00, a01, a10, a11);
+        } else {
+            store_delta_pair_gpr(head_d, a00, a01, a10, a11);
+        }
         (r0, r1, ones0 & ones1)
     }
 }
@@ -8352,6 +8587,7 @@ mod tests {
                     del[0].as_mut_ptr(),
                     degen,
                     b_ones,
+                    false,
                 );
                 let (q0, q1, qo) = r2_head_group_fold_and_store_inline::<false>(
                     t,
@@ -8361,6 +8597,7 @@ mod tests {
                     del[1].as_mut_ptr(),
                     degen,
                     b_ones,
+                    false,
                 );
                 assert_eq!((words(p0), p0.4, words(p1), p1.4, po), (words(q0), q0.4, words(q1), q1.4, qo));
                 assert_eq!(anc[0], anc[1], "case {case}");
