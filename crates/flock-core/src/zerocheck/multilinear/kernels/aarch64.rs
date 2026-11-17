@@ -2896,6 +2896,17 @@ pub(crate) fn r2_full_xb_rho_prep(eq_lo: &[F128]) -> Option<Vec<F128>> {
 /// ([`reduce_tri_q`]). The b == 1 group shortcut adds the reduced scaled row
 /// to the sum's low limb (`a * 1`).
 ///
+/// `ODD2`: a window is walked in two passes, its even groups and then its
+/// odd groups, each pass with its own eight sums. An odd group's rows are
+/// scaled by `x^b` alone as well, and the odd pass's sums are reduced and
+/// multiplied by `lambda rho = eq_lo[2 first + 3]`, the first odd group's own
+/// weight (the relation [`r2_full_xb_rho_prep`] checked):
+/// `sum_g (lambda rho x^b a_g) b_g = (lambda rho) * sum_g ((x^b a_g) b_g)`
+/// over the window's odd groups, the same identity with the scale `x^b` and
+/// the window weight `lambda rho`. `rho_prep` is then not read. The pairs,
+/// their folds and their stores are the same; only their order inside a
+/// window differs.
+///
 /// The walk is the prepared-weight walk's own: the same pairs in the same
 /// order through the same functions ([`r2_pair_fold_and_store_off`], the
 /// head groups' functions and [`r2_pair_fold_and_store`] for pair 120), so
@@ -2911,7 +2922,7 @@ pub(crate) fn r2_full_xb_rho_prep(eq_lo: &[F128]) -> Option<Vec<F128>> {
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
+unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool, const ODD2: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -2976,19 +2987,124 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
             let mut pn = anchors.add(4 * 64 * block);
             let mut pd = deltas.add(32 * 64 * block);
             for win in 0..2usize {
+                if ODD2 {
+                    // Two passes over the window, the even groups and then
+                    // the odd ones: each pass has one group body, one set
+                    // of eight sums, the scale `x^b` and its own window
+                    // weight (`lambda`, then `lambda rho`).
+                    let first = 64 * block + 32 * win;
+                    let trips = if win == 0 { 16 } else { 14 };
+                    for t in 0..2usize {
+                        let mut acc = [tri_zero; 8];
+                        let mut xb = vdupq_n_u64(1);
+                        let mut qa = pa.wrapping_add(32 * t);
+                        let mut qb = pb.wrapping_add(32 * t);
+                        let mut qn = pn.wrapping_add(4 * t);
+                        let mut qd = pd.wrapping_add(32 * t);
+                        macro_rules! products2 {
+                            ($rows0:expr, $rows1:expr, $pad1:literal) => {{
+                                let (a0, a1, b0, b1, deg0) = $rows0;
+                                let (a2, a3, b2, b3, deg1) = $rows1;
+                                if !$pad1 && deg0 & deg1 & ones_is_one {
+                                    acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb, k87));
+                                    acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb, k87));
+                                    acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb, k87));
+                                } else {
+                                    let a0w = mul_xb_q(a0, xb, k87);
+                                    let a1w = mul_xb_q(a1, xb, k87);
+                                    let (a2w, a3w) = if $pad1 {
+                                        (zero, zero)
+                                    } else {
+                                        (mul_xb_q(a2, xb, k87), mul_xb_q(a3, xb, k87))
+                                    };
+                                    tri_acc_q(&mut acc[0], a1w, b1);
+                                    if !deg0 {
+                                        tri_acc_q(&mut acc[1], veorq_u64(a0w, a1w), veorq_u64(b0, b1));
+                                    }
+                                    if !$pad1 {
+                                        tri_acc_q(&mut acc[2], a3w, b3);
+                                        if !deg1 {
+                                            tri_acc_q(&mut acc[3], veorq_u64(a2w, a3w), veorq_u64(b2, b3));
+                                        }
+                                        tri_acc_q(&mut acc[4], a2w, b2);
+                                    }
+                                    let e_aw = veorq_u64(a0w, a2w);
+                                    let o_aw = veorq_u64(a1w, a3w);
+                                    let e_b = veorq_u64(b0, b2);
+                                    let o_b = veorq_u64(b1, b3);
+                                    tri_acc_q(&mut acc[5], e_aw, e_b);
+                                    tri_acc_q(&mut acc[6], o_aw, o_b);
+                                    tri_acc_q(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                                }
+                            }};
+                        }
+                        for trip in 0..trips {
+                            let (rows0, rows1) = if head && win == 0 && trip < HC_HEAD_PAIRS / 4 {
+                                let g = 2 * trip + t;
+                                let head_a = anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * g);
+                                let head_d = deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * g);
+                                let (r0, r1, ones) = if head_inline {
+                                    r2_head_group_fold_and_store_inline::<F7>(
+                                        table_data, qa, qb, head_a, head_d, degen, b_ones,
+                                    )
+                                } else {
+                                    r2_head_group_fold_and_store::<F7>(
+                                        table_data, qa, qb, head_a, head_d, degen, b_ones,
+                                    )
+                                };
+                                head_ok &= ones;
+                                (r0, r1)
+                            } else {
+                                (
+                                    r2_pair_fold_and_store_off::<F7, 0, 0>(
+                                        table_data, qa, qb, qn, qd, degen, b_ones,
+                                    ),
+                                    r2_pair_fold_and_store_off::<F7, 16, 32>(
+                                        table_data, qa, qb, qn, qd, degen, b_ones,
+                                    ),
+                                )
+                            };
+                            products2!(rows0, rows1, false);
+                            xb = vshlq_n_u64::<1>(xb);
+                            qa = qa.wrapping_add(64);
+                            qb = qb.wrapping_add(64);
+                            qn = qn.wrapping_add(8);
+                            qd = qd.wrapping_add(64);
+                        }
+                        if win == 1 && t == 0 {
+                            // Group 60 (`t = 0`, `b = 14`): pair 120 live,
+                            // pair 121 padded and not written.
+                            let x_lo0 = 2 * (64 * block + 60);
+                            let rows0 = r2_pair_fold_and_store::<F7>(
+                                table_data, a_packed, b_packed, anchors, deltas, x_lo0, false, degen,
+                                b_ones, true,
+                            );
+                            products2!(rows0, (zero, zero, zero, zero, false), true);
+                        }
+                        // The pass's sums, reduced, times its window weight
+                        // `lambda rho^t = eq_lo[2 (first + t) + 1]`.
+                        let lambda = vld1q_u64(eq_lo.add(2 * (first + t) + 1).cast::<u64>());
+                        let lambda_sw = swap_halves_q(lambda);
+                        for (sum, acc) in sums.iter_mut().zip(acc) {
+                            let v = reduce_tri_binius_xor_q(acc.ll, acc.cross, acc.hh, zero);
+                            tri_acc_sw(sum, lambda, lambda_sw, v);
+                        }
+                    }
+                    pa = pa.wrapping_add(64 * trips);
+                    pb = pb.wrapping_add(64 * trips);
+                    pn = pn.wrapping_add(8 * trips);
+                    pd = pd.wrapping_add(64 * trips);
+                    continue;
+                }
+
                 let first = 64 * block + 32 * win;
                 // Window 0 has sixteen live groups per parity; window 1 has
                 // fourteen, then group 60 (even, `b = 14`) with its second
                 // pair padded; groups 61..64 are dead.
                 let trips = if win == 0 { 16 } else { 14 };
-                let mut p1_even = tri_zero;
-                let mut pinf_even = tri_zero;
-                let mut p1_odd = tri_zero;
-                let mut pinf_odd = tri_zero;
-                let mut w0 = tri_zero;
-                let mut w3 = tri_zero;
-                let mut w4 = tri_zero;
-                let mut w5 = tri_zero;
+                // The window's sums in slot order (P1 even, G(inf) even, P1
+                // odd, G(inf) odd, W0, W3, W4, W5).
+                let mut we = [tri_zero; 8];
                 // `x^b` in both lanes, and the prepared pair of `rho x^b`.
                 let mut xb = vdupq_n_u64(1);
                 let mut pr = rho_prep;
@@ -2996,7 +3112,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 // a rows scaled by `$scale`; `$pad1`: the second pair is
                 // padded (its rows are zero).
                 macro_rules! products {
-                    ($rows0:expr, $rows1:expr, $pad1:literal, $scale:expr) => {{
+                    ($acc:ident, $rows0:expr, $rows1:expr, $pad1:literal, $scale:expr) => {{
                         let (a0, a1, b0, b1, deg0) = $rows0;
                         let (a2, a3, b2, b3, deg1) = $rows1;
                         let scale = $scale;
@@ -3004,31 +3120,31 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                             // b == 1 across the group: W3, W4, W5 and both
                             // G(inf) terms vanish and every other product is
                             // the scaled `a_i`.
-                            p1_even.ll = veorq_u64(p1_even.ll, scale(a1));
-                            p1_odd.ll = veorq_u64(p1_odd.ll, scale(a3));
-                            w0.ll = veorq_u64(w0.ll, scale(a2));
+                            $acc[0].ll = veorq_u64($acc[0].ll, scale(a1));
+                            $acc[2].ll = veorq_u64($acc[2].ll, scale(a3));
+                            $acc[4].ll = veorq_u64($acc[4].ll, scale(a2));
                         } else {
                             let a0w = scale(a0);
                             let a1w = scale(a1);
                             let (a2w, a3w) = if $pad1 { (zero, zero) } else { (scale(a2), scale(a3)) };
-                            tri_acc_q(&mut p1_even, a1w, b1);
+                            tri_acc_q(&mut $acc[0], a1w, b1);
                             if !deg0 {
-                                tri_acc_q(&mut pinf_even, veorq_u64(a0w, a1w), veorq_u64(b0, b1));
+                                tri_acc_q(&mut $acc[1], veorq_u64(a0w, a1w), veorq_u64(b0, b1));
                             }
                             if !$pad1 {
-                                tri_acc_q(&mut p1_odd, a3w, b3);
+                                tri_acc_q(&mut $acc[2], a3w, b3);
                                 if !deg1 {
-                                    tri_acc_q(&mut pinf_odd, veorq_u64(a2w, a3w), veorq_u64(b2, b3));
+                                    tri_acc_q(&mut $acc[3], veorq_u64(a2w, a3w), veorq_u64(b2, b3));
                                 }
-                                tri_acc_q(&mut w0, a2w, b2);
+                                tri_acc_q(&mut $acc[4], a2w, b2);
                             }
                             let e_aw = veorq_u64(a0w, a2w);
                             let o_aw = veorq_u64(a1w, a3w);
                             let e_b = veorq_u64(b0, b2);
                             let o_b = veorq_u64(b1, b3);
-                            tri_acc_q(&mut w3, e_aw, e_b);
-                            tri_acc_q(&mut w4, o_aw, o_b);
-                            tri_acc_q(&mut w5, veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                            tri_acc_q(&mut $acc[5], e_aw, e_b);
+                            tri_acc_q(&mut $acc[6], o_aw, o_b);
+                            tri_acc_q(&mut $acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
                         }
                     }};
                 }
@@ -3070,7 +3186,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 // `b`) per trip.
                 for trip in 0..trips {
                     let (rows0, rows1) = fold_group!(trip, 0, 0, 16, 0, 32);
-                    products!(rows0, rows1, false, |v| mul_xb_q(v, xb, k87));
+                    products!(we, rows0, rows1, false, |v| mul_xb_q(v, xb, k87));
                     let (rows0, rows1) = fold_group!(trip, 1, 32, 48, 64, 96);
                     let p0 = vld1q_u64(pr.cast::<u64>());
                     let p1 = vld1q_u64(pr.add(1).cast::<u64>());
@@ -3091,7 +3207,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                         inout(reg) pr,
                         options(pure, nomem, nostack, preserves_flags),
                     );
-                    products!(rows0, rows1, false, |v| mul_prep86_q(p0, p1, v, k86));
+                    products!(we, rows0, rows1, false, |v| mul_prep86_q(p0, p1, v, k86));
                 }
                 if win == 1 {
                     // Group 60 (`t = 0`, `b = 14`): pair 120 live, pair 121
@@ -3101,15 +3217,12 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                         table_data, a_packed, b_packed, anchors, deltas, x_lo0, false, degen, b_ones,
                         true,
                     );
-                    products!(rows0, (zero, zero, zero, zero, false), true, |v| mul_xb_q(v, xb, k87));
+                    products!(we, rows0, (zero, zero, zero, zero, false), true, |v| mul_xb_q(v, xb, k87));
                 }
                 // The window's sums, reduced, times its weight.
                 let lambda = vld1q_u64(eq_lo.add(2 * first + 1).cast::<u64>());
                 let lambda_sw = swap_halves_q(lambda);
-                for (sum, acc) in sums
-                    .iter_mut()
-                    .zip([p1_even, pinf_even, p1_odd, pinf_odd, w0, w3, w4, w5])
-                {
+                for (sum, acc) in sums.iter_mut().zip(we) {
                     let v = reduce_tri_binius_xor_q(acc.ll, acc.cross, acc.hh, zero);
                     tri_acc_sw(sum, lambda, lambda_sw, v);
                 }
@@ -3148,20 +3261,36 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb(
     tail_compact: bool,
     head_fail: *const core::sync::atomic::AtomicBool,
     out: *mut F128,
+    odd: bool,
 ) {
     unsafe {
-        if table7.is_null() {
-            fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false>(
-                table_data, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
-                head_fail, out,
-            )
-        } else {
-            fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true>(
-                table7, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
-                head_fail, out,
-            )
+        macro_rules! go {
+            ($f7:literal, $odd2:literal, $t:expr) => {
+                fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<$f7, $odd2>(
+                    $t, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
+                    head_fail, out,
+                )
+            };
+        }
+        match (table7.is_null(), odd) {
+            (true, false) => go!(false, false, table_data),
+            (true, true) => go!(false, true, table_data),
+            (false, false) => go!(true, false, table7),
+            (false, true) => go!(true, true, table7),
         }
     }
+}
+
+/// Whether the window-scaled walk scales its odd groups' rows by `x^b` too
+/// and leaves `rho` to the window end (`ODD2` of
+/// [`fold_round2_compact_chunk_neon_lookahead_8_xb_impl`]);
+/// `FLOCK_NO_R2_FULL_XB_ODD` (any value) keeps the prepared `rho x^b` row
+/// products. Same anchors, deltas and slots either way; read once per
+/// process.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) fn r2_full_xb_odd_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_FULL_XB_ODD").is_none())
 }
 
 /// Kill switch for the unreduced window sums of the pre-scaled round-two W
@@ -9738,7 +9867,7 @@ mod tests {
                     (true, true, false),
                 ] {
                     for pieces in [false, true] {
-                        let run = |xb: bool| {
+                        let run = |xb: u8| {
                             let a_off = n_blocks * HC_ANCHOR_GAP + HC_ANCHOR_SHIFT;
                             let d_off = n_blocks * HC_DELTA_GAP + HC_DELTA_SHIFT;
                             let mut anchors = vec![poison; 2 * LO_SIZE + a_off];
@@ -9761,7 +9890,7 @@ mod tests {
                                 } else {
                                     table.as_ptr().cast::<u8>()
                                 };
-                                if xb {
+                                if xb != 0 {
                                     fold_round2_compact_chunk_neon_lookahead_8_xb(
                                         table.as_ptr().cast::<u8>(),
                                         if pieces { tp } else { core::ptr::null() },
@@ -9776,6 +9905,7 @@ mod tests {
                                         tail,
                                         hf,
                                         out.as_mut_ptr(),
+                                        xb == 2,
                                     );
                                 } else {
                                     let k = if pieces {
@@ -9806,9 +9936,11 @@ mod tests {
                             }
                             (anchors, deltas, out, flag.into_inner())
                         };
-                        let (want, got) = (run(false), run(true));
+                        let want = run(0);
+                        for xb in [1u8, 2] {
+                        let got = run(xb);
                         let at = format!(
-                            "ones {ones_is_one} bad {bad_head} head {head} tail {tail} degen {degen} pieces {pieces}"
+                            "ones {ones_is_one} bad {bad_head} head {head} tail {tail} degen {degen} pieces {pieces} xb {xb}"
                         );
                         assert_eq!(got.0, want.0, "anchors: {at}");
                         assert_eq!(got.1, want.1, "deltas: {at}");
@@ -9816,10 +9948,131 @@ mod tests {
                         assert_eq!(got.3, want.3, "head flag: {at}");
                         assert_eq!(want.3, head && bad_head, "head flag set: {at}");
                         assert!(got.2.iter().all(|v| *v != poison), "slots written: {at}");
+                        }
                     }
                 }
             }
         }
+    }
+
+
+    /// Cycle harness (ignored; run with `--ignored`): `ALG_ITERS` full walks
+    /// of one 16,384-pair chunk in the ranked head- and tail-compacted layout
+    /// through the seven-piece table, weights with the window structure.
+    /// `ALG_K` = 0 the prepared-weight walk, 1 the window-scaled walk, 2 the
+    /// window-scaled walk with the odd groups scaled by `x^b` (two passes). Rows are drawn
+    /// inside the per-position OR/AND masks of a census file (`ALG_CENSUS`,
+    /// the kern8 diagnostic's output) when given, else random with the head
+    /// pairs' b rows all ones. Run it under `/usr/bin/time -l` at two
+    /// iteration counts: the difference is the walk's.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    #[ignore]
+    fn alg_r2_xb_cycle_harness() {
+        const LO_SIZE: usize = 16_384;
+        let iters: usize = std::env::var("ALG_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let kind: u8 = std::env::var("ALG_K").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mut state = 0x4b38_4841_524e_4553u64;
+        let mut a_packed = vec![0u8; 16 * LO_SIZE];
+        let mut b_packed = vec![0u8; 16 * LO_SIZE];
+        if let Ok(path) = std::env::var("ALG_CENSUS") {
+            let census = std::fs::read(path).expect("census");
+            let rd = |i: usize| u64::from_le_bytes(census[8 * i..8 * i + 8].try_into().unwrap());
+            for r in 0..2 * LO_SIZE {
+                let p = r & 255;
+                let a = (splitmix64(&mut state) & rd(p)) | rd(256 + p);
+                let b = (splitmix64(&mut state) & rd(512 + p)) | rd(768 + p);
+                a_packed[8 * r..8 * r + 8].copy_from_slice(&a.to_le_bytes());
+                b_packed[8 * r..8 * r + 8].copy_from_slice(&b.to_le_bytes());
+            }
+        } else {
+            for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+                *byte = splitmix64(&mut state) as u8;
+            }
+            for block in 0..LO_SIZE / 128 {
+                b_packed[block * 64 * 32..(block * 64 + 4) * 32].fill(0xff);
+            }
+        }
+        let n_groups = LO_SIZE / 2;
+        let mut eq_lo: Vec<F128> = (0..LO_SIZE)
+            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+            .collect();
+        let rho = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+        for first in (0..n_groups).step_by(32) {
+            eq_lo[2 * first + 3] = rho * eq_lo[2 * first + 1];
+            for t in 0..2 {
+                for b in 1..16 {
+                    eq_lo[2 * (first + 2 * b + t) + 1] = eq_lo[2 * (first + t) + 1] * F128::new(1u64 << b, 0);
+                }
+            }
+        }
+        let eq_prep = round2_eq_prep(&eq_lo);
+        let rho_prep = r2_full_xb_rho_prep(&eq_lo).expect("structured weights");
+        let mut singles: Vec<F128> =
+            (0..64).map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state))).collect();
+        let rest = singles[..63].iter().fold(F128::ZERO, |acc, v| acc + *v);
+        singles[63] = F128::ONE + rest;
+        let table = linear_byte_banks(&singles);
+        let table7 = r2_fold7_table(&table).expect("linear");
+        let n_blocks = LO_SIZE / 128;
+        let a_off = n_blocks * HC_ANCHOR_GAP + HC_ANCHOR_SHIFT;
+        let d_off = n_blocks * HC_DELTA_GAP + HC_DELTA_SHIFT;
+        let mut anchors = vec![F128::ZERO; 2 * LO_SIZE + a_off];
+        let mut deltas = vec![0u8; 16 * LO_SIZE + d_off];
+        let head_fail = core::sync::atomic::AtomicBool::new(false);
+        let mut sum = F128::ZERO;
+        for _ in 0..iters {
+            let mut out = [F128::ZERO; 8];
+            unsafe {
+                let (anc, del) = (anchors.as_mut_ptr().add(a_off), deltas.as_mut_ptr().add(d_off));
+                if kind == 0 {
+                    fold_round2_compact_chunk_neon_lookahead_8_impl::<true, false, true, true>(
+                        table7.as_ptr().cast::<u8>(),
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        anc,
+                        del,
+                        eq_lo.as_ptr(),
+                        eq_prep.as_ptr(),
+                        LO_SIZE,
+                        0,
+                        127,
+                        121,
+                        true,
+                        true,
+                        true,
+                        true,
+                        &head_fail,
+                        out.as_mut_ptr(),
+                    );
+                } else {
+                    fold_round2_compact_chunk_neon_lookahead_8_xb(
+                        table.as_ptr().cast::<u8>(),
+                        table7.as_ptr().cast::<u8>(),
+                        a_packed.as_ptr(),
+                        b_packed.as_ptr(),
+                        anc,
+                        del,
+                        eq_lo.as_ptr(),
+                        rho_prep.as_ptr(),
+                        LO_SIZE,
+                        true,
+                        true,
+                        &head_fail,
+                        out.as_mut_ptr(),
+                        kind == 2,
+                    );
+                }
+            }
+            for v in out {
+                sum += v;
+            }
+        }
+        let h = deltas.iter().fold(0u64, |h, b| h.rotate_left(5) ^ u64::from(*b));
+        eprintln!(
+            "alg harness kind {kind} iters {iters} head_fail {} sum {sum:?} deltas {h:016x}",
+            head_fail.load(core::sync::atomic::Ordering::Relaxed)
+        );
     }
 
     /// The ranked pre-scaled loop with the reduction constant held in a

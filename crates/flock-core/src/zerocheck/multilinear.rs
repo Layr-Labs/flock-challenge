@@ -2554,6 +2554,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         tail_compact,
                         head_fail_ptr,
                         out.as_mut_ptr(),
+                        kernels::aarch64::r2_full_xb_odd_enabled(),
                     );
                 } else if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
                     kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
