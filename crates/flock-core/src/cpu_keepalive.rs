@@ -271,6 +271,25 @@ mod imp {
 
     const HOT_PROVE_YIELD_EVERY: u32 = 32;
 
+    /// `true` from the witness hand-off until the commitment is done (the commit
+    /// window), set and cleared by [`pool_spin_witness_done`] / [`pool_spin_commit_done`].
+    static COMMIT_WINDOW: AtomicBool = AtomicBool::new(false);
+
+    /// OS-yield interval of the hot-prove spinners inside the commit window
+    /// (`FLOCK_HOT_COMMIT_YIELD_EVERY=<n>`, 1..=4096). Unset = the record's
+    /// [`HOT_PROVE_YIELD_EVERY`], so the default build behaves as the record; a
+    /// smaller value hands cores to Metal's submit/completion threads sooner
+    /// while the GPU ends the commit window. Scheduling only. Read once.
+    fn commit_yield_every() -> u32 {
+        static N: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_HOT_COMMIT_YIELD_EVERY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .map_or(HOT_PROVE_YIELD_EVERY, |n| n.clamp(1, 4096))
+        });
+        *N
+    }
+
     fn pool_spin_body(deadline: Instant, leaves_at_witness: bool) {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut idle: u32 = 0;
@@ -284,7 +303,12 @@ mod imp {
                     break;
                 }
                 idle = idle.wrapping_add(1);
-                if idle % HOT_PROVE_YIELD_EVERY == 0 {
+                let every = if COMMIT_WINDOW.load(Ordering::Relaxed) {
+                    commit_yield_every()
+                } else {
+                    HOT_PROVE_YIELD_EVERY
+                };
+                if idle % every == 0 {
                     std::thread::yield_now();
                     if Instant::now() >= deadline {
                         break;
@@ -329,6 +353,7 @@ mod imp {
         if HOT_PROVE_OFF.load(Ordering::Relaxed) {
             pool_spin_release();
         } else if POOL_SPIN.load(Ordering::Relaxed) {
+            COMMIT_WINDOW.store(true, Ordering::Relaxed);
             HOT_PROVE.store(true, Ordering::Release);
             // The helper pool's workers stay hot for the same interval.
             crate::epool::hot_spin_start();
@@ -344,6 +369,7 @@ mod imp {
     static RESV_HOT_OFF: AtomicBool = AtomicBool::new(false);
 
     pub(super) fn pool_spin_commit_done() {
+        COMMIT_WINDOW.store(false, Ordering::Relaxed);
         if RESV_HOT_OFF.load(Ordering::Relaxed)
             || !HOT_PROVE.load(Ordering::Acquire)
             || !POOL_SPIN.load(Ordering::Relaxed)
