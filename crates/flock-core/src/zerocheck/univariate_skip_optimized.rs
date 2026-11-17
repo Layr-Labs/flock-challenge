@@ -2282,6 +2282,86 @@ unsafe fn precompute_ab_unit<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     window_unit: Option<AbWindowUnitRun>,
 ) {
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    // Fused pre-conversion (see `ENV_NO_AB_PRECONV_FUSED`): a unit of
+    // CPU-owned positions is produced into a cache-resident scratch, and
+    // each position's 64 converted lanes are stored in place of its rows.
+    if x_outer < AB_PRECONV_FUSED_FROM.load(std::sync::atomic::Ordering::Relaxed) {
+        // SAFETY: forwarded unchanged.
+        return unsafe {
+            precompute_ab_unit_bytes::<FAST_POLICY, FORCE_DIRECT>(
+                a_unit, b_unit, inv_table, within_outer_mask, b_med_counts, blake3_static_layout,
+                static_b_context, nt, compact, representation, x_outer, unit_chunks, chunk_byte_base,
+                out_unit, a_col, b_col, window_plan, window_unit,
+            )
+        };
+    }
+    AB_PRECONV_FUSED_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        if scratch.len() < unit_chunks * OUTER_BYTES {
+            scratch.resize(unit_chunks * OUTER_BYTES, 0);
+        }
+        let rows_base = scratch.as_mut_ptr();
+        // SAFETY: the scratch covers the unit; same producer, cached stores.
+        unsafe {
+            precompute_ab_unit_bytes::<FAST_POLICY, FORCE_DIRECT>(
+                a_unit, b_unit, inv_table, within_outer_mask, b_med_counts, blake3_static_layout,
+                static_b_context, false, compact, representation, x_outer, unit_chunks, chunk_byte_base,
+                rows_base, a_col, b_col, window_plan, window_unit,
+            );
+        }
+        let convert = convert_table();
+        let mut lanes = [F128::ZERO; ELL];
+        for local in 0..unit_chunks {
+            let within_hash_outer = (x_outer + local) & within_outer_mask;
+            let n_b_med = b_med_counts[within_hash_outer] as usize;
+            if n_b_med == 0 {
+                continue;
+            }
+            let first_b_med = representation.first_materialized_b_med(within_hash_outer);
+            let end_b_med = representation.materialized_b_med_end(within_hash_outer, n_b_med);
+            // SAFETY: position `local` of the scratch and of the caller's
+            // unit are 1 KiB each; `lanes` is a separate buffer.
+            unsafe {
+                let rows = &*rows_base.add(local * OUTER_BYTES).cast::<[[u8; 64]; 1 << N_MEDIUM]>();
+                kernels::accumulate_convert_ab_nomul::<true, true>(rows, first_b_med, end_b_med, convert, &mut lanes);
+                let src = lanes.as_ptr().cast::<u8>();
+                let dst = out_unit.add(local * OUTER_BYTES);
+                if nt {
+                    for block in 0..1usize << N_MEDIUM {
+                        store_nt_64(src.add(block * 64), dst.add(block * 64));
+                    }
+                } else {
+                    core::ptr::copy_nonoverlapping(src, dst, OUTER_BYTES);
+                }
+            }
+        }
+    });
+    AB_PRECONV_FUSED_COUNT.fetch_add(unit_chunks, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn precompute_ab_unit_bytes<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
+    a_unit: &[u8],
+    b_unit: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    blake3_static_layout: bool,
+    static_b_context: Option<kernels::StaticBContext>,
+    nt: bool,
+    compact: bool,
+    representation: Round1AbRepresentation,
+    x_outer: usize,
+    unit_chunks: usize,
+    chunk_byte_base: usize,
+    out_unit: *mut u8,
+    a_col: &mut [F8; ELL],
+    b_col: &mut [F8; ELL],
+    window_plan: Option<AbWindowRows>,
+    window_unit: Option<AbWindowUnitRun>,
+) {
+    const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     let window_run_done = if let Some((rows, partials)) = window_unit {
         let direct = if FORCE_DIRECT {
             true
@@ -4214,6 +4294,531 @@ fn launch_ab_completion_gpu_prefix(
 }
 
 /// Completion set-up: everything the chunk queue reads besides `ab_inner`.
+// ---------------------------------------------------------------------------
+// Round-one AB bank pre-conversion.
+//
+// The folded round-one AB completion spends its CPU time on a re-coding that
+// needs no challenge: for an outer position `x` and lane `l` it XORs
+// `T_w[b][byte_b]` over the position's materialized medium rows `b`, where
+// `T_w = convert * eq_top[w]` and `convert[b][v] = x^b * phi8(v)`. The sum
+// `v[x][l] = XOR_b convert[b][byte_b]` is one F128 that depends on the
+// witness only, and `XOR_b T_w[b][byte_b] = eq_top[w] * v[x][l]` (field
+// multiplication is GF(2)-bilinear). A position's sixteen 64-byte rows and
+// its sixty-four `v` lanes are both exactly 1 KiB, so `v` can replace the
+// rows in place.
+//
+// Between the commit's CPU work and the root, pool workers that have no
+// commit-window job left convert whole sub-chunks (one `(x_hi, w)` pair, 128
+// positions) from the top of the CPU-owned range downward and set that
+// sub-chunk's flag when its last byte is written. The root does not wait for
+// them: `ab_preconv_stop` only raises a flag, and a converter checks it
+// before every claim. The round-one driver then calls `ab_preconv_settle`,
+// which waits until no converter is inside a sub-chunk (at most one
+// sub-chunk's work each, begun before the stop) and withdraws the
+// registration; from there on the flags are frozen. A flagged sub-chunk is
+// folded with one prepared product per lane, an unflagged one with the byte
+// kernel as before; both add the same field elements to the same banks' fold,
+// so the round-one message is the same for every converted set.
+//
+// `FLOCK_NO_AB_PRECONV=1` (exact `1`, read once per process) never arms it.
+// ---------------------------------------------------------------------------
+
+pub const ENV_NO_AB_PRECONV: &str = "FLOCK_NO_AB_PRECONV";
+
+/// Positions per sub-chunk (`2^7`, one value of the table index `w`).
+const AB_PRECONV_SUB_BITS: usize = 7;
+/// Sub-chunks of the ranked shape: 128 `x_hi` chunks of 32 each.
+const AB_PRECONV_N_SUB: usize = 128 * 32;
+
+struct AbPreconv {
+    /// Address of the armed transform storage; 0 = not armed.
+    storage: std::sync::atomic::AtomicUsize,
+    /// Incremented by every arm; a converter job of an older arm exits.
+    epoch: std::sync::atomic::AtomicUsize,
+    /// Lowest convertible sub-chunk (the GPU arm's chunks stay in byte form).
+    floor: std::sync::atomic::AtomicUsize,
+    /// The next claim takes sub-chunk `cursor - 1`.
+    cursor: std::sync::atomic::AtomicUsize,
+    stop: std::sync::atomic::AtomicBool,
+    inflight: std::sync::atomic::AtomicUsize,
+    within_outer_mask: std::sync::atomic::AtomicUsize,
+    b_med_counts: [std::sync::atomic::AtomicU8; 16],
+    /// 0 complete, 1 identity prefix omitted, 2 with the output window.
+    representation: std::sync::atomic::AtomicU8,
+    /// 1 = every position of the sub-chunk holds its converted lanes.
+    flags: [std::sync::atomic::AtomicU8; AB_PRECONV_N_SUB],
+}
+
+static AB_PRECONV: AbPreconv = AbPreconv {
+    storage: std::sync::atomic::AtomicUsize::new(0),
+    epoch: std::sync::atomic::AtomicUsize::new(0),
+    floor: std::sync::atomic::AtomicUsize::new(0),
+    cursor: std::sync::atomic::AtomicUsize::new(0),
+    stop: std::sync::atomic::AtomicBool::new(true),
+    inflight: std::sync::atomic::AtomicUsize::new(0),
+    within_outer_mask: std::sync::atomic::AtomicUsize::new(0),
+    b_med_counts: [const { std::sync::atomic::AtomicU8::new(0) }; 16],
+    representation: std::sync::atomic::AtomicU8::new(0),
+    flags: [const { std::sync::atomic::AtomicU8::new(0) }; AB_PRECONV_N_SUB],
+};
+
+fn ab_preconv_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))
+            && std::env::var_os(ENV_NO_AB_PRECONV).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+impl Round1AbInner {
+    /// Arm the pre-conversion for this transform. The caller vouches that the
+    /// transform's only later readers are the round-one AB completion driver
+    /// of the lincheck-C route and its GPU prefix arm, and that nothing reads
+    /// or writes the storage before that driver runs. Returns whether it armed
+    /// (ranked folded shape only).
+    pub fn arm_preconv(&self, m: usize, padding: &PaddingSpec) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if !ab_preconv_enabled() || m != 32 || padding.k_log != 14 {
+            return false;
+        }
+        let n_outer = m - K_SKIP - N_INNER;
+        let n_hi = fold4_n_hi_from_env().min(n_outer);
+        let n_lo = n_outer - n_hi;
+        if n_hi != 7
+            || n_lo != 12
+            || ab_eq_fold_from_env().bank_bits(n_lo) != Some(AB_PRECONV_SUB_BITS)
+            || self.len_bytes() != (1usize << m) / 8
+        {
+            return false;
+        }
+        let (within_outer_mask, counts) = build_b_med_counts(padding);
+        if counts.len() > 16 || counts.len() != within_outer_mask + 1 {
+            return false;
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let gpu_chunks = crate::gpu_commit::gpu_zc_ab_completion_share().min(1usize << n_hi);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let gpu_chunks = 0usize;
+        let a = &AB_PRECONV;
+        let _ = ab_preconv_ahead();
+        // No converter of an earlier arm may still be inside a sub-chunk.
+        a.stop.store(true, SeqCst);
+        while a.inflight.load(SeqCst) != 0 {
+            core::hint::spin_loop();
+        }
+        a.epoch.fetch_add(1, SeqCst);
+        for f in a.flags.iter() {
+            f.store(0, SeqCst);
+        }
+        for (slot, c) in a.b_med_counts.iter().zip(counts.iter()) {
+            slot.store(*c, SeqCst);
+        }
+        a.within_outer_mask.store(within_outer_mask, SeqCst);
+        a.representation.store(
+            match self.representation {
+                Round1AbRepresentation::Complete => 0,
+                Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false } => 1,
+                Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true } => 2,
+            },
+            SeqCst,
+        );
+        let floor_sub = gpu_chunks << (n_lo - AB_PRECONV_SUB_BITS);
+        a.floor.store(floor_sub, SeqCst);
+        // Fused producer: every CPU-owned position is already converted, or
+        // none is (any other count is a producer route this was not built
+        // for: fail closed).
+        let fused = AB_PRECONV_FUSED_COUNT.swap(0, SeqCst);
+        if fused != 0 {
+            assert_eq!(
+                fused,
+                ((1usize << n_hi) - gpu_chunks) << n_lo,
+                "fused AB pre-conversion covered a partial transform"
+            );
+            for f in a.flags[floor_sub..].iter() {
+                f.store(1, SeqCst);
+            }
+            a.cursor.store(floor_sub, SeqCst);
+        } else {
+            a.cursor.store(AB_PRECONV_N_SUB, SeqCst);
+        }
+        a.storage.store(self.storage.as_ptr() as usize, SeqCst);
+        a.stop.store(false, SeqCst);
+        true
+    }
+}
+
+/// Sub-chunks (128 outer positions each) that the CPU tail hash's workers
+/// convert AHEAD of their first tail unit: `FLOCK_AB_PRECONV_AHEAD=<n>`,
+/// `0..=4096`, clamped to the CPU-owned sub-chunks (3,072 with the GPU arm's
+/// default 32 chunks). Unset = [`AB_PRECONV_AHEAD_DEFAULT`]. With 0 only
+/// workers with no commit-window job left convert; a positive count trades
+/// tail-hash units (cb3 then hashes them) for conversions. Any count gives
+/// the same proof. Read once per process, at the first arm (the warm-up
+/// prove); a non-integer value fails loudly.
+pub const ENV_AB_PRECONV_AHEAD: &str = "FLOCK_AB_PRECONV_AHEAD";
+
+/// Kill switch of the FUSED pre-conversion (`FLOCK_NO_AB_PRECONV_FUSED=1`,
+/// exact `1`: the transform is written as bytes and converted in place by
+/// idle workers or the ahead count, as without it). With it on, the AB
+/// producer of an armed prove writes every CPU-owned position (chunks at or
+/// above the GPU arm's share) directly as its 64 converted lanes: no second
+/// pass and no rewrite; the GPU arm's chunks stay bytes. Every prove of the
+/// process, the warm-up included, then folds the same converted set. Read
+/// once per process.
+pub const ENV_NO_AB_PRECONV_FUSED: &str = "FLOCK_NO_AB_PRECONV_FUSED";
+
+/// First outer position the producer writes converted; `usize::MAX` = none.
+static AB_PRECONV_FUSED_FROM: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+/// Positions produced converted since the last arm.
+static AB_PRECONV_FUSED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+std::thread_local! {
+    static AB_PRECONV_FUSED_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn ab_preconv_fused_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        ab_preconv_enabled()
+            && std::env::var_os(ENV_NO_AB_PRECONV_FUSED).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// GPU chunks of the ranked folded shape, or `None` when the shape is not
+/// the one the pre-conversion is built for.
+fn ab_preconv_shape(m: usize, padding: &PaddingSpec) -> Option<usize> {
+    if !ab_preconv_enabled() || m != 32 || padding.k_log != 14 {
+        return None;
+    }
+    let n_outer = m - K_SKIP - N_INNER;
+    let n_hi = fold4_n_hi_from_env().min(n_outer);
+    let n_lo = n_outer - n_hi;
+    if n_hi != 7 || n_lo != 12 || ab_eq_fold_from_env().bank_bits(n_lo) != Some(AB_PRECONV_SUB_BITS) {
+        return None;
+    }
+    let (within_outer_mask, counts) = build_b_med_counts(padding);
+    if counts.len() > 16 || counts.len() != within_outer_mask + 1 {
+        return None;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let gpu_chunks = crate::gpu_commit::gpu_zc_ab_completion_share().min(1usize << n_hi);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let gpu_chunks = 0usize;
+    Some(gpu_chunks)
+}
+
+/// Before the AB arm of a prove whose transform will be armed (same vouching
+/// as [`Round1AbInner::arm_preconv`]): its producer writes CPU-owned
+/// positions converted. Ended by [`ab_preconv_fused_end`].
+pub fn ab_preconv_fused_begin(m: usize, padding: &PaddingSpec) {
+    use std::sync::atomic::Ordering::SeqCst;
+    AB_PRECONV_FUSED_COUNT.store(0, SeqCst);
+    if !ab_preconv_fused_enabled() {
+        return;
+    }
+    if let Some(gpu_chunks) = ab_preconv_shape(m, padding) {
+        AB_PRECONV_FUSED_FROM.store(gpu_chunks << 12, SeqCst);
+    }
+}
+
+/// The commit join and the split tuner's replays of the AB arm are over (the
+/// replays produce converted positions too, so they price the arm as it runs).
+pub fn ab_preconv_fused_end() {
+    AB_PRECONV_FUSED_FROM.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+}
+const AB_PRECONV_AHEAD_DEFAULT: usize = 0;
+
+fn ab_preconv_ahead() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| match std::env::var_os(ENV_AB_PRECONV_AHEAD) {
+        None => AB_PRECONV_AHEAD_DEFAULT,
+        Some(value) => value
+            .to_str()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .expect("FLOCK_AB_PRECONV_AHEAD must be a non-negative integer"),
+    }
+    .min(AB_PRECONV_N_SUB))
+}
+
+/// A tail-hash worker before its first unit: convert while fewer than the
+/// ahead count of sub-chunks have been claimed (see [`ENV_AB_PRECONV_AHEAD`]).
+pub(crate) fn ab_preconv_run_ahead() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let ahead = ab_preconv_ahead();
+    let a = &AB_PRECONV;
+    if ahead == 0 || a.stop.load(SeqCst) || a.storage.load(SeqCst) == 0 {
+        return;
+    }
+    ab_preconv_run(a.epoch.load(SeqCst), AB_PRECONV_N_SUB - ahead, usize::MAX);
+}
+
+std::thread_local! {
+    /// Set on the thread that drives the commitment to its root: it never
+    /// converts, even if it meets a converter job while it waits on the pool.
+    static AB_PRECONV_DRIVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The calling thread drives the commitment (it will call
+/// [`ab_preconv_stop`]): converter jobs it meets return at once.
+pub(crate) fn ab_preconv_mark_driver() {
+    AB_PRECONV_DRIVER.with(|d| d.set(true));
+}
+
+/// Stop the converters' claims (the root is ready). Never waits.
+pub(crate) fn ab_preconv_stop() {
+    AB_PRECONV.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    AB_PRECONV_DRIVER.with(|d| d.set(false));
+}
+
+/// A pool worker has no commit-window job left: convert sub-chunks on this
+/// worker's pool until the stop, as detached jobs of one sub-chunk each
+/// (whoever runs one is held for one sub-chunk at most, and every job first
+/// runs whatever else is queued). Returns at once.
+pub(crate) fn ab_preconv_spawn_idle() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let a = &AB_PRECONV;
+    if a.stop.load(SeqCst) || a.storage.load(SeqCst) == 0 {
+        return;
+    }
+    let epoch = a.epoch.load(SeqCst);
+    // Not while the zerocheck C fold split is still untuned (the warm-up
+    // window, `gpu_commit::zc_fold_tune_pending`): that split is tuned once
+    // from this prove's round one, with the wall of the AB completion as its
+    // head, and the warm-up's long commit window would convert every
+    // sub-chunk where a later prove converts a fraction. The warm-up
+    // therefore converts only the ahead count, which later proves convert
+    // too, and its head prices their unconverted remainder.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::gpu_commit::zc_fold_tune_pending() {
+        return;
+    }
+    rayon::spawn(move || ab_preconv_idle_job(epoch));
+}
+
+fn ab_preconv_idle_job(epoch: usize) {
+    if AB_PRECONV_DRIVER.with(|d| d.get()) {
+        return;
+    }
+    // Queued pool work goes first. This job is off every deque while it
+    // runs, so the yields below find only other work (this worker's deque,
+    // then steals, then injected jobs) and return idle when there is none;
+    // only then is a sub-chunk converted. The re-spawn lands on this
+    // worker's deque, and the next job starts with the same yields, so no
+    // job waits behind a converter for more than one sub-chunk.
+    while matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {}
+    if ab_preconv_run(epoch, 0, 1) == 1 {
+        rayon::spawn(move || ab_preconv_idle_job(epoch));
+    }
+}
+
+/// Claim and convert at most `max` sub-chunks while the arm `epoch` is live,
+/// not stopped, and the cursor is above `until` (and above the floor).
+/// Returns the number converted.
+fn ab_preconv_run(epoch: usize, until: usize, max: usize) -> usize {
+    use std::sync::atomic::Ordering::SeqCst;
+    let a = &AB_PRECONV;
+    let mut done = 0usize;
+    a.inflight.fetch_add(1, SeqCst);
+    while done < max {
+        // Checked after `inflight` was raised: a settle that has seen
+        // `inflight == 0` after raising `stop` can meet no later claim.
+        if a.stop.load(SeqCst) || a.epoch.load(SeqCst) != epoch {
+            break;
+        }
+        let storage = a.storage.load(SeqCst);
+        if storage == 0 {
+            break;
+        }
+        let floor = a.floor.load(SeqCst).max(until);
+        let Ok(c) = a.cursor.fetch_update(SeqCst, SeqCst, |c| (c > floor).then(|| c - 1)) else {
+            break;
+        };
+        let sub = c - 1;
+        // SAFETY: the arm's storage is live and unread until the settle,
+        // which waits for `inflight`; this job owns sub-chunk `sub` alone.
+        unsafe { ab_preconv_convert_sub(storage as *mut u8, sub) };
+        a.flags[sub].store(1, SeqCst);
+        done += 1;
+    }
+    a.inflight.fetch_sub(1, SeqCst);
+    done
+}
+
+/// Replace the byte rows of every position of sub-chunk `sub` by the
+/// position's 64 converted lanes.
+///
+/// # Safety
+/// `storage` is the armed transform (ranked shape), and no other thread
+/// touches the sub-chunk's bytes.
+unsafe fn ab_preconv_convert_sub(storage: *mut u8, sub: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let a = &AB_PRECONV;
+    let mut counts = [0u8; 16];
+    for (c, slot) in counts.iter_mut().zip(a.b_med_counts.iter()) {
+        *c = slot.load(Relaxed);
+    }
+    let representation = match a.representation.load(Relaxed) {
+        0 => Round1AbRepresentation::Complete,
+        1 => Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false },
+        _ => Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true },
+    };
+    let within_outer_mask = a.within_outer_mask.load(Relaxed);
+    let subs_per_hi_bits = 12 - AB_PRECONV_SUB_BITS;
+    // SAFETY: forwarded.
+    unsafe {
+        ab_preconv_convert_positions(
+            storage,
+            sub >> subs_per_hi_bits,
+            sub & ((1usize << subs_per_hi_bits) - 1),
+            12 + N_INNER,
+            within_outer_mask,
+            &counts,
+            representation,
+        )
+    }
+}
+
+/// The conversion of sub-chunk `(x_hi, w)`: for every position with rows,
+/// `lanes[l] = XOR_b convert[b][rows[b][l]]` by the byte kernel itself over
+/// the unscaled convert table, written over the position's 1 KiB.
+///
+/// # Safety
+/// `storage` covers the sub-chunk's positions; no other thread touches them.
+unsafe fn ab_preconv_convert_positions(
+    storage: *mut u8,
+    x_hi: usize,
+    w: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    representation: Round1AbRepresentation,
+) {
+    let convert = convert_table();
+    let n_lo = n_lo_and_inner - N_INNER;
+    let mut lanes = [F128::ZERO; ELL];
+    for u in 0..1usize << AB_PRECONV_SUB_BITS {
+        let x_outer_lo = (w << AB_PRECONV_SUB_BITS) | u;
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        let within_hash_outer = x_outer & within_outer_mask;
+        let n_b_med = b_med_counts[within_hash_outer] as usize;
+        if n_b_med == 0 {
+            // The fold skips this position in both forms.
+            continue;
+        }
+        let byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let first_b_med = representation.first_materialized_b_med(within_hash_outer);
+        let end_b_med = representation.materialized_b_med_end(within_hash_outer, n_b_med);
+        // SAFETY: the position's 1 KiB lies inside the storage; `lanes` is a
+        // separate buffer, so the rows are read completely before the write.
+        unsafe {
+            let rows = &*storage.add(byte_base).cast::<[[u8; 64]; 1 << N_MEDIUM]>();
+            kernels::accumulate_convert_ab_nomul::<true, true>(rows, first_b_med, end_b_med, convert, &mut lanes);
+            core::ptr::copy_nonoverlapping(
+                lanes.as_ptr().cast::<u8>(),
+                storage.add(byte_base),
+                ELL * core::mem::size_of::<F128>(),
+            );
+        }
+    }
+}
+
+/// The frozen conversion state of one transform after [`ab_preconv_settle`].
+struct AbPreconvFrozen {
+    any: bool,
+}
+
+impl AbPreconvFrozen {
+    #[inline]
+    fn converted(&self, sub: usize) -> bool {
+        self.any && AB_PRECONV.flags[sub].load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+}
+
+/// Stop the converters, wait until none is inside a sub-chunk and withdraw
+/// the registration. Returns the frozen flags when `ab_inner` is the armed
+/// transform (`any` = at least one sub-chunk was converted).
+fn ab_preconv_settle(ab_inner: &Round1AbInner) -> Option<AbPreconvFrozen> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let a = &AB_PRECONV;
+    if a.storage.load(SeqCst) == 0 {
+        return None;
+    }
+    a.stop.store(true, SeqCst);
+    while a.inflight.load(SeqCst) != 0 {
+        core::hint::spin_loop();
+    }
+    let storage = a.storage.swap(0, SeqCst);
+    if storage != ab_inner.storage.as_ptr() as usize {
+        // Another transform was armed; none of its sub-chunks may be read as
+        // converted here, and none of this one's was written.
+        assert_eq!(a.cursor.load(SeqCst), AB_PRECONV_N_SUB, "pre-converted transform lost its reader");
+        return None;
+    }
+    Some(AbPreconvFrozen { any: a.cursor.load(SeqCst) != AB_PRECONV_N_SUB })
+}
+
+/// Fail closed on a route that reads the transform as bytes only.
+fn ab_preconv_assert_bytes(ab_inner: &Round1AbInner) {
+    if let Some(frozen) = ab_preconv_settle(ab_inner) {
+        assert!(!frozen.any, "byte-only round-one route met a pre-converted transform");
+    }
+}
+
+/// `bank[u][l] ^= scale * v[x][l]` for the 128 positions of sub-chunk
+/// `(x_hi, w)`, read from their converted lanes.
+#[allow(clippy::too_many_arguments)]
+fn ab_preconv_accumulate_sub(
+    ab_inner: &[u8],
+    x_hi: usize,
+    w: usize,
+    n_lo_and_inner: usize,
+    within_outer_mask: usize,
+    b_med_counts: &[u8],
+    scale: F128,
+    banks: &mut [F128],
+) {
+    let n_lo = n_lo_and_inner - N_INNER;
+    debug_assert_eq!(banks.len(), ELL << AB_PRECONV_SUB_BITS);
+    for u in 0..1usize << AB_PRECONV_SUB_BITS {
+        let x_outer_lo = (w << AB_PRECONV_SUB_BITS) | u;
+        let x_outer = x_outer_lo | (x_hi << n_lo);
+        if b_med_counts[x_outer & within_outer_mask] == 0 {
+            continue;
+        }
+        let byte_base = ((x_outer_lo << N_INNER) | (x_hi << n_lo_and_inner)) * N_CHUNKS;
+        let lanes = &ab_inner[byte_base..byte_base + ELL * core::mem::size_of::<F128>()];
+        let bank = &mut banks[u * ELL..(u + 1) * ELL];
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+        // SAFETY: AES/PMULL is enabled; `lanes` holds 64 F128 (two u64 limbs
+        // each, little-endian), read unaligned.
+        unsafe {
+            use core::arch::aarch64::*;
+            use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep};
+            let prep = const_prep(core::mem::transmute::<F128, uint64x2_t>(scale));
+            let src = lanes.as_ptr().cast::<u64>();
+            let dst = bank.as_mut_ptr().cast::<u64>();
+            for l in 0..ELL {
+                let p = mul_const_prep(prep, vld1q_u64(src.add(2 * l)));
+                vst1q_u64(dst.add(2 * l), veorq_u64(vld1q_u64(dst.add(2 * l)), p));
+            }
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+        for l in 0..ELL {
+            // SAFETY: 16 readable bytes per lane; F128 is two u64 limbs.
+            let v = unsafe { core::ptr::read_unaligned(lanes.as_ptr().add(16 * l).cast::<F128>()) };
+            bank[l] += scale * v;
+        }
+    }
+}
+
+std::thread_local! {
+    /// Per-worker banks of the converted sub-chunks of one `x_hi` range.
+    static AB_PRECONV_BANKS: std::cell::RefCell<Vec<F128>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 enum AbCompletionSetup {
     Plain {
         eq: SplitEqGhash,
@@ -4225,6 +4830,7 @@ enum AbCompletionSetup {
         eq_bot: Vec<F128>,
         tables: Vec<F128>,
         bank_deferred: bool,
+        eq_top_scaled: Vec<F128>,
     },
 }
 
@@ -4294,6 +4900,7 @@ where
                 eq_bot,
                 tables,
                 bank_deferred,
+                eq_top_scaled,
             }
         } else {
             let eq = SplitEqGhash::with_n_hi(r_outer, fold4_n_hi);
@@ -4313,12 +4920,15 @@ where
     let n_lo_and_inner = n_lo + N_INNER;
     let convert = convert_table();
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    // From here on no converter writes the transform and the flags are frozen.
+    let preconv = ab_preconv_settle(ab_inner).filter(|frozen| frozen.any);
     let ab_inner_bytes = ab_inner.as_bytes();
 
     let mut partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(hi_size);
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let tail_out = match setup {
         AbCompletionSetup::Plain { eq, eq_lo_scaled } => {
+            assert!(preconv.is_none(), "plain round-one route met a pre-converted transform");
             crate::epool::run_hetero_chunks_caller_tail(
                 hi_size,
                 |x_hi| {
@@ -4351,6 +4961,7 @@ where
             eq_bot,
             tables,
             bank_deferred,
+            eq_top_scaled,
         } => {
             let bank_len = eq_bot.len() * ELL;
             // GPU prefix arm: in an admitted prove the GPU owns chunks
@@ -4375,7 +4986,7 @@ where
             let half_lo = big_lo_size / 2;
             let mut half_partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(2 * split);
             let half_base = crate::epool::SyncPtr(half_partials.as_mut_ptr());
-            let fold_chunk = |x_hi: usize, range: std::ops::Range<usize>| -> [F128; ELL] {
+            let fold_bytes = |x_hi: usize, range: std::ops::Range<usize>| -> [F128; ELL] {
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
                     let mut banks = cell.borrow_mut();
@@ -4400,6 +5011,66 @@ where
                         &mut banks,
                         &mut partial,
                     );
+                });
+                partial
+            };
+            // A range's partial is the XOR of its sub-ranges' partials: byte
+            // runs go through the byte kernel, flagged sub-chunks through
+            // one product per lane into their own banks and the same fold.
+            let fold_chunk = |x_hi: usize, range: std::ops::Range<usize>| -> [F128; ELL] {
+                let sub_mask = (1usize << AB_PRECONV_SUB_BITS) - 1;
+                let Some(frozen) = preconv.as_ref().filter(|_| {
+                    bank_bits == AB_PRECONV_SUB_BITS
+                        && n_lo == 12
+                        && hi_size == 128
+                        && (range.start | range.end) & sub_mask == 0
+                }) else {
+                    assert!(preconv.is_none(), "pre-converted transform outside the ranked folded shape");
+                    return fold_bytes(x_hi, range);
+                };
+                let subs_per_hi = big_lo_size >> AB_PRECONV_SUB_BITS;
+                let (w0, w1) = (range.start >> AB_PRECONV_SUB_BITS, range.end >> AB_PRECONV_SUB_BITS);
+                let is_conv = |w: usize| frozen.converted(x_hi * subs_per_hi + w);
+                if !(w0..w1).any(is_conv) {
+                    return fold_bytes(x_hi, range);
+                }
+                let mut partial = [F128::ZERO; ELL];
+                let mut w = w0;
+                while w < w1 {
+                    if is_conv(w) {
+                        w += 1;
+                        continue;
+                    }
+                    let start = w;
+                    while w < w1 && !is_conv(w) {
+                        w += 1;
+                    }
+                    let p = fold_bytes(x_hi, start << AB_PRECONV_SUB_BITS..w << AB_PRECONV_SUB_BITS);
+                    for lane in 0..ELL {
+                        partial[lane] += p[lane];
+                    }
+                }
+                AB_PRECONV_BANKS.with(|cell| {
+                    let mut banks = cell.borrow_mut();
+                    banks.clear();
+                    banks.resize(bank_len, F128::ZERO);
+                    for w in (w0..w1).filter(|&w| is_conv(w)) {
+                        ab_preconv_accumulate_sub(
+                            ab_inner_bytes,
+                            x_hi,
+                            w,
+                            n_lo_and_inner,
+                            within_outer_mask,
+                            &b_med_counts,
+                            eq_top_scaled[w],
+                            &mut banks,
+                        );
+                    }
+                    let mut p = [F128::ZERO; ELL];
+                    finish_ab_eq_fold_banks(&eq_bot, eq.hi[x_hi], &banks, bank_deferred, &mut p);
+                    for lane in 0..ELL {
+                        partial[lane] += p[lane];
+                    }
                 });
                 partial
             };
@@ -5591,6 +6262,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let mask_tables = build_c_mask_tables(&eq_lo_scaled);
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    ab_preconv_assert_bytes(ab_inner);
     let ab_inner_bytes = ab_inner.as_bytes();
     let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
     let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
@@ -5779,6 +6451,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
     let c_table_ms = t_c_table.elapsed().as_secs_f64() * 1e3;
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
+    ab_preconv_assert_bytes(ab_inner);
     let ab_inner_bytes = ab_inner.as_bytes();
 
     let timing_cpu_ns: [std::sync::atomic::AtomicU64; 3] =
@@ -6038,29 +6711,112 @@ fn round1_shift_reduce_extract_c_packed_serial(
 }
 
 #[cfg(test)]
-mod tests {
-    /// The R2-CS ceiling offer (`gpu_commit::ENV_NO_R2_OFFER_CEIL`) never
-    /// reads past the rows the A/B rebuild publishes, nor past the anchors
-    /// view, at any shape the rebuild accepts.
+mod ab_preconv_tests {
+    use super::*;
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The converted kernel against the byte kernel: two sub-chunks of one
+    /// `x_hi`, every representation of the ranked transform, random rows and
+    /// random challenge factors. Checks every bank lane and the folded
+    /// partial, deferred and plain.
     #[test]
-    fn r2_offer_ceil_within_published_prefix() {
-        assert_eq!(crate::gpu_commit::zc_r2_offer_ceil_chunks(2048), 880);
-        for log_hi in 3..=14usize {
-            let hi = 1usize << log_hi;
-            let offer = crate::gpu_commit::zc_r2_offer_ceil_chunks(hi);
-            // The rebuild's cap, as `round2_ab_rebuild_geometry` computes it.
-            let cap = hi * crate::gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT / 100;
-            assert!(offer <= cap, "offer {offer} above the published prefix {cap} (hi {hi})");
-            assert!(offer <= (hi * crate::gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT).div_ceil(100));
-            assert!(offer < hi);
-        }
-        for m in 20..=34usize {
-            if let Some((cap, hi, _)) = round2_ab_rebuild_geometry((1usize << m) / 8) {
-                assert!(crate::gpu_commit::zc_r2_offer_ceil_chunks(hi) <= cap);
+    fn converted_sub_chunks_fold_to_the_byte_kernel_partial() {
+        let n_lo_and_inner = 12 + N_INNER;
+        let sub = 1usize << AB_PRECONV_SUB_BITS;
+        let convert = convert_table();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let representations = [
+            (Round1AbRepresentation::Complete, [16u8, 16]),
+            (Round1AbRepresentation::Complete, [16u8, 15]),
+            (Round1AbRepresentation::Complete, [16u8, 0]),
+            (Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false }, [16u8, 15]),
+            (Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true }, [16u8, 15]),
+        ];
+        for (representation, counts) in representations {
+            let within_outer_mask = 1usize;
+            let mut storage: Vec<F128> = (0..2 * sub * ELL)
+                .map(|_| F128::new(xorshift(&mut seed), xorshift(&mut seed)))
+                .collect();
+            let scales: Vec<F128> =
+                (0..2).map(|_| F128::new(xorshift(&mut seed), xorshift(&mut seed))).collect();
+            let eq_bot: Vec<F128> =
+                (0..sub).map(|_| F128::new(xorshift(&mut seed), xorshift(&mut seed))).collect();
+            let eq_hi = F128::new(xorshift(&mut seed), xorshift(&mut seed));
+            let tables = build_ab_eq_fold_tables(&scales, convert);
+            let bytes = |v: &Vec<F128>| unsafe {
+                core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), v.len() * 16).to_vec()
+            };
+            let raw = bytes(&storage);
+            // Byte kernel: every position into its bank with the scaled table.
+            let mut want = vec![F128::ZERO; sub * ELL];
+            for w in 0..2 {
+                for u in 0..sub {
+                    let x_lo = (w << AB_PRECONV_SUB_BITS) | u;
+                    let n_b_med = counts[x_lo & within_outer_mask] as usize;
+                    if n_b_med == 0 {
+                        continue;
+                    }
+                    let first = representation.first_materialized_b_med(x_lo & within_outer_mask);
+                    let end = representation.materialized_b_med_end(x_lo & within_outer_mask, n_b_med);
+                    let rows = precomputed_ab_rows(&raw, x_lo * 1024);
+                    let bank: &mut [F128; ELL] = (&mut want[u * ELL..(u + 1) * ELL]).try_into().unwrap();
+                    kernels::accumulate_convert_ab_nomul::<false, true>(
+                        rows,
+                        first,
+                        end,
+                        &tables[w * CONVERT_TABLE_SIZE..(w + 1) * CONVERT_TABLE_SIZE],
+                        bank,
+                    );
+                }
+            }
+            // Converted kernel: convert in place, then one product per lane.
+            for w in 0..2 {
+                unsafe {
+                    ab_preconv_convert_positions(
+                        storage.as_mut_ptr().cast::<u8>(),
+                        0,
+                        w,
+                        n_lo_and_inner,
+                        within_outer_mask,
+                        &counts,
+                        representation,
+                    );
+                }
+            }
+            let converted = bytes(&storage);
+            let mut got = vec![F128::ZERO; sub * ELL];
+            for w in 0..2 {
+                ab_preconv_accumulate_sub(
+                    &converted,
+                    0,
+                    w,
+                    n_lo_and_inner,
+                    within_outer_mask,
+                    &counts,
+                    scales[w],
+                    &mut got,
+                );
+            }
+            assert!(want.iter().any(|v| *v != F128::ZERO));
+            assert_eq!(got, want, "banks differ for {representation:?} {counts:?}");
+            for deferred in [false, true] {
+                let (mut a, mut b) = ([F128::ZERO; ELL], [F128::ZERO; ELL]);
+                finish_ab_eq_fold_banks(&eq_bot, eq_hi, &want, deferred, &mut a);
+                finish_ab_eq_fold_banks(&eq_bot, eq_hi, &got, deferred, &mut b);
+                assert_eq!(a, b);
             }
         }
     }
+}
 
+#[cfg(test)]
+mod tests {
     use super::*;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
