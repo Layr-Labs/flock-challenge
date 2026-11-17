@@ -184,34 +184,6 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
     }
 }
 
-/// Square with two independent limb products and the same recursive
-/// two-stage reduction as `ghash_mul_binius`. The cross terms cancel over
-/// GF(2), so there is no middle product or cross-term reconstruction.
-///
-/// # Safety
-/// Requires the `aes` target feature (PMULL).
-#[inline]
-#[target_feature(enable = "aes")]
-pub unsafe fn ghash_square_binius(a: F128) -> F128 {
-    unsafe {
-        let t0 = pmull(a.lo, a.lo);
-        let t2 = pmull(a.hi, a.hi);
-        let k = vreinterpretq_p64_u64(vdupq_n_u64(0x87));
-        let fold0 = transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(t2), k,
-        ));
-        let t1 = veorq_u64(fold0, vextq_u64::<1>(t0, t2));
-        let fold1 = transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(t1), k,
-        ));
-        let result = veorq_u64(fold1, vzip1q_u64(t0, t1));
-        F128 {
-            lo: vgetq_lane_u64::<0>(result),
-            hi: vgetq_lane_u64::<1>(result),
-        }
-    }
-}
-
 /// Batch multiply 2× F128 in parallel via Karatsuba 6-PMULL.
 ///
 /// Strategy: 6 Karatsuba PMULLs (3 per product: ll, hh, and (a_lo^a_hi)·(b_lo^b_hi)),
