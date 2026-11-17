@@ -2804,8 +2804,6 @@ fn commit_with_round1_ab_precompute(
     );
 
     flock_core::tmark::mark("commit join end");
-    // The reserved workers join the spin from here (`FLOCK_NO_RESV_HOT`).
-    flock_core::cpu_keepalive::pool_spin_commit_done();
     if run_ranked_exact_tune {
         if std::env::var_os("FLOCK_NO_TUNE_REPLAY_BACKING").is_none() {
             *replay_backing.lock().unwrap() = Some(
