@@ -373,6 +373,50 @@ impl DeferredAb<'_> {
         unreachable!("deferred A/B handles are minted by the aarch64 SIMD driver only");
     }
 
+    /// Write the z rows of quad `q` (compressions `4q..4q + 4`, 512 u32
+    /// words each, back to back) into `zs`, from the same inputs the driver
+    /// used: u32 words `0..488` of each row are the bytes the driver put in
+    /// the z buffer; words `488..512` of each row are left unwritten (the
+    /// opening's z rebuild never reads them; see
+    /// `flock_core::pcs::ENV_NO_OPEN_Z_REBUILD`). Neither buffer is touched.
+    ///
+    /// # Safety
+    /// `zs` is valid for `4 * (K / 32)` u32 writes.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    pub(crate) unsafe fn fill_z_quad(&self, q: usize, zs: *mut u32) {
+        assert!(q < self.n_quads);
+        #[cfg(target_arch = "aarch64")]
+        {
+            use witgen_simd::QuadInput;
+            let first = 4 * q;
+            // SAFETY: the scratch contract is the caller's.
+            let emit = |input: QuadInput<'_>| unsafe { witgen_simd::build_quad_z_rows_plain(input, zs) };
+            // Same input selection as `fill_quad_to` (and the driver's
+            // `process_group`).
+            match self.spec_init {
+                Some(init) if self.gen_ilp && self.seed_in_place => {
+                    let mut slot = std::mem::MaybeUninit::uninit();
+                    emit(QuadInput::Seeded(crate::seed_pipe::gen_quad_soa_into(init, first, &mut slot)));
+                }
+                Some(init) if self.gen_ilp => {
+                    let seeded = crate::seed_pipe::gen_quad_soa(init, first);
+                    emit(QuadInput::Seeded(&seeded));
+                }
+                Some(init) => {
+                    let synth: [Compression; 4] = std::array::from_fn(|j| {
+                        crate::seed_pipe::gen_block_with(init, first + j, self.gen_ilp)
+                    });
+                    emit(QuadInput::Blocks(std::array::from_fn(|j| &synth[j])));
+                }
+                None => {
+                    emit(QuadInput::Blocks(std::array::from_fn(|j| &self.blocks[first + j])));
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        unreachable!("deferred A/B handles are minted by the aarch64 SIMD driver only");
+    }
+
     /// Produce every quad now, without scratch copies (any route that does
     /// not hand the producer to the AB precompute).
     pub(crate) fn fill_all(&self) {
@@ -3484,9 +3528,9 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false, false>(inputs, z, a, b, sa, sb)
             } else {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false>(inputs, z, a, b, sa, sb)
             }
         }
     }
@@ -3525,7 +3569,7 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3534,7 +3578,7 @@ pub(crate) mod witgen_simd {
                     sb,
                 )
             } else {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3556,12 +3600,36 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false>(
+            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false, false>(
                 inputs, core::ptr::null_mut(), a, b, sa, sb,
             )
         }
     }
 
+
+    /// The z rows of one quad (compressions `4q..4q + 4`) written to `zs` with
+    /// plain stores, for a caller that folds them straight out of that
+    /// scratch (the opening's z rebuild, `flock_core::pcs::ENV_NO_OPEN_Z_REBUILD`).
+    /// The same builder, inputs and z stage as the ranked z-only form
+    /// (`build_quad_split_neon::<true, ..>`); only the drain differs: u32
+    /// words `0..488` of each 512-word row (`4 * U32_PER_BLOCK` words in all,
+    /// rows back to back) get exactly the bytes that form publishes — words
+    /// `482..488` zero — and words `488..512` of each row are not written.
+    ///
+    /// # Safety
+    /// `zs` is valid for `4 * U32_PER_BLOCK` u32 writes.
+    pub(crate) unsafe fn build_quad_z_rows_plain(inputs: QuadInput<'_>, zs: *mut u32) {
+        unsafe {
+            build_quad_split_neon_impl::<true, false, false, false, false, false, false, false, true>(
+                inputs,
+                zs,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        }
+    }
 
     /// One 16-byte load at a constant byte offset that the optimizer cannot
     /// merge with other loads of the same word (a merged load would be held
@@ -3594,6 +3662,7 @@ pub(crate) mod witgen_simd {
         const ELIDE_B_STAGE_TAIL: bool,
         const PAIR_STAGE_STORES: bool,
         const DIRECT_SCRATCH: bool,
+        const ZPLAIN: bool,
     >(
         inputs: QuadInput<'_>,
         z: *mut u32,
@@ -3603,6 +3672,7 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         const {
+            assert!(!ZPLAIN || WZ);
             assert!(!MEM || (!WZ && SCRATCH && COPY));
             assert!(!DIRECT_SCRATCH || (!WZ && SCRATCH && COPY));
             assert!(!(WZ && SCRATCH));
@@ -3953,7 +4023,15 @@ pub(crate) mod witgen_simd {
             }
 
             // ---- drain ----
-            if WZ {
+            if WZ && ZPLAIN {
+                // Scratch rows: words 484..488 are the zeros the sparse tail
+                // publisher supplies (482/483 were zeroed above); chunks
+                // 0..61 then drain with plain stores.
+                for w in RANKED_SPARSE_TAIL_WORD + 4..8 * ELIDE_ZERO_CHUNK {
+                    vst1q_u32(za.add(w) as *mut u32, zero);
+                }
+                dump_range::<false>(za, z, 0, ELIDE_ZERO_CHUNK);
+            } else if WZ {
                 dump_range_lines_nt(za, z, 0, RANKED_SPARSE_TAIL_CHUNK);
                 dump_ranked_sparse_tail_nt(za, z);
             } else if SCRATCH && COPY {
@@ -5536,6 +5614,36 @@ impl Blake3Setup {
                                     )
                                 }
                             })
+                    }
+                    _ => None,
+                };
+                // Opening z rebuild (`flock_core::pcs::ENV_NO_OPEN_Z_REBUILD`):
+                // the round-5 materialize rebuilds the z rows of the blocks
+                // its CPU workers fold from the same inputs (either handle),
+                // instead of reading them back from the z buffer.
+                let z_handle = deferred_ab.as_ref().or(r2_rebuild_only.as_ref());
+                let open_z_produce = |q: usize, zs: *mut u32| {
+                    if let Some(handle) = z_handle {
+                        // SAFETY: the materialize hands a scratch of four
+                        // complete rows (the registration's contract).
+                        unsafe { handle.fill_z_quad(q, zs) };
+                    }
+                };
+                let _open_z_rebuild = match z_handle {
+                    Some(handle) if flock_core::pcs::open_z_rebuild_enabled() && z_packed.len() == handle.n_quads() * 4 * (K / 128) => {
+                        // SAFETY: the z buffer keeps its allocation (the
+                        // prover moves the Vec, never its contents) and no
+                        // one writes it until the prove below returns, before
+                        // this scope drops; the producer reproduces the
+                        // driver's z rows (`DeferredAb::fill_z_quad`).
+                        Some(unsafe {
+                            flock_core::pcs::open_z_rebuild_scope(
+                                z_packed.as_ptr(),
+                                z_packed.len(),
+                                handle.n_quads(),
+                                &open_z_produce,
+                            )
+                        })
                     }
                     _ => None,
                 };
@@ -7265,6 +7373,102 @@ mod tests {
     /// with a scratch writes the record's bytes. Buffers start with a
     /// previous witness in place (its per-block constants are the ranked
     /// arm's token-certified chunks), both kernel input forms, several inits.
+    /// Opening z rebuild (`flock_core::pcs::ENV_NO_OPEN_Z_REBUILD`): the z rows
+    /// a handle writes into a scratch (`DeferredAb::fill_z_quad`) are the
+    /// driver's z bytes in u32 words `0..488` of every row — against the
+    /// full z/a/b builder and the ranked z-only form — for every input
+    /// selection the handle can hold, and words `488..512` stay untouched.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn deferred_ab_fill_z_quad_matches_driver_z_rows() {
+        use super::witgen_simd::{self, QuadInput};
+        const ROW: usize = K / 32;
+        const U32S: usize = 4 * ROW;
+        const N_QUADS: usize = 6;
+        const LIVE: usize = 488;
+        for (case, init) in [0u64, 0x0123_4567_89ab_cdef, 0x9e37_79b9_7f4a_7c15].into_iter().enumerate() {
+            // Truth: the full builder's z rows (every chunk written).
+            let blocks: Vec<Compression> =
+                (0..4 * N_QUADS).map(|j| crate::seed_pipe::gen_block_with(init, j, true)).collect();
+            let mut truth = vec![0u32; N_QUADS * U32S];
+            let mut a = vec![0u32; N_QUADS * U32S];
+            let mut b = vec![0u32; N_QUADS * U32S];
+            for q in 0..N_QUADS {
+                let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * q);
+                unsafe {
+                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
+                        QuadInput::Seeded(&seeded),
+                        truth.as_mut_ptr().add(q * U32S),
+                        a.as_mut_ptr().add(q * U32S),
+                        b.as_mut_ptr().add(q * U32S),
+                        false,
+                        false,
+                        [false; 3],
+                        false,
+                    );
+                }
+            }
+            // The ranked z-only form (what the deferred driver publishes).
+            let mut z_only = vec![0x7777_7777u32; N_QUADS * U32S];
+            for q in 0..N_QUADS {
+                let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * q);
+                let none = core::ptr::null_mut::<u32>();
+                unsafe {
+                    witgen_simd::build_quad_split_neon::<true, false, false, false>(
+                        QuadInput::Seeded(&seeded),
+                        z_only.as_mut_ptr().add(q * U32S),
+                        none,
+                        none,
+                        none,
+                        none,
+                    );
+                }
+            }
+            for q in 0..N_QUADS {
+                for r in 0..4 {
+                    let at = q * U32S + r * ROW;
+                    assert_eq!(&z_only[at..at + LIVE], &truth[at..at + LIVE], "z-only form row (case {case} q {q} r {r})");
+                }
+            }
+            // Every input selection of the handle.
+            for (spec_init, gen_ilp, seed_in_place) in
+                [(Some(init), true, true), (Some(init), true, false), (Some(init), false, false), (None, true, true)]
+            {
+                let (mut ha, mut hb) = (a.clone(), b.clone());
+                let handle = super::DeferredAb {
+                    blocks: &blocks,
+                    spec_init,
+                    gen_ilp,
+                    a: ha.as_mut_ptr(),
+                    b: hb.as_mut_ptr(),
+                    n_quads: N_QUADS,
+                    primed_scratch: true,
+                    copy_drain: true,
+                    input_mem: true,
+                    seed_in_place,
+                    rebuild_only: false,
+                };
+                for q in 0..N_QUADS {
+                    let mut zs = vec![0xA5A5_A5A5u32; U32S];
+                    unsafe { handle.fill_z_quad(q, zs.as_mut_ptr()) };
+                    for r in 0..4 {
+                        let at = q * U32S + r * ROW;
+                        assert_eq!(
+                            &zs[r * ROW..r * ROW + LIVE],
+                            &truth[at..at + LIVE],
+                            "rebuilt z row (case {case} spec {spec_init:?} ilp {gen_ilp} in-place {seed_in_place} q {q} r {r})"
+                        );
+                        assert!(
+                            zs[r * ROW + LIVE..(r + 1) * ROW].iter().all(|&w| w == 0xA5A5_A5A5),
+                            "words past 488 are left alone"
+                        );
+                    }
+                }
+                assert!(ha == a && hb == b, "the z fill touches neither buffer");
+            }
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn deferred_ab_rebuilt_chunks_match_record_globals() {

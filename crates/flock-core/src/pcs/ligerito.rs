@@ -8126,6 +8126,94 @@ fn materialize_direct_fold8(
             fold8_block_incumbent(scratch, block, b_out, f_out)
         }
     };
+    // Opening z rebuild (`super::ENV_NO_OPEN_Z_REBUILD`): with a producer
+    // registered for this buffer, a CPU-folded block gets its z rows quad by
+    // quad from the producer into the worker's 512-element scratch and
+    // folds them from there. Only the whole-load four-slot form without an
+    // ordinary basis has a rebuild body; it is that form's block body with
+    // `f_in` read from the scratch: the same kernel calls on the same words
+    // in the same order (one 128-word row = two slots, one quad = eight).
+    let z_rebuild = if super::open_z_rebuild_enabled()
+        && whole_fold64
+        && !has_ordinary
+        && block_len.is_multiple_of(8)
+        && packed_witness.len().is_multiple_of(512)
+    {
+        super::open_z_rebuild_take(&packed_witness).filter(|r| r.n_quads() * 512 == packed_witness.len())
+    } else {
+        None
+    };
+    let z_rebuild_p_only = z_rebuild.is_some() && super::open_z_rebuild_p_only();
+    let zr_blocks = std::sync::atomic::AtomicUsize::new(0);
+    let zr_helper_blocks = std::sync::atomic::AtomicUsize::new(0);
+    let fold8_block_rebuilt = |zr: &super::OpenZRebuild,
+                               scratch: &mut Vec<F128>,
+                               zs: &mut Vec<F128>,
+                               block: usize,
+                               b_out: &mut [F128],
+                               f_out: &mut [F128]|
+     -> (F128, F128) {
+        debug_assert!(!has_ordinary && whole_fold64 && zs.len() >= 512);
+        let (first_claim, rest_claims) = claims.split_first().unwrap();
+        let (first_table, rest_tables) = direct_tables.split_first().unwrap();
+        super::ring_switch::compose_fold_byte_table_into(
+            first_claim.eq_hi[block],
+            first_table,
+            scratch,
+        );
+        let q0 = block * block_len / 8;
+        let mut slot = 0usize;
+        while slot < block_len {
+            // SAFETY: `zs` holds 512 elements; the registration outlives
+            // this materialize (it belongs to the prove that called it).
+            unsafe { zr.produce_quad(q0 + slot / 8, zs.as_mut_ptr()) };
+            for half in 0..2 {
+                let base = 256 * half;
+                crate::field::f128_slice::fold_banked_slots4_whole_into::<64>(
+                    &fold_weight,
+                    &zs[base..base + 256],
+                    &mut f_out[slot..slot + 4],
+                    odd_slot_live,
+                );
+                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+                let direct1 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
+                let direct2 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
+                let direct3 =
+                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
+                b_out[slot] = direct0;
+                b_out[slot + 1] = direct1;
+                b_out[slot + 2] = direct2;
+                b_out[slot + 3] = direct3;
+                slot += 4;
+            }
+        }
+        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
+    };
+    // A CPU-folded block: rebuilt rows when registered (and, under the
+    // P-only knob, on a main-pool worker), else read from the buffer.
+    let fold8_cpu = |st: &mut (Vec<F128>, Vec<F128>),
+                     block: usize,
+                     b_out: &mut [F128],
+                     f_out: &mut [F128]|
+     -> (F128, F128) {
+        if let Some(zr) = z_rebuild.as_ref() {
+            let helper = crate::epool::epool().is_some_and(|p| p.current_thread_index().is_some());
+            if !(z_rebuild_p_only && helper) {
+                if st.1.len() < 512 {
+                    st.1 = crate::alloc_uninit_f128_vec(512);
+                }
+                zr_blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if helper {
+                    zr_helper_blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let (scratch, zs) = (&mut st.0, &mut st.1);
+                return fold8_block_rebuilt(zr, scratch, zs, block, b_out, f_out);
+            }
+        }
+        fold8_block(&mut st.0, block, b_out, f_out)
+    };
     // The same block body when `f_out` already holds the GPU's witness fold
     // (an exact field sum, bit-identical to the banked CPU fold): only the
     // direct basis part and the round-0 partial remain. Ranked shape only
@@ -8190,8 +8278,8 @@ fn materialize_direct_fold8(
         let zf_setup_ms = zf_t0.elapsed().as_secs_f64() * 1e3;
         crate::epool::run_hetero_chunks_stateful(
             n_blocks,
-            || crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN),
-            |scratch, block| {
+            || (crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN), Vec::new()),
+            |st: &mut (Vec<F128>, Vec<F128>), block| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 if zf_want {
                     if !zf_launch_claimed.swap(true, std::sync::atomic::Ordering::AcqRel) {
@@ -8238,9 +8326,9 @@ fn materialize_direct_fold8(
                         let tb = zfold_debug_any().then(std::time::Instant::now);
                         let partial = if let (true, Some(job)) = (from_gpu, job) {
                             f_out.copy_from_slice(job.block_out(block));
-                            fold8_b_only(scratch, block, b_out, f_out)
+                            fold8_b_only(&mut st.0, block, b_out, f_out)
                         } else {
-                            fold8_block(scratch, block, b_out, f_out)
+                            fold8_cpu(st, block, b_out, f_out)
                         };
                         if let Some(tb) = tb {
                             let ns = tb.elapsed().as_nanos() as u64;
@@ -8268,7 +8356,7 @@ fn materialize_direct_fold8(
                     partials_base
                         .ptr()
                         .add(block)
-                        .write(fold8_block(scratch, block, b_out, f_out));
+                        .write(fold8_cpu(st, block, b_out, f_out));
                     if let Some(tb) = tb {
                         zf_ns_full.fetch_add(
                             tb.elapsed().as_nanos() as u64,
@@ -8297,6 +8385,14 @@ fn materialize_direct_fold8(
                 );
             }
         }
+        if zfold_debug_any() && z_rebuild.is_some() {
+            eprintln!(
+                "    [zfold] z rebuild: {} CPU blocks rebuilt ({} on helper threads){}",
+                zr_blocks.load(std::sync::atomic::Ordering::Relaxed),
+                zr_helper_blocks.load(std::sync::atomic::Ordering::Relaxed),
+                if z_rebuild_p_only { ", P-only" } else { "" },
+            );
+        }
         if zfold_debug_any() {
             let full = n_blocks - zf_used;
             let nf = zf_ns_full.load(std::sync::atomic::Ordering::Relaxed);
@@ -8322,8 +8418,8 @@ fn materialize_direct_fold8(
             .zip(folded_f.par_chunks_mut(block_len))
             .enumerate()
             .map_init(
-                || crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN),
-                |scratch, (block, (b_out, f_out))| fold8_block(scratch, block, b_out, f_out),
+                || (crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN), Vec::new()),
+                |st, (block, (b_out, f_out))| fold8_cpu(st, block, b_out, f_out),
             )
             .reduce(
                 || (F128::ZERO, F128::ZERO),
@@ -19521,6 +19617,59 @@ mod tests {
             Some(round1),
             &mut ordinary_challenger,
         );
+        // Opening z rebuild (`pcs::ENV_NO_OPEN_Z_REBUILD`): the same proof
+        // with a producer registered for the witness buffer. The producer
+        // copies the rows from a clone; the materializer must take the
+        // registration, fold every block from the rebuilt rows and emit the
+        // same proof bytes.
+        let rows = poly.clone();
+        let direct_again = direct.clone();
+        let mut rebuilt_witness = poly.clone();
+        // Scribble a buffer pattern the rebuild must never read: the
+        // registered buffer's own rows are replaced by garbage, so a block
+        // folded from the buffer instead of the producer changes the proof.
+        for value in rebuilt_witness.iter_mut() {
+            *value = F128::new(0xDEAD_BEEF_0BAD_F00D, 0x5EED_5EED_5EED_5EED);
+        }
+        let produced = std::sync::atomic::AtomicUsize::new(0);
+        let producer = |q: usize, zs: *mut u32| {
+            produced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: the materializer hands a 512-element scratch.
+            unsafe {
+                core::ptr::copy_nonoverlapping(rows.as_ptr().add(512 * q), zs.cast::<F128>(), 512);
+            }
+        };
+        let got_rebuilt = if crate::pcs::open_z_rebuild_enabled() {
+            // SAFETY: the buffer lives (moved, not copied) until the prover
+            // returns; the producer reproduces `rows`, the true witness.
+            let _scope = unsafe {
+                crate::pcs::open_z_rebuild_scope(
+                    rebuilt_witness.as_ptr(),
+                    rebuilt_witness.len(),
+                    rebuilt_witness.len() / 512,
+                    &producer,
+                )
+            };
+            let witness_ptr = rebuilt_witness.as_ptr();
+            let witness_len = rebuilt_witness.len();
+            let mut rebuilt_challenger =
+                crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
+            let proof = recursive_prover_with_basis_direct_fold8(
+                &cfg,
+                rebuilt_witness,
+                Vec::new(),
+                direct_again,
+                target,
+                &wtns_0.mat,
+                &wtns_0.tree,
+                round0,
+                &mut rebuilt_challenger,
+            );
+            let leftover = open_z_rebuild_pending(witness_ptr, witness_len);
+            Some((proof, leftover))
+        } else {
+            None
+        };
         let mut direct_challenger =
             crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
         let got = recursive_prover_with_basis_direct_fold8(
@@ -19534,6 +19683,20 @@ mod tests {
             round0,
             &mut direct_challenger,
         );
+        if let Some((proof, leftover)) = got_rebuilt {
+            // Only the whole-load four-slot form has a rebuild body (the
+            // AArch64 PMULL build); elsewhere the registration stays unused
+            // and the scribbled buffer would change the proof.
+            if cfg!(all(target_arch = "aarch64", target_feature = "aes")) {
+                assert!(!leftover, "the materializer must take the z registration");
+                assert_eq!(
+                    produced.load(std::sync::atomic::Ordering::Relaxed),
+                    rows.len() / 512,
+                    "one producer call per quad"
+                );
+                assert_eq!(proof, got, "rebuilt-row proof must equal the buffer-read proof");
+            }
+        }
 
         assert_eq!(got, ordinary);
         assert_eq!(
@@ -19568,6 +19731,12 @@ mod tests {
             &wtns_0.root(),
             &mut verifier_challenger,
         ));
+    }
+
+    /// Whether a z-rebuild registration for this buffer is still pending
+    /// (taking it out, so a leftover cannot leak into a later test).
+    fn open_z_rebuild_pending(ptr: *const F128, len: usize) -> bool {
+        crate::pcs::open_z_rebuild_take_raw(ptr as usize, len).is_some()
     }
 
     /// `induce_sumcheck_evaluate_at_residual` matches dense
