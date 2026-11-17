@@ -1992,23 +1992,7 @@ impl AbUnitScratch {
 
     fn with_pairing(unit_bytes: usize, paired: bool) -> Self {
         let slots = if paired { 2 } else { 1 };
-        let len = 2 * slots * unit_bytes + 64;
-        // Lane abpr: reuse this thread's previous scratch allocation when its
-        // length matches, instead of allocating
-        // and zeroing a fresh one per drain. Its bytes are initialized (zeroed
-        // once, then only written by producers) but may hold an earlier
-        // drain's rows: `primed` still starts false for both slots, so the
-        // producer's first fill of each slot writes every byte (the
-        // `Round1AbProducer` contract) before the transform or the stripe
-        // emitter reads it. Different unit/pairing layouts may have the same
-        // total length; this is safe because alignment and layout are rebuilt
-        // and each new slot is cold-filled. A mismatched length or an empty
-        // cache falls back to a fresh zeroed allocation. Nested drains can
-        // only take a parked allocation, never an outer drain's live one.
-        let storage = AB_UNIT_SCRATCH_CACHE
-            .with(|cell| cell.take())
-            .filter(|v| v.len() == len && ab_unit_scratch_reuse_enabled())
-            .unwrap_or_else(|| vec![0u8; len]);
+        let storage = vec![0u8; 2 * slots * unit_bytes + 64];
         let offset = storage.as_ptr().align_offset(64);
         assert!(offset < 64);
         Self {
@@ -2044,35 +2028,6 @@ impl AbUnitScratch {
         self.primed[0] = true;
         (a, b)
     }
-}
-
-impl Drop for AbUnitScratch {
-    fn drop(&mut self) {
-        // Park the initialized allocation for this thread's next drain. Only
-        // the bytes are kept; `primed` is never carried over.
-        let storage = core::mem::take(&mut self.storage);
-        if !storage.is_empty() && ab_unit_scratch_reuse_enabled() {
-            let _ = AB_UNIT_SCRATCH_CACHE.try_with(|cell| cell.set(Some(storage)));
-        }
-    }
-}
-
-std::thread_local! {
-    /// Lane abpr: one parked [`AbUnitScratch`] allocation per thread.
-    static AB_UNIT_SCRATCH_CACHE: std::cell::Cell<Option<Vec<u8>>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Kill switch for the per-thread A/B unit scratch reuse:
-/// `FLOCK_NO_AB_UNIT_SCRATCH_REUSE=1` allocates and zeroes a fresh scratch
-/// per drain worker again. Read once per process.
-pub const ENV_NO_AB_UNIT_SCRATCH_REUSE: &str = "FLOCK_NO_AB_UNIT_SCRATCH_REUSE";
-
-fn ab_unit_scratch_reuse_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os(ENV_NO_AB_UNIT_SCRATCH_REUSE).as_deref() != Some(std::ffi::OsStr::new("1"))
-    })
 }
 
 /// Kill switch for the per-worker window-rows plan: any value of
@@ -7177,71 +7132,6 @@ mod tests {
         }
         // Arms x (representations x unit sizes that divide the buffer).
         assert_eq!(checked, 5 * (1 + 3 * 2 + 3 * 3));
-    }
-
-    /// Lane abpr: a reused scratch allocation never carries `primed`, so a
-    /// producer that skips constant bytes when primed still writes every
-    /// byte on a new drain; a different shape gets a fresh zeroed buffer.
-    #[test]
-    fn ab_unit_scratch_reuse_resets_primed_and_keys_length() {
-        const UNIT: usize = 1024;
-        for paired in [false, true] {
-            let first_ptr = {
-                let mut s = AbUnitScratch::with_pairing(UNIT, paired);
-                for unit in 0..4 {
-                    s.fill(unit, |a, b, _| unsafe {
-                        core::ptr::write_bytes(a, 0xa1, UNIT);
-                        core::ptr::write_bytes(b, 0xb1, UNIT);
-                    });
-                }
-                s.storage.as_ptr()
-            };
-            let mut s = AbUnitScratch::with_pairing(UNIT, paired);
-            if ab_unit_scratch_reuse_enabled() {
-                assert_eq!(s.storage.as_ptr(), first_ptr, "same thread, same shape reuses");
-            }
-            assert_eq!(s.primed, [false; 2], "primed never carried over");
-            let mut seen = Vec::new();
-            for unit in 0..2 {
-                let (a, b) = s.fill(unit, |a, b, primed| {
-                    seen.push(primed);
-                    unsafe {
-                        core::ptr::write_bytes(a, 0x22, UNIT);
-                        core::ptr::write_bytes(b, 0x33, UNIT);
-                    }
-                });
-                assert!(a.iter().all(|&x| x == 0x22) && b.iter().all(|&x| x == 0x33));
-            }
-            assert_eq!(seen, if paired { vec![false, false] } else { vec![false, true] });
-            drop(s);
-            let other = AbUnitScratch::with_pairing(2 * UNIT, paired);
-            assert!(other.storage.iter().all(|&x| x == 0), "new shape is fresh and zeroed");
-        }
-    }
-
-    #[test]
-    fn ab_unit_scratch_reuse_equal_length_different_layout() {
-        const UNIT: usize = 1024;
-        let mut old = AbUnitScratch::with_pairing(UNIT, true);
-        for unit in 0..2 {
-            old.fill(unit, |a, b, _| unsafe {
-                core::ptr::write_bytes(a, 0xa1, UNIT);
-                core::ptr::write_bytes(b, 0xb1, UNIT);
-            });
-        }
-        drop(old);
-        // Paired UNIT and unpaired 2*UNIT have equal total storage lengths.
-        let mut new = AbUnitScratch::with_pairing(2 * UNIT, false);
-        assert_eq!(new.primed, [false; 2]);
-        let (a, b) = new.fill(0, |a, b, primed| {
-            assert!(!primed);
-            unsafe {
-                core::ptr::write_bytes(a, 0x12, 2 * UNIT);
-                core::ptr::write_bytes(b, 0x34, 2 * UNIT);
-            }
-        });
-        assert!(a.iter().all(|&x| x == 0x12));
-        assert!(b.iter().all(|&x| x == 0x34));
     }
 
     /// Primed scratch slots: a producer that skips the constant half of a

@@ -425,14 +425,6 @@ pub(crate) fn join_signal_enabled() -> bool {
     *ON
 }
 
-pub const ENV_NO_TAIL_HALF_UNITS: &str = "FLOCK_NO_TAIL_HALF_UNITS";
-
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn tail_half_units_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAIL_HALF_UNITS));
-    *ON
-}
-
 /// Serial XOR of a fold prefix into the CPU suffix (`FLOCK_NO_FOLD_SERIAL_XOR`,
 /// any value, kills): the round-one C fold's and the lincheck fold's drains
 /// add the GPU prefix's 2^k_log lanes (256 KiB at the ranked shape) into the
@@ -1087,23 +1079,6 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
         }
     });
     if gpu_commit_enabled() { *SHARE } else { 0 }
-}
-
-/// Kill switch for submitting the round-one AB completion arm as one command
-/// buffer (`FLOCK_NO_ZC_AB_SCHED`, any value, read once per process): the
-/// table build is committed as its own command buffer ahead of the gather and
-/// finish, as before. With the switch unset, the table build, the gather and
-/// the finish are encoded into a single command buffer (the table build's
-/// encoder first, then the gather and finish encoder), so no other work on the
-/// queue can be scheduled between the build and the gather, and the arm pays
-/// one command buffer's start instead of two. The kernels, their inputs,
-/// their order and every output are the same.
-pub const ENV_NO_ZC_AB_SCHED: &str = "FLOCK_NO_ZC_AB_SCHED";
-
-pub(crate) fn gpu_zc_ab_one_cb_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_AB_SCHED).is_none());
-    *ON
 }
 
 /// Diagnostic trace for the round-one AB completion arm: the warm-up oracle
@@ -3186,6 +3161,37 @@ pub(crate) fn ntt_ab_priority_helpers() -> usize {
             .filter(|n| *n >= 1)
             .unwrap_or(DEFAULT_HELPERS)
     })
+}
+
+/// Kill switch for the split sweep's AB-end pricing under the NTT priority
+/// (see [`ENV_NO_NTT_AB_PRIORITY`]): `FLOCK_NO_TUNE_AB_MIN` (any value)
+/// restores the incumbent pricing and extension rule. Read once per process.
+///
+/// With the NTT ahead of the AB arm, a split's commit window is the latest of
+/// three ends: the GPU's `cb2 + cb3`, the NTT's `ntt + launch + cb3`, and the
+/// AB arm's end. The incumbent folds the AB end into each sample's CPU arm
+/// and adds cb3's launch to it; but cb3 is committed once the NTT is done, so
+/// the AB end never waits for that launch, and an AB replay that a contended
+/// sample stretched raises its split's CPU arm by the whole stretch. With
+/// this on, the sweep keeps the three terms apart: cb2, cb3 and the NTT get
+/// lines through every sample, the AB end a line through each split's
+/// earliest AB end (a contended sample can only end later), and the AB term
+/// carries no cb3 launch. The sweep also samples the next candidate split
+/// whenever the fitted terms still leave the largest split sampled to the
+/// GPU (`cb2 + cb3` above the AB and NTT ends there), not only when that
+/// split's mean host wall is the smallest: one stretched sample at the
+/// boundary split then cannot end the sweep below the crossing. Tuner inputs
+/// only: the chosen split is byte-verified as before, and the fit still
+/// chooses within the sampled range.
+pub const ENV_NO_TUNE_AB_MIN: &str = "FLOCK_NO_TUNE_AB_MIN";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn tune_ab_min_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| ntt_ab_priority_enabled() && std::env::var_os(ENV_NO_TUNE_AB_MIN).is_none())
 }
 
 /// Run pending main-pool jobs on this worker until `done()` holds or the pool
@@ -12649,9 +12655,9 @@ kernel void blake3_pow_seg_tail(
         n_leaves: usize,
         suffix_start: usize,
         args: Id,
-        unit_levels: usize,
     ) -> Vec<u32> {
-        let unit = 1usize << unit_levels;
+        const UNIT_LEVELS: usize = 10;
+        let unit = 1usize << UNIT_LEVELS;
         debug_assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let mut per_unit: Vec<u32> = Vec::with_capacity(12);
         unsafe {
@@ -12693,7 +12699,7 @@ kernel void blake3_pow_seg_tail(
                 let off = next_arg((unit / 256) as u32, &mut per_unit);
                 gpu.dispatch_indirect(enc, args, off, 256);
             }
-            while done < unit_levels {
+            while done < UNIT_LEVELS {
                 // Per unit: `unit >> (done + 1)` parents at the next level.
                 let n_out = unit >> (done + 1);
                 let tpg = n_out.min(256);
@@ -14292,9 +14298,9 @@ kernel void blake3_pow_seg_tail(
         }
     }
 
-    fn tail_unit_levels() -> usize {
-        if super::tail_half_units_enabled() { 9 } else { 10 }
-    }
+    /// 1,024-leaf units of the CPU tail hash (`super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
+    /// one unit is its leaves and ten parent levels, rooted at level 10.
+    const TAIL_UNIT_LEVELS: usize = 10;
 
     /// Process-lifetime indirect-count buffer of the CPU tail hash's cb3.
     static TAIL_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -14359,8 +14365,7 @@ kernel void blake3_pow_seg_tail(
         suffix_start: usize,
         force: usize,
     ) -> Result<(), String> {
-        let unit_levels = tail_unit_levels();
-        let unit = 1usize << unit_levels;
+        let unit = 1usize << TAIL_UNIT_LEVELS;
         assert!(n_leaves.is_power_of_two() && n_leaves >= 1 << 16);
         assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let total_units = (n_leaves - suffix_start) / unit;
@@ -14378,7 +14383,7 @@ kernel void blake3_pow_seg_tail(
             let cb3 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb3)?;
             let per_unit =
-                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args, unit_levels);
+                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args);
             gpu.end_encoding(enc);
             // The join below returns on this signal (`super::ENV_NO_JOIN_SIGNAL`).
             let sig3 = if super::join_signal_enabled() { gpu.arm_done(cb3) } else { None };
@@ -14414,7 +14419,7 @@ kernel void blake3_pow_seg_tail(
             // the same unit only with the same bytes into the same slots.
             unsafe {
                 let bytes = core::slice::from_raw_parts(bytes_base.ptr().add(start * 1024), unit * 1024);
-                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, unit_levels);
+                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, TAIL_UNIT_LEVELS);
             }
         };
         // cb2's completion as the caller reads it: its armed signal when
@@ -14525,29 +14530,27 @@ kernel void blake3_pow_seg_tail(
         gpu.release(cb3);
         r?;
         crate::tmark::mark("cb3 host woke");
+        // The suffix's levels 11..16 from the unit roots. Level `l`'s first
         // node is rounded down, so a node over the GPU prefix's last 256ths
         // and the suffix's first is rebuilt too: its children on the prefix
         // side are cb2's (every aligned block inside the prefix lies inside
         // one of cb2's greedy subtrees, each complete up to its root).
         let mut ls = 0usize;
         let mut ll = n_leaves;
-        for _ in 0..unit_levels {
+        for _ in 0..TAIL_UNIT_LEVELS {
             ls += ll;
             ll /= 2;
         }
-        let mut lo = suffix_start >> unit_levels;
+        let mut lo = suffix_start >> TAIL_UNIT_LEVELS;
         while ll > 16 {
             let ws = ls + ll;
             let wlo = lo / 2;
-            let mut o = wlo;
-            while o < ll / 2 {
-                let len = 1024.min(ll / 2 - o);
-                unsafe {
-                    let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * o), 2 * len);
-                    let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + o), len);
-                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
-                }
-                o += len;
+            // SAFETY: every GPU write of the tree is complete (cb2 and cb3
+            // joined above) and every CPU unit is done (the scope joined).
+            unsafe {
+                let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * wlo), ll - 2 * wlo);
+                let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + wlo), ll / 2 - wlo);
+                crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
             }
             ls = ws;
             ll /= 2;
@@ -15340,10 +15343,129 @@ kernel void blake3_pow_seg_tail(
         if let Ok(mut v) = fine_arm_samples().lock() {
             if v.len() == lens.1.wrapping_add(1) {
                 if let Some(s) = v.last_mut() {
+                    if super::tune_ab_min_enabled() {
+                        if let Ok(mut r) = ab_arm_samples().lock() {
+                            r.push((s.0, s.1, s.2, s.3, ab_ms));
+                        }
+                    }
                     s.2 = s.2.max(ab_ms - s.3);
                 }
             }
         }
+    }
+
+    /// Per-sample `(k_split, cb2 GPU ms, CPU suffix NTT ms, cb3 GPU ms, AB
+    /// replay end in ms after cb2's GPU start)` of the split sweep, recorded
+    /// by [`price_ab_end_into_arms`] before it raises the fine row's CPU arm
+    /// (only under `super::ENV_NO_TUNE_AB_MIN`'s pricing).
+    fn ab_arm_samples() -> &'static std::sync::Mutex<Vec<(usize, f64, f64, f64, f64)>> {
+        static V: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64, f64, f64)>>> =
+            std::sync::OnceLock::new();
+        V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// Lines of the window's terms over the CPU share `x` in 256ths, fitted
+    /// through the sweep's samples (see `super::ENV_NO_TUNE_AB_MIN`): cb2,
+    /// cb3 and the NTT take Theil-Sen lines through every coarse sample, the
+    /// AB end one through each sampled split's earliest AB end (a contended
+    /// sample only ever ends later). `None` with fewer than three sampled
+    /// splits, or unless the prefix shrinks and the NTT grows with the CPU
+    /// share (otherwise the lines describe noise, not the arms).
+    struct AbMinLines {
+        cb2: (f64, f64),
+        ntt: (f64, f64),
+        cb3: (f64, f64),
+        ab: (f64, f64),
+        lo: usize,
+        hi: usize,
+    }
+
+    impl AbMinLines {
+        fn fit(samples: &[(usize, f64, f64, f64, f64)]) -> Option<Self> {
+            let rows: Vec<&(usize, f64, f64, f64, f64)> = samples
+                .iter()
+                .filter(|s| {
+                    let (k, m) = decode_hybrid_split(s.0);
+                    m == 0 && (1..=ARM_SPLIT_MAX_K).contains(&k)
+                })
+                .collect();
+            let mut ks: Vec<usize> = rows.iter().map(|s| s.0).collect();
+            ks.sort_unstable();
+            ks.dedup();
+            if ks.len() < 3 {
+                return None;
+            }
+            let xs: Vec<f64> = rows.iter().map(|s| 16.0 * s.0 as f64).collect();
+            let col = |f: fn(&(usize, f64, f64, f64, f64)) -> f64| rows.iter().map(|s| f(s)).collect::<Vec<f64>>();
+            let cb2 = theil_sen(&xs, &col(|s| s.1))?;
+            let ntt = theil_sen(&xs, &col(|s| s.2))?;
+            let cb3 = theil_sen(&xs, &col(|s| s.3))?;
+            let kx: Vec<f64> = ks.iter().map(|&k| 16.0 * k as f64).collect();
+            let ab_min: Vec<f64> = ks
+                .iter()
+                .map(|&k| rows.iter().filter(|s| s.0 == k).map(|s| s.4).fold(f64::INFINITY, f64::min))
+                .collect();
+            let ab = theil_sen(&kx, &ab_min)?;
+            let all = [cb2.0, cb2.1, ntt.0, ntt.1, cb3.0, cb3.1, ab.0, ab.1];
+            if !(cb2.1 < 0.0 && ntt.1 > 0.0 && all.iter().all(|v| v.is_finite())) {
+                return None;
+            }
+            Some(AbMinLines { cb2, ntt, cb3, ab, lo: 16 * ks[0], hi: 16 * ks[ks.len() - 1] })
+        }
+
+        /// `(gpu, ntt, ab)` ends at CPU share `c` (256ths): `cb2 + cb3`,
+        /// `ntt + lat + cb3`, and the AB end. The AB term carries no cb3
+        /// launch: cb3 is committed when the NTT is done, whether or not the
+        /// AB arm still runs.
+        fn terms(&self, c: usize, lat: f64) -> (f64, f64, f64) {
+            let x = c as f64;
+            let line = |l: (f64, f64)| l.0 + l.1 * x;
+            let h = line(self.cb3).max(0.0);
+            (line(self.cb2) + h, line(self.ntt) + lat + h, line(self.ab))
+        }
+    }
+
+    /// Whether the window at split `k` (sixteenths, the largest sampled so
+    /// far) is still the GPU's by the fitted terms: `cb2 + cb3` above both
+    /// the AB end and `ntt + lat + cb3`. The window then shrinks toward a
+    /// larger CPU share, past the sampled range (see
+    /// `super::ENV_NO_TUNE_AB_MIN`).
+    fn ab_min_gpu_bound_at(k: usize, lat: f64) -> bool {
+        let rows = ab_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        let Some(l) = AbMinLines::fit(&rows) else { return false };
+        if !lat.is_finite() || l.hi != 16 * k {
+            return false;
+        }
+        let (gpu, ntt, ab) = l.terms(16 * k, lat);
+        gpu > ab.max(ntt)
+    }
+
+    /// The split, in the storable `k + 16 * m` form, that minimises the
+    /// window `max(cb2 + cb3, ntt + lat + cb3, ab)` of [`AbMinLines`] over
+    /// the sampled range, or `None` to keep the incumbent pricing (see
+    /// `super::ENV_NO_TUNE_AB_MIN`).
+    fn split_from_ab_min_fit(
+        samples: &[(usize, f64, f64, f64, f64)],
+        allow_fine: bool,
+        lat: f64,
+    ) -> Option<usize> {
+        let l = AbMinLines::fit(samples)?;
+        if !lat.is_finite() {
+            return None;
+        }
+        let mut best = (0usize, f64::INFINITY);
+        for c in (l.lo..=l.hi).step_by(if allow_fine { 1 } else { 16 }) {
+            let (gpu, ntt, ab) = l.terms(c, lat);
+            let w = gpu.max(ntt).max(ab);
+            if w < best.1 {
+                best = (c, w);
+            }
+        }
+        let (k, m) = (best.0 / 16, best.0 % 16);
+        if k == 0 || k >= 16 {
+            return None;
+        }
+        Some(k + 16 * m)
     }
 
     fn record_fine_arms(k_split: usize, cb2_ms: f64, cpu_ms: f64, cb3_ms: f64) {
@@ -15752,7 +15874,17 @@ kernel void blake3_pow_seg_tail(
     /// the boundary has the strictly smallest mean, stopping at k=7.
     fn collect_ranked_exact_samples<E>(
         extend: bool,
+        sample: impl FnMut(usize) -> Result<f64, E>,
+    ) -> Result<Vec<[f64; 2]>, E> {
+        collect_ranked_exact_samples_with(extend, sample, |_| false)
+    }
+
+    /// [`collect_ranked_exact_samples`] that also extends while
+    /// `also_extend(k)` holds for the largest candidate `k` sampled so far.
+    fn collect_ranked_exact_samples_with<E>(
+        extend: bool,
         mut sample: impl FnMut(usize) -> Result<f64, E>,
+        also_extend: impl Fn(usize) -> bool,
     ) -> Result<Vec<[f64; 2]>, E> {
         let mut walls = vec![[0.0; 2]; RANKED_EXACT_INITIAL_CANDIDATES];
         for (i, &k) in RANKED_EXACT_TUNE_CANDIDATES[..walls.len()].iter().enumerate() {
@@ -15764,7 +15896,9 @@ kernel void blake3_pow_seg_tail(
         while extend && walls.len() < RANKED_EXACT_TUNE_CANDIDATES.len() {
             let Some(means) = mean_ranked_exact_samples(&walls) else { break };
             let boundary = means[means.len() - 1];
-            if !means[..means.len() - 1].iter().all(|&m| boundary < m) {
+            if !means[..means.len() - 1].iter().all(|&m| boundary < m)
+                && !also_extend(RANKED_EXACT_TUNE_CANDIDATES[walls.len() - 1])
+            {
                 break;
             }
             let k = RANKED_EXACT_TUNE_CANDIDATES[walls.len()];
@@ -16316,8 +16450,16 @@ kernel void blake3_pow_seg_tail(
             if let Ok(mut v) = cb3_launch_latency_samples().lock() {
                 v.clear();
             }
+            if let Ok(mut v) = ab_arm_samples().lock() {
+                v.clear();
+            }
             let _recording = ArmRecordScope::enter();
-            match collect_ranked_exact_samples(extend, sample) {
+            // See `super::ENV_NO_TUNE_AB_MIN`: also sample the next split
+            // while the largest one sampled is still GPU-bound.
+            let ab_min = super::tune_ab_min_enabled();
+            match collect_ranked_exact_samples_with(extend, sample, |k| {
+                ab_min && ab_min_gpu_bound_at(k, tune_cb3_launch_latency_ms())
+            }) {
                 Ok(samples) => samples,
                 Err(e) => {
                     if dbg {
@@ -16357,12 +16499,25 @@ kernel void blake3_pow_seg_tail(
             None => swept,
         };
         let fine_samples = fine_arm_samples().lock().map(|v| v.clone()).unwrap_or_default();
+        let ab_rows = if super::tune_ab_min_enabled() {
+            ab_arm_samples().lock().map(|v| v.clone()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let fit = if tune_fit_enabled() && chosen != 0 {
-            split_from_fit(
-                &fine_samples,
-                hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled(),
-                tune_cb3_launch_latency_ms(),
-            )
+            let allow_fine = hybrid_fine_enabled() && hybrid_gpu_suffix_hash_enabled();
+            let lat = tune_cb3_launch_latency_ms();
+            // See `super::ENV_NO_TUNE_AB_MIN`; without its samples (switch
+            // set, or no NTT priority) this is the incumbent fit.
+            let ab_fit = split_from_ab_min_fit(&ab_rows, allow_fine, lat);
+            if dbg && super::tune_ab_min_enabled() {
+                eprintln!(
+                    "[gpu-commit] ab-min fit: {ab_fit:?} over {} samples, incumbent fit {:?}",
+                    ab_rows.len(),
+                    split_from_fit(&fine_samples, allow_fine, lat),
+                );
+            }
+            ab_fit.or_else(|| split_from_fit(&fine_samples, allow_fine, lat))
         } else {
             None
         };
@@ -21789,6 +21944,39 @@ kernel void zc_eq_rows(
             assert_eq!(super::split_from_fit(&flat, true, 0.0), None);
         }
 
+        #[test]
+        fn split_from_ab_min_fit_prices_each_split_by_its_earliest_ab_end() {
+            // cb2 = 44 - 0.15 c, cb3 = 1, ntt = 0.2 c, AB end = 24 + 0.1 c
+            // (256ths), with the first sample of every split stretched by 3:
+            // the window max(cb2 + cb3, ntt + lat + cb3, ab) of the earliest
+            // AB ends is minimal at c = 84, whatever the cb3 launch.
+            let mut s = Vec::new();
+            let mut seen = Vec::new();
+            for k in [2usize, 3, 4, 5, 5, 4, 3, 2, 6, 6] {
+                let c = 16.0 * k as f64;
+                let stretch = if seen.contains(&k) { 0.0 } else { 3.0 };
+                seen.push(k);
+                s.push((k, 44.0 - 0.15 * c, 0.2 * c, 1.0, 24.0 + 0.1 * c + stretch));
+            }
+            for lat in [0.0, 0.5] {
+                let fine = super::split_from_ab_min_fit(&s, true, lat).unwrap();
+                assert_eq!(super::decode_hybrid_split(fine), (5, 4), "lat {lat}");
+            }
+            assert_eq!(super::split_from_ab_min_fit(&s, false, 0.0), Some(5));
+            // Through split 5 the window is still the GPU's at the largest
+            // split sampled; through split 6 it is not.
+            let l = super::AbMinLines::fit(&s[..8]).unwrap();
+            let (gpu, ntt, ab) = l.terms(l.hi, 0.0);
+            assert!(l.hi == 80 && gpu > ab.max(ntt), "{gpu} {ntt} {ab}");
+            let l = super::AbMinLines::fit(&s).unwrap();
+            let (gpu, ntt, ab) = l.terms(l.hi, 0.0);
+            assert!(l.hi == 96 && gpu < ab.max(ntt), "{gpu} {ntt} {ab}");
+            // Too few distinct splits, or an NTT that does not grow: no fit.
+            assert_eq!(super::split_from_ab_min_fit(&s[..2], true, 0.0), None);
+            let flat: Vec<_> = s.iter().map(|r| (r.0, r.1, 5.0, r.3, r.4)).collect();
+            assert_eq!(super::split_from_ab_min_fit(&flat, true, 0.0), None);
+        }
+
         // Fine split from arms (mini1-like arms: GPU-bound at k=3, CPU-bound at 4).
         #[test]
         fn fine_split_interpolates_between_bracketing_splits() {
@@ -26535,9 +26723,7 @@ kernel void zc_ab_finish(
     /// An in-flight round-one AB completion GPU prefix.
     pub(crate) struct ZcAbJob {
         /// Table build, then gather + finish (same queue, in order; the
-        /// second reads the tables the first wrote, hazard-tracked). With the
-        /// one-buffer submission (`ENV_NO_ZC_AB_SCHED`) `cb_tables` is NIL and
-        /// `cb` holds all three kernels.
+        /// second reads the tables the first wrote, hazard-tracked).
         cb_tables: Id,
         cb: Id,
         /// `cb`'s completion signal (`super::ENV_NO_JOIN_SIGNAL`).
@@ -26688,12 +26874,9 @@ kernel void zc_ab_finish(
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let pool = gpu.pool_push();
-            // One command buffer for the whole arm (`ENV_NO_ZC_AB_SCHED`):
-            // the table build's encoder, then the gather and finish encoder.
-            let one_cb = super::gpu_zc_ab_one_cb_enabled();
             let submitted = (|| -> Result<(Id, Id, Option<DoneSig>), String> {
                 // Command buffer 1: the table build (own GPU wall in the
-                // diagnostics), or the arm's only command buffer.
+                // diagnostics).
                 let cb_tables = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb_tables)?;
                 gpu.set_pipeline(enc, state.tables_pso);
@@ -26702,11 +26885,9 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.tables_buf, 0, 2);
                 gpu.dispatch(enc, ZC_AB_TOPS as u64, 256);
                 gpu.end_encoding(enc);
-                // Command buffer 2 (or the same one): gather, then finish
-                // (serial dispatches of one encoder: the finish reads the banks
-                // the gather wrote; the encoder after the table build's reads
-                // the tables it wrote).
-                let cb = if one_cb { cb_tables } else { gpu.command_buffer()? };
+                // Command buffer 2: gather, then finish (serial dispatches of
+                // one encoder: the finish reads the banks the gather wrote).
+                let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
                 gpu.set_pipeline(enc, state.gather_pso);
                 gpu.set_buffer(enc, ab_buf, 0, 0);
@@ -26725,11 +26906,6 @@ kernel void zc_ab_finish(
                 // Armed in the warm-up's oracle launch too, so the timed
                 // launch finds its event in the pool.
                 let sig = if super::join_signal_enabled() { gpu.arm_done(cb) } else { None };
-                if one_cb {
-                    let cb = gpu.retain(cb);
-                    gpu.commit_async(cb);
-                    return Ok((NIL, cb, sig));
-                }
                 let cb_tables = gpu.retain(cb_tables);
                 let cb = gpu.retain(cb);
                 gpu.commit_async(cb_tables);
@@ -26775,8 +26951,7 @@ kernel void zc_ab_finish(
         unsafe {
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
-            // the table build; the table build's status is checked too (a
-            // one-buffer job has no separate table buffer).
+            // the table build; the table build's status is checked too.
             // A timed join returns on the buffer's signal; the oracle launch
             // waits for the status (it reads the GPU's timestamps).
             let ok = if job.calibration || !super::join_signal_enabled() {
@@ -26784,25 +26959,18 @@ kernel void zc_ab_finish(
             } else {
                 gpu.join_cb_sig(job.cb, job.sig.as_ref(), 2.0)
             }
-            .and_then(|()| if job.cb_tables.is_null() { Ok(()) } else { gpu.wait_cb(job.cb_tables) });
+            .and_then(|()| gpu.wait_cb(job.cb_tables));
             if ok.is_ok() {
                 Gpu::recycle_done(job.sig);
             }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
-            // With one buffer its wall covers the table build as well and is
-            // reported as gather+finish (tables 0).
             let (tables_ms, gather_ms) = if ok.is_ok() {
-                (
-                    if job.cb_tables.is_null() { 0.0 } else { zc_fold_gpu_wall_ms(gpu, job.cb_tables) },
-                    zc_fold_gpu_wall_ms(gpu, job.cb),
-                )
+                (zc_fold_gpu_wall_ms(gpu, job.cb_tables), zc_fold_gpu_wall_ms(gpu, job.cb))
             } else {
                 (0.0, 0.0)
             };
             let gpu_ms = tables_ms + gather_ms;
-            if !job.cb_tables.is_null() {
-                gpu.release(job.cb_tables);
-            }
+            gpu.release(job.cb_tables);
             gpu.release(job.cb);
             if let Err(e) = ok {
                 ZC_AB_MODE.store(ZC_AB_DISABLED, Ordering::Relaxed);
