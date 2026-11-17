@@ -2501,13 +2501,19 @@ fn shift_reduce_inner_mixed_const_b_h4<
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
 
-    let plain = inv_table.data_ptr();
+    // [`ABV_TWIST`] (fused form only): the twisted images, whose first image
+    // is the twisted plain row table.
+    const { assert!(V & ABV_TWIST == 0 || (V & ABV_FUSE != 0 && !STATIC_A)) };
+    let twist = if V & ABV_TWIST != 0 { ab_twist_tables(inv_table) } else { core::ptr::null() };
+    let plain = if V & ABV_TWIST != 0 { twist } else { inv_table.data_ptr() };
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
     let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
     // Karatsuba images (see `ab_kara_tables`), or under `ABV_HZ` the sigma
     // tables (see `ab_hz_tables`); dangling and unused otherwise.
-    let kplain = if V & ABV_KARA != 0 {
+    let kplain = if V & ABV_TWIST != 0 {
+        twist
+    } else if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
     } else if V & ABV_HZ != 0 {
         ab_hz_tables(inv_table)
@@ -2647,10 +2653,13 @@ fn shift_reduce_inner_mixed_const_b_h4<
             let o0 = opnds!(plain, plain_sw, kplain, 0);
             let o4 = opnds!(scaled, scaled_sw, kscaled, 4);
             fuse_absorb_k0(&mut acc, &o0, &o4);
-            let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
-            let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
-            let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
-            let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
+            // [`ABV_TWIST`]: plain lane `2a + t` is the `lo` products of
+            // register `2a + t` and the `hi` products of register `2a + 1 - t`.
+            let tw = |i: usize| if V & ABV_TWIST != 0 { i ^ 2 } else { i };
+            let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[tw(1)]));
+            let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[tw(3)]));
+            let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[tw(5)]));
+            let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[tw(7)]));
             store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
             return;
         }
@@ -3312,15 +3321,29 @@ unsafe fn xor_vary_ext<const J0: u32, const J1: u32>(
     b_word: u64,
     db: [&mut core::arch::aarch64::uint8x16_t; 4],
 ) {
+    unsafe { xor_vary_ext_t::<J0, J1, 0>(table_base, b_word, db) }
+}
+
+/// [`xor_vary_ext`]; with [`ABV_TWIST`] in `V`: in the twisted layout
+/// (twisted rows, an odd byte reads the lane of the other register of its
+/// pair).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn xor_vary_ext_t<const J0: u32, const J1: u32, const V: u32>(
+    table_base: *const u8,
+    b_word: u64,
+    db: [&mut core::arch::aarch64::uint8x16_t; 4],
+) {
     use core::arch::aarch64::*;
     unsafe {
         let r0 = table_base.add(byte_from_word::<J0>(b_word) * 64);
         let r1 = if J1 < 8 { table_base.add(((b_word >> ((J1 & 7) * 8)) & 0xff) as usize * 64) } else { r0 };
         let fix = |v: uint8x16_t, odd: bool| if odd { vextq_u8::<8>(v, v) } else { v };
+        let lane = |q: usize, j: u32| q ^ (j as usize / 2) ^ if V & ABV_TWIST != 0 { (j & 1) as usize } else { 0 };
         for (q, d) in db.into_iter().enumerate() {
-            let v0 = fix(vld1q_u8(r0.add((q ^ (J0 as usize / 2)) * 16)), J0 % 2 == 1);
+            let v0 = fix(vld1q_u8(r0.add(lane(q, J0) * 16)), J0 % 2 == 1);
             if J1 < 8 {
-                let v1 = fix(vld1q_u8(r1.add((q ^ (J1 as usize / 2)) * 16)), J1 % 2 == 1);
+                let v1 = fix(vld1q_u8(r1.add(lane(q, J1) * 16)), J1 % 2 == 1);
                 *d = xor3_u8(*d, v0, v1);
             } else {
                 *d = veorq_u8(*d, v0);
@@ -4122,6 +4145,33 @@ unsafe fn apply_word_kara<const V: u32, const SCALED: bool>(
                 }
             };
         }
+        if SCALED && V & ABV_TWIST != 0 {
+            // [`ABV_TWIST`]: the same eighteen lookups out of the twisted
+            // image; register `q` takes the even sum `E_q` and the odd sum
+            // `O_(q ^ 1)` (`R_q = E_q ^ sw(O_(q ^ 1))`), with `X = E_0 ^
+            // sw(O_0)`: `R0 = X ^ sw(t1)`, `R1 = X ^ e0s ^ e1s`, `R2 = X ^ te ^
+            // sw(t1 ^ t2 ^ oss)`, `R3 = R1 ^ te ^ ess ^ sw(t2)`.
+            let (e0a, o0a) = ab_kara_slot_pair::<0, 1, 0>(kara, word);
+            let (e0b, o0b) = ab_kara_slot_pair::<2, 3, 1>(kara, word);
+            let (e1a, o1a) = ab_kara_slot_pair::<4, 5, 2>(kara, word);
+            let (e1b, o1b) = ab_kara_slot_pair::<6, 7, 3>(kara, word);
+            let o0 = veorq_u8(xor3_u8(o0a, o0b, o1a), o1b);
+            let x = xor3_u8(xor3_u8(e0a, e0b, e1a), e1b, vextq_u8::<8>(o0, o0));
+            let (e0s, o0s) = ab_kara_slot_pair::<0, 1, 4>(kara, u);
+            let (e1s, o1s) = ab_kara_slot_pair::<4, 5, 5>(kara, u);
+            let t1 = veorq_u8(o0s, o1s);
+            let r0 = veorq_u8(x, vextq_u8::<8>(t1, t1));
+            let r1 = xor3_u8(x, e0s, e1s);
+            let (esa, osa) = ab_kara_slot_pair::<0, 1, 6>(kara, s);
+            let (esb, osb) = ab_kara_slot_pair::<2, 3, 7>(kara, s);
+            let te = veorq_u8(esa, esb);
+            let t2 = veorq_u8(osa, osb);
+            let (ess, oss) = ab_kara_ninth_pair(kara, v);
+            let t3 = xor3_u8(t1, t2, oss);
+            let r2 = xor3_u8(x, te, vextq_u8::<8>(t3, t3));
+            let r3 = veorq_u8(xor3_u8(r1, te, ess), vextq_u8::<8>(t2, t2));
+            return (r0, r1, r2, r3);
+        }
         if SCALED && V & ABV_KARA_SLOT != 0 && V & ABV_KARA_XOR16 != 0 {
             // The same eighteen lookups and the same twelve-XOR recombination
             // as the `ABV_KARA_XOR16` arm below; only the address formation
@@ -4292,7 +4342,7 @@ pub(crate) fn ab_bstatic_z_enabled() -> bool {
 /// image, `kara` its [`ab_kara_tables`] base.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_z_low<const NB: u32>(
+unsafe fn apply_word_z_low<const NB: u32, const V: u32>(
     t0: *const u8,
     kara: *const u8,
     w: u64,
@@ -4327,12 +4377,19 @@ unsafe fn apply_word_z_low<const NB: u32>(
             p = veorq_u8(p, ld(a, 96));
             q = veorq_u8(q, ld(a, 112));
         }
-        let p = vreinterpretq_u64_u8(p);
-        let q = vreinterpretq_u64_u8(q);
-        let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
-        let b1 = vreinterpretq_u8_u64(vzip2q_u64(p, p));
-        let b2 = vreinterpretq_u8_u64(vzip1q_u64(q, q));
-        let b3 = vreinterpretq_u8_u64(vzip2q_u64(q, q));
+        let (b0, b1, b2, b3) = if V & ABV_TWIST != 0 {
+            // [`ABV_TWIST`]: `p` and `q` already sit in the registers' layout.
+            (p, vextq_u8::<8>(p, p), q, vextq_u8::<8>(q, q))
+        } else {
+            let p = vreinterpretq_u64_u8(p);
+            let q = vreinterpretq_u64_u8(q);
+            (
+                vreinterpretq_u8_u64(vzip1q_u64(p, p)),
+                vreinterpretq_u8_u64(vzip2q_u64(p, p)),
+                vreinterpretq_u8_u64(vzip1q_u64(q, q)),
+                vreinterpretq_u8_u64(vzip2q_u64(q, q)),
+            )
+        };
         if NB >= 3 {
             // {2,3,6,7}: bytes 2 ^ 3.
             let a = rec(ab_z_idx::<2, 7>(ys));
@@ -4373,7 +4430,7 @@ pub(crate) fn ab_bstatic_z_low_forms<const NB: u32>(
                 xor_vary_ext::<2, 3>(plain, w, [d0, d1, d2, d3]);
             }
         }
-        let z = apply_word_z_low::<NB>(plain, kara, w);
+        let z = apply_word_z_low::<NB, 0>(plain, kara, w);
         let e = [veorq_u8(vld1q_u8(pp), z.0), veorq_u8(vld1q_u8(pp.add(16)), z.1), veorq_u8(vld1q_u8(pp.add(32)), z.2), veorq_u8(vld1q_u8(pp.add(48)), z.3)];
         for i in 0..4 {
             vst1q_u8(out.0.as_mut_ptr().add(16 * i), d[i]);
@@ -4498,7 +4555,7 @@ fn ab_z_idx<const J: u32, const LOG: u32>(word: u64) -> usize {
 /// the outputs in the [`ABV_Z_OUT3`] form.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_z<const PACK: bool, const REC: bool, const OUT3: bool>(
+unsafe fn apply_word_z<const PACK: bool, const REC: bool, const OUT3: bool, const ZETA4: bool, const TWIST: bool>(
     t0: *const u8,
     z: *const u8,
     w: u64,
@@ -4510,13 +4567,21 @@ unsafe fn apply_word_z<const PACK: bool, const REC: bool, const OUT3: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let ys = w ^ (w >> 8);
-        let yl1 = w ^ (w >> 16);
-        let yl2 = w ^ (w >> 32);
-        let ysl1 = ys ^ (ys >> 16);
-        let ysl2 = ys ^ (ys >> 32);
-        let yl12 = yl1 ^ (yl1 >> 32);
-        let yall = ysl1 ^ (ysl1 >> 32);
+        // The eight lookup bytes `w_T` (see [`ABV_Z_ZETA4`]): each name is
+        // the word whose lookup byte the extractions below read.
+        let (ys, yl1, yl2, ysl1, ysl2, yl12, yall) = if ZETA4 {
+            let [a, b, c, d] = ab_z_zeta4_words(w);
+            (b, c, a, d, b, c, d)
+        } else {
+            let ys = w ^ (w >> 8);
+            let yl1 = w ^ (w >> 16);
+            let yl2 = w ^ (w >> 32);
+            let ysl1 = ys ^ (ys >> 16);
+            let ysl2 = ys ^ (ys >> 32);
+            let yl12 = yl1 ^ (yl1 >> 32);
+            let yall = ysl1 ^ (ysl1 >> 32);
+            (ys, yl1, yl2, ysl1, ysl2, yl12, yall)
+        };
         let ld = |base: *const u8, idx: usize| vld1q_u8(base.add(idx));
         // T = {}: the plain row.
         let i0 = ab_z_idx::<0, 6>(yall);
@@ -4571,6 +4636,20 @@ unsafe fn apply_word_z<const PACK: bool, const REC: bool, const OUT3: bool>(
         let fg = veorq_u8(f, g);
         let p = vreinterpretq_u64_u8(xor3_u8(d01, e0, fg));
         let q = vreinterpretq_u64_u8(xor3_u8(d23, e2, fg));
+        if TWIST {
+            // Twisted lane layout ([`ABV_TWIST`]): register `2a + t` holds
+            // block `4a + 2t` and block `4a + 2(1 - t) + 1`, so the `s` terms
+            // of the two registers of a lane pair are `p` and `p` with its
+            // halves swapped; `t0` and the `N` record lanes are twisted.
+            let p = vreinterpretq_u8_u64(p);
+            let q = vreinterpretq_u8_u64(q);
+            return (
+                xor3_u8(xor3_u8(m0, k, n0), l0, p),
+                xor3_u8(xor3_u8(m0, k, n1), l1, vextq_u8::<8>(p, p)),
+                xor3_u8(xor3_u8(m2, k, n0), l2, q),
+                xor3_u8(xor3_u8(m2, k, n1), l3, vextq_u8::<8>(q, q)),
+            );
+        }
         if OUT3 {
             // The five terms of each output below, as two three-way XORs.
             let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
@@ -4656,6 +4735,292 @@ fn ab_z_out3_apply_matches_shared_form() {
             (
                 bytes(apply_word_into_4_regs_v::<{ AB_Z_VARIANT | ABV_Z_OUT3 }, false>(t, sw, kara, w)),
                 bytes(apply_word_into_4_regs_v::<AB_Z_VARIANT, false>(t, sw, kara, w)),
+                bytes(apply_word_into_4_regs(t, sw, w)),
+            )
+        };
+        assert_eq!(new, old, "w={w:016x}");
+        assert_eq!(new, plain, "w={w:016x}");
+    }
+}
+
+/// Row-body variant bit (with the [`ABV_Z_ZETA4`] z form and the
+/// Karatsuba `x^4` image): every apply of the row writes its 64 bytes in
+/// the twisted lane layout, register `2a + t` holding the 8-byte blocks
+/// `4a + 2t` and `4a + 2(1 - t) + 1` (lanes `[L0.lo|L1.hi]`,
+/// `[L1.lo|L0.hi]`, `[L2.lo|L3.hi]`, `[L3.lo|L2.hi]`), out of the twisted
+/// images of [`ab_twist_tables`]. The z form's half-constant terms then
+/// need one `ext` per lane pair instead of one `dup` per lane, the products
+/// stay lane-wise, and the row's reduction pairs the product registers of
+/// each plain lane (`lo` of one register, `hi` of the other), so the row is
+/// stored in the plain layout. Every output byte is the same XOR of the same
+/// table bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_TWIST: u32 = 1 << 19;
+
+/// Kill switch for [`ABV_TWIST`]: any value of `FLOCK_NO_ZC_AB_TWIST` keeps
+/// the plain lane layout (the main-pool unit rows then take the per-chunk
+/// rows, which write the same bytes). Read once per process.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_twist_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_TWIST").is_none())
+}
+
+/// The 64 bytes of a table row in the [`ABV_TWIST`] layout.
+#[cfg(target_arch = "aarch64")]
+fn ab_twist_row(row: &[u8]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    for r in 0..4usize {
+        // Register `r` = [block 2r | block 2(r ^ 1) + 1].
+        let (lo, hi) = (2 * r, 2 * (r ^ 1) + 1);
+        out[16 * r..16 * r + 8].copy_from_slice(&row[8 * lo..8 * lo + 8]);
+        out[16 * r + 8..16 * r + 16].copy_from_slice(&row[8 * hi..8 * hi + 8]);
+    }
+    out
+}
+
+/// The twisted images of [`ABV_TWIST`], laid out like [`ab_kara_tables`]
+/// so the same offsets apply: the twisted plain row table at offset 0
+/// (where the plain Karatsuba image would be; the form never reads it),
+/// the Karatsuba image of the twisted `x^4` rows, then the plain z image
+/// with the `N` lanes of its 128-byte records twisted (the record pairs,
+/// `l1 l2`, `s l2` and `s l1 l2` tables as in [`ab_kara_tables`]).
+/// 128-byte aligned, built once per process.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_twist_tables(inv_table: &InvNttTableByteSingleGf8) -> *const u8 {
+    struct Tables {
+        storage: Vec<u8>,
+        offset: usize,
+    }
+    static TABLES: std::sync::OnceLock<Tables> = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        let len = 2 * AB_KARA_IMAGE_BYTES + AB_Z_IMAGE_BYTES;
+        let mut storage = vec![0u8; len + 127];
+        let offset = storage.as_ptr().align_offset(128);
+        assert!(offset < 128);
+        let dst = &mut storage[offset..offset + len];
+        // SAFETY: each image is 256 rows of 64 bytes.
+        let (plain, scaled) = unsafe {
+            (
+                core::slice::from_raw_parts(inv_table.data_ptr(), 256 * 64),
+                core::slice::from_raw_parts(inv_table.scaled_x4_data_ptr(), 256 * 64),
+            )
+        };
+        for x in 0..256 {
+            dst[x * 64..x * 64 + 64].copy_from_slice(&ab_twist_row(&plain[x * 64..x * 64 + 64]));
+            let row = ab_twist_row(&scaled[x * 64..x * 64 + 64]);
+            let k = &mut dst[AB_KARA_IMAGE_BYTES..2 * AB_KARA_IMAGE_BYTES];
+            for i in 0..16 {
+                let (c0, c1, c2, c3) = (row[i], row[16 + i], row[32 + i], row[48 + i]);
+                let entry = &mut k[x * 128..(x + 1) * 128];
+                entry[i] = c0;
+                entry[16 + i] = c1;
+                entry[32 + i] = c2;
+                entry[48 + i] = c3;
+                entry[64 + i] = c0 ^ c1;
+                entry[80 + i] = c2 ^ c3;
+                entry[96 + i] = c0 ^ c2;
+                entry[112 + i] = c1 ^ c3;
+                k[AB_KARA_NINTH + x * 16 + i] = c0 ^ c1 ^ c2 ^ c3;
+            }
+        }
+        let z = &mut dst[2 * AB_KARA_IMAGE_BYTES..];
+        for x in 0..256 {
+            ab_z_fill_entry(&plain[x * 64..(x + 1) * 64], x, z);
+            // N0 = [n(0)|n(1)], N1 = [n(2)|n(3)] -> [n(0)|n(3)], [n(2)|n(1)].
+            let rec = &mut z[AB_Z_REC + x * 128..AB_Z_REC + (x + 1) * 128];
+            let mut n = [0u8; 32];
+            n.copy_from_slice(&rec[32..64]);
+            rec[40..48].copy_from_slice(&n[24..32]);
+            rec[56..64].copy_from_slice(&n[8..16]);
+        }
+        Tables { storage, offset }
+    });
+    // SAFETY: `offset < 128` and the allocation holds `offset + len`.
+    unsafe { tables.storage.as_ptr().add(tables.offset) }
+}
+
+/// The [`ABV_TWIST`] applies write the twisted layout of the plain applies'
+/// bytes: the z form, the `x^4` Karatsuba form, the low-byte z form and the
+/// per-byte partial rows, for the zero and all-ones words, every one-byte
+/// word and random words.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_twist_applies_match_plain() {
+    use crate::ntt::AdditiveNttGf8;
+    use core::arch::aarch64::*;
+    const VT: u32 = AB_Z_VARIANT | ABV_Z_OUT3 | ABV_Z_ZETA4 | ABV_KARA_SLOT | ABV_KARA_XOR16 | ABV_TWIST;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let tw = ab_twist_tables(&table);
+    let (t, sw) = (table.data_ptr(), table.half_swapped_data_ptr());
+    let (ts, sws) = (table.scaled_x4_data_ptr(), table.scaled_x4_half_swapped_data_ptr());
+    let bytes = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| {
+        let mut out = [0u8; 64];
+        // SAFETY: four 16-byte stores into a 64-byte array.
+        unsafe {
+            vst1q_u8(out.as_mut_ptr(), v.0);
+            vst1q_u8(out.as_mut_ptr().add(16), v.1);
+            vst1q_u8(out.as_mut_ptr().add(32), v.2);
+            vst1q_u8(out.as_mut_ptr().add(48), v.3);
+        }
+        out
+    };
+    let mut x = 0x7357_A11E_5EED_0001u64;
+    for i in 0..20000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let w = match i {
+            0 => 0,
+            1 => u64::MAX,
+            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
+            _ => x,
+        };
+        // SAFETY: the applies read inside the table images only.
+        unsafe {
+            let plain = bytes(apply_word_into_4_regs(t, sw, w));
+            let plain_s = bytes(apply_word_into_4_regs(ts, sws, w));
+            assert_eq!(bytes(apply_word_into_4_regs_v::<VT, false>(tw, tw, tw, w)), ab_twist_row(&plain), "z w={w:016x}");
+            assert_eq!(
+                bytes(apply_word_into_4_regs_v::<VT, true>(tw, tw, tw.add(AB_KARA_IMAGE_BYTES), w)),
+                ab_twist_row(&plain_s),
+                "kara w={w:016x}"
+            );
+            for nb in [2u32, 3, 4] {
+                let v = w & ((1u64 << (8 * nb)) - 1);
+                let want = ab_twist_row(&bytes(apply_word_into_4_regs(t, sw, v)));
+                let got = bytes(match nb {
+                    2 => apply_word_z_low::<2, VT>(tw, tw, v),
+                    3 => apply_word_z_low::<3, VT>(tw, tw, v),
+                    _ => apply_word_z_low::<4, VT>(tw, tw, v),
+                });
+                assert_eq!(got, want, "z_low nb={nb} w={v:016x}");
+            }
+            // Per-byte partial rows: bytes (0, 1), (2, 3) and the single bytes 4 and 7.
+            let mut d = [vdupq_n_u8(0); 4];
+            {
+                let [d0, d1, d2, d3] = &mut d;
+                xor_vary_ext_t::<0, 1, VT>(tw, w, [d0, d1, d2, d3]);
+                xor_vary_ext_t::<2, 3, VT>(tw, w, [d0, d1, d2, d3]);
+                xor_vary_ext_t::<4, 8, VT>(tw, w, [d0, d1, d2, d3]);
+                xor_vary_ext_t::<7, 8, VT>(tw, w, [d0, d1, d2, d3]);
+            }
+            let v = w & 0x0000_0000_ffff_ffff | (w & 0xff00_00ff_0000_0000);
+            let want = ab_twist_row(&bytes(apply_word_into_4_regs(t, sw, v)));
+            assert_eq!(bytes((d[0], d[1], d[2], d[3])), want, "vary w={w:016x}");
+        }
+    }
+}
+
+/// Row-body variant bit (with [`ABV_Z`], [`ABV_Z_REC`] and [`ABV_Z_OUT3`]):
+/// the z-basis apply forms the words it reads its eight lookup bytes from
+/// with four shifted XORs instead of seven. With `a = w ^ (w >> 32)`,
+/// `b = a ^ (a >> 8)`, `c = a ^ (a >> 16)` and `d = b ^ (b >> 16)`, byte `T`
+/// of the word below is `w_T`, the XOR of the bytes `W_b` with `b ⊇ T`:
+/// `T = 0, 4` in `d`, `1, 5` in `c`, `2, 6` in `b`, `3` in `a`, `7` in `w`
+/// (the seven-word form reads the same eight values at the same byte
+/// positions of `yall`, `ysl1`, `yl12`, `yl1`, `ysl2`, `ys`, `yl2`, `w`).
+/// Every lookup index is the same, so the loads and the bytes written are
+/// the same; only three integer instructions per word go.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_Z_ZETA4: u32 = 1 << 18;
+
+/// Kill switch for [`ABV_Z_ZETA4`]: any value of `FLOCK_NO_ZC_AB_Z_ZETA4`
+/// keeps the seven-XOR lookup words (the main-pool unit rows then take the
+/// per-chunk rows, which write the same bytes). Read once per process.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_z_zeta4_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_AB_Z_ZETA4").is_none())
+}
+
+/// The words `[a, b, c, d]` of [`ABV_Z_ZETA4`].
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn ab_z_zeta4_words(w: u64) -> [u64; 4] {
+    let a = w ^ (w >> 32);
+    let b = a ^ (a >> 8);
+    let c = a ^ (a >> 16);
+    let d = b ^ (b >> 16);
+    [a, b, c, d]
+}
+
+/// Every lookup byte of the [`ABV_Z_ZETA4`] words equals the seven-word
+/// form's at the position the apply reads, and both equal the superset sum.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_z_zeta4_words_match_seven_word_form() {
+    let byte = |x: u64, j: u32| (x >> (8 * j)) & 0xff;
+    let mut x = 0x0123_4567_89AB_CDEFu64;
+    for i in 0..200_000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let w = match i {
+            0 => 0,
+            1 => u64::MAX,
+            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
+            _ => x,
+        };
+        let ys = w ^ (w >> 8);
+        let yl1 = w ^ (w >> 16);
+        let yl2 = w ^ (w >> 32);
+        let ysl1 = ys ^ (ys >> 16);
+        let ysl2 = ys ^ (ys >> 32);
+        let yl12 = yl1 ^ (yl1 >> 32);
+        let yall = ysl1 ^ (ysl1 >> 32);
+        let [a, b, c, d] = ab_z_zeta4_words(w);
+        let old = [(yall, 0), (yl12, 1), (ysl2, 2), (yl2, 3), (ysl1, 4), (yl1, 5), (ys, 6), (w, 7)];
+        let new = [(d, 0), (c, 1), (b, 2), (a, 3), (d, 4), (c, 5), (b, 6), (w, 7)];
+        for t in 0..8u32 {
+            let sup = (0..8u32).filter(|b| b & t == t).fold(0, |acc, b| acc ^ byte(w, b));
+            assert_eq!(byte(old[t as usize].0, old[t as usize].1), sup, "old w={w:016x} T={t}");
+            assert_eq!(byte(new[t as usize].0, new[t as usize].1), sup, "new w={w:016x} T={t}");
+        }
+    }
+}
+
+/// The [`ABV_Z_ZETA4`] apply writes the [`ABV_Z_OUT3`] apply's bytes and the
+/// plain apply's for the zero and all-ones words, every one-byte word and
+/// random words, in the plain image.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_z_zeta4_apply_matches_out3_form() {
+    use crate::ntt::AdditiveNttGf8;
+    use core::arch::aarch64::*;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let kara = ab_kara_tables(&table);
+    let (t, sw) = (table.data_ptr(), table.half_swapped_data_ptr());
+    let bytes = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| {
+        let mut out = [0u8; 64];
+        // SAFETY: four 16-byte stores into a 64-byte array.
+        unsafe {
+            vst1q_u8(out.as_mut_ptr(), v.0);
+            vst1q_u8(out.as_mut_ptr().add(16), v.1);
+            vst1q_u8(out.as_mut_ptr().add(32), v.2);
+            vst1q_u8(out.as_mut_ptr().add(48), v.3);
+        }
+        out
+    };
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for i in 0..20000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let w = match i {
+            0 => 0,
+            1 => u64::MAX,
+            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
+            _ => x,
+        };
+        const V3: u32 = AB_Z_VARIANT | ABV_Z_OUT3;
+        // SAFETY: the applies read inside the table images only.
+        let (new, old, plain) = unsafe {
+            (
+                bytes(apply_word_into_4_regs_v::<{ V3 | ABV_Z_ZETA4 }, false>(t, sw, kara, w)),
+                bytes(apply_word_into_4_regs_v::<V3, false>(t, sw, kara, w)),
                 bytes(apply_word_into_4_regs(t, sw, w)),
             )
         };
@@ -5010,6 +5375,22 @@ unsafe fn apply_word_into_4_regs_v<const V: u32, const SCALED: bool>(
     core::arch::aarch64::uint8x16_t,
     core::arch::aarch64::uint8x16_t,
 ) {
+    // The twisted layout exists for this form only: the plain image in
+    // z form with the four-XOR words, the scaled image in Karatsuba form.
+    const {
+        assert!(
+            V & ABV_TWIST == 0
+                || (V & ABV_Z != 0
+                    && V & ABV_Z_REC != 0
+                    && V & ABV_Z_OUT3 != 0
+                    && V & ABV_Z_ZETA4 != 0
+                    && V & ABV_Z_SCALED == 0
+                    && V & ABV_Z_MT == 0
+                    && V & ABV_KARA_SLOT != 0
+                    && V & ABV_KARA_XOR16 != 0
+                    && V & ABV_NOSW != 0)
+        )
+    };
     unsafe {
         if V & ABV_Z != 0 && (!SCALED || V & ABV_Z_SCALED != 0) {
             let z = if SCALED {
@@ -5018,17 +5399,21 @@ unsafe fn apply_word_into_4_regs_v<const V: u32, const SCALED: bool>(
                 kara.add(2 * AB_KARA_IMAGE_BYTES)
             };
             if V & ABV_Z_REC != 0 && V & ABV_Z_PACK != 0 {
-                apply_word_z::<true, true, false>(table_base, z, word)
+                apply_word_z::<true, true, false, false, false>(table_base, z, word)
             } else if V & ABV_Z_REC != 0 && V & ABV_Z_MT != 0 {
                 apply_word_z_mt(table_base, z, word)
+            } else if V & ABV_Z_REC != 0 && V & ABV_Z_OUT3 != 0 && V & ABV_Z_ZETA4 != 0 && V & ABV_TWIST != 0 {
+                apply_word_z::<false, true, true, true, true>(table_base, z, word)
+            } else if V & ABV_Z_REC != 0 && V & ABV_Z_OUT3 != 0 && V & ABV_Z_ZETA4 != 0 {
+                apply_word_z::<false, true, true, true, false>(table_base, z, word)
             } else if V & ABV_Z_REC != 0 && V & ABV_Z_OUT3 != 0 {
-                apply_word_z::<false, true, true>(table_base, z, word)
+                apply_word_z::<false, true, true, false, false>(table_base, z, word)
             } else if V & ABV_Z_REC != 0 {
-                apply_word_z::<false, true, false>(table_base, z, word)
+                apply_word_z::<false, true, false, false, false>(table_base, z, word)
             } else if V & ABV_Z_PACK != 0 {
-                apply_word_z::<true, false, false>(table_base, z, word)
+                apply_word_z::<true, false, false, false, false>(table_base, z, word)
             } else {
-                apply_word_z::<false, false, false>(table_base, z, word)
+                apply_word_z::<false, false, false, false, false>(table_base, z, word)
             }
         } else if V & ABV_KARA != 0 {
             apply_word_kara::<V, SCALED>(kara, word)
@@ -5696,12 +6081,16 @@ pub(crate) fn ab_mixed_row_guarded(
     nt_store: bool,
 ) -> bool {
     const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16;
-    // The production mixed rows: the H2 form with the fused products. Either
-    // kill switch (`FLOCK_NO_ZC_AB_MIXED_H2`, `FLOCK_NO_ZC_AB_MIXED_FUSE`)
-    // takes the incumbent form `V0`; the unfused H2 instance is kept for
-    // the tests only, so the binary carries no extra mixed-row instance.
-    const VF: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE;
-    let fuse = ab_mixed_h2_enabled() && ab_mixed_fuse_enabled();
+    // The production mixed rows: the H2 form with the fused products, the
+    // four-XOR lookup words ([`ABV_Z_ZETA4`]) and the twisted lane layout
+    // ([`ABV_TWIST`], the window rows' tables). Any of the kill switches
+    // (`FLOCK_NO_ZC_AB_MIXED_H2`, `FLOCK_NO_ZC_AB_MIXED_FUSE`,
+    // `FLOCK_NO_ZC_AB_Z_ZETA4`, `FLOCK_NO_ZC_AB_TWIST`) takes the incumbent
+    // form `V0`; the other H2
+    // instances are kept for the tests only, so the binary carries no extra
+    // mixed-row instance.
+    const VF: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_Z_ZETA4 | ABV_TWIST;
+    let fuse = ab_mixed_h2_enabled() && ab_mixed_fuse_enabled() && ab_z_zeta4_enabled() && ab_twist_enabled();
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
     let word = |packed: &[u8], k: usize| -> u64 {

@@ -75,6 +75,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
     use core::arch::aarch64::*;
     // The fused accumulation implements the `ABV_HORNER2` steps only.
     const { assert!(V & ABV_FUSE == 0 || V & ABV_HORNER2 != 0) };
+    // The twisted layout reads no static partials (complemented basis only).
+    const { assert!(V & ABV_TWIST == 0 || (V & ABV_TRANSFORM_TRIM != 0 && V & ABV_KARA != 0)) };
     let b_med = BLK % 16;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     if HOIST {
@@ -82,7 +84,9 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
     } else {
         assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
     }
-    let plain = inv_table.data_ptr();
+    // [`ABV_TWIST`]: `kara` is [`ab_twist_tables`], whose first image is
+    // the twisted plain row table.
+    let plain = if V & ABV_TWIST != 0 { kara } else { inv_table.data_ptr() };
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
     let scaled_sw = inv_table.scaled_x4_half_swapped_data_ptr();
@@ -112,8 +116,8 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                 #[allow(unused_variables)]
                 let b_word = transform_partial_word::<V>(bw!($k));
                 if V & ABV_NOSW != 0 {
-                    $(xor_vary_ext::<$j0, $j1>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
-                    $(xor_vary_ext::<$js, 8>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
+                    $(xor_vary_ext_t::<$j0, $j1, V>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
+                    $(xor_vary_ext_t::<$js, 8, V>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
                 } else {
                     $(xor_vary_pair::<$j0, $j1>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
                     $(xor_vary_single::<$js>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
@@ -141,7 +145,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
             ($blk:literal, $k:literal, $nb:literal, $inc:expr) => {{
                 if V & ABV_BSTATIC_Z != 0 {
                     let pp = pbase.add(($blk * 8 + $k) * 64);
-                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(
+                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb, V>(
                         plain, kplain, transform_partial_word::<V>(bw!($k)),
                     );
                     let (d0, d1, d2, d3) = transform_partial_seed::<V>(pp);
@@ -1112,10 +1116,13 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
             }
             _ => unreachable!("no static-B Horner plan for this arm"),
         };
-        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
-        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
-        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
-        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[7]));
+        // [`ABV_TWIST`]: plain lane `2a + t` is the `lo` products of
+        // register `2a + t` and the `hi` products of register `2a + 1 - t`.
+        let tw = |i: usize| if V & ABV_TWIST != 0 { i ^ 2 } else { i };
+        let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[tw(1)]));
+        let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[tw(3)]));
+        let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[tw(5)]));
+        let r3 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[6]), vreinterpretq_u8_u16(acc[tw(7)]));
         store_row_64(out.as_mut_ptr(), nt_store, r0, r1, r2, r3);
     }
 }
@@ -1266,7 +1273,9 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u32, const HOIST: bool>(
         assert!(end <= a_packed.len() && end <= b_packed.len());
     }
     let out = out_outer.as_mut_ptr();
-    let kara = if V & ABV_KARA != 0 {
+    let kara = if V & ABV_TWIST != 0 {
+        ab_twist_tables(inv_table)
+    } else if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
     } else if V & ABV_HZ != 0 {
         ab_hz_tables(inv_table)
@@ -1346,9 +1355,26 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                     const BASE: u32 = AB_UNIT_MAIN | ABV_Z_OUT3;
                     if ab_fuse_enabled() {
                         if const { V & ABV_TRANSFORM_TRIM != 0 } {
-                            bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM | ABV_TRANSFORM_TRIM }, true, true>(
-                                x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
-                            )
+                            // The four-XOR lookup words ([`ABV_Z_ZETA4`]) in
+                            // the twisted lane layout ([`ABV_TWIST`]);
+                            // `FLOCK_NO_ZC_AB_Z_ZETA4` or `FLOCK_NO_ZC_AB_TWIST`
+                            // takes the per-chunk rows (build budget: no
+                            // second unit instance).
+                            if ab_z_zeta4_enabled() && ab_twist_enabled() {
+                                bstatic_horner_window_unit_nt::<
+                                    { BASE | AB_FUSE_FORM | ABV_TRANSFORM_TRIM | ABV_Z_ZETA4 | ABV_TWIST },
+                                    true,
+                                    true,
+                                >(
+                                    x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials,
+                                    out_unit,
+                                )
+                            } else {
+                                bstatic_horner_window_unit_per_chunk::<V, HOIST>(
+                                    x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials,
+                                    out_unit, true,
+                                )
+                            }
                         } else {
                             bstatic_horner_window_unit_nt::<{ BASE | AB_FUSE_FORM }, true, true>(
                                 x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
@@ -1504,7 +1530,9 @@ fn bstatic_horner_window_unit_flag<const V: u32, const HOIST: bool>(
     out_unit: &mut [u8],
     nt_store: bool,
 ) {
-    let kara = if V & ABV_KARA != 0 {
+    let kara = if V & ABV_TWIST != 0 {
+        ab_twist_tables(inv_table)
+    } else if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
     } else if V & ABV_HZ != 0 {
         ab_hz_tables(inv_table)
@@ -1561,7 +1589,9 @@ fn bstatic_horner_window_unit_nt<const V: u32, const HOIST: bool, const NT: bool
     partials: [&'static [[u8; 64]; 248]; 2],
     out_unit: &mut [u8],
 ) {
-    let kara = if V & ABV_KARA != 0 {
+    let kara = if V & ABV_TWIST != 0 {
+        ab_twist_tables(inv_table)
+    } else if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
     } else if V & ABV_HZ != 0 {
         ab_hz_tables(inv_table)
@@ -1870,6 +1900,106 @@ fn ab_window_unit_fuse_matches_parent() {
                 let helper_want = both!(AB_UNIT_HELPER, false);
                 assert_eq!(helper_want.0, want.0, "helper {at}");
                 assert_eq!(both!(AB_UNIT_HELPER | ABV_FUSE, false), helper_want, "FUSE_E {at}");
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 4 * 5 * 2);
+}
+
+/// The ranked main-pool unit rows with [`ABV_Z_ZETA4`] (complemented
+/// static-B basis, fused products, three-way XOR outputs) write the bytes of
+/// the same instance without it, of the per-chunk rows and of the plain
+/// instance, and [`bstatic_horner_window_unit_impl`] writes them too: units
+/// of eight chunks from window 0, three from window 1 and one from either
+/// window, in a unit scratch and at a chunk offset in a whole buffer, with B
+/// rows that satisfy the static masks, random B rows (every row through the
+/// fallback) and B rows where every other row satisfies them, with random,
+/// zero and all-ones A rows.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_window_unit_zeta4_matches_parent() {
+    use crate::ntt::AdditiveNttGf8;
+    const OUTER_BYTES: usize = 16 * 64;
+    const PARENT: u32 = AB_UNIT_MAIN | ABV_Z_OUT3 | ABV_FUSE | ABV_TRANSFORM_TRIM;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let partials = bstatic_partials(&table);
+    let mut state = 0x2E7A_4D11_C0DE_5EEDu64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut checked = 0usize;
+    for (x0, n) in [(8usize, 8usize), (5, 3), (2, 1), (7, 1)] {
+        let total = (x0 + n) * OUTER_BYTES;
+        for case in 0..5usize {
+            let mut a: Vec<u8> = (0..total).map(|_| next() as u8).collect();
+            let mut b: Vec<u8> = (0..total).map(|_| (next() >> 9) as u8).collect();
+            if case != 1 {
+                for chunk in 0..x0 + n {
+                    let w = chunk & 1;
+                    for b_med in 0..16usize {
+                        if w * 16 + b_med > 30 || (case == 2 && b_med % 2 == 1) {
+                            continue;
+                        }
+                        for k in 0..N_CHUNKS {
+                            let off = chunk * OUTER_BYTES + b_med * 64 + k * N_CHUNKS;
+                            let (mask, expected) = BSTATIC_MASKS[w * 16 + b_med][k];
+                            let word = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                            b[off..off + 8].copy_from_slice(&((word & !mask) | expected).to_le_bytes());
+                        }
+                    }
+                }
+            }
+            if case == 3 {
+                a.fill(0);
+            }
+            if case == 4 {
+                a.fill(0xff);
+            }
+            for in_scratch in [true, false] {
+                let (a_in, b_in, base) = if in_scratch {
+                    (&a[x0 * OUTER_BYTES..], &b[x0 * OUTER_BYTES..], 0)
+                } else {
+                    (&a[..], &b[..], x0 * OUTER_BYTES)
+                };
+                let run = |f: &dyn Fn(&mut [u8])| {
+                    let mut out = vec![0x3cu8; n * OUTER_BYTES];
+                    f(&mut out);
+                    out
+                };
+                let p = [partials, partials];
+                let at = format!("x0={x0} n={n} case={case} scratch={in_scratch}");
+                let want = run(&|o| bstatic_horner_window_unit_nt::<PARENT, true, true>(x0, 1, a_in, b_in, &table, base, p, o));
+                assert!(want.iter().any(|&x| x != 0x3c), "{at}");
+                let got = run(&|o| {
+                    bstatic_horner_window_unit_nt::<{ PARENT | ABV_Z_ZETA4 }, true, true>(x0, 1, a_in, b_in, &table, base, p, o)
+                });
+                assert_eq!(got, want, "ZETA4 {at}");
+                let twisted = run(&|o| {
+                    bstatic_horner_window_unit_nt::<{ PARENT | ABV_Z_ZETA4 | ABV_TWIST }, true, true>(
+                        x0, 1, a_in, b_in, &table, base, p, o,
+                    )
+                });
+                assert_eq!(twisted, want, "TWIST {at}");
+                let via = run(&|o| {
+                    bstatic_horner_window_unit_impl::<{ AB_UNIT_MAIN | ABV_TRANSFORM_TRIM }, true>(
+                        x0, 1, a_in, b_in, &table, base, p, o, true,
+                    )
+                });
+                assert_eq!(via, want, "unit impl {at}");
+                let per_chunk = run(&|o| {
+                    bstatic_horner_window_unit_per_chunk::<{ AB_UNIT_MAIN | ABV_TRANSFORM_TRIM }, true>(
+                        x0, 1, a_in, b_in, &table, base, p, o, true,
+                    )
+                });
+                assert_eq!(per_chunk, want, "per chunk {at}");
+                let plain = run(&|o| bstatic_horner_window_unit_nt::<0, false, true>(x0, 1, a_in, b_in, &table, base, p, o));
+                assert_eq!(plain, want, "plain {at}");
                 checked += 1;
             }
         }

@@ -165,14 +165,14 @@ mod imp {
 
     /// `true` while the spin threads should keep running. Cleared by [`stop`];
     /// each thread also self-exits past `MAX_KEEPALIVE`.
-    static RUNNING: AtomicBool = AtomicBool::new(false);
+    static RUNNING: crate::Line<AtomicBool> = crate::Line(AtomicBool::new(false));
 
     /// Spin threads spawned but not yet finished. [`start`] increments before
     /// each spawn (and re-decrements if the spawn fails); each thread
     /// decrements itself as its very last action. This replaces handle-based
     /// joining on the timed path: awaiting quiet costs one load in the common
     /// case instead of 10–14 sequential `pthread_join` reaps.
-    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static LIVE: crate::Line<AtomicUsize> = crate::Line(AtomicUsize::new(0));
 
     /// How long [`join_all`] may wait for the spin threads to notice the stop
     /// signal before giving up and letting the prove proceed anyway. The
@@ -219,7 +219,7 @@ mod imp {
 
     /// Hot pool spin: `true` while the main Rayon pool's own workers spin in
     /// [`pool_spin_body`] instead of parking.
-    static POOL_SPIN: AtomicBool = AtomicBool::new(false);
+    static POOL_SPIN: crate::Line<AtomicBool> = crate::Line(AtomicBool::new(false));
 
     /// Keep the main pool's workers on-core across the ready→seed gap and the
     /// witness phase. Each worker (but one, left free for the seed-pipe
@@ -321,7 +321,7 @@ mod imp {
     }
 
     /// `true` from the witness hand-off until the release at proof done.
-    static HOT_PROVE: AtomicBool = AtomicBool::new(false);
+    static HOT_PROVE: crate::Line<AtomicBool> = crate::Line(AtomicBool::new(false));
     /// `FLOCK_NO_HOT_PROVE`, read once in [`pool_spin_start`] (untimed).
     static HOT_PROVE_OFF: AtomicBool = AtomicBool::new(false);
 
@@ -339,7 +339,7 @@ mod imp {
     /// workers [`HOT_PROVE_RESERVED`] leaves out of the hot spin idle in
     /// [`resv_hot_body`] instead of Rayon's sleep (see
     /// [`super::pool_spin_commit_done`]).
-    static RESV_HOT: AtomicBool = AtomicBool::new(false);
+    static RESV_HOT: crate::Line<AtomicBool> = crate::Line(AtomicBool::new(false));
     /// `FLOCK_NO_RESV_HOT`, read once in [`pool_spin_start`] (untimed).
     static RESV_HOT_OFF: AtomicBool = AtomicBool::new(false);
 

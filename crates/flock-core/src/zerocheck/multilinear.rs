@@ -4778,6 +4778,70 @@ fn zc_tri_caller_first_enabled() -> bool {
     *ON
 }
 
+/// Zero-allocate the tri passes' plain-store output lines
+/// (`FLOCK_NO_ZC_TRI_ZVA`, any value, restores plain stores into cold
+/// lines). A tri pass below the non-temporal threshold stores its outputs
+/// into pooled buffers whose lines are not in any cache, so every output line
+/// is first read from memory (write-allocate) and then overwritten in full.
+/// `DC ZVA` allocates each whole block of a chunk's output range zeroed
+/// without that read, right before the chunk's kernel overwrites every
+/// element of the range. Only blocks wholly inside the chunk's own range are
+/// touched, so no other chunk's data is ever zeroed; the outputs are the
+/// kernel's, so bytes are identical. Read once per process; off when the
+/// zero-block instruction is prohibited or its block is not 64 bytes.
+fn zc_tri_zva_block() -> usize {
+    use std::sync::LazyLock;
+    static BLOCK: LazyLock<usize> = LazyLock::new(|| {
+        if std::env::var_os("FLOCK_NO_ZC_TRI_ZVA").is_some() {
+            return 0;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let dczid: u64;
+            // SAFETY: DCZID_EL0 is readable at EL0 and has no side effects.
+            unsafe { core::arch::asm!("mrs {}, dczid_el0", out(reg) dczid, options(nomem, nostack)) };
+            if dczid & 0x10 != 0 {
+                return 0;
+            }
+            let block = 4usize << (dczid & 0xf);
+            if block == 64 { block } else { 0 }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            0
+        }
+    });
+    *BLOCK
+}
+
+/// `DC ZVA` over every `block`-byte block wholly inside `out` (see
+/// [`zc_tri_zva_block`]); a no-op for `block == 0`.
+///
+/// # Safety
+/// The caller owns `out` exclusively and overwrites all of it afterwards.
+#[inline]
+unsafe fn zc_tri_zva(out: *mut F128, len: usize, block: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if block == 0 {
+            return;
+        }
+        let lo = out as usize;
+        let hi = lo + len * std::mem::size_of::<F128>();
+        let mut at = (lo + block - 1) & !(block - 1);
+        let end = hi & !(block - 1);
+        while at < end {
+            // SAFETY: the whole block `[at, at + block)` lies inside `out`.
+            unsafe { core::arch::asm!("dc zva, {}", in(reg) at, options(nostack)) };
+            at += block;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (out, len, block);
+    }
+}
+
 /// [`fold_cascade_t_into_packed_prefix`] with the 5+6 GPU prefix arm when
 /// `gpu` is set (see `gpu_commit::ENV_NO_ZC_T56_GPU`): on the ranked packed
 /// b-one-packed depth-two pass whose `prefix` is the K arm's, the GPU folds
@@ -5059,8 +5123,19 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
         let cpu_base = 0usize;
         // One queue closure for both drains below (CPU chunks from `base`).
         let base = std::sync::atomic::AtomicUsize::new(cpu_base);
+        // Plain-store passes only (see `zc_tri_zva_block`).
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        let zva = if nt_stores { 0 } else { zc_tri_zva_block() };
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        let zva = 0usize;
         let body = |i: usize| {
             let x_hi = base.load(std::sync::atomic::Ordering::Relaxed) + i;
+            // SAFETY: exclusive owner of this chunk's output ranges, which
+            // the chunk kernel below overwrites in full.
+            unsafe {
+                zc_tri_zva(a_base.ptr().add(x_hi * chunk_out), chunk_out, zva);
+                zc_tri_zva(b_base.ptr().add(x_hi * chunk_out), chunk_out, zva);
+            }
             // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
             let (a_o, b_o) = unsafe {
                 (
@@ -9043,3 +9118,37 @@ mod tests {
 // r581: source-distinct cadence marker; no semantic effect.
 
 // r584: source-distinct cadence marker
+
+#[cfg(test)]
+mod zva_tests {
+    use super::*;
+
+    /// The zero-allocate helper zeroes only whole blocks inside the range it
+    /// is given and leaves every byte outside that range untouched.
+    #[test]
+    fn tri_zva_stays_inside_its_range() {
+        let block = zc_tri_zva_block();
+        let fill = F128::new(0x5555_5555_5555_5555, 0xAAAA_AAAA_AAAA_AAAA);
+        let mut buf = vec![fill; 64];
+        for (off, len) in [(1usize, 9usize), (3, 40), (0, 64), (5, 2)] {
+            buf.iter_mut().for_each(|v| *v = fill);
+            let base = buf.as_mut_ptr();
+            // SAFETY: `[off, off + len)` lies inside `buf`, owned here.
+            unsafe { zc_tri_zva(base.add(off), len, block) };
+            let lo = base as usize + off * 16;
+            let hi = lo + len * 16;
+            for (i, v) in buf.iter().enumerate() {
+                let a = base as usize + i * 16;
+                let inside_block = block != 0 && {
+                    let start = a & !(block - 1);
+                    start >= lo && start + block <= hi
+                };
+                if inside_block {
+                    assert_eq!(*v, F128::ZERO, "off {off} len {len} elem {i}");
+                } else {
+                    assert_eq!(*v, fill, "off {off} len {len} elem {i}");
+                }
+            }
+        }
+    }
+}

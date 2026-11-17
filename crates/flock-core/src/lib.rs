@@ -44,6 +44,23 @@ pub mod tmark;
 pub mod verifier;
 pub mod zerocheck;
 
+/// A value alone on its own 128-byte cache line (FS-128). Apple P-core
+/// clusters share their last-level cache in 128-byte lines, so a counter that
+/// pool threads write and a flag that spinners poll must not share one: every
+/// write would pull the line away from every poller (across clusters on a
+/// two-cluster chip). Layout only: the wrapped value and every access to it
+/// are unchanged.
+#[repr(align(128))]
+pub(crate) struct Line<T>(pub(crate) T);
+
+impl<T> std::ops::Deref for Line<T> {
+    type Target = T;
+    #[inline(always)]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 /// Shared kill switch for the micro-stack batch of small prover cuts
 /// (`eval_sk_at_vks` memoization, recursion-OOD optimized eq-table builder,
 /// fast `pcs_open` bundle encoder). Set exactly `FLOCK_NO_MICRO_STACK=1` to
@@ -217,7 +234,7 @@ mod ranked_start_pause_tests {
 }
 
 /// 0 = not resolved, 1 = spin before blocking, 2 = block at once.
-static LOCK_SPIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static LOCK_SPIN: Line<std::sync::atomic::AtomicU8> = Line(std::sync::atomic::AtomicU8::new(0));
 /// `try_lock` attempts [`lock_spin`] makes before it blocks.
 const LOCK_SPIN_TRIES: u32 = 4096;
 
@@ -496,4 +513,18 @@ fn linux_physical_cores() -> Option<usize> {
         }
     }
     (!cores.is_empty()).then_some(cores.len())
+}
+
+#[cfg(test)]
+mod line_tests {
+    /// Every [`super::Line`] value starts and ends on a 128-byte boundary.
+    #[test]
+    fn line_is_one_whole_128_byte_line() {
+        assert_eq!(std::mem::align_of::<super::Line<std::sync::atomic::AtomicBool>>(), 128);
+        assert_eq!(std::mem::size_of::<super::Line<std::sync::atomic::AtomicBool>>(), 128);
+        assert_eq!(std::mem::size_of::<super::Line<std::sync::atomic::AtomicU64>>(), 128);
+        let pair = [super::Line(std::sync::atomic::AtomicUsize::new(0)), super::Line(std::sync::atomic::AtomicUsize::new(0))];
+        assert_eq!((&pair[0] as *const _ as usize) % 128, 0);
+        assert_eq!((&pair[1] as *const _ as usize) - (&pair[0] as *const _ as usize), 128);
+    }
 }

@@ -50,9 +50,9 @@ use rayon::prelude::*;
 /// the moment its own condition holds. Published only by the first drain to
 /// claim the slot; `GUESTS` is the hazard count that makes closing safe.
 type GuestFn<'a> = dyn Fn(&dyn Fn() -> bool) -> usize + Sync + 'a;
-static GUEST: std::sync::atomic::AtomicPtr<&'static GuestFn<'static>> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static GUESTS: AtomicUsize = AtomicUsize::new(0);
+static GUEST: crate::Line<std::sync::atomic::AtomicPtr<&'static GuestFn<'static>>> =
+    crate::Line(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()));
+static GUESTS: crate::Line<AtomicUsize> = crate::Line(AtomicUsize::new(0));
 
 /// Publishes `guest` for the duration of `body`, then closes the slot and
 /// waits for any guest still inside it before returning (also on unwind).
@@ -109,13 +109,13 @@ fn with_slot<R>(
 /// hazard count that makes closing safe (as for [`GUEST`]). Scheduling only:
 /// every chunk of either queue is still claimed exactly once from its own
 /// cursor.
-static PRIORITY: std::sync::atomic::AtomicPtr<&'static GuestFn<'static>> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static PRIORITY_GUESTS: AtomicUsize = AtomicUsize::new(0);
+static PRIORITY: crate::Line<std::sync::atomic::AtomicPtr<&'static GuestFn<'static>>> =
+    crate::Line(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()));
+static PRIORITY_GUESTS: crate::Line<AtomicUsize> = crate::Line(AtomicUsize::new(0));
 /// Threads currently inside the priority claim loop through
 /// [`help_priority`], and the most allowed there at once.
-static PRIORITY_HELPERS: AtomicUsize = AtomicUsize::new(0);
-static PRIORITY_CAP: AtomicUsize = AtomicUsize::new(0);
+static PRIORITY_HELPERS: crate::Line<AtomicUsize> = crate::Line(AtomicUsize::new(0));
+static PRIORITY_CAP: crate::Line<AtomicUsize> = crate::Line(AtomicUsize::new(0));
 
 thread_local! {
     /// The `helpers` of this thread's innermost live [`PriorityScope`];
@@ -236,11 +236,11 @@ pub(crate) fn help_guest_until(
 /// only between [`set_linger_phase`] calls (lincheck and the PCS open: the
 /// opening's recursive levels are many short queues between short serial
 /// steps; zerocheck's long kernels measured neutral).
-static LINGER_SLOT: std::sync::atomic::AtomicPtr<&'static GuestFn<'static>> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static LINGERS: AtomicUsize = AtomicUsize::new(0);
-static LINGER_EPOCH: AtomicU64 = AtomicU64::new(0);
-static LINGER_PHASE: AtomicBool = AtomicBool::new(false);
+static LINGER_SLOT: crate::Line<std::sync::atomic::AtomicPtr<&'static GuestFn<'static>>> =
+    crate::Line(std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()));
+static LINGERS: crate::Line<AtomicUsize> = crate::Line(AtomicUsize::new(0));
+static LINGER_EPOCH: crate::Line<AtomicU64> = crate::Line(AtomicU64::new(0));
+static LINGER_PHASE: crate::Line<AtomicBool> = crate::Line(AtomicBool::new(false));
 
 fn linger_window_ns() -> u64 {
     static NS: OnceLock<u64> = OnceLock::new();
@@ -501,7 +501,7 @@ const EPOOL_MIN_CHUNKS: usize = 4;
 /// main-pool-only (inline when single-threaded), so the two-pool shape is
 /// never observable in the output, only in which pool claims each chunk.
 /// `true` while the helper pool's workers stay in [`hot_spin_body`].
-static HOT_SPIN: AtomicBool = AtomicBool::new(false);
+static HOT_SPIN: crate::Line<AtomicBool> = crate::Line(AtomicBool::new(false));
 /// `FLOCK_NO_EPOOL_HOT`, read by [`hot_spin_arm`].
 static HOT_SPIN_OFF: AtomicBool = AtomicBool::new(false);
 /// Upper bound on one hot spin, should [`hot_spin_release`] never be reached.
@@ -574,7 +574,7 @@ pub(crate) fn hot_spin_release() {
 /// Chunks claimed by the efficiency-core helper pool across all hetero
 /// drains (diagnostic only; relaxed ordering). Read deltas around a window
 /// to prove E-core engagement for that window.
-static EPOOL_HELPER_CHUNKS: AtomicUsize = AtomicUsize::new(0);
+static EPOOL_HELPER_CHUNKS: crate::Line<AtomicUsize> = crate::Line(AtomicUsize::new(0));
 
 /// Total chunks claimed by the helper pool so far (monotonic).
 pub fn helper_chunks_claimed() -> usize {
@@ -588,7 +588,7 @@ pub fn helper_chunks_claimed() -> usize {
 /// single-threaded main pool, zero chunks) do not count, and neither does
 /// [`run_chunks_with_helper_only`]. Read
 /// deltas around a window to price the per-drain kickoff for that window.
-static EPOOL_BROADCASTS: AtomicU64 = AtomicU64::new(0);
+static EPOOL_BROADCASTS: crate::Line<AtomicU64> = crate::Line(AtomicU64::new(0));
 
 /// Total helper broadcasts issued by the hetero drains so far (monotonic).
 pub fn helper_broadcasts_issued() -> u64 {
@@ -598,7 +598,7 @@ pub fn helper_broadcasts_issued() -> u64 {
 /// Helper-pool broadcast jobs that arrived after their drain had closed its
 /// gate and so ran nothing (diagnostic only; relaxed ordering). Each is a
 /// helper thread whose scheduling delay the drain did not wait for.
-static EPOOL_LATE_HELPERS: AtomicU64 = AtomicU64::new(0);
+static EPOOL_LATE_HELPERS: crate::Line<AtomicU64> = crate::Line(AtomicU64::new(0));
 
 /// Total late helper arrivals so far (monotonic).
 pub fn helper_late_arrivals() -> u64 {
@@ -834,6 +834,7 @@ pub(crate) fn drain_hetero<H>(
 /// same atomic cursor (the main workers drain to the end), and `f(i)` does not
 /// depend on which thread runs it, so outputs are byte-identical.
 /// `FLOCK_NO_EPOOL_TAIL_GUARD=1` restores unconditional helper claims.
+#[repr(align(128))]
 struct TailGuard {
     on: bool,
     main_threads: u64,
@@ -934,9 +935,11 @@ where
         }
         return;
     }
+    // The claim cursor and the completion count the publisher spins on sit
+    // on their own lines (FS-128).
     struct Drain {
-        next: AtomicUsize,
-        done: AtomicUsize,
+        next: crate::Line<AtomicUsize>,
+        done: crate::Line<AtomicUsize>,
         n: usize,
         f: *const (dyn Fn(usize) + Sync + 'static),
     }
@@ -967,8 +970,8 @@ where
         )
     };
     let drain = Arc::new(Drain {
-        next: AtomicUsize::new(0),
-        done: AtomicUsize::new(0),
+        next: crate::Line(AtomicUsize::new(0)),
+        done: crate::Line(AtomicUsize::new(0)),
         n: n_chunks,
         f: f_static as *const (dyn Fn(usize) + Sync + 'static),
     });
@@ -1126,11 +1129,13 @@ where
 /// sees `done == n_chunks` therefore happens after every chunk's writes.
 ///
 pub struct HelpQueue<'a> {
-    next: AtomicUsize,
-    done: AtomicUsize,
-    main_claims: AtomicUsize,
+    // Cursor, completion count and the guard's counters on separate lines
+    // (FS-128).
+    next: crate::Line<AtomicUsize>,
+    done: crate::Line<AtomicUsize>,
+    main_claims: crate::Line<AtomicUsize>,
     main_active: AtomicUsize,
-    main_ns: AtomicU64,
+    main_ns: crate::Line<AtomicU64>,
     main_cnt: AtomicU64,
     guard_on: bool,
     main_width: u64,
@@ -1141,11 +1146,11 @@ pub struct HelpQueue<'a> {
 impl<'a> HelpQueue<'a> {
     pub fn new(n_chunks: usize, f: &'a (dyn Fn(usize) + Sync)) -> Self {
         Self {
-            next: AtomicUsize::new(0),
-            done: AtomicUsize::new(0),
-            main_claims: AtomicUsize::new(0),
+            next: crate::Line(AtomicUsize::new(0)),
+            done: crate::Line(AtomicUsize::new(0)),
+            main_claims: crate::Line(AtomicUsize::new(0)),
             main_active: AtomicUsize::new(0),
-            main_ns: AtomicU64::new(0),
+            main_ns: crate::Line(AtomicU64::new(0)),
             main_cnt: AtomicU64::new(0),
             guard_on: tail_guard_enabled(),
             main_width: rayon::current_num_threads() as u64,
@@ -1397,7 +1402,8 @@ fn run_chunks_with_helper_arm_after<F, A>(
         after();
         return;
     }
-    let next = AtomicUsize::new(0);
+    // The cursor on its own line, away from the tail guard's counters (FS-128).
+    let next = crate::Line(AtomicUsize::new(0));
     let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
     let worker = || {
         loop {
@@ -1517,7 +1523,8 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
         }
         return;
     }
-    let next = AtomicUsize::new(0);
+    // The cursor on its own line, away from the tail guard's counters (FS-128).
+    let next = crate::Line(AtomicUsize::new(0));
     let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
     let caller = rayon::current_thread_index();
     let worker = || {
