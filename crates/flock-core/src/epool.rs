@@ -407,11 +407,32 @@ static HOT_SPIN_OFF: AtomicBool = AtomicBool::new(false);
 /// Upper bound on one hot spin, should [`hot_spin_release`] never be reached.
 const HOT_SPIN_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Kill switch for the parked helper pool (`FLOCK_NO_EPOOL_PARK=1`, exact
+/// `1`: the helper pool's workers stay in [`hot_spin_body`] from the witness
+/// hand-off to proof done, as in the record). With it unset, the hot helper
+/// spin does not start and the helper workers park between hetero drains as
+/// Rayon's idle rounds leave them, as before the spin was added; every drain
+/// then wakes them through its own `spawn_broadcast`. Scheduling only: the
+/// same jobs, run by the same pool, claim the same chunks' disjoint ranges.
+/// Read once per process.
+pub const ENV_NO_EPOOL_PARK: &str = "FLOCK_NO_EPOOL_PARK";
+
+fn epool_park_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !std::env::var(ENV_NO_EPOOL_PARK).is_ok_and(|v| v == "1")
+    });
+    *ON
+}
+
 /// Read the hot helper spin's kill switch (`FLOCK_NO_EPOOL_HOT`, any value)
 /// and make sure the helper pool exists. Called where the main pool's hot
-/// spin is armed, outside any timed interval.
+/// spin is armed, outside any timed interval. With [`ENV_NO_EPOOL_PARK`]
+/// unset the spin stays off, as if `FLOCK_NO_EPOOL_HOT` were set.
 pub(crate) fn hot_spin_arm() {
-    HOT_SPIN_OFF.store(std::env::var_os("FLOCK_NO_EPOOL_HOT").is_some(), Ordering::Relaxed);
+    HOT_SPIN_OFF.store(
+        epool_park_enabled() || std::env::var_os("FLOCK_NO_EPOOL_HOT").is_some(),
+        Ordering::Relaxed,
+    );
     let _ = epool();
 }
 
