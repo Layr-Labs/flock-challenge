@@ -1938,6 +1938,28 @@ pub(crate) fn grind_lat_enabled() -> bool {
     *ON.get_or_init(|| !env_is_one(ENV_NO_GRIND_LAT))
 }
 
+/// Kill switch for the grind scan's straight-line compression
+/// (`FLOCK_NO_POW_STRAIGHT=1`, exact `1`: the two-buffer looped schedule, as
+/// before). `blake3_pow_scan_v2`'s `pow_compress0_pre` finished round zero
+/// and ran rounds one to six as a loop that gathers the sixteen message words
+/// into the other buffer after each round. With it on, the same arithmetic
+/// is written out round by round with BLAKE3's fixed message schedule over
+/// the message `state || nonce || 0^6`: no word moves between rounds, the six
+/// zero words are constants, and the 16-bit rotation swaps the word's halves.
+/// M4 (`pow_probe`, 16 alternating rounds, 2^24 attempts at 32 bits on the
+/// production grid): 0.477 -> 0.398 ns per attempt (2.10 -> 2.51 G attempts
+/// per second, 16 of 16 lower); every form returns the same smallest nonce
+/// (8 digests at 14, 16 and 18 bits). Same chaining value word, so every
+/// grind returns the same nonce. Read once, when the grind kernel is compiled
+/// at Gpu init.
+pub const ENV_NO_POW_STRAIGHT: &str = "FLOCK_NO_POW_STRAIGHT";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn pow_straight_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_POW_STRAIGHT));
+    *ON
+}
+
 /// Whether this process builds the race tail: the item and everything the
 /// launched race needs (the Metal grind, the fixed-grid scan, the
 /// caller-first race scan) are on.
@@ -2146,6 +2168,32 @@ pub const ENV_NO_GRIND_SEG2: &str = "FLOCK_NO_GRIND_SEG2";
 
 /// Segments of the segmented race scan.
 pub(crate) const GRIND_SEG2_SEGMENTS: usize = 4;
+
+/// Kill switch for the segment tails of the segmented race scan
+/// (`FLOCK_NO_GRIND_SEG_TAIL=1`, exact `1`: four segments that report
+/// through shared-event signals between encoders, as before). Those
+/// signals reached the CPU only once the whole command buffer had finished
+/// (M4, timed proofs: every segment's signal first seen 33-72 us after the
+/// buffer's GPU end), so an answer in segment 0 or 1 waited for the later
+/// segments, which the CPU could not cut in time either. With it on, the
+/// scan is cut into [`GRIND_SEG_TAIL_SEGMENTS`] segments in one serial
+/// encoder, each followed by a one-thread tail (`blake3_pow_seg_tail`, built
+/// with the race tail) that publishes the segment's smallest match, or none,
+/// with a system-coherent store as soon as the segment ends, and on a match
+/// sets every later segment's `best` to 0 so their threads return at their
+/// first check. The calling thread reads the words in segment order: a
+/// segment is taken only after every lower one published no match, so the
+/// answer is the block's smallest qualifying nonce, as before. Without the
+/// tail pipeline, the event signals. Read once per process.
+pub const ENV_NO_GRIND_SEG_TAIL: &str = "FLOCK_NO_GRIND_SEG_TAIL";
+
+/// Segments of the segment-tail race scan (see [`ENV_NO_GRIND_SEG_TAIL`]).
+pub(crate) const GRIND_SEG_TAIL_SEGMENTS: usize = 8;
+
+pub(crate) fn grind_seg_tail_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_GRIND_SEG_TAIL));
+    *ON
+}
 
 pub(crate) fn grind_seg2_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GRIND_SEG2).is_none());
@@ -3001,6 +3049,64 @@ pub const ENV_NO_GPU_WAIT_HELP: &str = "FLOCK_NO_GPU_WAIT_HELP";
 pub(crate) fn gpu_wait_help_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_GPU_WAIT_HELP).is_none())
+}
+
+/// Kill switch for the hybrid suffix NTT's priority over the round-one AB
+/// arm: `FLOCK_NO_NTT_AB_PRIORITY` (any value) restores the incumbent
+/// schedule. Read once per process.
+///
+/// The commit/AB join runs the hybrid commit's CPU suffix NTT on the commit
+/// arm's worker while every other main-pool worker sits in the AB queue's
+/// claim loop, so the NTT's chunk drains get those workers only once the AB
+/// queue is empty; the NTT then finishes last and the CPU idles while cb3
+/// hashes the suffix. With priority, the NTT's chunk drains run inside an
+/// `epool::PriorityScope`: before its next AB chunk an AB main worker runs
+/// the NTT drain's claim loop, at most [`ntt_ab_priority_helpers`] of them at
+/// a time (the NTT's passes stream the codeword, so a few workers beside the
+/// compute-bound AB arm use the cores better than all of them at once), and
+/// the NTT finishes ahead of cb2 while the AB arm's remainder runs beside
+/// cb2's end and cb3. Four schedule changes go with it: the commit arm's
+/// worker helps the AB queue while it waits for the fine split's boundary
+/// signal; cb3 is committed as soon as the NTT is done while the AB arm is
+/// still running (no CPU tail hash then, as the CPU is busy); the split
+/// sweep prices each sample's CPU arm to cover the AB replay's end, since
+/// the AB arm, not the NTT, is then the CPU work that finishes last; and
+/// before the sweep the CPU touches the staging range the sweep's suffixes
+/// cover, so no sample pays a first touch the timed proves never pay.
+/// Scheduling only: every NTT and AB chunk is claimed exactly once from its
+/// own queue and computes the same bytes, and cb3 encodes the same suffix
+/// hash; the split is byte-verified as before.
+pub const ENV_NO_NTT_AB_PRIORITY: &str = "FLOCK_NO_NTT_AB_PRIORITY";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ntt_ab_priority_enabled() -> bool {
+    ntt_ab_priority_helpers() > 0
+}
+
+/// How many AB main workers may join one NTT chunk queue at a time (see
+/// [`ENV_NO_NTT_AB_PRIORITY`]); 0 when the priority is off.
+/// `FLOCK_NTT_AB_PRIORITY_HELPERS=n` (n >= 1) overrides the default.
+/// Read once per process.
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn ntt_ab_priority_helpers() -> usize {
+    const DEFAULT_HELPERS: usize = 4;
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if std::env::var_os(ENV_NO_NTT_AB_PRIORITY).is_some() {
+            return 0;
+        }
+        std::env::var("FLOCK_NTT_AB_PRIORITY_HELPERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(DEFAULT_HELPERS)
+    })
 }
 
 /// Run pending main-pool jobs on this worker until `done()` holds or the pool
@@ -9752,6 +9858,65 @@ kernel void ntt_g5(device uint4* data                [[buffer(0)]],
     // one bounded ascending block and atomically records the smallest matching
     // offset, so the host can advance block-by-block without weakening the
     // challenger's globally-smallest-nonce rule.
+    /// The grind scan's straight-line `pow_compress0_pre` (see
+    /// `super::ENV_NO_POW_STRAIGHT`): round zero's last quarter-round, then
+    /// rounds one to six written out with BLAKE3's message schedule over the
+    /// message `state || nonce || 0^6`, whose six zero words are constants;
+    /// the 16-bit rotation swaps the halves, the others are `rotate` (left by
+    /// 32 - n). Same arithmetic as the looped form: same cv0.
+    const POW_PRE_STRAIGHT: &str = r#"#define PW_ROTR(x, n) rotate((uint)(x), (uint)(32u - (n)))
+#define PW_ROT16(x) as_type<uint>(as_type<ushort2>((uint)(x)).yx)
+#define PW_G(a, b, c, d, x, y)                         \
+    a = a + b + (x); d = PW_ROT16(d ^ a);              \
+    c = c + d;       b = PW_ROTR(b ^ c, 12u);          \
+    a = a + b + (y); d = PW_ROTR(d ^ a, 8u);           \
+    c = c + d;       b = PW_ROTR(b ^ c, 7u);
+#define PW_ROUND(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15) \
+    PW_G(v0, v4, v8,  v12, w[s0],  w[s1]);  PW_G(v1, v5, v9,  v13, w[s2],  w[s3]);    \
+    PW_G(v2, v6, v10, v14, w[s4],  w[s5]);  PW_G(v3, v7, v11, v15, w[s6],  w[s7]);    \
+    PW_G(v0, v5, v10, v15, w[s8],  w[s9]);  PW_G(v1, v6, v11, v12, w[s10], w[s11]);   \
+    PW_G(v2, v7, v8,  v13, w[s12], w[s13]); PW_G(v3, v4, v9,  v14, w[s14], w[s15]);
+static inline uint pow_compress0_pre(constant uint* pre, uint nonce_lo, uint nonce_hi) {
+    uint v0 = pre[0], v1 = pre[1], v2 = pre[2], v3 = pre[3];
+    uint v4 = pre[4], v5 = pre[5], v6 = pre[6], v7 = pre[7];
+    uint v8 = pre[8], v9 = pre[9], v10 = pre[10], v11 = pre[11];
+    uint v12 = pre[12], v13 = pre[13], v14 = pre[14], v15 = pre[15];
+    const uint w[16] = {pre[16], pre[17], pre[18], pre[19], pre[20], pre[21], pre[22], pre[23],
+                        nonce_lo, nonce_hi, 0u, 0u, 0u, 0u, 0u, 0u};
+    PW_G(v0, v5, v10, v15, nonce_lo, nonce_hi);
+    PW_ROUND(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+    PW_ROUND(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1)
+    PW_ROUND(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6)
+    PW_ROUND(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4)
+    PW_ROUND(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7)
+    PW_ROUND(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13)
+    return v0 ^ v8;
+}
+#undef PW_ROUND
+#undef PW_G
+#undef PW_ROT16
+#undef PW_ROTR
+"#;
+
+    /// The grind library's source as compiled at Gpu init: [`POW_MSL_SOURCE`]
+    /// with `pow_compress0_pre` replaced by [`POW_PRE_STRAIGHT`], unless
+    /// `FLOCK_NO_POW_STRAIGHT=1` or the looped function is not found exactly
+    /// once (then the incumbent text). `blake3_pow_scan` (v1) is unchanged.
+    pub(crate) fn pow_msl_source() -> std::borrow::Cow<'static, str> {
+        const START: &str = "static inline uint pow_compress0_pre(constant uint* pre, uint nonce_lo, uint nonce_hi) {";
+        const END: &str = "    return v[0] ^ v[8u];\n}\n";
+        let src = POW_MSL_SOURCE;
+        if !super::pow_straight_enabled() || src.matches(START).count() != 1 {
+            return std::borrow::Cow::Borrowed(src);
+        }
+        let a = src.find(START).expect("counted above");
+        let Some(rel) = src[a..].find(END) else {
+            return std::borrow::Cow::Borrowed(src);
+        };
+        let b = a + rel + END.len();
+        std::borrow::Cow::Owned(format!("{}{POW_PRE_STRAIGHT}{}", &src[..a], &src[b..]))
+    }
+
     const POW_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -9959,6 +10124,31 @@ kernel void blake3_pow_race_tail(
 {
     uint b = atomic_load_explicit(best, memory_order_relaxed);
     atomic_store_explicit(best, 0xffffffffu, memory_order_relaxed);
+    word[0] = (tag << 24u) | (b < params.len ? b : 0xffffffu);
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, POW_RACE_SCOPE_SYSTEM);
+}
+
+// Segment tail of the segmented race scan (`ENV_NO_GRIND_SEG_TAIL`): one
+// thread behind segment k's scan in the same serial encoder reads the
+// segment's final smallest match and publishes `tag << 24 | code` (code =
+// the match offset in the segment, or 0xFFFFFF for none) with a
+// system-coherent store and a system-scope fence, so the CPU sees it as soon
+// as the segment ends; on a match it first sets every later segment's `best`
+// to 0, so their threads return at their first check.
+kernel void blake3_pow_seg_tail(
+    device atomic_uint* best              [[buffer(1)]],
+    constant PowParams& params            [[buffer(2)]],
+    volatile coherent(system) device uint* word [[buffer(3)]],
+    constant uint& tag                    [[buffer(4)]],
+    device atomic_uint* later             [[buffer(5)]],
+    constant uint& n_later                [[buffer(6)]])
+{
+    uint b = atomic_load_explicit(best, memory_order_relaxed);
+    if (b < params.len) {
+        for (uint j = 0u; j < n_later; j++) {
+            atomic_store_explicit(&later[j], 0u, memory_order_relaxed);
+        }
+    }
     word[0] = (tag << 24u) | (b < params.len ? b : 0xffffffu);
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, POW_RACE_SCOPE_SYSTEM);
 }
@@ -10591,7 +10781,8 @@ kernel void blake3_pow_race_tail(
                     // ranked commitment GPU.  The grind gate will see NIL and
                     // permanently retain the exact CPU implementation.
                     (|| -> Result<(Id, Id), String> {
-                        let src = api.nsstring(POW_MSL_SOURCE)?;
+                        // `super::ENV_NO_POW_STRAIGHT`: the straight-line compression.
+                        let src = api.nsstring(&pow_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
                             api,
@@ -14352,6 +14543,10 @@ kernel void blake3_pow_race_tail(
                 // tree, same flat-tree slots, so the root is unchanged.
                 if hybrid_gpu_suffix_hash_enabled() {
                     let t_cpu_ntt = std::time::Instant::now();
+                    // See `super::ENV_NO_NTT_AB_PRIORITY`.
+                    let helpers = super::ntt_ab_priority_helpers();
+                    let ntt_first = helpers > 0;
+                    let prio = crate::epool::PriorityScope::new(helpers);
                     if fine_m == 0 {
                         ntt.forward_transform_interleaved_ranked_block_range_and_then(
                             data,
@@ -14378,6 +14573,17 @@ kernel void blake3_pow_race_tail(
                             16 - k_cpu16,
                             fine_m,
                             || {
+                                if ntt_first {
+                                    // The NTT's own queues are done here:
+                                    // help the AB queue until the boundary
+                                    // signal (or a failure) is visible.
+                                    let _off = crate::epool::PriorityScope::new(0);
+                                    super::help_pool_until(|| {
+                                        gpu.event_signaled_value(ev) >= want
+                                            || gpu_cb_failed(gpu, cb2)
+                                            || head_failed()
+                                    });
+                                }
                                 let mut spins = 0u32;
                                 while gpu.event_signaled_value(ev) < want {
                                     if gpu_cb_failed(gpu, cb2) || head_failed() {
@@ -14400,6 +14606,7 @@ kernel void blake3_pow_race_tail(
                             |_elem_offset: usize, _chunk: &[F128]| {},
                         )?;
                     }
+                    drop(prio);
                     let cpu_ntt_ms = t_cpu_ntt.elapsed().as_secs_f64() * 1e3;
                     // Same clock as the command buffers' GPU timestamps.
                     let cpu_done_s = crate::tmark::now_ns() as f64 * 1e-9;
@@ -14407,10 +14614,13 @@ kernel void blake3_pow_race_tail(
                     // CPU tail hash (see `super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
                     // only while cb2 still runs once the AB sibling has
                     // returned (the CPU is idle only then), never in the
-                    // tuner's sweep.
+                    // tuner's sweep. With the NTT ahead of a still running
+                    // AB arm, cb3 is queued behind cb2 at once instead.
                     let tail_force = super::hybrid_tail_hash_force();
                     let sig2 = take_cb2_done(gpu, cb2);
-                    let tail = !hybrid_arm_recording()
+                    let ab_busy = ntt_first && !super::ab_arm_done();
+                    let tail = !ab_busy
+                        && !hybrid_arm_recording()
                         && super::hybrid_cpu_tail_hash_enabled()
                         && (tail_force > 0 || {
                             super::help_pool_until(|| super::ab_arm_done() || gpu.cb_done(cb2, sig2.as_ref()));
@@ -14479,6 +14689,7 @@ kernel void blake3_pow_race_tail(
                     crate::tmark::mark_gpu("cb3 gpu start", "cb3 gpu end", cb3_s, cb3_e);
                     record_hybrid_arms(k_split, (cb3_e - cb2_s) * 1e3, cpu_ntt_ms);
                     record_fine_arms(k_split, (cb2_e - cb2_s) * 1e3, cpu_ntt_ms, (cb3_e - cb3_s) * 1e3);
+                    note_arm_cb2_start(cb2_s);
                     if cpu_done_s > cb2_e {
                         record_cb3_launch_latency((cb3_s - cpu_done_s) * 1e3);
                     }
@@ -14978,6 +15189,54 @@ kernel void blake3_pow_race_tail(
         static V: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64, f64)>>> =
             std::sync::OnceLock::new();
         V.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// cb2's GPU start of the sweep's most recent hybrid sample, in seconds
+    /// on the command buffers' clock (`f64` bits; 0 = none).
+    static ARM_CB2_START_BITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn note_arm_cb2_start(cb2_s: f64) {
+        if hybrid_arm_recording() {
+            ARM_CB2_START_BITS.store(cb2_s.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Sample lengths of the hybrid and fine arm records, taken before a
+    /// sweep sample so [`price_ab_end_into_arms`] can find that sample's rows.
+    fn arm_record_lens() -> (usize, usize) {
+        (
+            hybrid_arm_samples().lock().map_or(usize::MAX, |v| v.len()),
+            fine_arm_samples().lock().map_or(usize::MAX, |v| v.len()),
+        )
+    }
+
+    /// With the NTT ahead of the AB arm (`super::ENV_NO_NTT_AB_PRIORITY`) the
+    /// AB arm is the CPU work that ends last, so a split's window is the later
+    /// of its GPU arm and the AB arm's end. Raise the sample's CPU arm (the
+    /// rows it added since `lens`) to the AB replay's end `ab_end_s`, taken
+    /// on the same clock relative to that sample's cb2 start: the hybrid
+    /// row's `max(gpu, cpu)` then covers it, and the fine row's CPU arm
+    /// becomes at least `ab - cb3`, so `max(cb2, cpu) + cb3` covers it too.
+    fn price_ab_end_into_arms(lens: (usize, usize), ab_end_s: f64) {
+        let cb2_s = f64::from_bits(ARM_CB2_START_BITS.swap(0, std::sync::atomic::Ordering::Relaxed));
+        let ab_ms = (ab_end_s - cb2_s) * 1e3;
+        if !(cb2_s > 0.0 && ab_ms.is_finite()) {
+            return;
+        }
+        if let Ok(mut v) = hybrid_arm_samples().lock() {
+            if v.len() == lens.0.wrapping_add(1) {
+                if let Some(s) = v.last_mut() {
+                    s.2 = s.2.max(ab_ms);
+                }
+            }
+        }
+        if let Ok(mut v) = fine_arm_samples().lock() {
+            if v.len() == lens.1.wrapping_add(1) {
+                if let Some(s) = v.last_mut() {
+                    s.2 = s.2.max(ab_ms - s.3);
+                }
+            }
+        }
     }
 
     fn record_fine_arms(k_split: usize, cb2_ms: f64, cpu_ms: f64, cb3_ms: f64) {
@@ -15878,13 +16137,34 @@ kernel void blake3_pow_race_tail(
             } else {
                 None
             };
+            let ntt_first = super::ntt_ab_priority_enabled();
+            let lens = arm_record_lens();
+            let replay_end_ns = std::sync::atomic::AtomicU64::new(0);
+            let replay_start_ns = std::sync::atomic::AtomicU64::new(0);
             let (score, fp_ms) = sample_ranked_exact_graph(
                 || reprime_for(k),
                 || timed_graph(k),
-                &replay_ab,
+                || {
+                    replay_start_ns.store(crate::tmark::now_ns(), Ordering::Relaxed);
+                    replay_ab();
+                    replay_end_ns.store(crate::tmark::now_ns(), Ordering::Relaxed);
+                },
                 delay,
                 std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some(),
             )?;
+            if dbg {
+                let cb2_s = f64::from_bits(ARM_CB2_START_BITS.load(Ordering::Relaxed));
+                let raw = fine_arm_samples().lock().ok().and_then(|v| v.last().copied());
+                eprintln!(
+                    "[gpu-commit] exact-AB sample k={k}: replay start {:.2} end {:.2} ms after cb2 start, fine row {:?}",
+                    (replay_start_ns.load(Ordering::Relaxed) as f64 * 1e-9 - cb2_s) * 1e3,
+                    (replay_end_ns.load(Ordering::Relaxed) as f64 * 1e-9 - cb2_s) * 1e3,
+                    raw,
+                );
+            }
+            if ntt_first {
+                price_ab_end_into_arms(lens, replay_end_ns.load(Ordering::Relaxed) as f64 * 1e-9);
+            }
             first_pass_ms = Some(fp_ms);
             if dbg {
                 eprintln!(
@@ -15894,6 +16174,28 @@ kernel void blake3_pow_race_tail(
             }
             Ok(score)
         };
+        if super::ntt_ab_priority_enabled() {
+            // The sweep's CPU suffixes reach down to sixteenth `16 - 7`, and
+            // the fine split's boundary sub-blocks one below. Touch every
+            // page of that staging range once (same value written back; no
+            // GPU work uses staging here), so the first sample of each split
+            // does not pay the CPU's first touch of its new range, which no
+            // later prove pays; with the NTT ahead of the AB arm that cost
+            // lands on the AB replay's end the samples are priced by.
+            use rayon::prelude::*;
+            let max_k = RANKED_EXACT_TUNE_CANDIDATES[RANKED_EXACT_TUNE_CANDIDATES.len() - 1];
+            let bytes = params.codeword_len_f128() * core::mem::size_of::<F128>();
+            let from = bytes / 16 * (16 - max_k - 1);
+            let base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(ctx.staging) }.cast::<u8>());
+            (from / 4096..bytes / 4096).into_par_iter().for_each(|page| {
+                // SAFETY: `page * 4096 + 8 <= bytes`, inside the staging
+                // buffer; nothing else accesses staging during the sweep.
+                unsafe {
+                    let p = base.ptr().add(page * 4096).cast::<u64>();
+                    p.write_volatile(p.read_volatile());
+                }
+            });
+        }
         let samples = {
             // Only the sweep's own samples price a split: they are the only
             // graph runs taken beside the A/B replay, which is what makes the
@@ -16107,6 +16409,14 @@ kernel void blake3_pow_race_tail(
                 "[gpu-commit] broad exact-AB {} -> k={} verified={verified}",
                 table.join(" "),
                 if verified { chosen } else { 0 },
+            );
+        }
+        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            let k = if verified { chosen } else { 0 };
+            eprintln!(
+                "[phase-timing] hybrid split: cpu {} of 256 (ntt priority helpers {})",
+                256 - hybrid_prefix256(k),
+                super::ntt_ab_priority_helpers(),
             );
         }
         finish_ranked_exact_contention_tune(params, cpu_tree, if verified { chosen } else { 0 });
@@ -17401,6 +17711,10 @@ kernel void blake3_pow_race_tail(
     /// the build.
     static POW_RACE_TAIL: OnceLock<bool> = OnceLock::new();
 
+    /// `blake3_pow_seg_tail` (built with the race tail, see
+    /// `super::ENV_NO_GRIND_SEG_TAIL`); unset keeps the event signals.
+    static SEG_TAIL_PSO: OnceLock<usize> = OnceLock::new();
+
     impl PowRaceSlots {
         pub(crate) const EMPTY: Self = Self {
             tail: NIL,
@@ -17495,12 +17809,18 @@ kernel void blake3_pow_race_tail(
     // ---- Segmented race scan (see `super::ENV_NO_GRIND_SEG2`) ----
 
     const SEG_K: usize = super::GRIND_SEG2_SEGMENTS;
+    /// Segments with segment tails (`super::ENV_NO_GRIND_SEG_TAIL`).
+    const SEG_TAIL_K: usize = super::GRIND_SEG_TAIL_SEGMENTS;
+    /// The larger of the two segment counts (per-set arrays).
+    const SEG_MAX: usize = if SEG_TAIL_K > SEG_K { SEG_TAIL_K } else { SEG_K };
     /// Slot sets: a launch's set is reused only after its buffer completed.
     const SEG_SETS: usize = 3;
     /// Per set: the 24 round-zero words at 0, segment `k`'s parameters at
-    /// `128 + 16 k`.
-    const SEG_ARGS_STRIDE: usize = 256;
-    /// Per set: segment `k`'s `best` word at `4 k`.
+    /// `128 + 16 k`, the launch tag at `SEG_TAG_OFF`.
+    const SEG_ARGS_STRIDE: usize = 512;
+    const SEG_TAG_OFF: usize = 128 + 16 * SEG_MAX;
+    /// Per set: segment `k`'s `best` word at `4 k` (and, segment tails,
+    /// segment `k`'s published word at `4 k` of the words buffer).
     const SEG_SLOT_STRIDE: usize = 64;
 
     struct SegRace {
@@ -17508,8 +17828,13 @@ kernel void blake3_pow_race_tail(
         next_value: u64,
         args: Id,
         slots: Id,
-        /// The one buffer encoded ahead: (set, command buffer, event base).
-        prepared: Option<(usize, Id, u64)>,
+        /// Segment tails' published words (`super::ENV_NO_GRIND_SEG_TAIL`).
+        words: Id,
+        /// Launch tags of the segment tails (1..=255).
+        tag_counter: u32,
+        /// The one buffer encoded ahead: (set, command buffer, event base,
+        /// segment tails).
+        prepared: Option<(usize, Id, u64, bool)>,
         /// Each set's last committed buffer (retained), until it completed.
         inflight: [Id; SEG_SETS],
         next: usize,
@@ -17529,17 +17854,32 @@ kernel void blake3_pow_race_tail(
             }
             let args = gpu.new_buffer(SEG_SETS * SEG_ARGS_STRIDE).ok()?;
             let slots = gpu.new_buffer(SEG_SETS * SEG_SLOT_STRIDE).ok()?;
+            let words = gpu.new_buffer(SEG_SETS * SEG_SLOT_STRIDE).ok()?;
             let w = gpu.buffer_contents(slots).cast::<u32>();
             for i in 0..SEG_SETS * SEG_SLOT_STRIDE / 4 {
                 w.add(i).write_volatile(u32::MAX);
             }
-            Some(SegRace { ev, next_value: 0, args, slots, prepared: None, inflight: [NIL; SEG_SETS], next: 0 })
+            let ww = gpu.buffer_contents(words).cast::<u32>();
+            for i in 0..SEG_SETS * SEG_SLOT_STRIDE / 4 {
+                ww.add(i).write_volatile(0);
+            }
+            Some(SegRace {
+                ev,
+                next_value: 0,
+                args,
+                slots,
+                words,
+                tag_counter: 0,
+                prepared: None,
+                inflight: [NIL; SEG_SETS],
+                next: 0,
+            })
         }
     }
 
     /// A set no buffer is using: never launched, or its last buffer completed.
     unsafe fn seg_set_free(gpu: &Gpu, st: &mut SegRace, i: usize) -> bool {
-        if st.prepared.is_some_and(|(p, _, _)| p == i) {
+        if st.prepared.is_some_and(|(p, _, _, _)| p == i) {
             return false;
         }
         let cb = st.inflight[i];
@@ -17560,9 +17900,44 @@ kernel void blake3_pow_race_tail(
     /// Encode set `i`'s buffer: per segment, the v2 scan over the set's
     /// state, the segment's `best` word and parameters, then the segment's
     /// signal (`base + k + 1`). Retained, not committed.
-    unsafe fn seg_encode(gpu: &Gpu, st: &mut SegRace, i: usize) -> Option<(Id, u64)> {
+    unsafe fn seg_encode(gpu: &Gpu, st: &mut SegRace, i: usize) -> Option<(Id, u64, bool)> {
         const POW_V2_TG: u64 = 256;
         const POW_V2_GRID: u64 = 1 << 16;
+        // Segment tails (`super::ENV_NO_GRIND_SEG_TAIL`): one serial encoder,
+        // each segment's scan followed by its one-thread tail; no signals.
+        if let Some(&tail) = SEG_TAIL_PSO.get()
+            && super::grind_seg_tail_enabled()
+        {
+            let tail = tail as Id;
+            unsafe {
+                let pool = gpu.pool_push();
+                let cb = (|| -> Option<Id> {
+                    let cb = gpu.command_buffer().ok()?;
+                    let enc = gpu.compute_encoder(cb).ok()?;
+                    for k in 0..SEG_TAIL_K {
+                        gpu.set_pipeline(enc, gpu.pso_pow);
+                        gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE, 0);
+                        gpu.set_buffer(enc, st.slots, i * SEG_SLOT_STRIDE + 4 * k, 1);
+                        gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE + 128 + 16 * k, 2);
+                        gpu.dispatch(enc, POW_V2_GRID / POW_V2_TG, POW_V2_TG);
+                        gpu.set_pipeline(enc, tail);
+                        gpu.set_buffer(enc, st.slots, i * SEG_SLOT_STRIDE + 4 * k, 1);
+                        gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE + 128 + 16 * k, 2);
+                        gpu.set_buffer(enc, st.words, i * SEG_SLOT_STRIDE + 4 * k, 3);
+                        gpu.set_buffer(enc, st.args, i * SEG_ARGS_STRIDE + SEG_TAG_OFF, 4);
+                        // The later segments' `best` words (none after the last).
+                        gpu.set_buffer(enc, st.slots, i * SEG_SLOT_STRIDE + 4 * (k + 1).min(SEG_TAIL_K - 1), 5);
+                        let n_later = (SEG_TAIL_K - 1 - k) as u32;
+                        gpu.set_bytes(enc, &n_later.to_le_bytes(), 6);
+                        gpu.dispatch(enc, 1, 1);
+                    }
+                    gpu.end_encoding(enc);
+                    Some(gpu.retain(cb))
+                })();
+                gpu.pool_pop(pool);
+                return cb.map(|cb| (cb, 0, true));
+            }
+        }
         let base = st.next_value;
         st.next_value = base + SEG_K as u64;
         unsafe {
@@ -17582,7 +17957,7 @@ kernel void blake3_pow_race_tail(
                 Some(gpu.retain(cb))
             })();
             gpu.pool_pop(pool);
-            cb.map(|cb| (cb, base))
+            cb.map(|cb| (cb, base, false))
         }
     }
 
@@ -17609,8 +17984,8 @@ kernel void blake3_pow_race_tail(
             let Some(i) = (0..SEG_SETS).map(|k| (next + k) % SEG_SETS).find(|&i| seg_set_free(gpu, st, i)) else {
                 return;
             };
-            if let Some((cb, base)) = seg_encode(gpu, st, i) {
-                st.prepared = Some((i, cb, base));
+            if let Some((cb, base, tails)) = seg_encode(gpu, st, i) {
+                st.prepared = Some((i, cb, base, tails));
             }
         }
     }
@@ -17622,6 +17997,12 @@ kernel void blake3_pow_race_tail(
         ev: Id,
         base: u64,
         slots: *const std::sync::atomic::AtomicU32,
+        /// Segment tails' published words (null: the event signals).
+        words: *const u32,
+        /// This launch's tag in the published words.
+        tag: u32,
+        /// Segments of this launch.
+        n_seg: usize,
         seg: u32,
         start: u64,
         /// Lowest segment not yet found empty.
@@ -17642,9 +18023,17 @@ kernel void blake3_pow_race_tail(
         }
 
         fn zero_from(&self, k: usize) {
-            for j in k..SEG_K {
+            for j in k..self.n_seg {
                 self.slot(j).store(0, std::sync::atomic::Ordering::Relaxed);
             }
+        }
+
+        /// Segment tails: segment `k`'s published word, if this launch's.
+        fn word(&self, k: usize) -> Option<u32> {
+            // SAFETY: the race's process-lifetime words buffer; the GPU
+            // stores each word once per launch with a system-coherent store.
+            let w = unsafe { self.words.add(k).read_volatile() };
+            (w >> 24 == self.tag).then_some(w & 0x00FF_FFFF)
         }
 
         /// The answer once known: `Some(Some(n))` = smallest match, `Some(None)`
@@ -17654,9 +18043,26 @@ kernel void blake3_pow_race_tail(
             if self.settled.load(Ordering::Relaxed) {
                 return None;
             }
+            if !self.words.is_null() {
+                // Segment tails: the words in segment order; a segment's
+                // answer is taken only after every lower one published none.
+                loop {
+                    let k = self.k.load(Ordering::Relaxed);
+                    if k >= self.n_seg {
+                        self.settled.store(true, Ordering::Relaxed);
+                        return Some(None);
+                    }
+                    let Some(code) = self.word(k) else { return None };
+                    if code != super::POW_RACE_NO_MATCH {
+                        self.settled.store(true, Ordering::Relaxed);
+                        return Some(Some(self.start + k as u64 * u64::from(self.seg) + u64::from(code)));
+                    }
+                    self.k.store(k + 1, Ordering::Relaxed);
+                }
+            }
             loop {
                 let k = self.k.load(Ordering::Relaxed);
-                if k >= SEG_K {
+                if k >= self.n_seg {
                     self.settled.store(true, Ordering::Relaxed);
                     return Some(None);
                 }
@@ -17711,11 +18117,17 @@ kernel void blake3_pow_race_tail(
     }
 
     /// Launch the prepared buffer (or encode one now) over `[start, start +
-    /// len)` in [`SEG_K`] equal segments.
+    /// len)` in equal segments: [`SEG_TAIL_K`] with segment tails
+    /// (`super::ENV_NO_GRIND_SEG_TAIL`), else [`SEG_K`] with event signals.
     pub(crate) fn gpu_pow_seg_launch(state_digest: &[u8; 32], start: u64, len: u32, bits: u32) -> Option<SegRaceJob> {
         const POW_V2_GRID: u32 = 1 << 16;
-        let seg = len / SEG_K as u32;
-        if !(1..=32).contains(&bits) || !len.is_power_of_two() || seg < POW_V2_GRID || len >= super::POW_RACE_NO_MATCH {
+        // As before, on the event signals' four segments; the segment tails'
+        // smaller segments only leave some of the grid's threads idle.
+        if !(1..=32).contains(&bits)
+            || !len.is_power_of_two()
+            || len / (SEG_K as u32) < POW_V2_GRID
+            || len >= super::POW_RACE_NO_MATCH
+        {
             return None;
         }
         let gpu = gpu().ok()?;
@@ -17728,27 +18140,38 @@ kernel void blake3_pow_race_tail(
                 *slot = seg_setup(gpu);
             }
             let st = slot.as_mut()?;
-            let (i, cb, base) = match st.prepared.take() {
+            let (i, cb, base, tails) = match st.prepared.take() {
                 Some(p) => p,
                 None => {
                     let next = st.next;
                     let i = (0..SEG_SETS).map(|k| (next + k) % SEG_SETS).find(|&i| seg_set_free(gpu, st, i))?;
-                    let (cb, base) = seg_encode(gpu, st, i)?;
-                    (i, cb, base)
+                    let (cb, base, tails) = seg_encode(gpu, st, i)?;
+                    (i, cb, base, tails)
                 }
             };
+            let n_seg = if tails { SEG_TAIL_K } else { SEG_K };
+            let seg = len / n_seg as u32;
             let args = gpu.buffer_contents(st.args).add(i * SEG_ARGS_STRIDE);
             let pre = super::pow_round0_pre(state_digest);
             core::ptr::copy_nonoverlapping(pre.as_ptr(), args.cast::<u32>(), pre.len());
-            for k in 0..SEG_K {
+            // This launch's tag (segment tails; stale words carry another).
+            st.tag_counter = st.tag_counter % 255 + 1;
+            let tag = st.tag_counter;
+            args.add(SEG_TAG_OFF).cast::<u32>().write(tag);
+            for k in 0..n_seg {
                 let s0 = start + k as u64 * u64::from(seg);
                 let params = [s0 as u32, (s0 >> 32) as u32, seg, bits];
                 core::ptr::copy_nonoverlapping(params.as_ptr(), args.add(128 + 16 * k).cast::<u32>(), 4);
             }
             let slots = gpu.buffer_contents(st.slots).add(i * SEG_SLOT_STRIDE).cast::<std::sync::atomic::AtomicU32>();
-            for k in 0..SEG_K {
+            for k in 0..n_seg {
                 (*slots.add(k)).store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             }
+            let words = if tails {
+                gpu.buffer_contents(st.words).add(i * SEG_SLOT_STRIDE).cast::<u32>().cast_const()
+            } else {
+                core::ptr::null()
+            };
             std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             gpu.commit_async(cb);
             st.inflight[i] = cb;
@@ -17759,6 +18182,9 @@ kernel void blake3_pow_race_tail(
                 ev: st.ev,
                 base,
                 slots,
+                words,
+                tag,
+                n_seg,
                 seg,
                 start,
                 k: std::sync::atomic::AtomicUsize::new(0),
@@ -17877,6 +18303,35 @@ kernel void blake3_pow_race_tail(
                             &mut pso_err
                         );
                         gpu.release(function);
+                    }
+                }
+                // The segment tail (`super::ENV_NO_GRIND_SEG_TAIL`), same
+                // library; NIL keeps the segmented scan's event signals.
+                if !pso.is_null()
+                    && super::grind_seg_tail_enabled()
+                    && let Ok(ns) = api.nsstring("blake3_pow_seg_tail")
+                {
+                    let function: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                        library,
+                        c"newFunctionWithName:",
+                        ns
+                    );
+                    if !function.is_null() {
+                        let mut pso_err: Id = NIL;
+                        let seg: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            gpu.device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            function,
+                            &mut pso_err
+                        );
+                        gpu.release(function);
+                        if !seg.is_null() {
+                            let _ = SEG_TAIL_PSO.set(seg as usize);
+                        }
                     }
                 }
                 gpu.release(library);

@@ -117,7 +117,10 @@ pub fn pool_spin_witness_done() {
 /// idle round ends in a kernel yield, so a runnable thread outside the pool
 /// still gets a core within one round. Scheduling only: the same jobs, run by
 /// the same pool. Released with the rest of the spin at proof done.
-/// `FLOCK_NO_RESV_HOT=1` keeps the reserved workers parking as before.
+/// `FLOCK_NO_RESV_HOT=1` keeps the reserved workers parking as before. By
+/// default the reserved workers now park (the reserved-worker spin does not
+/// start); `FLOCK_NO_RESV_PARK=1` restores the spin. Both are read once, in
+/// the untimed pool spin start.
 pub fn pool_spin_commit_done() {
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     imp::pool_spin_commit_done();
@@ -247,7 +250,11 @@ mod imp {
         HOT_PROVE.store(false, Ordering::Relaxed);
         HOT_PROVE_OFF.store(std::env::var_os("FLOCK_NO_HOT_PROVE").is_some(), Ordering::Relaxed);
         crate::epool::hot_spin_arm();
-        RESV_HOT_OFF.store(std::env::var_os("FLOCK_NO_RESV_HOT").is_some(), Ordering::Relaxed);
+        // Reserved workers park again from the commitment's join on, as before
+        // the reserved-worker spin (`FLOCK_NO_RESV_PARK=1`, exact `1`, keeps
+        // the record's spin). Scheduling only: the same jobs, the same pool.
+        let resv_park = !std::env::var("FLOCK_NO_RESV_PARK").is_ok_and(|v| v == "1");
+        RESV_HOT_OFF.store(resv_park || std::env::var_os("FLOCK_NO_RESV_HOT").is_some(), Ordering::Relaxed);
         crate::lock_spin_arm();
         let deadline = Instant::now() + MAX_KEEPALIVE;
         rayon::spawn_broadcast(move |ctx| {
