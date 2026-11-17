@@ -385,6 +385,30 @@ impl Dual {
         self.step_depth = 0;
     }
 
+    fn prepare_basis_sink(&mut self, rs: &[F128]) -> Option<C2RetainedPreparation> {
+        let reduced_log_d = self.log_d - self.depth;
+        if !c2_basis_sink_enabled() || !c2_retained_transpose_enabled()
+            || !c2_basis_sink_shape(self.log_d, reduced_log_d, self.log_inv_rate, self.positions.len())
+        {
+            return None;
+        }
+        let d = self.depth;
+        assert_eq!(rs.len(), d);
+        if self.step_depth != d {
+            for ((&alpha, qscales), w0) in
+                self.weights.iter().zip(&self.scales).zip(&mut self.w0_pows)
+            {
+                let mut v = alpha;
+                for (s, &r_s) in rs.iter().enumerate() {
+                    v = mul(v, F128::ONE + mul(r_s, qscales[s]));
+                }
+                *w0 = v;
+            }
+        }
+        prepare_c2_retained_transpose(&self.ntt, &self.positions, &self.w0_pows,
+            reduced_log_d, self.log_inv_rate, c2_lean_windows_enabled())
+    }
+
     pub(super) fn materialize(&mut self, rs: &[F128]) -> Vec<F128> {
         let d = self.depth;
         assert_eq!(rs.len(), d);
@@ -479,13 +503,14 @@ impl Pending {
         self.challenges.push(r);
         let complete = self.challenges.len() == d;
         // Small states (`FLOCK_NO_SMALL_SERIAL=1` kills): the fold and the
-        // dual's message / materialize run one after the other on this
+        // dual's message / basis preparation run one after the other on this
         // thread instead of as a Rayon join. On the ranked open these are
         // the folds of the 2^15..2^5 states, where the join's wake and wait
         // cost about as much as the dual's work (M4: the c2 folds of one
         // prove take 1.04 -> 0.98 ms with 4 threads, 1.34 -> 1.20 ms with
         // 10). Same operations on the same inputs, combined in the same
-        // order, so the message, the basis and the transcript are unchanged.
+        // order; the retained basis is emitted into combined_basis only once
+        // the fold state is ready.
         if sc.f.len() <= C2_SEQ_MAX_STATE && crate::small_serial_enabled() {
             let mut message = sc.fold(r);
             let correction = self.dual.message(&self.challenges);
@@ -500,6 +525,10 @@ impl Pending {
                     && sc.pending_fold_basis.is_none()
                     && sc.pending_ood_eq.is_none()
             );
+            if let Some(prepared) = self.dual.prepare_basis_sink(&self.challenges) {
+                prepared.add_to(&self.dual.ntt, &mut sc.combined_basis);
+                return (message, true);
+            }
             let basis = self.dual.materialize(&self.challenges);
             assert_eq!(basis.len(), sc.combined_basis.len());
             for (dst, &src) in sc.combined_basis.iter_mut().zip(&basis) {
@@ -520,13 +549,22 @@ impl Pending {
                 || sc.fold(r),
                 || {
                     let corr = dual.message(challenges);
-                    let b = dual.materialize(challenges);
+                    let b = dual.prepare_basis_sink(challenges)
+                        .ok_or_else(|| dual.materialize(challenges));
                     (corr, b)
                 },
             );
             message.u_0 += correction.u_0;
             message.u_2 += correction.u_2;
             *sc.transcript.last_mut().expect("fold records a message") = message;
+            // The fold has joined: only now can final emission XOR into its basis.
+            let basis = match basis {
+                Ok(prepared) => {
+                    prepared.add_to(&self.dual.ntt, &mut sc.combined_basis);
+                    return (message, true);
+                }
+                Err(basis) => basis,
+            };
             assert_eq!(basis.len(), sc.combined_basis.len());
             if sc.combined_basis.len() >= 16_384 {
                 use rayon::prelude::*;

@@ -790,3 +790,113 @@ fn production_gate_and_optout() {
     config.queries[0] -= 1;
     assert!(!selected(&config, 25, 19, 1, 1 << 19, true, true, false));
 }
+
+#[test]
+fn basis_sink_retained_matches_nonzero_destination() {
+    for (full_log, log_d, drop_log, count) in [(20, 17, 1, 218), (18, 15, 2, 106)] {
+        let ntt = AdditiveNttF128::standard(full_log);
+        let n = 1usize << log_d;
+        // Repeated positions include equal pairs that cancel and a third survivor.
+        let positions: Vec<usize> = (0..count).map(|i| (i / 3) * n / count).collect();
+        let values: Vec<F128> = (0..count)
+            .map(|i| F128::new((i / 3 + 7) as u64, (i / 3 + 11) as u64))
+            .collect();
+        let original: Vec<F128> = (0..n >> drop_log)
+            .map(|i| F128::new(i as u64 + 1, i as u64 * 13 + 17))
+            .collect();
+        let incumbent = transpose_forward_ntt_sparse_retained_with(
+            &ntt, &positions, &values, log_d, drop_log, false,
+        ).unwrap();
+        let expected: Vec<F128> = original.iter().zip(&incumbent).map(|(&a, &b)| a + b).collect();
+        for lean in [false, true] {
+            let mut dst = original.clone();
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            TEST_C2_PREPARED_PRODUCER_CALLS.with(|calls| calls.set(0));
+            let prepared = prepare_c2_retained_transpose(
+                &ntt, &positions, &values, log_d, drop_log, lean,
+            ).unwrap();
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            TEST_C2_PREPARED_PRODUCER_CALLS.with(|calls| assert_eq!(calls.get(), usize::from(lean)));
+            prepared.add_to(&ntt, &mut dst);
+            assert_eq!(dst, expected, "nonzero destination log_d={log_d}, lean={lean}");
+        }
+    }
+}
+
+#[test]
+fn basis_sink_declines_malformed_inputs() {
+    let ntt = AdditiveNttF128::standard(20);
+    for (positions, values, log_d, drop_log) in [
+        (vec![0], vec![], 17, 1),
+        (vec![2, 1], vec![F128::ONE; 2], 17, 1),
+        (vec![1 << 17], vec![F128::ONE], 17, 1),
+        (vec![], vec![], 17, 0),
+        (vec![], vec![], 17, 17),
+        (vec![], vec![], usize::BITS as usize, 1),
+        (vec![], vec![], 21, 1),
+        (vec![], vec![], 12, 5),
+    ] {
+        assert!(prepare_c2_retained_transpose(&ntt, &positions, &values, log_d, drop_log, true).is_none());
+    }
+    for (log_d, drop_log) in [(17, 1), (15, 2), (5, 1)] {
+        let mut dst = vec![F128::new(31, 47); 1 << (log_d - drop_log)];
+        prepare_c2_retained_transpose(&ntt, &[], &[], log_d, drop_log, true)
+            .unwrap().add_to(&ntt, &mut dst);
+        assert!(dst.iter().all(|&v| v == F128::new(31, 47)));
+    }
+}
+
+#[test]
+fn basis_sink_policy_keeps_fallbacks() {
+    assert!(c2_basis_sink_shape(20, 17, 1, 218));
+    assert!(c2_basis_sink_shape(18, 15, 2, 106));
+    for shape in [(19, 17, 1, 218), (20, 17, 1, 217), (18, 15, 1, 106), (12, 9, 1, 4)] {
+        assert!(!c2_basis_sink_shape(shape.0, shape.1, shape.2, shape.3));
+    }
+    assert_eq!(c2_basis_sink_enabled(), std::env::var_os("FLOCK_NO_C2_BASIS_SINK").is_none());
+}
+
+#[test]
+fn basis_sink_production_pending_matches_materialize() {
+    for (full_log, rate, count) in [(20, 1, 218), (18, 2, 106)] {
+        let queries: Vec<usize> = (0..count).map(|i| (i / 3) * (1usize << full_log) / count).collect();
+        let alpha = [F128::new(7, 11); 8];
+        let row = [F128::new(17, 23)];
+        let make_dual = || c2::Dual::new_with_depth(3, full_log, rate, &[], &queries, &alpha, |_| &row);
+        let (dual, enforced) = make_dual();
+        let (mut reference, _) = make_dual();
+        let len = 1usize << (full_log - rate);
+        let f = vec![F128::new(29, 31); len];
+        let basis: Vec<F128> = (0..len).map(|i| F128::new(i as u64 + 1, 37)).collect();
+        let h = f.iter().zip(&basis).fold(F128::ZERO, |v, (&x, &y)| v + x * y);
+        let (mut candidate, _) = SumcheckProver::new(f.clone(), basis.clone(), h);
+        let (mut control, _) = SumcheckProver::new(f, basis, h);
+        let (mut pending, intro) = c2::Pending::introduce(dual, enforced, &mut candidate);
+        assert_eq!(intro, reference.message(&[]));
+        control.transcript.push(intro);
+        let beta = F128::new(41, 43);
+        pending.glue(beta, &mut candidate);
+        reference.scale(beta);
+        control.t_r += beta * enforced;
+        let challenges = [F128::new(47, 53), F128::ZERO, F128::ONE];
+        for depth in 1..=3 {
+            let r = challenges[depth - 1];
+            let (got, complete) = pending.fold(r, &mut candidate);
+            let mut want = control.fold(r);
+            let correction = reference.message(&challenges[..depth]);
+            want.u_0 += correction.u_0;
+            want.u_2 += correction.u_2;
+            *control.transcript.last_mut().unwrap() = want;
+            if complete {
+                let retained = reference.materialize(&challenges);
+                for (dst, src) in control.combined_basis.iter_mut().zip(retained) { *dst += src; }
+            }
+            assert_eq!(complete, depth == 3);
+            assert_eq!(got, want);
+            assert_eq!(candidate.f, control.f);
+            assert_eq!(candidate.t_r, control.t_r);
+            assert_eq!(candidate.transcript, control.transcript);
+            assert_eq!(candidate.combined_basis, control.combined_basis);
+        }
+    }
+}
