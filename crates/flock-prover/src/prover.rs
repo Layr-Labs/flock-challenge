@@ -2648,6 +2648,7 @@ fn commit_with_round1_ab_precompute(
     stripe_help: Option<&(dyn Fn() + Sync)>,
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
     after_ab: Option<&(dyn Fn() + Sync)>,
+    preconv_m: Option<usize>,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -2784,6 +2785,12 @@ fn commit_with_round1_ab_precompute(
             flock_core::tmark::mark("ab arm start");
             let t = std::time::Instant::now();
             let r = precompute_ab();
+            // Round-one AB pre-conversion (`FLOCK_NO_AB_PRECONV=1` kills):
+            // armed before the arm is reported done, so the CPU tail hash,
+            // which starts only after that, finds it.
+            if let Some(m) = preconv_m {
+                r.arm_preconv(m, padding);
+            }
             // Inside the arm, so its completion is ordered before the
             // tail-fill hook can observe a published stripe.
             if let Some(after_ab) = after_ab {
@@ -2804,8 +2811,6 @@ fn commit_with_round1_ab_precompute(
     );
 
     flock_core::tmark::mark("commit join end");
-    // The reserved workers join the spin from here (`FLOCK_NO_RESV_HOT`).
-    flock_core::cpu_keepalive::pool_spin_commit_done();
     if run_ranked_exact_tune {
         if std::env::var_os("FLOCK_NO_TUNE_REPLAY_BACKING").is_none() {
             *replay_backing.lock().unwrap() = Some(
@@ -2930,6 +2935,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             stripe_help,
             producer,
             after_ab,
+            // The lincheck-C route's round one is the transform's only
+            // reader (its AB completion driver and that driver's GPU arm).
+            ranked_lincheck_c_reuse_enabled(r1cs).then_some(r1cs.m),
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -3517,6 +3525,7 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         pcs_params,
         &padding,
         commit_codeword,
+        None,
         None,
         None,
         None,
