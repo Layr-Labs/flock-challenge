@@ -446,6 +446,25 @@ pub(crate) fn cb2_done_signal_enabled() -> bool {
     *ON
 }
 
+/// Fine-split head buffer (`FLOCK_NO_FINE_SIG_SPLIT=1`, exact, kills). A
+/// fine hybrid split's GPU prefix (cb2) signals the fine-split event behind
+/// its layer-4 encoder, and the CPU suffix gates its boundary sub-blocks on
+/// that event. A shared-event signal encoded between two encoders of one
+/// command buffer becomes visible to the CPU only once the whole buffer has
+/// completed, so the gate waited for every later pass of the prefix too.
+/// The layer-4 encoder and its signal now form their own command buffer
+/// (the head), committed directly ahead of the rest of cb2 on the same
+/// queue: the signal is visible once that encoder ends. Same kernels, same
+/// order, same buffers, same outputs; the head's status joins every check
+/// of cb2's status (the gate's poll and the cb2 joins). The split tuner's
+/// arm sweep keeps the single buffer (it prices cb2 from its timestamps).
+pub const ENV_NO_FINE_SIG_SPLIT: &str = "FLOCK_NO_FINE_SIG_SPLIT";
+
+pub(crate) fn fine_sig_split_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_FINE_SIG_SPLIT));
+    *ON
+}
+
 pub(crate) fn gpu_done_event_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         !std::env::var(ENV_NO_GPU_DONE_EVENT).is_ok_and(|v| v == "1")
@@ -12768,7 +12787,7 @@ kernel void blake3_pow_race_tail(
                         // `finish` (same idiom as the streamed tiles above).
                         let cb2 = self.gpu.retain(cb2);
                         arm_cb2_done(self.gpu, cb2);
-                        self.gpu.commit_async(cb2);
+                        commit_cb2(self.gpu, cb2);
                         crate::tmark::mark("early cb2 committed");
                         Ok(cb2)
                     })();
@@ -12936,7 +12955,10 @@ kernel void blake3_pow_race_tail(
             let _ = self.wait_pending();
             if let Some((cb2, _)) = self.early_cb2.take() {
                 let _ = unsafe { self.gpu.wait_cb(cb2) };
-                unsafe { self.gpu.release(cb2) };
+                unsafe {
+                    fine_head_release(self.gpu, cb2);
+                    self.gpu.release(cb2);
+                }
             }
             if let Some(cb) = self.early_graph.take() {
                 let _ = unsafe { self.gpu.wait_cb(cb) };
@@ -13712,32 +13734,129 @@ kernel void blake3_pow_race_tail(
             }
             let prefix16 = (16 - k_cpu16) as u64;
             let prefix256 = hybrid_prefix256(k_split) as u64;
-            let cb2 = gpu.command_buffer()?;
-            let enc = gpu.compute_encoder(cb2)?;
+            // `super::ENV_NO_FINE_SIG_SPLIT`: outside the arm sweep, encoder 1
+            // and the signal form the head buffer and encoder 2 goes into the
+            // returned cb2; [`commit_cb2`] commits the head right before it.
+            let split = super::fine_sig_split_enabled() && !hybrid_arm_recording();
+            let head = gpu.command_buffer()?;
+            let enc = gpu.compute_encoder(head)?;
             encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 4, 8, prefix16, 16);
             gpu.end_encoding(enc);
             let v = FINE_SPLIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            gpu.encode_signal_event(cb2, ev, v);
+            gpu.encode_signal_event(head, ev, v);
             FINE_SPLIT_WAIT.store(v, std::sync::atomic::Ordering::Release);
+            let cb2 = if split { gpu.command_buffer()? } else { head };
             let enc = gpu.compute_encoder(cb2)?;
             if hybrid_final_leaf_selected(gpu, log_d, n_leaves) {
                 encode_hybrid_prefix_tail(gpu, enc, staging, tw_buf, tree_buf, log_d, n_leaves, 8, prefix256, 256);
                 gpu.end_encoding(enc);
-                return Ok(cb2);
-            }
-            encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 8, log_d, prefix256, 256);
-            let prefix_leaves = prefix256 as usize * (n_leaves / 256);
-            let mut start = 0usize;
-            while start < prefix_leaves {
-                let mut size = 1usize << (prefix_leaves - start).ilog2();
-                while start % size != 0 {
-                    size >>= 1;
+            } else {
+                encode_ntt_passes_prefix_frac(gpu, enc, staging, tw_buf, log_d, 4, 8, log_d, prefix256, 256);
+                let prefix_leaves = prefix256 as usize * (n_leaves / 256);
+                let mut start = 0usize;
+                while start < prefix_leaves {
+                    let mut size = 1usize << (prefix_leaves - start).ilog2();
+                    while start % size != 0 {
+                        size >>= 1;
+                    }
+                    encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
+                    start += size;
                 }
-                encode_merkle_subtree(gpu, enc, staging, tree_buf, n_leaves, start, size);
-                start += size;
+                gpu.end_encoding(enc);
             }
-            gpu.end_encoding(enc);
+            if split {
+                fine_head_stash(gpu, cb2, head);
+            }
             Ok(cb2)
+        }
+    }
+
+    /// The fine-split head buffer encoded for a cb2 (see
+    /// `super::ENV_NO_FINE_SIG_SPLIT`): `(cb2, head, committed)`, with the
+    /// head retained here until [`fine_head_release`].
+    static FINE_HEAD: std::sync::Mutex<Option<(usize, usize, bool)>> = std::sync::Mutex::new(None);
+
+    unsafe fn fine_head_stash(gpu: &Gpu, cb2: Id, head: Id) {
+        let held = unsafe { gpu.retain(head) };
+        let old = FINE_HEAD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace((cb2 as usize, held as usize, false));
+        if let Some((_, h, _)) = old {
+            unsafe { gpu.release(h as Id) };
+        }
+    }
+
+    /// Commit `cb2`, directly preceded by its fine-split head when one was
+    /// encoded for it (same queue: the head runs first).
+    unsafe fn commit_cb2(gpu: &Gpu, cb2: Id) {
+        let head = {
+            let mut g = FINE_HEAD.lock().unwrap_or_else(|e| e.into_inner());
+            match g.as_mut() {
+                Some((c, h, committed)) if *c == cb2 as usize && !*committed => {
+                    *committed = true;
+                    Some(*h as Id)
+                }
+                _ => None,
+            }
+        };
+        unsafe {
+            if let Some(h) = head {
+                gpu.commit_async(h);
+            }
+            gpu.commit_async(cb2);
+        }
+    }
+
+    /// The fine-split head encoded for `cb2`, if any (valid until
+    /// [`fine_head_release`]).
+    fn fine_head_of(cb2: Id) -> Option<Id> {
+        match *FINE_HEAD.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some((c, h, _)) if c == cb2 as usize => Some(h as Id),
+            _ => None,
+        }
+    }
+
+    /// cb2's status check extended to its fine-split head: an error once the
+    /// head has failed.
+    unsafe fn fine_head_status(gpu: &Gpu, cb2: Id) -> Result<(), String> {
+        match fine_head_of(cb2) {
+            Some(h) if unsafe { gpu_cb_failed(gpu, h) } => {
+                Err("command buffer status 5 (fine-split head)".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Release the fine-split head encoded for `cb2`, if any (a committed
+    /// head is held by its queue until it completes).
+    unsafe fn fine_head_release(gpu: &Gpu, cb2: Id) {
+        let held = {
+            let mut g = FINE_HEAD.lock().unwrap_or_else(|e| e.into_inner());
+            if g.is_some_and(|(c, _, _)| c == cb2 as usize) { g.take() } else { None }
+        };
+        if let Some((_, h, _)) = held {
+            unsafe { gpu.release(h as Id) };
+        }
+    }
+
+    /// cb2's GPU interval, starting at its fine-split head when it has one.
+    unsafe fn cb2_gpu_interval(gpu: &Gpu, cb2: Id) -> (f64, f64) {
+        unsafe {
+            let (s, e) = cb_gpu_interval(gpu, cb2);
+            match fine_head_of(cb2) {
+                Some(h) => (cb_gpu_interval(gpu, h).0, e),
+                None => (s, e),
+            }
+        }
+    }
+
+    /// Releases cb2's fine-split head when the hybrid graph returns.
+    struct FineHeadRelease<'a>(&'a Gpu, Id);
+
+    impl Drop for FineHeadRelease<'_> {
+        fn drop(&mut self) {
+            unsafe { fine_head_release(self.0, self.1) };
         }
     }
 
@@ -13942,6 +14061,7 @@ kernel void blake3_pow_race_tail(
             gpu.wait_cb(cb2)?;
         }
         Gpu::recycle_done(sig2);
+        unsafe { fine_head_status(gpu, cb2) }?;
         // cb3's tree writes are read only below, after this join: on its
         // signal every write is complete and visible. The window trace reads
         // cb3's GPU timestamps, so it keeps the status wait.
@@ -13955,7 +14075,7 @@ kernel void blake3_pow_race_tail(
         }
         if window_trace_enabled() {
             let (s3, e3) = cb_gpu_interval(gpu, cb3);
-            let (s2, e2) = cb_gpu_interval(gpu, cb2);
+            let (s2, e2) = cb2_gpu_interval(gpu, cb2);
             eprintln!(
                 "[gpu-window] tail hash: CPU took {} of {total_units} suffix units in {tail_ms:.2} ms; \
                  cb3 start {:.3} ms after cb2's end, gpu dur {:.2} ms; cb2 gpu dur {:.2} ms",
@@ -13966,7 +14086,7 @@ kernel void blake3_pow_race_tail(
             );
         }
         {
-            let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
+            let (cb2_s, cb2_e) = cb2_gpu_interval(gpu, cb2);
             crate::tmark::mark_gpu("cb2 gpu start", "cb2 gpu end", cb2_s, cb2_e);
         }
         gpu.release(cb3);
@@ -14038,11 +14158,12 @@ kernel void blake3_pow_race_tail(
                             gpu, staging, tw_buf, tree_buf, log_d, n_leaves, k_split,
                         )?;
                         arm_cb2_done(gpu, cb2);
-                        gpu.commit_async(cb2);
+                        commit_cb2(gpu, cb2);
                         crate::tmark::mark("cb2 committed (late)");
                         cb2
                     }
                 };
+                let _fine_head = FineHeadRelease(gpu, cb2);
                 let prefix_leaves = hybrid_prefix256(k_split) * (n_leaves / 256);
 
                 // CPU: suffix NTT completion + leaves + subtree parents.
@@ -14081,10 +14202,14 @@ kernel void blake3_pow_race_tail(
                         );
                     } else {
                         // The boundary sixteenth's layers 4..8 are the GPU's
-                        // (cb2's first encoder): its event gates this arm's
-                        // last `fine_m` layer-8 sub-blocks of that sixteenth.
+                        // (cb2's first encoder, or its head buffer under
+                        // `super::ENV_NO_FINE_SIG_SPLIT`): its event gates
+                        // this arm's last `fine_m` layer-8 sub-blocks of that
+                        // sixteenth.
                         let ev = gpu.fine_split_event();
                         let want = FINE_SPLIT_WAIT.load(std::sync::atomic::Ordering::Acquire);
+                        let head = fine_head_of(cb2);
+                        let head_failed = || head.is_some_and(|h| gpu_cb_failed(gpu, h));
                         ntt.forward_transform_interleaved_ranked_fine_range_and_then(
                             data,
                             64,
@@ -14093,7 +14218,7 @@ kernel void blake3_pow_race_tail(
                             || {
                                 let mut spins = 0u32;
                                 while gpu.event_signaled_value(ev) < want {
-                                    if gpu_cb_failed(gpu, cb2) {
+                                    if gpu_cb_failed(gpu, cb2) || head_failed() {
                                         return Err("fine split: GPU prefix failed before layer-4 signal".into());
                                     }
                                     spins = spins.wrapping_add(1);
@@ -14102,6 +14227,11 @@ kernel void blake3_pow_race_tail(
                                     } else {
                                         core::hint::spin_loop();
                                     }
+                                }
+                                // A head that failed reports it here once its
+                                // signal ran (same rule as the done-signal joins).
+                                if head_failed() {
+                                    return Err("fine split: GPU prefix head failed".into());
                                 }
                                 Ok(())
                             },
@@ -14175,12 +14305,13 @@ kernel void blake3_pow_race_tail(
                         gpu.wait_cb(cb3)?;
                     }
                     Gpu::recycle_done(sig2);
+                    fine_head_status(gpu, cb2)?;
                     // Arms for the sweep's split selection. cb3 queues behind
                     // both cb2 and the CPU NTT, so this split's window is
                     // max(cb2, cpu NTT) + cb3: price the GPU arm as cb2's
                     // start to cb3's end and the CPU arm as the NTT wall.
                     crate::tmark::mark("cb3 host woke");
-                    let (cb2_s, cb2_e) = cb_gpu_interval(gpu, cb2);
+                    let (cb2_s, cb2_e) = cb2_gpu_interval(gpu, cb2);
                     let (cb3_s, cb3_e) = cb_gpu_interval(gpu, cb3);
                     crate::tmark::mark_gpu("cb2 gpu start", "cb2 gpu end", cb2_s, cb2_e);
                     crate::tmark::mark_gpu("cb3 gpu start", "cb3 gpu end", cb3_s, cb3_e);
@@ -15563,7 +15694,7 @@ kernel void blake3_pow_race_tail(
                         params.n_leaves(),
                         k,
                     )?;
-                    c.gpu.commit_async(cb2);
+                    commit_cb2(c.gpu, cb2);
                     staged_cb2.store(cb2 as usize, Ordering::Release);
                     Ok(())
                 })
@@ -16801,7 +16932,10 @@ kernel void blake3_pow_race_tail(
         let drain_early = |early: Option<(Id, usize)>| {
             if let Some((cb2, _)) = early {
                 let _ = unsafe { stream.gpu.wait_cb(cb2) };
-                unsafe { stream.gpu.release(cb2) };
+                unsafe {
+                    fine_head_release(stream.gpu, cb2);
+                    stream.gpu.release(cb2);
+                }
             }
         };
         // The early pure-GPU graph (if any) was queued behind the final tile:
