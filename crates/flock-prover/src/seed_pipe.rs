@@ -1526,6 +1526,8 @@ fn speculative_main(
     } else {
         flock_core::cpu_keepalive::keepalive_stop();
     }
+    // The efficiency-core helpers spin from here (`FLOCK_NO_EH_EARLY`).
+    flock_core::cpu_keepalive::epool_hot_seed();
 
     let Some(bytes) = line.as_deref() else {
         // EOF or error: closing the write end turns the worker's read into a
