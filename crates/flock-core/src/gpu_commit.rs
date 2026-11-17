@@ -1089,15 +1089,6 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
     if gpu_commit_enabled() { *SHARE } else { 0 }
 }
 
-/// Kill switch for submitting the round-one AB completion arm as one command
-/// buffer (`FLOCK_NO_ZC_AB_SCHED`, any value, read once per process): the
-/// table build is committed as its own command buffer ahead of the gather and
-/// finish, as before. With the switch unset, the table build, the gather and
-/// the finish are encoded into a single command buffer (the table build's
-/// encoder first, then the gather and finish encoder), so no other work on the
-/// queue can be scheduled between the build and the gather, and the arm pays
-/// one command buffer's start instead of two. The kernels, their inputs,
-/// their order and every output are the same.
 pub const ENV_NO_ZC_AB_SCHED: &str = "FLOCK_NO_ZC_AB_SCHED";
 
 pub(crate) fn gpu_zc_ab_one_cb_enabled() -> bool {
@@ -1159,6 +1150,9 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 /// one's, so 768 stays CPU-critical there.
 const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 768;
 
+pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
+const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
+
 /// Kill switch for the K arm's faster fold kernel (`FLOCK_NO_ZC_K_V2`, any
 /// value): the embedded `zc_k_fold` and the record's share
 /// ([`ZC_K_GPU_DEFAULT_CHUNKS`]). With it on, `zc_k_fold_v2` (compiled from
@@ -1193,6 +1187,9 @@ pub(crate) fn gpu_zc_k_share() -> usize {
             return 0;
         }
         match std::env::var_os(ENV_ZC_K_GPU_CHUNKS) {
+            None if zc_k_v2_enabled() && std::env::var_os(ENV_NO_ZC_K_SHARE800).is_none() => {
+                ZC_K_GPU_V2_RUNNER_CHUNKS
+            }
             None if zc_k_v2_enabled() => ZC_K_GPU_V2_DEFAULT_CHUNKS,
             None => ZC_K_GPU_DEFAULT_CHUNKS,
             Some(value) => value
@@ -26751,9 +26748,6 @@ kernel void zc_ab_finish(
     /// An in-flight round-one AB completion GPU prefix.
     pub(crate) struct ZcAbJob {
         /// Table build, then gather + finish (same queue, in order; the
-        /// second reads the tables the first wrote, hazard-tracked). With the
-        /// one-buffer submission (`ENV_NO_ZC_AB_SCHED`) `cb_tables` is NIL and
-        /// `cb` holds all three kernels.
         cb_tables: Id,
         cb: Id,
         /// `cb`'s completion signal (`super::ENV_NO_JOIN_SIGNAL`).
@@ -26904,12 +26898,9 @@ kernel void zc_ab_finish(
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
             let pool = gpu.pool_push();
-            // One command buffer for the whole arm (`ENV_NO_ZC_AB_SCHED`):
-            // the table build's encoder, then the gather and finish encoder.
             let one_cb = super::gpu_zc_ab_one_cb_enabled();
             let submitted = (|| -> Result<(Id, Id, Option<DoneSig>), String> {
                 // Command buffer 1: the table build (own GPU wall in the
-                // diagnostics), or the arm's only command buffer.
                 let cb_tables = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb_tables)?;
                 gpu.set_pipeline(enc, state.tables_pso);
@@ -26918,10 +26909,6 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.tables_buf, 0, 2);
                 gpu.dispatch(enc, ZC_AB_TOPS as u64, 256);
                 gpu.end_encoding(enc);
-                // Command buffer 2 (or the same one): gather, then finish
-                // (serial dispatches of one encoder: the finish reads the banks
-                // the gather wrote; the encoder after the table build's reads
-                // the tables it wrote).
                 let cb = if one_cb { cb_tables } else { gpu.command_buffer()? };
                 let enc = gpu.compute_encoder(cb)?;
                 gpu.set_pipeline(enc, state.gather_pso);
@@ -26991,8 +26978,6 @@ kernel void zc_ab_finish(
         unsafe {
             let waited = std::time::Instant::now();
             // The main buffer reads the tables buffer, so it completes after
-            // the table build; the table build's status is checked too (a
-            // one-buffer job has no separate table buffer).
             // A timed join returns on the buffer's signal; the oracle launch
             // waits for the status (it reads the GPU's timestamps).
             let ok = if job.calibration || !super::join_signal_enabled() {
@@ -27005,8 +26990,6 @@ kernel void zc_ab_finish(
                 Gpu::recycle_done(job.sig);
             }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
-            // With one buffer its wall covers the table build as well and is
-            // reported as gather+finish (tables 0).
             let (tables_ms, gather_ms) = if ok.is_ok() {
                 (
                     if job.cb_tables.is_null() { 0.0 } else { zc_fold_gpu_wall_ms(gpu, job.cb_tables) },
