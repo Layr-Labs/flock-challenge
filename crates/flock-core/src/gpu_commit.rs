@@ -1134,6 +1134,20 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 /// one's, so 768 stays CPU-critical there.
 const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 768;
 
+/// Kill switch for the runner-balanced K share (`FLOCK_NO_ZC_K_SHARE800`, any
+/// value: the faster kernel's default share is [`ZC_K_GPU_V2_DEFAULT_CHUNKS`],
+/// 768, as the record). The official runner reads the K pass CPU-critical
+/// with 768: its K GPU prefix ends about 0.64 ms before the CPU queue (a
+/// disclosed diagnostic run on the M3 Max, i34-9 `c4d5dd3c`), so the GPU idles
+/// at the K join. With CPU and GPU chunk rates from that reading (1280 chunks
+/// in ~8 ms, 768 in ~7.4 ms) the two sides end together near 800 of the 2048
+/// chunks. The default share becomes [`ZC_K_GPU_V2_RUNNER_CHUNKS`] (800, a
+/// multiple of 32). The same chunks and kernels, only the GPU/CPU boundary
+/// moves, so every output is the same field element. An explicit
+/// `FLOCK_ZC_K_GPU_CHUNKS` still wins. Read once per process.
+pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
+const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
+
 /// Kill switch for the K arm's faster fold kernel (`FLOCK_NO_ZC_K_V2`, any
 /// value): the embedded `zc_k_fold` and the record's share
 /// ([`ZC_K_GPU_DEFAULT_CHUNKS`]). With it on, `zc_k_fold_v2` (compiled from
@@ -1168,6 +1182,9 @@ pub(crate) fn gpu_zc_k_share() -> usize {
             return 0;
         }
         match std::env::var_os(ENV_ZC_K_GPU_CHUNKS) {
+            None if zc_k_v2_enabled() && std::env::var_os(ENV_NO_ZC_K_SHARE800).is_none() => {
+                ZC_K_GPU_V2_RUNNER_CHUNKS
+            }
             None if zc_k_v2_enabled() => ZC_K_GPU_V2_DEFAULT_CHUNKS,
             None => ZC_K_GPU_DEFAULT_CHUNKS,
             Some(value) => value
