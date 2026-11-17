@@ -3737,6 +3737,7 @@ fn fold2_compact_and_round45_into_packed_b(
                 share,
                 out_chunk / 256 * 244,
                 out_chunk / 64 * b_block,
+                k_xb,
             )
         } else {
             None
