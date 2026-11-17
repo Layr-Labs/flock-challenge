@@ -1992,7 +1992,11 @@ impl AbUnitScratch {
 
     fn with_pairing(unit_bytes: usize, paired: bool) -> Self {
         let slots = if paired { 2 } else { 1 };
-        let storage = vec![0u8; 2 * slots * unit_bytes + 64];
+        let len = 2 * slots * unit_bytes + 64;
+        let storage = AB_UNIT_SCRATCH_CACHE
+            .with(|cell| cell.take())
+            .filter(|v| v.len() == len && ab_unit_scratch_reuse_enabled())
+            .unwrap_or_else(|| vec![0u8; len]);
         let offset = storage.as_ptr().align_offset(64);
         assert!(offset < 64);
         Self {
@@ -2028,6 +2032,29 @@ impl AbUnitScratch {
         self.primed[0] = true;
         (a, b)
     }
+}
+
+impl Drop for AbUnitScratch {
+    fn drop(&mut self) {
+        let storage = core::mem::take(&mut self.storage);
+        if !storage.is_empty() && ab_unit_scratch_reuse_enabled() {
+            let _ = AB_UNIT_SCRATCH_CACHE.try_with(|cell| cell.set(Some(storage)));
+        }
+    }
+}
+
+std::thread_local! {
+    static AB_UNIT_SCRATCH_CACHE: std::cell::Cell<Option<Vec<u8>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub const ENV_NO_AB_UNIT_SCRATCH_REUSE: &str = "FLOCK_NO_AB_UNIT_SCRATCH_REUSE";
+
+fn ab_unit_scratch_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_AB_UNIT_SCRATCH_REUSE).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 /// Kill switch for the per-worker window-rows plan: any value of
@@ -7132,6 +7159,67 @@ mod tests {
         }
         // Arms x (representations x unit sizes that divide the buffer).
         assert_eq!(checked, 5 * (1 + 3 * 2 + 3 * 3));
+    }
+
+    #[test]
+    fn ab_unit_scratch_reuse_resets_primed_and_keys_length() {
+        const UNIT: usize = 1024;
+        for paired in [false, true] {
+            let first_ptr = {
+                let mut s = AbUnitScratch::with_pairing(UNIT, paired);
+                for unit in 0..4 {
+                    s.fill(unit, |a, b, _| unsafe {
+                        core::ptr::write_bytes(a, 0xa1, UNIT);
+                        core::ptr::write_bytes(b, 0xb1, UNIT);
+                    });
+                }
+                s.storage.as_ptr()
+            };
+            let mut s = AbUnitScratch::with_pairing(UNIT, paired);
+            if ab_unit_scratch_reuse_enabled() {
+                assert_eq!(s.storage.as_ptr(), first_ptr, "same thread, same shape reuses");
+            }
+            assert_eq!(s.primed, [false; 2], "primed never carried over");
+            let mut seen = Vec::new();
+            for unit in 0..2 {
+                let (a, b) = s.fill(unit, |a, b, primed| {
+                    seen.push(primed);
+                    unsafe {
+                        core::ptr::write_bytes(a, 0x22, UNIT);
+                        core::ptr::write_bytes(b, 0x33, UNIT);
+                    }
+                });
+                assert!(a.iter().all(|&x| x == 0x22) && b.iter().all(|&x| x == 0x33));
+            }
+            assert_eq!(seen, if paired { vec![false, false] } else { vec![false, true] });
+            drop(s);
+            let other = AbUnitScratch::with_pairing(2 * UNIT, paired);
+            assert!(other.storage.iter().all(|&x| x == 0), "new shape is fresh and zeroed");
+        }
+    }
+
+    #[test]
+    fn ab_unit_scratch_reuse_equal_length_different_layout() {
+        const UNIT: usize = 1024;
+        let mut old = AbUnitScratch::with_pairing(UNIT, true);
+        for unit in 0..2 {
+            old.fill(unit, |a, b, _| unsafe {
+                core::ptr::write_bytes(a, 0xa1, UNIT);
+                core::ptr::write_bytes(b, 0xb1, UNIT);
+            });
+        }
+        drop(old);
+        let mut new = AbUnitScratch::with_pairing(2 * UNIT, false);
+        assert_eq!(new.primed, [false; 2]);
+        let (a, b) = new.fill(0, |a, b, primed| {
+            assert!(!primed);
+            unsafe {
+                core::ptr::write_bytes(a, 0x12, 2 * UNIT);
+                core::ptr::write_bytes(b, 0x34, 2 * UNIT);
+            }
+        });
+        assert!(a.iter().all(|&x| x == 0x12));
+        assert!(b.iter().all(|&x| x == 0x34));
     }
 
     /// Primed scratch slots: a producer that skips the constant half of a
