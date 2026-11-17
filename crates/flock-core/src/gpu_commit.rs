@@ -425,6 +425,14 @@ pub(crate) fn join_signal_enabled() -> bool {
     *ON
 }
 
+pub const ENV_NO_TAIL_HALF_UNITS: &str = "FLOCK_NO_TAIL_HALF_UNITS";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tail_half_units_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAIL_HALF_UNITS));
+    *ON
+}
+
 /// Serial XOR of a fold prefix into the CPU suffix (`FLOCK_NO_FOLD_SERIAL_XOR`,
 /// any value, kills): the round-one C fold's and the lincheck fold's drains
 /// add the GPU prefix's 2^k_log lanes (256 KiB at the ranked shape) into the
@@ -12224,9 +12232,9 @@ kernel void blake3_pow_race_tail(
         n_leaves: usize,
         suffix_start: usize,
         args: Id,
+        unit_levels: usize,
     ) -> Vec<u32> {
-        const UNIT_LEVELS: usize = 10;
-        let unit = 1usize << UNIT_LEVELS;
+        let unit = 1usize << unit_levels;
         debug_assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let mut per_unit: Vec<u32> = Vec::with_capacity(12);
         unsafe {
@@ -12268,7 +12276,7 @@ kernel void blake3_pow_race_tail(
                 let off = next_arg((unit / 256) as u32, &mut per_unit);
                 gpu.dispatch_indirect(enc, args, off, 256);
             }
-            while done < UNIT_LEVELS {
+            while done < unit_levels {
                 // Per unit: `unit >> (done + 1)` parents at the next level.
                 let n_out = unit >> (done + 1);
                 let tpg = n_out.min(256);
@@ -13741,9 +13749,9 @@ kernel void blake3_pow_race_tail(
         }
     }
 
-    /// 1,024-leaf units of the CPU tail hash (`super::ENV_NO_HYBRID_CPU_TAIL_HASH`):
-    /// one unit is its leaves and ten parent levels, rooted at level 10.
-    const TAIL_UNIT_LEVELS: usize = 10;
+    fn tail_unit_levels() -> usize {
+        if super::tail_half_units_enabled() { 9 } else { 10 }
+    }
 
     /// Process-lifetime indirect-count buffer of the CPU tail hash's cb3.
     static TAIL_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -13808,7 +13816,8 @@ kernel void blake3_pow_race_tail(
         suffix_start: usize,
         force: usize,
     ) -> Result<(), String> {
-        let unit = 1usize << TAIL_UNIT_LEVELS;
+        let unit_levels = tail_unit_levels();
+        let unit = 1usize << unit_levels;
         assert!(n_leaves.is_power_of_two() && n_leaves >= 1 << 16);
         assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let total_units = (n_leaves - suffix_start) / unit;
@@ -13826,7 +13835,7 @@ kernel void blake3_pow_race_tail(
             let cb3 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb3)?;
             let per_unit =
-                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args);
+                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args, unit_levels);
             gpu.end_encoding(enc);
             // The join below returns on this signal (`super::ENV_NO_JOIN_SIGNAL`).
             let sig3 = if super::join_signal_enabled() { gpu.arm_done(cb3) } else { None };
@@ -13862,7 +13871,7 @@ kernel void blake3_pow_race_tail(
             // the same unit only with the same bytes into the same slots.
             unsafe {
                 let bytes = core::slice::from_raw_parts(bytes_base.ptr().add(start * 1024), unit * 1024);
-                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, TAIL_UNIT_LEVELS);
+                hash_ranked_leaf_chunk_and_local_parents(bytes, tree_base, n_leaves, start, unit, unit_levels);
             }
         };
         // cb2's completion as the caller reads it: its armed signal when
@@ -13972,27 +13981,29 @@ kernel void blake3_pow_race_tail(
         gpu.release(cb3);
         r?;
         crate::tmark::mark("cb3 host woke");
-        // The suffix's levels 11..16 from the unit roots. Level `l`'s first
         // node is rounded down, so a node over the GPU prefix's last 256ths
         // and the suffix's first is rebuilt too: its children on the prefix
         // side are cb2's (every aligned block inside the prefix lies inside
         // one of cb2's greedy subtrees, each complete up to its root).
         let mut ls = 0usize;
         let mut ll = n_leaves;
-        for _ in 0..TAIL_UNIT_LEVELS {
+        for _ in 0..unit_levels {
             ls += ll;
             ll /= 2;
         }
-        let mut lo = suffix_start >> TAIL_UNIT_LEVELS;
+        let mut lo = suffix_start >> unit_levels;
         while ll > 16 {
             let ws = ls + ll;
             let wlo = lo / 2;
-            // SAFETY: every GPU write of the tree is complete (cb2 and cb3
-            // joined above) and every CPU unit is done (the scope joined).
-            unsafe {
-                let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * wlo), ll - 2 * wlo);
-                let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + wlo), ll / 2 - wlo);
-                crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+            let mut o = wlo;
+            while o < ll / 2 {
+                let len = 1024.min(ll / 2 - o);
+                unsafe {
+                    let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * o), 2 * len);
+                    let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + o), len);
+                    crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                }
+                o += len;
             }
             ls = ws;
             ll /= 2;
