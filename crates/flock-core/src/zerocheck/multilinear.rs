@@ -3662,10 +3662,33 @@ fn fold2_compact_and_round45_into_packed_b(
         let _ = pack;
         false
     };
-    // The one-table kernel reads its group weights `eq_lo[2t + 1]` in
-    // prepared form, one table shared by every chunk.
+    // The one-table kernel reads its group weights `eq_lo[2t + 1]` either in
+    // prepared form (one table shared by every chunk), or — when the
+    // challenges satisfy the window relation — as the window scales
+    // `lambda * x^{2j}` (`FLOCK_NO_ZC_K_XB=1` keeps the prepared form), in
+    // which case no table is built or streamed at all.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
+    let k_xb =
+        one_table && kernels::aarch64::zc_k_xb_enabled() && kernels::aarch64::k_full_xb_weights(eq_lo, lo_size);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let k_shifts = k_xb && kernels::aarch64::zc_k_xb_shifts_enabled();
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+    let k_xb = false;
+    // Diagnostic trace (`FLOCK_ZC_K_XB_DEBUG=1`): whether the window-scaled
+    // K weights armed, and the first window's relation if they did not.
+    if std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some() && one_table {
+        let n_groups = lo_size / 2;
+        let armed = k_xb;
+        let first_window_ok = (0..n_groups.min(8)).all(|j| {
+            j == 0 || eq_lo[2 * j + 1] == eq_lo[1] * F128::new(1u64 << (2 * j), 0)
+        });
+        eprintln!(
+            "[zc-k-xb] armed={} n_groups={} first_window_ok={}",
+            armed, n_groups, first_window_ok
+        );
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let eq_prep = if one_table && !k_xb { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
     // The scaled table in seven pieces (`FLOCK_ZC_K_FOLD7=1`, off by default) for the packed
     // chunks on the performance-core workers: one lookup fewer per tree, the
     // same values (none when a byte bank is not linear).
@@ -3773,21 +3796,49 @@ fn fold2_compact_and_round45_into_packed_b(
             );
             let eq_ptr = eq_lo.as_ptr();
             #[cfg(target_feature = "sha3")]
-            let prep_ptr = eq_prep.as_ptr();
+            let prep_ptr = if k_xb { eq_lo.as_ptr() } else { eq_prep.as_ptr() };
             let out_ptr = outv.as_mut_ptr();
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
                     let ok = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
-                        kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
-                            fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
-                            degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
-                        )
+                        if k_xb {
+                            if k_shifts {
+                                kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true, true>(
+                                fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
+                                degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                            } else {
+                                kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true, false>(
+                                fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
+                                degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                            }
+                        } else {
+                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false, false>(
+                                fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
+                                degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                        }
                     } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
-                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
-                            compact.tail_compact, compact.head_compact, compact.head_b,
-                        )
+                        if k_xb {
+                            if k_shifts {
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, true>(
+                                t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                                compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                            } else {
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, false>(
+                                t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                                compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                            }
+                        } else {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false, false>(
+                                t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                                compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                        }
                     };
                     if !ok {
                         b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -3795,17 +3846,45 @@ fn fold2_compact_and_round45_into_packed_b(
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
-                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
-                        compact.tail_compact, compact.head_compact, compact.head_b,
-                    );
+                    if k_xb {
+                        if k_shifts {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true, true>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                        } else {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                        };
+                    } else {
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            compact.tail_compact, compact.head_compact, compact.head_b,
+                        );
+                    }
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
-                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
-                        false, false, F128::ZERO,
-                    );
+                    if k_xb {
+                        if k_shifts {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true, true>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            false, false, F128::ZERO,
+                        )
+                        } else {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            false, false, F128::ZERO,
+                        )
+                        };
+                    } else {
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            false, false, F128::ZERO,
+                        );
+                    }
                 }
                 #[cfg(target_feature = "sha3")]
                 (true, true) => fold2_compact_and_round45_chunk_neon_8_fused::<true>(
