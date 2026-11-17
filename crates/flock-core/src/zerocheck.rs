@@ -486,6 +486,66 @@ pub fn stage_commit_tail_fill<C: Challenger>(
     }
 }
 
+/// Stage only complete C gather chunks from a partially published stripe.
+///
+/// # Safety
+/// The first `ready_groups * (1 << padding.k_log)` bytes are complete and
+/// immutable until the staged job is adopted or retired. The entire pooled
+/// allocation stays live. The producer serializes this call with ALL repairs
+/// and permanently closes staging before calling `retire_commit_tail_fill`.
+pub unsafe fn stage_commit_tail_fill_ready_prefix<C: Challenger>(
+    mut forked: C,
+    r1cs: &crate::r1cs::BlockR1cs,
+    commitment: &crate::pcs::Commitment,
+    stripe_ptr: usize,
+    stripe_len: usize,
+    ready_groups: usize,
+    padding: &PaddingSpec,
+) -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        let m = r1cs.m;
+        if m != 32 || padding.k_log != 14
+            || crate::lincheck::FOLD_IBLOCK.load(std::sync::atomic::Ordering::Relaxed)
+            || ready_groups > stripe_len / (1usize << padding.k_log)
+            || !crate::gpu_commit::zc_c_segments_enabled()
+        {
+            return false;
+        }
+        crate::proof::bind_statement(&mut forked, r1cs, commitment);
+        forked.observe_label(b"flock-zerocheck-v0");
+        let r_skip = forked.sample_f128_vec(K_SKIP);
+        let r_outer = forked.sample_f128_vec(m - K_SKIP - 7);
+        let mut r = vec![F128::ZERO; m];
+        r[..K_SKIP].copy_from_slice(&r_skip);
+        r[K_SKIP..K_SKIP + 3].copy_from_slice(&small_challenges_ghash());
+        r[K_SKIP + 3..K_SKIP + 7].copy_from_slice(&medium_challenges_ghash());
+        r[K_SKIP + 7..].copy_from_slice(&r_outer);
+        let useful = crate::lincheck::root_stripe_for_key(stripe_ptr, stripe_len)
+            .map_or(padding.useful_bits_per_block, |roots| roots.n_roots);
+        unsafe {
+            crate::gpu_commit::stage_zerocheck_c_fold_ready_prefix(
+                stripe_ptr as *const u8, stripe_len, ready_groups,
+                m, padding.k_log, useful, &r,
+            )
+        }
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (forked, r1cs, commitment, stripe_ptr, stripe_len, ready_groups, padding);
+        false
+    }
+}
+
+/// Must run under the producer's closed publication lease, before the first
+/// repair write. It waits out and discards the parked GPU reader.
+pub fn retire_commit_tail_fill(stripe_ptr: usize, stripe_len: usize) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    crate::gpu_commit::abandon_staged_zc_stripe(stripe_ptr, stripe_len);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = (stripe_ptr, stripe_len);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
     a_packed: &[u8],
@@ -634,6 +694,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                             recover_identity_prefix,
                             recover_output_window,
                         );
+                    crate::tmark::mark("r1 c post done");
                     if zc_timing {
                         eprintln!(
                             "[zc-timing] round1 lincheck-stripe C (fold8): {:.2} ms cpu={:.1}",
@@ -665,6 +726,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                             recover_identity_prefix,
                             recover_output_window,
                         );
+                    crate::tmark::mark("r1 c post done");
                     if zc_timing {
                         eprintln!(
                             "[zc-timing] round1 lincheck-stripe C: {:.2} ms cpu={:.1}",
@@ -809,6 +871,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let c_s = c_s_f128();
     let round1_ab: Vec<F128> = round1_ab_opt.iter().map(|x| c_s * *x).collect();
     let round1_c: Vec<F128> = round1_c_opt.iter().map(|x| c_s * *x).collect();
+    crate::tmark::mark("r1 message ready");
     if zc_timing {
         eprintln!(
             "[zc-timing] round1 URM: {:.2} ms cpu={:.1}",

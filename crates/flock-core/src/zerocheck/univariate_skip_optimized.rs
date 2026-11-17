@@ -4430,6 +4430,10 @@ where
                 });
                 partial
             };
+            // Trace the actual last AB CPU job independently of the caller's
+            // C tail; a queue join includes both and cannot identify the last.
+            let trace_cpu = crate::tmark::on();
+            let cpu_left = std::sync::atomic::AtomicUsize::new(whole + 2 * split);
             let out = crate::epool::run_hetero_chunks_caller_tail(
                 whole + 2 * split,
                 |i| {
@@ -4451,6 +4455,9 @@ where
                         } else {
                             *half_base.ptr().add(i - whole) = partial;
                         }
+                    }
+                    if trace_cpu && cpu_left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                        crate::tmark::mark("r1 ab cpu done");
                     }
                 },
                 tail,
@@ -4695,6 +4702,7 @@ fn round1_c_inner_fold_columns(
             claim_lo,
         );
         let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
+        crate::tmark::mark("r1 c cpu suffix done");
         // C fold tune fix (`gpu_commit::ENV_NO_ZC_FOLD_TUNE_FIX`), warm-up
         // window only: the head from the AB completion start, and the
         // minimum of two warm replays of this same suffix (discarded) as

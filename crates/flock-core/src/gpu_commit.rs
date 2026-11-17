@@ -2705,6 +2705,16 @@ pub(crate) fn gpu_zero_lane_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_ZERO_LANE").is_none())
 }
 
+/// Keep 128 rather than 252 uint4s of unused storage in the compacted
+/// g4x2 kernel only. Its table and twiddle array remain 8,704 bytes, so
+/// total threadgroup storage is 10,752 rather than 12,736 bytes. The
+/// dense kernel's M4-tuned pad need not be optimal for this remapped grid.
+/// `FLOCK_NO_GPU_COMPACT_RESIDENCY=1` restores the exact old compact source.
+pub(crate) fn gpu_compact_residency_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("FLOCK_NO_GPU_COMPACT_RESIDENCY").is_ok_and(|v| v == "1"))
+}
+
 /// Zero tail lanes the GPU commit passes may delete, published by the ranked
 /// BLAKE3 prover from its R1CS padding descriptor for the whole proof (the
 /// GPU graph is encoded during witness generation, before the CPU skip's own
@@ -3183,6 +3193,12 @@ pub(crate) fn ntt_ab_priority_helpers() -> usize {
             .filter(|n| *n >= 1)
             .unwrap_or(DEFAULT_HELPERS)
     })
+}
+
+/// Exact rollback of early C gather segments. No new shader or warmup pass.
+pub fn zc_c_segments_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_C_SEGMENTS").as_deref() != Some(std::ffi::OsStr::new("1")))
 }
 
 /// Kill switch for the split sweep's AB-end pricing under the NTT priority
@@ -6401,6 +6417,10 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// the 7 zero columns of every odd tile are never loaded or stored.
     /// `None` if an anchor drifted (the encoders then keep the dense grid).
     pub(crate) fn g4x2_zero_lane_msl_source() -> Option<String> {
+        g4x2_zero_lane_msl_source_with_residency(super::gpu_compact_residency_enabled())
+    }
+
+    fn g4x2_zero_lane_msl_source_with_residency(compact_residency: bool) -> Option<String> {
         let base = NTT_G4X2_TWL_MSL_SOURCE;
         // Column c of block B -> (position, lane): tile pair q = c / 121, the
         // pair's first 64 columns are the even tile's lanes, the next 57 the
@@ -6440,11 +6460,23 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
         if out.matches(round).count() != 1 {
             return None;
         }
-        Some(out.replacen(
+        let out = out.replacen(
             round,
             "    for (uint it = 0; it < 2u; it++) {\n        if ((g << 8) + (it << 7) >= (121u << (P.s - 1u))) { break; }\n",
             1,
-        ))
+        );
+        if compact_residency {
+            // Only the never-read allocation and its two unreachable indices
+            // change. Both dense sources and the from-z source stay intact.
+            // The existing warm-up cache key hashes this final source.
+            splice_exact(&out, &[
+                ("threadgroup uint4 pad[252u];", "threadgroup uint4 pad[128u];"),
+                ("pad[lid % 252u]", "pad[lid % 128u]"),
+                ("pad[(lid + 1u) % 252u]", "pad[(lid + 1u) % 128u]"),
+            ])
+        } else {
+            Some(out)
+        }
     }
 
     const NTT_G4X2_MSL_SOURCE: &str = r#"
@@ -7167,6 +7199,34 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
             assert_eq!(super::super::zero_lane_groups_per_block(4), 4);
             // s = 12: the compacted grid is exactly full (no partial group).
             assert_eq!(super::super::zero_lane_groups_per_block(12) * 256, 121u64 << 11);
+        }
+
+        #[test]
+        fn compact_residency_changes_only_dead_storage() {
+            let old = g4x2_zero_lane_msl_source_with_residency(false).unwrap();
+            let new = g4x2_zero_lane_msl_source_with_residency(true).unwrap();
+            let restored = splice_exact(&new, &[
+                ("threadgroup uint4 pad[128u];", "threadgroup uint4 pad[252u];"),
+                ("pad[lid % 128u]", "pad[lid % 252u]"),
+                ("pad[(lid + 1u) % 128u]", "pad[(lid + 1u) % 252u]"),
+            ]).unwrap();
+            assert_eq!(restored, old, "only the unused storage may change");
+            assert!(new.contains("if (P.log_d == 77u)"));
+            assert!(!new.contains("252u"));
+            assert_ne!(fnv1a64(&old), fnv1a64(&new), "the existing cache key must separate the modes");
+        }
+
+        #[test]
+        fn compact_residency_pipeline_retains_expected_storage() {
+            let gpu = gpu().expect("Metal must be available for the residency oracle");
+            assert!(!gpu.pso_ntt4g4x2_zl.is_null(), "selected compact pipeline is missing");
+            unsafe {
+                let expected = if super::super::gpu_compact_residency_enabled() { 10_752 } else { 12_736 };
+                let (bytes, width, max_threads) = gpu.pipeline_resources(gpu.pso_ntt4g4x2_zl);
+                eprintln!("compact residency: bytes={bytes}, width={width}, max_threads={max_threads}");
+                assert_eq!(bytes, expected, "Metal did not retain the selected pad");
+                assert!(max_threads >= 64);
+            }
         }
 
         #[test]
@@ -19518,6 +19578,10 @@ kernel void zc_eq_rows(
         /// The table is being written into `eq_buf` by the GPU, ahead of the
         /// fold in `cb` (see [`ENV_NO_ZC_GPU_EQ`]).
         eq_gpu: Option<GpuEqRows>,
+        /// Existing gather chunks already submitted. 64 means complete;
+        /// a smaller value leaves the final reduction for entry adoption.
+        gathered_chunks: usize,
+        early_stripe: bool,
     }
 
     /// Abandon a parked commit-tail-fill prefix: wait out its command
@@ -19931,14 +19995,20 @@ kernel void zc_eq_rows(
         /// nothing here may be pointed at memory that can be freed and
         /// re-allocated at the same address.
         unsafe fn wrap_z(&mut self, z: &[u8]) -> Result<Id, String> {
+            unsafe { self.wrap_z_raw(z.as_ptr(), z.len()) }
+        }
+
+        // No shared slice may cover the not-yet-published suffix of a stripe.
+        // Wrapping memory does not read it; dispatch bounds remain the caller's
+        // responsibility, and the allocation must outlive every dispatched reader.
+        unsafe fn wrap_z_raw(&mut self, z: *const u8, len: usize) -> Result<Id, String> {
             const MAX_WRAPS: usize = 3;
-            let ptr = z.as_ptr() as usize;
-            let len = z.len();
+            let ptr = z as usize;
             if let Some(&(_, _, buf)) = self.z_wraps.iter().find(|(p, l, _)| *p == ptr && *l == len)
             {
                 return Ok(buf);
             }
-            let buf = unsafe { self.gpu.wrap_buffer(z.as_ptr() as *mut u8, len)? };
+            let buf = unsafe { self.gpu.wrap_buffer(z as *mut u8, len)? };
             if self.z_wraps.len() == MAX_WRAPS {
                 let (_, _, old) = self.z_wraps.remove(0);
                 unsafe { self.gpu.release(old) };
@@ -20293,6 +20363,11 @@ kernel void zc_eq_rows(
         n_claims: usize,
         submitted: std::time::Instant,
         arm: FoldArm,
+        /// A first segment whose status must also succeed before consuming
+        /// the final reduction. Queue completion alone does not prove success.
+        prior_cb: Id,
+        gathered_chunks: usize,
+        early_stripe: bool,
         /// Completion signal (lincheck arm only; see `ENV_NO_GPU_DONE_EVENT`).
         sig: Option<DoneSig>,
     }
@@ -20328,8 +20403,13 @@ kernel void zc_eq_rows(
                 .ok_or_else(|| "zerocheck fold state vanished".to_string())?;
             let gpu = state.gpu;
             let out_buf = state.out_buf;
+            if self.gathered_chunks != ZC_FOLD_CHUNKS {
+                return Err("incomplete C gather cannot be consumed".into());
+            }
             let cb = self.cb;
             self.cb = NIL;
+            let prior_cb = self.prior_cb;
+            self.prior_cb = NIL;
             // The split autotune balances the GPU prefix against the CPU
             // suffix so both finish together, so the residual wait here is
             // typically sub-millisecond — which `waitUntilCompleted` rounds
@@ -20360,10 +20440,40 @@ kernel void zc_eq_rows(
             if wait.is_ok() {
                 Gpu::recycle_done(sig);
             }
-            let gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
+            if self.arm == FoldArm::Zc && crate::tmark::on() && wait.is_ok() {
+                // Trace requires actual completion, not only the shader signal.
+                if unsafe { gpu.wait_cb(cb) }.is_ok() {
+                    let (s, e) = unsafe { cb_gpu_interval(gpu, cb) };
+                    crate::tmark::mark_gpu("r1 c final gpu start", "r1 c final gpu end", s, e);
+                }
+            }
+            let mut gpu_ms = unsafe { zc_fold_gpu_wall_ms(gpu, cb) };
             let wall_ms = self.submitted.elapsed().as_secs_f64() * 1e3;
+            let prior_ok = if prior_cb.is_null() {
+                Ok(())
+            } else {
+                let result = unsafe { gpu.wait_cb(prior_cb) };
+                if result.is_ok() {
+                    gpu_ms += unsafe { zc_fold_gpu_wall_ms(gpu, prior_cb) };
+                    if crate::tmark::on() {
+                        let (s, e) = unsafe { cb_gpu_interval(gpu, prior_cb) };
+                        crate::tmark::mark_gpu("r1 c first gpu start", "r1 c first gpu end", s, e);
+                    }
+                }
+                unsafe { gpu.release(prior_cb) };
+                result
+            };
             unsafe { gpu.release(cb) };
             wait?;
+            prior_ok?;
+            if self.early_stripe {
+                let (_, fail_first, fail_last, _) = c_segment_test_flags();
+                // Injection is AFTER both readers finish: the production
+                // caller then redoes the whole GPU claim prefix on CPU.
+                if fail_first || (fail_last && !prior_cb.is_null()) {
+                    return Err("injected segmented C gather failure".into());
+                }
+            }
             // A/B + fallback-test hook (`FLOCK_LINCHECK_GPU_FAIL_DRAIN=1`):
             // the lincheck arm's drain reports failure AFTER the command
             // buffer completed (its output is simply never consumed), so
@@ -20626,15 +20736,20 @@ kernel void zc_eq_rows(
                     gpu.pool_pop(pool);
                 }
             }
-            fold_note_sample(
-                self.arm,
-                self.claim_lo,
-                self.n_claims,
-                sample_ms,
-                head_ms,
-                suffix_ms,
-                self.plan.byte_fold,
-            );
+            // Early release and summed command-buffer elapsed spans do not
+            // fit the incumbent single-window tuning model. Preserve the
+            // warmup share; segment spans above are diagnostics, not busy time.
+            if !self.early_stripe {
+                fold_note_sample(
+                    self.arm,
+                    self.claim_lo,
+                    self.n_claims,
+                    sample_ms,
+                    head_ms,
+                    suffix_ms,
+                    self.plan.byte_fold,
+                );
+            }
             Ok(())
         }
     }
@@ -20648,8 +20763,13 @@ kernel void zc_eq_rows(
                 unsafe {
                     let _ = gpu.wait_cb(self.cb);
                     gpu.release(self.cb);
+                    if !self.prior_cb.is_null() {
+                        let _ = gpu.wait_cb(self.prior_cb);
+                        gpu.release(self.prior_cb);
+                    }
                 }
                 self.cb = NIL;
+                self.prior_cb = NIL;
             }
         }
     }
@@ -21128,11 +21248,34 @@ kernel void zc_eq_rows(
         arm_sig: bool,
         eq_rows: Option<(u32, usize)>,
     ) -> Result<(Id, Option<DoneSig>, Option<Id>), String> {
+        unsafe { zc_fold_submit_chunk_range(gpu, state, plan, arm_sig, eq_rows, 0, ZC_FOLD_CHUNKS, true) }
+    }
+
+    /// Re-encode a contiguous range of the ORIGINAL gather output chunks.
+    /// Input and partial offsets preserve each original threadgroup's exact
+    /// arithmetic. Only the last segment runs the one original reduction.
+    unsafe fn zc_fold_submit_chunk_range(
+        gpu: &Gpu,
+        state: &ZcFold,
+        plan: &ZcFoldPlan,
+        arm_sig: bool,
+        eq_rows: Option<(u32, usize)>,
+        first_chunk: usize,
+        chunk_count: usize,
+        reduce: bool,
+    ) -> Result<(Id, Option<DoneSig>, Option<Id>), String> {
+        if chunk_count == 0 || first_chunk + chunk_count > ZC_FOLD_CHUNKS
+            || (eq_rows.is_some() && first_chunk != 0)
+        {
+            return Err("invalid C gather chunk range".into());
+        }
+        let stripe_base = first_chunk * plan.stripes_per_chunk;
+        let stripe_end = ((first_chunk + chunk_count) * plan.stripes_per_chunk).min(plan.stripe_hi);
         unsafe {
             let params = ZcFoldParams {
                 k: plan.k as u32,
                 useful: plan.useful as u32,
-                stripe_hi: plan.stripe_hi as u32,
+                stripe_hi: stripe_end.saturating_sub(stripe_base) as u32,
                 stripes_per_chunk: plan.stripes_per_chunk as u32,
                 i_groups: plan.i_groups as u32,
             };
@@ -21162,20 +21305,18 @@ kernel void zc_eq_rows(
             let cb = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb)?;
             gpu.set_pipeline(enc, plan.pso_fold);
-            gpu.set_buffer(enc, plan.z_buf, 0, 0);
-            gpu.set_buffer(enc, state.eq_buf, 0, 1);
-            gpu.set_buffer(enc, state.part_buf, 0, 2);
+            gpu.set_buffer(enc, plan.z_buf, stripe_base * plan.k, 0);
+            gpu.set_buffer(enc, state.eq_buf, stripe_base * 8 * 16, 1);
+            gpu.set_buffer(enc, state.part_buf, first_chunk * plan.k * 16, 2);
             gpu.set_bytes(enc, params_bytes, 3);
-            gpu.dispatch(
-                enc,
-                (ZC_FOLD_CHUNKS * plan.i_groups) as u64,
-                ZC_FOLD_TG as u64,
-            );
-            gpu.set_pipeline(enc, state.pso_reduce);
-            gpu.set_buffer(enc, state.part_buf, 0, 0);
-            gpu.set_buffer(enc, state.out_buf, 0, 1);
-            gpu.set_bytes(enc, reduce_bytes, 2);
-            gpu.dispatch(enc, (plan.k / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
+            gpu.dispatch(enc, (chunk_count * plan.i_groups) as u64, ZC_FOLD_TG as u64);
+            if reduce {
+                gpu.set_pipeline(enc, state.pso_reduce);
+                gpu.set_buffer(enc, state.part_buf, 0, 0);
+                gpu.set_buffer(enc, state.out_buf, 0, 1);
+                gpu.set_bytes(enc, reduce_bytes, 2);
+                gpu.dispatch(enc, (plan.k / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
+            }
             gpu.end_encoding(enc);
             let sig = if arm_sig { gpu.arm_done(cb) } else { None };
             let cb_eq = cb_eq.map(|c| {
@@ -21336,6 +21477,83 @@ kernel void zc_eq_rows(
         }
     }
 
+    /// Exact, non-timing test of the production segmented encoder. It
+    /// compares every existing partial and the final reduction, including
+    /// poisoned, undispatched dead columns. No split latch is consulted.
+    #[cfg(test)]
+    #[test]
+    fn c_segments_preserve_partial_ownership_and_reduction() {
+        let gpu = gpu().expect("segmented C oracle requires real Metal");
+        let (m, k_log) = (26usize, 14usize);
+        let k = 1usize << k_log;
+        let z_len = (1usize << m) / 8;
+        let layout = std::alloc::Layout::from_size_align(z_len, 16384).unwrap();
+        // The no-copy cache retains this allocation for the test process.
+        let z_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!z_ptr.is_null());
+        let z = unsafe { std::slice::from_raw_parts_mut(z_ptr, z_len) };
+        let mut rnd = 0xc512_24a8_1337_5e61u64;
+        for b in z.iter_mut() {
+            rnd ^= rnd << 13; rnd ^= rnd >> 7; rnd ^= rnd << 17;
+            *b = rnd as u8;
+        }
+        let eq: Vec<F128> = (0..1usize << (m - k_log))
+            .map(|i| F128::new((i as u64 + 1).wrapping_mul(0x9e37_79b9), !(i as u64).rotate_left(19)))
+            .collect();
+        let mut guard = ZC_FOLD.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() { *guard = Some(zc_fold_init(gpu)); }
+        let state = guard.as_mut().unwrap().as_mut().expect("C pipelines compile");
+        unsafe {
+            let pool = gpu.pool_push();
+            abandon_staged_prefix(state);
+            let z_buf = state.wrap_z_raw(z_ptr, z_len).unwrap();
+            let (mut buf, mut cap) = (state.eq_buf, state.eq_cap);
+            state.ensure(&mut buf, &mut cap, eq.len() * 16).unwrap();
+            state.eq_buf = buf; state.eq_cap = cap;
+            std::ptr::copy_nonoverlapping(eq.as_ptr(), gpu.buffer_contents(buf).cast::<F128>(), eq.len());
+            let (mut buf, mut cap) = (state.part_buf, state.part_cap);
+            state.ensure(&mut buf, &mut cap, ZC_FOLD_CHUNKS * k * 16).unwrap();
+            state.part_buf = buf; state.part_cap = cap;
+            let (mut buf, mut cap) = (state.out_buf, state.out_cap);
+            state.ensure(&mut buf, &mut cap, k * 16).unwrap();
+            state.out_buf = buf; state.out_cap = cap;
+            let parts = gpu.buffer_contents(state.part_buf).cast::<u8>();
+            let part_len = ZC_FOLD_CHUNKS * k * 16;
+            for (pso, byte_fold, factored_b4) in [
+                (state.pso_fold, false, false),
+                (state.pso_lc_fold, true, false),
+                (state.pso_lc_factored_b4, true, true),
+            ] {
+                assert!(!pso.is_null(), "each existing rollback PSO must run");
+                for stripe_hi in [512usize, 500] {
+                    let plan = ZcFoldPlan {
+                        z_buf, pso_fold: pso, byte_fold, factored_b4, k,
+                        useful: 11_320, stripe_hi, stripes_per_chunk: 8,
+                        i_groups: 11_320usize.div_ceil(ZC_FOLD_COLS_PER_TG),
+                    };
+                    std::ptr::write_bytes(parts, 0xa5, part_len);
+                    let cb = zc_fold_submit(gpu, state, &plan).unwrap();
+                    gpu.wait_cb(cb).unwrap(); gpu.release(cb);
+                    let want_parts = std::slice::from_raw_parts(parts, part_len).to_vec();
+                    let want_out = std::slice::from_raw_parts(gpu.buffer_contents(state.out_buf).cast::<u8>(), k * 16).to_vec();
+                    for q in [1usize, 31, 32, 63] {
+                        std::ptr::write_bytes(parts, 0xa5, part_len);
+                        let (first, _, _) = zc_fold_submit_chunk_range(gpu, state, &plan, false, None, 0, q, false).unwrap();
+                        gpu.wait_cb(first).unwrap(); gpu.release(first);
+                        let got = std::slice::from_raw_parts(parts, part_len);
+                        assert_eq!(&got[..q * k * 16], &want_parts[..q * k * 16]);
+                        assert!(got[q * k * 16..].iter().all(|&b| b == 0xa5), "first segment touched later partials");
+                        let (last, _, _) = zc_fold_submit_chunk_range(gpu, state, &plan, false, None, q, ZC_FOLD_CHUNKS - q, true).unwrap();
+                        gpu.wait_cb(last).unwrap(); gpu.release(last);
+                        assert_eq!(std::slice::from_raw_parts(parts, part_len), want_parts);
+                        assert_eq!(std::slice::from_raw_parts(gpu.buffer_contents(state.out_buf).cast::<u8>(), k * 16), want_out);
+                    }
+                }
+            }
+            gpu.pool_pop(pool);
+        }
+    }
+
     /// Submit the GPU prefix of the round-one C fold. `None` means the whole
     /// fold stays on the CPU (kill switch, non-ranked shape, no Metal device,
     /// or a stripe allocation Metal cannot wrap without a copy).
@@ -21365,6 +21583,38 @@ kernel void zc_eq_rows(
         useful_bits: usize,
         r: &[F128],
     ) -> bool {
+        unsafe { stage_zc_fold_raw(z_packed.as_ptr(), z_packed.len(), m, k_log, useful_bits, r, None) }
+    }
+
+    fn c_segment_test_flags() -> (bool, bool, bool, bool) {
+        static FLAGS: std::sync::OnceLock<(bool, bool, bool, bool)> = std::sync::OnceLock::new();
+        *FLAGS.get_or_init(|| {
+            let on = |key| std::env::var_os(key).as_deref() == Some(std::ffi::OsStr::new("1"));
+            (on("FLOCK_ZC_C_SEGMENTS_TEST_REJECT"), on("FLOCK_ZC_C_SEGMENTS_TEST_FAIL_FIRST"), on("FLOCK_ZC_C_SEGMENTS_TEST_FAIL_LAST"), on("FLOCK_ZC_C_SEGMENTS_TEST_FAIL_ROWS"))
+        })
+    }
+
+    pub(crate) unsafe fn stage_zerocheck_c_fold_ready_prefix(
+        z_ptr: *const u8, z_len: usize, ready_stripes: usize,
+        m: usize, k_log: usize, useful_bits: usize, r: &[F128],
+    ) -> bool {
+        // No warmup work or altered tuning: the timed route uses the PSO,
+        // buffers and share already exercised by the complete warmup fold.
+        if !super::zc_c_segments_enabled()
+            || !ZC_FOLD_CALIBRATED.load(std::sync::atomic::Ordering::Acquire)
+            || ZC_FOLD_TUNED_CLAIMS.load(std::sync::atomic::Ordering::Acquire) == usize::MAX
+            || m != 32 || k_log != 14 || ready_stripes == 0
+        {
+            return false;
+        }
+        unsafe { stage_zc_fold_raw(z_ptr, z_len, m, k_log, useful_bits, r, Some(ready_stripes)) }
+    }
+
+    /// The caller holds the stripe publication lease across this call.
+    unsafe fn stage_zc_fold_raw(
+        z_ptr: *const u8, z_len: usize, m: usize, k_log: usize,
+        useful_bits: usize, r: &[F128], ready_stripes: Option<usize>,
+    ) -> bool {
         if !super::gpu_zerocheck_enabled() {
             return false;
         }
@@ -21377,14 +21627,10 @@ kernel void zc_eq_rows(
             && !cfg!(test)
             && ZC_GPU_EQ_ORACLE.load(std::sync::atomic::Ordering::Relaxed) != 2
         {
-            let Some((job, rows)) = launch_fold_prefix_src(
-                FoldArm::Zc,
-                z_packed,
-                m,
-                k_log,
-                useful_bits,
-                EqSrc::GpuRows(&r[k_log..]),
-            ) else {
+            let Some((job, rows)) = (unsafe { launch_fold_prefix_src_raw(
+                FoldArm::Zc, z_ptr, z_len, m, k_log, useful_bits,
+                EqSrc::GpuRows(&r[k_log..]), ready_stripes,
+            ) }) else {
                 return false;
             };
             match rows {
@@ -21402,14 +21648,10 @@ kernel void zc_eq_rows(
             launched
         } else {
             let eq_outer = zc_fold_eq_table(&r[k_log..]);
-            let Some(job) = launch_fold_prefix(
-                FoldArm::Zc,
-                z_packed,
-                m,
-                k_log,
-                useful_bits,
-                eq_outer.as_slice(),
-            ) else {
+            let Some((job, _)) = (unsafe { launch_fold_prefix_src_raw(
+                FoldArm::Zc, z_ptr, z_len, m, k_log, useful_bits,
+                EqSrc::Table(eq_outer.as_slice()), ready_stripes,
+            ) }) else {
                 return false;
             };
             let eq_owned = match eq_outer {
@@ -21445,12 +21687,17 @@ kernel void zc_eq_rows(
                     n_claims,
                     submitted,
                     r: r.to_vec(),
-                    z_ptr: z_packed.as_ptr() as usize,
-                    z_len: z_packed.len(),
+                    z_ptr: z_ptr as usize,
+                    z_len,
                     eq_len,
                     eq_owned,
                     eq_gpu,
+                    gathered_chunks: job.gathered_chunks,
+                    early_stripe: ready_stripes.is_some(),
                 });
+                if ready_stripes.is_some() && super::gpu_zerocheck_debug() {
+                    eprintln!("[gpu-zc] C segments staged: {}/64 gather chunks, ready stripes {:?}", job.gathered_chunks, ready_stripes);
+                }
                 true
             }
             None => {
@@ -21466,6 +21713,20 @@ kernel void zc_eq_rows(
             }
         }
         // `guard` drops here: the lock is released with the prefix parked.
+    }
+
+    /// Under the producer's publication lease, retire any staged reader of
+    /// this stripe before repair. Pointer/length protect unrelated state.
+    pub(crate) fn abandon_staged_zc_stripe(z_ptr: usize, z_len: usize) {
+        let mut guard = ZC_FOLD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Ok(state)) = guard.as_mut() {
+            if state.staged.as_ref().is_some_and(|s| (s.z_ptr, s.z_len) == (z_ptr, z_len)) {
+                if super::gpu_zerocheck_debug() {
+                    eprintln!("[gpu-zc] C segments retired before stripe repair");
+                }
+                unsafe { abandon_staged_prefix(state) };
+            }
+        }
     }
 
     /// Commit-tail fill, adoption half: if a parked prefix matches this
@@ -21497,11 +21758,44 @@ kernel void zc_eq_rows(
             s.z_ptr == z_packed.as_ptr() as usize
                 && s.z_len == z_packed.len()
                 && s.r.as_slice() == r
+                && !(s.early_stripe && c_segment_test_flags().0)
         });
         if !matches {
             unsafe { abandon_staged_prefix(state) };
             return None;
         }
+        let segmented = state.staged.as_ref()?.gathered_chunks < ZC_FOLD_CHUNKS;
+        // Settle row construction BEFORE submitting another gather. On row
+        // failure, drain the first reader before any CPU eq rebuild can run.
+        let early_stripe = state.staged.as_ref()?.early_stripe;
+        if early_stripe && state.staged.as_ref()?.eq_gpu.as_ref().is_some_and(|rows| {
+            !unsafe { wait_eq_rows(state.gpu, rows.cb) } || zc_gpu_eq_fail_injected() || c_segment_test_flags().3
+        }) {
+            unsafe { abandon_staged_prefix(state) };
+            if super::gpu_zerocheck_debug() {
+                eprintln!("[gpu-zc] C segments retired after eq-row failure");
+            }
+            return None;
+        }
+        let late_cb = if segmented {
+            let parked = state.staged.as_ref()?;
+            let q = parked.gathered_chunks;
+            let pool = unsafe { state.gpu.pool_push() };
+            let submitted = unsafe { zc_fold_submit_chunk_range(state.gpu, state, &parked.plan, false, None, q, ZC_FOLD_CHUNKS - q, true) };
+            unsafe { state.gpu.pool_pop(pool) };
+            match submitted {
+                Ok((cb, _, _)) => {
+                    if super::gpu_zerocheck_debug() {
+                        eprintln!("[gpu-zc] C segments adopted: early {q}/64, late {}/64", ZC_FOLD_CHUNKS - q);
+                    }
+                    Some(cb)
+                },
+                Err(_) => {
+                    unsafe { abandon_staged_prefix(state) };
+                    return None;
+                }
+            }
+        } else { None };
         let staged = state.staged.take()?;
         let stage = FoldEqStage {
             ptr: unsafe { state.gpu.buffer_contents(state.eq_buf).cast::<F128>() },
@@ -21514,14 +21808,17 @@ kernel void zc_eq_rows(
             (None, Some(rows)) => FoldEqTable::GpuBuilt(GpuEqTable {
                 stage,
                 rows,
-                ready: std::sync::OnceLock::new(),
+                ready: if early_stripe { std::sync::OnceLock::from(()) } else { std::sync::OnceLock::new() },
             }),
             (None, None) => FoldEqTable::Staged(stage),
         };
         let submitted = staged.submitted;
         let job = ZcFoldJob {
             guard,
-            cb: staged.cb,
+            cb: late_cb.unwrap_or(staged.cb),
+            prior_cb: if late_cb.is_some() { staged.cb } else { NIL },
+            gathered_chunks: ZC_FOLD_CHUNKS,
+            early_stripe,
             plan: staged.plan,
             k: staged.k,
             claim_lo: staged.claim_lo,
@@ -21664,7 +21961,25 @@ kernel void zc_eq_rows(
         useful_bits: usize,
         eq: EqSrc<'_>,
     ) -> Option<(ZcFoldJob, Option<GpuEqRows>)> {
+        unsafe { launch_fold_prefix_src_raw(arm, z_packed.as_ptr(), z_packed.len(), m, k_log, useful_bits, eq, None) }
+    }
+
+    /// `ready_stripes` authorizes reads only below that bound. The caller
+    /// retains the allocation and prevents repair/rewrite until retirement.
+    unsafe fn launch_fold_prefix_src_raw(
+        arm: FoldArm,
+        z_ptr: *const u8,
+        z_len: usize,
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        eq: EqSrc<'_>,
+        ready_stripes: Option<usize>,
+    ) -> Option<(ZcFoldJob, Option<GpuEqRows>)> {
         let k = 1usize << k_log;
+        if z_len != (1usize << m) / 8 {
+            return None;
+        }
         if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) || m <= k_log + 3 {
             return None;
         }
@@ -21709,7 +22024,7 @@ kernel void zc_eq_rows(
         }
 
         let submitted = std::time::Instant::now();
-        let (cb, plan, sig, eq_rows) = {
+        let (cb, plan, sig, eq_rows, gathered_chunks) = {
             let state = guard.as_mut()?.as_mut().ok()?;
             // Any parked commit-tail-fill prefix that was not adopted by
             // now is stale (mismatched fingerprint or a non-adopting
@@ -21752,9 +22067,9 @@ kernel void zc_eq_rows(
             }
             unsafe {
                 let pool = gpu.pool_push();
-                type Built = (Id, ZcFoldPlan, Option<DoneSig>, Option<GpuEqRows>);
+                type Built = (Id, ZcFoldPlan, Option<DoneSig>, Option<GpuEqRows>, usize);
                 let built = (|| -> Result<Built, String> {
-                    let z_buf = state.wrap_z(z_packed)?;
+                    let z_buf = state.wrap_z_raw(z_ptr, z_len)?;
                     let (mut eq_buf, mut eq_cap) = (state.eq_buf, state.eq_cap);
                     state.ensure(&mut eq_buf, &mut eq_cap, n_outer * 16)?;
                     state.eq_buf = eq_buf;
@@ -21846,8 +22161,17 @@ kernel void zc_eq_rows(
                     // its exact status drain and GPU timestamps.
                     let arm_sig = arm == FoldArm::Lincheck
                         && arm.tuned().load(std::sync::atomic::Ordering::Relaxed) != usize::MAX;
-                    let (cb, sig, cb_eq) =
-                        zc_fold_submit_rows(gpu, state, &plan, arm_sig, eq_rows_plan)?;
+                    let gathered_chunks = ready_stripes.map_or(ZC_FOLD_CHUNKS, |ready| {
+                        if ready >= plan.stripe_hi { ZC_FOLD_CHUNKS }
+                        else { (ready / plan.stripes_per_chunk).min(ZC_FOLD_CHUNKS) }
+                    });
+                    if gathered_chunks == 0 {
+                        return Err("no complete C gather chunk published".into());
+                    }
+                    let (cb, sig, cb_eq) = zc_fold_submit_chunk_range(
+                        gpu, state, &plan, arm_sig, eq_rows_plan,
+                        0, gathered_chunks, gathered_chunks == ZC_FOLD_CHUNKS,
+                    )?;
                     let eq_rows = match (cb_eq, eq) {
                         (Some(cb), EqSrc::GpuRows(point)) => Some(GpuEqRows {
                             cb,
@@ -21855,7 +22179,7 @@ kernel void zc_eq_rows(
                         }),
                         _ => None,
                     };
-                    Ok((cb, plan, sig, eq_rows))
+                    Ok((cb, plan, sig, eq_rows, gathered_chunks))
                 })();
                 gpu.pool_pop(pool);
                 match built {
@@ -21881,6 +22205,9 @@ kernel void zc_eq_rows(
                 n_claims,
                 submitted,
                 arm,
+                prior_cb: NIL,
+                gathered_chunks,
+                early_stripe: ready_stripes.is_some(),
                 sig,
             },
             eq_rows,
@@ -26990,6 +27317,13 @@ kernel void zc_ab_finish(
                 Gpu::recycle_done(job.sig);
             }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
+            if crate::tmark::on() && ok.is_ok() {
+                // A shader signal can precede Metal timestamp publication.
+                if gpu.wait_cb(job.cb).is_ok() {
+                    let (s, e) = cb_gpu_interval(gpu, job.cb);
+                    crate::tmark::mark_gpu("r1 ab gpu start", "r1 ab gpu end", s, e);
+                }
+            }
             let (tables_ms, gather_ms) = if ok.is_ok() {
                 (
                     if job.cb_tables.is_null() { 0.0 } else { zc_fold_gpu_wall_ms(gpu, job.cb_tables) },
@@ -30195,7 +30529,10 @@ pub(crate) use imp::zfold::{ZfJob as ZFoldJob, launch as zfold_launch};
 /// `ENV_NO_COMMIT_TAIL_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix};
+pub(crate) use imp::{
+    adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix,
+    stage_zerocheck_c_fold_ready_prefix, abandon_staged_zc_stripe,
+};
 
 /// Round-one C fold tune fix: warm-up input hooks (see
 /// `ENV_NO_ZC_FOLD_TUNE_FIX`).

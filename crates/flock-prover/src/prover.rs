@@ -1058,6 +1058,23 @@ thread_local! {
     };
 }
 
+/// Bounded diagnostic seams of the actual producer/stager. They never
+/// depend on witness contents, trial number or a clock; the delay is an
+/// explicit test override, and ranked workers clear these environment keys.
+fn c_segment_test_producer() -> (u64, usize, bool, bool) {
+    static CONFIG: std::sync::OnceLock<(u64, usize, bool, bool)> = std::sync::OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        let number = |key| std::env::var(key).ok().and_then(|v| v.parse::<usize>().ok());
+        let on = |key| std::env::var_os(key).as_deref() == Some(std::ffi::OsStr::new("1"));
+        (
+            number("FLOCK_ZC_C_SEGMENTS_TEST_FINISH_DELAY_MS").unwrap_or(0).min(1000) as u64,
+            number("FLOCK_ZC_C_SEGMENTS_TEST_READY_GROUPS").unwrap_or(usize::MAX),
+            on("FLOCK_ZC_C_SEGMENTS_TEST_MISSING_GROUP"),
+            on("FLOCK_ZC_C_SEGMENTS_TEST_MISMATCH"),
+        )
+    })
+}
+
 /// Emits the root lincheck stripe from the deferred A/B producer's scratch.
 ///
 /// A stripe group is 8 consecutive blocks = quads `2g` and `2g + 1`. The
@@ -1080,6 +1097,10 @@ struct AbStripeEmitter<'a> {
     /// byte lets producers publish with a store rather than an RMW shared
     /// by 64 groups. `finish` reads these marks after AB production completes.
     emitted: Box<[std::sync::atomic::AtomicU8]>,
+    /// Root holds this lease through submit+park. Finish permanently closes
+    /// it before any repair, preventing a stale root snapshot from launching
+    /// after an empty-slot cancellation and into a rewrite.
+    publication_closed: std::sync::Mutex<bool>,
     epoch: u64,
     /// Words of a block the rows and the fixed-input checks read.
     read_words: usize,
@@ -1129,6 +1150,7 @@ impl<'a> AbStripeEmitter<'a> {
             emitted: (0..n_groups)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
+            publication_closed: std::sync::Mutex::new(false),
             epoch: AB_STRIPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             read_words: rows
                 .iter()
@@ -1201,7 +1223,7 @@ impl<'a> AbStripeEmitter<'a> {
             if self.fixed_inputs && !fixed_inputs_hold(&st.words, 0, group_f128, AB_STRIPE_WORDS) {
                 self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
+            self.emitted[group].store(1, std::sync::atomic::Ordering::Release);
         });
     }
 
@@ -1269,7 +1291,7 @@ impl<'a> AbStripeEmitter<'a> {
                 }
             }
         }
-        self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
+        self.emitted[group].store(1, std::sync::atomic::Ordering::Release);
     }
 
     /// After every unit was produced (the AB arm has joined its workers):
@@ -1277,7 +1299,7 @@ impl<'a> AbStripeEmitter<'a> {
     /// job = `DEFERRED_STRIPE_GROUPS_PER_JOB` groups; jobs with no missing
     /// group are skipped, partially missing ones are refilled whole, which
     /// rewrites identical bytes). Returns the number of missing groups.
-    fn finish(&self, _z_packed: &[F128], job: &(dyn Fn(usize) + Sync)) -> usize {
+    fn finish(&self, _z_packed: &[F128], job: &(dyn Fn(usize) + Sync), before_repair: &dyn Fn()) -> usize {
         use rayon::prelude::*;
         let per_job = DEFERRED_STRIPE_GROUPS_PER_JOB;
         let missing = |g: usize| {
@@ -1285,6 +1307,9 @@ impl<'a> AbStripeEmitter<'a> {
         };
         let n_missing = (0..self.n_groups).filter(|&g| missing(g)).count();
         if n_missing > 0 {
+            // A repair job can rewrite already emitted neighbours. Retire
+            // every early reader before the first such write, not afterwards.
+            before_repair();
             let jobs: Vec<usize> = (0..self.n_groups.div_ceil(per_job))
                 .filter(|&j| (j * per_job..((j + 1) * per_job).min(self.n_groups)).any(missing))
                 .collect();
@@ -2257,7 +2282,7 @@ mod deferred_stripe_tests {
                         })
                     });
                 }
-                let missing = emitter.finish(&z, &job);
+                let missing = emitter.finish(&z, &job, &|| {});
                 assert_eq!(missing, if case == 1 { n_units / 2 } else { 0 }, "case {case} direct {direct}");
                 let _ = n_jobs;
                 assert_eq!(stripe, expected, "rows={} case {case} direct {direct}", rows.len());
@@ -2469,7 +2494,7 @@ mod deferred_stripe_tests {
                     e.emit(2 * g + 1, sa[UNIT_U64..].as_mut_ptr().cast(), sb[UNIT_U64..].as_mut_ptr().cast());
                 }
                 let ns = t.elapsed().as_nanos() as f64 / G as f64;
-                let missing = e.finish(&z, &|_: usize| ());
+                let missing = e.finish(&z, &|_: usize| (), &|| {});
                 assert_eq!(missing, 0);
                 eprintln!("round {round} emit direct={direct}: {ns:.0} ns/group");
             }
@@ -2606,6 +2631,7 @@ fn make_commit_tail_fill_hook<'a, Ch: Challenger>(
     stripe_ready: &'a std::sync::atomic::AtomicBool,
     stripe_ptr: usize,
     stripe_len: usize,
+    early: Option<(&'a std::sync::Mutex<bool>, &'a [std::sync::atomic::AtomicU8])>,
 ) -> Option<CommitTailFillHook<'a>>
 where
     Ch: 'a,
@@ -2617,11 +2643,23 @@ where
     let forked = challenger.fork()?;
     Some(Box::new(move |commitment: &Commitment| {
         if !stripe_ready.load(std::sync::atomic::Ordering::Acquire) {
-            // The stripe fill lost the race to the graph; staging would
-            // read torn bytes. Skip — the incumbent zerocheck-entry
-            // submit runs.
-            if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
-                eprintln!("[commit-tail-fill] skipped: stripe not ready");
+            if let Some((closed, emitted)) = early {
+                let closed = closed.lock().unwrap_or_else(|e| e.into_inner());
+                if !*closed {
+                    // Acquire each group after its final write. The lease
+                    // prevents both missing-group and full-layout repair.
+                    let ready = emitted.iter()
+                        .take_while(|mark| mark.load(std::sync::atomic::Ordering::Acquire) != 0)
+                        .count().min(c_segment_test_producer().1);
+                    let staged = unsafe {
+                        flock_core::zerocheck::stage_commit_tail_fill_ready_prefix(
+                            forked, r1cs, commitment, stripe_ptr, stripe_len, ready, padding,
+                        )
+                    };
+                    if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                        eprintln!("[commit-tail-fill] C ready groups={ready} early={staged}");
+                    }
+                }
             }
             return;
         }
@@ -2969,6 +3007,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 &stripe_ready,
                 stripe.as_ptr() as usize,
                 stripe.len(),
+                None,
             );
             (run_commit(hook, None, ab_producer, None), stripe)
         }
@@ -3031,6 +3070,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 &stripe_ready,
                 stripe_ptr,
                 stripe_len,
+                None,
             );
             // One shared chunk queue for the stripe. The E-workers own it
             // (helper-only broadcast, as before); main-pool workers that
@@ -3086,6 +3126,13 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     fixed_root_rows.is_some(),
                     &input_mismatch,
                 );
+                let tail_fill_hook = if flock_core::gpu_commit::zc_c_segments_enabled() {
+                    make_commit_tail_fill_hook(
+                        &*challenger, r1cs, &padding, &stripe_ready,
+                        stripe_ptr, stripe_len,
+                        Some((&emitter.publication_closed, &emitter.emitted)),
+                    )
+                } else { tail_fill_hook };
                 // `primed`: the scratch pair has been filled before by this
                 // producer, which may then leave its per-block constants in
                 // place.  Either way the pair holds the unit's complete a and
@@ -3096,9 +3143,30 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 };
                 let finish = || {
                     let t = std::time::Instant::now();
-                    let missing = emitter.finish(&z_packed, &stripe_job_fn);
+                    let (delay_ms, _, missing_test, mismatch_test) = c_segment_test_producer();
+                    if delay_ms != 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                    let mut closed = emitter.publication_closed.lock().unwrap_or_else(|e| e.into_inner());
+                    *closed = true;
+                    // Change marks only after closing staging; missing-job
+                    // repair must retire a previously launched reader first.
+                    if missing_test {
+                        if let Some(last) = emitter.emitted.last() {
+                            last.store(0, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    if mismatch_test {
+                        input_mismatch.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    let retire = || flock_core::zerocheck::retire_commit_tail_fill(stripe_ptr, stripe_len);
+                    let missing = emitter.finish(&z_packed, &stripe_job_fn, &retire);
                     let mismatch = input_mismatch.load(std::sync::atomic::Ordering::Acquire);
                     if mismatch {
+                        // Mismatch can be discovered after root staging, or
+                        // by missing-group repair itself. Never overwrite a
+                        // stripe while even a discarded GPU reader is live.
+                        retire();
                         if let Some((n_jobs, job)) = &fallback_job {
                             use rayon::prelude::*;
                             (0..*n_jobs).into_par_iter().for_each(|j| job(j));

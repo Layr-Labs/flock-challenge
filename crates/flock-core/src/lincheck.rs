@@ -195,9 +195,14 @@ pub fn replace_root_stripe(addr: usize, len: usize, roots: RootStripe) -> bool {
 
 /// The root layout of `stripe`, if it was registered as root-compacted.
 pub fn root_stripe_for(stripe: &[u8]) -> Option<RootStripe> {
-    let key = (stripe.as_ptr() as usize, stripe.len());
+    root_stripe_for_key(stripe.as_ptr() as usize, stripe.len())
+}
+
+/// Metadata-only lookup for a stripe whose unpublished suffix is still being
+/// written. This creates no shared reference to its bytes.
+pub(crate) fn root_stripe_for_key(addr: usize, len: usize) -> Option<RootStripe> {
     let guard = ROOT_STRIPE.lock().unwrap_or_else(|e| e.into_inner());
-    guard.and_then(|(p, l, roots)| ((p, l) == key).then_some(roots))
+    guard.and_then(|(p, l, roots)| ((p, l) == (addr, len)).then_some(roots))
 }
 
 /// Fold width for a stripe: the registered root count, else `useful_bits`.
