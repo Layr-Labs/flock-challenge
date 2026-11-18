@@ -585,6 +585,14 @@ impl ZcT0Job {
         }
     }
 
+    /// The arm's output buffers (`T0_OUT` entries per chunk, chunk `c` at
+    /// `c * T0_OUT`). Process-lifetime; the next fired buffer (the next
+    /// prove's pass 0) rewrites them. Only chunks whose
+    /// [`Self::chunk_ready`] was observed are complete.
+    pub(crate) fn outputs(&self) -> (*const F128, *const F128) {
+        (self.out_a, self.out_b)
+    }
+
     /// Block until the whole buffer has run (oracle). `false` = it failed;
     /// the arm is then off for the process.
     pub(crate) fn wait_all(&self) -> bool {
