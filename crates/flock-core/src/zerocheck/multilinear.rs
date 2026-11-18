@@ -743,23 +743,14 @@ pub fn fold_at_z_naive(witness: &[bool], m: usize, k_skip: usize, weights: &[F12
 /// quantity sent on the wire is `Π(1) = eq(r[0], 1) · G(1) = r[0] · G(1)`,
 /// where `Π(X) = eq(r[0], X) · G(X)` is the actual round polynomial.
 pub fn round_pair_naive(a_mlv: &[F128], b_mlv: &[F128], r: &[F128]) -> (F128, F128) {
-    let log_n = a_mlv.len().trailing_zeros() as usize;
-    assert_eq!(r.len(), log_n);
-    round_pair_naive_with_eq(a_mlv, b_mlv, r[0], &build_eq(&r[1..]))
-}
-
-/// [`round_pair_naive`] with `eq_remaining = build_eq(&r[1..])` supplied
-/// (any table holding the same values) and `r_0 = r[0]`.
-pub fn round_pair_naive_with_eq(
-    a_mlv: &[F128],
-    b_mlv: &[F128],
-    r_0: F128,
-    eq_remaining: &[F128],
-) -> (F128, F128) {
     let n = a_mlv.len();
     assert_eq!(b_mlv.len(), n);
     assert!(n.is_power_of_two() && n >= 2);
     let half = n / 2;
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r.len(), log_n);
+
+    let eq_remaining = build_eq(&r[1..]);
     assert_eq!(eq_remaining.len(), half);
 
     // Reduction is F2-linear, so reduce each sum only after the loop.
@@ -775,14 +766,7 @@ pub fn round_pair_naive_with_eq(
         // Char-2: (a_1 − a_0)(b_1 − b_0) = (a_0 + a_1)(b_0 + b_1).
         g_inf ^= eq_x.mul_unreduced((a0 + a1) * (b0 + b1));
     }
-    (r_0 * g_one.reduce(), g_inf.reduce())
-}
-
-/// The equality table of a challenge suffix one shorter: `eq(r[1..])[x] =
-/// eq(r)[2x] + eq(r)[2x + 1]`, since `eq(r_0, 0) + eq(r_0, 1) = 1` exactly.
-/// One XOR per entry where a fresh table takes one product per entry.
-pub fn eq_drop_first(eq: &[F128]) -> Vec<F128> {
-    eq.chunks_exact(2).map(|p| p[0] + p[1]).collect()
+    (r[0] * g_one.reduce(), g_inf.reduce())
 }
 
 // ---------------------------------------------------------------------------
@@ -6890,35 +6874,6 @@ mod tests {
     // ----------------------------------------------------------------------
 
     /// `Σ_i L_i(z) = 1` for all z. The polynomial `1` interpolates to constant
-    /// Dropping the first challenge of an equality table by pair sums gives
-    /// the fresh table of the shorter suffix, entry for entry (both builder
-    /// routes: below and from three challenges), and the serial round on that
-    /// table equals `round_pair_naive`; a chain of drops (as in the serial
-    /// zerocheck tail) stays exact down to the one-entry table.
-    #[test]
-    fn eq_drop_first_matches_fresh_suffix_tables() {
-        let mut rng = Rng::new(0x5a7a_11e9);
-        for len in 1usize..=12 {
-            let r: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
-            let mut eq = build_eq(&r);
-            for d in 1..=len {
-                eq = eq_drop_first(&eq);
-                assert_eq!(eq, build_eq(&r[d..]), "len {len} drop {d}");
-            }
-            let n = 1usize << len;
-            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let mut rr = vec![F128::ONE];
-            rr.extend_from_slice(&r[1..]);
-            let tab = eq_drop_first(&build_eq(&r));
-            assert_eq!(round_pair_naive_with_eq(&a, &b, rr[0], &tab), round_pair_naive(&a, &b, &rr));
-            assert_eq!(
-                round_pair_naive_with_eq(&a, &b, r[0], &build_eq(&r[1..])),
-                round_pair_naive(&a, &b, &r)
-            );
-        }
-    }
-
     /// `1` at every node, so its evaluation at z is `Σ_i 1·L_i(z) = Σ_i L_i(z)`.
     #[test]
     fn lagrange_weights_sum_to_one() {

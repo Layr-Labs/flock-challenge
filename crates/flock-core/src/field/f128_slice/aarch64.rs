@@ -711,11 +711,6 @@ unsafe fn load_whole(p: *const F128) -> uint64x2_t {
 /// two slots: the caller promises they are zero, and a zero input adds
 /// nothing to any of the three product sums.
 ///
-/// `odd_lo_tail` (used only with an odd `odd_live < BANKS`) adds the promise
-/// that bank `odd_live - 1` of those two slots has a zero high limb. Its
-/// pair partner is then zero too, so of that pair's eight limb products
-/// only `x.lo * w.lo` and `x.lo * w.hi` can be nonzero: just those two run.
-///
 /// Same products (less the promised-zero ones), same accumulators and the
 /// same reduction as [`fold_banked_slots4_schoolbook`]: the four outputs are
 /// bit-identical whenever the promise holds.
@@ -730,7 +725,6 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
     input: &[F128],
     out: &mut [F128],
     odd_live: usize,
-    odd_lo_tail: bool,
 ) {
     unsafe {
         debug_assert!(BANKS % 2 == 0);
@@ -743,14 +737,7 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
 
         let w = weight.as_ptr();
         let x = input.as_ptr();
-        let mut lo_tail = odd_lo_tail && odd_live < BANKS && odd_live % 2 == 1;
-        let split = if odd_live >= BANKS {
-            BANKS
-        } else if lo_tail {
-            odd_live - 1
-        } else {
-            (odd_live + 1) & !1
-        };
+        let split = if odd_live >= BANKS { BANKS } else { (odd_live + 1) & !1 };
         let mut bank = 0usize;
         while bank < split {
             let w0 = vld1q_u64(w.add(bank).cast::<u64>());
@@ -796,16 +783,6 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
                     w1,
                     w1_sw,
                 );
-            }
-            if lo_tail {
-                // Bank `bank` of the second and fourth slot: low limb only,
-                // and bank `bank + 1` is zero.
-                for slot in [1usize, 3] {
-                    let xl = vgetq_lane_u64::<0>(load_whole(x.add(slot * BANKS + bank)));
-                    ll[slot] = veorq_u64(ll[slot], pmull(xl, vgetq_lane_u64::<0>(w0)));
-                    cross[slot] = veorq_u64(cross[slot], pmull(xl, vgetq_lane_u64::<0>(w0_sw)));
-                }
-                lo_tail = false;
             }
             bank += 2;
         }
