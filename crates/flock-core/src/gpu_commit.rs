@@ -21654,7 +21654,6 @@ kernel void zc_eq_rows(
     }
 
     /// Lincheck gate GPU-ward bias (`FLOCK_NO_LC_GATE_BIAS=1`, exact `1`,
-    /// kills; `FLOCK_LC_GATE_BIAS=N` sets it; default 2 claims; read once).
     /// The gate prices the GPU from warm-up replays of the FULL claim range
     /// back to back (M4 Pro: 5.4-5.9 ms for 64 claims, 0.086 ms/claim),
     /// but the timed prove's prefix runs at 0.060 ms/claim (2.47 ms for 41
@@ -21670,7 +21669,12 @@ kernel void zc_eq_rows(
             if std::env::var("FLOCK_NO_LC_GATE_BIAS").is_ok_and(|v| v == "1") {
                 return 0;
             }
-            std::env::var("FLOCK_LC_GATE_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+            let default = if std::env::var("FLOCK_NO_LC_GATE_BIAS3").is_ok_and(|v| v == "1") {
+                2
+            } else {
+                3
+            };
+            std::env::var("FLOCK_LC_GATE_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
         });
         if g == 0 {
             return 0;
