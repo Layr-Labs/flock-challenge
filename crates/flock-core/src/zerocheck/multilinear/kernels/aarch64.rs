@@ -2166,6 +2166,89 @@ unsafe fn mul_prep86_q(
     out
 }
 
+/// [`mul_prep86_q`] in six SIMD issue slots instead of seven: the same four
+/// data `PMULL`s, `EXT` and fold `PMULL`, the same ten instructions.
+///
+/// In [`mul_prep86_q`] the two halves are independent chains that each
+/// start with a lone `PMULL`, and the swapped `M` joins `L` through an
+/// `EOR` of its own. Here `M` is formed first and its swap is the
+/// accumulator of `L`'s first `PMULL`, so that `PMULL` issues as a fused
+/// `PMULL`+`EOR` pair and the separate `EOR` is gone:
+///
+/// * `M = x.lo*p1.lo + x.hi*p1.hi` (one `PMULL`, one fused pair);
+/// * `s = swap(M)` (`EXT`);
+/// * `s + x.lo*p0.lo`, `+ x.hi*p0.hi`, `+ M.hi*0x86` (three fused pairs).
+///
+/// The output is `L + swap(M) + M.hi*0x86`, the same summands as
+/// [`mul_prep86_q`] (XOR is associative and commutative), so the same bits.
+/// The price is latency: `L` now waits for `M`. The tri passes hide it
+/// behind the group's other rows.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn mul_prep86_seeded_q(
+    p0: core::arch::aarch64::uint64x2_t,
+    p1: core::arch::aarch64::uint64x2_t,
+    x: core::arch::aarch64::uint64x2_t,
+    k: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    let out: core::arch::aarch64::uint64x2_t;
+    // SAFETY: register-only carry-less products and XORs; every scratch
+    // register and the output are early clobbers. `t` is reused only after
+    // its previous value has been folded in (`swap(M)` into `l`).
+    unsafe {
+        core::arch::asm!(
+            "pmull {t:v}.1q, {x:v}.1d, {p1:v}.1d",
+            "pmull2 {m:v}.1q, {x:v}.2d, {p1:v}.2d",
+            "eor {m:v}.16b, {m:v}.16b, {t:v}.16b",
+            "ext {t:v}.16b, {m:v}.16b, {m:v}.16b, #8",
+            "pmull {l:v}.1q, {x:v}.1d, {p0:v}.1d",
+            "eor {l:v}.16b, {l:v}.16b, {t:v}.16b",
+            "pmull2 {t:v}.1q, {x:v}.2d, {p0:v}.2d",
+            "eor {t:v}.16b, {t:v}.16b, {l:v}.16b",
+            "pmull2 {o:v}.1q, {m:v}.2d, {k:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {t:v}.16b",
+            p0 = in(vreg) p0,
+            p1 = in(vreg) p1,
+            x = in(vreg) x,
+            k = in(vreg) k,
+            t = out(vreg) _,
+            m = out(vreg) _,
+            l = out(vreg) _,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// [`mul_prep86_seeded_q`] when `seeded`, else [`mul_prep86_q`]: the same
+/// bits either way.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn mul_prep86_sel_q(
+    seeded: bool,
+    p0: core::arch::aarch64::uint64x2_t,
+    p1: core::arch::aarch64::uint64x2_t,
+    x: core::arch::aarch64::uint64x2_t,
+    k: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    unsafe { if seeded { mul_prep86_seeded_q(p0, p1, x, k) } else { mul_prep86_q(p0, p1, x, k) } }
+}
+
+/// Seeded prepared products ([`mul_prep86_seeded_q`], six SIMD issue slots
+/// per row instead of seven) in the tri passes, which run
+/// [`mul_prep86_q`] once per weighted row: the eight group weights of every
+/// group, and the single-input output of every odd group of a
+/// dead-tail-packed input. On by default; `FLOCK_NO_ZC_PREP_SEED` (any
+/// value, read once per process) keeps the seven-slot form. Same bits
+/// either way.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(crate) fn zc_prep_seed_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_PREP_SEED").is_none());
+    *ON
+}
+
 /// The prepared pairs of the round-two group weights: entries `2u` and
 /// `2u + 1` hold `const_prep(eq_lo[2u + 1])`, the weight of group `u` of
 /// every chunk. One pass over half of `eq_lo`, shared by all chunks. The
@@ -7817,6 +7900,9 @@ fn fold_tri_and_message_impl<
 /// through [`mul_prep86_add_q`], and the group weights `eq_lo[4y + 3]`
 /// through [`mul_prep86_q`] with their pairs read from `eq_prep`. Same field
 /// products, fully reduced: same outputs and slots.
+///
+/// With `FF`, the weighted rows run as [`mul_prep86_seeded_q`] when
+/// [`zc_prep_seed_enabled`] (see [`fold_tri_and_message_core_with`]).
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
@@ -7839,7 +7925,52 @@ fn fold_tri_and_message_core<
     eq_lo: &[F128],
     eq_prep: &[F128],
 ) -> [F128; TRI_SLOTS] {
+    fold_tri_and_message_core_with::<DEPTH, NT, ABL, PACK, INL, SL, FF>(
+        a_in,
+        b_in,
+        a_out,
+        b_out,
+        rho_a,
+        rho_b,
+        rho_c,
+        eq_lo,
+        eq_prep,
+        FF && zc_prep_seed_enabled(),
+    )
+}
+
+/// [`fold_tri_and_message_core`] with the prepared-product form chosen by
+/// the caller: `seeded` (only read with `FF`) runs every [`mul_prep86_q`]
+/// of the pass (the eight weighted rows of every group, and the
+/// single-input output of every odd group of a dead-tail-packed input) as
+/// [`mul_prep86_seeded_q`], six SIMD issue slots instead of seven. The same
+/// fully reduced products, so the same outputs and slots. The form is
+/// chosen once per group, outside the products.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn fold_tri_and_message_core_with<
+    const DEPTH: usize,
+    const NT: bool,
+    const ABL: u32,
+    const PACK: bool,
+    const INL: bool,
+    const SL: bool,
+    const FF: bool,
+>(
+    a_in: &[F128],
+    b_in: &[F128],
+    a_out: &mut [F128],
+    b_out: &mut [F128],
+    rho_a: F128,
+    rho_b: F128,
+    rho_c: F128,
+    eq_lo: &[F128],
+    eq_prep: &[F128],
+    seeded: bool,
+) -> [F128; TRI_SLOTS] {
     use core::arch::aarch64::*;
+    let seeded = FF && seeded;
     assert!(DEPTH == 2 || DEPTH == 3);
     assert!(!PACK || (DEPTH == 2 && ABL == 0));
     let n_out = a_out.len();
@@ -7960,8 +8091,10 @@ fn fold_tri_and_message_core<
         /// [`fold_eight`] (depth two) of a packed block's second half:
         /// logical inputs 32..60 at `src`, input 60 = `*side`, inputs
         /// 61..63 zero. With `FF` and `one_in`, output 7 (input 60 alone) is
-        /// one prepared product by `op` = `(1 + ρa)(1 + ρb)`.
+        /// one prepared product by `op` = `(1 + ρa)(1 + ρb)` (seeded form when
+        /// `seeded`).
         #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
         unsafe fn fold_eight_packed_tail<const FF: bool>(
             src: *const F128,
             side: *const F128,
@@ -7969,6 +8102,7 @@ fn fold_tri_and_message_core<
             pp: &TriPrepQ,
             one_in: bool,
             op: &(uint64x2_t, uint64x2_t),
+            seeded: bool,
         ) -> [uint64x2_t; 8] {
             unsafe {
                 let mut v = [vdupq_n_u64(0); 8];
@@ -7988,7 +8122,7 @@ fn fold_tri_and_message_core<
                 };
                 v[6] = one(ld(src.add(24)), ld(src.add(25)), ld(src.add(26)), ld(src.add(27)));
                 v[7] = if FF && one_in {
-                    mul_prep86_q(op.0, op.1, ld(side), pp.k)
+                    mul_prep86_sel_q(seeded, op.0, op.1, ld(side), pp.k)
                 } else {
                     one(ld(side), zero, zero, zero)
                 };
@@ -8006,7 +8140,7 @@ fn fold_tri_and_message_core<
                 if y % 2 == 0 {
                     fold_eight::<2, false>(main, &rho, rc, rc_sw, &pp)
                 } else {
-                    fold_eight_packed_tail::<false>(main.add(32), sup.add(60 * PACK_BLOCKS + w), &rho, &pp, false, &op)
+                    fold_eight_packed_tail::<false>(main.add(32), sup.add(60 * PACK_BLOCKS + w), &rho, &pp, false, &op, false)
                 }
             } else {
                 fold_eight::<DEPTH, false>(ip.add((8 * y) << DEPTH), &rho, rc, rc_sw, &pp)
@@ -8018,6 +8152,7 @@ fn fold_tri_and_message_core<
         // memory, reloading the rho vectors and constants on every call).
         // `SL`: full depth-two groups through `fold_eight_sl`.
         #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
         unsafe fn fold_group_inl<const DEPTH: usize, const PACK: bool, const SL: bool, const FF: bool>(
             ip: *const F128,
             y: usize,
@@ -8027,6 +8162,7 @@ fn fold_tri_and_message_core<
             pp: &TriPrepQ,
             one_in: bool,
             op: &(uint64x2_t, uint64x2_t),
+            seeded: bool,
         ) -> [uint64x2_t; 8] {
             unsafe {
                 if PACK {
@@ -8040,7 +8176,7 @@ fn fold_tri_and_message_core<
                             fold_eight::<2, FF>(main, rho, rc, rc_sw, pp)
                         }
                     } else {
-                        fold_eight_packed_tail::<FF>(main.add(32), sup.add(60 * PACK_BLOCKS + w), rho, pp, one_in, op)
+                        fold_eight_packed_tail::<FF>(main.add(32), sup.add(60 * PACK_BLOCKS + w), rho, pp, one_in, op, seeded)
                     }
                 } else if SL && DEPTH == 2 {
                     fold_eight_sl::<FF>(ip.add((8 * y) << 2), rho, pp)
@@ -8057,8 +8193,10 @@ fn fold_tri_and_message_core<
         /// The other outputs fold the same inputs through the same
         /// products as [`fold_group_inl`]. With `FF` and `one_in`, the
         /// four-input outputs take [`fold4_prep_one_q`] and output 7 of an
-        /// odd group (input 60 alone) is one prepared product by `op`.
+        /// odd group (input 60 alone) is one prepared product by `op`
+        /// (seeded form when `seeded`).
         #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
         unsafe fn fold_group_bpack<const FF: bool>(
             ip: *const F128,
             y: usize,
@@ -8066,6 +8204,7 @@ fn fold_tri_and_message_core<
             pp: &TriPrepQ,
             one_in: bool,
             op: &(uint64x2_t, uint64x2_t),
+            seeded: bool,
         ) -> [uint64x2_t; 8] {
             unsafe {
                 let main = ip.add(B_PACK_BLOCK * (y / 2));
@@ -8095,7 +8234,7 @@ fn fold_tri_and_message_core<
                     let (v4, v5) = fold4_pair_expanded_tri_f_q::<FF>(main.add(44), rho, pp);
                     let v6 = one(ld(main.add(52)), ld(main.add(53)), ld(main.add(54)), one_q);
                     let v7 = if FF && one_in {
-                        mul_prep86_q(op.0, op.1, ld(main.add(55)), pp.k)
+                        mul_prep86_sel_q(seeded, op.0, op.1, ld(main.add(55)), pp.k)
                     } else {
                         one(ld(main.add(55)), zero, zero, zero)
                     };
@@ -8115,15 +8254,15 @@ fn fold_tri_and_message_core<
                 let y = g0 + t;
                 let (a, b) = if INL {
                     (
-                        fold_group_inl::<DEPTH, PACK, SL, FF>(a_ip, y, &rho, rc, rc_sw, &pp, one_in, &op),
+                        fold_group_inl::<DEPTH, PACK, SL, FF>(a_ip, y, &rho, rc, rc_sw, &pp, one_in, &op, seeded),
                         if PACK && bpack {
-                            fold_group_bpack::<FF>(b_ip, y, &rho, &pp, one_in, &op)
+                            fold_group_bpack::<FF>(b_ip, y, &rho, &pp, one_in, &op, seeded)
                         } else {
-                            fold_group_inl::<DEPTH, PACK, SL, FF>(b_ip, y, &rho, rc, rc_sw, &pp, one_in, &op)
+                            fold_group_inl::<DEPTH, PACK, SL, FF>(b_ip, y, &rho, rc, rc_sw, &pp, one_in, &op, seeded)
                         },
                     )
                 } else if PACK && bpack {
-                    (fold_group(a_ip, y), fold_group_bpack::<false>(b_ip, y, &rho, &pp, false, &op))
+                    (fold_group(a_ip, y), fold_group_bpack::<false>(b_ip, y, &rho, &pp, false, &op, false))
                 } else {
                     (fold_group(a_ip, y), fold_group(b_ip, y))
                 };
@@ -8145,10 +8284,17 @@ fn fold_tri_and_message_core<
                     // The weight's prepared pair (one paired load): five
                     // `PMULL`s and 10 instructions per row; the same fully
                     // reduced products as the schoolbook and Karatsuba forms.
+                    // `seeded`: six SIMD issue slots per row instead of seven.
                     let p0 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 2).cast::<u64>());
                     let p1 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 3).cast::<u64>());
-                    for i in 0..8 {
-                        ta[t][i] = mul_prep86_q(p0, p1, a[i], pp.k);
+                    if seeded {
+                        for i in 0..8 {
+                            ta[t][i] = mul_prep86_seeded_q(p0, p1, a[i], pp.k);
+                        }
+                    } else {
+                        for i in 0..8 {
+                            ta[t][i] = mul_prep86_q(p0, p1, a[i], pp.k);
+                        }
                     }
                 } else {
                     let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
@@ -8532,6 +8678,64 @@ mod tri_fused_fold_probe {
         assert_eq!(slots[0], slots[1]);
         for i in 0..rounds {
             println!("tri-d3 round={i} old={:.2} fused={:.2}", times[0][i], times[1][i]);
+        }
+    }
+
+    /// The tri passes with `seeded` false and true, alternated per round, one
+    /// thread: the packed depth-two pass at 8192 outputs (non-temporal stores)
+    /// and the depth-three pass at 4096 outputs (cached stores).
+    #[test]
+    #[ignore = "timing probe"]
+    fn tri_seeded_timing() {
+        let mut state = 0x7472_6973_6565_6474u64;
+        let mut draw = || {
+            let mut next = || {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^ (z >> 31)
+            };
+            F128::new(next(), next())
+        };
+        let rounds: usize = std::env::var("PROBE_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+        for depth in [2usize, 3] {
+            let n_out: usize = if depth == 2 { 8192 } else { 4096 };
+            let n_in = n_out << depth;
+            let len = if depth == 2 { n_in / (64 * PACK_BLOCKS) * PACK_SUPER } else { n_in };
+            let a: Vec<F128> = (0..len).map(|_| draw()).collect();
+            let b: Vec<F128> = (0..len).map(|_| draw()).collect();
+            let eq: Vec<F128> = (0..n_out / 2).map(|_| draw()).collect();
+            let ep = round2_eq_prep(&eq);
+            let (ra, rb, rc) = (draw(), draw(), if depth == 3 { draw() } else { F128::ZERO });
+            let (mut ao, mut bo) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+            let iters: usize = if depth == 2 { 20 } else { 40 };
+            let mut times = [Vec::new(), Vec::new()];
+            let mut slots = [[F128::ZERO; TRI_SLOTS]; 2];
+            for round in 0..rounds + 1 {
+                for k in 0..2usize {
+                    let form = (k + round) % 2;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..iters {
+                        slots[form] = if depth == 2 {
+                            fold_tri_and_message_core_with::<2, true, 0, true, true, true, true>(
+                                &a, &b, &mut ao, &mut bo, ra, rb, rc, &eq, &ep, form == 1,
+                            )
+                        } else {
+                            fold_tri_and_message_core_with::<3, false, 0, false, true, false, true>(
+                                &a, &b, &mut ao, &mut bo, ra, rb, rc, &eq, &ep, form == 1,
+                            )
+                        };
+                    }
+                    if round > 0 {
+                        times[form].push(t0.elapsed().as_secs_f64() * 1e6 / iters as f64);
+                    }
+                }
+            }
+            assert_eq!(slots[0], slots[1]);
+            for i in 0..rounds {
+                println!("tri-seeded depth={depth} round={i} old={:.2} seeded={:.2}", times[0][i], times[1][i]);
+            }
         }
     }
 }
@@ -9643,6 +9847,56 @@ mod tests {
         for edge in [[0, 0], [1, 0], [0, 1], [u64::MAX, u64::MAX], [1, 1]] {
             check(edge, [next(), next()]);
             check([next(), next()], edge);
+        }
+    }
+
+    /// The seeded prepared product ([`mul_prep86_seeded_q`]) returns the
+    /// same bits as the seven-slot [`mul_prep86_q`] and as an independent
+    /// bit-serial field product (Horner over the weight's 128 bits with the
+    /// scalar `mul_by_x`), through both arms of [`mul_prep86_sel_q`]: 1024
+    /// random weights and operands, zero/one/all-ones edges on either side,
+    /// and every single-bit weight against a random operand.
+    #[test]
+    fn mul_prep86_seeded_matches_prep86_and_bit_serial_product() {
+        use core::arch::aarch64::*;
+        let mut state = 0x5345_4544_3836_5052;
+        let mut next = || splitmix64(&mut state);
+        let lanes = |v: uint64x2_t| unsafe { (vgetq_lane_u64::<0>(v), vgetq_lane_u64::<1>(v)) };
+        let serial = |x: F128, t: F128| {
+            let mut r = F128::ZERO;
+            for i in (0..128).rev() {
+                r = crate::field::gf2_128::mul_by_x(r);
+                let bit = if i < 64 { (t.lo >> i) & 1 } else { (t.hi >> (i - 64)) & 1 };
+                if bit == 1 {
+                    r = F128::new(r.lo ^ x.lo, r.hi ^ x.hi);
+                }
+            }
+            r
+        };
+        let check = |t: F128, x: F128| unsafe {
+            let prep = round2_eq_prep(&[F128::ZERO, t]);
+            let p0 = vld1q_u64(prep.as_ptr().cast::<u64>());
+            let p1 = vld1q_u64(prep.as_ptr().add(1).cast::<u64>());
+            let xv = core::mem::transmute::<F128, uint64x2_t>(x);
+            let k = vdupq_n_u64(0x86);
+            let want = lanes(core::mem::transmute::<F128, uint64x2_t>(serial(x, t)));
+            assert_eq!(lanes(mul_prep86_seeded_q(p0, p1, xv, k)), want, "seeded, t {t:?} x {x:?}");
+            assert_eq!(lanes(mul_prep86_q(p0, p1, xv, k)), want, "seven-slot, t {t:?} x {x:?}");
+            assert_eq!(lanes(mul_prep86_sel_q(true, p0, p1, xv, k)), want, "sel seeded, t {t:?} x {x:?}");
+            assert_eq!(lanes(mul_prep86_sel_q(false, p0, p1, xv, k)), want, "sel seven-slot, t {t:?} x {x:?}");
+        };
+        for _ in 0..1024 {
+            check(F128::new(next(), next()), F128::new(next(), next()));
+        }
+        for edge in [(0, 0), (1, 0), (0, 1), (u64::MAX, u64::MAX), (1, 1), (u64::MAX, 0), (0, u64::MAX)] {
+            let e = F128::new(edge.0, edge.1);
+            check(e, F128::new(next(), next()));
+            check(F128::new(next(), next()), e);
+            check(e, e);
+        }
+        for bit in 0..128 {
+            let t = if bit < 64 { F128::new(1 << bit, 0) } else { F128::new(0, 1 << (bit - 64)) };
+            check(t, F128::new(next(), next()));
         }
     }
 
@@ -11758,6 +12012,101 @@ mod tests {
                 assert_eq!(bone, packed, "slots, case {case}, nt {nt}");
                 assert_eq!(ap, ao, "a outputs, case {case}, nt {nt}");
                 assert_eq!(bp, bo, "b outputs, case {case}, nt {nt}");
+            }
+        }
+    }
+
+    /// The seeded prepared products of the tri passes (both values of
+    /// `seeded` through `fold_tri_and_message_core_with`) against the parent
+    /// kernel, whose group folds, `ρc` level and weights are the unprepared
+    /// schoolbook and Karatsuba forms: depth three and depth two (seeded
+    /// weights) on full inputs, and depth two (seeded weights and
+    /// single-input outputs) on dead-tail-packed a with packed or
+    /// b-one-packed b. Both store flavours, several sizes; every output, all
+    /// 26 slots and the overrun guard must match.
+    #[test]
+    fn tri_seeded_chains_match_incumbent_and_parent() {
+        type T = fn(&[F128], &[F128], &mut [F128], &mut [F128], F128, F128, F128, &[F128], &[F128], bool) -> [F128; TRI_SLOTS];
+        type P = fn(&[F128], &[F128], &mut [F128], &mut [F128], F128, F128, F128, &[F128], &[F128]) -> [F128; TRI_SLOTS];
+        let mut state = 0x7472_6973_6565_6431;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let poison = F128::new(3, 5);
+        // Runs `f` on fresh poisoned outputs, checks the guard entry.
+        let run = |f: &dyn Fn(&mut [F128], &mut [F128]) -> [F128; TRI_SLOTS], n_out: usize, at: &str| {
+            let (mut ao, mut bo) = (vec![poison; n_out + 1], vec![poison; n_out + 1]);
+            let slots = f(&mut ao[..n_out], &mut bo[..n_out]);
+            assert_eq!((ao[n_out], bo[n_out]), (poison, poison), "overrun: {at}");
+            ao.truncate(n_out);
+            bo.truncate(n_out);
+            (slots, ao, bo)
+        };
+        // Depth three and depth two on full inputs.
+        let full: [(usize, bool, T, P); 4] = [
+            (3, false, fold_tri_and_message_core_with::<3, false, 0, false, true, false, true>, fold_tri_and_message_impl::<3, false, 0, false, false>),
+            (3, true, fold_tri_and_message_core_with::<3, true, 0, false, true, false, true>, fold_tri_and_message_impl::<3, true, 0, false, false>),
+            (2, false, fold_tri_and_message_core_with::<2, false, 0, false, true, true, true>, fold_tri_and_message_impl::<2, false, 0, false, false>),
+            (2, true, fold_tri_and_message_core_with::<2, true, 0, false, true, true, true>, fold_tri_and_message_impl::<2, true, 0, false, false>),
+        ];
+        for (depth, nt, new, parent) in full {
+            for n_out in [8usize, 64, 1024, 4096] {
+                let n_in = n_out << depth;
+                let a: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+                let b: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+                let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+                let ep = round2_eq_prep(&eq);
+                let (ra, rb, rc) = (rho(&mut state), rho(&mut state), if depth == 3 { rho(&mut state) } else { F128::ZERO });
+                let at = format!("full depth {depth} nt {nt} n_out {n_out}");
+                let want = run(&|ao, bo| parent(&a, &b, ao, bo, ra, rb, rc, &eq, &ep), n_out, &at);
+                for seeded in [false, true] {
+                    let got = run(&|ao, bo| new(&a, &b, ao, bo, ra, rb, rc, &eq, &ep, seeded), n_out, &at);
+                    assert_eq!(got, want, "{at} seeded {seeded}");
+                }
+            }
+        }
+        // Depth two on dead-tail-packed a, and packed or b-one-packed b.
+        let packed: [(bool, T, P); 2] = [
+            (false, fold_tri_and_message_core_with::<2, false, 0, true, true, true, true>, fold_tri_and_message_impl::<2, false, 0, true, false>),
+            (true, fold_tri_and_message_core_with::<2, true, 0, true, true, true, true>, fold_tri_and_message_impl::<2, true, 0, true, false>),
+        ];
+        for (nt, new, parent) in packed {
+            for case in 0..4 {
+                let n_out = 64 << case;
+                let n_in = 4 * n_out;
+                let mut a: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+                let mut b: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+                for blk in 0..n_in / 64 {
+                    a[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+                    b[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+                    b[64 * blk..64 * blk + 4].fill(F128::ONE);
+                    b[64 * blk + 59] = F128::ONE;
+                }
+                let pack = |v: &[F128]| -> Vec<F128> {
+                    let mut p = vec![F128::new(1, 2); n_in / 256 * PACK_SUPER];
+                    for (i, &x) in v.iter().enumerate() {
+                        if let Some(k) = packed_index(i) {
+                            p[k] = x;
+                        }
+                    }
+                    p
+                };
+                let mut bb = vec![F128::new(3, 4); n_in / 64 * B_PACK_BLOCK];
+                for (i, &x) in b.iter().enumerate() {
+                    if let Some(k) = bpack_index(i) {
+                        bb[k] = x;
+                    }
+                }
+                let (ap, bp) = (pack(&a), pack(&b));
+                let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+                let ep = round2_eq_prep(&eq);
+                let (ra, rb) = (rho(&mut state), rho(&mut state));
+                let at = format!("packed nt {nt} n_out {n_out}");
+                let want = run(&|ao, bo| parent(&ap, &bp, ao, bo, ra, rb, F128::ZERO, &eq, &ep), n_out, &at);
+                for seeded in [false, true] {
+                    for (b_in, what) in [(&bp, "packed b"), (&bb, "b-one-packed b")] {
+                        let got = run(&|ao, bo| new(&ap, b_in, ao, bo, ra, rb, F128::ZERO, &eq, &ep, seeded), n_out, &at);
+                        assert_eq!(got, want, "{at} {what} seeded {seeded}");
+                    }
+                }
             }
         }
     }

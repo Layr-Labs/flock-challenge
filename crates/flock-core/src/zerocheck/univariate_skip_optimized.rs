@@ -4118,6 +4118,15 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 /// With R2-CS on (`gpu_commit::ENV_NO_ZC_R2_CS`), a thread of its own builds
 /// the R2-CS pipeline (`gpu_commit::zc_r2_cs_prewarm`), joined by the warm-up
 /// round two's calibration.
+///
+/// With the pipeline fan-out on (`gpu_commit::ENV_NO_PIPE_FANOUT`), the ranked
+/// worker starts one counted helper (`gpu_commit::spawn_build`) per build
+/// instead: the round-one arm, the K pass, the grind tail and R2-CS each on
+/// their own thread, plus the fold kernels, the opening z-fold, the 5+6 fold
+/// and the tri pass 0 kernel, whose builds otherwise wait for their first
+/// launch (or, for the last two, for the split retune). The warm-up's
+/// commit/AB join waits for all of them (`gpu_commit::join_builds`). The
+/// round-two arm is not among them: it stays built at its first launch.
 pub fn ab_completion_gpu_prewarm() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -4125,6 +4134,32 @@ pub fn ab_completion_gpu_prewarm() {
             && crate::gpu_commit::gpu_zc_ab_completion_share() != 0;
         let k = crate::gpu_commit::zc_k_prewarm_wanted();
         let tail = crate::gpu_commit::pow_race_tail_wanted();
+        if crate::gpu_commit::pipe_fanout_enabled() && crate::is_ranked_worker_process() {
+            use crate::gpu_commit::spawn_build;
+            if ab {
+                spawn_build("flock-zcab-prewarm", || {
+                    if let Some(basis) = ab_completion_convert_basis() {
+                        crate::gpu_commit::zc_ab_prewarm(basis);
+                    }
+                });
+            }
+            if k {
+                spawn_build("flock-zck-prewarm", crate::gpu_commit::zc_k_prewarm);
+            }
+            if tail {
+                spawn_build("flock-tail-prewarm", crate::gpu_commit::gpu_pow_race_tail_prewarm);
+            }
+            if crate::gpu_commit::zc_r2_cs_prewarm_wanted() {
+                spawn_build("flock-zcr2cs-prewarm", crate::gpu_commit::zc_r2_cs_prewarm);
+            }
+            spawn_build("flock-fold-prewarm", crate::gpu_commit::zc_fold_prewarm);
+            spawn_build("flock-zfold-prewarm", crate::gpu_commit::zfold_prewarm);
+            if crate::gpu_commit::zc_t56_prewarm_wanted() {
+                spawn_build("flock-zct56-prewarm", crate::gpu_commit::zc_t56_prewarm);
+            }
+            spawn_build("flock-zct0-prewarm", crate::gpu_commit::zc_t0_prewarm);
+            return;
+        }
         if ab || k || tail {
             let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(move || {
                 if ab && let Some(basis) = ab_completion_convert_basis() {

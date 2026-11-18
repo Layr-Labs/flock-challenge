@@ -7713,7 +7713,7 @@ const ENV_NO_GPU_ZFOLD: &str = "FLOCK_NO_GPU_ZFOLD";
 /// view of z, writing the small folded vector) while the CPU queue steals
 /// from the top; see `gpu_commit::imp::zfold`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn zfold_gpu_enabled() -> bool {
+pub(crate) fn zfold_gpu_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os(ENV_NO_GPU_ZFOLD).is_none() && crate::gpu_commit::gpu_commit_enabled()
