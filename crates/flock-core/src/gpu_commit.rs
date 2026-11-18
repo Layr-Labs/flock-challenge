@@ -3088,6 +3088,26 @@ pub(crate) fn gpu_g4x2_build_linear_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_BUILD_LINEAR").is_none())
 }
 
+/// Layer-15 odd-sibling table patch in the dense g4x2 pass
+/// (`FLOCK_NO_G4X2_L15_PATCH`, any value, rebuilds every table). In the pass
+/// over layers 12..15 the last sub-layer's twiddles are those of layer 15,
+/// blocks `8B + c`, built and used in the order `c = 0..7`. The additive
+/// twiddles are linear in the block index, so an odd block's twiddle is its
+/// even sibling's plus the layer's first basis value, `0x10116` (degree 16).
+/// Entry `d` of bank `b` of the odd table is then the even entry plus
+/// `d * 0x10116 * x^(8b)`, whose degree is at most 31: the carry-less word
+/// `((d<<1)^(d<<2)^(d<<4)^(d<<8)^(d<<16)) << 8b`, added to the entry's low
+/// 32 bits with no reduction. For odd `c` the group patches the low words of
+/// the live table in place between the same two barriers instead of
+/// rebuilding all 512 entries. Every group checks the difference of the two
+/// prefetched twiddles before patching and rebuilds when it is not
+/// `0x10116`, so the tables are the record's for any twiddle table. Read
+/// once per process, when the dense g4x2 source is made.
+pub(crate) fn gpu_g4x2_l15_patch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_L15_PATCH").is_none())
+}
+
 /// One-round zero-lane g4x2 groups (`FLOCK_NO_G4X2_ZL_ONE_ROUND`, any
 /// value, keeps the record's 64-thread, two-round groups). A zero-lane g4x2
 /// group (the layers 4..7 and 8..11 passes) runs 2 x 128 columns of one
@@ -6497,7 +6517,7 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// `FLOCK_NO_GPU_TW_PREFETCH` is set.
     fn g4x2_msl_source() -> &'static str {
         if super::gpu_tw_prefetch_enabled() {
-            g4x2_twl_source()
+            g4x2_dense_twl_source()
         } else {
             NTT_G4X2_MSL_SOURCE
         }
@@ -6697,6 +6717,63 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
             && !G4X2_ONE_ROUND_ZL_FAILED.load(std::sync::atomic::Ordering::Relaxed)
             && *SPLICES.get_or_init(|| g4x2_zero_lane_two_round_source().as_deref().and_then(g4x2_one_round_zl).is_some())
     }
+
+    /// The dense pipeline's twiddle-prefetch text: [`g4x2_twl_source`] with
+    /// the layer-15 odd-sibling patch (see
+    /// [`super::gpu_g4x2_l15_patch_enabled`]) unless switched off or an
+    /// anchor drifted. Made once per process.
+    fn g4x2_dense_twl_source() -> &'static str {
+        static SRC: OnceLock<Option<String>> = OnceLock::new();
+        SRC.get_or_init(|| {
+            if super::gpu_g4x2_l15_patch_enabled() {
+                splice_exact(g4x2_twl_source(), &G4X2_L15_PATCH)
+            } else {
+                None
+            }
+        })
+        .as_deref()
+        .unwrap_or_else(g4x2_twl_source)
+    }
+
+    /// The layer-15 patch splices: the patch function, the choice in the
+    /// sub-layer loop, and the kernel's uniform gate.
+    const G4X2_L15_PATCH: [(&str, &str); 3] = [
+        (
+            "// One f=4 sub-layer over both register tiles `ea` and `eb`.",
+            "// Layer 15 of the ranked dense pass: the live table is the even sibling's
+// (twiddle t, block 8B + c - 1) and the next twiddle is t + 0x10116. Entry
+// d of bank b becomes entry + d * 0x10116 * x^(8b), a carry-less product of
+// degree <= 31, so only the low word changes and no reduction is needed.
+// The same two barriers as a build: readers of the even table retire, then
+// the patched table is published.
+static inline void gf_patch_byte16_l15(threadgroup uint4* tabB, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup uint* lo = (threadgroup uint*)tabB;
+    const uint t = lid >> 5;
+    const uint u = lid & 31u;
+    // d = u + 32 m: the word is linear in d.
+    const uint wu = (u << 1) ^ (u << 2) ^ (u << 4) ^ (u << 8) ^ (u << 16);
+    for (uint m = 0; m < 8u; m++) {
+        const uint dm = m << 5;
+        const uint w = (wu ^ (dm << 1) ^ (dm << 2) ^ (dm << 4) ^ (dm << 8) ^ (dm << 16)) << (t << 3);
+        const uint i = (((t << 8) + u + dm) << 2);
+        lo[i] ^= w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// One f=4 sub-layer over both register tiles `ea` and `eb`.",
+        ),
+        (
+            "            gf_build_byte16_twl(tabB, twl, (1u << j) - 1u + c, lid);           \\\n",
+            "            if (j == 3u && (c & 1u) != 0u && l15_gate                       \\\n                && all((twl[7u + c] ^ twl[6u + c]) == uint4(0x10116u, 0u, 0u, 0u))) { \\\n                gf_patch_byte16_l15(tabB, lid);                                \\\n            } else {                                                           \\\n                gf_build_byte16_twl(tabB, twl, (1u << j) - 1u + c, lid);       \\\n            }                                                                  \\\n",
+        ),
+        (
+            "    const uint lane = lid;\n",
+            "    const uint lane = lid;\n    // Layer 15 (sub-layer 3 of the pass at l = 12): odd siblings may be patched.\n    const bool l15_gate = P.log_d == 20u && P.l == 12u;\n",
+        ),
+    ];
 
     /// The twiddle-prefetch g4x2 source of the dense pipeline (the layers
     /// 12..15 pass): `NTT_G4X2_TWL_MSL_SOURCE`, with lane-linear table stores
