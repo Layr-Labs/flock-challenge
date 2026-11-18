@@ -3056,6 +3056,22 @@ pub(crate) fn gpu_final_leaf_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
 }
 
+/// Layer-17 sibling table (`FLOCK_NO_L17_SIBLING`, any value, keeps the
+/// record's two split-table builds): in the ranked fused final pass
+/// (`ntt_final_t3_leaf`), sub-layer 1 (layer `log_d - 3`, layer 17 at the
+/// ranked shape) multiplies by the tile's two twiddles `t0 = t(2B)` and
+/// `t1 = t(2B + 1)`. They differ by `Ŵ_2(β_3)` = 0x16 at every `log_d`, so
+/// their byte products share bits 32..95, and both twiddles' byte tables fit
+/// one 512-entry `uint4` table: bits 0..95 of `b * t0` and bits 0..31 of
+/// `b * t1`. One build (two barriers) instead of two (four), one indexed
+/// `uint4` read per byte instead of a `uint2` and a `uint`, and one reduction
+/// per product. Same field products, so the same codeword and leaf bytes.
+/// Read once per process, when the fused pipeline's source is made.
+pub(crate) fn gpu_l17_sibling_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_L17_SIBLING").is_none())
+}
+
 /// Lane-linear table stores in the dense g4x2 pass (layers 12..15 at the
 /// ranked size; `FLOCK_NO_G4X2_BUILD_LINEAR`, any value, keeps the record's
 /// store map). The zero-lane passes keep the record's text.
@@ -9200,6 +9216,118 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
 }
 "#;
 
+    /// Layer-17 sibling table (see [`super::gpu_l17_sibling_enabled`]): the
+    /// table build and the product, placed before the fused leaf kernel.
+    ///
+    /// Entry `256 p + b` holds `A = b * X^(8p) * t0` as a 96-bit polynomial
+    /// (`xyz`, unreduced: `t0` has at most 81 bits under `pass5_mixed_ok`, so
+    /// `A` stays below 2^96) and in `w` the low word of `b * X^(8p) * t1`.
+    /// `t0 + t1` has at most 16 bits, so the two products differ only in
+    /// their low word. A 32-bit word of `v` times `t` is the XOR of two such
+    /// halfword products, the second shifted by 16; the four word products,
+    /// shifted by 0, 32, 64 and 96 bits, sum to a polynomial below 2^208,
+    /// reduced once (`X^128 = X^7 + X^2 + X + 1`; the overflow has at most 80
+    /// bits, so one fold is exact).
+    const L17_SIBLING_FNS: &str = r#"
+template<uint S>
+static inline uint4 l17_shift(uint4 a) {
+    return (a << S) ^ uint4(0u, a.x >> (32u - S), a.y >> (32u - S), 0u);
+}
+
+static inline void l17_build(threadgroup uint4* tab, uint4 t0, uint4 t1, uint lid) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint4 g = uint4(t0.x, t0.y, t0.z, t1.x);
+    if (lid >= 32u) { g = l17_shift<8>(g); }
+    const uint aa = lid & 3u;
+    const uint cc = (lid & 31u) >> 2;
+    uint4 a = uint4(0u);
+    if (aa & 1u) { a ^= l17_shift<2>(g); }
+    if (aa & 2u) { a ^= l17_shift<3>(g); }
+    if (cc & 1u) { a ^= l17_shift<5>(g); }
+    if (cc & 2u) { a ^= l17_shift<6>(g); }
+    if (cc & 4u) { a ^= l17_shift<7>(g); }
+    const uint4 e1 = l17_shift<1>(g);
+    const uint4 f0 = l17_shift<4>(g);
+    const uint i = ((lid >> 5) << 8) + (cc << 5) + (aa << 2);
+    tab[i] = a;
+    tab[i + 1u] = a ^ g;
+    tab[i + 2u] = a ^ e1;
+    tab[i + 3u] = a ^ g ^ e1;
+    const uint4 q = a ^ f0;
+    tab[i + 16u] = q;
+    tab[i + 17u] = q ^ g;
+    tab[i + 18u] = q ^ e1;
+    tab[i + 19u] = q ^ g ^ e1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template<bool RIGHT>
+static inline uint4 l17_word(uint w, threadgroup const uint4* tab) {
+    const uint4 a = tab[w & 255u] ^ tab[256u + ((w >> 8) & 255u)];
+    const uint4 b = tab[(w >> 16) & 255u] ^ tab[256u + (w >> 24)];
+    const uint lo_a = RIGHT ? a.w : a.x;
+    const uint lo_b = RIGHT ? b.w : b.x;
+    return uint4(lo_a ^ (lo_b << 16),
+                 a.y ^ (lo_b >> 16) ^ (b.y << 16),
+                 a.z ^ (b.y >> 16) ^ (b.z << 16),
+                 b.z >> 16);
+}
+
+template<bool RIGHT>
+static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
+    uint4 low = l17_word<RIGHT>(v.x, tab);
+    uint4 t = l17_word<RIGHT>(v.y, tab);
+    low.yzw ^= t.xyz;
+    uint3 high = uint3(t.w, 0u, 0u);
+    t = l17_word<RIGHT>(v.z, tab);
+    low.zw ^= t.xy;
+    high.xy ^= t.zw;
+    t = l17_word<RIGHT>(v.w, tab);
+    low.w ^= t.x;
+    high ^= t.yzw;
+    low.xyz ^= high ^ (high << 1) ^ (high << 2) ^ (high << 7);
+    low.yz ^= (high.xy >> 31) ^ (high.xy >> 30) ^ (high.xy >> 25);
+    return low;
+}
+
+#define L17_BF(R, U, V)                                                      \
+    {                                                                        \
+        const uint4 nu = elems[U] ^ l17_mul<R>(elems[V], tabB);             \
+        elems[U] = nu;                                                       \
+        elems[V] ^= nu;                                                      \
+    }
+
+"#;
+
+    /// The fused leaf kernel's sub-layer 1 with the sibling table: twiddle
+    /// `c = 0` on pairs (0, 4)..(3, 7), `c = 1` on (8, 12)..(11, 15), as the
+    /// two `NTT_T3_MID` calls it replaces.
+    const L17_SIBLING_CALL: &str = "        {
+            const uint i17 = (1u << (P.l + 1u)) - 1u + (B << 1);
+            l17_build(tabB, twiddles[i17], twiddles[i17 + 1u], lid);
+        }
+        L17_BF(false, 0u, 4u)
+        L17_BF(false, 1u, 5u)
+        L17_BF(false, 2u, 6u)
+        L17_BF(false, 3u, 7u)
+        L17_BF(true, 8u, 12u)
+        L17_BF(true, 9u, 13u)
+        L17_BF(true, 10u, 14u)
+        L17_BF(true, 11u, 15u)
+";
+
+    /// `src` (a fused final-leaf source) with the layer-17 sibling table:
+    /// the helpers before the leaf kernel and its sub-layer 1 replaced.
+    /// `None` if an anchor drifted.
+    fn with_l17_sibling(src: &str) -> Option<String> {
+        let calls = "        NTT_T3_MID(1u, 0u)\n        NTT_T3_MID(1u, 1u)\n";
+        let entry = "[[max_total_threads_per_threadgroup(64)]]\nkernel void ntt_final_t3_leaf(";
+        if src.matches(calls).count() != 1 || src.matches(entry).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(calls, L17_SIBLING_CALL, 1).replacen(entry, &format!("{L17_SIBLING_FNS}{entry}"), 1))
+    }
+
     pub(crate) fn final_leaf_msl_source() -> String {
         let extra: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(NTT_FINAL_LEAF_EXTRA_MSL);
         let extra = if super::gpu_t3_bytetab_enabled() {
@@ -9210,6 +9338,11 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
         let extra: std::borrow::Cow<'static, str> = if super::gpu_t3_bytetab2_enabled() {
             let old = "        NTT_T3_SHORT_PAIR(2u, 0u)\n        NTT_T3_SHORT_PAIR(2u, 2u)\n";
             if extra.matches(old).count() == 1 { extra.replacen(old, T3_BYTETAB2, 1).into() } else { extra }
+        } else {
+            extra
+        };
+        let extra: std::borrow::Cow<'static, str> = if super::gpu_l17_sibling_enabled() {
+            with_l17_sibling(&extra).map_or(extra, Into::into)
         } else {
             extra
         };
@@ -25409,6 +25542,10 @@ kernel void zc_r2_horner_oracle(
         /// R2-CS steal (`super::ENV_NO_R2_STEAL`): a timed R2-CS prefix of the
         /// steal kernel; `None` = the record's join.
         steal: Option<ZcR2Steal>,
+        /// R2 C capture (`crate::zerocheck::univariate_skip_optimized::ENV_NO_R2_C_CAPTURE`):
+        /// this timed R2-CS prefix ran the b == 1 kernel with the capture's
+        /// pairs left out of its sums.
+        pure: bool,
     }
 
     /// The R2-CS steal's claims (`super::ENV_NO_R2_STEAL`): `next` = the
@@ -25531,6 +25668,13 @@ kernel void zc_r2_horner_oracle(
             self.cs.is_some() && !self.calibration
         }
 
+        /// R2 C capture: this timed R2-CS prefix left the capture's pairs
+        /// (head pairs 0..8, pairs 118 and 119 of every block) out of its
+        /// products and lookahead sums.
+        pub(crate) fn pure_active(&self) -> bool {
+            self.pure
+        }
+
         /// R2-CS steal (`super::ENV_NO_R2_STEAL`): this timed prefix's steal
         /// control, `None` = the record's join.
         pub(crate) fn steal(&self) -> Option<&ZcR2Steal> {
@@ -25582,6 +25726,7 @@ kernel void zc_r2_horner_oracle(
         horner: bool,
         cs: Option<&ZcR2CsBind>,
         signal: Option<u64>,
+        pure: bool,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -25625,13 +25770,14 @@ kernel void zc_r2_horner_oracle(
             if let Some(bind) = cs {
                 // R2-CS: the compact state, its layout and the head flag.
                 let l = &bind.layout;
+                // `pad0`: R2 C capture (read only by `r2cs_fast2.metal`).
                 let lp: [u32; 8] = [
                     u32::from(l.hc),
                     l.a_base as u32,
                     l.a_stride as u32,
                     l.d_base as u32,
                     l.d_stride as u32,
-                    0,
+                    u32::from(pure),
                     0,
                     0,
                 ];
@@ -25891,6 +26037,7 @@ kernel void zc_r2_horner_oracle(
                     // The primer never stores compact state (R2-CS probe).
                     None,
                     None,
+                    false,
                 )?;
                 state.prefetch_cb = cb;
                 Ok(())
@@ -25943,6 +26090,7 @@ kernel void zc_r2_horner_oracle(
             None,
             None,
             usize::MAX,
+            false,
         )
     }
 
@@ -25975,6 +26123,7 @@ kernel void zc_r2_horner_oracle(
         cs_layout: Option<ZcR2CsLayout>,
         cs_live: Option<(usize, usize, usize)>,
         ab_ready_chunks: usize,
+        pure: bool,
     ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
@@ -26200,6 +26349,9 @@ kernel void zc_r2_horner_oracle(
                 let word = if steal_value.is_some() { chunks as u32 } else { u32::MAX };
                 gpu.buffer_contents(state.steal_cut_buf).cast::<u32>().write_volatile(word);
             }
+            // R2 C capture: only a timed R2-CS prefix of the b == 1 kernel
+            // (`r2cs_fast2.metal`) leaves the capture's pairs out.
+            let pure = pure && timed_cs.is_some() && r2cs_fast::fast2_selected();
             let cb = zc_r2_submit(
                 gpu,
                 &state,
@@ -26212,6 +26364,7 @@ kernel void zc_r2_horner_oracle(
                 horner,
                 timed_cs.map(|(bind, _)| bind),
                 steal_value,
+                pure,
             )
             .ok()?;
             let steal = steal_value.map(|value| ZcR2Steal {
@@ -26238,6 +26391,7 @@ kernel void zc_r2_horner_oracle(
                     horner,
                     Some(bind),
                     None,
+                    false,
                 )
                 .unwrap_or(NIL),
                 None => NIL,
@@ -26267,6 +26421,7 @@ kernel void zc_r2_horner_oracle(
                 cs_cb,
                 _cs_views,
                 steal,
+                pure,
             })
         }
     }
@@ -26728,6 +26883,7 @@ kernel void zc_r2_horner_oracle(
                     job.horner,
                     None,
                     None,
+                    false,
                 ) else {
                     break;
                 };

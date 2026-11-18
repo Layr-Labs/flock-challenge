@@ -132,6 +132,16 @@ fn cascade4_off() -> bool {
 pub(crate) static ZC_CASCADE5_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Kill switch for the terminal tri lookahead reuse: exactly
+/// `FLOCK_NO_TRI_LOOKAHEAD_REUSE=1` keeps the record's tail, where the last tri
+/// pass's two lookahead messages are dropped and the first two numeric loop
+/// rounds rebuild them by binding and scanning the arrays. Read once per
+/// process. Same messages, same transcript, same bytes.
+fn tri_lookahead_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TRI_LOOKAHEAD_REUSE").is_none_or(|v| v != *"1"))
+}
+
 /// `FLOCK_NO_ZC_CASCADE5=1` restores the cascade4 i=8/i=9 tail route for an
 /// exact same-binary A/B. Production defaults to the fifth cascade.
 #[inline]
@@ -565,6 +575,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
+    // Round-two C capture (`univariate_skip_optimized::ENV_NO_R2_C_CAPTURE`):
+    // only this prove's round one may set it.
+    crate::zerocheck::univariate_skip_optimized::r2_c_capture_clear();
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
         assert!(
             capture_s_hat_v_c,
@@ -1223,7 +1236,45 @@ fn prove_packed_padded_inner<C: Challenger>(
                     }
                 }
                 crate::gpu_commit::lc_gpu_wake_fire(99);
-                let loop_start = mlv_rhos.len() - 1;
+                let mut loop_start = mlv_rhos.len() - 1;
+                // The last tri pass's two lookaheads are the messages of the
+                // first two numeric rounds (the next tri pass would have
+                // consumed them the same way, see the top of this loop): use
+                // them, then bind the numeric arrays at both draws instead of
+                // binding and scanning them for those messages. The loop
+                // below starts two rounds later on the same arrays.
+                if let Some((la, la2)) = pending.take().filter(|_| {
+                    tri_steps > 0
+                        && tri_lookahead_reuse_enabled()
+                        && loop_start + 2 <= n_mlv - 1
+                        && cur_a.len() >= 8
+                }) {
+                    let t_s = std::time::Instant::now();
+                    let n_in = cur_a.len();
+                    let k = mlv_rhos.len();
+                    let (n1, ninf) = eval_round3_lookahead(&la, mlv_rhos[k - 1]);
+                    multilinear_msgs.push((n1, ninf));
+                    challenger.observe_f128(n1);
+                    challenger.observe_f128(ninf);
+                    mlv_rhos.push(challenger.sample_f128());
+                    let (n1, ninf) = multilinear::eval_lookahead2(&la2, mlv_rhos[k - 1], mlv_rhos[k]);
+                    multilinear_msgs.push((n1, ninf));
+                    challenger.observe_f128(n1);
+                    challenger.observe_f128(ninf);
+                    mlv_rhos.push(challenger.sample_f128());
+                    fold_in_place_pair(&mut cur_a, &mut cur_b, mlv_rhos[k - 1]);
+                    fold_in_place_pair(&mut cur_a, &mut cur_b, mlv_rhos[k]);
+                    loop_start += 2;
+                    if tail_round_timing {
+                        eprintln!(
+                            "[zc-tail-rounds] tri lookahead reuse (rounds of loop i={}, {}; binds n={n_in}->{}): {:.3} ms",
+                            loop_start - 2,
+                            loop_start - 1,
+                            cur_a.len(),
+                            t_s.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                }
                 (cur_a, cur_b, loop_start)
             } else if use_cascade3 {
                 // Level three: the composed 5+6 pass additionally carries the
@@ -1541,7 +1592,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         mlv_rhos.push(challenger.sample_f128());
         if tail_round_timing {
             eprintln!(
-                "[zc-tail-rounds] loop i={i} (log_n {log_n_before}): {:.2} ms",
+                "[zc-tail-rounds] loop i={i} (log_n {log_n_before}): {:.3} ms",
                 t_round_i.elapsed().as_secs_f64() * 1e3
             );
         }
