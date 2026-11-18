@@ -604,37 +604,6 @@ pub(crate) fn lc_gpu_wake_fire(point: u32) {
     }
 }
 
-/// Opening GPU ping (`FLOCK_NO_OPEN_GPU_PING=1`, exact `1`, kills; read
-/// once). Posts one more lincheck-wake leaf dispatch (one threadgroup on the
-/// wake's private scratch pair) from the poster thread at the opening wake
-/// point `FLOCK_OPEN_PING_AT` (default 100: right after lincheck returns,
-/// ahead of the opening's first Metal grind race; 0..5 = before that L0 fold
-/// round's grind). Same no-op guards as the wake (timed proves only). It
-/// touches no prove buffer and nothing waits on it: proof bytes are
-/// unchanged.
-pub const ENV_NO_OPEN_GPU_PING: &str = "FLOCK_NO_OPEN_GPU_PING";
-
-pub fn open_gpu_ping(point: u32) {
-    static AT: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
-        if env_is_one(ENV_NO_OPEN_GPU_PING) {
-            return u32::MAX;
-        }
-        std::env::var("FLOCK_OPEN_PING_AT").ok().and_then(|v| v.parse().ok()).unwrap_or(100)
-    });
-    if point != *AT || !lc_gpu_wake_enabled() {
-        return;
-    }
-    crate::tmark::mark("open ping");
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    match lc_wake_poster() {
-        Some(poster) => {
-            LC_WAKE_POSTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            poster.unpark();
-        }
-        None => imp::lc_gpu_wake(),
-    }
-}
-
 pub(crate) fn gpu_lincheck_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());
@@ -1179,7 +1148,7 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 /// on an M1 Max balances near 740 of the 2048 chunks (13.2 ms at 512, 12.0 at
 /// 640, 11.9 at 768, 13.7 at 896); the runner's GPU is at least 2.1x this
 /// one's, so 768 stays CPU-critical there.
-const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 1024;
+const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 768;
 
 pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
 const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
@@ -16609,6 +16578,7 @@ kernel void blake3_pow_seg_tail(
         // the tilted split is what the dead-store check, the byte
         // verification and publication below see.
         let tilt = super::split_cpu_tilt256();
+        let diag_base = chosen;
         let chosen = if tilt > 0 && chosen != 0 {
             let tilted = tilt_split_toward_cpu(
                 chosen,
@@ -16626,6 +16596,11 @@ kernel void blake3_pow_seg_tail(
         } else {
             chosen
         };
+        // Diagnostic run (self-test print, `FLOCK_TMARK` only): this
+        // worker's arm tilt and the split it publishes.
+        if crate::tmark::env_on() {
+            eprintln!("[diag39] tuned split: tilt +{tilt}/256 base k={diag_base} -> k={chosen}");
+        }
 
         let matches_reference = || {
             cpu_codeword.len() == params.codeword_len_f128()
@@ -20557,7 +20532,6 @@ kernel void zc_eq_rows(
                         let measured = u_gpu / u_cpu;
                         let ratio = lincheck_fold_forced_ratio().unwrap_or(measured);
                         let g = lincheck_gate_share(ratio, self.n_claims, self.plan.factored_b4);
-                        let g = lincheck_gate_bias(g, self.n_claims, self.plan.factored_b4);
                         self.arm
                             .tuned()
                             .store(g, std::sync::atomic::Ordering::Relaxed);
@@ -20844,32 +20818,6 @@ kernel void zc_eq_rows(
             n_claims * 5 / 8
         };
         share.clamp(0.0, cap as f64) as usize
-    }
-
-    /// Lincheck gate GPU-ward bias (`FLOCK_NO_LC_GATE_BIAS=1`, exact `1`,
-    /// kills; `FLOCK_LC_GATE_BIAS=N` sets it; default 2 claims; read once).
-    /// The gate prices the GPU from warm-up replays of the FULL claim range
-    /// back to back (M4 Pro: 5.4-5.9 ms for 64 claims, 0.086 ms/claim),
-    /// but the timed prove's prefix runs at 0.060 ms/claim (2.47 ms for 41
-    /// claims) next to a CPU suffix that ends 0.2-0.4 ms later, so the
-    /// published share sits CPU-ward of the timed balance point. Measured
-    /// with fixed shares (FLOCK_LINCHECK_GPU_CLAIMS, 20 same-seed rounds):
-    /// lincheck span 39: +0.55 ms, 41: +0.14, 43: best, 45: +0.06, 47: +0.13.
-    /// A nonzero share moves `bias` claims GPU-ward, inside the same cap; a
-    /// share of 0 (GPU off) stays 0. Which device folds which claims never
-    /// changes the bytes.
-    fn lincheck_gate_bias(g: usize, n_claims: usize, factored_b4: bool) -> usize {
-        static BIAS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-            if std::env::var("FLOCK_NO_LC_GATE_BIAS").is_ok_and(|v| v == "1") {
-                return 0;
-            }
-            std::env::var("FLOCK_LC_GATE_BIAS").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
-        });
-        if g == 0 {
-            return 0;
-        }
-        let cap = if factored_b4 { n_claims * 3 / 4 } else { n_claims * 5 / 8 };
-        (g + *BIAS).min(cap.max(g))
     }
 
     pub(crate) fn lincheck_gate_share(ratio: f64, n_claims: usize, factored_b4: bool) -> usize {
