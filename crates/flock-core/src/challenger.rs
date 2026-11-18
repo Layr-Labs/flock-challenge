@@ -487,6 +487,14 @@ impl Challenger for FsChallenger {
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
+        // No PoW at this site: the nonce is 0 whatever the state, so the state
+        // digest (a hasher clone and finalize) has no reader. Absorb the zero
+        // nonce exactly as below. `FLOCK_NO_POW0_DIGEST_SKIP=1` (any value)
+        // computes the digest anyway; read once per process.
+        if bits == 0 && pow0_digest_skip_enabled() {
+            self.observe_bytes(&0u64.to_le_bytes());
+            return 0;
+        }
         let kind = self.hash_kind();
         let state_digest = self.state_digest();
         // Aggregate-aware parallelism: decide on the grind's *expected hash
@@ -1908,6 +1916,13 @@ fn grind_wide_enabled() -> bool {
 }
 
 /// Smallest grind (in bits) that the Metal arm takes.
+/// See [`FsChallenger`]'s `grind_pow`: zero-bit sites skip the unused state
+/// digest unless `FLOCK_NO_POW0_DIGEST_SKIP` is set.
+fn pow0_digest_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_POW0_DIGEST_SKIP").is_none())
+}
+
 fn gpu_grind_floor_bits() -> u32 {
     if grind_wide_enabled() {
         // Race floor 16 (`FLOCK_NO_GRIND_FLOOR16=1`, exact `1`, keeps the
@@ -2527,6 +2542,27 @@ mod tests {
                     !mk().verify_pow(bad, 0),
                     "non-zero nonce {bad} must be rejected at zero-bit grinding"
                 );
+            }
+        }
+    }
+
+    /// A zero-bit grind changes the transcript exactly as absorbing the zero
+    /// nonce does (the skipped state digest has no reader), on both hashes and
+    /// after a long transcript (several BLAKE3 chunks).
+    #[test]
+    fn fs_challenger_zero_bit_grind_absorbs_only_the_zero_nonce() {
+        for kind in KINDS {
+            for len in [4usize, 5000] {
+                let mk = || {
+                    let mut ch = FsChallenger::with_hash(b"pow-test", kind);
+                    ch.observe_bytes(&vec![0xA5; len]);
+                    ch
+                };
+                let mut a = mk();
+                assert_eq!(a.grind_pow(0), 0);
+                let mut b = mk();
+                b.observe_bytes(&0u64.to_le_bytes());
+                assert_eq!(a.sample_f128_vec(3), b.sample_f128_vec(3), "{kind:?} len {len}");
             }
         }
     }
