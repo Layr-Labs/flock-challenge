@@ -565,6 +565,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
+    // Round-two C capture (`univariate_skip_optimized::ENV_NO_R2_C_CAPTURE`):
+    // only this prove's round one may set it.
+    crate::zerocheck::univariate_skip_optimized::r2_c_capture_clear();
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
         assert!(
             capture_s_hat_v_c,
@@ -1124,6 +1127,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                 mlv_rhos.push(challenger.sample_f128());
                 let mut pending = Some((la7, la8));
                 let (mut cur_a, mut cur_b) = (a2_out, b2_out);
+                // Tri pass 0's carried GPU prefix, read by pass 1.
+                let mut t0_prefix: Option<multilinear::KGpuPrefix> = None;
                 for step in 0..tri_steps {
                     let (la, la2) = pending.take().expect("tri chain carries its lookaheads");
                     let k = mlv_rhos.len();
@@ -1150,10 +1155,19 @@ fn prove_packed_padded_inner<C: Challenger>(
                     // ~1.3 ms before the lincheck GPU prefix: wake the idle
                     // GPU (see `gpu_commit::ENV_NO_LC_GPU_WAKE`).
                     crate::gpu_commit::lc_gpu_wake_fire(step as u32);
-                    let (e1, einf, la, la2) = match t56_prefix.as_ref().filter(|_| step == 0) {
-                        // SAFETY: the prefix buffers are rewritten only by
-                        // the next 5+6 GPU launch.
-                        Some(p) => multilinear::fold_cascade_t_into_packed_prefix(
+                    // Pass 0 reads the 5+6 arm's prefix; pass 1 reads the
+                    // prefix pass 0's GPU arm carried
+                    // (`gpu_commit::ENV_NO_ZC_T0_CARRY`), if any.
+                    let carried_in = match step {
+                        0 => t56_prefix.as_ref(),
+                        1 => t0_prefix.as_ref(),
+                        _ => None,
+                    };
+                    let (e1, einf, la, la2, carried_out) = match carried_in {
+                        // SAFETY: the 5+6 prefix buffers are rewritten only
+                        // by the next 5+6 GPU launch, pass 0's only by the
+                        // next prove's pass 0.
+                        Some(p) => multilinear::fold_cascade_t_into_packed_prefix_gpu(
                             &cur_a,
                             &cur_b,
                             false,
@@ -1163,16 +1177,27 @@ fn prove_packed_padded_inner<C: Challenger>(
                             &mut nb,
                             &mlv_rhos[k - 3..k],
                             &r_nx,
+                            false,
                         ),
-                        None => multilinear::fold_cascade_t_into(
-                            &cur_a,
-                            &cur_b,
-                            &mut na,
-                            &mut nb,
-                            &mlv_rhos[k - 3..k],
-                            &r_nx,
-                        ),
+                        None => {
+                            let (e1, einf, la, la2) = multilinear::fold_cascade_t_into(
+                                &cur_a,
+                                &cur_b,
+                                &mut na,
+                                &mut nb,
+                                &mlv_rhos[k - 3..k],
+                                &r_nx,
+                            );
+                            (e1, einf, la, la2, None)
+                        }
                     };
+                    // Only pass 0 can carry (its GPU arm); the leading
+                    // outputs it carried were not written into `na` / `nb`.
+                    if step == 0 {
+                        t0_prefix = carried_out;
+                    } else {
+                        assert!(carried_out.is_none(), "only tri pass 0 carries a prefix");
+                    }
                     if tail_round_timing {
                         eprintln!(
                             "[zc-tail-rounds] tri pass {step} (out n={out_n}): {:.2} ms",
@@ -1188,6 +1213,17 @@ fn prove_packed_padded_inner<C: Challenger>(
                     pending = Some((la, la2));
                     cur_a = na;
                     cur_b = nb;
+                }
+                // A single tri pass leaves nothing to read a carried prefix:
+                // write it into pass 0's outputs, which the loop below reads.
+                if tri_steps == 1 {
+                    if let Some(p) = t0_prefix.take() {
+                        // SAFETY: pass 0's buffers are rewritten only by the
+                        // next prove's pass 0.
+                        let (pa, pb) = unsafe { p.slices() };
+                        cur_a[..pa.len()].copy_from_slice(pa);
+                        cur_b[..pb.len()].copy_from_slice(pb);
+                    }
                 }
                 crate::gpu_commit::lc_gpu_wake_fire(99);
                 let loop_start = mlv_rhos.len() - 1;

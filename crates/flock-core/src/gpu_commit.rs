@@ -447,6 +447,27 @@ pub(crate) fn fold_serial_xor_enabled() -> bool {
     *ON
 }
 
+/// Live-column reduce of the stripe folds (`FLOCK_NO_FOLD_LIVE_REDUCE=1`,
+/// exactly "1", restores the full-width reduce and drain). The round-one C
+/// fold's and the lincheck fold's gather already dispatches only the column
+/// groups that hold a fold column (`i_groups`; 12 of the 16 groups of 1,024
+/// columns on the root-compacted stripe, all 16 on a full stripe). The GPU
+/// reduce still read the 64 partial rows of every one of the `k` columns,
+/// including the groups no gather wrote, and the drain XORed all `k` lanes
+/// into the CPU suffix. With this on, the reduce runs over the dispatched
+/// groups' lanes only (same kernel, same stride, fewer threadgroups) and the
+/// drain adds exactly those lanes. Lanes past them lie past every fold
+/// column; on the root stripe they are past `n_roots`, which `RootStripe`
+/// declares arbitrary and its `expand` rebuilds, and on a full stripe there
+/// are none. Same live lanes, same sums, same proof. No kernel, pipeline or
+/// buffer changes. Read once per process.
+pub const ENV_NO_FOLD_LIVE_REDUCE: &str = "FLOCK_NO_FOLD_LIVE_REDUCE";
+
+pub(crate) fn fold_live_reduce_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_FOLD_LIVE_REDUCE));
+    *ON
+}
+
 pub const ENV_NO_CB2_DONE_SIGNAL: &str = "FLOCK_NO_CB2_DONE_SIGNAL";
 
 pub(crate) fn cb2_done_signal_enabled() -> bool {
@@ -1355,6 +1376,24 @@ pub const ENV_NO_ZC_T0_GPU: &str = "FLOCK_NO_ZC_T0_GPU";
 pub(crate) fn gpu_zc_t0_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_T0_GPU).is_none());
     *ON && gpu_zc_t56_enabled()
+}
+
+/// Kill switch for the tri pass 0 carry (`FLOCK_NO_ZC_T0_CARRY=1`, exactly
+/// "1": every chunk the queue takes from the GPU is copied into the pass's
+/// CPU output ranges, as before). With the carry on, the chunks the pass-0
+/// queue takes from the GPU (always the contiguous run `0..taken` in a
+/// ranked prove) stay in the arm's output buffers and tri pass 1 reads its
+/// leading inputs there, as pass 0 reads the 5+6 arm's and the 5+6 pass the
+/// K arm's: `taken x 2 x 1024 x 16` bytes are no longer copied (read and
+/// written) by the CPU. The slots of a taken chunk still go to its partial
+/// row. The oracle prove and the forced-share test hook keep the copy.
+/// Same values in the same order: identical proof. Read once per process.
+pub const ENV_NO_ZC_T0_CARRY: &str = "FLOCK_NO_ZC_T0_CARRY";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_zc_t0_carry_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_ZC_T0_CARRY));
+    *ON
 }
 
 /// Diagnostic cap on the tri pass 0 arm's offer, in pass-0 chunks
@@ -20412,13 +20451,17 @@ kernel void zc_eq_rows(
                 return Err("GPU eq rows failed".to_string());
             }
             assert_eq!(dst.len(), self.k);
+            // Live-column reduce (`ENV_NO_FOLD_LIVE_REDUCE`): the reduce
+            // wrote the dispatched groups' lanes only; add exactly those.
+            let lanes = zc_fold_reduce_lanes(&self.plan);
+            let dst = &mut dst[..lanes];
             // SAFETY: the command buffer completed, so the shared-storage
-            // result is visible to the CPU; `out_buf` holds exactly `k`
+            // result is visible to the CPU; `out_buf` holds `k >= lanes`
             // 16-byte lanes and is not aliased by `dst`.
             let src = unsafe {
                 std::slice::from_raw_parts(
                     gpu.buffer_contents(out_buf).cast::<F128>().cast_const(),
-                    self.k,
+                    lanes,
                 )
             };
             if super::fold_serial_xor_enabled() {
@@ -20441,10 +20484,13 @@ kernel void zc_eq_rows(
             if self.arm.debug() {
                 eprintln!(
                     "{} prefix {}/{} claims: gpu={gpu_ms:.2}ms submit-to-drain={wall_ms:.2}ms \
-                     head={head_ms:.2}ms cpu-suffix={suffix_ms:.2}ms",
+                     head={head_ms:.2}ms cpu-suffix={suffix_ms:.2}ms reduce-lanes={lanes}/{} \
+                     gather-groups={}",
                     self.arm.tag(),
                     self.claim_lo,
                     self.n_claims,
+                    self.k,
+                    self.plan.i_groups,
                 );
             }
             if self.arm == FoldArm::Zc {
@@ -21157,6 +21203,18 @@ kernel void zc_eq_rows(
         i_groups: usize,
     }
 
+    /// Output lanes the reduce writes and the drain adds: the dispatched
+    /// column groups' lanes with the live-column reduce on
+    /// ([`super::ENV_NO_FOLD_LIVE_REDUCE`]), else all `k`. A multiple of
+    /// [`ZC_FOLD_TG`] either way (`k` and the group width are).
+    fn zc_fold_reduce_lanes(plan: &ZcFoldPlan) -> usize {
+        if super::fold_live_reduce_enabled() {
+            (plan.i_groups * ZC_FOLD_COLS_PER_TG).min(plan.k)
+        } else {
+            plan.k
+        }
+    }
+
     unsafe fn zc_fold_submit(gpu: &Gpu, state: &ZcFold, plan: &ZcFoldPlan) -> Result<Id, String> {
         unsafe { zc_fold_submit_sig(gpu, state, plan, false).map(|(cb, _)| cb) }
     }
@@ -21233,7 +21291,10 @@ kernel void zc_eq_rows(
             gpu.set_buffer(enc, state.part_buf, 0, 0);
             gpu.set_buffer(enc, state.out_buf, 0, 1);
             gpu.set_bytes(enc, reduce_bytes, 2);
-            gpu.dispatch(enc, (plan.k / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
+            // Live-column reduce (`ENV_NO_FOLD_LIVE_REDUCE`): the lanes of
+            // the dispatched column groups only; the partial row stride
+            // stays `k` (`reduce_params`).
+            gpu.dispatch(enc, (zc_fold_reduce_lanes(plan) / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
             gpu.end_encoding(enc);
             let sig = if arm_sig { gpu.arm_done(cb) } else { None };
             let cb_eq = cb_eq.map(|c| {
@@ -24981,6 +25042,10 @@ kernel void zc_r2_horner_oracle(
         /// R2-CS steal (`super::ENV_NO_R2_STEAL`): a timed R2-CS prefix of the
         /// steal kernel; `None` = the record's join.
         steal: Option<ZcR2Steal>,
+        /// R2 C capture (`crate::zerocheck::univariate_skip_optimized::ENV_NO_R2_C_CAPTURE`):
+        /// this timed R2-CS prefix ran the b == 1 kernel with the capture's
+        /// pairs left out of its sums.
+        pure: bool,
     }
 
     /// The R2-CS steal's claims (`super::ENV_NO_R2_STEAL`): `next` = the
@@ -25103,6 +25168,13 @@ kernel void zc_r2_horner_oracle(
             self.cs.is_some() && !self.calibration
         }
 
+        /// R2 C capture: this timed R2-CS prefix left the capture's pairs
+        /// (head pairs 0..8, pairs 118 and 119 of every block) out of its
+        /// products and lookahead sums.
+        pub(crate) fn pure_active(&self) -> bool {
+            self.pure
+        }
+
         /// R2-CS steal (`super::ENV_NO_R2_STEAL`): this timed prefix's steal
         /// control, `None` = the record's join.
         pub(crate) fn steal(&self) -> Option<&ZcR2Steal> {
@@ -25154,6 +25226,7 @@ kernel void zc_r2_horner_oracle(
         horner: bool,
         cs: Option<&ZcR2CsBind>,
         signal: Option<u64>,
+        pure: bool,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -25197,13 +25270,14 @@ kernel void zc_r2_horner_oracle(
             if let Some(bind) = cs {
                 // R2-CS: the compact state, its layout and the head flag.
                 let l = &bind.layout;
+                // `pad0`: R2 C capture (read only by `r2cs_fast2.metal`).
                 let lp: [u32; 8] = [
                     u32::from(l.hc),
                     l.a_base as u32,
                     l.a_stride as u32,
                     l.d_base as u32,
                     l.d_stride as u32,
-                    0,
+                    u32::from(pure),
                     0,
                     0,
                 ];
@@ -25463,6 +25537,7 @@ kernel void zc_r2_horner_oracle(
                     // The primer never stores compact state (R2-CS probe).
                     None,
                     None,
+                    false,
                 )?;
                 state.prefetch_cb = cb;
                 Ok(())
@@ -25515,6 +25590,7 @@ kernel void zc_r2_horner_oracle(
             None,
             None,
             usize::MAX,
+            false,
         )
     }
 
@@ -25547,6 +25623,7 @@ kernel void zc_r2_horner_oracle(
         cs_layout: Option<ZcR2CsLayout>,
         cs_live: Option<(usize, usize, usize)>,
         ab_ready_chunks: usize,
+        pure: bool,
     ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
@@ -25772,6 +25849,9 @@ kernel void zc_r2_horner_oracle(
                 let word = if steal_value.is_some() { chunks as u32 } else { u32::MAX };
                 gpu.buffer_contents(state.steal_cut_buf).cast::<u32>().write_volatile(word);
             }
+            // R2 C capture: only a timed R2-CS prefix of the b == 1 kernel
+            // (`r2cs_fast2.metal`) leaves the capture's pairs out.
+            let pure = pure && timed_cs.is_some() && r2cs_fast::fast2_selected();
             let cb = zc_r2_submit(
                 gpu,
                 &state,
@@ -25784,6 +25864,7 @@ kernel void zc_r2_horner_oracle(
                 horner,
                 timed_cs.map(|(bind, _)| bind),
                 steal_value,
+                pure,
             )
             .ok()?;
             let steal = steal_value.map(|value| ZcR2Steal {
@@ -25810,6 +25891,7 @@ kernel void zc_r2_horner_oracle(
                     horner,
                     Some(bind),
                     None,
+                    false,
                 )
                 .unwrap_or(NIL),
                 None => NIL,
@@ -25839,6 +25921,7 @@ kernel void zc_r2_horner_oracle(
                 cs_cb,
                 _cs_views,
                 steal,
+                pure,
             })
         }
     }
@@ -26300,6 +26383,7 @@ kernel void zc_r2_horner_oracle(
                     job.horner,
                     None,
                     None,
+                    false,
                 ) else {
                     break;
                 };
