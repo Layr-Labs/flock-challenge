@@ -447,6 +447,27 @@ pub(crate) fn fold_serial_xor_enabled() -> bool {
     *ON
 }
 
+/// Live-column reduce of the stripe folds (`FLOCK_NO_FOLD_LIVE_REDUCE=1`,
+/// exactly "1", restores the full-width reduce and drain). The round-one C
+/// fold's and the lincheck fold's gather already dispatches only the column
+/// groups that hold a fold column (`i_groups`; 12 of the 16 groups of 1,024
+/// columns on the root-compacted stripe, all 16 on a full stripe). The GPU
+/// reduce still read the 64 partial rows of every one of the `k` columns,
+/// including the groups no gather wrote, and the drain XORed all `k` lanes
+/// into the CPU suffix. With this on, the reduce runs over the dispatched
+/// groups' lanes only (same kernel, same stride, fewer threadgroups) and the
+/// drain adds exactly those lanes. Lanes past them lie past every fold
+/// column; on the root stripe they are past `n_roots`, which `RootStripe`
+/// declares arbitrary and its `expand` rebuilds, and on a full stripe there
+/// are none. Same live lanes, same sums, same proof. No kernel, pipeline or
+/// buffer changes. Read once per process.
+pub const ENV_NO_FOLD_LIVE_REDUCE: &str = "FLOCK_NO_FOLD_LIVE_REDUCE";
+
+pub(crate) fn fold_live_reduce_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_FOLD_LIVE_REDUCE));
+    *ON
+}
+
 pub const ENV_NO_CB2_DONE_SIGNAL: &str = "FLOCK_NO_CB2_DONE_SIGNAL";
 
 pub(crate) fn cb2_done_signal_enabled() -> bool {
@@ -1357,6 +1378,24 @@ pub(crate) fn gpu_zc_t0_enabled() -> bool {
     *ON && gpu_zc_t56_enabled()
 }
 
+/// Kill switch for the tri pass 0 carry (`FLOCK_NO_ZC_T0_CARRY=1`, exactly
+/// "1": every chunk the queue takes from the GPU is copied into the pass's
+/// CPU output ranges, as before). With the carry on, the chunks the pass-0
+/// queue takes from the GPU (always the contiguous run `0..taken` in a
+/// ranked prove) stay in the arm's output buffers and tri pass 1 reads its
+/// leading inputs there, as pass 0 reads the 5+6 arm's and the 5+6 pass the
+/// K arm's: `taken x 2 x 1024 x 16` bytes are no longer copied (read and
+/// written) by the CPU. The slots of a taken chunk still go to its partial
+/// row. The oracle prove and the forced-share test hook keep the copy.
+/// Same values in the same order: identical proof. Read once per process.
+pub const ENV_NO_ZC_T0_CARRY: &str = "FLOCK_NO_ZC_T0_CARRY";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_zc_t0_carry_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_ZC_T0_CARRY));
+    *ON
+}
+
 /// Diagnostic cap on the tri pass 0 arm's offer, in pass-0 chunks
 /// (`FLOCK_ZC_T0_GPU_CHUNKS=<n>`); unset = every chunk whose input is on the
 /// GPU.
@@ -1413,6 +1452,32 @@ pub(crate) fn gpu_l1_merkle_overlap_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the L2 recursive-commit NTT/Merkle-leaf overlap
+/// (`FLOCK_NO_L2_MERKLE_OVERLAP`, any value): the L2 commit (2^16 leaves of
+/// 128 bytes) builds its tree with the CPU subtree builder after the
+/// transform, and nothing is pinned, wrapped or allocated for it. Without it,
+/// once the L1 overlap's warmup race has latched ON, the L2 commit runs the
+/// same overlap session on its own tree buffer, latch and reserved pinned
+/// codeword (`scratch::take_f128_pinned3`): each finalized NTT chunk's leaves
+/// are hashed by the same `leaf_hash128` kernel while the transform still
+/// runs, the internal levels follow the cover-completing batch, and the tree
+/// is read only after every command buffer of the session has completed.
+/// The first such L2 commit (the warmup prove) byte-compares the overlapped
+/// tree with the CPU builder's tree over the same codeword and keeps the CPU
+/// tree; a mismatch or any failure latches Off for the process.
+/// `FLOCK_NO_L1_MERKLE_OVERLAP` and `FLOCK_NO_GPU_RECURSIVE_MERKLE` turn it
+/// off as well. Read once per process. Same bytes.
+pub const ENV_NO_L2_MERKLE_OVERLAP: &str = "FLOCK_NO_L2_MERKLE_OVERLAP";
+
+pub(crate) fn gpu_l2_merkle_overlap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_L2_MERKLE_OVERLAP).is_none())
+}
+
+/// Leaf count of the L2 recursive commitment (`log_msg_cols = 13`, eight
+/// lanes, `log_inv_rate = 3`), the second shape the overlap session serves.
+pub(crate) const L2_OVERLAP_LEAVES: usize = 1 << 16;
+
 /// Admission latch for the L1 overlap: the first eligible L1 commit in the
 /// process (the warmup prove — the L1 shape is FS-serial, so there is exactly
 /// one first) dual-runs overlapped-then-incumbent, byte-compares the trees,
@@ -1427,6 +1492,57 @@ const L1_OVERLAP_ON: u8 = 1;
 const L1_OVERLAP_OFF: u8 = 2;
 static L1_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(L1_OVERLAP_UNMEASURED);
+
+/// The L2 shape's admission latch (`ENV_NO_L2_MERKLE_OVERLAP`), same states.
+/// An L2 session opens only while the L1 latch is ON (the L1 warmup race is
+/// the process's timing verdict on the overlap); this latch is decided by the
+/// first L2 session's byte compare alone, with no race of its own.
+static L2_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(L1_OVERLAP_UNMEASURED);
+
+/// Whether an L2 overlap session may open: every switch on and the L1 latch
+/// ON.
+fn l2_overlap_admitted() -> bool {
+    gpu_l1_merkle_overlap_enabled()
+        && gpu_recursive_merkle_enabled()
+        && gpu_l2_merkle_overlap_enabled()
+        && L1_OVERLAP_LATCH.load(std::sync::atomic::Ordering::Acquire) == L1_OVERLAP_ON
+}
+
+/// Codeword storage for an L2 commit when the reserved slot has none parked.
+/// The first L2 commit that may overlap (admitted, latch unmeasured) gets one
+/// fresh exact-size allocation, registered as the reserved pinned L2 codeword
+/// (`give_f128` parks it in that slot, and the L2 session wraps no other
+/// address); every other call takes an ordinary pooled buffer.
+pub(crate) fn l2_overlap_codeword(n: usize) -> Vec<F128> {
+    if l2_overlap_admitted()
+        && L2_OVERLAP_LATCH.load(std::sync::atomic::Ordering::Acquire) == L1_OVERLAP_UNMEASURED
+    {
+        let v = crate::alloc_uninit_vec(n);
+        crate::scratch::pin3_f128_allocation(&v);
+        return v;
+    }
+    crate::scratch::take_f128(n)
+}
+
+/// Publish the first L2 session's check: ON only when the overlapped tree
+/// equals the CPU builder's tree byte for byte; a mismatch or no overlapped
+/// tree (`None`) latches Off for the process. Prints one line under the open
+/// timing env that gates `[recursive-commit L2]`.
+pub(crate) fn l2_overlap_report(overlap_ms: f64, cpu_tree_ms: f64, equal: Option<bool>) {
+    let on = equal == Some(true);
+    let decision = if on { L1_OVERLAP_ON } else { L1_OVERLAP_OFF };
+    L2_OVERLAP_LATCH.store(decision, std::sync::atomic::Ordering::Release);
+    if std::env::var_os("LIG_PROVE_TRACE").is_some()
+        || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+    {
+        eprintln!(
+            "    [l2-overlap] warmup check: leaves={L2_OVERLAP_LEAVES} overlapped pass \
+             {overlap_ms:.2} ms, cpu tree {cpu_tree_ms:.2} ms, trees_equal={equal:?} -> latch {}",
+            if on { "ON" } else { "OFF" }
+        );
+    }
+}
 
 /// Latch margin for the warmup race. The race necessarily runs the arms
 /// back-to-back on a hot GPU/SLC — a regime that can only SHRINK the
@@ -1462,7 +1578,7 @@ pub(crate) fn l1_overlap_report(overlap_wall_ms: f64, incumbent_wall_ms: f64, eq
         }
         None => L1_OVERLAP_OFF,
     };
-    L1_OVERLAP_LATCH.store(decision, std::sync::atomic::Ordering::Relaxed);
+    L1_OVERLAP_LATCH.store(decision, std::sync::atomic::Ordering::Release);
     if gpu_zc_r2_debug() {
         eprintln!(
             "[l1-overlap] warmup race: overlapped {overlap_wall_ms:.2} ms vs incumbent \
@@ -1490,10 +1606,11 @@ pub(crate) struct L1MerkleOverlap {
     measuring: bool,
 }
 
-/// Open an overlap session for one eligible L1 commit, or `None` whenever the
-/// arm must stay on the incumbent path (kill switches, latch Off, non-L1
-/// shape, Metal init/wrap failure). All init and wrap-cache costs are paid
-/// here, before the caller starts its race clocks.
+/// Open an overlap session for one eligible L1 commit (or L2 commit, see
+/// [`ENV_NO_L2_MERKLE_OVERLAP`]), or `None` whenever the arm must stay on
+/// the incumbent path (kill switches, that shape's latch Off, L1 latch not ON
+/// for L2, other shapes, Metal init/wrap failure). All init and wrap-cache
+/// costs are paid here, before the caller starts its race clocks.
 pub(crate) fn gpu_l1_merkle_overlap_begin(
     data_ptr: *const u8,
     data_len: usize,
@@ -1502,7 +1619,14 @@ pub(crate) fn gpu_l1_merkle_overlap_begin(
     if !gpu_l1_merkle_overlap_enabled() || !gpu_recursive_merkle_enabled() {
         return None;
     }
-    let latch = l1_overlap_latch_state();
+    let latch = if num_leaves == L2_OVERLAP_LEAVES {
+        if !l2_overlap_admitted() {
+            return None;
+        }
+        L2_OVERLAP_LATCH.load(std::sync::atomic::Ordering::Acquire)
+    } else {
+        l1_overlap_latch_state()
+    };
     if latch == L1_OVERLAP_OFF {
         return None;
     }
@@ -1531,10 +1655,11 @@ impl L1MerkleOverlap {
     }
 
     /// [`Self::finish`] without the copy-out: on success returns the flat
-    /// tree as `(address, node count)` inside the process-persistent L1 tree
-    /// buffer (shared storage, every command buffer drained). The view stays
-    /// valid until the next 2^18-leaf recursive Merkle dispatch, i.e. the next
-    /// prove's L1 commit; the caller must drop it before then.
+    /// tree as `(address, node count)` inside the process-persistent tree
+    /// buffer of the session's shape (shared storage, every command buffer
+    /// drained). The view stays valid until the next recursive Merkle
+    /// dispatch of that shape (2^18 leaves: the next prove's L1 commit; 2^16:
+    /// the next prove's L2 commit); the caller must drop it before then.
     pub(crate) fn finish_view(self) -> Option<(usize, usize)> {
         self.inner.finish_view()
     }
@@ -3017,6 +3142,38 @@ pub(crate) fn gpu_final_leaf_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
 }
 
+/// Layer-17 sibling table (`FLOCK_NO_L17_SIBLING`, any value, keeps the
+/// record's two split-table builds): in the ranked fused final pass
+/// (`ntt_final_t3_leaf`), sub-layer 1 (layer `log_d - 3`, layer 17 at the
+/// ranked shape) multiplies by the tile's two twiddles `t0 = t(2B)` and
+/// `t1 = t(2B + 1)`. They differ by `Ŵ_2(β_3)` = 0x16 at every `log_d`, so
+/// their byte products share bits 32..95, and both twiddles' byte tables fit
+/// one 512-entry `uint4` table: bits 0..95 of `b * t0` and bits 0..31 of
+/// `b * t1`. One build (two barriers) instead of two (four), one indexed
+/// `uint4` read per byte instead of a `uint2` and a `uint`, and one reduction
+/// per product. Same field products, so the same codeword and leaf bytes.
+/// Read once per process, when the fused pipeline's source is made.
+pub(crate) fn gpu_l17_sibling_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_L17_SIBLING").is_none())
+}
+
+/// Lane-linear table stores in the dense g4x2 pass (layers 12..15 at the
+/// ranked size; `FLOCK_NO_G4X2_BUILD_LINEAR`, any value, keeps the record's
+/// store map). The zero-lane passes keep the record's text.
+/// The 64-thread build of a twiddle's 512-entry byte table gives thread
+/// `(bank t, lane u)` the entries `(cc << 5) | (aa << 2) | {0..3, 16..19}`,
+/// so the 32 lanes of a SIMD group store entries 64 bytes apart. Here lane
+/// `u` owns entries `u + 32 m` (`m = 0..7`): each of its eight stores writes
+/// 32 consecutive entries across the SIMD group. Entry `i` is still the XOR
+/// of the generators `t * X^b` over the set bits `b` of `i`, from the same
+/// generator chain, so every table, and the codeword, is unchanged. Read once
+/// per process, when the g4x2 source is made.
+pub(crate) fn gpu_g4x2_build_linear_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_BUILD_LINEAR").is_none())
+}
+
 pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB2").is_none())
@@ -3762,6 +3919,32 @@ pub const ENV_NO_HYBRID_CPU_TAIL_HASH: &str = "FLOCK_NO_HYBRID_CPU_TAIL_HASH";
 pub(crate) fn hybrid_cpu_tail_hash_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_HYBRID_CPU_TAIL_HASH).is_none());
+    *ON
+}
+
+/// Kill switch for the late CPU tail hash (`FLOCK_NO_LATE_TAIL_HASH`, any
+/// value: with the NTT ahead of a still running AB arm, cb3 hashes the whole
+/// CPU suffix on the GPU, as before). Read once per process.
+///
+/// Under the NTT's priority (`ENV_NO_NTT_AB_PRIORITY`) the hybrid CPU NTT is
+/// usually done while the AB arm still runs, so the CPU tail hash
+/// (`ENV_NO_HYBRID_CPU_TAIL_HASH`) never fires and cb3 is queued behind cb2
+/// over the whole suffix. When the AB arm then returns while cb2 is still
+/// running, every main-pool worker parks until cb3 ends. With this on, cb3
+/// is queued at the same moment over the same suffix in the tail hash's
+/// indirect-count form (all units on the GPU), the commit arm keeps helping
+/// the AB queue as before, and only once the AB arm has returned with cb2
+/// still running do the workers claim units from the top of the suffix,
+/// exactly as the tail hash does; if cb2 completes first, nothing is claimed
+/// and cb3 hashes every unit. Same claim rule, same units hashed by one or
+/// both sides into the same slots, same suffix levels recomputed after the
+/// join, so the root is unchanged. Not during the split tuner's sweep.
+pub const ENV_NO_LATE_TAIL_HASH: &str = "FLOCK_NO_LATE_TAIL_HASH";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn late_tail_hash_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LATE_TAIL_HASH).is_none());
     *ON
 }
 
@@ -6356,10 +6539,82 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// `FLOCK_NO_GPU_TW_PREFETCH` is set.
     fn g4x2_msl_source() -> &'static str {
         if super::gpu_tw_prefetch_enabled() {
-            NTT_G4X2_TWL_MSL_SOURCE
+            g4x2_twl_source()
         } else {
             NTT_G4X2_MSL_SOURCE
         }
+    }
+
+    /// Lane-linear table stores in the twiddle-prefetch g4x2 build (see
+    /// [`super::gpu_g4x2_build_linear_enabled`]): the build from its first
+    /// generator to its closing barrier, as in the record and lane-linear.
+    const G4X2_BUILD_TAIL_RECORD: &str = "    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);   // entry (cc << 5) | (aa << 2)
+    const uint o1 = o0 + 16u;                //   ... | 16
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+";
+    const G4X2_BUILD_TAIL_LINEAR: &str = "    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    // Entry bits 0..4 are the thread's lane u, bits 5..7 the store index m:
+    // the 32 lanes of a SIMD group store 32 consecutive entries at once.
+    uint4 A = uint4(0u);
+    if (u & 1u) { A ^= e0; }
+    if (u & 2u) { A ^= e1; }
+    if (u & 4u) { A ^= e2; }
+    if (u & 8u) { A ^= e3; }
+    if (u & 16u) { A ^= f0; }
+    const uint4 A1 = A ^ f1, A2 = A ^ f2, A3 = A1 ^ f2;
+    threadgroup uint4* dst = &tabB[(t << 8) + u];
+    dst[0u]   = A;
+    dst[32u]  = A1;
+    dst[64u]  = A2;
+    dst[96u]  = A3;
+    dst[128u] = A ^ f3;
+    dst[160u] = A1 ^ f3;
+    dst[192u] = A2 ^ f3;
+    dst[224u] = A3 ^ f3;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+";
+
+    /// The twiddle-prefetch g4x2 source of the dense pipeline (the layers
+    /// 12..15 pass): `NTT_G4X2_TWL_MSL_SOURCE`, with lane-linear table stores
+    /// unless `FLOCK_NO_G4X2_BUILD_LINEAR` is set or the anchor drifted. The
+    /// zero-lane pipeline (layers 4..7 and 8..11) keeps the record's text.
+    /// Made once per process.
+    fn g4x2_twl_source() -> &'static str {
+        static SRC: OnceLock<Option<String>> = OnceLock::new();
+        SRC.get_or_init(|| {
+            if super::gpu_g4x2_build_linear_enabled() {
+                splice_exact(NTT_G4X2_TWL_MSL_SOURCE, &[(G4X2_BUILD_TAIL_RECORD, G4X2_BUILD_TAIL_LINEAR)])
+            } else {
+                None
+            }
+        })
+        .as_deref()
+        .unwrap_or(NTT_G4X2_TWL_MSL_SOURCE)
     }
 
     /// The `NttParams` declaration shared by the g4x2 and final-pass
@@ -8850,6 +9105,118 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
 }
 "#;
 
+    /// Layer-17 sibling table (see [`super::gpu_l17_sibling_enabled`]): the
+    /// table build and the product, placed before the fused leaf kernel.
+    ///
+    /// Entry `256 p + b` holds `A = b * X^(8p) * t0` as a 96-bit polynomial
+    /// (`xyz`, unreduced: `t0` has at most 81 bits under `pass5_mixed_ok`, so
+    /// `A` stays below 2^96) and in `w` the low word of `b * X^(8p) * t1`.
+    /// `t0 + t1` has at most 16 bits, so the two products differ only in
+    /// their low word. A 32-bit word of `v` times `t` is the XOR of two such
+    /// halfword products, the second shifted by 16; the four word products,
+    /// shifted by 0, 32, 64 and 96 bits, sum to a polynomial below 2^208,
+    /// reduced once (`X^128 = X^7 + X^2 + X + 1`; the overflow has at most 80
+    /// bits, so one fold is exact).
+    const L17_SIBLING_FNS: &str = r#"
+template<uint S>
+static inline uint4 l17_shift(uint4 a) {
+    return (a << S) ^ uint4(0u, a.x >> (32u - S), a.y >> (32u - S), 0u);
+}
+
+static inline void l17_build(threadgroup uint4* tab, uint4 t0, uint4 t1, uint lid) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint4 g = uint4(t0.x, t0.y, t0.z, t1.x);
+    if (lid >= 32u) { g = l17_shift<8>(g); }
+    const uint aa = lid & 3u;
+    const uint cc = (lid & 31u) >> 2;
+    uint4 a = uint4(0u);
+    if (aa & 1u) { a ^= l17_shift<2>(g); }
+    if (aa & 2u) { a ^= l17_shift<3>(g); }
+    if (cc & 1u) { a ^= l17_shift<5>(g); }
+    if (cc & 2u) { a ^= l17_shift<6>(g); }
+    if (cc & 4u) { a ^= l17_shift<7>(g); }
+    const uint4 e1 = l17_shift<1>(g);
+    const uint4 f0 = l17_shift<4>(g);
+    const uint i = ((lid >> 5) << 8) + (cc << 5) + (aa << 2);
+    tab[i] = a;
+    tab[i + 1u] = a ^ g;
+    tab[i + 2u] = a ^ e1;
+    tab[i + 3u] = a ^ g ^ e1;
+    const uint4 q = a ^ f0;
+    tab[i + 16u] = q;
+    tab[i + 17u] = q ^ g;
+    tab[i + 18u] = q ^ e1;
+    tab[i + 19u] = q ^ g ^ e1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template<bool RIGHT>
+static inline uint4 l17_word(uint w, threadgroup const uint4* tab) {
+    const uint4 a = tab[w & 255u] ^ tab[256u + ((w >> 8) & 255u)];
+    const uint4 b = tab[(w >> 16) & 255u] ^ tab[256u + (w >> 24)];
+    const uint lo_a = RIGHT ? a.w : a.x;
+    const uint lo_b = RIGHT ? b.w : b.x;
+    return uint4(lo_a ^ (lo_b << 16),
+                 a.y ^ (lo_b >> 16) ^ (b.y << 16),
+                 a.z ^ (b.y >> 16) ^ (b.z << 16),
+                 b.z >> 16);
+}
+
+template<bool RIGHT>
+static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
+    uint4 low = l17_word<RIGHT>(v.x, tab);
+    uint4 t = l17_word<RIGHT>(v.y, tab);
+    low.yzw ^= t.xyz;
+    uint3 high = uint3(t.w, 0u, 0u);
+    t = l17_word<RIGHT>(v.z, tab);
+    low.zw ^= t.xy;
+    high.xy ^= t.zw;
+    t = l17_word<RIGHT>(v.w, tab);
+    low.w ^= t.x;
+    high ^= t.yzw;
+    low.xyz ^= high ^ (high << 1) ^ (high << 2) ^ (high << 7);
+    low.yz ^= (high.xy >> 31) ^ (high.xy >> 30) ^ (high.xy >> 25);
+    return low;
+}
+
+#define L17_BF(R, U, V)                                                      \
+    {                                                                        \
+        const uint4 nu = elems[U] ^ l17_mul<R>(elems[V], tabB);             \
+        elems[U] = nu;                                                       \
+        elems[V] ^= nu;                                                      \
+    }
+
+"#;
+
+    /// The fused leaf kernel's sub-layer 1 with the sibling table: twiddle
+    /// `c = 0` on pairs (0, 4)..(3, 7), `c = 1` on (8, 12)..(11, 15), as the
+    /// two `NTT_T3_MID` calls it replaces.
+    const L17_SIBLING_CALL: &str = "        {
+            const uint i17 = (1u << (P.l + 1u)) - 1u + (B << 1);
+            l17_build(tabB, twiddles[i17], twiddles[i17 + 1u], lid);
+        }
+        L17_BF(false, 0u, 4u)
+        L17_BF(false, 1u, 5u)
+        L17_BF(false, 2u, 6u)
+        L17_BF(false, 3u, 7u)
+        L17_BF(true, 8u, 12u)
+        L17_BF(true, 9u, 13u)
+        L17_BF(true, 10u, 14u)
+        L17_BF(true, 11u, 15u)
+";
+
+    /// `src` (a fused final-leaf source) with the layer-17 sibling table:
+    /// the helpers before the leaf kernel and its sub-layer 1 replaced.
+    /// `None` if an anchor drifted.
+    fn with_l17_sibling(src: &str) -> Option<String> {
+        let calls = "        NTT_T3_MID(1u, 0u)\n        NTT_T3_MID(1u, 1u)\n";
+        let entry = "[[max_total_threads_per_threadgroup(64)]]\nkernel void ntt_final_t3_leaf(";
+        if src.matches(calls).count() != 1 || src.matches(entry).count() != 1 {
+            return None;
+        }
+        Some(src.replacen(calls, L17_SIBLING_CALL, 1).replacen(entry, &format!("{L17_SIBLING_FNS}{entry}"), 1))
+    }
+
     pub(crate) fn final_leaf_msl_source() -> String {
         let extra: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(NTT_FINAL_LEAF_EXTRA_MSL);
         let extra = if super::gpu_t3_bytetab_enabled() {
@@ -8860,6 +9227,11 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
         let extra: std::borrow::Cow<'static, str> = if super::gpu_t3_bytetab2_enabled() {
             let old = "        NTT_T3_SHORT_PAIR(2u, 0u)\n        NTT_T3_SHORT_PAIR(2u, 2u)\n";
             if extra.matches(old).count() == 1 { extra.replacen(old, T3_BYTETAB2, 1).into() } else { extra }
+        } else {
+            extra
+        };
+        let extra: std::borrow::Cow<'static, str> = if super::gpu_l17_sibling_enabled() {
+            with_l17_sibling(&extra).map_or(extra, Into::into)
         } else {
             extra
         };
@@ -14417,6 +14789,7 @@ kernel void blake3_pow_seg_tail(
         n_leaves: usize,
         suffix_start: usize,
         force: usize,
+        after_ab: bool,
     ) -> Result<(), String> {
         let unit_levels = tail_unit_levels();
         let unit = 1usize << unit_levels;
@@ -14458,6 +14831,24 @@ kernel void blake3_pow_seg_tail(
         // Working coordinator (`super::ENV_NO_TAILHASH_COORD_WORK`): this
         // thread hashes units too, and every claimer checks cb2 first.
         let coord_work = super::tailhash_coord_work_enabled();
+        // Late tail hash (`super::ENV_NO_LATE_TAIL_HASH`): cb3 is queued over
+        // every unit while the AB arm still runs. This thread keeps helping
+        // the AB queue (as the whole-suffix cb3 path does) until the arm has
+        // returned or cb2 has completed; the claims below run only in the
+        // first case. With no claim, cb3 reads the full count written above.
+        let sig2_late = sig2.as_ref();
+        let cb2_done_late = || unsafe { gpu.cb_done(cb2_u as Id, sig2_late) };
+        let t_late = std::time::Instant::now();
+        let run_claims = if after_ab {
+            while !super::ab_arm_done() && !cb2_done_late() {
+                super::help_pool_until(|| super::ab_arm_done() || cb2_done_late());
+                std::thread::yield_now();
+            }
+            super::ab_arm_done() && !cb2_done_late()
+        } else {
+            true
+        };
+        let late_wait_ms = t_late.elapsed().as_secs_f64() * 1e3;
         let t_tail = std::time::Instant::now();
         let mut h = n_leaves;
         // Claim one unit: lower cb3's count first, then hash it.
@@ -14479,6 +14870,7 @@ kernel void blake3_pow_seg_tail(
         // cb2's completion as the caller reads it: its armed signal when
         // present (`super::ENV_NO_CB2_DONE_SIGNAL`), else the status.
         let sig2_ref = sig2.as_ref();
+        if run_claims {
         rayon::scope(|sc| {
             for _ in 0..rayon::current_num_threads() {
                 let claims = &claims;
@@ -14545,6 +14937,12 @@ kernel void blake3_pow_seg_tail(
                 }
             }
         });
+        } else {
+            // cb2 completed before the AB arm returned: keep helping the AB
+            // queue while cb3 runs, as the whole-suffix cb3 path does.
+            let sig3_ref = sig3.as_ref();
+            super::help_pool_until(|| unsafe { gpu.cb_done(cb3, sig3_ref) });
+        }
         let tail_ms = t_tail.elapsed().as_secs_f64() * 1e3;
         crate::tmark::mark("tail hash workers done");
         if sig2.is_some() && !window_trace_enabled() {
@@ -14611,6 +15009,14 @@ kernel void blake3_pow_seg_tail(
             ls = ws;
             ll /= 2;
             lo = wlo;
+        }
+        if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            eprintln!(
+                "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
+                 suffix units in {tail_ms:.2} ms",
+                if run_claims { "AB arm returned with cb2 running" } else { "cb2 completed first" },
+                (n_leaves - h) / unit,
+            );
         }
         Ok(())
     }
@@ -14767,7 +15173,17 @@ kernel void blake3_pow_seg_tail(
                             super::help_pool_until(|| super::ab_arm_done() || gpu.cb_done(cb2, sig2.as_ref()));
                             !gpu.cb_done(cb2, sig2.as_ref())
                         });
-                    if tail {
+                    // Late tail hash (see `super::ENV_NO_LATE_TAIL_HASH`): the
+                    // AB arm still runs and cb2 too, so cb3 is queued now in
+                    // the tail hash's form and the CPU claims units only if
+                    // the AB arm returns before cb2 completes.
+                    let late = ab_busy
+                        && tail_force == 0
+                        && !hybrid_arm_recording()
+                        && super::hybrid_cpu_tail_hash_enabled()
+                        && super::late_tail_hash_enabled()
+                        && !gpu.cb_done(cb2, sig2.as_ref());
+                    if tail || late {
                         hybrid_cpu_tail_hash_join(
                             gpu,
                             cb2,
@@ -14778,6 +15194,7 @@ kernel void blake3_pow_seg_tail(
                             n_leaves,
                             suffix_leaf_start,
                             tail_force,
+                            late,
                         )?;
                     } else {
                     let cb3 = gpu.command_buffer()?;
@@ -20412,13 +20829,17 @@ kernel void zc_eq_rows(
                 return Err("GPU eq rows failed".to_string());
             }
             assert_eq!(dst.len(), self.k);
+            // Live-column reduce (`ENV_NO_FOLD_LIVE_REDUCE`): the reduce
+            // wrote the dispatched groups' lanes only; add exactly those.
+            let lanes = zc_fold_reduce_lanes(&self.plan);
+            let dst = &mut dst[..lanes];
             // SAFETY: the command buffer completed, so the shared-storage
-            // result is visible to the CPU; `out_buf` holds exactly `k`
+            // result is visible to the CPU; `out_buf` holds `k >= lanes`
             // 16-byte lanes and is not aliased by `dst`.
             let src = unsafe {
                 std::slice::from_raw_parts(
                     gpu.buffer_contents(out_buf).cast::<F128>().cast_const(),
-                    self.k,
+                    lanes,
                 )
             };
             if super::fold_serial_xor_enabled() {
@@ -20441,10 +20862,13 @@ kernel void zc_eq_rows(
             if self.arm.debug() {
                 eprintln!(
                     "{} prefix {}/{} claims: gpu={gpu_ms:.2}ms submit-to-drain={wall_ms:.2}ms \
-                     head={head_ms:.2}ms cpu-suffix={suffix_ms:.2}ms",
+                     head={head_ms:.2}ms cpu-suffix={suffix_ms:.2}ms reduce-lanes={lanes}/{} \
+                     gather-groups={}",
                     self.arm.tag(),
                     self.claim_lo,
                     self.n_claims,
+                    self.k,
+                    self.plan.i_groups,
                 );
             }
             if self.arm == FoldArm::Zc {
@@ -21157,6 +21581,18 @@ kernel void zc_eq_rows(
         i_groups: usize,
     }
 
+    /// Output lanes the reduce writes and the drain adds: the dispatched
+    /// column groups' lanes with the live-column reduce on
+    /// ([`super::ENV_NO_FOLD_LIVE_REDUCE`]), else all `k`. A multiple of
+    /// [`ZC_FOLD_TG`] either way (`k` and the group width are).
+    fn zc_fold_reduce_lanes(plan: &ZcFoldPlan) -> usize {
+        if super::fold_live_reduce_enabled() {
+            (plan.i_groups * ZC_FOLD_COLS_PER_TG).min(plan.k)
+        } else {
+            plan.k
+        }
+    }
+
     unsafe fn zc_fold_submit(gpu: &Gpu, state: &ZcFold, plan: &ZcFoldPlan) -> Result<Id, String> {
         unsafe { zc_fold_submit_sig(gpu, state, plan, false).map(|(cb, _)| cb) }
     }
@@ -21233,7 +21669,10 @@ kernel void zc_eq_rows(
             gpu.set_buffer(enc, state.part_buf, 0, 0);
             gpu.set_buffer(enc, state.out_buf, 0, 1);
             gpu.set_bytes(enc, reduce_bytes, 2);
-            gpu.dispatch(enc, (plan.k / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
+            // Live-column reduce (`ENV_NO_FOLD_LIVE_REDUCE`): the lanes of
+            // the dispatched column groups only; the partial row stride
+            // stays `k` (`reduce_params`).
+            gpu.dispatch(enc, (zc_fold_reduce_lanes(plan) / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
             gpu.end_encoding(enc);
             let sig = if arm_sig { gpu.arm_done(cb) } else { None };
             let cb_eq = cb_eq.map(|c| {
@@ -22650,6 +23089,10 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         wraps: Vec<(usize, usize, Id)>,
         hits: usize,
         misses: usize,
+        /// The L2 overlap's flat-tree buffer (`2 * 2^16 - 1` nodes), created
+        /// by the first L2 session (`super::ENV_NO_L2_MERKLE_OVERLAP`); NIL
+        /// until then.
+        l2_tree_buf: Id,
     }
     // SAFETY: Metal objects are thread-safe; every access is serialized by
     // the REC_MERKLE mutex.
@@ -22764,6 +23207,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                     wraps: Vec::new(),
                     hits: 0,
                     misses: 0,
+                    l2_tree_buf: NIL,
                 };
                 // Pin one exact-fit L1 matrix allocation into the scratch
                 // pool's dedicated second slot, then wrap and wire it here
@@ -22989,7 +23433,9 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
     // transform is still producing the remaining chunks. `finish` drains the
     // leaf command buffers, then runs the internal levels and copy-out
     // exactly as the incumbent whole-tree offload does — same kernels, same
-    // wrapped matrix, same tree buffer, bit-identical bytes.
+    // wrapped matrix, same tree buffer, bit-identical bytes. The L2 commit
+    // (`ENV_NO_L2_MERKLE_OVERLAP`) runs the same session, with the same
+    // pipelines, on its own tree buffer and its pinned codeword's wrap.
     // -----------------------------------------------------------------------
 
     /// The ids below are copied out of the REC_MERKLE state under its lock in
@@ -23161,7 +23607,8 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         data_len: usize,
         num_leaves: usize,
     ) -> Option<L1MerkleOverlapSession> {
-        if !REC_MERKLE_SHAPES.contains(&num_leaves) || data_len != num_leaves * 128 {
+        let l2 = num_leaves == super::L2_OVERLAP_LEAVES;
+        if !(l2 || REC_MERKLE_SHAPES.contains(&num_leaves)) || data_len != num_leaves * 128 {
             return None;
         }
         let gpu = gpu().ok()?;
@@ -23191,6 +23638,13 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         state.hits += 1;
                         buf
                     }
+                    // L2 wraps only its reserved pinned codeword
+                    // (`scratch::take_f128_pinned3`); any other address is a
+                    // pool buffer that must not get a no-copy view, and that
+                    // commit builds its tree on the CPU.
+                    None if l2 && !crate::scratch::is_pinned3_f128(data_addr, data_len) => {
+                        return None;
+                    }
                     // The wrap API takes `*mut` (Metal buffers are generically
                     // writable); this kernel chain only ever reads the matrix.
                     None => match unsafe { gpu.wrap_buffer(data_ptr.cast_mut(), data_len) } {
@@ -23207,11 +23661,27 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
                         }
                     },
                 };
-                let &(_, tree_buf) = state
-                    .tree_bufs
-                    .iter()
-                    .find(|(n, _)| *n == num_leaves)
-                    .expect("shape checked above");
+                let tree_buf = if l2 {
+                    if state.l2_tree_buf.is_null() {
+                        match unsafe { gpu.new_buffer((2 * num_leaves - 1) * 32) } {
+                            Ok(buf) => state.l2_tree_buf = buf,
+                            Err(e) => {
+                                if super::gpu_zc_r2_debug() {
+                                    eprintln!("[l1-overlap] L2 tree buffer failed ({e})");
+                                }
+                                return None;
+                            }
+                        }
+                    }
+                    state.l2_tree_buf
+                } else {
+                    let &(_, tree_buf) = state
+                        .tree_bufs
+                        .iter()
+                        .find(|(n, _)| *n == num_leaves)
+                        .expect("shape checked above");
+                    tree_buf
+                };
                 (state.pso_leaf128, state.pso_parent, data_buf, tree_buf)
             }
             Some(Err(e)) => {
@@ -23248,8 +23718,11 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         }
 
         fn fail(&self, msg: &str) {
+            // Release/Acquire on the failure flag: set by the transform's
+            // workers and by the submitter, read before every submit and by
+            // `finish` before the tree is used.
             self.failed
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .store(true, std::sync::atomic::Ordering::Release);
             if super::gpu_zc_r2_debug() {
                 eprintln!("[l1-overlap] {msg} — falling back to incumbent");
             }
@@ -23260,7 +23733,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         /// `offset_elems`/`len_elems` are in F128 elements from the start of
         /// the wrapped matrix.
         pub(crate) fn chunk_ready(&self, offset_elems: usize, len_elems: usize) {
-            if self.failed.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
             if offset_elems % Self::LEAF_ELEMS != 0 || len_elems % Self::LEAF_ELEMS != 0 {
@@ -23318,8 +23791,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
         /// dispatch; the buffer is retained across its short-lived pool and
         /// drained in `finish` (the from-z first-pass stream idiom).
         fn submit_pending(&self, inner: &mut L1OverlapInner) {
-            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if inner.pending.is_empty() || self.failed.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
             // Publish every pending chunk's CPU stores to the encode below.
@@ -23482,7 +23954,7 @@ kernel void rec_parent_hash(device const uint* children [[buffer(0)]],
             if let Some(e) = drain_err {
                 self.fail(&format!("leaf drain failed ({e})"));
             }
-            if self.failed.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.failed.load(std::sync::atomic::Ordering::Acquire) {
                 return None;
             }
             // Exact-cover check: the accepted ranges must tile
@@ -24981,6 +25453,10 @@ kernel void zc_r2_horner_oracle(
         /// R2-CS steal (`super::ENV_NO_R2_STEAL`): a timed R2-CS prefix of the
         /// steal kernel; `None` = the record's join.
         steal: Option<ZcR2Steal>,
+        /// R2 C capture (`crate::zerocheck::univariate_skip_optimized::ENV_NO_R2_C_CAPTURE`):
+        /// this timed R2-CS prefix ran the b == 1 kernel with the capture's
+        /// pairs left out of its sums.
+        pure: bool,
     }
 
     /// The R2-CS steal's claims (`super::ENV_NO_R2_STEAL`): `next` = the
@@ -25103,6 +25579,13 @@ kernel void zc_r2_horner_oracle(
             self.cs.is_some() && !self.calibration
         }
 
+        /// R2 C capture: this timed R2-CS prefix left the capture's pairs
+        /// (head pairs 0..8, pairs 118 and 119 of every block) out of its
+        /// products and lookahead sums.
+        pub(crate) fn pure_active(&self) -> bool {
+            self.pure
+        }
+
         /// R2-CS steal (`super::ENV_NO_R2_STEAL`): this timed prefix's steal
         /// control, `None` = the record's join.
         pub(crate) fn steal(&self) -> Option<&ZcR2Steal> {
@@ -25154,6 +25637,7 @@ kernel void zc_r2_horner_oracle(
         horner: bool,
         cs: Option<&ZcR2CsBind>,
         signal: Option<u64>,
+        pure: bool,
     ) -> Result<Id, String> {
         unsafe {
             #[repr(C)]
@@ -25197,13 +25681,14 @@ kernel void zc_r2_horner_oracle(
             if let Some(bind) = cs {
                 // R2-CS: the compact state, its layout and the head flag.
                 let l = &bind.layout;
+                // `pad0`: R2 C capture (read only by `r2cs_fast2.metal`).
                 let lp: [u32; 8] = [
                     u32::from(l.hc),
                     l.a_base as u32,
                     l.a_stride as u32,
                     l.d_base as u32,
                     l.d_stride as u32,
-                    0,
+                    u32::from(pure),
                     0,
                     0,
                 ];
@@ -25463,6 +25948,7 @@ kernel void zc_r2_horner_oracle(
                     // The primer never stores compact state (R2-CS probe).
                     None,
                     None,
+                    false,
                 )?;
                 state.prefetch_cb = cb;
                 Ok(())
@@ -25515,6 +26001,7 @@ kernel void zc_r2_horner_oracle(
             None,
             None,
             usize::MAX,
+            false,
         )
     }
 
@@ -25547,6 +26034,7 @@ kernel void zc_r2_horner_oracle(
         cs_layout: Option<ZcR2CsLayout>,
         cs_live: Option<(usize, usize, usize)>,
         ab_ready_chunks: usize,
+        pure: bool,
     ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
@@ -25772,6 +26260,9 @@ kernel void zc_r2_horner_oracle(
                 let word = if steal_value.is_some() { chunks as u32 } else { u32::MAX };
                 gpu.buffer_contents(state.steal_cut_buf).cast::<u32>().write_volatile(word);
             }
+            // R2 C capture: only a timed R2-CS prefix of the b == 1 kernel
+            // (`r2cs_fast2.metal`) leaves the capture's pairs out.
+            let pure = pure && timed_cs.is_some() && r2cs_fast::fast2_selected();
             let cb = zc_r2_submit(
                 gpu,
                 &state,
@@ -25784,6 +26275,7 @@ kernel void zc_r2_horner_oracle(
                 horner,
                 timed_cs.map(|(bind, _)| bind),
                 steal_value,
+                pure,
             )
             .ok()?;
             let steal = steal_value.map(|value| ZcR2Steal {
@@ -25810,6 +26302,7 @@ kernel void zc_r2_horner_oracle(
                     horner,
                     Some(bind),
                     None,
+                    false,
                 )
                 .unwrap_or(NIL),
                 None => NIL,
@@ -25839,6 +26332,7 @@ kernel void zc_r2_horner_oracle(
                 cs_cb,
                 _cs_views,
                 steal,
+                pure,
             })
         }
     }
@@ -26300,6 +26794,7 @@ kernel void zc_r2_horner_oracle(
                     job.horner,
                     None,
                     None,
+                    false,
                 ) else {
                     break;
                 };

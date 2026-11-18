@@ -5720,11 +5720,11 @@ pub(crate) struct LigeroWitness {
     pub mat: Vec<F128>,
     pub tree: Vec<Hash>,
     /// Zero-copy flat tree `(address, node count)` inside the persistent GPU
-    /// L1 tree buffer, set only by [`ligero_commit_with_tree_view`] when the
-    /// overlapped L1 Merkle session completes (then `tree` stays empty). The
-    /// buffer is next written by the following prove's L1 commit, so the
-    /// witness must be dropped before that — the ranked open drops it at the
-    /// end of its first recursive level.
+    /// L1 or L2 tree buffer, set only by [`ligero_commit_with_tree_view`] when
+    /// the overlapped L1 or L2 Merkle session completes (then `tree` stays
+    /// empty). The buffer is next written by the following prove's commit of
+    /// the same level, so the witness must be dropped before that — the
+    /// ranked open drops it at the end of the next recursive level.
     tree_view: Option<(usize, usize)>,
     pub block_len: usize,
     pub num_interleaved: usize,
@@ -5858,11 +5858,11 @@ fn recursive_subtree_merkle_enabled() -> bool {
     *ON
 }
 
-/// [`ligero_commit`] whose overlapped-L1 GPU tree may be returned as a
-/// zero-copy view (`LigeroWitness::tree_view`) instead of a 16 MiB copy-out.
-/// Same codeword, same tree bytes, same root; only where the nodes live
-/// differs. Callers must read the tree through [`LigeroWitness::nodes`] and
-/// drop the witness before the next L1-shape commit.
+/// [`ligero_commit`] whose overlapped L1 or L2 GPU tree may be returned as a
+/// zero-copy view (`LigeroWitness::tree_view`) instead of a 16 MiB (4 MiB)
+/// copy-out. Same codeword, same tree bytes, same root; only where the nodes
+/// live differs. Callers must read the tree through [`LigeroWitness::nodes`]
+/// and drop the witness before the next commit of the same shape.
 pub(crate) fn ligero_commit_with_tree_view(
     poly: &[F128],
     log_msg_cols: usize,
@@ -5935,7 +5935,14 @@ fn ligero_commit_impl_view(
     // recursive shapes fuse that logical state into their first radix-8 pass.
     let codeword_len = block_len * num_interleaved;
     let alloc_start = timing.then(std::time::Instant::now);
-    let mut mat = crate::scratch::take_f128(codeword_len);
+    // The L2 overlap reads only its reserved pinned codeword allocation (see
+    // `gpu_commit::ENV_NO_L2_MERKLE_OVERLAP`); every other take is ordinary.
+    let mut mat = if fuse_from_message && block_len == crate::gpu_commit::L2_OVERLAP_LEAVES {
+        crate::scratch::take_f128_pinned3(codeword_len)
+            .unwrap_or_else(|| crate::gpu_commit::l2_overlap_codeword(codeword_len))
+    } else {
+        crate::scratch::take_f128(codeword_len)
+    };
     let alloc_elapsed = alloc_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     let mut fill_elapsed = std::time::Duration::ZERO;
     // L1 NTT/Merkle-leaf overlap: the transform fires a per-finalized-chunk
@@ -5945,8 +5952,8 @@ fn ligero_commit_impl_view(
     // between NTT start and the root observe); `begin` pays every init/wrap
     // cost before the race clocks below and returns `None` whenever the
     // incumbent must run instead (kill switch `FLOCK_NO_L1_MERKLE_OVERLAP=1`,
-    // `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, latch Off, non-L1 shape, any Metal
-    // failure).
+    // `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, `FLOCK_NO_L2_MERKLE_OVERLAP` at L2,
+    // latch Off, other shapes, any Metal failure).
     let leaf_size_bytes = num_interleaved * core::mem::size_of::<F128>();
     let overlap = if fuse_from_message && kind == HashKind::Blake3 && leaf_size_bytes == 128 {
         crate::gpu_commit::gpu_l1_merkle_overlap_begin(
@@ -6025,6 +6032,8 @@ fn ligero_commit_impl_view(
     // returns the bit-identical flat tree or `None` for the exact CPU path
     // (kill switch `FLOCK_NO_GPU_RECURSIVE_MERKLE=1`, non-Blake3 hashes,
     // other shapes, and every GPU failure).
+    let l2_overlap =
+        timing && block_len == crate::gpu_commit::L2_OVERLAP_LEAVES && overlap_session.is_some();
     let mut tree_view: Option<(usize, usize)> = None;
     let gpu_tree = if race_ran {
         raced_tree
@@ -6051,51 +6060,10 @@ fn ligero_commit_impl_view(
     } else {
         None
     };
+    let gpu_built = gpu_tree.is_some();
     let tree = match gpu_tree {
         Some(tree) => tree,
-        // Pooled tree storage for the CPU builder (the GPU offload's
-        // copy-out is pooled inside `gpu_recursive_merkle_blake3`): same
-        // fault/munmap argument, byte-identical output.
-        None => {
-            // Recursive 128-byte-leaf trees (2^10..2^16 leaves, L2..L5 on the
-            // ranked shape) are built as 64 aligned subtrees (32 at 2^10) in
-            // one P+E chunk queue instead of a leaf pass plus one parallel
-            // region per wide level and a serial tail: same kernels per node,
-            // byte-identical tree. A/B-CONTROL: FLOCK_NO_PCS_SUBTREE=1.
-            let lb = block_len.trailing_zeros() as usize;
-            let sub_log = if recursive_subtree_merkle_enabled()
-                && (10..=16).contains(&lb)
-                && leaf_size_bytes == 128
-            {
-                (lb - 6).clamp(5, 10)
-            } else {
-                0
-            };
-            if sub_log > 0 && lb <= 10 && op_small_merkle_serial_enabled() {
-                merkle::merkle_tree_into_subtrees_serial(
-                    crate::scratch::take_hash_tree(2 * block_len - 1),
-                    data_bytes,
-                    block_len,
-                    kind,
-                    sub_log,
-                )
-            } else if sub_log > 0 {
-                merkle::merkle_tree_into_subtrees(
-                    crate::scratch::take_hash_tree(2 * block_len - 1),
-                    data_bytes,
-                    block_len,
-                    kind,
-                    sub_log,
-                )
-            } else {
-                merkle::merkle_tree_into(
-                    crate::scratch::take_hash_tree(2 * block_len - 1),
-                    data_bytes,
-                    block_len,
-                    kind,
-                )
-            }
-        }
+        None => recursive_cpu_tree(data_bytes, block_len, leaf_size_bytes, kind),
     };
     let merkle_elapsed = merkle_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
 
@@ -6116,6 +6084,16 @@ fn ligero_commit_impl_view(
                 total_elapsed.as_secs_f64() * 1e3,
             );
         }
+        // One line per latched L2 overlap session (the first session's check
+        // prints its own line from `gpu_commit::l2_overlap_report`).
+        if l2_overlap {
+            let tree = match (tree_view.is_some(), gpu_built) {
+                (true, _) => "gpu-view",
+                (false, true) => "gpu-copy",
+                (false, false) => "cpu-fallback",
+            };
+            eprintln!("    [l2-overlap] engaged: leaves={block_len} tree={tree}");
+        }
     }
 
     LigeroWitness {
@@ -6124,6 +6102,57 @@ fn ligero_commit_impl_view(
         tree_view,
         block_len,
         num_interleaved,
+    }
+}
+
+/// The CPU builder of a commit's flat tree: the path of every commit without
+/// a GPU tree, and the reference of the first L2 overlap session's check.
+/// Pooled tree storage (the GPU offload's copy-out is pooled inside
+/// `gpu_recursive_merkle_blake3`): same fault/munmap argument,
+/// byte-identical output.
+fn recursive_cpu_tree(
+    data_bytes: &[u8],
+    block_len: usize,
+    leaf_size_bytes: usize,
+    kind: HashKind,
+) -> Vec<Hash> {
+    // Recursive 128-byte-leaf trees (2^10..2^16 leaves, L2..L5 on the
+    // ranked shape) are built as 64 aligned subtrees (32 at 2^10) in
+    // one P+E chunk queue instead of a leaf pass plus one parallel
+    // region per wide level and a serial tail: same kernels per node,
+    // byte-identical tree. A/B-CONTROL: FLOCK_NO_PCS_SUBTREE=1.
+    let lb = block_len.trailing_zeros() as usize;
+    let sub_log = if recursive_subtree_merkle_enabled()
+        && (10..=16).contains(&lb)
+        && leaf_size_bytes == 128
+    {
+        (lb - 6).clamp(5, 10)
+    } else {
+        0
+    };
+    if sub_log > 0 && lb <= 10 && op_small_merkle_serial_enabled() {
+        merkle::merkle_tree_into_subtrees_serial(
+            crate::scratch::take_hash_tree(2 * block_len - 1),
+            data_bytes,
+            block_len,
+            kind,
+            sub_log,
+        )
+    } else if sub_log > 0 {
+        merkle::merkle_tree_into_subtrees(
+            crate::scratch::take_hash_tree(2 * block_len - 1),
+            data_bytes,
+            block_len,
+            kind,
+            sub_log,
+        )
+    } else {
+        merkle::merkle_tree_into(
+            crate::scratch::take_hash_tree(2 * block_len - 1),
+            data_bytes,
+            block_len,
+            kind,
+        )
     }
 }
 
@@ -6138,6 +6167,8 @@ fn ligero_commit_impl_view(
 /// tree is byte-compared against the incumbent's; any mismatch or failure
 /// latches Off. Returns an INCUMBENT-arm GPU tree (`None` → the caller's CPU
 /// builder), so the warmup prove's bytes never depend on the overlapped arm.
+/// The first L2 session (`gpu_commit::L2_OVERLAP_LEAVES`) does not race: it
+/// runs [`l2_overlap_first_check`].
 fn l1_overlap_warmup_race(
     session: crate::gpu_commit::L1MerkleOverlap,
     poly: &[F128],
@@ -6147,6 +6178,9 @@ fn l1_overlap_warmup_race(
     ntt: &AdditiveNttF128,
     block_len: usize,
 ) -> Option<Vec<Hash>> {
+    if block_len == crate::gpu_commit::L2_OVERLAP_LEAVES {
+        return l2_overlap_first_check(session, poly, mat, num_interleaved, log_inv_rate, ntt);
+    }
     let run_incumbent = |mat: &mut [F128]| -> (Option<Vec<Hash>>, f64) {
         let t = std::time::Instant::now();
         ntt.forward_transform_interleaved_from_message_fused3(
@@ -6228,6 +6262,50 @@ fn l1_overlap_warmup_race(
     }
     crate::gpu_commit::l1_overlap_report(wall_a, wall_b, Some(equal));
     Some(incumbent_tree)
+}
+
+/// First L2 overlap session of the process (the warmup prove, opened only
+/// once the L1 race latched ON): the commit's own transform runs with the
+/// session attached, exactly as on a latched commit, then the CPU builder
+/// builds the tree over the same codeword and the two trees are compared
+/// byte for byte (the session's buffer is read in place after its drain).
+/// No second transform and no settle: the L2 latch goes ON only on equality
+/// (`gpu_commit::l2_overlap_report`). Returns the CPU tree, so the warmup
+/// prove's bytes never depend on the overlapped pass.
+fn l2_overlap_first_check(
+    session: crate::gpu_commit::L1MerkleOverlap,
+    poly: &[F128],
+    mat: &mut [F128],
+    num_interleaved: usize,
+    log_inv_rate: usize,
+    ntt: &AdditiveNttF128,
+) -> Option<Vec<Hash>> {
+    let t = std::time::Instant::now();
+    ntt.forward_transform_interleaved_from_message_fused3_and_then(
+        poly,
+        mat,
+        num_interleaved,
+        log_inv_rate,
+        |offset, chunk| session.chunk_ready(offset, chunk.len()),
+    );
+    let view = session.finish_view();
+    let overlap_ms = t.elapsed().as_secs_f64() * 1e3;
+    let data_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(mat.as_ptr().cast::<u8>(), core::mem::size_of_val(mat))
+    };
+    let block_len = data_bytes.len() / 128;
+    let t = std::time::Instant::now();
+    let tree = recursive_cpu_tree(data_bytes, block_len, 128, HashKind::Blake3);
+    let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+    // SAFETY: `finish_view` returns the session's tree buffer after every
+    // command buffer of the session has completed; nothing writes it until
+    // the next L2 session.
+    let equal = view.map(|(addr, len)| {
+        let gpu_tree: &[Hash] = unsafe { core::slice::from_raw_parts(addr as *const Hash, len) };
+        gpu_tree == tree.as_slice()
+    });
+    crate::gpu_commit::l2_overlap_report(overlap_ms, cpu_ms, equal);
+    Some(tree)
 }
 
 // ===================================================================
@@ -10598,8 +10676,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         let log_inv_rate_next = config.log_inv_rates[i + 2];
         let _t = std::time::Instant::now();
         let ntt_next = AdditiveNttF128::standard(log_msg_cols_next + log_inv_rate_next);
-        // Same borrow-instead-of-copy as the wtns_1 commit above.
-        let wtns_next = ligero_commit(
+        // Same borrow-instead-of-copy as the wtns_1 commit above, and the
+        // same tree view: an overlapped L2 tree stays in its GPU buffer
+        // (only the L1/L2 overlap sessions set a view; this witness is
+        // dropped at the end of the next iteration).
+        let wtns_next = ligero_commit_with_tree_view(
             sc_prover.f(),
             log_msg_cols_next,
             log_num_interleaved_next,

@@ -264,6 +264,16 @@ static PINNED2_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
 static PINNED2_F128_ADDR: AtomicUsize = AtomicUsize::new(0);
 static PINNED2_F128_LEN: AtomicUsize = AtomicUsize::new(0);
 
+/// Third pinned slot, registered once by the recursive-Merkle GPU offload
+/// for the L2 codeword (the L2 overlap's no-copy Metal view). Unlike the two
+/// slots above it is RESERVED: ordinary takes never hand it out (other
+/// exact-length requests of the prove would otherwise take it before the L2
+/// commit asks), only [`take_f128_pinned3`] does. Same give routing,
+/// same immunity to eviction and [`clear`].
+static PINNED3_F128: Mutex<Option<PinnedF128>> = Mutex::new(None);
+static PINNED3_F128_ADDR: AtomicUsize = AtomicUsize::new(0);
+static PINNED3_F128_LEN: AtomicUsize = AtomicUsize::new(0);
+
 /// Max buffers retained. The m=29 prove cycle gives ~18 distinct buffers:
 /// witness z/a/b, the L0 codeword, zerocheck's 2 fold outputs + 2 ping-pong
 /// halves, ring-switch's per-claim rs_eq_ind vectors, b_combined, and
@@ -365,6 +375,10 @@ pub(crate) fn f128_range_overlaps_pin(addr: usize, len_bytes: usize) -> bool {
             PINNED2_F128_ADDR.load(Ordering::Acquire),
             PINNED2_F128_LEN.load(Ordering::Acquire),
         ),
+        (
+            PINNED3_F128_ADDR.load(Ordering::Acquire),
+            PINNED3_F128_LEN.load(Ordering::Acquire),
+        ),
     ] {
         if a == 0 || l == 0 {
             continue;
@@ -441,6 +455,69 @@ pub(crate) fn pin2_f128_allocation(buffer: &[F128]) -> bool {
             true
         }
     }
+}
+
+/// [`pin2_f128_allocation`] for the reserved third slot (the L2 codeword).
+/// Registered once per process; there is no unpin.
+pub(crate) fn pin3_f128_allocation(buffer: &[F128]) -> bool {
+    if buffer.is_empty() {
+        return false;
+    }
+    let addr = buffer.as_ptr() as usize;
+    let len = buffer.len();
+    let mut slot = PINNED3_F128.lock().unwrap();
+    match slot.as_ref() {
+        Some(pinned) => pinned.addr == addr && pinned.len == len,
+        None => {
+            *slot = Some(PinnedF128 {
+                addr,
+                len,
+                buffer: None,
+                token: None,
+            });
+            PINNED3_F128_ADDR.store(addr, Ordering::Release);
+            PINNED3_F128_LEN.store(len, Ordering::Release);
+            true
+        }
+    }
+}
+
+/// Whether `[addr, addr + len_bytes)` is exactly the reserved third slot's
+/// registered allocation (the only codeword the L2 overlap wraps).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn is_pinned3_f128(addr: usize, len_bytes: usize) -> bool {
+    let a = PINNED3_F128_ADDR.load(Ordering::Acquire);
+    a != 0
+        && a == addr
+        && PINNED3_F128_LEN.load(Ordering::Acquire) * core::mem::size_of::<F128>() == len_bytes
+}
+
+/// The only take that hands out the reserved third slot: its allocation when
+/// it is registered with length `n` and parked, else `None` (the caller then
+/// takes an ordinary buffer). Contents are UNINITIALIZED, as for
+/// [`take_f128`].
+pub(crate) fn take_f128_pinned3(n: usize) -> Option<Vec<F128>> {
+    if PINNED3_F128_LEN.load(Ordering::Acquire) != n {
+        return None;
+    }
+    let v = {
+        let mut slot = PINNED3_F128.lock().unwrap();
+        let pinned = slot.as_mut()?;
+        if pinned.len != n {
+            return None;
+        }
+        let mut v = pinned.buffer.take()?;
+        pinned.token = None;
+        debug_assert_eq!(v.as_ptr() as usize, pinned.addr);
+        debug_assert!(v.capacity() >= n);
+        v.clear();
+        // SAFETY: the registered allocation has capacity >= n and F128 is
+        // Copy; callers retain the write-before-read contract of take_f128.
+        unsafe { v.set_len(n) };
+        v
+    };
+    purge_staged_addr(v.as_ptr() as usize);
+    Some(v)
 }
 
 /// Quarantine the allocation behind `buffer` once it next returns through
@@ -609,6 +686,18 @@ pub fn give_f128(v: Vec<F128>) {
     }
     if PINNED2_F128_ADDR.load(Ordering::Acquire) == addr {
         let mut slot = PINNED2_F128.lock().unwrap();
+        if let Some(pinned) = slot.as_mut()
+            && pinned.addr == addr
+            && v.capacity() >= pinned.len
+            && pinned.buffer.is_none()
+        {
+            pinned.buffer = Some(v);
+            pinned.token = token;
+            return;
+        }
+    }
+    if PINNED3_F128_ADDR.load(Ordering::Acquire) == addr {
+        let mut slot = PINNED3_F128.lock().unwrap();
         if let Some(pinned) = slot.as_mut()
             && pinned.addr == addr
             && v.capacity() >= pinned.len
