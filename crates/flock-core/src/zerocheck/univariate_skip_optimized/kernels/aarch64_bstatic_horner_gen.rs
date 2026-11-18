@@ -33,9 +33,18 @@ fn bstatic_horner_fallback(
 }
 
 /// One static-B arm `BLK = w * 16 + b_med` (3..=28) in the h4 Horner layout.
+///
+/// Build time: the out-of-line arms (the per-row entry's 26 instances, `V = 0`)
+/// never run on the ranked path; its window rows take the window kernels,
+/// which inline `bstatic_horner_blk_body` themselves. Unless the build sets
+/// `--cfg flock_bstatic_full_arms` (or builds the tests), each arm's body is
+/// the generic h4 kernel for the arm's `b_med`, which is what the full body
+/// runs whenever a row's static bytes do not match, so every arm writes the
+/// same bytes for any witness. The symbol, the signature and every call site
+/// stay as they are; only the bodies the optimiser has to work through shrink.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, unexpected_cfgs)]
 fn bstatic_horner_blk<const BLK: usize, const V: u32>(
     a_packed: &[u8],
     b_packed: &[u8],
@@ -46,9 +55,32 @@ fn bstatic_horner_blk<const BLK: usize, const V: u32>(
     out: &mut [u8; 64],
     nt_store: bool,
 ) {
+    #[cfg(any(test, flock_bstatic_full_arms))]
     bstatic_horner_blk_body::<BLK, V, false>(
         a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, out, nt_store,
     );
+    #[cfg(not(any(test, flock_bstatic_full_arms)))]
+    {
+        // The parameters the full body reads stay live (`partials` and the two
+        // slice lengths, which the h4 kernel does not read; `kara` the full
+        // body never reads at `V = 0`), so the optimiser keeps every caller's
+        // call sequence as it was; the move of `BLK` keeps the 26 arms distinct
+        // functions, so none is folded into another and every call keeps its
+        // target. The asm touches no memory and runs only in a hollow arm.
+        let _ = kara;
+        unsafe {
+            core::arch::asm!(
+                "mov {t}, #{blk} // {p} {al} {bl}",
+                t = out(reg) _,
+                blk = const BLK,
+                p = in(reg) partials.as_ptr(),
+                al = in(reg) a_packed.len(),
+                bl = in(reg) b_packed.len(),
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        shift_reduce_inner_ab_fused_neon_h4::<0>(a_packed, b_packed, inv_table, chunk_byte_base, BLK % 16, out, nt_store);
+    }
 }
 
 /// Body of [`bstatic_horner_blk`]. `kara` is [`ab_kara_tables`] when `V`
