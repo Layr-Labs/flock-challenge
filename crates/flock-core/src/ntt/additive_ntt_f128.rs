@@ -1676,9 +1676,13 @@ impl AdditiveNttF128 {
         let sb_end = b_start << 4;
         let sb_start = sb_end - fine_m;
         wait_boundary()?;
-        self.forward_transform_interleaved_block_range(
-            data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
-        );
+        if !(ntt_fine_pair_live_enabled()
+            && self.forward_transform_interleaved_fine_pair_live(data, num_ntts, sb_start, sb_end, odd_tail))
+        {
+            self.forward_transform_interleaved_block_range(
+                data, num_ntts, 8, DEEP_LAYER, sb_start, sb_end, odd_tail,
+            );
+        }
         self.forward_transform_interleaved_deep_fused_pairs_range_and_then(
             data,
             num_ntts,
@@ -1690,6 +1694,49 @@ impl AdditiveNttF128 {
             &finish_chunk,
         );
         Ok(())
+    }
+
+    /// Layers 8 and 9 over the layer-8 blocks `[sb_start, sb_end)` exactly
+    /// as `forward_transform_interleaved_block_range(data, num_ntts, 8, 10,
+    /// sb_start, sb_end, odd_tail)` runs them (one fused pair per block,
+    /// absolute twiddles, parallel jobs of eight quarter-rows), with each job
+    /// computing only the live lanes of the zero odd tail
+    /// ([`butterfly_interleaved_fused_2layer_par_rows_live`]). Returns
+    /// `false`, having done nothing, unless the tail is nonzero and the pair
+    /// runs on parallel rows with an even quarter.
+    fn forward_transform_interleaved_fine_pair_live(
+        &self,
+        data: &mut [F128],
+        num_ntts: usize,
+        sb_start: usize,
+        sb_end: usize,
+        odd_tail: usize,
+    ) -> bool {
+        const LAYER: usize = 8;
+        const PARALLEL_ROW_THRESHOLD: usize = 256;
+        let log_d = log2_pow2(data.len() / num_ntts);
+        if log_d < LAYER + 2 || odd_tail == 0 || odd_tail >= num_ntts || sb_start >= sb_end || sb_end > 1 << LAYER {
+            return false;
+        }
+        let block_size = 1usize << (log_d - LAYER);
+        let quarter = block_size >> 2;
+        if !quarter.is_multiple_of(2) || quarter < PARALLEL_ROW_THRESHOLD {
+            return false;
+        }
+        let block_elems = block_size * num_ntts;
+        for abs in sb_start..sb_end {
+            let start = abs * block_elems;
+            butterfly_interleaved_fused_2layer_par_rows_live(
+                &mut data[start..start + block_elems],
+                self.twiddle(LAYER, abs),
+                self.twiddle(LAYER + 1, 2 * abs),
+                self.twiddle(LAYER + 1, 2 * abs + 1),
+                quarter,
+                num_ntts,
+                odd_tail,
+            );
+        }
+        true
     }
 
     /// Finish the ranked L0 transform's five cache-local deep pairs and invoke
@@ -3076,6 +3123,66 @@ fn butterfly_interleaved_fused_2layer_par_rows(
     }
 }
 
+/// Kill switch for [`butterfly_interleaved_fused_2layer_par_rows_live`] at
+/// the fine boundary of the ranked split: exactly
+/// `FLOCK_NO_NTT_FINE_PAIR_LIVE=1` runs the dense parallel pair there, as
+/// before. Read once per process; the transform is bit-identical either way.
+fn ntt_fine_pair_live_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0: not read yet, 1: on, 2: off.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("FLOCK_NO_NTT_FINE_PAIR_LIVE").as_deref() != Some(std::ffi::OsStr::new("1"));
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// [`butterfly_interleaved_fused_2layer_par_rows`] (its parallel form: the
+/// same jobs of eight quarter-rows) for a block whose odd positions have
+/// `odd_tail` zero trailing lanes: `quarter` even, so the four rows of a
+/// group share one parity, and a group of odd rows has zero tail lanes in
+/// all four inputs, whose butterflies write zeros. Each job computes only
+/// the live lanes ([`kernels::try_butterfly_fused_2layer_row_group_live`]:
+/// 64 lanes per even row, `64 - odd_tail` per odd row at 64 lanes) with the
+/// twiddles prepared once per job; the dead lanes keep their zeros.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn butterfly_interleaved_fused_2layer_par_rows_live(
+    block: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    quarter: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+) {
+    use rayon::prelude::*;
+    const ROWS_PER_TASK: usize = 8;
+    debug_assert!(quarter.is_multiple_of(2) && odd_tail < num_ntts);
+    let stride = quarter * num_ntts;
+    debug_assert_eq!(block.len(), 4 * stride);
+    let (top_half, bot_half) = block.split_at_mut(2 * stride);
+    let (q1, q2) = top_half.split_at_mut(stride);
+    let (q3, q4) = bot_half.split_at_mut(stride);
+    let chunk = ROWS_PER_TASK * num_ntts;
+    q1.par_chunks_mut(chunk)
+        .zip(q2.par_chunks_mut(chunk))
+        .zip(q3.par_chunks_mut(chunk))
+        .zip(q4.par_chunks_mut(chunk))
+        .for_each(|(((rows_a, rows_b), rows_c), rows_d)| {
+            if !kernels::try_butterfly_fused_2layer_row_group_live(
+                rows_a, rows_b, rows_c, rows_d, t_outer, t_inner_a, t_inner_b, num_ntts, odd_tail,
+            ) {
+                kernels::butterfly_fused_2layer(rows_a, rows_b, rows_c, rows_d, t_outer, t_inner_a, t_inner_b);
+            }
+        });
+}
+
 /// Sequential counterpart of [`butterfly_interleaved_fused_2layer_par_rows`].
 /// Used from inside the deep phase's outer Rayon jobs: adding row-level Rayon
 /// here would create a nested fork/join for every 1 MiB subtree.
@@ -3705,6 +3812,77 @@ mod tests {
                 block, t_outer, t_inner_a, t_inner_b, 1, num_ntts,
             );
         }
+    }
+
+    /// The live-lane parallel pair of the fine boundary equals the dense
+    /// parallel pair on every lane (dead lanes included): (1) one block of
+    /// the ranked shape (64 lanes, quarter 1,024 = the 4,096-position block,
+    /// and quarter 256) and short blocks (quarter 2, 6), random inputs with
+    /// zero odd-row tails, twiddles random, zero, one, low-limb and
+    /// all-ones; (2) the ranked fine call (layers 8 and 9 over the layer-8
+    /// blocks `[sb_start, sb_end)`) against the block-range driver at log_d
+    /// 18 for every `m` in 1..=15 and varying absolute starts, with the data
+    /// outside the range as sentinels; with no zero tail it declines.
+    #[test]
+    fn fine_pair_live_absorb_matches_dense() {
+        let mut state = 0x5eed_f1e0_0a17_0001u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state ^ (state >> 29)
+        };
+        // The ranked shape: 57 live lanes in every odd row.
+        let odd_tail = 7usize;
+        let mut blocks = 0usize;
+        for quarter in [2usize, 6, 256, 1024] {
+            let num_ntts = 64usize;
+            let mut src: Vec<F128> = (0..4 * quarter * num_ntts).map(|_| F128::new(next(), next())).collect();
+            zero_odd_row_tails(&mut src, num_ntts, odd_tail);
+            let r = F128::new(next(), next());
+            let sets = [
+                [F128::new(next(), next()), F128::new(next(), next()), F128::new(next(), next())],
+                [F128::ZERO; 3],
+                [F128::ONE; 3],
+                [F128::new(next(), 0), F128::new(next(), 0), F128::new(next(), 0)],
+                [F128::new(u64::MAX, u64::MAX); 3],
+                [r, F128::ZERO, F128::ONE],
+            ];
+            for t in sets {
+                let mut want = src.clone();
+                butterfly_interleaved_fused_2layer_par_rows(&mut want, t[0], t[1], t[2], quarter, num_ntts);
+                let mut got = src.clone();
+                butterfly_interleaved_fused_2layer_par_rows_live(&mut got, t[0], t[1], t[2], quarter, num_ntts, odd_tail);
+                assert!(got == want, "quarter={quarter} t={t:?}");
+                blocks += 1;
+            }
+        }
+        assert_eq!(blocks, 4 * 6);
+
+        // The ranked fine call at log_d 18 (layer-8 blocks of 1,024
+        // positions, quarter 256), four lanes with one dead odd-row lane.
+        let (log_d, num_ntts, tail) = (18usize, 4usize, 1usize);
+        let ntt = AdditiveNttF128::standard(log_d);
+        let mut src: Vec<F128> = (0..(1usize << log_d) * num_ntts).map(|_| F128::new(next(), next())).collect();
+        zero_odd_row_tails(&mut src, num_ntts, tail);
+        let block_elems = (1usize << (log_d - 8)) * num_ntts;
+        let mut ranges = 0usize;
+        for m in 1..=15usize {
+            for b_start in [1usize, 7, 15] {
+                let sb_end = b_start << 4;
+                let sb_start = sb_end - m;
+                let mut want = src.clone();
+                ntt.forward_transform_interleaved_block_range(&mut want, num_ntts, 8, 10, sb_start, sb_end, tail);
+                let mut got = src.clone();
+                assert!(ntt.forward_transform_interleaved_fine_pair_live(&mut got, num_ntts, sb_start, sb_end, tail));
+                assert!(got == want, "m={m} b_start={b_start}");
+                assert!(got[..sb_start * block_elems] == src[..sb_start * block_elems]);
+                assert!(got[sb_end * block_elems..] == src[sb_end * block_elems..]);
+                ranges += 1;
+            }
+        }
+        assert_eq!(ranges, 15 * 3);
+        let mut got = src.clone();
+        assert!(!ntt.forward_transform_interleaved_fine_pair_live(&mut got, num_ntts, 100, 112, 0));
+        assert!(got == src);
     }
 
     const HAS_ZERO_TAIL_BLOCKS: bool = cfg!(all(target_arch = "aarch64", target_feature = "aes"));
