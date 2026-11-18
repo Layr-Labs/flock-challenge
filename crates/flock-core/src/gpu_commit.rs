@@ -1281,6 +1281,31 @@ pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 160;
 /// folds a chunk cannot change a bit. Read once per process.
 pub const ENV_NO_ZC_T56_LOOP: &str = "FLOCK_NO_ZC_T56_LOOP";
 
+/// Kill switch for the cascade-K arm's late-GPU steal
+/// (`FLOCK_NO_ZC_K_LOOP=1`: the record's join, where the CPU queue, having
+/// folded the chunks after the GPU's share, waits for the GPU's buffer).
+/// With it on, the launch, the share, the dispatch and the CPU queue are the
+/// record's; only the join differs. If the GPU's buffer is complete when the
+/// queue has drained, nothing else happens. If it is not, the CPU does not
+/// wait: it folds the GPU's chunks itself from the top of the share
+/// downward, into the arm's own output buffers (the layouts the oracle
+/// launch compares), lowering the supplemental fold and finish kernels' skip
+/// boundary as it goes, and asks at every claim whether the buffer has
+/// completed; from that moment every chunk below the boundary is the GPU's.
+/// The supplemental kernels are compiled from source at the prewarm (the
+/// faster fold's own route), leaving the embedded metallib untouched; on
+/// any compile failure the incumbent pipelines stay and the steal is off.
+/// Same kernels' arithmetic and same values per chunk, so which side folds
+/// a chunk cannot change a bit. Read once per process.
+pub const ENV_NO_ZC_K_LOOP: &str = "FLOCK_NO_ZC_K_LOOP";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn zc_k_loop_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !env_is_one(ENV_NO_ZC_K_LOOP));
+    *ON
+}
+
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 pub(crate) fn gpu_zc_t56_loop_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -5634,6 +5659,57 @@ kernel void zc_k_fold_v2(
 }
 
 "#;
+
+    /// The late-GPU steal's supplemental source ([`super::ENV_NO_ZC_K_LOOP`]):
+    /// [`ZC_K_V2_MSL_SOURCE`] with the fold renamed `zc_k_fold_loop`, the
+    /// boundary word (buffer 9) and its skip prologue, then the embedded
+    /// `zc_k_finish`'s own text (the last kernel of [`MSL_SOURCE`], verbatim)
+    /// renamed `zc_k_finish_loop` with the boundary word (buffer 4) and its
+    /// skip. Every anchor below is unique in its string; a missing anchor or
+    /// a failed compile leaves the incumbent pipelines in place and the
+    /// steal off, so the arm's behavior is never at risk from this build.
+    fn zc_k_loop_msl_source() -> Result<String, String> {
+        const FOLD_DECL: &str = "kernel void zc_k_fold_v2(";
+        const FLAG_ARG: &str = "    device atomic_uint* flag    [[buffer(8)]],\n";
+        const SRED: &str = "    threadgroup uint4 sred[8][8];\n";
+        const PARAMS_ARG: &str = "    constant ZcKParams& p       [[buffer(3)]],\n";
+        const BODY_OPEN: &str = "\n{\n";
+        const CUT_ARG9: &str = "    device const uint*  cut     [[buffer(9)]],\n";
+        const CUT_ARG4: &str = "    device const uint*  cut     [[buffer(4)]],\n";
+        const FOLD_SKIP: &str = "    // `cut[0]`: the lowest chunk the CPU has taken (late-GPU steal): one\n    // thread reads the word, the barrier publishes it, and a group of a\n    // chunk at or above it returns before any load.\n    threadgroup uint cut_tg = 0u;\n    if (lid == 0u) { cut_tg = cut[0]; }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n    if (tg / p.sb_per_chunk >= cut_tg) { return; }\n";
+        const FINISH_SKIP: &str = "    // Late-GPU steal: a chunk at or above the CPU's boundary was folded\n    // and weighted by the CPU straight into `part`; this finish leaves its\n    // slot alone. The eight threads each read the word themselves: there is\n    // no threadgroup barrier in this kernel.\n    if (chunk >= cut[0]) { return; }\n";
+        let fold = ZC_K_V2_MSL_SOURCE.find(FOLD_DECL);
+        let flag = ZC_K_V2_MSL_SOURCE.find(FLAG_ARG);
+        let sred = ZC_K_V2_MSL_SOURCE.find(SRED);
+        let params = MSL_SOURCE.find(PARAMS_ARG);
+        let finish = MSL_SOURCE.find("kernel void zc_k_finish(");
+        if [&fold, &flag, &sred, &params, &finish].iter().any(|x| x.is_none()) {
+            return Err("zc-k loop source anchors missing".into());
+        }
+        let (fold, flag, sred) = (fold.unwrap(), flag.unwrap(), sred.unwrap());
+        let (params, finish) = (params.unwrap(), finish.unwrap());
+        // The finish's body opener is the first `\n{\n` after its parameter
+        // list; the finish is the last kernel of `MSL_SOURCE`.
+        let body = MSL_SOURCE[params + PARAMS_ARG.len()..].find(BODY_OPEN)
+            .map(|at| params + PARAMS_ARG.len() + at)
+            .ok_or("zc-k loop finish body anchor missing")?;
+        let mut out = String::with_capacity(ZC_K_V2_MSL_SOURCE.len() + MSL_SOURCE.len() - finish + 1024);
+        out.push_str(&ZC_K_V2_MSL_SOURCE[..fold]);
+        out.push_str("kernel void zc_k_fold_loop(");
+        out.push_str(&ZC_K_V2_MSL_SOURCE[fold + FOLD_DECL.len()..flag + FLAG_ARG.len()]);
+        out.push_str(CUT_ARG9);
+        out.push_str(&ZC_K_V2_MSL_SOURCE[flag + FLAG_ARG.len()..sred + SRED.len()]);
+        out.push_str(FOLD_SKIP);
+        out.push_str(&ZC_K_V2_MSL_SOURCE[sred + SRED.len()..]);
+        out.push('\n');
+        out.push_str("kernel void zc_k_finish_loop(\n");
+        out.push_str(&MSL_SOURCE[finish + "kernel void zc_k_finish(".len()..params + PARAMS_ARG.len()]);
+        out.push_str(CUT_ARG4);
+        out.push_str(&MSL_SOURCE[params + PARAMS_ARG.len()..body + BODY_OPEN.len()]);
+        out.push_str(FINISH_SKIP);
+        out.push_str(&MSL_SOURCE[body + BODY_OPEN.len()..]);
+        Ok(out)
+    }
 
     /// The leaf + parent3 kernel's straight-line compression (see
     /// `super::ENV_NO_LEAF_STRAIGHT`): the seven rounds written out with
@@ -27176,6 +27252,13 @@ kernel void zc_ab_finish(
         part_buf: Id,
         /// Set by the GPU when a b output the b-one pack skips is not one.
         flag_buf: Id,
+        /// The late-GPU steal's supplemental kernels (NIL: the steal is off
+        /// and the launch below is the record's exactly) and the boundary
+        /// word they read (`u32::MAX` = no skip; the CPU lowers it only
+        /// under its claim lock).
+        fold_loop_pso: Id,
+        finish_loop_pso: Id,
+        cut_buf: Id,
         /// Scratch output of the round-two premap touch dispatch.
         touch_buf: Id,
         chunks: usize,
@@ -27251,7 +27334,8 @@ kernel void zc_ab_finish(
     /// they were built on, as raw handles. Built once per process, normally by
     /// the prewarm helper ([`zc_k_prewarm_start`]); `None` = no embedded
     /// metallib or a pipeline failed (arm off).
-    static ZC_K_PSOS: std::sync::OnceLock<Option<(usize, usize, usize)>> = std::sync::OnceLock::new();
+    static ZC_K_PSOS: std::sync::OnceLock<Option<(usize, usize, usize, usize, usize)>> =
+        std::sync::OnceLock::new();
     /// Whether the fold pipeline last built is `zc_k_fold_v2` (it then reads
     /// the rho2 nibble table after the byte-table nibbles in `nib_buf`).
     static ZC_K_V2_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -27259,7 +27343,7 @@ kernel void zc_ab_finish(
     /// Build the K arm's pipelines on `device` from the embedded metallib; the
     /// faster fold (`zc_k_fold_v2`, see [`super::zc_k_v2_enabled`]) from
     /// source, keeping the embedded fold if that fails.
-    unsafe fn zc_k_build_psos(api: &Api, device: Id) -> Result<(Id, Id), String> {
+    unsafe fn zc_k_build_psos(api: &Api, device: Id) -> Result<(Id, Id, Id, Id), String> {
         unsafe {
             let release = |obj: Id| {
                 if !obj.is_null() {
@@ -27267,9 +27351,36 @@ kernel void zc_ab_finish(
                 }
             };
             let library = try_embedded_metallib(api, device);
-            if library.is_null() {
-                return Err("embedded metallib unavailable".into());
-            }
+            // The embedded metallib is unavailable (a stale container on an
+            // older runtime, or the dispatch-data path rejected it): compile
+            // the same source here, on the thread the prewarm already builds
+            // the faster fold on. Untimed either way - init runs before the
+            // warm-up prove - and the kernels, the argument tables and the
+            // pipelines are the source's own.
+            let owned;
+            let library = if !library.is_null() {
+                library
+            } else {
+                let src = api.nsstring(MSL_SOURCE)?;
+                let mut err: Id = NIL;
+                let lib: Id = send!(
+                    api,
+                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                    device,
+                    c"newLibraryWithSource:options:error:",
+                    src,
+                    NIL,
+                    &mut err
+                );
+                if lib.is_null() {
+                    return Err(format!(
+                        "embedded metallib unavailable and source compile failed: {}",
+                        api.error_string(err)
+                    ));
+                }
+                owned = lib;
+                owned
+            };
             let pool = (api.pool_push)();
             let make_pipeline = |name: &str| -> Result<Id, String> {
                 let ns = api.nsstring(name)?;
@@ -27357,6 +27468,78 @@ kernel void zc_ab_finish(
                     }
                 }
             }
+            // The late-GPU steal's supplemental kernels ([`super::ENV_NO_ZC_K_LOOP`]):
+            // compiled from source exactly as the faster fold above; the
+            // embedded metallib is untouched. Only when the faster fold is
+            // active (the loop fold is derived from it); on any failure the
+            // incumbent pipelines stay and the steal is off.
+            let mut loop_fold: Result<Id, String> = Err("not built".into());
+            let mut loop_finish: Result<Id, String> = Err("not built".into());
+            if super::zc_k_loop_enabled() && ZC_K_V2_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+                let built = (|| -> Result<(Id, Id), String> {
+                    let src = api.nsstring(&zc_k_loop_msl_source()?)?;
+                    let mut err: Id = NIL;
+                    let lib: Id = send!(
+                        api,
+                        unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                        device,
+                        c"newLibraryWithSource:options:error:",
+                        src,
+                        NIL,
+                        &mut err
+                    );
+                    if lib.is_null() {
+                        return Err(format!("zc-k loop compile: {}", api.error_string(err)));
+                    }
+                    let mut made: Vec<(Id, Id)> = Vec::new();
+                    for name in ["zc_k_fold_loop", "zc_k_finish_loop"] {
+                        let ns = api.nsstring(name)?;
+                        let f: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                            lib,
+                            c"newFunctionWithName:",
+                            ns
+                        );
+                        if f.is_null() {
+                            release(lib);
+                            return Err(format!("{name} kernel not found"));
+                        }
+                        let mut perr: Id = NIL;
+                        let pso: Id = send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                            device,
+                            c"newComputePipelineStateWithFunction:error:",
+                            f,
+                            &mut perr
+                        );
+                        release(f);
+                        if pso.is_null() {
+                            for (a, b) in made.drain(..) {
+                                release(a);
+                                release(b);
+                            }
+                            release(lib);
+                            return Err(format!("{name} pipeline: {}", api.error_string(perr)));
+                        }
+                        made.push((f, pso));
+                    }
+                    release(lib);
+                    Ok((made[0].1, made[1].1))
+                })();
+                match built {
+                    Ok((f, g)) => {
+                        loop_fold = Ok(f);
+                        loop_finish = Ok(g);
+                    }
+                    Err(e) => {
+                        if super::gpu_zc_k_debug() {
+                            eprintln!("[zc-k-gpu] loop kernels unavailable ({e}); steal off");
+                        }
+                    }
+                }
+            }
             (api.pool_pop)(pool);
             release(library);
             let (fold_pso, finish_pso) = match (fold, finish) {
@@ -27377,15 +27560,39 @@ kernel void zc_ab_finish(
             };
             // The fold kernel's quad and SIMD reductions assume 32-wide SIMD
             // groups and a 256-thread superblock.
+            let (loop_fold_pso, loop_finish_pso) = match (loop_fold, loop_finish) {
+                (Ok(a), Ok(b)) => {
+                    if query(a, c"maxTotalThreadsPerThreadgroup") < 256
+                        || query(a, c"threadExecutionWidth") != 32
+                        || query(b, c"maxTotalThreadsPerThreadgroup") < 8
+                    {
+                        release(a);
+                        release(b);
+                        if super::gpu_zc_k_debug() {
+                            eprintln!("[zc-k-gpu] loop kernels' shapes rejected; steal off");
+                        }
+                        (NIL, NIL)
+                    } else {
+                        (a, b)
+                    }
+                }
+                _ => (NIL, NIL),
+            };
             if query(fold_pso, c"maxTotalThreadsPerThreadgroup") < 256
                 || query(fold_pso, c"threadExecutionWidth") != 32
                 || query(finish_pso, c"maxTotalThreadsPerThreadgroup") < 8
             {
                 release(fold_pso);
                 release(finish_pso);
+                if !loop_fold_pso.is_null() {
+                    release(loop_fold_pso);
+                }
+                if !loop_finish_pso.is_null() {
+                    release(loop_finish_pso);
+                }
                 return Err("zc-k PSOs cannot run their threadgroup shapes".into());
             }
-            Ok((fold_pso, finish_pso))
+            Ok((fold_pso, finish_pso, loop_fold_pso, loop_finish_pso))
         }
     }
 
@@ -27404,9 +27611,15 @@ kernel void zc_ab_finish(
     pub(crate) fn zc_k_prewarm() {
         if let Ok(gpu) = gpu() {
             let _ = ZC_K_PSOS.get_or_init(|| unsafe {
-                zc_k_build_psos(&gpu.api, gpu.device)
-                    .ok()
-                    .map(|(f, g)| (f as usize, g as usize, gpu.device as usize))
+                zc_k_build_psos(&gpu.api, gpu.device).ok().map(|(f, g, lf, lg)| {
+                    (
+                        f as usize,
+                        g as usize,
+                        lf as usize,
+                        lg as usize,
+                        gpu.device as usize,
+                    )
+                })
             });
         }
     }
@@ -27439,24 +27652,33 @@ kernel void zc_ab_finish(
         unsafe {
             let waited = std::time::Instant::now();
             let shared = *ZC_K_PSOS.get_or_init(|| {
-                zc_k_build_psos(&gpu.api, gpu.device)
-                    .ok()
-                    .map(|(f, g)| (f as usize, g as usize, gpu.device as usize))
+                zc_k_build_psos(&gpu.api, gpu.device).ok().map(|(f, g, lf, lg)| {
+                    (
+                        f as usize,
+                        g as usize,
+                        lf as usize,
+                        lg as usize,
+                        gpu.device as usize,
+                    )
+                })
             });
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             // Handles built on another device object cannot run on this
             // context's queue: build them here instead.
-            let (fold_pso, finish_pso, how) = match shared {
-                Some((f, g, dev)) if dev == gpu.device as usize => (f as Id, g as Id, "shared"),
+            let (fold_pso, finish_pso, loop_fold_pso, loop_finish_pso, how) = match shared {
+                Some((f, g, lf, lg, dev)) if dev == gpu.device as usize => {
+                    (f as Id, g as Id, lf as Id, lg as Id, "shared")
+                }
                 _ => {
-                    let (f, g) = zc_k_build_psos(&gpu.api, gpu.device)?;
-                    (f, g, "built at the launch")
+                    let (f, g, lf, lg) = zc_k_build_psos(&gpu.api, gpu.device)?;
+                    (f, g, lf, lg, "built at the launch")
                 }
             };
             if super::gpu_zc_k_debug() {
                 eprintln!("[zc-k-gpu] pipelines: {how} (joined after {wait_ms:.2} ms)");
             }
-            let mut made: Vec<Id> = Vec::with_capacity(8);
+            let fold_loop_pso = loop_fold_pso;
+            let mut made: Vec<Id> = Vec::with_capacity(9);
             for len in [
                 (256 + 512) * 16,
                 (2 + n_weights + chunks) * 16,
@@ -27466,6 +27688,7 @@ kernel void zc_ab_finish(
                 chunks * 8 * 16,
                 16,
                 8 * 16,
+                16,
             ] {
                 match gpu.new_buffer(len) {
                     Ok(b) => made.push(b),
@@ -27490,6 +27713,9 @@ kernel void zc_ab_finish(
                 part_buf: made[5],
                 flag_buf: made[6],
                 touch_buf: made[7],
+                cut_buf: made[8],
+                fold_loop_pso,
+                finish_loop_pso: loop_finish_pso,
                 chunks,
                 per_chunk_a,
                 per_chunk_b,
@@ -27512,11 +27738,28 @@ kernel void zc_ab_finish(
         per_chunk_b: usize,
         calibration: bool,
         submitted: std::time::Instant,
+        /// Whether the supplemental kernels are in flight and the CPU may
+        /// steal the GPU's share at the drain.
+        stealable: bool,
+        /// The kernels' boundary word (`chunks` = none). Present only when
+        /// `stealable`.
+        cut: *mut u32,
+        /// The arm's process-lifetime output buffers, for the CPU's stolen
+        /// chunks: `a` at `c * per_chunk_a`, `b` at `c * per_chunk_b` and
+        /// the eq_hi-weighted partial slot `c`, exactly the layouts the
+        /// oracle launch compares against the CPU's own outputs.
+        out_a: *mut F128,
+        out_b: *mut F128,
+        part: *mut [F128; 8],
     }
 
     // SAFETY: the handles are only waited/released by the launching thread;
-    // Metal objects are themselves thread-safe.
+    // Metal objects are themselves thread-safe. The steal pointers name the
+    // arm's process-lifetime shared buffers, which nothing rewrites before
+    // the join; the late-GPU seam's claim lock and the hetero queue's join
+    // order every write the CPU's stolen chunks make to them.
     unsafe impl Send for ZcKJob {}
+    unsafe impl Sync for ZcKJob {}
 
     impl ZcKJob {
         /// First chunk the CPU queue folds: zero during the oracle probe (the
@@ -27527,6 +27770,46 @@ kernel void zc_ab_finish(
 
         pub(crate) fn calibration(&self) -> bool {
             self.calibration
+        }
+
+        /// Whether the CPU may fold the GPU's chunks at the drain: the
+        /// supplemental kernels are in flight.
+        pub(crate) fn stealable(&self) -> bool {
+            self.stealable
+        }
+
+        /// The packed output strides (a: 244 per 256 outputs, b: 56 per 64),
+        /// for the CPU's stolen chunks.
+        pub(crate) fn per_chunk_a(&self) -> usize {
+            self.per_chunk_a
+        }
+
+        pub(crate) fn per_chunk_b(&self) -> usize {
+            self.per_chunk_b
+        }
+
+        /// Whether the buffer is complete (a poll, never a wait): the armed
+        /// signal when present, else (and always for a failure) the buffer
+        /// status. A failed buffer counts as done; the join below reports
+        /// the failure and the CPU folds the whole prefix.
+        pub(crate) fn done(&self) -> bool {
+            match gpu() {
+                Ok(g) => unsafe { g.cb_done(self.cb, self.sig.as_ref()) },
+                Err(_) => true,
+            }
+        }
+
+        /// Publish the CPU's steal boundary: the GPU's fold and finish skip
+        /// chunks `>= hi`, and a skipped chunk keeps whatever the CPU wrote
+        /// to its outputs and its partial slot.
+        pub(crate) fn set_cut(&self, hi: usize) {
+            unsafe { self.cut.write_volatile(hi as u32) };
+        }
+
+        /// The arm's output pointers for the CPU's stolen chunks (see the
+        /// struct fields). Valid until the join; the steal runs before it.
+        pub(crate) fn steal_ptrs(&self) -> (*mut F128, *mut F128, *mut [F128; 8]) {
+            (self.out_a, self.out_b, self.part)
         }
 
         /// GPU prefix length in chunks.
@@ -28011,11 +28294,21 @@ kernel void zc_ab_finish(
                 pad: [0; 3],
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
+            // Late-GPU steal: the supplemental kernels when they built (the
+            // boundary word starts at "no skip"; the CPU lowers it only under
+            // its claim lock once its own queue has drained), else the
+            // record's own pipelines and no boundary at all.
+            let stealable = state.fold_loop_pso != NIL && state.finish_loop_pso != NIL;
+            let (fold_pso, finish_pso) = if stealable {
+                (state.fold_loop_pso, state.finish_loop_pso)
+            } else {
+                (state.fold_pso, state.finish_pso)
+            };
             let pool = gpu.pool_push();
             let submitted = (|| -> Result<(Id, Option<DoneSig>), String> {
                 let cb = gpu.command_buffer()?;
                 let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, state.fold_pso);
+                gpu.set_pipeline(enc, fold_pso);
                 gpu.set_buffer(enc, a_view, 0, 0);
                 gpu.set_buffer(enc, d_view, 0, 1);
                 gpu.set_buffer(enc, state.nib_buf, 0, 2);
@@ -28025,10 +28318,19 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.tgp_buf, 0, 6);
                 gpu.set_bytes(enc, pb, 7);
                 gpu.set_buffer(enc, state.flag_buf, 0, 8);
+                if stealable {
+                    gpu.buffer_contents(state.cut_buf).cast::<u32>().write_volatile(chunks as u32);
+                    gpu.set_buffer(enc, state.cut_buf, 0, 9);
+                }
                 gpu.dispatch(enc, (chunks * sb_per_chunk) as u64, 256);
                 // Serial dispatches of one encoder: the finish reads the
-                // superblock sums the fold wrote.
-                gpu.set_pipeline(enc, state.finish_pso);
+                // superblock sums the fold wrote; with the steal on it skips
+                // the CPU's chunks so their partial slots (written by the
+                // CPU) are kept.
+                gpu.set_pipeline(enc, finish_pso);
+                if stealable {
+                    gpu.set_buffer(enc, state.cut_buf, 0, 4);
+                }
                 gpu.set_buffer(enc, state.tgp_buf, 0, 0);
                 gpu.set_buffer(enc, state.consts_buf, 0, 1);
                 gpu.set_buffer(enc, state.part_buf, 0, 2);
@@ -28053,6 +28355,15 @@ kernel void zc_ab_finish(
                     per_chunk_b,
                     calibration: mode == ZC_K_UNCALIBRATED,
                     submitted: std::time::Instant::now(),
+                    stealable,
+                    cut: if stealable {
+                        gpu.buffer_contents(state.cut_buf).cast::<u32>()
+                    } else {
+                        core::ptr::null_mut()
+                    },
+                    out_a: gpu.buffer_contents(state.out_a).cast::<F128>(),
+                    out_b: gpu.buffer_contents(state.out_b).cast::<F128>(),
+                    part: gpu.buffer_contents(state.part_buf).cast::<[F128; 8]>(),
                 }),
                 Err(e) => {
                     if debug {

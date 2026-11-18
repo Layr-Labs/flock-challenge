@@ -3746,14 +3746,36 @@ fn fold2_compact_and_round45_into_packed_b(
     let cpu_base = gpu_job.as_ref().map_or(0, crate::gpu_commit::ZcKJob::cpu_base);
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3")))]
     let cpu_base = 0usize;
-    let chunk_body = |x_hi: usize| {
+    // A late-GPU steal's destination: the K arm's process-lifetime output
+    // buffers and its packed strides. Chunk `x_hi`'s outputs land at
+    // `x_hi * per_a` / `x_hi * per_b` of `a` / `b` and its eq_hi-weighted
+    // partial slot at `part + x_hi` - the layouts the oracle launch
+    // compares, so the join reads a stolen chunk unchanged.
+    struct KSteal {
+        a: *mut F128,
+        b: *mut F128,
+        part: *mut [F128; 8],
+        per_a: usize,
+        per_b: usize,
+    }
+    // SAFETY: the pointers name the K arm's process-lifetime buffers; the
+    // seam's claim lock and the hetero queue's join order every write, and
+    // nothing else reads them before the join below.
+    unsafe impl Sync for KSteal {}
+
+    // `dst = None`: the pass's own output buffers and partial slots.
+    let chunk_body = |x_hi: usize, dst: Option<&KSteal>| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them. Packed: each of a
         // chunk's `out_chunk / 256` superblocks takes 244 entries.
         let (a_ptr, b_ptr) = unsafe {
-            let o = if pack { x_hi * out_chunk / 256 * 244 } else { x_hi * out_chunk };
-            let ob = if bpack { x_hi * out_chunk / 64 * b_block } else { o };
-            (a_base.ptr().add(o), b_base.ptr().add(ob))
+            if let Some(st) = dst {
+                (st.a.add(x_hi * st.per_a), st.b.add(x_hi * st.per_b))
+            } else {
+                let o = if pack { x_hi * out_chunk / 256 * 244 } else { x_hi * out_chunk };
+                let ob = if bpack { x_hi * out_chunk / 64 * b_block } else { o };
+                (a_base.ptr().add(o), b_base.ptr().add(ob))
+            }
         };
         // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
         let pair_base = 2 * x_hi * out_chunk;
@@ -3878,10 +3900,69 @@ fn fold2_compact_and_round45_into_packed_b(
         let eq_h = eq_hi[x_hi];
         // SAFETY: each queue job owns its partial slot exclusively.
         unsafe {
-            crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
+            let slot = match dst {
+                Some(st) => st.part.add(x_hi).cast(),
+                None => partials_base.ptr().add(x_hi),
+            };
+            crate::field::f128_slice::scale_slice_into(&mut *slot, &outv, eq_h);
         }
     };
-    crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
+    crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i, None));
+
+    // Late-GPU steal of the K arm (`FLOCK_NO_ZC_K_LOOP=1` keeps the record's
+    // join below): the 5+6 arm's seam, ported. The launch, the share and the
+    // CPU queue above are the record's. If the GPU's buffer is complete when
+    // the queue has drained, that is all. If not, the CPU does not wait: it
+    // folds the GPU's chunks itself from the top of the share downward,
+    // lowering the supplemental fold and finish kernels' skip boundary as
+    // it goes, and asks at every claim whether the buffer has completed; from
+    // that moment every chunk below the boundary is the GPU's. A stolen
+    // chunk's outputs and its weighted partial slot are written into the
+    // arm's own buffers, so the join reads them unchanged, and a b output the
+    // pack skips that is not one still fails the pass through the CPU
+    // queue's own flag. Which side folds a chunk cannot change a bit.
+    //
+    // The seam: the boundary and the completion flag change only under the
+    // claim lock; once completion is seen the boundary never moves again.
+    // The kernels skip a chunk only at or above a boundary value the CPU
+    // wrote, and every value written is the chunk the CPU claimed with it,
+    // so a chunk below the final boundary was never skipped (the completed
+    // buffer folded it) and never claimed (no CPU write).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    if let Some(job) = gpu_job.as_ref().filter(|j| j.stealable() && !j.calibration()) {
+        if !job.done() {
+            let (a, b, part) = job.steal_ptrs();
+            let steal = KSteal {
+                a,
+                b,
+                part,
+                per_a: job.per_chunk_a(),
+                per_b: job.per_chunk_b(),
+            };
+            let claims = std::sync::Mutex::new((cpu_base, false));
+            crate::epool::run_hetero_chunks(cpu_base, |_| {
+                let x_hi = {
+                    let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.1 || g.0 == 0 {
+                        return;
+                    }
+                    if job.done() {
+                        g.1 = true;
+                        return;
+                    }
+                    job.set_cut(g.0 - 1);
+                    g.0 -= 1;
+                    g.0
+                };
+                chunk_body(x_hi, Some(&steal));
+            });
+            let (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+            // Without the completion seen, the CPU folded every chunk of the
+            // share and nothing of the GPU's is read; a failed buffer counts
+            // as done here (the join reports it and folds the prefix).
+            assert!(gpu_done || lo == 0, "K steal ended early: {lo} chunks unclaimed");
+        }
+    }
 
     // Join the GPU prefix (it was submitted first and is normally done).
     #[allow(unused_mut)]
@@ -3927,7 +4008,7 @@ fn fold2_compact_and_round45_into_packed_b(
             crate::gpu_commit::ZcKResult::Failed => {
                 // The GPU failed after admission: the CPU folds the prefix
                 // chunks with the same kernel (the arm is now disabled).
-                crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
+                crate::epool::run_hetero_chunks(cpu_base, |i| chunk_body(i, None));
             }
         }
     }
