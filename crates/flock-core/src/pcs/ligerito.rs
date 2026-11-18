@@ -5829,7 +5829,7 @@ fn ligero_commit_select(
         target_feature = "aes"
     )) && recursive_from_message_shape
         && level_enabled
-        && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
+        && recursive_from_message_env_clear();
     ligero_commit_impl_view(
         poly,
         log_msg_cols,
@@ -5878,7 +5878,7 @@ pub(crate) fn ligero_commit_with_tree_view(
         log_inv_rate,
         ntt,
         kind,
-        std::env::var("FLOCK_NO_L1_TREE_VIEW").map_or(true, |v| v != "1"),
+        l1_tree_view_env_on(),
     )
 }
 
@@ -5925,8 +5925,7 @@ fn ligero_commit_impl_view(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
-    let timing = std::env::var_os("LIG_PROVE_TRACE").is_some()
-        || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let timing = commit_trace_env();
     let total_start = timing.then(std::time::Instant::now);
 
     // LSB-lane layout: input matches `data[pos * num_interleaved + lane]`.
@@ -6294,6 +6293,175 @@ impl RoundQuad {
 /// opening skip their Rayon join (`FLOCK_NO_SMALL_SERIAL=1` kills).
 const SMALL_SERIAL_MAX_LOG_STATE: usize = 15;
 
+/// Kill switch for the cached ligerito / ring-switch gate environment
+/// (`FLOCK_NO_LIGERITO_ENV_ONCE`, any value: every gate call reads its
+/// variables from the process environment again, as before). Read once per
+/// process.
+pub const ENV_NO_LIGERITO_ENV_ONCE: &str = "FLOCK_NO_LIGERITO_ENV_ONCE";
+
+pub(crate) fn ligerito_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LIGERITO_ENV_ONCE).is_none());
+    *ON
+}
+
+/// The trace term of the ligerito prove (`LIG_PROVE_TRACE` /
+/// `FLOCK_OPEN_TIMING`). The process environment does not change during a
+/// prove, so the first answer is kept. `FLOCK_NO_LIGERITO_ENV_ONCE` restores
+/// the per-call lookups.
+#[inline]
+fn prove_trace_env() -> bool {
+    if ligerito_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+        });
+        return *ON;
+    }
+    std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+}
+
+/// [`c2::enabled`] with the `FLOCK_NO_LIG_C2` value kept the same way (the
+/// value itself is kept, so `c2::enabled` still makes the comparison).
+#[inline]
+fn lig_c2_enabled(use_lazy_l1_ood: bool) -> bool {
+    if ligerito_env_once_enabled() {
+        static NO_LIG_C2: std::sync::LazyLock<Option<std::ffi::OsString>> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_C2"));
+        return c2::enabled(use_lazy_l1_ood, NO_LIG_C2.as_deref());
+    }
+    c2::enabled(
+        use_lazy_l1_ood,
+        std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
+    )
+}
+
+/// The timing term of the ligero commit (`LIG_PROVE_TRACE` /
+/// `FLOCK_OPEN_TIMING`, both `var_os`), kept the same way.
+#[inline]
+fn commit_trace_env() -> bool {
+    if ligerito_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("LIG_PROVE_TRACE").is_some()
+                || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+        });
+        return *ON;
+    }
+    std::env::var_os("LIG_PROVE_TRACE").is_some()
+        || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+}
+
+/// The `FLOCK_NO_RECURSIVE_FROM_MESSAGE` term of the recursive commit
+/// selector, kept the same way.
+#[inline]
+fn recursive_from_message_env_clear() -> bool {
+    if ligerito_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none()
+        });
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none()
+}
+
+/// The `FLOCK_NO_L1_TREE_VIEW` (exact `'1'`) term of
+/// [`ligero_commit_with_tree_view`], kept the same way.
+#[inline]
+fn l1_tree_view_env_on() -> bool {
+    if ligerito_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_NO_L1_TREE_VIEW").map_or(true, |v| v != "1")
+        });
+        return *ON;
+    }
+    std::env::var("FLOCK_NO_L1_TREE_VIEW").map_or(true, |v| v != "1")
+}
+
+/// The environment term of [`ranked_fold2_enabled`], kept the same way.
+#[inline]
+fn lig_fold2_env_clear() -> bool {
+    if ligerito_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+}
+
+/// The `FLOCK_NO_DIRECT_FOLD8_PAIR` term of the direct-fold8 slot folds, kept
+/// the same way.
+#[inline]
+fn direct_fold8_pair_env_clear() -> bool {
+    if ligerito_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none()
+}
+
+/// The `FLOCK_NO_DIRECT_FOLD8_QUAD` term of the direct-fold8 slot folds, kept
+/// the same way.
+#[inline]
+fn direct_fold8_quad_env_clear() -> bool {
+    if ligerito_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none()
+}
+
+/// The `FLOCK_NO_LIG_LAZY_OOD_EQ` term of the ranked L1 lazy-OOD selector,
+/// kept the same way.
+#[inline]
+fn lig_lazy_ood_eq_env_off() -> bool {
+    if ligerito_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some());
+        return *OFF;
+    }
+    std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some()
+}
+
+/// The environment term of the ranked L2 lazy-OOD selector, kept the same
+/// way (`FLOCK_NO_LIGERITO_ENV_ONCE` restores the per-call lookup).
+#[inline]
+fn ranked_l2_lazy_ood_eq_env_disabled() -> bool {
+    if ligerito_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            ranked_l2_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L2_LAZY_OOD).as_deref())
+        });
+        return *OFF;
+    }
+    ranked_l2_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L2_LAZY_OOD).as_deref())
+}
+
+/// The environment term of the ranked L3 lazy-OOD selector, kept the same
+/// way (`FLOCK_NO_LIGERITO_ENV_ONCE` restores the per-call lookup).
+#[inline]
+fn ranked_l3_lazy_ood_eq_env_disabled() -> bool {
+    if ligerito_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            ranked_l3_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L3_LAZY_OOD).as_deref())
+        });
+        return *OFF;
+    }
+    ranked_l3_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L3_LAZY_OOD).as_deref())
+}
+
+/// The environment term of the ranked L4 lazy-OOD selector, kept the same
+/// way (`FLOCK_NO_LIGERITO_ENV_ONCE` restores the per-call lookup).
+#[inline]
+fn ranked_l4_lazy_ood_eq_env_disabled() -> bool {
+    if ligerito_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            ranked_l4_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L4_LAZY_OOD).as_deref())
+        });
+        return *OFF;
+    }
+    ranked_l4_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L4_LAZY_OOD).as_deref())
+}
+
 /// Enable the previously-promoted two-challenge initial-fold cadence only for
 /// the ranked opening geometry it was designed and validated for. The opt-out
 /// keeps an adjacent single-fold control available without rebuilding.
@@ -6302,7 +6470,7 @@ pub(crate) fn ranked_fold2_enabled(poly_len: usize, initial_k: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && poly_len == (1usize << 25)
         && initial_k == 6
-        && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+        && lig_fold2_env_clear()
 }
 
 /// Compute `(u_0, u_2)` for `u(X) = Σ_x f(X, x) · b(X, x)` where `X` is the
@@ -8027,9 +8195,8 @@ fn materialize_direct_fold8(
     // The rollback retains the incumbent two single-slot calls for A/B.
     let pair_fold64 = deferred_reduce
         && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
-        && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
-    let quad_fold64 =
-        pair_fold64 && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none();
+        && direct_fold8_pair_env_clear();
+    let quad_fold64 = pair_fold64 && direct_fold8_quad_env_clear();
     // Whole-element loads in the four-slot fold (same products, same sums;
     // see `f128_slice::fold_banked_slots4_whole_into`). The rollback runs
     // the incumbent block body.
@@ -8547,7 +8714,7 @@ fn ranked_l1_lazy_ood_eq_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some(),
+        lig_lazy_ood_eq_env_off(),
     )
 }
 
@@ -8647,7 +8814,7 @@ fn ranked_l2_lazy_ood_eq_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L2_LAZY_OOD).as_deref()),
+        ranked_l2_lazy_ood_eq_env_disabled(),
     )
 }
 
@@ -8772,7 +8939,7 @@ fn ranked_l3_lazy_ood_eq_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l3_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L3_LAZY_OOD).as_deref()),
+        ranked_l3_lazy_ood_eq_env_disabled(),
     )
 }
 
@@ -8896,7 +9063,7 @@ fn ranked_l4_lazy_ood_eq_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l4_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L4_LAZY_OOD).as_deref()),
+        ranked_l4_lazy_ood_eq_env_disabled(),
     )
 }
 
@@ -10059,8 +10226,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
     assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
-    let trace =
-        std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let trace = prove_trace_env();
     let mut t_init_sumcheck = std::time::Duration::ZERO;
     let mut t_commits = std::time::Duration::ZERO;
     let mut t_opens = std::time::Duration::ZERO;
@@ -10451,10 +10617,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let use_c2 = c2::enabled(
-        use_lazy_l1_ood,
-        std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
-    );
+    let use_c2 = lig_c2_enabled(use_lazy_l1_ood);
     let open_l0 = || {
         use rayon::prelude::*;
         rayon::join(

@@ -3019,6 +3019,33 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     )
 }
 
+/// The trace term of the batched ring switch (`PCS_TRACE` /
+/// `FLOCK_OPEN_TIMING`). The process environment does not change during a
+/// prove, so the first answer is kept; `FLOCK_NO_LIGERITO_ENV_ONCE` (any
+/// value) restores the per-call lookups.
+#[inline]
+fn batched_open_trace_env() -> bool {
+    if crate::pcs::ligerito::ligerito_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+        });
+        return *ON;
+    }
+    std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+}
+
+/// The `FLOCK_NO_OPEN_DEFERRED_C` term of the deferred-C precondition, kept
+/// the same way.
+#[inline]
+fn open_deferred_c_env_clear() -> bool {
+    if crate::pcs::ligerito::ligerito_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
+}
+
 /// Move optional canonical statistics into the proof beside unchanged
 /// Fold8 views. Slots use original claim order. A supplied value must equal
 /// that claim's Fold8 collapse. Missing or wrong-size hints use the current
@@ -3034,8 +3061,7 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
     basis_elidable: bool,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
-    let trace =
-        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let trace = batched_open_trace_env();
     let n = x_outers.len();
     let l = packed_witness.len();
     for x in x_outers {
@@ -3353,7 +3379,7 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
         && use_split
         && has_quad[0]
         && !has_quad[1]
-        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
+        && open_deferred_c_env_clear();
 
     // Per-opening tails are independent once every γ_rs is sampled (the
     // transcript work above is complete), so run the two openings' table and
