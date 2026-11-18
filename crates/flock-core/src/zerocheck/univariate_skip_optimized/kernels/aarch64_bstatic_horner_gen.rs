@@ -46,13 +46,16 @@ fn bstatic_horner_blk<const BLK: usize, const V: u32>(
     out: &mut [u8; 64],
     nt_store: bool,
 ) {
+    let kz = ab_row_z_base::<V>(inv_table, kara);
     bstatic_horner_blk_body::<BLK, V, false>(
-        a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, out, nt_store,
+        a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, kz, out, nt_store,
     );
 }
 
 /// Body of [`bstatic_horner_blk`]. `kara` is [`ab_kara_tables`] when `V`
-/// has `ABV_KARA` and is not dereferenced otherwise.
+/// has `ABV_KARA` and is not dereferenced otherwise. `kz` is
+/// [`ab_kara_tables`] (whose z records [`ABV_HIGH_SUFFIX_Z`] reads) when `V`
+/// has that bit, see [`ab_row_z_base`], and is not dereferenced otherwise.
 ///
 /// `HOIST = true` (window rows only, see [`bstatic_horner_window_rows`]):
 /// the caller has already checked that the row's eight K words lie inside
@@ -68,6 +71,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
     chunk_byte_base: usize,
     partials: &'static [[u8; 64]; 248],
     kara: *const u8,
+    kz: *const u8,
     out: &mut [u8; 64],
     nt_store: bool,
 ) {
@@ -146,6 +150,31 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let pp = pbase.add(($blk * 8 + $k) * 64);
                     let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(
                         plain, kplain, transform_partial_word::<V>(bw!($k)),
+                    );
+                    let (d0, d1, d2, d3) = transform_partial_seed::<V>(pp);
+                    (
+                        veorq_u8(d0, z0),
+                        veorq_u8(d1, z1),
+                        veorq_u8(d2, z2),
+                        veorq_u8(d3, z3),
+                    )
+                } else {
+                    $inc
+                }
+            }};
+        }
+        // A plain-image static B word (`k < 4`) whose varying bytes are
+        // exactly bytes `8-NB..8`: under `ABV_HIGH_SUFFIX_Z` its partial
+        // image plus the varying bytes' z-form image read through the output
+        // block permutation ([`apply_word_z_high`]); otherwise the incumbent
+        // form `$inc`.
+        #[allow(unused_macros)]
+        macro_rules! bimg_hz {
+            ($blk:literal, $k:literal, $nb:literal, $inc:expr) => {{
+                if V & ABV_HIGH_SUFFIX_Z != 0 {
+                    let pp = pbase.add(($blk * 8 + $k) * 64);
+                    let (z0, z1, z2, z3) = apply_word_z_high::<$nb>(
+                        plain, kz, transform_partial_word::<V>(bw!($k)),
                     );
                     let (d0, d1, d2, d3) = transform_partial_seed::<V>(pp);
                     (
@@ -243,7 +272,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_g!(2));
                     let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
                     fuse_absorb_first(&mut acc, &o2, &o6);
-                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_s!(3, 1, [(6, 7)], []));
+                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_hz!(3, 1, 2, bimg_s!(3, 1, [(6, 7)], [])));
                     let o5 = if V & ABV_SPARSE_SCALE != 0 {
                         opnds_ss!(5, 3, true)
                     } else {
@@ -282,7 +311,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_g!(2));
                     let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
                     fuse_absorb_first(&mut acc, &o2, &o6);
-                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_s!(4, 1, [(5, 6)], [7]));
+                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_hz!(4, 1, 3, bimg_s!(4, 1, [(5, 6)], [7])));
                     let o5 = if V & ABV_SPARSE_SCALE != 0 {
                         opnds_ss!(5, 4, true)
                     } else {
@@ -480,7 +509,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_g!(1));
                     let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
                     fuse_absorb_k1(&mut acc, &o1, &o5);
-                    let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_s!(9, 0, [(5, 6)], [7]));
+                    let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_hz!(9, 0, 3, bimg_s!(9, 0, [(5, 6)], [7])));
                     let o4 = if V & ABV_SPARSE_SCALE != 0 {
                         opnds_ss!(4, 4, true)
                     } else {
@@ -523,7 +552,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_g!(1));
                     let o5 = opnds!(scaled, scaled_sw, kscaled, 5, bimg_g!(5));
                     fuse_absorb_k1(&mut acc, &o1, &o5);
-                    let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_sk!(10, 0, [(4, 5), (6, 7)], []));
+                    let o0 = opnds!(plain, plain_sw, kplain, 0, bimg_hz!(10, 0, 4, bimg_sk!(10, 0, [(4, 5), (6, 7)], [])));
                     let o4 = opnds!(scaled, scaled_sw, kscaled, 4, bimg_sk!(10, 4, [(3, 4), (5, 6)], [7]));
                     fuse_absorb_k0(&mut acc, &o0, &o4);
                     acc
@@ -627,7 +656,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                     acc
                 } else {
-                    let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_s!(13, 3, [(6, 7)], []));
+                    let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_hz!(13, 3, 2, bimg_s!(13, 3, [(6, 7)], [])));
                     let o7 = if V & ABV_SPARSE_SCALE != 0 {
                         opnds_ss!(7, 2, true)
                     } else {
@@ -666,7 +695,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     horner_absorb_k0::<V>(&mut acc, &lo0, &hi0, carry_not);
                     acc
                 } else {
-                    let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_s!(14, 3, [(5, 6)], [7]));
+                    let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_hz!(14, 3, 3, bimg_s!(14, 3, [(5, 6)], [7])));
                     let o7 = if V & ABV_SPARSE_SCALE != 0 {
                         opnds_ss!(7, 4, true)
                     } else {
@@ -864,7 +893,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_g!(3));
                     let o7 = opnds!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
                     let mut acc = fuse_seed(&o3, &o7);
-                    let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_s!(19, 2, [(5, 6)], [7]));
+                    let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_hz!(19, 2, 3, bimg_s!(19, 2, [(5, 6)], [7])));
                     let o6 = if V & ABV_SPARSE_SCALE != 0 {
                         opnds_ss!(6, 3, true)
                     } else {
@@ -903,7 +932,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o3 = opnds!(plain, plain_sw, kplain, 3, bimg_g!(3));
                     let o7 = opnds!(scaled, scaled_sw, kscaled, 7, bimg_g!(7));
                     let mut acc = fuse_seed(&o3, &o7);
-                    let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_sk!(20, 2, [(4, 5), (6, 7)], []));
+                    let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_hz!(20, 2, 4, bimg_sk!(20, 2, [(4, 5), (6, 7)], [])));
                     let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_sk!(20, 6, [(3, 4), (5, 6)], [7]));
                     fuse_absorb_first(&mut acc, &o2, &o6);
                     let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_sk!(20, 1, [(0, 1), (2, 3)], [4]));
@@ -1062,7 +1091,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_g!(2));
                     let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
                     fuse_absorb_first(&mut acc, &o2, &o6);
-                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_s!(24, 1, [(6, 7)], []));
+                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_hz!(24, 1, 2, bimg_s!(24, 1, [(6, 7)], [])));
                     let o5 = if V & ABV_SPARSE_SCALE != 0 {
                         opnds_ss!(5, 3, true)
                     } else {
@@ -1101,7 +1130,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                     let o2 = opnds!(plain, plain_sw, kplain, 2, bimg_g!(2));
                     let o6 = opnds!(scaled, scaled_sw, kscaled, 6, bimg_g!(6));
                     fuse_absorb_first(&mut acc, &o2, &o6);
-                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_sk!(25, 1, [(4, 5), (6, 7)], []));
+                    let o1 = opnds!(plain, plain_sw, kplain, 1, bimg_hz!(25, 1, 4, bimg_sk!(25, 1, [(4, 5), (6, 7)], [])));
                     let o5 = if V & ABV_SPARSE_SCALE != 0 {
                         opnds_ss!(5, 4, true)
                     } else {
@@ -1394,6 +1423,7 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u32, const HOIST: bool>(
     } else {
         core::ptr::null()
     };
+    let kz = ab_row_z_base::<V>(inv_table, kara);
     macro_rules! rows {
         ($($blk:literal),*) => {{
             $(
@@ -1401,7 +1431,7 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u32, const HOIST: bool>(
                 let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
                 if V & ABV_INLINE_WINDOW != 0 {
                     bstatic_horner_blk_body::<$blk, V, HOIST>(
-                        a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store,
+                        a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, kz, dst, nt_store,
                     );
                 } else {
                     bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store);
@@ -1471,14 +1501,24 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                             // images take each row's short-B `x^4` word with
                             // the weight on B ([`ABV_SPARSE_SCALE`]) and the
                             // other `x^4` words in the lane z form
-                            // ([`ABV_KARA_LANEZ`]); this is the only fused
-                            // instance with them. `FLOCK_NO_AB_SPARSE_SCALE=1`
-                            // or `FLOCK_NO_ZC_AB_LANEZ=1` takes the per-chunk
+                            // ([`ABV_KARA_LANEZ`]), and the plain B words
+                            // whose varying bytes are a high run of two to
+                            // four in the z form ([`ABV_HIGH_SUFFIX_Z`]);
+                            // this is the only fused instance with them.
+                            // `FLOCK_NO_AB_SPARSE_SCALE=1`,
+                            // `FLOCK_NO_ZC_AB_LANEZ=1` or
+                            // `FLOCK_NO_AB_HIGH_SUFFIX_Z=1` takes the per-chunk
                             // rows, which write the same bytes (build budget:
                             // no separate unit instance).
-                            if ab_sparse_scale_enabled() && ab_kara_lanez_enabled() {
+                            if ab_sparse_scale_enabled() && ab_kara_lanez_enabled() && ab_high_suffix_z_enabled() {
                                 bstatic_horner_window_unit_nt::<
-                                    { BASE | AB_FUSE_FORM | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_KARA_LANEZ },
+                                    {
+                                        BASE | AB_FUSE_FORM
+                                            | ABV_TRANSFORM_TRIM
+                                            | ABV_SPARSE_SCALE
+                                            | ABV_KARA_LANEZ
+                                            | ABV_HIGH_SUFFIX_Z
+                                    },
                                     true,
                                     true,
                                 >(
@@ -1516,9 +1556,26 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                 // the same bounds checks (`HOIST`: one per window).
                 if ab_fuse_e_enabled() {
                     if const { V & ABV_TRANSFORM_TRIM != 0 } {
-                        bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM | ABV_TRANSFORM_TRIM }, HOIST, true>(
-                            x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
-                        )
+                        // With the plain B words whose varying bytes are a
+                        // high run of two to four in the z form
+                        // ([`ABV_HIGH_SUFFIX_Z`], records of
+                        // [`ab_kara_tables`]); `FLOCK_NO_AB_HIGH_SUFFIX_Z=1`
+                        // takes the per-chunk rows, which write the same
+                        // bytes (build budget: no separate unit instance).
+                        if ab_high_suffix_z_enabled() {
+                            bstatic_horner_window_unit_nt::<
+                                { AB_UNIT_HELPER | AB_FUSE_FORM | ABV_TRANSFORM_TRIM | ABV_HIGH_SUFFIX_Z },
+                                HOIST,
+                                true,
+                            >(
+                                x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                            )
+                        } else {
+                            bstatic_horner_window_unit_per_chunk::<V, HOIST>(
+                                x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
+                                true,
+                            )
+                        }
                     } else {
                         bstatic_horner_window_unit_nt::<{ AB_UNIT_HELPER | AB_FUSE_FORM }, HOIST, true>(
                             x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit,
@@ -1653,6 +1710,7 @@ fn bstatic_horner_window_unit_flag<const V: u32, const HOIST: bool>(
     } else {
         core::ptr::null()
     };
+    let kz = ab_row_z_base::<V>(inv_table, kara);
     for (i, out_outer) in out_unit.chunks_exact_mut(16 * 64).enumerate() {
         let w = (x_outer + i) & window_mask;
         let chunk_byte_base = chunk_byte_base + i * 16 * 64;
@@ -1670,7 +1728,7 @@ fn bstatic_horner_window_unit_flag<const V: u32, const HOIST: bool>(
                     let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
                     if V & ABV_INLINE_WINDOW != 0 {
                         bstatic_horner_blk_body::<$blk, V, HOIST>(
-                            a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store,
+                            a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, kz, dst, nt_store,
                         );
                     } else {
                         bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store);
@@ -1710,6 +1768,7 @@ fn bstatic_horner_window_unit_nt<const V: u32, const HOIST: bool, const NT: bool
     } else {
         core::ptr::null()
     };
+    let kz = ab_row_z_base::<V>(inv_table, kara);
     for (i, out_outer) in out_unit.chunks_exact_mut(16 * 64).enumerate() {
         let w = (x_outer + i) & window_mask;
         let chunk_byte_base = chunk_byte_base + i * 16 * 64;
@@ -1727,7 +1786,7 @@ fn bstatic_horner_window_unit_nt<const V: u32, const HOIST: bool, const NT: bool
                     let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
                     if V & ABV_INLINE_WINDOW != 0 {
                         bstatic_horner_blk_body::<$blk, V, HOIST>(
-                            a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, NT,
+                            a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, kz, dst, NT,
                         );
                     } else {
                         bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, NT);
@@ -2019,8 +2078,11 @@ fn ab_window_unit_fuse_matches_parent() {
     assert_eq!(checked, 4 * 5 * 2);
 }
 
-/// The default main-pool unit instance (with [`ABV_TRANSFORM_TRIM`] and
-/// [`ABV_SPARSE_SCALE`]) writes the bytes of the fused form without them,
+/// The default main-pool unit instance (with [`ABV_TRANSFORM_TRIM`],
+/// [`ABV_SPARSE_SCALE`], [`ABV_KARA_LANEZ`] and [`ABV_HIGH_SUFFIX_Z`]) and
+/// the default helper-thread unit instance (with the trim and
+/// [`ABV_HIGH_SUFFIX_Z`]), and each with the high-suffix bit alone, write
+/// the bytes of the fused form without them,
 /// with the trim only, and of the parent unit form, for both store
 /// flavours, at the geometry of [`ab_window_unit_fuse_matches_parent`]: B
 /// rows on their static plans with random varying bytes, with all varying
@@ -2108,6 +2170,18 @@ fn ab_window_unit_sparse_scale_matches_parent() {
                     want,
                     "helper TRIM {at}"
                 );
+                assert_eq!(
+                    both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_KARA_LANEZ | ABV_HIGH_SUFFIX_Z),
+                    want,
+                    "TRIM SPARSE LANEZ HIGH {at}"
+                );
+                assert_eq!(both!(FUSED | ABV_HIGH_SUFFIX_Z), want, "HIGH {at}");
+                assert_eq!(
+                    both!(AB_UNIT_HELPER | ABV_FUSE | ABV_TRANSFORM_TRIM | ABV_HIGH_SUFFIX_Z),
+                    want,
+                    "helper TRIM HIGH {at}"
+                );
+                assert_eq!(both!(AB_UNIT_HELPER | ABV_FUSE | ABV_HIGH_SUFFIX_Z), want, "helper HIGH {at}");
                 checked += 1;
             }
         }
@@ -2126,7 +2200,9 @@ fn ab_window_unit_sparse_scale_matches_parent() {
 /// with A all ones and with random A; (3) A a single bit in each of the 64
 /// positions with B random on its plan. The sparse-scale unit writes the
 /// bytes of the incumbent fused unit, the trimmed fused unit, the
-/// helper-thread unit and the parent form, for both store flavours.
+/// helper-thread unit and the parent form, for both store flavours; so do
+/// the main-pool and helper-thread units with [`ABV_HIGH_SUFFIX_Z`] (with and
+/// without the trim).
 #[cfg(all(test, target_arch = "aarch64"))]
 #[test]
 fn ab_window_unit_sparse_scale_adversarial() {
@@ -2184,6 +2260,14 @@ fn ab_window_unit_sparse_scale_adversarial() {
         assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE), want, "TRIM SPARSE {at}");
         assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_KARA_LANEZ), want, "TRIM SPARSE LANEZ {at}");
         assert_eq!(both!(AB_UNIT_HELPER | ABV_FUSE | ABV_TRANSFORM_TRIM), want, "helper TRIM {at}");
+        assert_eq!(
+            both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_KARA_LANEZ | ABV_HIGH_SUFFIX_Z),
+            want,
+            "TRIM SPARSE LANEZ HIGH {at}"
+        );
+        assert_eq!(both!(FUSED | ABV_HIGH_SUFFIX_Z), want, "HIGH {at}");
+        assert_eq!(both!(AB_UNIT_HELPER | ABV_FUSE | ABV_TRANSFORM_TRIM | ABV_HIGH_SUFFIX_Z), want, "helper TRIM HIGH {at}");
+        assert_eq!(both!(AB_UNIT_HELPER | ABV_FUSE | ABV_HIGH_SUFFIX_Z), want, "helper HIGH {at}");
         let mut out = [0u8; 2 * OUTER_BYTES];
         out.copy_from_slice(&want.0);
         out

@@ -4524,6 +4524,202 @@ unsafe fn apply_word_z_low<const NB: u32>(
     }
 }
 
+/// Row-body variant bit (with the z records of [`ab_kara_tables`]): a
+/// plain-image static-B word (`k < 4`) whose varying bytes are exactly the
+/// high bytes `8-NB..8` (`NB` = 2, 3 or 4) takes its partial image plus
+/// [`apply_word_z_high`] of the varying bytes instead of the per-byte rows
+/// (`NB` = 2, 3) or the whole-word apply (`NB` = 4): 6, 8 or 10 reads
+/// instead of 8, 12 or 15 (main-pool rows) or 8, 12 or 16 (helper rows).
+/// Ten words of the 26 static-B rows: (BLK, k) = (3, 1), (13, 3), (24, 1)
+/// with two bytes; (4, 1), (9, 0), (14, 3), (19, 2) with three; (10, 0),
+/// (20, 2), (25, 1) with four. Same output bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_HIGH_SUFFIX_Z: u32 = 1 << 21;
+
+/// Kill switch for [`ABV_HIGH_SUFFIX_Z`]: exactly
+/// `FLOCK_NO_AB_HIGH_SUFFIX_Z=1` takes the per-chunk rows in the main-pool
+/// and the helper window units (no second unit instance, build budget),
+/// which write the same bytes. Read once per process; kept free of generic
+/// code (no closure, no `OnceLock` instance).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_high_suffix_z_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0: not read yet, 1: on, 2: off.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("FLOCK_NO_AB_HIGH_SUFFIX_Z").as_deref() != Some(std::ffi::OsStr::new("1"));
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// The base of [`ab_kara_tables`] for a row body with [`ABV_HIGH_SUFFIX_Z`]
+/// (the `kz` of `bstatic_horner_blk_body`): `kara` itself when `V` applies
+/// the Karatsuba form, the canonical tables otherwise (the helper rows,
+/// whose `kara` is [`ab_hz_tables`], a different layout). Not dereferenced
+/// without the bit.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn ab_row_z_base<const V: u32>(inv_table: &InvNttTableByteSingleGf8, kara: *const u8) -> *const u8 {
+    if V & ABV_HIGH_SUFFIX_Z != 0 && V & ABV_KARA == 0 {
+        ab_kara_tables(inv_table)
+    } else {
+        kara
+    }
+}
+
+/// [`apply_word_z_low`] of the word `w` restricted to its high bytes
+/// `8-NB..8` (`2 <= NB <= 4`), the other bytes taken as zero. Output block
+/// `n` (eight bytes) receives `R_(n^j)(W_j)` from byte `j` (see
+/// [`xor_vary_single`]), so for any `t` the word `v` with `v_j = w_(j^t)`
+/// has `T(v)` block `n ^ t` equal to `T(w)` block `n`. With `t` = 6, 7, 4
+/// for `NB` = 2, 3, 4 the high bytes of `w` are the low `NB` bytes of `v`:
+/// `w >> 48`, the byte reversal of `w`, `w >> 32` (the low form drops
+/// every other byte). Register `q` of the result is register `q ^ (t >> 1)`
+/// of the low form, its two halves exchanged when `t` is odd. Same reads as
+/// the low form: 6, 8 or 10.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z_high<const NB: u32>(
+    t0: *const u8,
+    kara: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    const { assert!(NB >= 2 && NB <= 4) };
+    unsafe {
+        match NB {
+            // t = 6: register q is register q ^ 3.
+            2 => {
+                let (z0, z1, z2, z3) = apply_word_z_low::<NB>(t0, kara, w >> 48);
+                (z3, z2, z1, z0)
+            }
+            // t = 7: register q is register q ^ 3 with its halves exchanged.
+            3 => {
+                let (z0, z1, z2, z3) = apply_word_z_low::<NB>(t0, kara, w.swap_bytes());
+                let sw = |x: uint8x16_t| vextq_u8::<8>(x, x);
+                (sw(z3), sw(z2), sw(z1), sw(z0))
+            }
+            // t = 4: register q is register q ^ 2.
+            _ => {
+                let (z0, z1, z2, z3) = apply_word_z_low::<NB>(t0, kara, w >> 32);
+                (z2, z3, z0, z1)
+            }
+        }
+    }
+}
+
+/// [`apply_word_z_high`] against the table's scalar apply
+/// (`InvNttTableByteSingleGf8::apply_scalar`) and its NEON apply: (1) the
+/// apply of `w` restricted to its high `NB` bytes, for every byte value at
+/// every high position, every one of the 64 single-bit words (bits outside
+/// the high bytes are dropped), zero, all ones and random words; (2) for
+/// each of the ten [`ABV_HIGH_SUFFIX_Z`] words of the static-B plans, the
+/// plan leaves exactly the high `NB` bytes unchecked, and on guarded words
+/// (static bytes 0xff, varying bytes zero, all ones, every single bit and
+/// random) both row forms equal the whole-word apply: the complemented form
+/// `[1; 64] ^ T(!b)` of [`ABV_TRANSFORM_TRIM`] and the partial image plus
+/// the varying bytes.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_high_suffix_translation() {
+    use crate::ntt::AdditiveNttGf8;
+    use core::arch::aarch64::*;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let kara = ab_kara_tables(&table);
+    let plain = table.data_ptr();
+    let partials = bstatic_partials(&table);
+    let bytes = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| {
+        let mut out = [0u8; 64];
+        // SAFETY: four 16-byte stores into a 64-byte array.
+        unsafe {
+            vst1q_u8(out.as_mut_ptr(), v.0);
+            vst1q_u8(out.as_mut_ptr().add(16), v.1);
+            vst1q_u8(out.as_mut_ptr().add(32), v.2);
+            vst1q_u8(out.as_mut_ptr().add(48), v.3);
+        }
+        out
+    };
+    let scalar = |w: u64| {
+        let mut f = [F8::ZERO; 64];
+        table.apply_scalar(&w.to_le_bytes(), &mut f);
+        let mut g = [F8::ZERO; 64];
+        table.apply(&w.to_le_bytes(), &mut g);
+        assert_eq!(f, g, "w={w:016x}");
+        f.map(|x| x.0)
+    };
+    let mut x = 0x4A11_5EED_0000_0A01u64;
+    let mut rnd = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut checked = 0usize;
+    macro_rules! high {
+        ($nb:literal) => {{
+            let vary: u64 = ((1u64 << (8 * $nb)) - 1).swap_bytes();
+            let mut words: Vec<u64> = (0..256 * $nb).map(|i| ((i % 256) as u64) << (8 * (7 - i / 256))).collect();
+            words.extend((0..64).map(|bit| 1u64 << bit));
+            words.extend([0, u64::MAX]);
+            words.extend((0..4000).map(|_| rnd()));
+            for w in words {
+                // SAFETY: the apply reads inside the table images only.
+                let got = bytes(unsafe { apply_word_z_high::<$nb>(plain, kara, w) });
+                assert_eq!(got, scalar(w & vary), "nb={} w={w:016x}", $nb);
+                checked += 1;
+            }
+        }};
+    }
+    high!(2);
+    high!(3);
+    high!(4);
+    assert_eq!(checked, 256 * 9 + 3 * (64 + 2 + 4000));
+    // The ten words: (blk, k, NB).
+    let sites: [(usize, usize, u32); 10] =
+        [(3, 1, 2), (13, 3, 2), (24, 1, 2), (4, 1, 3), (9, 0, 3), (14, 3, 3), (19, 2, 3), (10, 0, 4), (20, 2, 4), (25, 1, 4)];
+    let mut rows = 0usize;
+    for (blk, k, nb) in sites {
+        let (mask, expected) = BSTATIC_MASKS[blk][k];
+        let vary = ((1u64 << (8 * nb)) - 1).swap_bytes();
+        assert_eq!(!mask, vary, "blk={blk} k={k}: unchecked bytes");
+        assert_eq!(expected, !vary, "blk={blk} k={k}: static bytes 0xff");
+        let mut vs: Vec<u64> = vec![0, u64::MAX];
+        vs.extend((0..64).map(|bit| 1u64 << bit));
+        vs.extend((0..2000).map(|_| rnd()));
+        for v in vs {
+            let b = (v & vary) | !vary;
+            let want = scalar(b);
+            let pp = partials[blk * 8 + k];
+            // SAFETY: the applies read inside the table images only.
+            let (trim, part) = unsafe {
+                let z = |w: u64| match nb {
+                    2 => apply_word_z_high::<2>(plain, kara, w),
+                    3 => apply_word_z_high::<3>(plain, kara, w),
+                    _ => apply_word_z_high::<4>(plain, kara, w),
+                };
+                (bytes(z(!b)), bytes(z(b)))
+            };
+            let trim: [u8; 64] = core::array::from_fn(|i| 1 ^ trim[i]);
+            let part: [u8; 64] = core::array::from_fn(|i| pp[i] ^ part[i]);
+            assert_eq!(trim, want, "trim blk={blk} k={k} b={b:016x}");
+            assert_eq!(part, want, "partial blk={blk} k={k} b={b:016x}");
+            rows += 1;
+        }
+    }
+    assert_eq!(rows, 10 * (2 + 64 + 2000));
+}
+
 /// Row-body variant bit (with [`ABV_TRANSFORM_TRIM`], [`ABV_FUSE`] and the
 /// z-basis plain apply): in each static-B Horner row the one `x^4` word
 /// (`k >= 4`) whose B varies only in `NB <= 4` consecutive bytes at the low
