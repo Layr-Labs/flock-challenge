@@ -778,6 +778,40 @@ pub fn round_pair_naive_with_eq(
     (r_0 * g_one.reduce(), g_inf.reduce())
 }
 
+pub fn fold_in_place_and_round_pair_with_eq(
+    a: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    challenge: F128,
+    r_0: F128,
+    eq_remaining: &[F128],
+) -> (F128, F128) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 4);
+    let quarter = n / 4;
+    assert_eq!(eq_remaining.len(), quarter);
+
+    let mut g_one = F256Unreduced::ZERO;
+    let mut g_inf = F256Unreduced::ZERO;
+    for x_prime in 0..quarter {
+        let i = 4 * x_prime;
+        let a0 = a[i] + challenge * (a[i + 1] + a[i]);
+        let a1 = a[i + 2] + challenge * (a[i + 3] + a[i + 2]);
+        let b0 = b[i] + challenge * (b[i + 1] + b[i]);
+        let b1 = b[i + 2] + challenge * (b[i + 3] + b[i + 2]);
+        a[2 * x_prime] = a0;
+        a[2 * x_prime + 1] = a1;
+        b[2 * x_prime] = b0;
+        b[2 * x_prime + 1] = b1;
+        let eq_x = eq_remaining[x_prime];
+        g_one ^= eq_x.mul_unreduced(a1 * b1);
+        g_inf ^= eq_x.mul_unreduced((a0 + a1) * (b0 + b1));
+    }
+    a.truncate(2 * quarter);
+    b.truncate(2 * quarter);
+    (r_0 * g_one.reduce(), g_inf.reduce())
+}
+
 /// The equality table of a challenge suffix one shorter: `eq(r[1..])[x] =
 /// eq(r)[2x] + eq(r)[2x + 1]`, since `eq(r_0, 0) + eq(r_0, 1) = 1` exactly.
 /// One XOR per entry where a fresh table takes one product per entry.
@@ -6938,6 +6972,27 @@ mod tests {
                 round_pair_naive_with_eq(&a, &b, r[0], &build_eq(&r[1..])),
                 round_pair_naive(&a, &b, &r)
             );
+        }
+    }
+
+    #[test]
+    fn fused_tail_fold_and_round_matches_two_passes() {
+        let mut rng = Rng::new(0x7a11_f01d);
+        for log_n in 2usize..=12 {
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let rho = rng.f128();
+            let r_0 = rng.f128();
+            let r: Vec<F128> = (0..log_n - 2).map(|_| rng.f128()).collect();
+            let eq = build_eq(&r);
+            let (mut a2, mut b2) = (a.clone(), b.clone());
+            fold_in_place_pair(&mut a2, &mut b2, rho);
+            let want = round_pair_naive_with_eq(&a2, &b2, r_0, &eq);
+            let (mut a1, mut b1) = (a, b);
+            let got = fold_in_place_and_round_pair_with_eq(&mut a1, &mut b1, rho, r_0, &eq);
+            assert_eq!(got, want, "log_n {log_n}");
+            assert_eq!((a1, b1), (a2, b2), "log_n {log_n}");
         }
     }
 
