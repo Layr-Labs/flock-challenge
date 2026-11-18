@@ -437,6 +437,115 @@ fn set_utility_qos() {
 #[cfg(not(target_os = "macos"))]
 fn set_utility_qos() {}
 
+/// `pthread_t` of each helper-pool thread, by its index in the pool (0 = not
+/// started). Written once by the thread itself in the pool's start handler;
+/// the pool lives for the whole process, so an entry never dangles.
+static HELPER_PTHREADS: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
+
+#[cfg(target_os = "macos")]
+fn record_helper_thread(index: usize) {
+    unsafe extern "C" {
+        fn pthread_self() -> usize;
+    }
+    if let Some(slot) = HELPER_PTHREADS.get(index) {
+        // SAFETY: `pthread_self` has no preconditions.
+        slot.store(unsafe { pthread_self() }, Ordering::Release);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn record_helper_thread(_index: usize) {}
+
+/// Wait boost (`FLOCK_NO_EPOOL_WAIT_BOOST=1`, exact `1`, restores the plain
+/// wait). A hetero drain that has claimed every chunk waits for the helper
+/// threads still inside a chunk. Those threads run at `QOS_CLASS_UTILITY` so
+/// that they stay on the efficiency cores, and the waiter is a main-pool
+/// thread at user-interactive QoS: a priority inversion. Whenever another
+/// utility-or-higher thread on the machine wants the helper's core, the
+/// helper is descheduled with the chunk in hand and the whole drain, on the
+/// proof's serial spine, waits for it to be scheduled again (a census of
+/// timed proves on a loaded M4 Pro saw such waits of 1 to 50 ms in about one
+/// proof in three, and 0.1 to 0.2 ms of ordinary efficiency-core tails in the
+/// others).
+///
+/// With the boost, a waiter that still finds helpers inside after its short
+/// spin asks the kernel for a QoS override on exactly those threads
+/// (`pthread_override_qos_class_start_np`, the system's remedy for this
+/// inversion) for as long as it waits, and ends it when they have left: the
+/// helper runs at the waiter's QoS, so it gets a core at once and may finish
+/// its chunk on a performance core. Nothing is boosted when no helper is
+/// inside, which is the common case.
+///
+/// Scheduling only: the same thread runs the same chunk to the same bytes.
+fn wait_boost_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(target_os = "macos")
+            && std::env::var_os("FLOCK_NO_EPOOL_WAIT_BOOST").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// QoS overrides held on the helper threads named by a gate's `inside` mask;
+/// ended on drop.
+struct WaitBoost {
+    tokens: [usize; 8],
+    len: usize,
+}
+
+impl WaitBoost {
+    const fn none() -> Self {
+        Self { tokens: [0; 8], len: 0 }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start(mut inside: u64) -> Self {
+        unsafe extern "C" {
+            fn pthread_override_qos_class_start_np(thread: usize, qos_class: u32, relative_priority: i32) -> usize;
+        }
+        let mut boost = Self::none();
+        while inside != 0 && boost.len < boost.tokens.len() {
+            let index = inside.trailing_zeros() as usize;
+            inside &= inside - 1;
+            let thread = HELPER_PTHREADS.get(index).map_or(0, |t| t.load(Ordering::Acquire));
+            if thread == 0 {
+                continue;
+            }
+            // SAFETY: `thread` is the live `pthread_t` of a helper-pool thread
+            // (the pool is never torn down). 0x21 = QOS_CLASS_USER_INTERACTIVE,
+            // the main pool's class. A null return means no override was made.
+            let token = unsafe { pthread_override_qos_class_start_np(thread, 0x21, 0) };
+            if token != 0 {
+                boost.tokens[boost.len] = token;
+                boost.len += 1;
+            }
+        }
+        boost
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn start(_inside: u64) -> Self {
+        Self::none()
+    }
+}
+
+impl Drop for WaitBoost {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe extern "C" {
+                fn pthread_override_qos_class_end_np(token: usize) -> i32;
+            }
+            for &token in &self.tokens[..self.len] {
+                // SAFETY: `token` came from the matching start call and is
+                // ended exactly once.
+                unsafe {
+                    let _ = pthread_override_qos_class_end_np(token);
+                }
+            }
+        }
+    }
+}
+
 fn build_epool() -> Option<rayon::ThreadPool> {
     // Diagnostic: `FLOCK_EPOOL_MAX_THREADS=<n>` caps the helper pool, e.g. at
     // the official M3 Max's 4 E-cores on a host with more (an M5 Pro reports
@@ -451,7 +560,10 @@ fn build_epool() -> Option<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .thread_name(|i| format!("flock-ecore-{i}"))
-        .start_handler(|_| set_utility_qos())
+        .start_handler(|index| {
+            set_utility_qos();
+            record_helper_thread(index);
+        })
         .build()
         .ok()
 }
@@ -681,6 +793,9 @@ struct Gate {
     state: AtomicUsize,
     panicked: AtomicBool,
     body: JobPtr,
+    /// Bit `i` set while helper-pool thread `i` is inside the body (wait
+    /// boost only; the admission protocol is `state` alone).
+    inside: AtomicU64,
 }
 
 impl Gate {
@@ -706,11 +821,13 @@ impl Gate {
     /// panic is caught here (a `spawn_broadcast` job has no caller to unwind
     /// into, and the helper pool has no panic handler) and re-raised by the
     /// drain.
-    fn run(&self) {
+    fn run(&self, helper_index: usize) {
         if !self.enter() {
             EPOOL_LATE_HELPERS.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let bit = if helper_index < 64 { 1u64 << helper_index } else { 0 };
+        self.inside.fetch_or(bit, Ordering::Relaxed);
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: admitted by `enter`; the drain waits for our `leave`
             // before its frame (the body's referent) can go away.
@@ -720,6 +837,7 @@ impl Gate {
         if !ok {
             self.panicked.store(true, Ordering::Relaxed);
         }
+        self.inside.fetch_and(!bit, Ordering::Relaxed);
         self.state.fetch_sub(1, Ordering::Release);
     }
 
@@ -728,14 +846,23 @@ impl Gate {
     fn close_and_wait(&self) -> bool {
         self.state.fetch_or(GATE_CLOSED, Ordering::Relaxed);
         let mut spins = 0u32;
+        // Held until every admitted helper has left (see `wait_boost_enabled`).
+        let mut boost = WaitBoost::none();
         while self.state.load(Ordering::Acquire) != GATE_CLOSED {
             if spins < 64 {
                 std::hint::spin_loop();
                 spins += 1;
             } else {
+                if spins == 64 {
+                    spins = 65;
+                    if wait_boost_enabled() {
+                        boost = WaitBoost::start(self.inside.load(Ordering::Relaxed));
+                    }
+                }
                 std::thread::yield_now();
             }
         }
+        drop(boost);
         self.panicked.load(Ordering::Relaxed)
     }
 }
@@ -787,6 +914,7 @@ pub(crate) fn drain_hetero<H>(
             state: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
             body: JobPtr::new(helper),
+            inside: AtomicU64::new(0),
         });
         let close = CloseOnDrop(Arc::clone(&gate));
         let posted = AtomicBool::new(false);
@@ -799,7 +927,7 @@ pub(crate) fn drain_hetero<H>(
                 // off the contended cache line.
                 if !posted.load(Ordering::Relaxed) && !posted.swap(true, Ordering::Relaxed) {
                     let gate = Arc::clone(&gate);
-                    ep.spawn_broadcast(move |_| gate.run());
+                    ep.spawn_broadcast(move |context| gate.run(context.index()));
                 }
                 worker();
             });
@@ -839,7 +967,51 @@ struct TailGuard {
     main_threads: u64,
     main_ns: AtomicU64,
     main_cnt: AtomicU64,
+    /// First-claim guard engaged for this drain (see [`first_guard_enabled`]).
+    first_guard: bool,
+    /// This drain's slot in [`HELPER_RATIO_Q8`].
+    slot: usize,
 }
+
+/// First-claim guard (`FLOCK_NO_EPOOL_FIRST_GUARD=1`, exact `1`, restores the
+/// unconditional first claim). The tail guard above knows a helper's chunk
+/// time only after that helper has run one chunk of the drain, so every
+/// helper's first claim of every drain was unconditional. In a short queue
+/// that is the claim that matters: the opening's 36-chunk drain is over for
+/// the ten main workers in under four of their chunk times, an efficiency
+/// core needs longer than that for one chunk, and the drain then waits for
+/// the helper's single chunk (a census of the timed prove on an M4 Pro put
+/// that wait at about 0.1 to 0.2 ms per proof, in that one drain, three times
+/// in four with the helper on its first chunk).
+///
+/// With the guard, a helper's first claim uses the helper-to-main chunk time
+/// ratio that earlier drains of the same chunk count measured in this process
+/// (the warm-up proof runs every drain of the timed proof once), and before
+/// any measurement a prior of three: it claims only while at least
+/// `ratio * main_threads` chunks are left, which is the tail guard's own
+/// inequality with the helper's time replaced by `ratio * t_main`. The ratio
+/// is kept between one and six, so with ten main threads the guard can only
+/// turn a first claim away in a queue with fewer than sixty chunks left.
+/// Later claims are the tail guard's, unchanged.
+///
+/// Scheduling only: every chunk index is still claimed exactly once from the
+/// same atomic cursor and the main workers drain to the end, so outputs are
+/// byte-identical.
+fn first_guard_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_EPOOL_FIRST_GUARD").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Slots of [`HELPER_RATIO_Q8`]; a prime, so the power-of-two chunk counts
+/// the prover uses do not share one slot.
+const HELPER_RATIO_SLOTS: usize = 61;
+/// Helper chunk time over main chunk time, in 256ths, per drain chunk count
+/// modulo [`HELPER_RATIO_SLOTS`]; 0 = not measured yet in this process.
+static HELPER_RATIO_Q8: [AtomicU64; HELPER_RATIO_SLOTS] = [const { AtomicU64::new(0) }; HELPER_RATIO_SLOTS];
+/// Ratio assumed before a drain size has been measured (three, in 256ths).
+const HELPER_RATIO_PRIOR_Q8: u64 = 3 << 8;
 
 fn tail_guard_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -855,7 +1027,17 @@ impl TailGuard {
             main_threads: main_threads as u64,
             main_ns: AtomicU64::new(0),
             main_cnt: AtomicU64::new(0),
+            first_guard: false,
+            slot: 0,
         }
+    }
+
+    /// [`Self::new`] for a drain of `n_chunks`, with the first-claim guard.
+    fn for_drain(main_threads: usize, has_helper: bool, n_chunks: usize) -> Self {
+        let mut guard = Self::new(main_threads, has_helper);
+        guard.first_guard = guard.on && first_guard_enabled();
+        guard.slot = n_chunks % HELPER_RATIO_SLOTS;
+        guard
     }
 
     /// Run main-pool chunk `i`, publishing its duration.
@@ -876,8 +1058,19 @@ impl TailGuard {
     /// should still claim, given the queue cursor `next`.
     #[inline]
     fn helper_may_claim(&self, own_ns: u64, next: usize, n_chunks: usize) -> bool {
-        if !self.on || own_ns == 0 {
+        if !self.on {
             return true;
+        }
+        if own_ns == 0 {
+            if !self.first_guard {
+                return true;
+            }
+            // First claim of this helper in this drain: its chunk time is
+            // `ratio * t_main` as far as this process has measured.
+            let measured = HELPER_RATIO_Q8[self.slot].load(Ordering::Relaxed);
+            let ratio_q8 = if measured == 0 { HELPER_RATIO_PRIOR_Q8 } else { measured };
+            let remaining = n_chunks.saturating_sub(next) as u64;
+            return ratio_q8.saturating_mul(self.main_threads) <= remaining << 8;
         }
         let cnt = self.main_cnt.load(Ordering::Relaxed);
         if cnt == 0 {
@@ -899,6 +1092,19 @@ impl TailGuard {
         run();
         let ns = (started.elapsed().as_nanos() as u64).max(1);
         *own_ns = if *own_ns == 0 { ns } else { (*own_ns + ns) / 2 };
+        if self.first_guard {
+            let cnt = self.main_cnt.load(Ordering::Relaxed);
+            let t_main = if cnt == 0 { 0 } else { self.main_ns.load(Ordering::Relaxed) / cnt };
+            if t_main != 0 {
+                // One to six main chunk times (a cold or descheduled chunk
+                // must not keep helpers out of a queue of sixty chunks or
+                // more); a quarter-weight average.
+                let ratio = (ns.saturating_mul(256) / t_main).clamp(1 << 8, 6 << 8);
+                let slot = &HELPER_RATIO_Q8[self.slot];
+                let old = slot.load(Ordering::Relaxed);
+                slot.store(if old == 0 { ratio } else { (3 * old + ratio) / 4 }, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -1398,7 +1604,7 @@ fn run_chunks_with_helper_arm_after<F, A>(
         return;
     }
     let next = AtomicUsize::new(0);
-    let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
+    let guard = TailGuard::for_drain(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS, n_chunks);
     let worker = || {
         loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
@@ -1518,7 +1724,7 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
         return;
     }
     let next = AtomicUsize::new(0);
-    let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
+    let guard = TailGuard::for_drain(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS, n_chunks);
     let caller = rayon::current_thread_index();
     let worker = || {
         // A thread that publishes a priority queue and picked this task up

@@ -160,7 +160,13 @@ pub const ENV_NO_READY_PAUSE: &str = "FLOCK_NO_READY_PAUSE";
 /// proof through readiness to the timed proof runs exactly as it did, so the
 /// pause cannot reach the timed proof. It is a plain sleep, the same in every
 /// worker, and reads nothing but the executable name and the argument count.
-const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1300);
+///
+/// 1200 ms, not the 1300 ms it was: the public job logs put this lineage's
+/// jobs at 895 to 899 s of the runner's 900 s job limit, and three entries
+/// with a few more seconds of build were cancelled at the limit with their
+/// benchmark step finished and their score unposted. A hundred milliseconds
+/// less idle per worker returns about 12 s to a 120-trial job.
+const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1200);
 
 /// Pure selector: the pause a process takes at start-up, if any.
 fn ranked_start_pause_for(
