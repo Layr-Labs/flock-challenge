@@ -151,17 +151,34 @@ fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128
 /// NTT objects are constructed repeatedly by the recursive PCS, and rebuilding
 /// these rows otherwise repeats field inversions and multiplications even when
 /// the large twiddle table is already resident from the untimed warm proof.
-/// Clone into the original nested-`Vec` representation so transform object
-/// layout and hot-loop dereferencing remain unchanged.
-fn cached_standard_evals(dim: usize) -> Vec<Vec<F128>> {
-    static TABLES: OnceLock<[OnceLock<Vec<Vec<F128>>>; 65]> = OnceLock::new();
+/// The cached triangle is shared (`Arc`, a reference-count bump per
+/// construction) instead of deep-cloned: `evals` is never mutated after
+/// construction, and every row read goes through the same nested rows.
+/// `FLOCK_NO_NTT_EVALS_SHARED` (any value; read once per process) restores the
+/// per-construction deep copy.
+fn cached_standard_evals(dim: usize) -> Arc<[Vec<F128>]> {
+    static TABLES: OnceLock<[OnceLock<Arc<[Vec<F128>]>>; 65]> = OnceLock::new();
     let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
-    tables[dim]
-        .get_or_init(|| {
-            let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
-            generate_evals_from_subspace(&basis)
-        })
-        .clone()
+    let shared = tables[dim].get_or_init(|| {
+        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+        Arc::from(generate_evals_from_subspace(&basis))
+    });
+    if ntt_evals_shared_enabled() {
+        Arc::clone(shared)
+    } else {
+        Arc::from(shared.to_vec())
+    }
+}
+
+/// Kill switch for the shared standard `evals` triangle (`FLOCK_NO_NTT_EVALS_SHARED`,
+/// any value: every `standard()` construction deep-copies the cached triangle, as
+/// before). Read once per process.
+pub const ENV_NO_NTT_EVALS_SHARED: &str = "FLOCK_NO_NTT_EVALS_SHARED";
+
+pub(crate) fn ntt_evals_shared_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_NTT_EVALS_SHARED).is_none());
+    *ON
 }
 
 /// Complete the last radix-8 group for the ranked Apple-silicon L0 commit.
@@ -720,7 +737,9 @@ const INTERLEAVED_PHASE_DEEP_ONLY: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct AdditiveNttF128 {
     /// `evals[i]` of length `ℓ − i`, the normalized subspace polynomial values.
-    evals: Vec<Vec<F128>>,
+    /// Shared with the standard-NTT cache (see [`cached_standard_evals`]); never
+    /// mutated after construction.
+    evals: Arc<[Vec<F128>]>,
     /// Breadth-first table: layer `l` starts at `2^l - 1`.
     precomputed_twiddles: Option<Arc<[F128]>>,
 }
@@ -731,7 +750,7 @@ impl AdditiveNttF128 {
         let evals = generate_evals_from_subspace(basis);
         let precomputed_twiddles = precompute_twiddles(&evals).map(Arc::from);
         Self {
-            evals,
+            evals: Arc::from(evals),
             precomputed_twiddles,
         }
     }
