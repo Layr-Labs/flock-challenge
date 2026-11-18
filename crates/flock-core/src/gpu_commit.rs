@@ -1671,8 +1671,12 @@ pub const ENV_NO_SPLIT_CPU_TILT: &str = "FLOCK_NO_SPLIT_CPU_TILT";
 pub const ENV_SPLIT_CPU_TILT: &str = "FLOCK_SPLIT_CPU_TILT";
 
 /// Default CPU-ward tilt of the tuned commit split, in 256ths of the
-/// position range (see [`ENV_NO_SPLIT_CPU_TILT`]).
-pub(crate) const SPLIT_CPU_TILT_256: usize = 4;
+/// position range (see [`ENV_NO_SPLIT_CPU_TILT`]): none. On the runner,
+/// with both pools' hot spins yielding every thirty-second idle round, a
+/// larger tilt read slower (4: 88.90 ms, 12: 89.85, 16: 90.25, 20: 90.94,
+/// one interleaved official run), so the tune's own split is published;
+/// `FLOCK_SPLIT_CPU_TILT=4` restores the previous default.
+pub(crate) const SPLIT_CPU_TILT_256: usize = 0;
 
 /// The tilt in 256ths (see [`ENV_NO_SPLIT_CPU_TILT`]).
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
@@ -21957,7 +21961,7 @@ kernel void zc_eq_rows(
         #[test]
         fn cpu_tilt_moves_the_split_by_256ths() {
             use super::{hybrid_split_valid, split_cpu_share256 as c, tilt_split_toward_cpu as t};
-            assert_eq!(crate::gpu_commit::SPLIT_CPU_TILT_256, 4);
+            assert_eq!(crate::gpu_commit::SPLIT_CPU_TILT_256, 0);
             assert_eq!(t(5, 0, true), 5);
             // Coarse k=5 (cpu 80/256) + 4 -> k=5, m=4 (cpu 84/256).
             assert_eq!(t(5, 4, true), 5 + 16 * 4);
