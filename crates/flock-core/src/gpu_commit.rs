@@ -3247,6 +3247,29 @@ pub(crate) fn tune_ab_min_enabled() -> bool {
     *ON.get_or_init(|| ntt_ab_priority_enabled() && std::env::var_os(ENV_NO_TUNE_AB_MIN).is_none())
 }
 
+/// Kill switch for the AB end's lower envelope in the split sweep's fit
+/// (`FLOCK_NO_TUNE_AB_ENV`, any value: the AB line's intercept is the median
+/// residual, as before). Under [`ENV_NO_TUNE_AB_MIN`]'s pricing the AB line
+/// goes through each sampled split's earliest AB end, but both samples of the
+/// largest split are taken back to back, so one contention burst can stretch
+/// both and lift the line at the split where the terms cross. With this on,
+/// the slope stays the Theil-Sen median and the intercept is the second
+/// smallest residual: close to the lower envelope of the per-split earliest
+/// ends (a contended sample only ever ends later), but one low outlier (an AB
+/// end read early against a late cb2 start) cannot set the line on its own.
+/// Tuner input only: the chosen split is byte-verified as before. Read once
+/// per process.
+pub const ENV_NO_TUNE_AB_ENV: &str = "FLOCK_NO_TUNE_AB_ENV";
+
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub(crate) fn tune_ab_env_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_TUNE_AB_ENV).is_none())
+}
+
 /// Run pending main-pool jobs on this worker until `done()` holds or the pool
 /// has nothing to hand out. Returns without waiting in either case; the caller
 /// then performs its ordinary (exact) wait. No-op off a pool worker.
@@ -15461,7 +15484,16 @@ kernel void blake3_pow_seg_tail(
                 .iter()
                 .map(|&k| rows.iter().filter(|s| s.0 == k).map(|s| s.4).fold(f64::INFINITY, f64::min))
                 .collect();
-            let ab = theil_sen(&kx, &ab_min)?;
+            let mut ab = theil_sen(&kx, &ab_min)?;
+            if super::tune_ab_env_enabled() {
+                // Near-lower envelope (`super::ENV_NO_TUNE_AB_ENV`): same
+                // slope, the second smallest residual as the intercept (at
+                // least three splits are sampled here), so neither a split
+                // stretched by contention nor one low outlier sets the line.
+                let mut r: Vec<f64> = kx.iter().zip(&ab_min).map(|(x, y)| y - ab.1 * x).collect();
+                r.sort_by(|a, b| a.total_cmp(b));
+                ab.0 = r[1];
+            }
             let all = [cb2.0, cb2.1, ntt.0, ntt.1, cb3.0, cb3.1, ab.0, ab.1];
             if !(cb2.1 < 0.0 && ntt.1 > 0.0 && all.iter().all(|v| v.is_finite())) {
                 return None;
