@@ -244,7 +244,7 @@ impl Dual {
         let mut scales = crate::alloc_uninit_vec::<[F128; 4]>(n_queries);
         let mut positions = crate::alloc_uninit_vec::<usize>(n_queries);
         let mut w2_pows = crate::alloc_uninit_vec::<F128>(n_queries);
-        let par_floor = if std::env::var("FLOCK_NO_OP_DUAL_PAR").map_or(true, |v| v != "1") {
+        let par_floor = if op_dual_par_env_on() {
             256
         } else {
             1024
@@ -623,6 +623,21 @@ impl Pending {
 pub(super) fn terminal_skip_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_TERMINAL_SKIP").is_none())
+}
+
+/// The `FLOCK_NO_OP_DUAL_PAR` (exact `'1'`) term of the dual-opening
+/// parallel floor. The process environment does not change during a prove,
+/// so the first answer is kept; `FLOCK_NO_LIGERITO_ENV_ONCE` (any value)
+/// restores the per-call lookup.
+#[inline]
+fn op_dual_par_env_on() -> bool {
+    if super::ligerito_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_NO_OP_DUAL_PAR").map_or(true, |v| v != "1")
+        });
+        return *ON;
+    }
+    std::env::var("FLOCK_NO_OP_DUAL_PAR").map_or(true, |v| v != "1")
 }
 
 pub(super) fn enabled(lazy_l1_selected: bool, disabled: Option<&std::ffi::OsStr>) -> bool {
