@@ -4320,6 +4320,16 @@ fn gpu_mixed_final_selected(log_d: usize, l: usize, f: usize) -> bool {
     select_gpu_mixed_final(log_d, l, f, true, gpu_mixed_final_enabled())
 }
 
+/// Kill switch for the per-call-site selector cache of the Objective-C `send!`
+/// macro (`FLOCK_NO_SELCACHE`, any value: every message looks its selector up
+/// again). Read once per process.
+#[allow(dead_code)]
+pub(crate) fn selcache_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_SELCACHE").is_none());
+    *ON
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod imp {
     use super::*;
@@ -4365,11 +4375,24 @@ mod imp {
     unsafe impl Send for Api {}
     unsafe impl Sync for Api {}
 
-    /// `objc_msgSend` cast to a concrete signature per call site.
+    /// `objc_msgSend` cast to a concrete signature per call site. Each expansion
+    /// keeps the selector it looked up together with the name pointer it looked
+    /// it up for (`FLOCK_NO_SELCACHE`, any value: every send looks its selector
+    /// up again, as before). Selectors are interned for the life of the process,
+    /// so the kept value is the one `sel_registerName` would return again; a
+    /// different name at the same site (a variable selector) is looked up again.
     macro_rules! send {
         ($api:expr, $ty:ty, $obj:expr, $sel:expr $(, $a:expr)* $(,)?) => {{
             let f: $ty = core::mem::transmute($api.msg_send);
-            f($obj, ($api.sel_register)($sel.as_ptr()) $(, $a)*)
+            let name = $sel.as_ptr();
+            let sel = if crate::gpu_commit::selcache_enabled() {
+                static CACHED: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+                let &(n, s) = CACHED.get_or_init(|| (name as usize, ($api.sel_register)(name) as usize));
+                if n == name as usize { s as *mut core::ffi::c_void } else { ($api.sel_register)(name) }
+            } else {
+                ($api.sel_register)(name)
+            };
+            f($obj, sel $(, $a)*)
         }};
     }
 
