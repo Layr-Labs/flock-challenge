@@ -6399,6 +6399,38 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
     (SumcheckMessage { u_0, u_2 }, y)
 }
 
+/// [`round_msg_and_eval_lsb`] for an LSB-first equality table
+/// `b = eq_table(z)` with `z_0 = z[0]` (`FLOCK_NO_OOD_EQ_PAIR_SUM=1` kills).
+/// Each pair is `b[2j] = (1 + z_0) w_j`, `b[2j + 1] = z_0 w_j`, so
+/// `w_j = b[2j] + b[2j + 1]`. With `a = sum f_0 w` and `s = sum (f_0 + f_1) w`
+/// the exact field identities `u_0 = (1 + z_0) a`, `u_2 = s` and
+/// `y = a + z_0 s` give the same three values with two products per pair
+/// instead of three (ranked L5: 64 pairs, 192 -> 130 products). Shapes at or
+/// above the parallel threshold take the incumbent scan.
+fn round_msg_and_eval_lsb_eq(f: &[F128], b: &[F128], z_0: F128) -> (SumcheckMessage, F128) {
+    let n = f.len();
+    debug_assert!(n.is_power_of_two() && n >= 2);
+    debug_assert_eq!(b.len(), n);
+    let half = n / 2;
+    if half >= 4096 {
+        return round_msg_and_eval_lsb(f, b);
+    }
+    let (mut a, mut s) = (F128::ZERO, F128::ZERO);
+    for j in 0..half {
+        let f0 = f[2 * j];
+        let f1 = f[2 * j + 1];
+        let w = b[2 * j] + b[2 * j + 1];
+        a += f0 * w;
+        s += (f0 + f1) * w;
+    }
+    (SumcheckMessage { u_0: a + z_0 * a, u_2: s }, a + z_0 * s)
+}
+
+fn ood_eq_pair_sum_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OOD_EQ_PAIR_SUM").is_none())
+}
+
 /// Default low-factor width for retained lazy-OOD equalities. Ranked L1/L2
 /// retain the original 11-bit low factor (11+7 and 11+4); L3 explicitly asks
 /// for 10+2 and L4 for 8+1. Shorter tails fit entirely in the low factor and
@@ -7827,6 +7859,24 @@ pub(crate) fn with_witness_padding<T>(
     f()
 }
 
+/// Low-limb tail of the odd slots in the four-slot witness fold (default on,
+/// with the zero tail). The ranked witness's useful prefix ends 49 bits into
+/// the odd slots' bank 56, so that bank's high limb is padding zero and its
+/// pair (56, 57) needs two of its eight limb products (see
+/// `f128_slice::fold_banked_slots4_whole_into`).
+/// `FLOCK_NO_DIRECT_FOLD8_LO_TAIL=1` (any value) runs the full pair. Read
+/// once per process.
+fn direct_fold8_lo_tail_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DIRECT_FOLD8_LO_TAIL").is_none())
+}
+
+/// Whether a padding descriptor's useful prefix ends in the low limb of its
+/// last word (`1..=64` useful bits there), so that word's high limb is zero.
+fn direct_fold8_last_word_lo_only(padding: Option<(usize, usize)>) -> bool {
+    matches!(padding, Some((_, useful_bits)) if (1..=64).contains(&(useful_bits % 128)))
+}
+
 /// Leading banks that can be nonzero in the odd 64-word slots of the packed
 /// witness, from a padding descriptor: when one block of the descriptor is
 /// exactly two slots (`k_log = 14`) and its useful prefix ends inside the
@@ -7994,6 +8044,11 @@ fn materialize_direct_fold8(
     } else {
         64
     };
+    // The odd slots' last live bank (56 at 57 live banks) has a zero high
+    // limb when the useful prefix ends in a word's low limb.
+    let odd_slot_lo_tail = odd_slot_live == 57
+        && direct_fold8_lo_tail_enabled()
+        && direct_fold8_last_word_lo_only(WITNESS_PADDING.with(|cell| cell.get()));
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -8052,6 +8107,7 @@ fn materialize_direct_fold8(
                         &f_in[base..base + 256],
                         &mut f_out[slot..slot + 4],
                         $odd_live,
+                        $odd_live == 57 && odd_slot_lo_tail,
                     );
                 } else {
                     let folded_f = crate::field::f128_slice::fold_banked_slots4::<64>(
@@ -8194,6 +8250,7 @@ fn materialize_direct_fold8(
                     &zs[base..base + 256],
                     &mut f_out[slot..slot + 4],
                     odd_slot_live,
+                    odd_slot_lo_tail,
                 );
                 let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
                 let direct1 =
@@ -9255,6 +9312,25 @@ impl SumcheckProver {
         (msg, h_new)
     }
 
+    /// [`Self::introduce_new_with_eval`] for `b_new = eq_table(z)` with
+    /// `z_0 = z[0]`: same message, same `h_new`, same pending glue, from
+    /// [`round_msg_and_eval_lsb_eq`].
+    fn introduce_new_with_eval_eq(&mut self, b_new: Vec<F128>, z_0: F128) -> (SumcheckMessage, F128) {
+        assert_eq!(b_new.len(), self.f.len());
+        assert!(
+            self.pending_glue.is_none(),
+            "ordinary introduction already pending"
+        );
+        assert!(
+            self.pending_fold_basis.is_none(),
+            "ordinary introduction across deferred glue"
+        );
+        let (msg, h_new) = round_msg_and_eval_lsb_eq(&self.f, &b_new, z_0);
+        self.transcript.push(msg);
+        self.pending_glue = Some((b_new, h_new));
+        (msg, h_new)
+    }
+
     /// Introduce `eq(z, ·)` as retained low/high factors rather than a dense
     /// table. Returns `None` without changing state for unsupported geometry
     /// or any outstanding introduction. A caller may use the full-table path
@@ -9544,7 +9620,22 @@ fn op_serial_opens_enabled() -> bool {
 }
 
 fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) -> Vec<Hash> {
-    merkle::merkle_multi_proof(tree, block_len, queries)
+    // Every caller passes `sample_distinct_queries` output, which is sorted
+    // and unique, so the sorted entry skips a sort and dedup that would
+    // leave the list unchanged.
+    if multiproof_sorted_entry_enabled() {
+        merkle::merkle_multi_proof_sorted(tree, block_len, queries)
+    } else {
+        merkle::merkle_multi_proof(tree, block_len, queries)
+    }
+}
+
+/// Kill switch for the sorted multi-proof entry:
+/// `FLOCK_NO_MP_SORTED_ENTRY` (any value) restores the general
+/// entry's sort and dedup. Same hashes. Read once per process.
+fn multiproof_sorted_entry_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_MP_SORTED_ENTRY").is_none())
 }
 
 /// Drive the recursive Ligerito prover to prove `poly(eval_point) = claimed_value`.
@@ -10480,14 +10571,23 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             }
             let ri = challenger.sample_f128();
             let msg = if let Some(pending) = pending_c2.as_mut() {
-                let (msg, complete) = pending.fold(ri, &mut sc_prover);
-                if complete {
+                // The last fold of the open: past it the prover reads only
+                // `f` (the final `yr`) and the transcript, so the dual's
+                // basis is never merged (see `c2::Pending::fold_terminal`).
+                if i + 1 == r && j + 1 == k_i && c2::terminal_skip_enabled() {
+                    let msg = pending.fold_terminal(ri, &mut sc_prover);
                     pending_c2 = None;
-                    if trace {
-                        eprintln!("  C2 merged after fold 2");
+                    msg
+                } else {
+                    let (msg, complete) = pending.fold(ri, &mut sc_prover);
+                    if complete {
+                        pending_c2 = None;
+                        if trace {
+                            eprintln!("  C2 merged after fold 2");
+                        }
                     }
+                    msg
                 }
-                msg
             } else {
                 sc_prover.fold(ri)
             };
@@ -10683,7 +10783,11 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     } else {
                         build_eq_table(&z)
                     };
-                    let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
+                    let (intro, y) = if ood_eq_pair_sum_enabled() {
+                        sc_prover.introduce_new_with_eval_eq(eq_z, z[0])
+                    } else {
+                        sc_prover.introduce_new_with_eval(eq_z)
+                    };
                     (intro, y, false)
                 };
                 challenger.observe_f128(y);
@@ -12694,6 +12798,31 @@ mod tests {
     }
 
     use super::*;
+
+    /// The pair-sum OOD scan equals the three-product scan on both equality
+    /// builders, for every serial size (the ranked L5 one is 128 entries) and
+    /// for z_0 in {0, 1, random}; the parallel sizes take the incumbent scan.
+    #[test]
+    fn ood_eq_pair_sum_matches_three_product_scan() {
+        use crate::challenger::Challenger;
+        let mut rng = crate::challenger::RandomChallenger::new(0x00D5_0041);
+        for log_n in 1..=14usize {
+            let f = rng.sample_f128_vec(1usize << log_n);
+            for case in 0..3 {
+                let mut z = rng.sample_f128_vec(log_n);
+                if case < 2 {
+                    z[0] = if case == 0 { F128::ZERO } else { F128::ONE };
+                }
+                for b in [build_eq_table(&z), crate::lincheck::build_eq_table_optimized(&z)] {
+                    assert_eq!(
+                        round_msg_and_eval_lsb_eq(&f, &b, z[0]),
+                        round_msg_and_eval_lsb(&f, &b),
+                        "log_n={log_n} case={case}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The recursive from-message first pass preserves every encoded element
     /// and every node of the ordinary Merkle tree for both production rates.
