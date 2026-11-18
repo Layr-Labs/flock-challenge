@@ -144,6 +144,44 @@ pub(super) fn try_butterfly_fused_2layer_rows(
     false
 }
 
+/// One parallel job of a fused pair whose odd rows have `odd_tail` zero
+/// trailing lanes in all four quarters: the four slices hold the same
+/// consecutive quarter-rows (`num_ntts` lanes each, starting at an even
+/// row). Only the live lanes are computed. Returns `false` when the caller
+/// should run the dense [`butterfly_fused_2layer`] over the job instead.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn try_butterfly_fused_2layer_row_group_live(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    num_ntts: usize,
+    odd_tail: usize,
+) -> bool {
+    debug_assert!(num_ntts > 0 && odd_tail < num_ntts);
+    debug_assert!(a.len().is_multiple_of(num_ntts));
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    // SAFETY: the cfg gate supplies `aes`; the geometry and the zero tail
+    // are the caller's contract, asserted in debug builds.
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_2layer_row_group_live(
+                a, b, c, d, t_outer, t_inner_a, t_inner_b, num_ntts, odd_tail,
+            );
+            return true;
+        }
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    let _ = (a, b, c, d, t_outer, t_inner_a, t_inner_b, num_ntts, odd_tail);
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn try_butterfly_fused_2layer_low_inner_rows(
