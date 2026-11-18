@@ -4029,6 +4029,72 @@ pub(crate) fn tailhash_coord_work_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the banded CPU tail-hash cb3 (`FLOCK_NO_TAIL_BANDS=1`,
+/// exact `1`: one indirect chain over the whole suffix, claims stop at cb2's
+/// end, the reserve as before). With it on (and the working coordinator on),
+/// cb3 is encoded as [`TAIL_BANDS`] bottom-up bands of whole units, each the
+/// same chain of indirect dispatches with its own count slots, so a claim
+/// made while cb3 runs lowers the count of every band that has not started
+/// yet. The claims stop at cb3's end instead of cb2's (no reserve, no floor),
+/// and the claim scope also runs when cb2 completed before the AB arm
+/// returned, if the arm returns while cb3 still runs. Counts only fall, every
+/// dispatch reads a count no lower than the final one, and the CPU hashes
+/// every unit at or above it, so the root is unchanged. Read once per process.
+pub const ENV_NO_TAIL_BANDS: &str = "FLOCK_NO_TAIL_BANDS";
+/// Bands of the banded tail-hash cb3 (see [`ENV_NO_TAIL_BANDS`]).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) const TAIL_BANDS: usize = 8;
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tail_bands_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAIL_BANDS));
+    *ON
+}
+
+/// Kill switch for the CPU tail-hash reserve
+/// (`FLOCK_NO_TAIL_HASH_RESERVE_LATE=1`, exact `1`: cb3's count follows the
+/// claims down to the lowest claim and the claims stop at cb2's end, as
+/// before). With it on (and the working coordinator on), each claim
+/// publishes cb3's indirect count `reserve` units below the unclaimed top,
+/// so the topmost unclaimed units are not offered to cb3; at cb2's end the
+/// count stops moving and the claimers keep hashing down to the last count
+/// they published (the floor) while cb3 hashes the units below it.
+///
+/// Compatible with the late tail hash (`ENV_NO_LATE_TAIL_HASH`): the count
+/// is never raised, and only a claim lowers it below the full count. In the
+/// late form cb3 is committed with the full count as before, so when cb2
+/// completes before the AB arm returns (no claim at all) cb3 hashes every
+/// unit; when the claims run, the floor is the last count a claim actually
+/// published (the full count if none did), never a count cb3 was not shown.
+/// In the eager form the reserved count is written before cb3's commit.
+/// Every unit is hashed by at least one side (cb3 read a count no lower than
+/// the floor; the CPU hashes every unit from the top down to the floor), a
+/// unit hashed by both is the same bytes into the same slots, so the root is
+/// unchanged. No new wait: the claim lock, the claim loop and the cb2 check
+/// are the existing ones. `FLOCK_TAIL_HASH_RESERVE_PCT=<n>` sets the reserve
+/// as a percentage of the suffix's units (clamped to 0..=50, default
+/// [`TAIL_HASH_RESERVE_PCT_DEFAULT`]). Read once per process.
+pub const ENV_NO_TAIL_HASH_RESERVE_LATE: &str = "FLOCK_NO_TAIL_HASH_RESERVE_LATE";
+pub const ENV_TAIL_HASH_RESERVE_PCT: &str = "FLOCK_TAIL_HASH_RESERVE_PCT";
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+const TAIL_HASH_RESERVE_PCT_DEFAULT: usize = 10;
+
+/// The reserve's percentage of the suffix's units: 0 with the kill switch
+/// set, else [`ENV_TAIL_HASH_RESERVE_PCT`] (clamped to 0..=50) or the default.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tail_hash_reserve_pct() -> usize {
+    static PCT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if env_is_one(ENV_NO_TAIL_HASH_RESERVE_LATE) {
+            return 0;
+        }
+        std::env::var(ENV_TAIL_HASH_RESERVE_PCT)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(TAIL_HASH_RESERVE_PCT_DEFAULT, |v| v.min(50))
+    });
+    *PCT
+}
+
 /// Test hook of the CPU tail hash: 1,024-leaf units the CPU hashes before it
 /// looks at cb2 (so a fast GPU still leaves it a chosen share; `usize::MAX`
 /// or any count past the suffix = all of it), and the path is taken even if
@@ -13451,6 +13517,27 @@ kernel void blake3_pow_seg_tail(
         args: Id,
         unit_levels: usize,
     ) -> Vec<u32> {
+        unsafe {
+            encode_merkle_suffix_units_indirect_at(
+                gpu, enc, codeword_buf, tree_buf, n_leaves, suffix_start, args, unit_levels, 0,
+            )
+        }
+    }
+
+    /// [`encode_merkle_suffix_units_indirect`] with its indirect slots from
+    /// `slot_base` (a slot is three u32: 12 bytes) instead of slot 0.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_merkle_suffix_units_indirect_at(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves: usize,
+        suffix_start: usize,
+        args: Id,
+        unit_levels: usize,
+        slot_base: usize,
+    ) -> Vec<u32> {
         let unit = 1usize << unit_levels;
         debug_assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let mut per_unit: Vec<u32> = Vec::with_capacity(12);
@@ -13466,7 +13553,7 @@ kernel void blake3_pow_seg_tail(
             let mut done = 0usize;
             let mut next_arg = |per: u32, per_unit: &mut Vec<u32>| -> u64 {
                 per_unit.push(per);
-                ((per_unit.len() - 1) * 12) as u64
+                ((slot_base + per_unit.len() - 1) * 12) as u64
             };
             if super::select_gpu_leaf_parent3(!gpu.pso_leaf_parent3.is_null()) {
                 gpu.set_pipeline(enc, gpu.pso_leaf_parent3);
@@ -13519,6 +13606,99 @@ kernel void blake3_pow_seg_tail(
                 args.add(3 * i).write_volatile(p * units as u32);
                 args.add(3 * i + 1).write_volatile(1);
                 args.add(3 * i + 2).write_volatile(1);
+            }
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Upper bound of one chain's indirect slots (its per-unit list) in the
+    /// banded tail-hash cb3: a leaf dispatch and at most ten parent levels.
+    const TAIL_BAND_SLOTS: usize = 16;
+
+    /// cb3 for the CPU tail hash in [`super::TAIL_BANDS`] bottom-up bands
+    /// (see `super::ENV_NO_TAIL_BANDS`): band `j` covers the suffix's units
+    /// `[j * w, (j + 1) * w)` (`w = ceil(units / bands)`, the last band
+    /// shorter; only bands that start below `units` are encoded) with the
+    /// chain of [`encode_merkle_suffix_units_indirect`] from that band's first
+    /// leaf, its slots from `j * chain` (`chain` = the chain's dispatches).
+    /// Every band's chain is the same, so one per-unit list serves all.
+    /// Returns (that list, `w`, the bands encoded).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_merkle_suffix_units_banded(
+        gpu: &Gpu,
+        enc: Id,
+        codeword_buf: Id,
+        tree_buf: Id,
+        n_leaves: usize,
+        suffix_start: usize,
+        args: Id,
+        unit_levels: usize,
+        bands: usize,
+    ) -> (Vec<u32>, usize, usize) {
+        let unit = 1usize << unit_levels;
+        let units = (n_leaves - suffix_start) / unit;
+        debug_assert!(units > 0 && bands > 0);
+        let w = units.div_ceil(bands);
+        let nb = units.div_ceil(w);
+        debug_assert!(nb <= bands);
+        let mut per_unit = Vec::new();
+        for j in 0..nb {
+            let start = suffix_start + j * w * unit;
+            let p = unsafe {
+                encode_merkle_suffix_units_indirect_at(
+                    gpu,
+                    enc,
+                    codeword_buf,
+                    tree_buf,
+                    n_leaves,
+                    start,
+                    args,
+                    unit_levels,
+                    j * per_unit.len(),
+                )
+            };
+            assert!(p.len() <= TAIL_BAND_SLOTS && (j == 0 || p == per_unit));
+            per_unit = p;
+        }
+        (per_unit, w, nb)
+    }
+
+    /// The indirect counts of [`encode_merkle_suffix_units_banded`] for
+    /// `units` GPU units from the suffix's start: band `j` gets
+    /// `clamp(units - j * w, 0, w)` (non-increasing over a launch). `prev`
+    /// is the count last written (`None`: write every band); a band whose
+    /// count does not change is not rewritten.
+    ///
+    /// Within a chain the slots are written last dispatch first and the leaf
+    /// slot last, with a Release fence between consecutive slots. So any
+    /// observer that sees a slot's new (lower) count also sees it in every
+    /// later slot of the chain: a dispatch never reads a higher count than
+    /// any earlier dispatch of its chain read, and never builds a node from
+    /// inputs its chain did not write (a torn read only duplicates work).
+    unsafe fn write_tail_counts_banded(
+        args: *mut u32,
+        per_unit: &[u32],
+        w: usize,
+        nb: usize,
+        units: usize,
+        prev: Option<usize>,
+    ) {
+        let chain = per_unit.len();
+        for j in 0..nb {
+            let u = units.saturating_sub(j * w).min(w);
+            if prev.is_some_and(|c| c.saturating_sub(j * w).min(w) == u) {
+                continue;
+            }
+            for (i, &p) in per_unit.iter().enumerate().rev() {
+                let s = 3 * (j * chain + i);
+                unsafe {
+                    args.add(s + 1).write_volatile(1);
+                    args.add(s + 2).write_volatile(1);
+                    args.add(s).write_volatile(p * u as u32);
+                }
+                if i > 0 {
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                }
             }
         }
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -15099,6 +15279,18 @@ kernel void blake3_pow_seg_tail(
     /// Process-lifetime indirect-count buffer of the CPU tail hash's cb3.
     static TAIL_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+    /// Process-lifetime indirect-count buffer of the banded cb3
+    /// (`super::ENV_NO_TAIL_BANDS`): [`super::TAIL_BANDS`] chains of at most
+    /// [`TAIL_BAND_SLOTS`] slots.
+    static TAIL_BAND_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+    /// The banded cb3 is on: its switch and the working coordinator
+    /// (`super::ENV_NO_TAILHASH_COORD_WORK`), whose claimers check the stop
+    /// rule under the claim lock.
+    fn tail_bands_on() -> bool {
+        super::tail_bands_enabled() && super::tailhash_coord_work_enabled()
+    }
+
     static CB2_DONE: std::sync::Mutex<Option<(usize, DoneSig)>> = std::sync::Mutex::new(None);
 
     unsafe fn arm_cb2_done(gpu: &Gpu, cb2: Id) {
@@ -15166,37 +15358,87 @@ kernel void blake3_pow_seg_tail(
         assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let total_units = (n_leaves - suffix_start) / unit;
         let force_units = force.min(total_units);
-        let args = match TAIL_ARGS.get() {
-            Some(&b) => b as Id,
-            None => {
-                let b = unsafe { gpu.new_buffer(16 * 12)? };
-                *TAIL_ARGS.get_or_init(|| b as usize) as Id
+        // Banded cb3 (`super::ENV_NO_TAIL_BANDS`): no reserve and no floor;
+        // the claims stop at cb3's end instead.
+        let bands = tail_bands_on();
+        // CPU tail-hash reserve (`super::ENV_NO_TAIL_HASH_RESERVE_LATE`):
+        // units of the unclaimed top a claim does not offer to cb3; only with
+        // the working coordinator, never more than the units above the forced
+        // ones. The late form commits cb3 with the full count (a claim lowers
+        // it, so with no claim cb3 hashes every unit); the eager form, whose
+        // claims always run, commits it with the reserve already applied.
+        let reserve = if super::tailhash_coord_work_enabled() && !bands {
+            (total_units * super::tail_hash_reserve_pct() / 100).min(total_units - force_units)
+        } else {
+            0
+        };
+        let first_count = if after_ab { total_units } else { total_units - reserve };
+        let args = if bands {
+            match TAIL_BAND_ARGS.get() {
+                Some(&b) => b as Id,
+                None => {
+                    let b = unsafe { gpu.new_buffer(super::TAIL_BANDS * TAIL_BAND_SLOTS * 12)? };
+                    *TAIL_BAND_ARGS.get_or_init(|| b as usize) as Id
+                }
+            }
+        } else {
+            match TAIL_ARGS.get() {
+                Some(&b) => b as Id,
+                None => {
+                    let b = unsafe { gpu.new_buffer(16 * 12)? };
+                    *TAIL_ARGS.get_or_init(|| b as usize) as Id
+                }
             }
         };
         let args_ptr = unsafe { gpu.buffer_contents(args).cast::<u32>() };
         // cb3, committed now behind cb2 (no launch gap at cb2's end).
-        let (cb3, per_unit, sig3) = unsafe {
+        // Banded: (band width in units, bands encoded); (0, 0) otherwise.
+        let (cb3, per_unit, sig3, band_w, band_n) = unsafe {
             let cb3 = gpu.command_buffer()?;
             let enc = gpu.compute_encoder(cb3)?;
-            let per_unit =
-                encode_merkle_suffix_units_indirect(gpu, enc, staging, tree_buf, n_leaves, suffix_start, args, unit_levels);
+            let (per_unit, band_w, band_n) = if bands {
+                encode_merkle_suffix_units_banded(
+                    gpu,
+                    enc,
+                    staging,
+                    tree_buf,
+                    n_leaves,
+                    suffix_start,
+                    args,
+                    unit_levels,
+                    super::TAIL_BANDS,
+                )
+            } else {
+                let p = encode_merkle_suffix_units_indirect(
+                    gpu, enc, staging, tree_buf, n_leaves, suffix_start, args, unit_levels,
+                );
+                (p, 0, 0)
+            };
             gpu.end_encoding(enc);
             // The join below returns on this signal (`super::ENV_NO_JOIN_SIGNAL`).
             let sig3 = if super::join_signal_enabled() { gpu.arm_done(cb3) } else { None };
-            write_tail_counts(args_ptr, &per_unit, total_units);
+            if bands {
+                write_tail_counts_banded(args_ptr, &per_unit, band_w, band_n, first_count, None);
+            } else {
+                write_tail_counts(args_ptr, &per_unit, first_count);
+            }
             let cb3 = gpu.retain(cb3);
             gpu.commit_async(cb3);
-            (cb3, per_unit, sig3)
+            (cb3, per_unit, sig3, band_w, band_n)
         };
         crate::tmark::mark("cb3 committed (tail)");
         let bytes_base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(staging).cast::<u8>() });
         let args_base = crate::epool::SyncPtr(args_ptr);
         let per_unit = &per_unit;
-        // (next unclaimed top, exclusive; claims stopped)
-        let claims = std::sync::Mutex::new((n_leaves, false));
+        // (next unclaimed top, exclusive; claims stopped; cb3's frozen floor,
+        // usize::MAX until the reserve freezes the count at cb2's end; the
+        // last unit count published to cb3; banded only: the unclaimed top
+        // when a claimer first saw cb2's end, usize::MAX until then)
+        let claims = std::sync::Mutex::new((n_leaves, false, usize::MAX, first_count, usize::MAX));
         // Raw handles cross the scope as integers (the body runs on this
         // thread; the workers get the claims and the byte/tree/args bases).
         let cb2_u = cb2 as usize;
+        let cb3_u = cb3 as usize;
         // Working coordinator (`super::ENV_NO_TAILHASH_COORD_WORK`): this
         // thread hashes units too, and every claimer checks cb2 first.
         let coord_work = super::tailhash_coord_work_enabled();
@@ -15221,11 +15463,29 @@ kernel void blake3_pow_seg_tail(
         let t_tail = std::time::Instant::now();
         let mut h = n_leaves;
         // Claim one unit: lower cb3's count first, then hash it.
-        let claim = move |g: &mut (usize, bool)| -> usize {
+        // With the reserve the count is published `reserve` units below the
+        // unclaimed top, never above the last one published, and not at all
+        // once frozen.
+        let claim = move |g: &mut (usize, bool, usize, usize, usize)| -> usize {
             g.0 -= unit;
-            // SAFETY: the args buffer is the arm's; counts only decrease.
-            unsafe { write_tail_counts(args_base.ptr(), per_unit, (g.0 - suffix_start) / unit) };
+            if g.2 == usize::MAX {
+                let c = ((g.0 - suffix_start) / unit).saturating_sub(reserve).min(g.3);
+                // SAFETY: the args buffer is the arm's; counts only decrease.
+                if bands {
+                    unsafe { write_tail_counts_banded(args_base.ptr(), per_unit, band_w, band_n, c, Some(g.3)) };
+                } else {
+                    unsafe { write_tail_counts(args_base.ptr(), per_unit, c) };
+                }
+                g.3 = c;
+            }
             g.0
+        };
+        // Reserve only: at cb2's end the count stops moving; the floor is the
+        // last count published (cb3 read one no lower).
+        let freeze = move |g: &mut (usize, bool, usize, usize, usize)| {
+            if g.2 == usize::MAX {
+                g.2 = suffix_start + g.3 * unit;
+            }
         };
         let hash_unit = move |start: usize| {
             // SAFETY: `start..start + unit` was claimed by this thread alone;
@@ -15239,7 +15499,34 @@ kernel void blake3_pow_seg_tail(
         // cb2's completion as the caller reads it: its armed signal when
         // present (`super::ENV_NO_CB2_DONE_SIGNAL`), else the status.
         let sig2_ref = sig2.as_ref();
-        if run_claims {
+        let sig3_ref = sig3.as_ref();
+        // The claims' stop rule, read under the claim lock: cb2's completion
+        // as the caller reads it; banded (`super::ENV_NO_TAIL_BANDS`): cb3's,
+        // and the unclaimed top is noted the first time cb2's end is seen.
+        let stop = move |g: &mut (usize, bool, usize, usize, usize)| -> bool {
+            // SAFETY: the committed cb2 and cb3 and their signals, all held
+            // by the caller until after the claim scope.
+            unsafe {
+                if bands {
+                    if g.4 == usize::MAX && gpu.cb_done(cb2_u as Id, sig2_ref) {
+                        g.4 = g.0;
+                    }
+                    gpu.cb_done(cb3_u as Id, sig3_ref)
+                } else {
+                    gpu.cb_done(cb2_u as Id, sig2_ref)
+                }
+            }
+        };
+        // cb2 completed before the AB arm returned: keep helping the AB
+        // queue while cb3 runs, as the whole-suffix cb3 path does. Banded:
+        // the same single call also returns once the AB arm has returned,
+        // and the claims run if cb3 is still running then (no retry: if the
+        // call returns with neither, the joins below wait as before).
+        let late_entry = !run_claims && {
+            super::help_pool_until(|| (bands && super::ab_arm_done()) || unsafe { gpu.cb_done(cb3, sig3_ref) });
+            bands && super::ab_arm_done() && !unsafe { gpu.cb_done(cb3, sig3_ref) }
+        };
+        if run_claims || late_entry {
         rayon::scope(|sc| {
             for _ in 0..rayon::current_num_threads() {
                 let claims = &claims;
@@ -15249,25 +15536,37 @@ kernel void blake3_pow_seg_tail(
                         if g.1 || g.0 <= suffix_start {
                             break;
                         }
-                        // Working coordinator: stop the claims at the first
-                        // claim attempt after cb2's end (the caller may be
-                        // inside a unit of its own and not see it), read as
-                        // the caller reads it.
-                        if coord_work
+                        if g.2 != usize::MAX {
+                            // Reserve: frozen; hash down to the floor.
+                            if g.0 <= g.2 {
+                                g.1 = true;
+                                break;
+                            }
+                        } else if coord_work
                             && (n_leaves - g.0) / unit >= force_units
-                            // SAFETY: the committed cb2 and its signal, both
-                            // held by the caller until after this scope.
-                            && unsafe { gpu.cb_done(cb2_u as Id, sig2_ref) }
+                            && stop(&mut g)
                         {
-                            g.1 = true;
-                            break;
+                            // Working coordinator: stop the claims at the
+                            // first claim attempt after cb2's end (the caller
+                            // may be inside a unit of its own and not see
+                            // it), read as the caller reads it. With the
+                            // reserve: freeze the count and keep claiming
+                            // down to the floor.
+                            if reserve == 0 {
+                                g.1 = true;
+                                break;
+                            }
+                            freeze(&mut g);
+                            if g.0 <= g.2 {
+                                g.1 = true;
+                                break;
+                            }
                         }
                         claim(&mut g)
                     };
                     hash_unit(start);
                 });
             }
-            let cb2_done = || unsafe { gpu.cb_done(cb2_u as Id, sig2_ref) };
             let mut spins = 0u32;
             loop {
                 {
@@ -15282,11 +15581,27 @@ kernel void blake3_pow_seg_tail(
                         h = suffix_start;
                         break;
                     }
+                    if g.2 != usize::MAX {
+                        // Reserve: frozen; hash down to the floor.
+                        if g.0 <= g.2 {
+                            g.1 = true;
+                            h = g.0;
+                            break;
+                        }
+                        let start = claim(&mut g);
+                        drop(g);
+                        hash_unit(start);
+                        continue;
+                    }
                     let claimed = (n_leaves - g.0) / unit;
-                    if claimed >= force_units && cb2_done() {
-                        g.1 = true;
-                        h = g.0;
-                        break;
+                    if claimed >= force_units && stop(&mut g) {
+                        if reserve == 0 {
+                            g.1 = true;
+                            h = g.0;
+                            break;
+                        }
+                        freeze(&mut g);
+                        continue;
                     }
                     if claimed < force_units || coord_work {
                         // Test builds: help with the forced units (a pool
@@ -15306,12 +15621,21 @@ kernel void blake3_pow_seg_tail(
                 }
             }
         });
-        } else {
-            // cb2 completed before the AB arm returned: keep helping the AB
-            // queue while cb3 runs, as the whole-suffix cb3 path does.
-            let sig3_ref = sig3.as_ref();
-            super::help_pool_until(|| unsafe { gpu.cb_done(cb3, sig3_ref) });
         }
+        // Banded: units the CPU took after a claimer saw cb2's end (all of
+        // them when the claims started after it).
+        let after_cb2 = if bands {
+            let g = claims.lock().unwrap_or_else(|e| e.into_inner());
+            if late_entry {
+                (n_leaves - h) / unit
+            } else if g.4 != usize::MAX {
+                (g.4 - h) / unit
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let tail_ms = t_tail.elapsed().as_secs_f64() * 1e3;
         crate::tmark::mark("tail hash workers done");
         if sig2.is_some() && !window_trace_enabled() {
@@ -15382,9 +15706,10 @@ kernel void blake3_pow_seg_tail(
         if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
             eprintln!(
                 "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
-                 suffix units in {tail_ms:.2} ms",
+                 suffix units in {tail_ms:.2} ms{}",
                 if run_claims { "AB arm returned with cb2 running" } else { "cb2 completed first" },
                 (n_leaves - h) / unit,
+                if bands { format!("; bands {band_n}, {after_cb2} units after cb2's end") } else { String::new() },
             );
         }
         Ok(())
@@ -15552,7 +15877,29 @@ kernel void blake3_pow_seg_tail(
                         && super::hybrid_cpu_tail_hash_enabled()
                         && super::late_tail_hash_enabled()
                         && !gpu.cb_done(cb2, sig2.as_ref());
-                    if tail || late {
+                    // Banded cb3 (see `super::ENV_NO_TAIL_BANDS`): cb2 is
+                    // already complete and the AB arm has returned, so
+                    // instead of the plain cb3 the banded one is committed
+                    // through the late join, whose claims then run at once
+                    // while cb3 runs (never with the AB arm still running:
+                    // the join's waits then cover at most the rest of cb3
+                    // after the claims, not the whole cb3 as on the plain
+                    // path).
+                    // Never in the tuner's sweep, which prices the plain cb3.
+                    let unit = 1usize << tail_unit_levels();
+                    let banded_plain = false && !tail
+                        && !late
+                        && tail_bands_on()
+                        && tail_force == 0
+                        && !hybrid_arm_recording()
+                        && super::hybrid_cpu_tail_hash_enabled()
+                        && super::ab_arm_done()
+                        && n_leaves.is_power_of_two()
+                        && n_leaves >= 1 << 16
+                        && suffix_leaf_start.is_multiple_of(unit)
+                        && suffix_leaf_start < n_leaves
+                        && gpu.cb_done(cb2, sig2.as_ref());
+                    if tail || late || banded_plain {
                         hybrid_cpu_tail_hash_join(
                             gpu,
                             cb2,
@@ -15563,7 +15910,7 @@ kernel void blake3_pow_seg_tail(
                             n_leaves,
                             suffix_leaf_start,
                             tail_force,
-                            late,
+                            late || banded_plain,
                         )?;
                     } else {
                     let cb3 = gpu.command_buffer()?;
