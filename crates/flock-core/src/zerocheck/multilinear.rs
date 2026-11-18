@@ -3662,11 +3662,20 @@ fn fold2_compact_and_round45_into_packed_b(
         let _ = pack;
         false
     };
+    // The one-table kernel reads its group weights `eq_lo[2t + 1]` either in
+    // prepared form (one table shared by every chunk), or — when the
+    // challenges satisfy the window relation — as the window scales
+    // `lambda * x^{2j}` (`FLOCK_NO_ZC_K_XB=1` keeps the prepared form), in
+    // which case no table is built or streamed at all.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let k_xb =
         one_table && kernels::aarch64::zc_k_xb_enabled() && kernels::aarch64::k_full_xb_weights(eq_lo, lo_size);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let k_shifts = k_xb && kernels::aarch64::zc_k_xb_shifts_enabled();
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let k_xb = false;
+    // Diagnostic trace (`FLOCK_ZC_K_XB_DEBUG=1`): whether the window-scaled
+    // K weights armed, and the first window's relation if they did not.
     if std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some() && one_table {
         let n_groups = lo_size / 2;
         let armed = k_xb;
@@ -3794,24 +3803,38 @@ fn fold2_compact_and_round45_into_packed_b(
                 (true, true) if one_table && pack => {
                     let ok = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
                         if k_xb {
-                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true>(
+                            if k_shifts {
+                                kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true, true>(
                                 fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
                                 degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
                             )
+                            } else {
+                                kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true, false>(
+                                fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
+                                degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                            }
                         } else {
-                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false>(
+                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false, false>(
                                 fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
                                 degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
                             )
                         }
                     } else {
                         if k_xb {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true>(
+                            if k_shifts {
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, true>(
                                 t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
                                 compact.tail_compact, compact.head_compact, compact.head_b,
                             )
+                            } else {
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, false>(
+                                t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                                compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                            }
                         } else {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false, false>(
                                 t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
                                 compact.tail_compact, compact.head_compact, compact.head_b,
                             )
@@ -3824,12 +3847,19 @@ fn fold2_compact_and_round45_into_packed_b(
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
                     if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true>(
+                        if k_shifts {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true, true>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             compact.tail_compact, compact.head_compact, compact.head_b,
-                        );
+                        )
+                        } else {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            compact.tail_compact, compact.head_compact, compact.head_b,
+                        )
+                        };
                     } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             compact.tail_compact, compact.head_compact, compact.head_b,
                         );
@@ -3838,12 +3868,19 @@ fn fold2_compact_and_round45_into_packed_b(
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => {
                     if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true>(
+                        if k_shifts {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true, true>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             false, false, F128::ZERO,
-                        );
+                        )
+                        } else {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true, false>(
+                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
+                            false, false, F128::ZERO,
+                        )
+                        };
                     } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             false, false, F128::ZERO,
                         );
@@ -4645,8 +4682,18 @@ pub(crate) fn fold_cascade_t_into_packed_prefix(
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
-    let (m1, minf, la, la2, _) =
+    let (m1, minf, la, la2, carried) =
         fold_cascade_t_into_packed_prefix_gpu(a, b, packed, bpacked, prefix, a_out, b_out, rhos, r_next, false);
+    // With `gpu` off, a prefix comes back only from the tri pass 0 carry
+    // (`gpu_commit::ENV_NO_ZC_T0_CARRY`); this wrapper's callers read every
+    // output entry, so write the carried leading outputs in.
+    if let Some(p) = carried {
+        // SAFETY: the arm's buffers are rewritten only by the next prove's
+        // pass 0; the carried chunks were observed complete.
+        let (pa, pb) = unsafe { p.slices() };
+        a_out[..pa.len()].copy_from_slice(pa);
+        b_out[..pb.len()].copy_from_slice(pb);
+    }
     (m1, minf, la, la2)
 }
 
@@ -4738,7 +4785,17 @@ std::thread_local! {
 /// launch (oracle) the CPU folds every chunk and the GPU's outputs and
 /// slots of every offered chunk must equal the CPU's. `FLOCK_ZC_T0_FORCE`
 /// (test hook) keeps chunks below it for the GPU and waits for them.
+///
+/// Carry (`gpu_commit::ENV_NO_ZC_T0_CARRY`): outside the oracle and the
+/// test hook, the chunks taken from the GPU are exactly `0..taken` (the GPU
+/// side of the queue only advances `g0` from 0, one ready chunk at a time).
+/// Their outputs are then not copied: they stay in the arm's buffers, and
+/// the returned prefix (`taken * chunk_out` entries of each) is what tri
+/// pass 1 reads in place of the leading entries of this pass's `a_out` /
+/// `b_out`, which are left unwritten there. `None` = nothing carried (every
+/// output range written, as before).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
 fn tri0_gpu_queue(
     job: crate::gpu_commit::ZcT0Job,
     hi_size: usize,
@@ -4747,9 +4804,10 @@ fn tri0_gpu_queue(
     b_base: crate::epool::SyncPtr<F128>,
     partials_base: crate::epool::SyncPtr<std::mem::MaybeUninit<[F128; 26]>>,
     body: &(dyn Fn(usize) + Sync),
-) {
+) -> Option<KGpuPrefix> {
     let calibration = job.calibration();
     let force = if calibration { 0 } else { crate::gpu_commit::gpu_zc_t0_force().min(job.offer()) };
+    let carry = !calibration && force == 0 && crate::gpu_commit::gpu_zc_t0_carry_enabled();
     let claims = std::sync::Mutex::new((0usize, hi_size, 0usize));
     crate::epool::run_hetero_chunks(hi_size, |_| {
         let (x_hi, from_gpu) = {
@@ -4781,15 +4839,32 @@ fn tri0_gpu_queue(
             // SAFETY: exclusive owner of chunk `x_hi`'s output ranges and
             // partial slot (claimed above); the queue join publishes them.
             unsafe {
-                std::ptr::copy_nonoverlapping(ga.as_ptr(), a_base.ptr().add(x_hi * chunk_out), chunk_out);
-                std::ptr::copy_nonoverlapping(gb.as_ptr(), b_base.ptr().add(x_hi * chunk_out), chunk_out);
+                if !carry {
+                    std::ptr::copy_nonoverlapping(ga.as_ptr(), a_base.ptr().add(x_hi * chunk_out), chunk_out);
+                    std::ptr::copy_nonoverlapping(gb.as_ptr(), b_base.ptr().add(x_hi * chunk_out), chunk_out);
+                }
                 partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(slots));
             }
         } else {
             body(x_hi);
         }
     });
-    let taken = claims.into_inner().unwrap_or_else(|e| e.into_inner()).2;
+    let (g0, _, taken) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+    // Carry: the GPU-taken chunks are `0..g0` (no forced claims), all of
+    // them observed complete; hand them to the next pass uncopied.
+    let carried = if carry && taken > 0 {
+        assert_eq!(g0, taken, "tri pass 0 carry: GPU chunks are not a prefix");
+        let (a, b) = job.outputs();
+        if crate::gpu_commit::gpu_zc_t0_debug() {
+            eprintln!(
+                "[zc-t0-gpu] carry: chunks 0..{taken} handed to tri pass 1 uncopied ({} KiB not copied)",
+                taken * 2 * chunk_out * std::mem::size_of::<F128>() / 1024
+            );
+        }
+        Some(KGpuPrefix { a, b, len_a: taken * chunk_out, len_b: taken * chunk_out })
+    } else {
+        None
+    };
     if calibration {
         let equal = job.wait_all()
             && (0..job.offer()).all(|c| {
@@ -4804,6 +4879,7 @@ fn tri0_gpu_queue(
         crate::gpu_commit::zc_t0_verdict(equal, job.offer());
     }
     job.finish(taken, hi_size);
+    carried
 }
 
 /// Caller-first main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, any value,
@@ -4826,7 +4902,9 @@ fn zc_tri_caller_first_enabled() -> bool {
 /// the leading chunks that lie wholly inside that prefix. Also returns the
 /// arm's prefix (`None` unless it was used for this pass's outputs): its
 /// `len` leading outputs of `a_out` / `b_out` were not written, and the next
-/// tri pass reads them from there.
+/// tri pass reads them from there. Tri pass 0 returns its own GPU arm's
+/// prefix the same way when it carries (`gpu_commit::ENV_NO_ZC_T0_CARRY`),
+/// whatever `gpu` is.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     a: &[F128],
@@ -5143,7 +5221,15 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
         let t0_job: Option<()> = None;
         match t0_job {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            Some(job) => tri0_gpu_queue(job, hi_size, chunk_out, a_base, b_base, partials_base, &body),
+            Some(job) => {
+                // Carry (`ENV_NO_ZC_T0_CARRY`): the GPU-taken leading
+                // outputs stay in the arm's buffers; returned below for tri
+                // pass 1, which reads them in place of `a_out` / `b_out`'s
+                // leading entries (not written in that case).
+                if let Some(p) = tri0_gpu_queue(job, hi_size, chunk_out, a_base, b_base, partials_base, &body) {
+                    gpu_prefix = Some(p);
+                }
+            }
             _ => crate::epool::run_hetero_chunks(hi_size - cpu_base, &body),
         }
         // Join the GPU prefix (submitted first; normally done).
