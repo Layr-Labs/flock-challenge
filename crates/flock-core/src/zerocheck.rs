@@ -30,7 +30,7 @@ use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into,
     fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_compact_and_round4_into,
     fold2_plain_and_round6_into, fold2_plain_and_round67_into,
-    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
+    eq_drop_first, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive_with_eq,
     uni_skip_fold_and_round_pair_compact_padded_lookahead_for,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
@@ -1551,6 +1551,12 @@ fn prove_packed_padded_inner<C: Challenger>(
     // (T3's hetero drain is already behind us, so the delta is loop-only).
     let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
+    // The serial rounds' equality tables: each round's suffix is the previous
+    // round's minus its first challenge, so after the first serial round the
+    // table is the previous one's pair sums (`eq_drop_first`) instead of a
+    // fresh build. `FLOCK_NO_ZC_TAIL_EQ_REUSE=1` (any value) builds each one.
+    let tail_eq_reuse = zc_tail_eq_reuse_enabled();
+    let mut tail_eq: Vec<F128> = Vec::new();
     for i in loop_start..(n_mlv - 1) {
         let t_round_i = std::time::Instant::now();
         let rho_prev = mlv_rhos[i];
@@ -1583,7 +1589,13 @@ fn prove_packed_padded_inner<C: Challenger>(
             (m1, mi)
         } else {
             fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            round_pair_naive(&a_mlv, &b_mlv, &r_next)
+            let want = a_mlv.len() / 2;
+            tail_eq = if tail_eq_reuse && tail_eq.len() == 2 * want {
+                eq_drop_first(&tail_eq)
+            } else {
+                univariate_skip::build_eq(&r_next[1..])
+            };
+            round_pair_naive_with_eq(&a_mlv, &b_mlv, r_next[0], &tail_eq)
         };
 
         multilinear_msgs.push((m1, mi));
@@ -1826,6 +1838,14 @@ pub fn verify<C: Challenger>(
         b_eval: proof.final_b_eval,
         c_eval: proof.final_c_eval,
     })
+}
+
+/// See the serial tail rounds of the prover: `FLOCK_NO_ZC_TAIL_EQ_REUSE=1`
+/// (any value) builds every serial round's equality table afresh. Read once
+/// per process.
+fn zc_tail_eq_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_TAIL_EQ_REUSE").is_none())
 }
 
 #[cfg(test)]
