@@ -47,8 +47,48 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && direct_ab_env_clear()
+}
+
+/// Kill switch for the cached prover gate environment
+/// (`FLOCK_NO_PROVER_GATE_ENV_ONCE`, any value: every gate call reads its
+/// variables from the process environment again, as before). Read once per
+/// process.
+pub const ENV_NO_PROVER_GATE_ENV_ONCE: &str = "FLOCK_NO_PROVER_GATE_ENV_ONCE";
+
+fn prover_gate_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_PROVER_GATE_ENV_ONCE).is_none());
+    *ON
+}
+
+/// The environment half of [`ranked_direct_ab_precompute_enabled`]. The
+/// ranked gates call it five times per prove (two lookups each); the
+/// process environment does not change during a prove, so the first answer
+/// is kept. `FLOCK_NO_PROVER_GATE_ENV_ONCE` restores the per-call lookups.
+#[inline]
+fn direct_ab_env_clear() -> bool {
+    if prover_gate_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+                && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+        });
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
         && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+}
+
+/// The environment term of [`ranked_lincheck_c_reuse_enabled`], kept the same
+/// way (`FLOCK_NO_PROVER_GATE_ENV_ONCE` restores the per-call lookup).
+#[inline]
+fn lincheck_c_reuse_env_clear() -> bool {
+    if prover_gate_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
 }
 
 /// Whether the c-claim ships its four-bank sufficient statistic instead of the
@@ -91,7 +131,7 @@ fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.useful_bits == 15_409
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
         && r1cs.c0_is_identity()
-        && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
+        && lincheck_c_reuse_env_clear()
 }
 
 /// C1 needs both statement properties and the exact row-major BLAKE3

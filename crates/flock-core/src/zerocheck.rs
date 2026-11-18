@@ -30,7 +30,8 @@ use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into,
     fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_in_place_pair, fold2_compact_and_round4_into,
     fold2_plain_and_round6_into, fold2_plain_and_round67_into,
-    eq_drop_first, interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive_with_eq,
+    eq_drop_first, fold_in_place_and_round_pair_with_eq, interpolate_at_z_combined,
+    interpolate_at_z_on_lambda, round_pair_naive_with_eq,
     uni_skip_fold_and_round_pair_compact_padded_lookahead_for,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
@@ -38,6 +39,13 @@ use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
     small_challenges_ghash,
 };
+
+fn zc_tail_fused_fold_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("FLOCK_NO_ZC_TAIL_FUSED_FOLD").is_none()
+    });
+    *ON
+}
 
 /// Test-only forced-off latch for the two-challenge lookahead. Production
 /// reads `FLOCK_NO_ZC_LOOKAHEAD`; the transcript-identity test flips this
@@ -1605,14 +1613,24 @@ fn prove_packed_padded_inner<C: Challenger>(
             b_mlv.truncate(half);
             (m1, mi)
         } else {
-            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-            let want = a_mlv.len() / 2;
+            let want = a_mlv.len() / 4;
             tail_eq = if tail_eq_reuse && tail_eq.len() == 2 * want {
                 eq_drop_first(&tail_eq)
             } else {
                 univariate_skip::build_eq(&r_next[1..])
             };
-            round_pair_naive_with_eq(&a_mlv, &b_mlv, r_next[0], &tail_eq)
+            if zc_tail_fused_fold_enabled() {
+                fold_in_place_and_round_pair_with_eq(
+                    &mut a_mlv,
+                    &mut b_mlv,
+                    rho_prev,
+                    r_next[0],
+                    &tail_eq,
+                )
+            } else {
+                fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+                round_pair_naive_with_eq(&a_mlv, &b_mlv, r_next[0], &tail_eq)
+            }
         };
 
         multilinear_msgs.push((m1, mi));
