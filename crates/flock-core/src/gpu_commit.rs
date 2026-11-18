@@ -447,6 +447,27 @@ pub(crate) fn fold_serial_xor_enabled() -> bool {
     *ON
 }
 
+/// Live-column reduce of the stripe folds (`FLOCK_NO_FOLD_LIVE_REDUCE=1`,
+/// exactly "1", restores the full-width reduce and drain). The round-one C
+/// fold's and the lincheck fold's gather already dispatches only the column
+/// groups that hold a fold column (`i_groups`; 12 of the 16 groups of 1,024
+/// columns on the root-compacted stripe, all 16 on a full stripe). The GPU
+/// reduce still read the 64 partial rows of every one of the `k` columns,
+/// including the groups no gather wrote, and the drain XORed all `k` lanes
+/// into the CPU suffix. With this on, the reduce runs over the dispatched
+/// groups' lanes only (same kernel, same stride, fewer threadgroups) and the
+/// drain adds exactly those lanes. Lanes past them lie past every fold
+/// column; on the root stripe they are past `n_roots`, which `RootStripe`
+/// declares arbitrary and its `expand` rebuilds, and on a full stripe there
+/// are none. Same live lanes, same sums, same proof. No kernel, pipeline or
+/// buffer changes. Read once per process.
+pub const ENV_NO_FOLD_LIVE_REDUCE: &str = "FLOCK_NO_FOLD_LIVE_REDUCE";
+
+pub(crate) fn fold_live_reduce_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_FOLD_LIVE_REDUCE));
+    *ON
+}
+
 pub const ENV_NO_CB2_DONE_SIGNAL: &str = "FLOCK_NO_CB2_DONE_SIGNAL";
 
 pub(crate) fn cb2_done_signal_enabled() -> bool {
@@ -1355,6 +1376,24 @@ pub const ENV_NO_ZC_T0_GPU: &str = "FLOCK_NO_ZC_T0_GPU";
 pub(crate) fn gpu_zc_t0_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_T0_GPU).is_none());
     *ON && gpu_zc_t56_enabled()
+}
+
+/// Kill switch for the tri pass 0 carry (`FLOCK_NO_ZC_T0_CARRY=1`, exactly
+/// "1": every chunk the queue takes from the GPU is copied into the pass's
+/// CPU output ranges, as before). With the carry on, the chunks the pass-0
+/// queue takes from the GPU (always the contiguous run `0..taken` in a
+/// ranked prove) stay in the arm's output buffers and tri pass 1 reads its
+/// leading inputs there, as pass 0 reads the 5+6 arm's and the 5+6 pass the
+/// K arm's: `taken x 2 x 1024 x 16` bytes are no longer copied (read and
+/// written) by the CPU. The slots of a taken chunk still go to its partial
+/// row. The oracle prove and the forced-share test hook keep the copy.
+/// Same values in the same order: identical proof. Read once per process.
+pub const ENV_NO_ZC_T0_CARRY: &str = "FLOCK_NO_ZC_T0_CARRY";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_zc_t0_carry_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_ZC_T0_CARRY));
+    *ON
 }
 
 /// Diagnostic cap on the tri pass 0 arm's offer, in pass-0 chunks
@@ -3017,6 +3056,66 @@ pub(crate) fn gpu_final_leaf_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_FINAL_LEAF").is_none())
 }
 
+/// Lane-linear table stores in the dense g4x2 pass (layers 12..15 at the
+/// ranked size; `FLOCK_NO_G4X2_BUILD_LINEAR`, any value, keeps the record's
+/// store map). The zero-lane passes keep the record's text.
+/// The 64-thread build of a twiddle's 512-entry byte table gives thread
+/// `(bank t, lane u)` the entries `(cc << 5) | (aa << 2) | {0..3, 16..19}`,
+/// so the 32 lanes of a SIMD group store entries 64 bytes apart. Here lane
+/// `u` owns entries `u + 32 m` (`m = 0..7`): each of its eight stores writes
+/// 32 consecutive entries across the SIMD group. Entry `i` is still the XOR
+/// of the generators `t * X^b` over the set bits `b` of `i`, from the same
+/// generator chain, so every table, and the codeword, is unchanged. Read once
+/// per process, when the g4x2 source is made.
+pub(crate) fn gpu_g4x2_build_linear_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_BUILD_LINEAR").is_none())
+}
+
+/// One-round zero-lane g4x2 groups (`FLOCK_NO_G4X2_ZL_ONE_ROUND`, any
+/// value, keeps the record's 64-thread, two-round groups). A zero-lane g4x2
+/// group (the layers 4..7 and 8..11 passes) runs 2 x 128 columns of one
+/// block, which share the block's 15 twiddles, as two rounds of 128
+/// columns: every byte table is built twice, once per round, by 64 threads
+/// storing eight entries each. Here the group has 128 threads and one round:
+/// threads `0..63` take the record's first round, threads `64..127` the
+/// second, side by side, and each table is built once for both, by 128
+/// threads storing four entries each (lane `u = lid & 63` of bank
+/// `t = lid >> 6` owns entries `u + 64 m`). Same groups, same columns, same
+/// butterflies in the same order over the same tables (entry `i` is still the
+/// XOR of `X^b * g` over the bits of `i`): the codeword is unchanged. Each
+/// thread holds the record's two columns; the never-read residency pad grows
+/// so a core still runs twelve SIMD groups (three groups of four instead of
+/// six of two). A group whose second half is past the block's live columns
+/// (only at `s = 8`) loads the first half's columns there, takes part in
+/// every table build and barrier, and stores nothing. The dense pipeline
+/// (layers 12..15) keeps its text and 64-thread groups. A pipeline that
+/// cannot run 128 threads, or a drifted anchor, keeps the record's text.
+/// Read once per process.
+pub(crate) fn gpu_g4x2_zl_one_round_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_ZL_ONE_ROUND").is_none())
+}
+
+/// Double-buffered byte tables in the one-round g4x2 groups
+/// (`FLOCK_NO_G4X2_TAB_DBUF`, any value, keeps one table and two barriers per
+/// build). The group's 15 builds alternate between two 8 KiB tables
+/// (`tabB + ((k & 1) << 9)` for twiddle `k`), and each build drops its
+/// leading barrier: that barrier only kept a build from overwriting the table
+/// the previous twiddle's products were still reading, and with two tables
+/// the build for twiddle `k` overwrites the table of twiddle `k - 2`, whose
+/// last reads every thread finished before it reached the publishing barrier
+/// of twiddle `k - 1`. One barrier after the twiddle prefetch publishes
+/// `twl` (the first build's leading barrier did that). The second table
+/// comes out of the one-round group's residency pad, so the group still
+/// allocates 24,576 B. Same tables, same products: the codeword is
+/// unchanged. Only with [`gpu_g4x2_zl_one_round_enabled`], so in the
+/// zero-lane pipeline. Read once per process.
+pub(crate) fn gpu_g4x2_tab_dbuf_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_TAB_DBUF").is_none())
+}
+
 pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB2").is_none())
@@ -3762,6 +3861,32 @@ pub const ENV_NO_HYBRID_CPU_TAIL_HASH: &str = "FLOCK_NO_HYBRID_CPU_TAIL_HASH";
 pub(crate) fn hybrid_cpu_tail_hash_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_HYBRID_CPU_TAIL_HASH).is_none());
+    *ON
+}
+
+/// Kill switch for the late CPU tail hash (`FLOCK_NO_LATE_TAIL_HASH`, any
+/// value: with the NTT ahead of a still running AB arm, cb3 hashes the whole
+/// CPU suffix on the GPU, as before). Read once per process.
+///
+/// Under the NTT's priority (`ENV_NO_NTT_AB_PRIORITY`) the hybrid CPU NTT is
+/// usually done while the AB arm still runs, so the CPU tail hash
+/// (`ENV_NO_HYBRID_CPU_TAIL_HASH`) never fires and cb3 is queued behind cb2
+/// over the whole suffix. When the AB arm then returns while cb2 is still
+/// running, every main-pool worker parks until cb3 ends. With this on, cb3
+/// is queued at the same moment over the same suffix in the tail hash's
+/// indirect-count form (all units on the GPU), the commit arm keeps helping
+/// the AB queue as before, and only once the AB arm has returned with cb2
+/// still running do the workers claim units from the top of the suffix,
+/// exactly as the tail hash does; if cb2 completes first, nothing is claimed
+/// and cb3 hashes every unit. Same claim rule, same units hashed by one or
+/// both sides into the same slots, same suffix levels recomputed after the
+/// join, so the root is unchanged. Not during the split tuner's sweep.
+pub const ENV_NO_LATE_TAIL_HASH: &str = "FLOCK_NO_LATE_TAIL_HASH";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn late_tail_hash_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LATE_TAIL_HASH).is_none());
     *ON
 }
 
@@ -6356,10 +6481,223 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// `FLOCK_NO_GPU_TW_PREFETCH` is set.
     fn g4x2_msl_source() -> &'static str {
         if super::gpu_tw_prefetch_enabled() {
-            NTT_G4X2_TWL_MSL_SOURCE
+            g4x2_twl_source()
         } else {
             NTT_G4X2_MSL_SOURCE
         }
+    }
+
+    /// Lane-linear table stores in the twiddle-prefetch g4x2 build (see
+    /// [`super::gpu_g4x2_build_linear_enabled`]): the build from its first
+    /// generator to its closing barrier, as in the record and lane-linear.
+    const G4X2_BUILD_TAIL_RECORD: &str = "    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (aa & 1u) { A ^= e2; }
+    if (aa & 2u) { A ^= e3; }
+    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
+    uint4 C = uint4(0u);
+    if (cc & 1u) { C ^= f1; }
+    if (cc & 2u) { C ^= f2; }
+    if (cc & 4u) { C ^= f3; }
+    const uint4 H0 = C, H1 = C ^ f0;
+    threadgroup uint4* dst = &tabB[t << 8];
+    const uint o0 = (cc << 5) + (aa << 2);   // entry (cc << 5) | (aa << 2)
+    const uint o1 = o0 + 16u;                //   ... | 16
+    dst[o0 + 0u] = L0 ^ H0;
+    dst[o0 + 1u] = L1 ^ H0;
+    dst[o0 + 2u] = L2 ^ H0;
+    dst[o0 + 3u] = L3 ^ H0;
+    dst[o1 + 0u] = L0 ^ H1;
+    dst[o1 + 1u] = L1 ^ H1;
+    dst[o1 + 2u] = L2 ^ H1;
+    dst[o1 + 3u] = L3 ^ H1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+";
+    const G4X2_BUILD_TAIL_LINEAR: &str = "    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    // Entry bits 0..4 are the thread's lane u, bits 5..7 the store index m:
+    // the 32 lanes of a SIMD group store 32 consecutive entries at once.
+    uint4 A = uint4(0u);
+    if (u & 1u) { A ^= e0; }
+    if (u & 2u) { A ^= e1; }
+    if (u & 4u) { A ^= e2; }
+    if (u & 8u) { A ^= e3; }
+    if (u & 16u) { A ^= f0; }
+    const uint4 A1 = A ^ f1, A2 = A ^ f2, A3 = A1 ^ f2;
+    threadgroup uint4* dst = &tabB[(t << 8) + u];
+    dst[0u]   = A;
+    dst[32u]  = A1;
+    dst[64u]  = A2;
+    dst[96u]  = A3;
+    dst[128u] = A ^ f3;
+    dst[160u] = A1 ^ f3;
+    dst[192u] = A2 ^ f3;
+    dst[224u] = A3 ^ f3;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+";
+
+    /// The record's twiddle-prefetch build up to its first generator (see
+    /// [`super::gpu_g4x2_zl_one_round_enabled`]); with
+    /// [`G4X2_BUILD_TAIL_RECORD`] the whole function.
+    const G4X2_TWL_BUILD_HEAD: &str = "static inline void gf_build_byte16_twl(
+    threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 5;        // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 31u;
+    const uint aa = u & 3u;          // owns entry bits 2..3
+    const uint cc = u >> 2;          // owns entry bits 5..7
+";
+    /// The one-round build: 128 threads, lane `u` of bank `t` stores entries
+    /// `u + 64 m` (`m = 0..3`).
+    const G4X2_TWL_BUILD_128: &str = "static inline void gf_build_byte16_twl(
+    threadgroup uint4* tabB, threadgroup const uint4* twl, uint k, uint lid)
+{
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint t  = lid >> 6;        // 0: b*tw          1: b*(tw*x^8)
+    const uint u  = lid & 63u;       // entry bits 0..5; bits 6..7 = store index
+    uint4 e0 = twl[(t << 4) + k];
+    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 A = uint4(0u);
+    if (u & 1u) { A ^= e0; }
+    if (u & 2u) { A ^= e1; }
+    if (u & 4u) { A ^= e2; }
+    if (u & 8u) { A ^= e3; }
+    if (u & 16u) { A ^= f0; }
+    if (u & 32u) { A ^= f1; }
+    const uint4 A2 = A ^ f2;
+    threadgroup uint4* dst = &tabB[(t << 8) + u];
+    dst[0u]   = A;
+    dst[64u]  = A2;
+    dst[128u] = A ^ f3;
+    dst[192u] = A2 ^ f3;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+";
+    /// Never-read residency pad of the one-round group: 8,192 + 512 +
+    /// 15,872 = 24,576 B of threadgroup memory, three 128-thread groups per
+    /// core (the record's 12,736 B gives six 64-thread groups).
+    const G4X2_ONE_ROUND_PAD: [(&str, &str); 4] = [
+        ("[[max_total_threads_per_threadgroup(64)]]\n", "[[max_total_threads_per_threadgroup(128)]]\n"),
+        ("    threadgroup uint4 pad[252u];\n", "    threadgroup uint4 pad[992u];\n"),
+        ("pad[lid % 252u]", "pad[lid % 992u]"),
+        ("pad[(lid + 1u) % 252u]", "pad[(lid + 1u) % 992u]"),
+    ];
+
+    /// `src` (a two-round g4x2 text with the record's build) with the
+    /// one-round build, the 128-thread bound and pad.
+    fn g4x2_one_round_common(src: &str) -> Option<String> {
+        let build = format!("{G4X2_TWL_BUILD_HEAD}{G4X2_BUILD_TAIL_RECORD}");
+        let mut reps: Vec<(&str, &str)> = vec![(build.as_str(), G4X2_TWL_BUILD_128)];
+        reps.extend(G4X2_ONE_ROUND_PAD.iter().copied());
+        let s = splice_exact(src, &reps)?;
+        if !super::gpu_g4x2_tab_dbuf_enabled() {
+            return Some(s);
+        }
+        // One-round text with the double-buffered tables (see
+        // `super::gpu_g4x2_tab_dbuf_enabled`); a drifted anchor keeps the
+        // single table.
+        splice_exact(&s, &G4X2_TAB_DBUF).or(Some(s))
+    }
+
+    /// The double-buffer splices of the one-round text: the build without
+    /// its leading barrier and into table `k & 1`, the products from it, two
+    /// tables in place of 7,680 B of pad, and one barrier publishing `twl`.
+    const G4X2_TAB_DBUF: [(&str, &str); 7] = [
+        (
+            "{\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n    const uint t  = lid >> 6;",
+            "{\n    // No leading barrier: the build writes table k & 1, last read for twiddle k - 2.\n    const uint t  = lid >> 6;",
+        ),
+        (
+            "    threadgroup uint4* dst = &tabB[(t << 8) + u];\n    dst[0u]   = A;\n    dst[64u]",
+            "    threadgroup uint4* dst = &tabB[((k & 1u) << 9) + (t << 8) + u];\n    dst[0u]   = A;\n    dst[64u]",
+        ),
+        (
+            "gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[0], pa, pb);",
+            "gf_mul_byte16_x2(ea[ev], eb[ev], &tabB[(((1u << j) - 1u + c) & 1u) << 9], pa, pb);",
+        ),
+        ("    threadgroup uint4 tabB[512u];", "    threadgroup uint4 tabB[1024u];"),
+        ("    threadgroup uint4 pad[992u];\n", "    threadgroup uint4 pad[480u];\n"),
+        ("pad[lid % 992u] = ea[0];\n            threadgroup_barrier(mem_flags::mem_threadgroup);\n            ea[0] ^= pad[(lid + 1u) % 992u];",
+         "pad[lid % 480u] = ea[0];\n            threadgroup_barrier(mem_flags::mem_threadgroup);\n            ea[0] ^= pad[(lid + 1u) % 480u];"),
+        (
+            "        twl[16u + lid] = g;\n    }\n",
+            "        twl[16u + lid] = g;\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);   // publish twl: the builds have no leading barrier\n",
+        ),
+    ];
+
+    /// Set when the one-round zero-lane pipeline could not be made (compile
+    /// error or fewer than 128 threads): the record's text is used instead.
+    static G4X2_ONE_ROUND_ZL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// `out` (the two-round zero-lane text) in one round: the threads of
+    /// half `it` own columns `(g << 8) + (it << 7) + (lid & 63)` and `+ 64`;
+    /// a half past the block's live columns (only at `s = 8`) loads the
+    /// group's first-half columns and stores nothing.
+    fn g4x2_one_round_zl(out: &str) -> Option<String> {
+        let s = g4x2_one_round_common(out)?;
+        splice_exact(
+            &s,
+            &[
+                (
+                    "    for (uint it = 0; it < 2u; it++) {\n        if ((g << 8) + (it << 7) >= (121u << (P.s - 1u))) { break; }\n",
+                    "    {\n        const uint it = lid >> 6;   // one round: half `it` takes the record's round `it`\n        const bool live = (g << 8) + (it << 7) < (121u << (P.s - 1u));\n        const uint cbase = live ? (g << 8) + (it << 7) : (g << 8);\n",
+                ),
+                (
+                    "            ZL_COL((g << 8) + (it << 7) + lid, pa, la)\n            ZL_COL((g << 8) + (it << 7) + 64u + lid, pb, lb)\n            for (uint e = 0; e < NF; e++) {\n                ea[e]",
+                    "            ZL_COL(cbase + (lid & 63u), pa, la)\n            ZL_COL(cbase + 64u + (lid & 63u), pb, lb)\n            for (uint e = 0; e < NF; e++) {\n                ea[e]",
+                ),
+                (
+                    "        {\n            uint pa, la, pb, lb;\n            ZL_COL((g << 8) + (it << 7) + lid, pa, la)\n            ZL_COL((g << 8) + (it << 7) + 64u + lid, pb, lb)\n            for (uint e = 0; e < NF; e++) {\n                data[",
+                    "        if (live) {\n            uint pa, la, pb, lb;\n            ZL_COL(cbase + (lid & 63u), pa, la)\n            ZL_COL(cbase + 64u + (lid & 63u), pb, lb)\n            for (uint e = 0; e < NF; e++) {\n                data[",
+                ),
+            ],
+        )
+    }
+
+    /// Threads per group for a g4x2-family test pipeline: 128 for a
+    /// one-round kernel (its `max_total_threads_per_threadgroup(128)`
+    /// bound), else the record's 64.
+    #[cfg(test)]
+    pub(crate) unsafe fn g4x2_test_tpg(gpu: &Gpu, pso: Id) -> u64 {
+        let max: u64 = unsafe { send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup") };
+        if max == 128 { 128 } else { 64 }
+    }
+
+    /// Threads per group of the zero-lane g4x2 dispatch.
+    pub(crate) fn g4x2_zl_tpg() -> u64 {
+        if g4x2_zl_one_round_active() { 128 } else { 64 }
+    }
+
+    fn g4x2_zl_one_round_active() -> bool {
+        static SPLICES: OnceLock<bool> = OnceLock::new();
+        super::gpu_g4x2_zl_one_round_enabled()
+            && !G4X2_ONE_ROUND_ZL_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+            && *SPLICES.get_or_init(|| g4x2_zero_lane_two_round_source().as_deref().and_then(g4x2_one_round_zl).is_some())
+    }
+
+    /// The twiddle-prefetch g4x2 source of the dense pipeline (the layers
+    /// 12..15 pass): `NTT_G4X2_TWL_MSL_SOURCE`, with lane-linear table stores
+    /// unless `FLOCK_NO_G4X2_BUILD_LINEAR` is set or the anchor drifted. The
+    /// zero-lane pipeline (layers 4..7 and 8..11) keeps the record's text.
+    /// Made once per process.
+    fn g4x2_twl_source() -> &'static str {
+        static SRC: OnceLock<Option<String>> = OnceLock::new();
+        SRC.get_or_init(|| {
+            if super::gpu_g4x2_build_linear_enabled() {
+                splice_exact(NTT_G4X2_TWL_MSL_SOURCE, &[(G4X2_BUILD_TAIL_RECORD, G4X2_BUILD_TAIL_LINEAR)])
+            } else {
+                None
+            }
+        })
+        .as_deref()
+        .unwrap_or(NTT_G4X2_TWL_MSL_SOURCE)
     }
 
     /// The `NttParams` declaration shared by the g4x2 and final-pass
@@ -6432,6 +6770,18 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// the 7 zero columns of every odd tile are never loaded or stored.
     /// `None` if an anchor drifted (the encoders then keep the dense grid).
     pub(crate) fn g4x2_zero_lane_msl_source() -> Option<String> {
+        let out = g4x2_zero_lane_two_round_source()?;
+        if super::gpu_g4x2_zl_one_round_enabled() && !G4X2_ONE_ROUND_ZL_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(one) = g4x2_one_round_zl(&out) {
+                return Some(one);
+            }
+        }
+        Some(out)
+    }
+
+    /// The record's (two-round) zero-lane text; see
+    /// [`g4x2_zero_lane_msl_source`].
+    fn g4x2_zero_lane_two_round_source() -> Option<String> {
         let base = NTT_G4X2_TWL_MSL_SOURCE;
         // Column c of block B -> (position, lane): tile pair q = c / 121, the
         // pair's first 64 columns are the even tile's lanes, the next 57 the
@@ -7259,7 +7609,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 let p = NttParams { log_d: 20, l: l as u32, f: 4, s: (16 - l) as u32 };
                 let bytes = core::slice::from_raw_parts((&p as *const NttParams).cast::<u8>(), core::mem::size_of::<NttParams>());
                 gpu.set_bytes(enc, bytes, 2);
-                gpu.dispatch(enc, groups, 64);
+                gpu.dispatch(enc, groups, g4x2_test_tpg(gpu, pso));
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb).unwrap();
                 let (s, e) = cb_gpu_interval(gpu, cb);
@@ -7478,7 +7828,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 gpu.set_buffer(enc, data, 0, 0);
                 gpu.set_buffer(enc, tw, 0, 1);
                 set_ntt_params(gpu, enc, NttParams { log_d: 20, l: l as u32, f: 4, s: (16 - l) as u32 }, zt);
-                gpu.dispatch(enc, groups, 64);
+                gpu.dispatch(enc, groups, g4x2_test_tpg(gpu, pso));
                 gpu.end_encoding(enc);
                 gpu.commit_and_wait(cb).unwrap();
                 let (s, e) = cb_gpu_interval(gpu, cb);
@@ -11075,7 +11425,8 @@ kernel void blake3_pow_seg_tail(
                     && super::gpu_zero_lane_enabled()
                     && super::gpu_tw_prefetch_enabled()
                 {
-                    (|| -> Result<Id, String> {
+                    let make = || -> Result<Id, String> {
+                        let need = g4x2_zl_tpg();
                         let text = g4x2_zero_lane_msl_source().ok_or("zero-lane splice anchor drifted")?;
                         let src = api.nsstring(&text)?;
                         let mut err: Id = NIL;
@@ -11113,12 +11464,22 @@ kernel void blake3_pow_seg_tail(
                         }
                         let max_threads: u64 =
                             send!(api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup");
-                        if max_threads < 64 {
+                        if max_threads < need {
                             send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
                             return Err(format!("zero-lane g4x2 pipeline allows {max_threads} threads"));
                         }
                         Ok(pso)
-                    })()
+                    };
+                    match make() {
+                        Err(e) if g4x2_zl_tpg() == 128 => {
+                            if debug_enabled() {
+                                eprintln!("[gpu-commit] one-round zero-lane g4x2: {e}; keeping two rounds");
+                            }
+                            G4X2_ONE_ROUND_ZL_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                            make()
+                        }
+                        r => r,
+                    }
                     .unwrap_or_else(|e| {
                         if debug_enabled() {
                             eprintln!("[gpu-commit] {e}; keeping the dense g4x2 grid");
@@ -12202,10 +12563,10 @@ kernel void blake3_pow_seg_tail(
                         if debug_enabled() {
                             eprintln!("[gpu-commit] zero-lane g4x2 pass l={l} s={s}");
                         }
-                        (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
+                        (gpu.pso_ntt4g4x2_zl, g4x2_zl_tpg(), (1u64 << l) * super::zero_lane_groups_per_block(s))
                     }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
-                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                        (gpu.pso_ntt4g4x2, 64, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
@@ -12278,10 +12639,10 @@ kernel void blake3_pow_seg_tail(
                         if debug_enabled() {
                             eprintln!("[gpu-commit] zero-lane g4x2 pass l={l} s={s}");
                         }
-                        (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
+                        (gpu.pso_ntt4g4x2_zl, g4x2_zl_tpg(), (1u64 << l) * super::zero_lane_groups_per_block(s))
                     }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
-                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                        (gpu.pso_ntt4g4x2, 64, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
@@ -12361,10 +12722,10 @@ kernel void blake3_pow_seg_tail(
                         if debug_enabled() {
                             eprintln!("[gpu-commit] zero-lane g4x2 pass l={l} s={s}");
                         }
-                        (gpu.pso_ntt4g4x2_zl, 64u64, (1u64 << l) * super::zero_lane_groups_per_block(s))
+                        (gpu.pso_ntt4g4x2_zl, g4x2_zl_tpg(), (1u64 << l) * super::zero_lane_groups_per_block(s))
                     }
                     4 if share_log > 0 && s > share_log && !gpu.pso_ntt4g4x2.is_null() => {
-                        (gpu.pso_ntt4g4x2, 64u64, 1u64 << (log_d - f - share_log))
+                        (gpu.pso_ntt4g4x2, 64, 1u64 << (log_d - f - share_log))
                     }
                     4 if share_log > 0 && s >= share_log => {
                         (gpu.pso_ntt4g4, 64u64, 1u64 << (log_d - f - share_log))
@@ -14417,6 +14778,7 @@ kernel void blake3_pow_seg_tail(
         n_leaves: usize,
         suffix_start: usize,
         force: usize,
+        after_ab: bool,
     ) -> Result<(), String> {
         let unit_levels = tail_unit_levels();
         let unit = 1usize << unit_levels;
@@ -14458,6 +14820,24 @@ kernel void blake3_pow_seg_tail(
         // Working coordinator (`super::ENV_NO_TAILHASH_COORD_WORK`): this
         // thread hashes units too, and every claimer checks cb2 first.
         let coord_work = super::tailhash_coord_work_enabled();
+        // Late tail hash (`super::ENV_NO_LATE_TAIL_HASH`): cb3 is queued over
+        // every unit while the AB arm still runs. This thread keeps helping
+        // the AB queue (as the whole-suffix cb3 path does) until the arm has
+        // returned or cb2 has completed; the claims below run only in the
+        // first case. With no claim, cb3 reads the full count written above.
+        let sig2_late = sig2.as_ref();
+        let cb2_done_late = || unsafe { gpu.cb_done(cb2_u as Id, sig2_late) };
+        let t_late = std::time::Instant::now();
+        let run_claims = if after_ab {
+            while !super::ab_arm_done() && !cb2_done_late() {
+                super::help_pool_until(|| super::ab_arm_done() || cb2_done_late());
+                std::thread::yield_now();
+            }
+            super::ab_arm_done() && !cb2_done_late()
+        } else {
+            true
+        };
+        let late_wait_ms = t_late.elapsed().as_secs_f64() * 1e3;
         let t_tail = std::time::Instant::now();
         let mut h = n_leaves;
         // Claim one unit: lower cb3's count first, then hash it.
@@ -14479,6 +14859,7 @@ kernel void blake3_pow_seg_tail(
         // cb2's completion as the caller reads it: its armed signal when
         // present (`super::ENV_NO_CB2_DONE_SIGNAL`), else the status.
         let sig2_ref = sig2.as_ref();
+        if run_claims {
         rayon::scope(|sc| {
             for _ in 0..rayon::current_num_threads() {
                 let claims = &claims;
@@ -14545,6 +14926,12 @@ kernel void blake3_pow_seg_tail(
                 }
             }
         });
+        } else {
+            // cb2 completed before the AB arm returned: keep helping the AB
+            // queue while cb3 runs, as the whole-suffix cb3 path does.
+            let sig3_ref = sig3.as_ref();
+            super::help_pool_until(|| unsafe { gpu.cb_done(cb3, sig3_ref) });
+        }
         let tail_ms = t_tail.elapsed().as_secs_f64() * 1e3;
         crate::tmark::mark("tail hash workers done");
         if sig2.is_some() && !window_trace_enabled() {
@@ -14611,6 +14998,14 @@ kernel void blake3_pow_seg_tail(
             ls = ws;
             ll /= 2;
             lo = wlo;
+        }
+        if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            eprintln!(
+                "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
+                 suffix units in {tail_ms:.2} ms",
+                if run_claims { "AB arm returned with cb2 running" } else { "cb2 completed first" },
+                (n_leaves - h) / unit,
+            );
         }
         Ok(())
     }
@@ -14767,7 +15162,17 @@ kernel void blake3_pow_seg_tail(
                             super::help_pool_until(|| super::ab_arm_done() || gpu.cb_done(cb2, sig2.as_ref()));
                             !gpu.cb_done(cb2, sig2.as_ref())
                         });
-                    if tail {
+                    // Late tail hash (see `super::ENV_NO_LATE_TAIL_HASH`): the
+                    // AB arm still runs and cb2 too, so cb3 is queued now in
+                    // the tail hash's form and the CPU claims units only if
+                    // the AB arm returns before cb2 completes.
+                    let late = ab_busy
+                        && tail_force == 0
+                        && !hybrid_arm_recording()
+                        && super::hybrid_cpu_tail_hash_enabled()
+                        && super::late_tail_hash_enabled()
+                        && !gpu.cb_done(cb2, sig2.as_ref());
+                    if tail || late {
                         hybrid_cpu_tail_hash_join(
                             gpu,
                             cb2,
@@ -14778,6 +15183,7 @@ kernel void blake3_pow_seg_tail(
                             n_leaves,
                             suffix_leaf_start,
                             tail_force,
+                            late,
                         )?;
                     } else {
                     let cb3 = gpu.command_buffer()?;
@@ -20412,13 +20818,17 @@ kernel void zc_eq_rows(
                 return Err("GPU eq rows failed".to_string());
             }
             assert_eq!(dst.len(), self.k);
+            // Live-column reduce (`ENV_NO_FOLD_LIVE_REDUCE`): the reduce
+            // wrote the dispatched groups' lanes only; add exactly those.
+            let lanes = zc_fold_reduce_lanes(&self.plan);
+            let dst = &mut dst[..lanes];
             // SAFETY: the command buffer completed, so the shared-storage
-            // result is visible to the CPU; `out_buf` holds exactly `k`
+            // result is visible to the CPU; `out_buf` holds `k >= lanes`
             // 16-byte lanes and is not aliased by `dst`.
             let src = unsafe {
                 std::slice::from_raw_parts(
                     gpu.buffer_contents(out_buf).cast::<F128>().cast_const(),
-                    self.k,
+                    lanes,
                 )
             };
             if super::fold_serial_xor_enabled() {
@@ -20441,10 +20851,13 @@ kernel void zc_eq_rows(
             if self.arm.debug() {
                 eprintln!(
                     "{} prefix {}/{} claims: gpu={gpu_ms:.2}ms submit-to-drain={wall_ms:.2}ms \
-                     head={head_ms:.2}ms cpu-suffix={suffix_ms:.2}ms",
+                     head={head_ms:.2}ms cpu-suffix={suffix_ms:.2}ms reduce-lanes={lanes}/{} \
+                     gather-groups={}",
                     self.arm.tag(),
                     self.claim_lo,
                     self.n_claims,
+                    self.k,
+                    self.plan.i_groups,
                 );
             }
             if self.arm == FoldArm::Zc {
@@ -21157,6 +21570,18 @@ kernel void zc_eq_rows(
         i_groups: usize,
     }
 
+    /// Output lanes the reduce writes and the drain adds: the dispatched
+    /// column groups' lanes with the live-column reduce on
+    /// ([`super::ENV_NO_FOLD_LIVE_REDUCE`]), else all `k`. A multiple of
+    /// [`ZC_FOLD_TG`] either way (`k` and the group width are).
+    fn zc_fold_reduce_lanes(plan: &ZcFoldPlan) -> usize {
+        if super::fold_live_reduce_enabled() {
+            (plan.i_groups * ZC_FOLD_COLS_PER_TG).min(plan.k)
+        } else {
+            plan.k
+        }
+    }
+
     unsafe fn zc_fold_submit(gpu: &Gpu, state: &ZcFold, plan: &ZcFoldPlan) -> Result<Id, String> {
         unsafe { zc_fold_submit_sig(gpu, state, plan, false).map(|(cb, _)| cb) }
     }
@@ -21233,7 +21658,10 @@ kernel void zc_eq_rows(
             gpu.set_buffer(enc, state.part_buf, 0, 0);
             gpu.set_buffer(enc, state.out_buf, 0, 1);
             gpu.set_bytes(enc, reduce_bytes, 2);
-            gpu.dispatch(enc, (plan.k / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
+            // Live-column reduce (`ENV_NO_FOLD_LIVE_REDUCE`): the lanes of
+            // the dispatched column groups only; the partial row stride
+            // stays `k` (`reduce_params`).
+            gpu.dispatch(enc, (zc_fold_reduce_lanes(plan) / ZC_FOLD_TG) as u64, ZC_FOLD_TG as u64);
             gpu.end_encoding(enc);
             let sig = if arm_sig { gpu.arm_done(cb) } else { None };
             let cb_eq = cb_eq.map(|c| {
