@@ -7872,7 +7872,13 @@ fn fold_tri_and_message_core<
         // Group `y` (32 logical inputs): packed, block `y / 2` of superblock
         // `y / 8`, first half from its main entries, second half through the
         // tail with the block's output-60 entry.
-        let fold_group = |ip: *const F128, y: usize| -> [uint64x2_t; 8] {
+        // The group fold as a macro so the sequential route below can inline
+        // it (the closure is compiled out of line: two calls per group, each
+        // re-splatting the fold constants and returning rows through memory).
+        macro_rules! fold_group_m {
+            ($ip:expr, $y:expr, $rho:expr) => {{
+                let (ip, y): (*const F128, usize) = ($ip, $y);
+                let rho: &Fold4RhoQ = $rho;
             if PACK {
                 let (blk, w) = (y / 2, (y / 2) % PACK_BLOCKS);
                 let sup = ip.add(PACK_SUPER * (blk / PACK_BLOCKS));
@@ -7885,6 +7891,20 @@ fn fold_tri_and_message_core<
             } else {
                 fold_eight::<DEPTH, false>(ip.add((8 * y) << DEPTH), &rho, rc, rc_sw, &pp)
             }
+            }};
+        }
+        let fold_group = |ip: *const F128, y: usize| -> [uint64x2_t; 8] { fold_group_m!(ip, y, &rho) };
+        let tri_seq = ABL == 0 && !SL && tri_fold_seq_enabled();
+        // The sequential route's copy of the fold constants, opaque so they
+        // live in vector registers (or spill as vectors) instead of being
+        // rebuilt from general-register halves with `FMOV`/`DUP` per use.
+        let rho_v = Fold4RhoQ {
+            a: opaque_q(rho.a),
+            a_sw: opaque_q(rho.a_sw),
+            b: opaque_q(rho.b),
+            b_sw: opaque_q(rho.b_sw),
+            ab: opaque_q(rho.ab),
+            ab_sw: opaque_q(rho.ab_sw),
         };
         // `INL`: the same group fold as `fold_group`, as an always-inlined
         // function, so its eight vectors stay in registers at the call site
@@ -7978,6 +7998,36 @@ fn fold_tri_and_message_core<
             }
         }
 
+        // Two groups per trip through each accumulation pass: the fused
+        // PMULL+EOR writes a fresh register, so with one group per trip
+        // every accumulator needs a loop-carried `MOV` back; with two the
+        // second group's result can land in the first one's input register.
+        let tri_unroll = tri_pass_unroll_enabled();
+        macro_rules! pass_loop {
+            ($t:ident, $gn:expr, $body:block) => {
+                let gn: usize = $gn;
+                if tri_unroll {
+                    let mut tt = 0usize;
+                    while tt + 2 <= gn {
+                        {
+                            let $t = tt;
+                            $body
+                        }
+                        {
+                            let $t = tt + 1;
+                            $body
+                        }
+                        tt += 2;
+                    }
+                    if tt < gn {
+                        let $t = tt;
+                        $body
+                    }
+                } else {
+                    for $t in 0..gn $body
+                }
+            };
+        }
         const TG: usize = 16;
         let ng = n_out / 8;
         let mut ta = [[zero; 8]; TG];
@@ -7985,7 +8035,29 @@ fn fold_tri_and_message_core<
         let mut g0 = 0usize;
         while g0 < ng {
             let gn = (ng - g0).min(TG);
-            for t in 0..gn {
+            if tri_seq {
+                // One side at a time: fold a, store it, weight it; then fold
+                // b, store it. Only one side's eight rows are live, so the
+                // fold constants stay in registers across groups.
+                for t in 0..gn {
+                    let y = g0 + t;
+                    let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
+                    let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
+                    let a = fold_group_m!(a_ip, y, &rho_v);
+                    for h in 0..4 {
+                        store_pair::<NT>(a_op.add(8 * y + 2 * h), a[2 * h], a[2 * h + 1]);
+                    }
+                    for i in 0..8 {
+                        ta[t][i] = mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]);
+                    }
+                    let b = fold_group_m!(b_ip, y, &rho_v);
+                    for h in 0..4 {
+                        store_pair::<NT>(b_op.add(8 * y + 2 * h), b[2 * h], b[2 * h + 1]);
+                    }
+                    tb[t] = b;
+                }
+            }
+            for t in 0..if tri_seq { 0 } else { gn } {
                 let y = g0 + t;
                 let (a, b) = if INL {
                     (
@@ -8039,7 +8111,7 @@ fn fold_tri_and_message_core<
             }
             {
                 let mut e = [acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]];
-                for t in 0..gn {
+                pass_loop!(t, gn, {
                     let (aw, b) = (&ta[t], &tb[t]);
                     for j in 0..4 {
                         tri_acc_q(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
@@ -8049,14 +8121,14 @@ fn fold_tri_and_message_core<
                             veorq_u64(b[2 * j], b[2 * j + 1]),
                         );
                     }
-                }
+                });
                 acc[..8].copy_from_slice(&e);
             }
             {
                 let mut l = [
                     acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
                 ];
-                for t in 0..gn {
+                pass_loop!(t, gn, {
                     let (aw, b) = (&ta[t], &tb[t]);
                     for k in 0..2 {
                         let o = 4 * k;
@@ -8068,12 +8140,12 @@ fn fold_tri_and_message_core<
                         tri_acc_q(&mut l[4 + k], oa, ob);
                         tri_acc_q(&mut l[6 + k], veorq_u64(ea, oa), veorq_u64(eb, ob));
                     }
-                }
+                });
                 acc[8..16].copy_from_slice(&l);
             }
             {
                 let mut g = [acc[16], acc[17], acc[18], acc[20], acc[21]];
-                for t in 0..gn {
+                pass_loop!(t, gn, {
                     let (aw, b) = (&ta[t], &tb[t]);
                     tri_acc_q(&mut g[0], aw[4], b[4]);
                     let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
@@ -8084,7 +8156,7 @@ fn fold_tri_and_message_core<
                     tri_acc_q(&mut g[2], s2a, s2b);
                     tri_acc_q(&mut g[3], s1a, s1b);
                     tri_acc_q(&mut g[4], s3a, s3b);
-                }
+                });
                 acc[16] = g[0];
                 acc[17] = g[1];
                 acc[18] = g[2];
@@ -8093,7 +8165,7 @@ fn fold_tri_and_message_core<
             }
             {
                 let mut g = [acc[19], acc[22], acc[23], acc[24], acc[25]];
-                for t in 0..gn {
+                pass_loop!(t, gn, {
                     let (aw, b) = (&ta[t], &tb[t]);
                     let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
                     let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
@@ -8108,7 +8180,7 @@ fn fold_tri_and_message_core<
                     tri_acc_q(&mut g[2], s01a, s01b);
                     tri_acc_q(&mut g[3], s23a, s23b);
                     tri_acc_q(&mut g[4], veorq_u64(s01a, s23a), veorq_u64(s01b, s23b));
-                }
+                });
                 acc[19] = g[0];
                 acc[22] = g[1];
                 acc[23] = g[2];
@@ -11812,4 +11884,31 @@ impl ProdAcc {
     pub(crate) fn reduce(self) -> F128 {
         self.0.reduce()
     }
+}
+
+/// Kill switch for the two-group trips of the tri passes' accumulation
+/// loops (`FLOCK_NO_TRI_UNROLL2`, any value). Same products, same XORs, same bytes.
+#[cfg(target_arch = "aarch64")]
+fn tri_pass_unroll_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TRI_UNROLL2").is_none())
+}
+
+/// Kill switch for the one-side-at-a-time inlined group fold of the tri
+/// passes (`FLOCK_NO_TRI_FOLD_SEQ`, any value). Same values, same bytes.
+#[cfg(target_arch = "aarch64")]
+fn tri_fold_seq_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TRI_FOLD_SEQ").is_none())
+}
+
+/// The value of `v`, hidden from the optimiser so a constant stays in its register.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn opaque_q(v: core::arch::aarch64::uint64x2_t) -> core::arch::aarch64::uint64x2_t {
+    let mut v = v;
+    unsafe {
+        core::arch::asm!("/* {v:v} */", v = inout(vreg) v, options(pure, nomem, nostack, preserves_flags));
+    }
+    v
 }
