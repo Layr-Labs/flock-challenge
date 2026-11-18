@@ -585,6 +585,10 @@ impl ZcT0Job {
         }
     }
 
+    pub(crate) fn outputs(&self) -> (*const F128, *const F128) {
+        (self.out_a, self.out_b)
+    }
+
     /// Block until the whole buffer has run (oracle). `false` = it failed;
     /// the arm is then off for the process.
     pub(crate) fn wait_all(&self) -> bool {

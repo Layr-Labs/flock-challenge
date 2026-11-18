@@ -20,6 +20,12 @@ mod r2cs_fast {
         )
     }
 
+    pub(super) fn fast2_selected() -> bool {
+        std::env::var_os("FLOCK_NO_R2CS_FAST").as_deref() != Some(OsStr::new("1"))
+            && std::env::var_os("FLOCK_NO_R2CS_FAST2").as_deref() != Some(OsStr::new("1"))
+            && KERNEL.contains(ENTRY)
+    }
+
     pub(super) fn source_for(original: &'static str, control: Option<&OsStr>, control2: Option<&OsStr>) -> Cow<'static, str> {
         if control == Some(OsStr::new("1")) {
             return Cow::Borrowed(original);

@@ -132,6 +132,11 @@ fn cascade4_off() -> bool {
 pub(crate) static ZC_CASCADE5_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+fn tri_lookahead_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TRI_LOOKAHEAD_REUSE").is_none_or(|v| v != *"1"))
+}
+
 /// `FLOCK_NO_ZC_CASCADE5=1` restores the cascade4 i=8/i=9 tail route for an
 /// exact same-binary A/B. Production defaults to the fifth cascade.
 #[inline]
@@ -565,6 +570,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
+    crate::zerocheck::univariate_skip_optimized::r2_c_capture_clear();
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
         assert!(
             capture_s_hat_v_c,
@@ -1124,6 +1130,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                 mlv_rhos.push(challenger.sample_f128());
                 let mut pending = Some((la7, la8));
                 let (mut cur_a, mut cur_b) = (a2_out, b2_out);
+                let mut t0_prefix: Option<multilinear::KGpuPrefix> = None;
                 for step in 0..tri_steps {
                     let (la, la2) = pending.take().expect("tri chain carries its lookaheads");
                     let k = mlv_rhos.len();
@@ -1150,10 +1157,13 @@ fn prove_packed_padded_inner<C: Challenger>(
                     // ~1.3 ms before the lincheck GPU prefix: wake the idle
                     // GPU (see `gpu_commit::ENV_NO_LC_GPU_WAKE`).
                     crate::gpu_commit::lc_gpu_wake_fire(step as u32);
-                    let (e1, einf, la, la2) = match t56_prefix.as_ref().filter(|_| step == 0) {
-                        // SAFETY: the prefix buffers are rewritten only by
-                        // the next 5+6 GPU launch.
-                        Some(p) => multilinear::fold_cascade_t_into_packed_prefix(
+                    let carried_in = match step {
+                        0 => t56_prefix.as_ref(),
+                        1 => t0_prefix.as_ref(),
+                        _ => None,
+                    };
+                    let (e1, einf, la, la2, carried_out) = match carried_in {
+                        Some(p) => multilinear::fold_cascade_t_into_packed_prefix_gpu(
                             &cur_a,
                             &cur_b,
                             false,
@@ -1163,16 +1173,25 @@ fn prove_packed_padded_inner<C: Challenger>(
                             &mut nb,
                             &mlv_rhos[k - 3..k],
                             &r_nx,
+                            false,
                         ),
-                        None => multilinear::fold_cascade_t_into(
-                            &cur_a,
-                            &cur_b,
-                            &mut na,
-                            &mut nb,
-                            &mlv_rhos[k - 3..k],
-                            &r_nx,
-                        ),
+                        None => {
+                            let (e1, einf, la, la2) = multilinear::fold_cascade_t_into(
+                                &cur_a,
+                                &cur_b,
+                                &mut na,
+                                &mut nb,
+                                &mlv_rhos[k - 3..k],
+                                &r_nx,
+                            );
+                            (e1, einf, la, la2, None)
+                        }
                     };
+                    if step == 0 {
+                        t0_prefix = carried_out;
+                    } else {
+                        assert!(carried_out.is_none(), "only tri pass 0 carries a prefix");
+                    }
                     if tail_round_timing {
                         eprintln!(
                             "[zc-tail-rounds] tri pass {step} (out n={out_n}): {:.2} ms",
@@ -1189,8 +1208,47 @@ fn prove_packed_padded_inner<C: Challenger>(
                     cur_a = na;
                     cur_b = nb;
                 }
+                if tri_steps == 1 {
+                    if let Some(p) = t0_prefix.take() {
+                        let (pa, pb) = unsafe { p.slices() };
+                        cur_a[..pa.len()].copy_from_slice(pa);
+                        cur_b[..pb.len()].copy_from_slice(pb);
+                    }
+                }
                 crate::gpu_commit::lc_gpu_wake_fire(99);
-                let loop_start = mlv_rhos.len() - 1;
+                let mut loop_start = mlv_rhos.len() - 1;
+                if let Some((la, la2)) = pending.take().filter(|_| {
+                    tri_steps > 0
+                        && tri_lookahead_reuse_enabled()
+                        && loop_start + 2 <= n_mlv - 1
+                        && cur_a.len() >= 8
+                }) {
+                    let t_s = std::time::Instant::now();
+                    let n_in = cur_a.len();
+                    let k = mlv_rhos.len();
+                    let (n1, ninf) = eval_round3_lookahead(&la, mlv_rhos[k - 1]);
+                    multilinear_msgs.push((n1, ninf));
+                    challenger.observe_f128(n1);
+                    challenger.observe_f128(ninf);
+                    mlv_rhos.push(challenger.sample_f128());
+                    let (n1, ninf) = multilinear::eval_lookahead2(&la2, mlv_rhos[k - 1], mlv_rhos[k]);
+                    multilinear_msgs.push((n1, ninf));
+                    challenger.observe_f128(n1);
+                    challenger.observe_f128(ninf);
+                    mlv_rhos.push(challenger.sample_f128());
+                    fold_in_place_pair(&mut cur_a, &mut cur_b, mlv_rhos[k - 1]);
+                    fold_in_place_pair(&mut cur_a, &mut cur_b, mlv_rhos[k]);
+                    loop_start += 2;
+                    if tail_round_timing {
+                        eprintln!(
+                            "[zc-tail-rounds] tri lookahead reuse (rounds of loop i={}, {}; binds n={n_in}->{}): {:.3} ms",
+                            loop_start - 2,
+                            loop_start - 1,
+                            cur_a.len(),
+                            t_s.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                }
                 (cur_a, cur_b, loop_start)
             } else if use_cascade3 {
                 // Level three: the composed 5+6 pass additionally carries the
@@ -1508,7 +1566,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         mlv_rhos.push(challenger.sample_f128());
         if tail_round_timing {
             eprintln!(
-                "[zc-tail-rounds] loop i={i} (log_n {log_n_before}): {:.2} ms",
+                "[zc-tail-rounds] loop i={i} (log_n {log_n_before}): {:.3} ms",
                 t_round_i.elapsed().as_secs_f64() * 1e3
             );
         }

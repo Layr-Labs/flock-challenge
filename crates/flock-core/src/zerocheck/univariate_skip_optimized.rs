@@ -4845,6 +4845,39 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     (round1_c_opt, s_hat_v_c, quad, fold4, recovered_ab)
 }
 
+/// per process.
+///
+pub const ENV_NO_R2_C_CAPTURE: &str = "FLOCK_NO_R2_C_CAPTURE";
+
+pub(crate) fn r2_c_capture_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_R2_C_CAPTURE).is_none());
+    *ON
+}
+
+pub(crate) const R2_C_CAPTURE_ROWS: [usize; 15] = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 237, 238, 239];
+
+static R2_C_CAPTURE: std::sync::Mutex<Option<Vec<F128>>> = std::sync::Mutex::new(None);
+
+pub(crate) fn r2_c_capture_clear() {
+    *R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+pub(crate) fn r2_c_capture_take() -> Option<Vec<F128>> {
+    R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+fn r2_c_capture_store(c_inner: &[F128]) {
+    if c_inner.len() < 240 * ELL {
+        return;
+    }
+    let mut rows = Vec::with_capacity(R2_C_CAPTURE_ROWS.len() * ELL);
+    for t in R2_C_CAPTURE_ROWS {
+        rows.extend_from_slice(&c_inner[ELL * t..ELL * (t + 1)]);
+    }
+    *R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(rows);
+}
+
 /// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
 /// stripe fold, but six inner coordinates are retained (64 banks) for the
 /// direct-fold8 PCS consumer. The wire outputs (`round1_c_opt`, canonical
@@ -4874,6 +4907,9 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    if r2_c_capture_enabled() && recover_identity_prefix && recover_output_window && m == 32 {
+        r2_c_capture_store(&c_inner);
+    }
     let recovered_ab = recover_identity_prefix.then(|| {
         let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table);
         if recover_output_window {

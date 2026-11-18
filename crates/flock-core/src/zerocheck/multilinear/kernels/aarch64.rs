@@ -2977,6 +2977,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
     degen: bool,
     tail_compact: bool,
     head_fail: *const core::sync::atomic::AtomicBool,
+    skip_pure: bool,
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
@@ -2984,6 +2985,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
     unsafe {
         let (anchors0, deltas0) = (anchors, deltas);
         let head = !head_fail.is_null();
+        assert!(!skip_pure || (head && degen));
         assert!(!head || tail_compact);
         assert!(lo_size.is_multiple_of(128));
         let head_inline = head && r2_head_inline_enabled();
@@ -3124,6 +3126,34 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 // The walk's own order, two groups (`t = 0`, `t = 1` of one
                 // `b`) per trip.
                 for trip in 0..trips {
+                    if skip_pure && ((win == 0 && trip < HC_HEAD_PAIRS / 4) || (win == 1 && trip == 13)) {
+                        if win == 0 {
+                            for i in 0..2usize {
+                                let g = 2 * trip + i;
+                                head_ok &= r2_head_group_store_even::<F7>(
+                                    table_data,
+                                    pa.wrapping_add(32 * i),
+                                    pb.wrapping_add(32 * i),
+                                    anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * g),
+                                    deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * g),
+                                    nt_deltas,
+                                );
+                            }
+                        } else {
+                            let (rows0, rows1) = fold_group!(trip, 0, 0, 16, 0, 32);
+                            products!(rows0, rows1, false, |v| mul_xb_q(v, xb, k87));
+                            head_ok &= r2_group_store_even_off::<F7, 32, 48, 64, 96>(
+                                table_data, pa, pb, pn, pd, b_ones, nt_deltas,
+                            );
+                        }
+                        xb = vshlq_n_u64::<1>(xb);
+                        pr = pr.wrapping_add(2);
+                        pa = pa.wrapping_add(64);
+                        pb = pb.wrapping_add(64);
+                        pn = pn.wrapping_add(8);
+                        pd = pd.wrapping_add(64);
+                        continue;
+                    }
                     let (rows0, rows1) = fold_group!(trip, 0, 0, 16, 0, 32);
                     products!(rows0, rows1, false, |v| mul_xb_q(v, xb, k87));
                     let (rows0, rows1) = fold_group!(trip, 1, 32, 48, 64, 96);
@@ -3202,18 +3232,19 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb(
     degen: bool,
     tail_compact: bool,
     head_fail: *const core::sync::atomic::AtomicBool,
+    skip_pure: bool,
     out: *mut F128,
 ) {
     unsafe {
         if table7.is_null() {
             fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false>(
                 table_data, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
-                head_fail, out,
+                head_fail, skip_pure, out,
             )
         } else {
             fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true>(
                 table7, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
-                head_fail, out,
+                head_fail, skip_pure, out,
             )
         }
     }
@@ -6268,6 +6299,82 @@ unsafe fn r2_head_group_fold_and_store_inline<const F7: bool>(
             store_delta_pair_gpr(head_d, a00, a01, a10, a11);
         }
         (r0, r1, ones0 & ones1)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn r2_head_group_store_even<const F7: bool>(
+    table_data: *const u8,
+    a_row: *const u8,
+    b_row: *const u8,
+    head_a: *mut F128,
+    head_d: *mut u8,
+    nt_deltas: bool,
+) -> bool {
+    unsafe {
+        let code = |p: *const u8, off: usize| u64::from_le(core::ptr::read_unaligned(p.add(off).cast::<u64>()));
+        let (a00, a01, a10, a11) = (code(a_row, 0), code(a_row, 8), code(a_row, 16), code(a_row, 24));
+        let ones = (code(b_row, 0) & code(b_row, 8) & code(b_row, 16) & code(b_row, 24)) == u64::MAX;
+        let (e0, e1) = fold_two_rows_g::<F7>(table_data, a00, a10);
+        core::arch::asm!(
+            "stnp {a:q}, {b:q}, [{dst}]",
+            dst = in(reg) head_a,
+            a = in(vreg) e0,
+            b = in(vreg) e1,
+            options(nostack, preserves_flags),
+        );
+        if nt_deltas {
+            store_delta_pair_gpr_nt(head_d, a00, a01, a10, a11);
+        } else {
+            store_delta_pair_gpr(head_d, a00, a01, a10, a11);
+        }
+        ones
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn r2_group_store_even_off<
+    const F7: bool,
+    const C0: usize,
+    const C1: usize,
+    const N0: usize,
+    const N1: usize,
+>(
+    table_data: *const u8,
+    a_row: *const u8,
+    b_row: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    b_ones: core::arch::aarch64::uint64x2_t,
+    nt_deltas: bool,
+) -> bool {
+    unsafe {
+        let code = |p: *const u8, off: usize| u64::from_le(core::ptr::read_unaligned(p.add(off).cast::<u64>()));
+        let (a0, a1, a2, a3) = (code(a_row, C0), code(a_row, C0 + 8), code(a_row, C1), code(a_row, C1 + 8));
+        let ones =
+            (code(b_row, C0) & code(b_row, C0 + 8) & code(b_row, C1) & code(b_row, C1 + 8)) == u64::MAX;
+        if !ones {
+            r2_pair_fold_and_store_off::<F7, C0, N0>(table_data, a_row, b_row, anchors, deltas, true, b_ones, nt_deltas);
+            r2_pair_fold_and_store_off::<F7, C1, N1>(table_data, a_row, b_row, anchors, deltas, true, b_ones, nt_deltas);
+            return false;
+        }
+        let (e0, e2) = fold_two_rows_g::<F7>(table_data, a0, a2);
+        store_anchor_pair_nt_off::<N0>(anchors, e0, b_ones);
+        if nt_deltas {
+            store_delta_a_only_gpr_nt_off::<C0>(deltas, a0, a1);
+        } else {
+            store_delta_a_only_gpr_off::<C0>(deltas, a0, a1);
+        }
+        store_anchor_pair_nt_off::<N1>(anchors, e2, b_ones);
+        if nt_deltas {
+            store_delta_a_only_gpr_nt_off::<C1>(deltas, a2, a3);
+        } else {
+            store_delta_a_only_gpr_off::<C1>(deltas, a2, a3);
+        }
+        true
     }
 }
 
@@ -9976,6 +10083,7 @@ mod tests {
                                         degen,
                                         tail,
                                         hf,
+                                        false,
                                         out.as_mut_ptr(),
                                     );
                                 } else {

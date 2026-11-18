@@ -82,6 +82,18 @@ kernel void zc_r2_products_horner_cs(
         // pair of the group is live, else 0: no products. A group with only
         // padded pairs adds nothing (only the four Horner shifts run).
         if (simd_all(pad || (c_one && ((br.x & br.z) & (br.y & br.w)) == 0xffffffffu))) {
+            uint pib = pair_idx & 127u;
+            if (cl.pad0 != 0u && (pib < 8u || pib == 118u || pib == 119u)) {
+                if (!pad) {
+                    a0 = zc_r2_fold<ZC_R2_PL>(ar.x, ar.y, nib);
+                    zc_r2_cs_store(pair_idx, ar, br, a0, uint4(1u, 0u, 0u, 0u), cs_anchors, cs_deltas, cl);
+                }
+                zc_r2_cs_horner_shift(h1);
+                zc_r2_cs_horner_shift(hi);
+                zc_r2_cs_horner_shift(wa);
+                zc_r2_cs_horner_shift(wb);
+                continue;
+            }
             if (!pad) {
                 a0 = zc_r2_fold<ZC_R2_PL>(ar.x, ar.y, nib);
                 a1 = zc_r2_fold<ZC_R2_PL>(ar.z, ar.w, nib);
@@ -115,6 +127,10 @@ kernel void zc_r2_products_horner_cs(
             // Head-compacted state: a head pair's b rows must be all ones.
             if (cl.hc != 0u && (pair_idx & 127u) < 8u) {
                 head_bad = head_bad || ((br.x & br.z) & (br.y & br.w)) != 0xffffffffu;
+            }
+            if (cl.pad0 != 0u) {
+                uint pib = pair_idx & 127u;
+                head_bad = head_bad || pib < 8u || pib == 118u || pib == 119u;
             }
         }
         // Four passes through one product body; pass k takes the
