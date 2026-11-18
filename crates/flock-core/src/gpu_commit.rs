@@ -3925,6 +3925,50 @@ pub(crate) fn tailhash_coord_work_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the CPU tail-hash reserve
+/// (`FLOCK_NO_TAIL_HASH_RESERVE_LATE=1`, exact `1`: cb3's count follows the
+/// claims down to the lowest claim and the claims stop at cb2's end, as
+/// before). With it on (and the working coordinator on), each claim
+/// publishes cb3's indirect count `reserve` units below the unclaimed top,
+/// so the topmost unclaimed units are not offered to cb3; at cb2's end the
+/// count stops moving and the claimers keep hashing down to the last count
+/// they published (the floor) while cb3 hashes the units below it.
+///
+/// Compatible with the late tail hash (`ENV_NO_LATE_TAIL_HASH`): the count
+/// is never raised, and only a claim lowers it below the full count. In the
+/// late form cb3 is committed with the full count as before, so when cb2
+/// completes before the AB arm returns (no claim at all) cb3 hashes every
+/// unit; when the claims run, the floor is the last count a claim actually
+/// published (the full count if none did), never a count cb3 was not shown.
+/// In the eager form the reserved count is written before cb3's commit.
+/// Every unit is hashed by at least one side (cb3 read a count no lower than
+/// the floor; the CPU hashes every unit from the top down to the floor), a
+/// unit hashed by both is the same bytes into the same slots, so the root is
+/// unchanged. No new wait: the claim lock, the claim loop and the cb2 check
+/// are the existing ones. `FLOCK_TAIL_HASH_RESERVE_PCT=<n>` sets the reserve
+/// as a percentage of the suffix's units (clamped to 0..=50, default
+/// [`TAIL_HASH_RESERVE_PCT_DEFAULT`]). Read once per process.
+pub const ENV_NO_TAIL_HASH_RESERVE_LATE: &str = "FLOCK_NO_TAIL_HASH_RESERVE_LATE";
+pub const ENV_TAIL_HASH_RESERVE_PCT: &str = "FLOCK_TAIL_HASH_RESERVE_PCT";
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+const TAIL_HASH_RESERVE_PCT_DEFAULT: usize = 10;
+
+/// The reserve's percentage of the suffix's units: 0 with the kill switch
+/// set, else [`ENV_TAIL_HASH_RESERVE_PCT`] (clamped to 0..=50) or the default.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tail_hash_reserve_pct() -> usize {
+    static PCT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if env_is_one(ENV_NO_TAIL_HASH_RESERVE_LATE) {
+            return 0;
+        }
+        std::env::var(ENV_TAIL_HASH_RESERVE_PCT)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(TAIL_HASH_RESERVE_PCT_DEFAULT, |v| v.min(50))
+    });
+    *PCT
+}
+
 /// Test hook of the CPU tail hash: 1,024-leaf units the CPU hashes before it
 /// looks at cb2 (so a fast GPU still leaves it a chosen share; `usize::MAX`
 /// or any count past the suffix = all of it), and the path is taken even if
@@ -14919,6 +14963,18 @@ kernel void blake3_pow_seg_tail(
         assert!(suffix_start.is_multiple_of(unit) && suffix_start < n_leaves);
         let total_units = (n_leaves - suffix_start) / unit;
         let force_units = force.min(total_units);
+        // CPU tail-hash reserve (`super::ENV_NO_TAIL_HASH_RESERVE_LATE`):
+        // units of the unclaimed top a claim does not offer to cb3; only with
+        // the working coordinator, never more than the units above the forced
+        // ones. The late form commits cb3 with the full count (a claim lowers
+        // it, so with no claim cb3 hashes every unit); the eager form, whose
+        // claims always run, commits it with the reserve already applied.
+        let reserve = if super::tailhash_coord_work_enabled() {
+            (total_units * super::tail_hash_reserve_pct() / 100).min(total_units - force_units)
+        } else {
+            0
+        };
+        let first_count = if after_ab { total_units } else { total_units - reserve };
         let args = match TAIL_ARGS.get() {
             Some(&b) => b as Id,
             None => {
@@ -14936,7 +14992,7 @@ kernel void blake3_pow_seg_tail(
             gpu.end_encoding(enc);
             // The join below returns on this signal (`super::ENV_NO_JOIN_SIGNAL`).
             let sig3 = if super::join_signal_enabled() { gpu.arm_done(cb3) } else { None };
-            write_tail_counts(args_ptr, &per_unit, total_units);
+            write_tail_counts(args_ptr, &per_unit, first_count);
             let cb3 = gpu.retain(cb3);
             gpu.commit_async(cb3);
             (cb3, per_unit, sig3)
@@ -14945,8 +15001,10 @@ kernel void blake3_pow_seg_tail(
         let bytes_base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(staging).cast::<u8>() });
         let args_base = crate::epool::SyncPtr(args_ptr);
         let per_unit = &per_unit;
-        // (next unclaimed top, exclusive; claims stopped)
-        let claims = std::sync::Mutex::new((n_leaves, false));
+        // (next unclaimed top, exclusive; claims stopped; cb3's frozen floor,
+        // usize::MAX until the reserve freezes the count at cb2's end; the
+        // last unit count published to cb3)
+        let claims = std::sync::Mutex::new((n_leaves, false, usize::MAX, first_count));
         // Raw handles cross the scope as integers (the body runs on this
         // thread; the workers get the claims and the byte/tree/args bases).
         let cb2_u = cb2 as usize;
@@ -14974,11 +15032,25 @@ kernel void blake3_pow_seg_tail(
         let t_tail = std::time::Instant::now();
         let mut h = n_leaves;
         // Claim one unit: lower cb3's count first, then hash it.
-        let claim = move |g: &mut (usize, bool)| -> usize {
+        // With the reserve the count is published `reserve` units below the
+        // unclaimed top, never above the last one published, and not at all
+        // once frozen.
+        let claim = move |g: &mut (usize, bool, usize, usize)| -> usize {
             g.0 -= unit;
-            // SAFETY: the args buffer is the arm's; counts only decrease.
-            unsafe { write_tail_counts(args_base.ptr(), per_unit, (g.0 - suffix_start) / unit) };
+            if g.2 == usize::MAX {
+                let c = ((g.0 - suffix_start) / unit).saturating_sub(reserve).min(g.3);
+                // SAFETY: the args buffer is the arm's; counts only decrease.
+                unsafe { write_tail_counts(args_base.ptr(), per_unit, c) };
+                g.3 = c;
+            }
             g.0
+        };
+        // Reserve only: at cb2's end the count stops moving; the floor is the
+        // last count published (cb3 read one no lower).
+        let freeze = move |g: &mut (usize, bool, usize, usize)| {
+            if g.2 == usize::MAX {
+                g.2 = suffix_start + g.3 * unit;
+            }
         };
         let hash_unit = move |start: usize| {
             // SAFETY: `start..start + unit` was claimed by this thread alone;
@@ -15002,18 +15074,33 @@ kernel void blake3_pow_seg_tail(
                         if g.1 || g.0 <= suffix_start {
                             break;
                         }
-                        // Working coordinator: stop the claims at the first
-                        // claim attempt after cb2's end (the caller may be
-                        // inside a unit of its own and not see it), read as
-                        // the caller reads it.
-                        if coord_work
+                        if g.2 != usize::MAX {
+                            // Reserve: frozen; hash down to the floor.
+                            if g.0 <= g.2 {
+                                g.1 = true;
+                                break;
+                            }
+                        } else if coord_work
                             && (n_leaves - g.0) / unit >= force_units
                             // SAFETY: the committed cb2 and its signal, both
                             // held by the caller until after this scope.
                             && unsafe { gpu.cb_done(cb2_u as Id, sig2_ref) }
                         {
-                            g.1 = true;
-                            break;
+                            // Working coordinator: stop the claims at the
+                            // first claim attempt after cb2's end (the caller
+                            // may be inside a unit of its own and not see
+                            // it), read as the caller reads it. With the
+                            // reserve: freeze the count and keep claiming
+                            // down to the floor.
+                            if reserve == 0 {
+                                g.1 = true;
+                                break;
+                            }
+                            freeze(&mut g);
+                            if g.0 <= g.2 {
+                                g.1 = true;
+                                break;
+                            }
                         }
                         claim(&mut g)
                     };
@@ -15035,11 +15122,27 @@ kernel void blake3_pow_seg_tail(
                         h = suffix_start;
                         break;
                     }
+                    if g.2 != usize::MAX {
+                        // Reserve: frozen; hash down to the floor.
+                        if g.0 <= g.2 {
+                            g.1 = true;
+                            h = g.0;
+                            break;
+                        }
+                        let start = claim(&mut g);
+                        drop(g);
+                        hash_unit(start);
+                        continue;
+                    }
                     let claimed = (n_leaves - g.0) / unit;
                     if claimed >= force_units && cb2_done() {
-                        g.1 = true;
-                        h = g.0;
-                        break;
+                        if reserve == 0 {
+                            g.1 = true;
+                            h = g.0;
+                            break;
+                        }
+                        freeze(&mut g);
+                        continue;
                     }
                     if claimed < force_units || coord_work {
                         // Test builds: help with the forced units (a pool
