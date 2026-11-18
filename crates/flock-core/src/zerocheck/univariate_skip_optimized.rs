@@ -4845,6 +4845,57 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     (round1_c_opt, s_hat_v_c, quad, fold4, recovered_ab)
 }
 
+/// Kill switch for the round-two C capture (`FLOCK_NO_R2_C_CAPTURE`, any
+/// value: round two folds and multiplies every live row, as before). Read once
+/// per process.
+///
+/// At the ranked shape, round two's groups 0..4 (rows 0..16 of every 256-row
+/// block, the identity prefix) and group 59 (rows 236..240, output words)
+/// have b rows that are all ones and a rows equal to the C rows (C = A AND B).
+/// Their round-two products are then the scaled a rows alone, and summed over
+/// the blocks with the instance weights they are the same linear forms of
+/// round one's completed C inner fold (`c_inner`, whose instance weights are
+/// the same challenges). With this on, round one keeps those fifteen rows of
+/// `c_inner` (odd and even rows 1..16 except rows 0, 4, 8, 12, and rows
+/// 237..240), and round two folds only the even rows of these groups (their
+/// anchors; the deltas are raw bytes), adds none of their products, and adds
+/// their exact contributions to `G(1)`, `W0` and `W1` once from the kept rows.
+/// Same field values, same transcript.
+pub const ENV_NO_R2_C_CAPTURE: &str = "FLOCK_NO_R2_C_CAPTURE";
+
+pub(crate) fn r2_c_capture_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_R2_C_CAPTURE).is_none());
+    *ON
+}
+
+/// The `c_inner` rows round two takes (see [`ENV_NO_R2_C_CAPTURE`]), in order.
+pub(crate) const R2_C_CAPTURE_ROWS: [usize; 15] = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 237, 238, 239];
+
+/// This prove's kept rows (`R2_C_CAPTURE_ROWS.len() * 64` lanes), set by
+/// round one's C fold and taken by round two of the same prove; cleared at
+/// the start of every zerocheck.
+static R2_C_CAPTURE: std::sync::Mutex<Option<Vec<F128>>> = std::sync::Mutex::new(None);
+
+pub(crate) fn r2_c_capture_clear() {
+    *R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+pub(crate) fn r2_c_capture_take() -> Option<Vec<F128>> {
+    R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+fn r2_c_capture_store(c_inner: &[F128]) {
+    if c_inner.len() < 240 * ELL {
+        return;
+    }
+    let mut rows = Vec::with_capacity(R2_C_CAPTURE_ROWS.len() * ELL);
+    for t in R2_C_CAPTURE_ROWS {
+        rows.extend_from_slice(&c_inner[ELL * t..ELL * (t + 1)]);
+    }
+    *R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(rows);
+}
+
 /// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
 /// stripe fold, but six inner coordinates are retained (64 banks) for the
 /// direct-fold8 PCS consumer. The wire outputs (`round1_c_opt`, canonical
@@ -4874,6 +4925,11 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
+    // Round-two C capture: only for the ranked producer whose omitted rows
+    // (identity prefix, output window) the AB message also takes from C.
+    if r2_c_capture_enabled() && recover_identity_prefix && recover_output_window && m == 32 {
+        r2_c_capture_store(&c_inner);
+    }
     let recovered_ab = recover_identity_prefix.then(|| {
         let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table);
         if recover_output_window {
