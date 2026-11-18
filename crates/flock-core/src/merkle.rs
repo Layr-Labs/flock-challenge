@@ -1053,6 +1053,30 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     let mut active: Vec<usize> = positions.to_vec();
     active.sort_unstable();
     active.dedup();
+    multi_proof_from_active(tree, num_leaves, active)
+}
+
+/// [`merkle_multi_proof`] for positions that are already strictly ascending
+/// (sorted and unique), as the opening's query sampler returns them. The
+/// general entry's sort and dedup leave such a list unchanged, so the same
+/// traversal on the same list emits the same hashes.
+pub fn merkle_multi_proof_sorted(
+    tree: &[Hash],
+    num_leaves: usize,
+    sorted_unique_positions: &[usize],
+) -> Vec<Hash> {
+    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
+    assert_eq!(tree.len(), 2 * num_leaves - 1);
+
+    if sorted_unique_positions.is_empty() || num_leaves == 1 {
+        return Vec::new();
+    }
+    debug_assert!(sorted_unique_positions.windows(2).all(|w| w[0] < w[1]));
+    multi_proof_from_active(tree, num_leaves, sorted_unique_positions.to_vec())
+}
+
+/// Bottom-up traversal shared by both entries; `active` is sorted-unique.
+fn multi_proof_from_active(tree: &[Hash], num_leaves: usize, mut active: Vec<usize>) -> Vec<Hash> {
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
     let mut proof = Vec::new();
@@ -1838,6 +1862,38 @@ mod tests {
                 assert!(
                     multi.len() <= sorted.len() * log_n,
                     "multi-proof can't exceed sum of independent paths"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multi_proof_sorted_entry_matches_general_entry() {
+        let leaf_size = 4;
+        for (n_leaves, seed) in [(2usize, 7u64), (64, 2025), (4096, 2026)] {
+            let data = random_data(n_leaves, leaf_size, seed);
+            for kind in KINDS {
+                let tree = merkle_tree(&data, n_leaves, kind);
+                let mut state = seed;
+                for count in [1usize, 2, 3, 36, 43, 218] {
+                    let mut positions: Vec<usize> = (0..count)
+                        .map(|_| {
+                            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                            ((state >> 33) as usize) % n_leaves
+                        })
+                        .collect();
+                    positions.sort_unstable();
+                    positions.dedup();
+                    assert_eq!(
+                        merkle_multi_proof_sorted(&tree, n_leaves, &positions),
+                        merkle_multi_proof(&tree, n_leaves, &positions),
+                        "{kind}: n_leaves={n_leaves} count={count}"
+                    );
+                }
+                let all: Vec<usize> = (0..n_leaves).collect();
+                assert_eq!(
+                    merkle_multi_proof_sorted(&tree, n_leaves, &all),
+                    merkle_multi_proof(&tree, n_leaves, &all)
                 );
             }
         }
