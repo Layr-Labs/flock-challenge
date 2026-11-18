@@ -1792,6 +1792,110 @@ pub(crate) fn static_warmup_latch_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_STATIC_WARMUP_LATCH).is_none())
 }
 
+/// Kill switch for the parallel Metal pipeline builds:
+/// `FLOCK_NO_PIPE_FANOUT=1` (exact `1`) restores the incumbent order, one
+/// build after another. Read once per process.
+///
+/// Every worker process makes each Metal pipeline it uses itself: the GPU
+/// context's eleven embedded-library pipelines and its supplemental
+/// libraries, then the lazily built arms. Each build is one request to the
+/// Metal compiler service, which serves several requests at once. The
+/// incumbent issues them one after another: the context's builds on the
+/// thread that first asks for the GPU, the round-two arm's two pipelines
+/// inline in the warm-up's zerocheck, the fold kernels inside its commit,
+/// the opening z-fold inside its opening, and the round-one arm, the K pass
+/// and the grind tail in a chain on one helper.
+///
+/// With the fan-out on:
+/// - `imp::init_gpu` issues each pipeline, and each supplemental library,
+///   on a thread of its own (each with its own autorelease pool) and joins
+///   them all before it makes the context;
+/// - the round-two arm makes its two pipelines side by side, still at its
+///   first launch inside the warm-up's zerocheck (the window the round-one C
+///   fold tune measures), as before;
+/// - the ranked worker's first prove starts, at its existing prewarm hook,
+///   one counted helper ([`spawn_build`]) per lazily built pipeline set:
+///   the round-one AB completion, the K pass, the grind tail, R2-CS, the
+///   fold kernels, the opening z-fold, the 5+6 fold and the tri pass 0
+///   kernel; the GPU context's own helpers (the Merkle top kernel, the
+///   round-one arm) are counted too;
+/// - the prove that holds the split-tune ticket (the warm-up) starts its
+///   commit/AB join only after every counted helper is done
+///   ([`join_builds`]), so that join, the AB wall it measures and the split
+///   sweep after it run with no build beside them.
+///
+/// Every build compiles the same source with the same calls and fills the
+/// same process-wide slot that its consumer reads (a consumer that comes
+/// first joins the build or makes it, as before); only the thread and the
+/// moment change. No build reads or writes prover state, the scratch pools
+/// or the transcript, so every proof byte is unchanged.
+pub const ENV_NO_PIPE_FANOUT: &str = "FLOCK_NO_PIPE_FANOUT";
+
+/// Whether the pipeline fan-out is on (see [`ENV_NO_PIPE_FANOUT`]).
+pub(crate) fn pipe_fanout_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !env_is_one(ENV_NO_PIPE_FANOUT))
+}
+
+/// Helpers started by [`spawn_build`] that have not returned yet.
+static BUILDS_PENDING: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+/// Signalled when [`BUILDS_PENDING`] drops to zero.
+static BUILDS_DONE: std::sync::Condvar = std::sync::Condvar::new();
+
+/// One counted helper; dropping it (return or unwind) uncounts it.
+struct BuildToken;
+
+impl Drop for BuildToken {
+    fn drop(&mut self) {
+        let mut pending = BUILDS_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        *pending -= 1;
+        if *pending == 0 {
+            BUILDS_DONE.notify_all();
+        }
+    }
+}
+
+/// Run `f` on a new thread named `name`, counted by [`join_builds`] until it
+/// returns. When no thread can be made, `f` is dropped unrun and its
+/// consumer makes the build on first use, as without the fan-out.
+pub(crate) fn spawn_build(name: &str, f: impl FnOnce() + Send + 'static) {
+    *BUILDS_PENDING.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    let token = BuildToken;
+    let _ = std::thread::Builder::new().name(name.into()).spawn(move || {
+        let _token = token;
+        f();
+    });
+}
+
+/// Block until every helper started by [`spawn_build`] has returned (at
+/// once when none is running).
+pub fn join_builds() {
+    let mut pending = BUILDS_PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    while *pending > 0 {
+        pending = BUILDS_DONE.wait(pending).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+#[cfg(test)]
+mod pipe_fanout_tests {
+    #[test]
+    fn join_builds_waits_for_every_counted_helper() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DONE: AtomicUsize = AtomicUsize::new(0);
+        for i in 0..4u64 {
+            super::spawn_build("fanout-test", move || {
+                std::thread::sleep(std::time::Duration::from_millis(5 * i));
+                DONE.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        super::join_builds();
+        assert_eq!(DONE.load(Ordering::SeqCst), 4);
+        // A helper that unwinds is uncounted too (the join returns).
+        super::spawn_build("fanout-test-panic", || panic!("unwind"));
+        super::join_builds();
+    }
+}
+
 /// Candidate directories for the cross-process cache, in preference order:
 /// the platform temp dir, then existing ancestor directories of each
 /// path-shaped argument (deepest first, so probing later walks *up* toward
@@ -4194,6 +4298,7 @@ mod imp {
     pub(crate) const NIL: Id = std::ptr::null_mut();
 
     /// Function pointers resolved from libobjc / Metal at init.
+    #[derive(Clone, Copy)]
     pub(crate) struct Api {
         msg_send: *const c_void,
         get_class: unsafe extern "C" fn(*const i8) -> Id,
@@ -9668,20 +9773,24 @@ kernel void parent_top(device uint* tree             [[buffer(0)]],
                 return;
             }
             let gpu_u = gpu as *const Gpu as usize;
-            let _ = std::thread::Builder::new()
-                .name("merkle-top-build".into())
-                .spawn(move || {
-                    unsafe extern "C" {
-                        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-                    }
-                    unsafe {
-                        let _ = pthread_set_qos_class_self_np(0x11, 0);
-                    }
-                    // SAFETY: `gpu` is the process-lifetime GPU context.
-                    let gpu = unsafe { &*(gpu_u as *const Gpu) };
-                    let pso = unsafe { build_parent_top(gpu) }.map_or(0, |p| p as usize);
-                    let _ = PARENT_TOP.set(pso);
-                });
+            let build = move || {
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x11, 0);
+                }
+                // SAFETY: `gpu` is the process-lifetime GPU context.
+                let gpu = unsafe { &*(gpu_u as *const Gpu) };
+                let pso = unsafe { build_parent_top(gpu) }.map_or(0, |p| p as usize);
+                let _ = PARENT_TOP.set(pso);
+            };
+            // `super::ENV_NO_PIPE_FANOUT`: a counted helper.
+            if super::pipe_fanout_enabled() {
+                super::spawn_build("merkle-top-build", build);
+            } else {
+                let _ = std::thread::Builder::new().name("merkle-top-build".into()).spawn(build);
+            }
         });
     }
 
@@ -10982,21 +11091,118 @@ kernel void blake3_pow_seg_tail(
             let Some(basis) = crate::zerocheck::univariate_skip_optimized::ab_completion_convert_basis() else {
                 return;
             };
-            let _ = std::thread::Builder::new()
-                .name("zc-ab-prewarm".into())
-                .spawn(move || {
-                    // Efficiency-core hint (`QOS_CLASS_UTILITY`, as the epool
-                    // helpers): the setup then runs beside the warm-up
-                    // prove's performance-core work instead of on top of it.
-                    unsafe extern "C" {
-                        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
-                    }
-                    unsafe {
-                        let _ = pthread_set_qos_class_self_np(0x11, 0);
-                    }
-                    let _ = zc_ab_state(basis);
-                });
+            let build = move || {
+                // Efficiency-core hint (`QOS_CLASS_UTILITY`, as the epool
+                // helpers): the setup then runs beside the warm-up
+                // prove's performance-core work instead of on top of it.
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x11, 0);
+                }
+                let _ = zc_ab_state(basis);
+            };
+            // `super::ENV_NO_PIPE_FANOUT`: a counted helper.
+            if super::pipe_fanout_enabled() {
+                super::spawn_build("zc-ab-prewarm", build);
+            } else {
+                let _ = std::thread::Builder::new().name("zc-ab-prewarm".into()).spawn(build);
+            }
         });
+    }
+
+    /// A value or closure handed to another thread. Metal objects are
+    /// thread-safe; each build thread drains its own autorelease pool.
+    struct SendCell<T>(T);
+    // SAFETY: only Metal handles (thread-safe objects) and closures over
+    // them cross threads in this wrapper.
+    unsafe impl<T> Send for SendCell<T> {}
+
+    impl<T> SendCell<T> {
+        fn into_inner(self) -> T {
+            self.0
+        }
+    }
+
+    /// One build of [`init_gpu`]: done inline, or running on a thread of
+    /// its own under the fan-out (`super::ENV_NO_PIPE_FANOUT`).
+    enum BuildJob<T> {
+        Ready(T),
+        Running(std::thread::JoinHandle<SendCell<T>>),
+    }
+
+    impl<T: 'static> BuildJob<T> {
+        /// Run `f` here (`fan` off), or on a new thread inside its own
+        /// autorelease pool; here as well when no thread can be made.
+        fn start(api: &Api, fan: bool, f: impl FnOnce() -> T + 'static) -> Self {
+            if !fan {
+                return BuildJob::Ready(f());
+            }
+            let (pool_push, pool_pop) = (api.pool_push, api.pool_pop);
+            let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(SendCell(f))));
+            let theirs = std::sync::Arc::clone(&slot);
+            let spawned = std::thread::Builder::new().name("gpu-pipeline-build".into()).spawn(move || {
+                let f = theirs.lock().unwrap_or_else(|e| e.into_inner()).take();
+                let f = f.expect("a build job runs once").into_inner();
+                // SAFETY: a push/pop pair of this thread's own pool.
+                unsafe {
+                    let pool = pool_push();
+                    let out = f();
+                    pool_pop(pool);
+                    SendCell(out)
+                }
+            });
+            match spawned {
+                Ok(handle) => BuildJob::Running(handle),
+                Err(_) => {
+                    let f = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    BuildJob::Ready(f.expect("a build job runs once").into_inner()())
+                }
+            }
+        }
+
+        /// The build's result (joins its thread).
+        fn get(self) -> T {
+            match self {
+                BuildJob::Ready(out) => out,
+                BuildJob::Running(handle) => match handle.join() {
+                    Ok(out) => out.into_inner(),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                },
+            }
+        }
+    }
+
+    /// One pipeline of `library`'s kernel `name` on `device`.
+    unsafe fn build_pso(api: &Api, device: Id, library: Id, name: &str) -> Result<Id, String> {
+        unsafe {
+            let ns = api.nsstring(name)?;
+            let f: Id = send!(
+                api,
+                unsafe extern "C" fn(Id, Sel, Id) -> Id,
+                library,
+                c"newFunctionWithName:",
+                ns
+            );
+            if f.is_null() {
+                return Err(format!("kernel {name} not found"));
+            }
+            let mut err: Id = NIL;
+            let p: Id = send!(
+                api,
+                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                device,
+                c"newComputePipelineStateWithFunction:error:",
+                f,
+                &mut err
+            );
+            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+            if p.is_null() {
+                return Err(format!("pipeline {name}: {}", api.error_string(err)));
+            }
+            Ok(p)
+        }
     }
 
     fn init_gpu() -> Result<Gpu, String> {
@@ -11054,37 +11260,25 @@ kernel void blake3_pow_seg_tail(
                 let build_psos = |library: Id| -> Result<[Id; 11], String> {
                     let mut out = [NIL; 11];
                     for (slot, name) in out.iter_mut().zip(KERNELS) {
-                        let ns = api.nsstring(name)?;
-                        let f: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id) -> Id,
-                            library,
-                            c"newFunctionWithName:",
-                            ns
-                        );
-                        if f.is_null() {
-                            return Err(format!("kernel {name} not found"));
-                        }
-                        let mut err: Id = NIL;
-                        let p: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                            device,
-                            c"newComputePipelineStateWithFunction:error:",
-                            f,
-                            &mut err
-                        );
-                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-                        if p.is_null() {
-                            return Err(format!("pipeline {name}: {}", api.error_string(err)));
-                        }
-                        *slot = p;
+                        *slot = build_pso(&api, device, library, name)?;
                     }
                     Ok(out)
                 };
+                // `super::ENV_NO_PIPE_FANOUT`: with the fan-out on, the eleven
+                // pipelines and each supplemental build below start on
+                // threads of their own and are joined before the context is
+                // made; with it off, each runs here in this order.
+                let fan = super::pipe_fanout_enabled();
                 let mut psos: Option<[Id; 11]> = None;
                 let prebuilt = try_embedded_metallib(&api, device);
-                if !prebuilt.is_null() {
+                let prebuilt_jobs = if fan && !prebuilt.is_null() {
+                    Some(KERNELS.map(move |name| {
+                        BuildJob::start(&api, true, move || build_pso(&api, device, prebuilt, name))
+                    }))
+                } else {
+                    None
+                };
+                if prebuilt_jobs.is_none() && !prebuilt.is_null() {
                     if let Ok(p) = build_psos(prebuilt) {
                         psos = Some(p);
                     }
@@ -11095,54 +11289,46 @@ kernel void blake3_pow_seg_tail(
                         c"release"
                     );
                 }
-                let [
-                    pso_ntt,
-                    pso_ntt4g4,
-                    pso_ntt4,
-                    pso_ntt3,
-                    pso_ntt4z,
-                    pso_ntt4zg4,
-                    pso_ntt4h8,
-                    pso_ntt5mix,
-                    pso_leaf,
-                    pso_parent,
-                    pso_parent3,
-                ] = match psos {
-                    Some(p) => p,
-                    None => {
-                        let src = api.nsstring(MSL_SOURCE)?;
-                        let mut err: Id = NIL;
-                        let library: Id = send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                            device,
-                            c"newLibraryWithSource:options:error:",
-                            src,
-                            NIL,
-                            &mut err
-                        );
-                        if library.is_null() {
-                            return Err(format!(
-                                "shader compile failed: {}",
-                                api.error_string(err)
-                            ));
+                let main_psos = |psos: Option<[Id; 11]>| -> Result<[Id; 11], String> {
+                    Ok(match psos {
+                        Some(p) => p,
+                        None => {
+                            let src = api.nsstring(MSL_SOURCE)?;
+                            let mut err: Id = NIL;
+                            let library: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                                device,
+                                c"newLibraryWithSource:options:error:",
+                                src,
+                                NIL,
+                                &mut err
+                            );
+                            if library.is_null() {
+                                return Err(format!(
+                                    "shader compile failed: {}",
+                                    api.error_string(err)
+                                ));
+                            }
+                            let p = build_psos(library)?;
+                            send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel) -> Id,
+                                library,
+                                c"release"
+                            );
+                            p
                         }
-                        let p = build_psos(library)?;
-                        send!(
-                            api,
-                            unsafe extern "C" fn(Id, Sel) -> Id,
-                            library,
-                            c"release"
-                        );
-                        p
-                    }
+                    })
                 };
+                // Without the fan-out the eleven pipelines are settled here.
+                let main_serial = if prebuilt_jobs.is_none() { Some(main_psos(psos)?) } else { None };
 
                 // Keep the embedded incumbent metallib byte-for-byte intact.
                 // The exact rollback skips this supplemental compile and
                 // selects the incumbent pso_ntt4zg4 below.
-                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) =
-                    if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
+                let zero_root_job = BuildJob::start(&api, fan, move || -> Result<(Id, Id), String> {
+                    Ok(if cfg!(test) || super::gpu_from_z_zero_root_selected(20) {
                         let src = api.nsstring(zero_root_msl_source())?;
                         let mut err: Id = NIL;
                         let library: Id = send!(
@@ -11206,12 +11392,17 @@ kernel void blake3_pow_seg_tail(
                         (candidate, export)
                     } else {
                         (NIL, NIL)
-                    };
+                    })
+                });
+                // Inline (fan-out off), a failed compile ends the build here.
+                if let BuildJob::Ready(Err(e)) = &zero_root_job {
+                    return Err(e.clone());
+                }
 
                 // Supplemental leaf+parent3 fuse. Failure → NIL → exact
                 // incumbent leaf + parent3 path. Compile only when the ranked
                 // gate is open so non-ranked processes skip the MSL frontend.
-                let pso_leaf_parent3 = if super::gpu_leaf_parent3_enabled() {
+                let leaf_parent3_job = BuildJob::start(&api, fan, move || if super::gpu_leaf_parent3_enabled() {
                     (|| -> Result<Id, String> {
                         // `super::ENV_NO_LEAF_STRAIGHT`: the straight-line compression.
                         let src = api.nsstring(&leaf_parent3_msl_source())?;
@@ -11280,7 +11471,7 @@ kernel void blake3_pow_seg_tail(
                     .unwrap_or(NIL)
                 } else {
                     NIL
-                };
+                });
 
                 // Supplemental vectorized Merkle kernels (uint4 loads/stores),
                 // kept out of the embedded metallib so the incumbent library
@@ -11288,7 +11479,7 @@ kernel void blake3_pow_seg_tail(
                 // not poison the already-valid GPU: the Merkle encoders see
                 // NIL and retain the incumbent scalar kernels, whose output
                 // is bit-identical.
-                let (pso_leaf_v4, pso_parent3_v4) = if super::gpu_leaf_vec4_enabled() {
+                let leaf_v4_job = BuildJob::start(&api, fan, move || if super::gpu_leaf_vec4_enabled() {
                     let t0 = std::time::Instant::now();
                     let built = (|| -> Result<(Id, Id), String> {
                         let src = api.nsstring(LEAF_VEC4_MSL_SOURCE)?;
@@ -11393,10 +11584,10 @@ kernel void blake3_pow_seg_tail(
                     }
                 } else {
                     (NIL, NIL)
-                };
+                });
 
                 let pow_v2 = super::grind_scan_v2_enabled();
-                let (pso_pow, pow_out) = if super::gpu_grind_enabled() {
+                let pow_job = BuildJob::start(&api, fan, move || if super::gpu_grind_enabled() {
                     // This optimization is supplemental: a compile/pipeline/
                     // allocation failure must not poison the already-valid
                     // ranked commitment GPU.  The grind gate will see NIL and
@@ -11481,12 +11672,12 @@ kernel void blake3_pow_seg_tail(
                     .unwrap_or((NIL, NIL))
                 } else {
                     (NIL, NIL)
-                };
+                });
                 // Supplemental two-tiles-per-thread g4 NTT pass, its own
                 // library. Any failure, or a pipeline that cannot run a
                 // 64-thread group, leaves NIL and the encoders keep
                 // `ntt_fused_reg4g4`.
-                let pso_ntt4g4x2 = if super::gpu_g4x2_enabled() {
+                let g4x2_job = BuildJob::start(&api, fan, move || if super::gpu_g4x2_enabled() {
                     (|| -> Result<Id, String> {
                         let src = api.nsstring(&g4x2_pipeline_msl_source())?;
                         let mut err: Id = NIL;
@@ -11551,10 +11742,16 @@ kernel void blake3_pow_seg_tail(
                     })
                 } else {
                     NIL
-                };
+                });
                 // Zero-lane compacted g4x2: its own library; any failure
                 // leaves NIL and the encoders keep the dense g4x2 grid.
-                let pso_ntt4g4x2_zl = if !pso_ntt4g4x2.is_null()
+                // Fan-out: built whenever g4x2 is attempted; dropped below
+                // when g4x2 itself did not build.
+                let g4x2_built = match &g4x2_job {
+                    BuildJob::Ready(p) => !p.is_null(),
+                    BuildJob::Running(_) => super::gpu_g4x2_enabled(),
+                };
+                let g4x2_zl_job = BuildJob::start(&api, fan, move || if g4x2_built
                     && super::gpu_zero_lane_enabled()
                     && super::gpu_tw_prefetch_enabled()
                 {
@@ -11621,11 +11818,11 @@ kernel void blake3_pow_seg_tail(
                     })
                 } else {
                     NIL
-                };
+                });
                 // Supplemental ranked final pass, its own library. Any
                 // failure, or a pipeline that cannot run a 64-thread group,
                 // leaves NIL and the encoders keep `ntt_pass5_mixed`.
-                let pso_ntt5t3 = if super::gpu_final_t3_enabled() {
+                let final_t3_job = BuildJob::start(&api, fan, move || if super::gpu_final_t3_enabled() {
                     (|| -> Result<Id, String> {
                         let src = api.nsstring(&final_t3_msl_source())?;
                         let mut err: Id = NIL;
@@ -11690,8 +11887,8 @@ kernel void blake3_pow_seg_tail(
                     })
                 } else {
                     NIL
-                };
-                let pso_final_leaf = if super::gpu_final_leaf_enabled() {
+                });
+                let final_leaf_job = BuildJob::start(&api, fan, move || if super::gpu_final_leaf_enabled() {
                     (|| -> Result<Id, String> {
                         let src = api.nsstring(&final_leaf_pipeline_msl_source())?;
                         let mut err: Id = NIL;
@@ -11756,7 +11953,57 @@ kernel void blake3_pow_seg_tail(
                     })
                 } else {
                     NIL
+                });
+                let [
+                    pso_ntt,
+                    pso_ntt4g4,
+                    pso_ntt4,
+                    pso_ntt3,
+                    pso_ntt4z,
+                    pso_ntt4zg4,
+                    pso_ntt4h8,
+                    pso_ntt5mix,
+                    pso_leaf,
+                    pso_parent,
+                    pso_parent3,
+                ] = match (main_serial, prebuilt_jobs) {
+                    (Some(p), _) => p,
+                    (None, jobs) => {
+                        // Fan-out: any failed pipeline takes the source path,
+                        // as one failure in the loop above does.
+                        let built = jobs.expect("fan-out builds started").map(BuildJob::get);
+                        send!(
+                            api,
+                            unsafe extern "C" fn(Id, Sel) -> Id,
+                            prebuilt,
+                            c"release"
+                        );
+                        let psos = if built.iter().all(Result::is_ok) {
+                            Some(built.map(|p| p.unwrap_or(NIL)))
+                        } else {
+                            for p in built.into_iter().flatten() {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, p, c"release");
+                            }
+                            None
+                        };
+                        main_psos(psos)?
+                    }
                 };
+                let zero_root = zero_root_job.get();
+                let pso_leaf_parent3 = leaf_parent3_job.get();
+                let (pso_leaf_v4, pso_parent3_v4) = leaf_v4_job.get();
+                let (pso_pow, pow_out) = pow_job.get();
+                let pso_ntt4g4x2 = g4x2_job.get();
+                let pso_ntt4g4x2_zl = match g4x2_zl_job.get() {
+                    zl if pso_ntt4g4x2.is_null() && !zl.is_null() => {
+                        send!(api, unsafe extern "C" fn(Id, Sel) -> Id, zl, c"release");
+                        NIL
+                    }
+                    zl => zl,
+                };
+                let pso_ntt5t3 = final_t3_job.get();
+                let pso_final_leaf = final_leaf_job.get();
+                let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) = zero_root?;
                 Ok(Gpu {
                     api,
                     device,
@@ -20242,6 +20489,20 @@ kernel void zc_eq_rows(
 
     static ZC_FOLD: Mutex<Option<Result<ZcFold, String>>> = Mutex::new(None);
 
+    /// Build the fold kernels' state (`zc_fold_init`) now, into the slot its
+    /// first launch fills (`super::ENV_NO_PIPE_FANOUT`). Nothing when both
+    /// arms that use it are off, or the slot is taken or poisoned.
+    pub(crate) fn zc_fold_prewarm() {
+        if !super::gpu_zerocheck_enabled() && !super::gpu_lincheck_enabled() {
+            return;
+        }
+        let Ok(gpu) = gpu() else { return };
+        let Ok(mut guard) = ZC_FOLD.lock() else { return };
+        if guard.is_none() {
+            *guard = Some(zc_fold_init(gpu));
+        }
+    }
+
     fn zc_fold_init(gpu: &'static Gpu) -> Result<ZcFold, String> {
         unsafe {
             let pool = gpu.pool_push();
@@ -25256,7 +25517,26 @@ kernel void zc_r2_horner_oracle(
                     }
                     Ok(pso)
                 };
-                let ordinary = make_pipeline("zc_r2_products");
+                // `super::ENV_NO_PIPE_FANOUT`: the Horner pipeline builds on a
+                // second thread beside the ordinary one.
+                let (ordinary, horner) = if super::pipe_fanout_enabled() {
+                    let make = SendCell(&make_pipeline);
+                    std::thread::scope(|scope| {
+                        let horner = scope.spawn(move || {
+                            let pool = gpu.pool_push();
+                            let built = (make.into_inner())("zc_r2_products_horner");
+                            gpu.pool_pop(pool);
+                            SendCell(built)
+                        });
+                        let ordinary = make_pipeline("zc_r2_products");
+                        match horner.join() {
+                            Ok(built) => (ordinary, Some(built.into_inner())),
+                            Err(panic) => std::panic::resume_unwind(panic),
+                        }
+                    })
+                } else {
+                    (make_pipeline("zc_r2_products"), None)
+                };
                 if super::gpu_zc_r2_debug() {
                     eprintln!(
                         "[zc-r2] Horner kernel form: {}",
@@ -25264,14 +25544,19 @@ kernel void zc_r2_horner_oracle(
                     );
                 }
                 let built = match ordinary {
-                    Ok(pso) => match make_pipeline("zc_r2_products_horner") {
+                    Ok(pso) => match horner.unwrap_or_else(|| make_pipeline("zc_r2_products_horner")) {
                         Ok(horner_pso) => Ok((pso, horner_pso)),
                         Err(e) => {
                             gpu.release(pso);
                             Err(e)
                         }
                     },
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        if let Some(Ok(horner_pso)) = horner {
+                            gpu.release(horner_pso);
+                        }
+                        Err(e)
+                    }
                 };
                 gpu.release(library);
                 built
@@ -30575,6 +30860,20 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
 
         static ZF: Mutex<Option<Result<ZfState, String>>> = Mutex::new(None);
 
+        /// Build the arm's state (`zf_init`) now, into the slot its first
+        /// launch fills (`super::super::ENV_NO_PIPE_FANOUT`). Nothing when the
+        /// arm is off or the slot is taken.
+        pub(crate) fn prewarm() {
+            if !crate::pcs::ligerito::zfold_gpu_enabled() {
+                return;
+            }
+            let Ok(gpu) = gpu() else { return };
+            let mut guard = ZF.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = Some(zf_init(gpu));
+            }
+        }
+
         fn zf_init(gpu: &'static Gpu) -> Result<ZfState, String> {
             unsafe {
                 let pool = gpu.pool_push();
@@ -30831,7 +31130,11 @@ pub(crate) use imp::{
 
 /// Opening z-fold GPU arm (see `ENV_NO_GPU_ZFOLD` in `pcs::ligerito`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use imp::zfold::{ZfJob as ZFoldJob, launch as zfold_launch};
+pub(crate) use imp::zfold::{ZfJob as ZFoldJob, launch as zfold_launch, prewarm as zfold_prewarm};
+
+/// Early builds of the lazily built arms (see `ENV_NO_PIPE_FANOUT`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::zc_fold_prewarm;
 
 /// Commit-tail fill: staged/adopted round-one C-fold prefix (see
 /// `ENV_NO_COMMIT_TAIL_FILL`).

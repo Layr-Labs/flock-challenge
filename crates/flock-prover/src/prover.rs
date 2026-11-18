@@ -2751,6 +2751,12 @@ fn commit_with_round1_ab_precompute(
         ),
     );
 
+    // The prove that holds the split-tune ticket (the warm-up) starts its
+    // commit/AB join once the counted pipeline builds are done
+    // (`gpu_commit::ENV_NO_PIPE_FANOUT`; at once when none is running).
+    if run_ranked_exact_tune {
+        flock_core::gpu_commit::join_builds();
+    }
     flock_core::tmark::mark("commit join start");
     // The CPU tail hash of the hybrid commit waits for this arm (see
     // `gpu_commit::ENV_NO_HYBRID_CPU_TAIL_HASH`).

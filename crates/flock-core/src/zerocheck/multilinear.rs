@@ -4937,8 +4937,11 @@ fn tri0_gpu_queue(
     b_base: crate::epool::SyncPtr<F128>,
     partials_base: crate::epool::SyncPtr<std::mem::MaybeUninit<[F128; 26]>>,
     body: &(dyn Fn(usize) + Sync),
+    weigh: Option<&[F128]>,
 ) -> Option<KGpuPrefix> {
     let calibration = job.calibration();
+    // Raw rows for the oracle below.
+    let weigh = weigh.filter(|_| !calibration);
     let force = if calibration { 0 } else { crate::gpu_commit::gpu_zc_t0_force().min(job.offer()) };
     let carry = !calibration && force == 0 && crate::gpu_commit::gpu_zc_t0_carry_enabled();
     let claims = std::sync::Mutex::new((0usize, hi_size, 0usize));
@@ -4969,6 +4972,12 @@ fn tri0_gpu_queue(
         };
         if from_gpu {
             let (ga, gb, slots) = job.chunk_out(x_hi);
+            // Tri partials weighted on their producers: this worker weighs
+            // the GPU's row (`FLOCK_NO_TRI_WEIGHT_WORKERS`).
+            let slots = match weigh {
+                Some(eq_hi) => tri_weigh(eq_hi[x_hi], slots),
+                None => slots,
+            };
             // SAFETY: exclusive owner of chunk `x_hi`'s output ranges and
             // partial slot (claimed above); the queue join publishes them.
             unsafe {
@@ -5013,6 +5022,61 @@ fn tri0_gpu_queue(
     }
     job.finish(taken, hi_size);
     carried
+}
+
+/// Tri partials weighted on their producers (`FLOCK_NO_TRI_WEIGHT_WORKERS`, any
+/// value, keeps the record's combine). After a tri pass's chunks have joined,
+/// the record's caller multiplies every chunk's 26 raw slots by the chunk's
+/// `eq_hi` weight and sums them, serially (`hi_size * 26` products per pass).
+/// With this on, the worker that produces a chunk's row (the CPU fold, the
+/// steal, the tri pass 0 queue's copy of a ready GPU chunk) stores it already
+/// weighted by the same products, the caller weights only the rows it copies
+/// from an admitted GPU prefix, and the combine is a sum. Same products, the
+/// same terms summed in GF(2^128) (exact, order-free), so the same 26 values.
+/// Calibration launches (raw-row oracles) keep raw rows. Read once per process.
+fn tri_weight_workers_enabled() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_TRI_WEIGHT_WORKERS").is_none());
+    *ON
+}
+
+/// A chunk's 26 tri slots times its `eq_hi` weight (the record's combine's
+/// products).
+#[inline]
+fn tri_weigh(eq_h: F128, v: [F128; 26]) -> [F128; 26] {
+    let mut w = v;
+    for x in w.iter_mut() {
+        *x = eq_h * *x;
+    }
+    w
+}
+
+/// The 26 tri sums: of weighted rows (`weighted`) or of raw rows times their
+/// `eq_hi` weights (the record's combine).
+fn tri_combine(partials: &[[F128; 26]], eq_hi: &[F128], weighted: bool) -> [F128; 26] {
+    let mut s = [F128::ZERO; 26];
+    if weighted {
+        for outv in partials {
+            for (slot, &v) in s.iter_mut().zip(outv.iter()) {
+                *slot += v;
+            }
+        }
+    } else {
+        for (x_hi, outv) in partials.iter().enumerate() {
+            let eq_h = eq_hi[x_hi];
+            for (slot, &v) in s.iter_mut().zip(outv.iter()) {
+                *slot += eq_h * v;
+            }
+        }
+    }
+    s
+}
+
+/// `FLOCK_ZC_TAIL_ROUND_TIMING` (read once): the tri combine's timing line.
+fn tri_combine_timing() -> bool {
+    use std::sync::LazyLock;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some());
+    *ON
 }
 
 /// Caller-first main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, any value,
@@ -5149,7 +5213,12 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     let mut gpu_prefix: Option<KGpuPrefix> = None;
     #[cfg(test)]
     let hetero = hetero || TRI_PARTIAL_TEST_MODE.with(|m| m.get() != 0);
-    let partials: Vec<[F128; 26]> = if hetero {
+    // Tri partials weighted on their producers (`FLOCK_NO_TRI_WEIGHT_WORKERS`).
+    let ww = tri_weight_workers_enabled();
+    let timing = tri_combine_timing();
+    #[allow(unused_mut)]
+    let mut rows_us = 0.0f64;
+    let (partials, weighted): (Vec<[F128; 26]>, bool) = if hetero {
         let mut partials = tri_partial_storage(hi_size);
         let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
@@ -5204,6 +5273,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 };
                 let (a_in, b_in) = inputs(x_hi);
                 let outv = chunk(&a_in, &b_in, a_o, b_o);
+                let outv = if ww { tri_weigh(eq_hi[x_hi], outv) } else { outv };
                 // SAFETY: exclusive owner of this row; write a complete value
                 // without forming a reference to uninitialized storage.
                 unsafe {
@@ -5263,9 +5333,31 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                     crate::epool::run_hetero_chunks(lo, &fold);
                 }
                 let taken = if gpu_ok { lo } else { 0 };
-                for c in 0..taken {
-                    partials[c].write(job.part(c));
+                let t_rows = timing.then(std::time::Instant::now);
+                if ww && taken >= 64 {
+                    // Tri partials weighted on their producers: the GPU's
+                    // rows (each finished from its banks, then weighted) by
+                    // the pool, eight rows per claim, instead of the caller.
+                    let rows = |g: usize| {
+                        for c in 8 * g..(8 * g + 8).min(taken) {
+                            // SAFETY: row `c` belongs to claim `g` alone; the
+                            // run's join publishes it.
+                            unsafe {
+                                partials_base
+                                    .ptr()
+                                    .add(c)
+                                    .write(std::mem::MaybeUninit::new(tri_weigh(eq_hi[c], job.part(c))));
+                            }
+                        }
+                    };
+                    crate::epool::run_hetero_chunks_then(taken.div_ceil(8), &rows, &|| {});
+                } else {
+                    for c in 0..taken {
+                        let part = job.part(c);
+                        partials[c].write(if ww { tri_weigh(eq_hi[c], part) } else { part });
+                    }
                 }
+                rows_us = t_rows.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
                 if taken > 0 {
                     let (a, b) = job.outputs();
                     gpu_prefix = Some(KGpuPrefix { a, b, len_a: taken * chunk_out, len_b: taken * chunk_out });
@@ -5276,14 +5368,16 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 // SAFETY: the joined CPU suffix/steals and the copied GPU
                 // prefix partition every row; failure paths recompute the rest.
                 let partials = unsafe { tri_partials_assume_init(partials) };
-                let mut s = [F128::ZERO; 26];
-                for (x_hi, outv) in partials.iter().enumerate() {
-                    let eq_h = eq_hi[x_hi];
-                    for (slot, &v) in s.iter_mut().zip(outv.iter()) {
-                        *slot += eq_h * v;
-                    }
-                }
+                let t_comb = timing.then(std::time::Instant::now);
+                let s = tri_combine(&partials, eq_hi, ww);
+                let comb_us = t_comb.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
                 let (m1, minf, la, la2) = tri_finish(&s, r_next);
+                if timing {
+                    eprintln!(
+                        "[zc-tail-rounds] tri combine (rows={hi_size}, weighted on workers={ww}): \
+                         gpu rows {rows_us:.1} us + sum {comb_us:.1} us"
+                    );
+                }
                 (m1, minf, la, la2, gpu_prefix)
             };
         }
@@ -5312,6 +5406,12 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
         let cpu_base = 0usize;
         // One queue closure for both drains below (CPU chunks from `base`).
         let base = std::sync::atomic::AtomicUsize::new(cpu_base);
+        // Tri partials weighted on their producers, unless a launch here is a
+        // calibration (its oracle compares raw rows).
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let ww_h = std::sync::atomic::AtomicBool::new(ww && !gpu_job.as_ref().is_some_and(|j| j.calibration()));
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let ww_h = std::sync::atomic::AtomicBool::new(ww);
         let body = |i: usize| {
             let x_hi = base.load(std::sync::atomic::Ordering::Relaxed) + i;
             // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
@@ -5323,6 +5423,8 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
             };
             let (a_in, b_in) = inputs(x_hi);
             let outv = chunk(&a_in, &b_in, a_o, b_o);
+            let outv =
+                if ww_h.load(std::sync::atomic::Ordering::Relaxed) { tri_weigh(eq_hi[x_hi], outv) } else { outv };
             // SAFETY: exclusive owner; initialize the complete row by value.
             unsafe {
                 partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
@@ -5352,14 +5454,19 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
         };
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let t0_job: Option<()> = None;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if t0_job.as_ref().is_some_and(|j| j.calibration()) {
+            ww_h.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         match t0_job {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             Some(job) => {
+                let weigh = if ww_h.load(std::sync::atomic::Ordering::Relaxed) { Some(eq_hi.as_slice()) } else { None };
                 // Carry (`ENV_NO_ZC_T0_CARRY`): the GPU-taken leading
                 // outputs stay in the arm's buffers; returned below for tri
                 // pass 1, which reads them in place of `a_out` / `b_out`'s
                 // leading entries (not written in that case).
-                if let Some(p) = tri0_gpu_queue(job, hi_size, chunk_out, a_base, b_base, partials_base, &body) {
+                if let Some(p) = tri0_gpu_queue(job, hi_size, chunk_out, a_base, b_base, partials_base, &body, weigh) {
                     gpu_prefix = Some(p);
                 }
             }
@@ -5395,9 +5502,12 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                         }
                     } else {
                         assert_eq!(parts.len(), chunks);
-                        for (dst, value) in partials[..chunks].iter_mut().zip(parts) {
-                            dst.write(value);
+                        let ww_rows = ww_h.load(std::sync::atomic::Ordering::Relaxed);
+                        let t_rows = timing.then(std::time::Instant::now);
+                        for (c, (dst, value)) in partials[..chunks].iter_mut().zip(parts).enumerate() {
+                            dst.write(if ww_rows { tri_weigh(eq_hi[c], value) } else { value });
                         }
+                        rows_us = t_rows.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
                         gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
                     }
                 }
@@ -5412,10 +5522,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
         // SAFETY: each CPU row is assigned in full; admitted GPU prefix rows
         // are copied in full, and any failed prefix was recomputed on the CPU.
         // The tri0 queue likewise writes each claimed row before returning.
-        unsafe { tri_partials_assume_init(partials) }
+        (unsafe { tri_partials_assume_init(partials) }, ww_h.into_inner())
     } else if hi_size == 1 {
         let (a_in, b_in) = inputs(0);
-        vec![chunk(&a_in, &b_in, a_out, b_out)]
+        (vec![chunk(&a_in, &b_in, a_out, b_out)], false)
     } else if zc_tri_caller_first_enabled() {
         // The `par_chunks_mut(chunk_out)` grid below: `hi_size` chunks.
         let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
@@ -5434,15 +5544,17 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
             };
             let (a_in, b_in) = inputs(x_hi);
             let outv = chunk(&a_in, &b_in, a_o, b_o);
+            let outv = if ww { tri_weigh(eq_hi[x_hi], outv) } else { outv };
             // SAFETY: exclusive owner of partials[x_hi].
             unsafe {
                 *partials_base.ptr().add(x_hi) = outv;
             }
         });
-        partials
+        (partials, ww)
     } else {
         use rayon::prelude::*;
-        a_out
+        (
+            a_out
             .par_chunks_mut(chunk_out)
             .zip(b_out.par_chunks_mut(chunk_out))
             .enumerate()
@@ -5450,17 +5562,21 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 let (a_in, b_in) = inputs(x_hi);
                 chunk(&a_in, &b_in, a_o, b_o)
             })
-            .collect()
+            .collect::<Vec<_>>(),
+            false,
+        )
     };
 
-    let mut s = [F128::ZERO; 26];
-    for (x_hi, outv) in partials.iter().enumerate() {
-        let eq_h = eq_hi[x_hi];
-        for (slot, &v) in s.iter_mut().zip(outv.iter()) {
-            *slot += eq_h * v;
-        }
-    }
+    let t_comb = timing.then(std::time::Instant::now);
+    let s = tri_combine(&partials, eq_hi, weighted);
+    let comb_us = t_comb.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
     let (m1, minf, la, la2) = tri_finish(&s, r_next);
+    if timing {
+        eprintln!(
+            "[zc-tail-rounds] tri combine (rows={hi_size}, weighted on workers={weighted}): \
+             gpu rows {rows_us:.1} us + sum {comb_us:.1} us"
+        );
+    }
     (m1, minf, la, la2, gpu_prefix)
 }
 
