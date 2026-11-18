@@ -1551,10 +1551,59 @@ unsafe fn butterfly_low_fold_q(
     }
 }
 
+/// Kill switch for the absorbed c seed of the low-twiddle final pair
+/// ([`butterfly_fused_2layer_low_lazy_impl`] with `ABSORB = true`): exactly
+/// `FLOCK_NO_NTT_LOW_PAIR_ABSORB=1` keeps the incumbent lane body. Read once
+/// per process; the outputs are bit-identical either way.
+fn ntt_low_pair_absorb_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0: not read yet, 1: on, 2: off.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("FLOCK_NO_NTT_LOW_PAIR_ABSORB").as_deref() != Some(std::ffi::OsStr::new("1"));
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// [`butterfly_fused_2layer_low_lazy_impl`] in the form the switch selects.
 #[target_feature(enable = "aes")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
 unsafe fn butterfly_fused_2layer_low_lazy(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+) {
+    unsafe {
+        if ntt_low_pair_absorb_enabled() {
+            butterfly_fused_2layer_low_lazy_impl::<true>(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        } else {
+            butterfly_fused_2layer_low_lazy_impl::<false>(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+        }
+    }
+}
+
+/// The lazy low-twiddle fused pair. `ABSORB = true`: layer L's second
+/// output `c1 = c + a1` only seeds row c's layer-L+1 chain, so it is never
+/// formed; that chain starts from `a1` (`lc = a1 + (d1 * t_inner_b).lo`) and
+/// `c` joins the chain's x^64 fold as the extra summand of
+/// [`fold_x64_plus_into`] (the accumulator of its `pmull2` slot). Same
+/// summands, same products: bit-identical outputs, one `eor` less per lane
+/// (the `butterfly_fused_2layer_row_with_const_q` absorb, applied to the
+/// low-twiddle pair).
+#[target_feature(enable = "aes")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn butterfly_fused_2layer_low_lazy_impl<const ABSORB: bool>(
     a: &mut [F128],
     b: &mut [F128],
     c: &mut [F128],
@@ -1584,7 +1633,18 @@ unsafe fn butterfly_fused_2layer_low_lazy(
             let (na, nc, p) = butterfly_low_lazy_q(xa, xc, to, zero);
             let (nb, nd) = butterfly_low_fold_q(xb, xd, to, zero);
             let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
-            let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
+            let (fc, fd) = if ABSORB {
+                // `butterfly_low_fold_q(nc, nd, tb, p)` with `nc = xc + na`.
+                let hi = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                    vreinterpretq_p64_u64(nd),
+                    vreinterpretq_p64_u64(tb),
+                ));
+                let lc = fused_pmull_lo_acc(na, nd, tb);
+                let fc = fold_x64_plus_into(lc, veorq_u64(hi, p), xc);
+                (fc, veorq_u64(nd, fc))
+            } else {
+                butterfly_low_fold_q(nc, nd, tb, p)
+            };
             vst1q_u64(ea.offset(off).cast::<u64>(), fa);
             vst1q_u64(eb.offset(off).cast::<u64>(), fb);
             vst1q_u64(ec.offset(off).cast::<u64>(), fc);
@@ -1664,6 +1724,7 @@ pub(super) unsafe fn butterfly_fused_2layer_low_lazy_zero_tail_blocks<F>(
     debug_assert!(zero_tail < num_ntts);
     debug_assert!(blocks.len().is_multiple_of(4 * num_ntts));
     let dense = num_ntts - zero_tail;
+    let absorb = ntt_low_pair_absorb_enabled();
     unsafe {
         use core::arch::aarch64::*;
         let zero = vdupq_n_u64(0);
@@ -1676,7 +1737,11 @@ pub(super) unsafe fn butterfly_fused_2layer_low_lazy_zero_tail_blocks<F>(
             let (b, b_tail) = b.split_at_mut(dense);
             let (c, c_tail) = c.split_at_mut(dense);
             let (d, d_tail) = d.split_at_mut(dense);
-            butterfly_fused_2layer_low_lazy(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+            if absorb {
+                butterfly_fused_2layer_low_lazy_impl::<true>(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+            } else {
+                butterfly_fused_2layer_low_lazy_impl::<false>(a, b, c, d, t_outer, t_inner_a, t_inner_b);
+            }
 
             let to = vdupq_n_u64(t_outer.lo);
             debug_assert!(
@@ -2509,6 +2574,78 @@ unsafe fn butterfly_fused_2layer_rows_impl<const PREPARED: bool>(
     }
 }
 
+/// One job of a parallel fused pair over a block with a zero odd tail:
+/// `a, b, c, d` hold the same consecutive quarter-rows of the four quarters,
+/// `num_ntts` lanes per row, the first row of even position. In every odd
+/// row the last `odd_tail` lanes are zero in all four quarters (the ranked
+/// zero tail; a block whose quarter is even keeps one parity per row
+/// group), and a butterfly of zeros writes zeros, so those lanes are left
+/// as they are: an even row and the live lanes of the next odd row are
+/// adjacent, one run of `2 * num_ntts - odd_tail` lanes. Each run takes the
+/// row kernels of [`butterfly_fused_2layer_rows`] (the prepared form, with
+/// the absorbed sum unless `FLOCK_NO_NTT_ABSORB` is set; twiddles prepared
+/// once per call).
+///
+/// # Safety
+/// Requires the `aes` target feature; equal slice lengths, a multiple of
+/// `num_ntts`; `odd_tail < num_ntts`; the odd rows' tail lanes are zero.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_2layer_row_group_live(
+    a: &mut [F128],
+    b: &mut [F128],
+    c: &mut [F128],
+    d: &mut [F128],
+    t_outer: F128,
+    t_inner_a: F128,
+    t_inner_b: F128,
+    num_ntts: usize,
+    odd_tail: usize,
+) {
+    use core::arch::aarch64::*;
+    debug_assert!(odd_tail < num_ntts);
+    debug_assert!(a.len().is_multiple_of(num_ntts));
+    debug_assert!(a.len() == b.len() && a.len() == c.len() && a.len() == d.len());
+    unsafe {
+        let to = vld1q_u64((&raw const t_outer).cast::<u64>());
+        let ta = vld1q_u64((&raw const t_inner_a).cast::<u64>());
+        let tb = vld1q_u64((&raw const t_inner_b).cast::<u64>());
+        let prepared = if use_const_fold() {
+            Some((const_coeffs(to), const_coeffs(ta), const_coeffs(tb)))
+        } else {
+            None
+        };
+        let absorb = prepared.is_some() && use_ntt_absorb();
+        let rows = a.len() / num_ntts;
+        let mut r = 0;
+        while r < rows {
+            let start = r * num_ntts;
+            let len = if r + 1 < rows { 2 * num_ntts - odd_tail } else { num_ntts };
+            debug_assert!(
+                b[start + len..(start + 2 * num_ntts).min(b.len())]
+                    .iter()
+                    .chain(&d[start + len..(start + 2 * num_ntts).min(d.len())])
+                    .chain(&a[start + len..(start + 2 * num_ntts).min(a.len())])
+                    .chain(&c[start + len..(start + 2 * num_ntts).min(c.len())])
+                    .all(|x| *x == F128::ZERO),
+                "live fused pair needs zero tail lanes in every odd row"
+            );
+            let (ra, rb) = (&mut a[start..start + len], &mut b[start..start + len]);
+            let (rc, rd) = (&mut c[start..start + len], &mut d[start..start + len]);
+            match prepared {
+                Some((to, ta, tb)) if absorb => {
+                    butterfly_fused_2layer_row_with_const_q::<true>(ra, rb, rc, rd, to, ta, tb);
+                }
+                Some((to, ta, tb)) => {
+                    butterfly_fused_2layer_row_with_const_q::<false>(ra, rb, rc, rd, to, ta, tb);
+                }
+                None => butterfly_fused_2layer_row_with_q(ra, rb, rc, rd, to, ta, tb),
+            }
+            r += 2;
+        }
+    }
+}
+
 #[cfg(test)]
 mod const_fold_tests {
     use super::*;
@@ -2714,6 +2851,80 @@ mod low_pmull_tests {
         }
         assert_eq!(cases, 448);
         assert_eq!(modes_seen, [448; 3]);
+    }
+
+    /// Both lane bodies of the lazy low-twiddle pair (the absorbed c seed,
+    /// `ABSORB = true`, and the incumbent) give the independent polynomial
+    /// oracle's four outputs: random and zero inputs, twiddles zero, one,
+    /// `u64::MAX`, random and mixed per position, lane counts up to 257 and
+    /// the suffix shape of 64 lanes whose last 7 have zero b and d rows.
+    #[test]
+    fn low_pair_absorbed_matches_scalar() {
+        let mut cases = 0;
+        for seed in 0..16u64 {
+            for n in [1usize, 2, 3, 7, 31, 57, 64, 129, 257] {
+                let mut state = 0xab50_7bed ^ seed;
+                let mut input: Vec<F128> = (0..4 * n)
+                    .map(|_| F128::new(random(&mut state), random(&mut state)))
+                    .collect();
+                if seed == 1 {
+                    input.fill(F128::ZERO);
+                }
+                if n == 64 && seed % 2 == 0 {
+                    for i in 57..64 {
+                        input[n + i] = F128::ZERO;
+                        input[3 * n + i] = F128::ZERO;
+                    }
+                }
+                let sets = [
+                    [F128::ZERO; 3],
+                    [F128::ONE; 3],
+                    [F128::new(u64::MAX, 0); 3],
+                    core::array::from_fn(|_| F128::new(random(&mut state), 0)),
+                    [F128::ONE, F128::ZERO, F128::new(u64::MAX, 0)],
+                    [F128::new(random(&mut state), 0), F128::new(u64::MAX, 0), F128::ZERO],
+                ];
+                for t in sets {
+                    let mut expected = vec![F128::ZERO; 4 * n];
+                    for i in 0..n {
+                        let a = input[i] + scalar_mul(input[2 * n + i], t[0]);
+                        let c = input[2 * n + i] + a;
+                        let b = input[n + i] + scalar_mul(input[3 * n + i], t[0]);
+                        let d = input[3 * n + i] + b;
+                        let aa = a + scalar_mul(b, t[1]);
+                        let bb = b + aa;
+                        let cc = c + scalar_mul(d, t[2]);
+                        let dd = d + cc;
+                        expected[i] = aa;
+                        expected[n + i] = bb;
+                        expected[2 * n + i] = cc;
+                        expected[3 * n + i] = dd;
+                    }
+                    for absorb in [true, false] {
+                        let mut actual = input.clone();
+                        let (a, rest) = actual.split_at_mut(n);
+                        let (b, rest) = rest.split_at_mut(n);
+                        let (c, d) = rest.split_at_mut(n);
+                        unsafe {
+                            if absorb {
+                                butterfly_fused_2layer_low_lazy_impl::<true>(a, b, c, d, t[0], t[1], t[2]);
+                            } else {
+                                butterfly_fused_2layer_low_lazy_impl::<false>(a, b, c, d, t[0], t[1], t[2]);
+                            }
+                        }
+                        for (actual, expected) in actual.iter().zip(&expected) {
+                            assert_eq!(
+                                (actual.lo, actual.hi),
+                                (expected.lo, expected.hi),
+                                "seed={seed}, lanes={n}, absorb={absorb}"
+                            );
+                        }
+                    }
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 16 * 9 * 6);
     }
 }
 
