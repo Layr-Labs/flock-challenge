@@ -4524,6 +4524,193 @@ unsafe fn apply_word_z_low<const NB: u32>(
     }
 }
 
+/// Row-body variant bit (with [`ABV_TRANSFORM_TRIM`], [`ABV_FUSE`] and the
+/// z-basis plain apply): in each static-B Horner row the one `x^4` word
+/// (`k >= 4`) whose B varies only in `NB <= 4` consecutive bytes at the low
+/// or the high end of the word takes its weight on the B side. Its A word is
+/// applied out of the plain image (the z-basis form, 15 lookups instead of
+/// the 18 of the `x^4` Karatsuba image) and its B word out of the `x^4`
+/// image's Karatsuba tables restricted to the varying bytes
+/// ([`apply_word_sparse_x4`]; no table is added to the row's working set). In every lane `(x^4·T(a))·T(b)` and
+/// `T(a)·(x^4·T(b))` are 8×8-bit carry-less products of bytes that are
+/// congruent mod p, so the Horner sum, its carry folds and the final
+/// reduction write the same bytes.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_SPARSE_SCALE: u32 = 1 << 20;
+
+/// Kill switch for [`ABV_SPARSE_SCALE`]: exactly `FLOCK_NO_AB_SPARSE_SCALE=1`
+/// takes the per-chunk rows in the main-pool window unit (no second unit
+/// instance, build budget), which write the same bytes. Read once per
+/// process; kept free of generic code (no closure, no `OnceLock` instance).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_sparse_scale_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0: not read yet, 1: on, 2: off.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("FLOCK_NO_AB_SPARSE_SCALE").as_deref() != Some(std::ffi::OsStr::new("1"));
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// `x^4·T(b)` of a guarded static-B word `b` under [`ABV_TRANSFORM_TRIM`]
+/// whose varying bytes are the `NB` (1..=4) bytes `0..NB` (`HIGH = false`)
+/// or `8-NB..8` (`HIGH = true`); `nb` is `!b`, which the row guard makes
+/// zero at every other byte. `T` is GF(2)-linear and `T(all-ones)` is
+/// `[1; 64]`, so `x^4·T(b) = [x^4; 64] ^ x^4·T(nb)`.
+///
+/// `x^4·T(nb)` is read out of the `x^4` image's Karatsuba tables (`kscaled`,
+/// 128-byte entries `C0, C1, C2, C3, C0^C1, C2^C3, ...`), which the row's
+/// other `x^4` words read anyway: no table is added to the row's working
+/// set. In the lane z form of that apply (see `apply_word_kara_lanez` and
+/// [`apply_word_kara`]) every lookup indexed by a byte that is zero reads
+/// row 0, which is zero; with bytes 4..8 zero only four remain:
+/// `out_q = E_q ^ sw(O_q)` with `E_q = C_q(v0) ^ M_q(s2)` and
+/// `O_q = C_q(v1) ^ M_q(s3)`, where `v0 = b0^b2`, `v1 = b1^b3`, `s2 = b2`,
+/// `s3 = b3`, `M_0 = M_1` the `C0^C1` slot and `M_2 = M_3` the `C2^C3` slot,
+/// and `sw` the 8-byte half exchange. Lookups of bytes the width leaves zero
+/// are not made: 4, 8, 10 or 12 reads for one to four bytes.
+///
+/// High bytes: output block `n` receives `R_(n^j)(W_j)` from byte `j` (see
+/// [`xor_vary_single`]), so the byte-reversed word (byte `j` at
+/// `7 - j = j ^ 7`) gives the low form with output block `n` read from
+/// block `n ^ 7`: register `q` is register `3 - q` with its two halves
+/// exchanged, which moves `sw` from `O` to `E`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_sparse_x4<const NB: u32, const HIGH: bool>(
+    kscaled: *const u8,
+    nb: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    const { assert!(NB >= 1 && NB <= 4) };
+    unsafe {
+        let w = if HIGH { nb.swap_bytes() } else { nb };
+        // Bytes 0, 1 of `v`: b0 ^ b2, b1 ^ b3 (b2 = b3 = 0 below width 3).
+        let v = if NB >= 3 { w ^ (w >> 16) } else { w };
+        let ld = |base: *const u8, off: usize| vld1q_u8(base.add(off));
+        // An opaque entry address, so the slots of one index load as `ldp` pairs.
+        let at = |i: usize| -> *const u8 {
+            let a: usize;
+            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) kscaled, i = in(reg) i,
+                options(pure, nomem, nostack, preserves_flags));
+            a as *const u8
+        };
+        let z = vdupq_n_u8(0);
+        let a = at(ab_z_idx::<0, 7>(v));
+        let (mut e0, mut e1, mut e2, mut e3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
+        let (mut o0, mut o1, mut o2, mut o3) = (z, z, z, z);
+        if NB >= 2 {
+            let a = at(ab_z_idx::<1, 7>(v));
+            (o0, o1, o2, o3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
+        }
+        if NB >= 3 {
+            let a = at(ab_z_idx::<2, 7>(w));
+            let (m01, m23) = (ld(a, 64), ld(a, 80));
+            (e0, e1, e2, e3) = (veorq_u8(e0, m01), veorq_u8(e1, m01), veorq_u8(e2, m23), veorq_u8(e3, m23));
+        }
+        if NB >= 4 {
+            let a = at(ab_z_idx::<3, 7>(w));
+            let (m01, m23) = (ld(a, 64), ld(a, 80));
+            (o0, o1, o2, o3) = (veorq_u8(o0, m01), veorq_u8(o1, m01), veorq_u8(o2, m23), veorq_u8(o3, m23));
+        }
+        // x^4 · 1 in GF(2^8).
+        let c = vdupq_n_u8(0x10);
+        let sw = |x: uint8x16_t| vextq_u8::<8>(x, x);
+        if NB == 1 {
+            return if HIGH {
+                (veorq_u8(c, sw(e3)), veorq_u8(c, sw(e2)), veorq_u8(c, sw(e1)), veorq_u8(c, sw(e0)))
+            } else {
+                (veorq_u8(c, e0), veorq_u8(c, e1), veorq_u8(c, e2), veorq_u8(c, e3))
+            };
+        }
+        if HIGH {
+            (xor3_u8(c, o3, sw(e3)), xor3_u8(c, o2, sw(e2)), xor3_u8(c, o1, sw(e1)), xor3_u8(c, o0, sw(e0)))
+        } else {
+            (xor3_u8(c, e0, sw(o0)), xor3_u8(c, e1, sw(o1)), xor3_u8(c, e2, sw(o2)), xor3_u8(c, e3, sw(o3)))
+        }
+    }
+}
+
+/// [`apply_word_sparse_x4`] equals the `x^4`-scaled apply of the whole word
+/// ([`apply_word_into_4_regs`] out of the scaled image) for every static-B
+/// word shape it serves (`NB` = 1..4 low or high varying bytes, all other
+/// bytes 0xff): every byte value at every varying position, and random
+/// varying bytes.
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_sparse_x4_apply_matches_scaled_apply() {
+    use crate::ntt::AdditiveNttGf8;
+    use core::arch::aarch64::*;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let kara = ab_kara_tables(&table);
+    let bytes = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| {
+        let mut out = [0u8; 64];
+        // SAFETY: four 16-byte stores into a 64-byte array.
+        unsafe {
+            vst1q_u8(out.as_mut_ptr(), v.0);
+            vst1q_u8(out.as_mut_ptr().add(16), v.1);
+            vst1q_u8(out.as_mut_ptr().add(32), v.2);
+            vst1q_u8(out.as_mut_ptr().add(48), v.3);
+        }
+        out
+    };
+    let mut x = 0x5EED_5CA1_E0F4_0001u64;
+    let mut checked = 0usize;
+    macro_rules! case {
+        ($nb:literal, $high:literal) => {{
+            let vary: u64 = if $nb == 8 { u64::MAX } else { (1u64 << (8 * $nb)) - 1 };
+            let vary = if $high { vary.swap_bytes() } else { vary };
+            for i in 0..(256 * $nb + 4000) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let v = if i < 256 * $nb {
+                    let pos = if $high { 7 - (i / 256) } else { i / 256 };
+                    ((i % 256) as u64) << (8 * pos)
+                } else {
+                    x & vary
+                };
+                // The guarded word: every static byte 0xff, varying bytes `!v`.
+                let b = !v;
+                // SAFETY: the applies read inside the table images only.
+                let (got, want) = unsafe {
+                    (
+                        bytes(apply_word_sparse_x4::<$nb, $high>(kara.wrapping_add(AB_KARA_IMAGE_BYTES), !b)),
+                        bytes(apply_word_into_4_regs(
+                            table.scaled_x4_data_ptr(),
+                            table.scaled_x4_half_swapped_data_ptr(),
+                            b,
+                        )),
+                    )
+                };
+                assert_eq!(got, want, "nb={} high={} b={b:016x}", $nb, $high);
+                checked += 1;
+            }
+        }};
+    }
+    case!(1, false);
+    case!(1, true);
+    case!(2, false);
+    case!(2, true);
+    case!(3, false);
+    case!(3, true);
+    case!(4, false);
+    case!(4, true);
+    assert_eq!(checked, 256 * 20 + 8 * 4000);
+}
+
 /// Test access: one static-B word `(blk, k)` of a plan whose varying bytes
 /// are `0..NB`, through the partial path (per-byte rows) and through the
 /// partial image plus [`apply_word_z_low`]; `w` must match the plan's
