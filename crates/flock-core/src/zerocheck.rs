@@ -75,7 +75,14 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+    fn read() -> bool {
+        std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+    }
+    if multilinear::zc_gate_latch_enabled() {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *OFF;
+    }
+    read()
 }
 
 /// Test-only forced-off latch for the second-level cascade (rounds 5+6),
@@ -96,7 +103,14 @@ fn cascade2_off() -> bool {
     if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
+    fn read() -> bool {
+        std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
+    }
+    if multilinear::zc_gate_latch_enabled() {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *OFF;
+    }
+    read()
 }
 
 /// Test-only forced-off latch for the third-level cascade (rounds 7+8),
