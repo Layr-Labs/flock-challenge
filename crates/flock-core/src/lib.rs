@@ -88,6 +88,19 @@ pub(crate) fn small_serial_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_SMALL_SERIAL).as_deref() != Some(std::ffi::OsStr::new("1")))
 }
 
+/// Kill switch for keeping the path-switch environment reads of the
+/// zerocheck, lincheck, NTT, grinding and witness-stripe gates once per
+/// process (`FLOCK_NO_PATH_ENV_ONCE`, any value: each gate reads its variable
+/// from the process environment on every call, as before). Read once per
+/// process.
+pub const ENV_NO_PATH_ENV_ONCE: &str = "FLOCK_NO_PATH_ENV_ONCE";
+
+pub fn path_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_PATH_ENV_ONCE).is_none());
+    *ON
+}
+
 /// Unlike `ab_compact_store_enabled` this does **not** latch the first read
 /// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
 /// per-call `var_os` read is noise, and re-reading keeps same-process A/B
