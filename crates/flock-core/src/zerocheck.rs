@@ -30,7 +30,8 @@ use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into,
     fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_in_place_pair, fold2_compact_and_round4_into,
     fold2_plain_and_round6_into, fold2_plain_and_round67_into,
-    eq_drop_first, fold_in_place_and_round_pair_with_eq, interpolate_at_z_combined,
+    eq_drop_first, fold3_in_place_and_round_pair_with_eq, fold_in_place_and_round_pair_with_eq,
+    interpolate_at_z_combined,
     interpolate_at_z_on_lambda, round_pair_naive_with_eq,
     uni_skip_fold_and_round_pair_compact_padded_lookahead_for,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
@@ -44,6 +45,22 @@ fn zc_tail_fused_fold_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os("FLOCK_NO_ZC_TAIL_FUSED_FOLD").is_none()
     });
+    *ON
+}
+
+/// Tail fold3 (`FLOCK_NO_ZC_TAIL_FOLD3`, any value, keeps the record's two
+/// passes): the terminal tri lookahead reuse binds the numeric arrays at its
+/// two draws with [`fold2_in_place_pair`], and the first numeric loop round
+/// then binds them again at a challenge that was already drawn before that
+/// fold2 (the second lookahead's draw) and scans them for its message. When
+/// that round takes the serial fused path, the fold2 is deferred into it:
+/// [`fold3_in_place_and_round_pair_with_eq`] does the three binds and the
+/// message in one traversal, without storing and re-reading the quarter-size
+/// tables. Same field operations in the same order, same transcript, same
+/// proof bytes. Read once per process.
+fn zc_tail_fold3_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_FOLD3").is_none());
     *ON
 }
 
@@ -1052,6 +1069,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // `loop_start` is the first tail iteration this route has not already
     // produced. The loop body's `r_next[1..] = r[k_skip + i + 2..]` is already
     // indexed by `i`, so starting at 2 (or 4) needs no other change.
+    // Tail fold3 (`zc_tail_fold3_enabled`): the terminal tri reuse's two
+    // draws, when its fold2 is deferred into the first loop round.
+    let mut tail_fold2: Option<(F128, F128)> = None;
     let (mut a_mlv, mut b_mlv, loop_start) = if let Some(la) = lookahead {
         // Round three: evaluate the deferred quadratic. No pass at all.
         let (first_m1, first_mi) = eval_round3_lookahead(&la, mlv_rhos[0]);
@@ -1283,7 +1303,18 @@ fn prove_packed_padded_inner<C: Challenger>(
                     challenger.observe_f128(n1);
                     challenger.observe_f128(ninf);
                     mlv_rhos.push(challenger.sample_f128());
-                    if zc_tri_reuse_fold2_enabled() {
+                    // Tail fold3: defer this fold2 into the first loop round
+                    // when that round runs at all and takes the serial fused
+                    // path (its input, the fold2 output, below 2^15).
+                    let defer = zc_tri_reuse_fold2_enabled()
+                        && zc_tail_fused_fold_enabled()
+                        && zc_tail_fold3_enabled()
+                        && loop_start + 2 < n_mlv - 1
+                        && cur_a.len() >= 16
+                        && cur_a.len() / 4 < (1usize << 15);
+                    if defer {
+                        tail_fold2 = Some((mlv_rhos[k - 1], mlv_rhos[k]));
+                    } else if zc_tri_reuse_fold2_enabled() {
                         fold2_in_place_pair(&mut cur_a, &mut cur_b, mlv_rhos[k - 1], mlv_rhos[k]);
                     } else {
                         fold_in_place_pair(&mut cur_a, &mut cur_b, mlv_rhos[k - 1]);
@@ -1562,7 +1593,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     // parallel speedup — a fresh 64 MB buffer per round, we alternate between
     // two persistent buffers. Scratch capacity = N/2 (the largest fused
     // output); only needed when the first round is actually fused.
-    let n_in = a_mlv.len();
+    // A deferred fold2 (tail fold3) leaves the arrays four times the size the
+    // loop starts from; size the scratch for the size the loop sees.
+    let n_in = a_mlv.len() >> if tail_fold2.is_some() { 2 } else { 0 };
     let (mut a_nxt, mut b_nxt) = if n_in >= 1024 {
         (
             crate::scratch::take_f128(n_in / 2),
@@ -1585,7 +1618,9 @@ fn prove_packed_padded_inner<C: Challenger>(
     for i in loop_start..(n_mlv - 1) {
         let t_round_i = std::time::Instant::now();
         let rho_prev = mlv_rhos[i];
-        let log_n_before = a_mlv.len().trailing_zeros() as usize;
+        // With a deferred fold2 the arrays still hold its input (4x).
+        let cur_len = a_mlv.len() >> if tail_fold2.is_some() { 2 } else { 0 };
+        let log_n_before = cur_len.trailing_zeros() as usize;
 
         // r_next for the next round's message: length log_n_before - 1.
         // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
@@ -1594,6 +1629,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
 
         let (m1, mi) = if log_n_before >= 15 {
+            assert!(tail_fold2.is_none(), "tail fold3 deferred into a parallel round");
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,
@@ -1613,13 +1649,23 @@ fn prove_packed_padded_inner<C: Challenger>(
             b_mlv.truncate(half);
             (m1, mi)
         } else {
-            let want = a_mlv.len() / 4;
+            let want = cur_len / 4;
             tail_eq = if tail_eq_reuse && tail_eq.len() == 2 * want {
                 eq_drop_first(&tail_eq)
             } else {
                 univariate_skip::build_eq(&r_next[1..])
             };
-            if zc_tail_fused_fold_enabled() {
+            if let Some((r1, r2)) = tail_fold2.take() {
+                fold3_in_place_and_round_pair_with_eq(
+                    &mut a_mlv,
+                    &mut b_mlv,
+                    r1,
+                    r2,
+                    rho_prev,
+                    r_next[0],
+                    &tail_eq,
+                )
+            } else if zc_tail_fused_fold_enabled() {
                 fold_in_place_and_round_pair_with_eq(
                     &mut a_mlv,
                     &mut b_mlv,
@@ -1651,6 +1697,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             crate::epool::helper_chunks_claimed() - hetero_claimed_before
         );
     }
+
+    assert!(tail_fold2.is_none(), "tail fold3: deferred fold2 not consumed");
 
     // ---- 8. Final binding at ρ_{n_mlv} (the last challenge) ----
     let rho_last = *mlv_rhos.last().expect("at least one ρ sampled");

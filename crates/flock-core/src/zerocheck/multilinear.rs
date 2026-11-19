@@ -812,6 +812,64 @@ pub fn fold_in_place_and_round_pair_with_eq(
     (r_0 * g_one.reduce(), g_inf.reduce())
 }
 
+/// [`fold2_in_place_pair`] at `(r1, r2)` followed by
+/// [`fold_in_place_and_round_pair_with_eq`] at `challenge`, in one pass.
+///
+/// Per output pair `x'` it reads the sixteen inputs `16x'..16x'+15`, forms
+/// the four two-variable folds `p_j` exactly as [`fold2_in_place_pair`] does
+/// (`a01 = a[4y] + r1·(a[4y+1] + a[4y])`, `a23` likewise,
+/// `p = a01 + r2·(a23 + a01)`, `y = 4x' + j`), then binds `challenge` on
+/// `(p0, p1)` and `(p2, p3)` and accumulates the round message from those two
+/// values exactly as [`fold_in_place_and_round_pair_with_eq`] does. Same field
+/// operations in the same order, so the outputs and the message are
+/// bit-identical to the two calls; the quarter-size table between them is
+/// never stored or re-read. Writes land at `2x'`, `2x'+1`, which every later
+/// read (`16x'' ≥ 16x' + 16`) is past.
+pub fn fold3_in_place_and_round_pair_with_eq(
+    a: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    r1: F128,
+    r2: F128,
+    challenge: F128,
+    r_0: F128,
+    eq_remaining: &[F128],
+) -> (F128, F128) {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 16);
+    let sixteenth = n / 16;
+    assert_eq!(eq_remaining.len(), sixteenth);
+
+    #[inline(always)]
+    fn f2(v: &[F128], y: usize, r1: F128, r2: F128) -> F128 {
+        let v01 = v[4 * y] + r1 * (v[4 * y + 1] + v[4 * y]);
+        let v23 = v[4 * y + 2] + r1 * (v[4 * y + 3] + v[4 * y + 2]);
+        v01 + r2 * (v23 + v01)
+    }
+
+    let mut g_one = F256Unreduced::ZERO;
+    let mut g_inf = F256Unreduced::ZERO;
+    for x_prime in 0..sixteenth {
+        let y = 4 * x_prime;
+        let (pa0, pa1, pa2, pa3) = (f2(a, y, r1, r2), f2(a, y + 1, r1, r2), f2(a, y + 2, r1, r2), f2(a, y + 3, r1, r2));
+        let (pb0, pb1, pb2, pb3) = (f2(b, y, r1, r2), f2(b, y + 1, r1, r2), f2(b, y + 2, r1, r2), f2(b, y + 3, r1, r2));
+        let a0 = pa0 + challenge * (pa1 + pa0);
+        let a1 = pa2 + challenge * (pa3 + pa2);
+        let b0 = pb0 + challenge * (pb1 + pb0);
+        let b1 = pb2 + challenge * (pb3 + pb2);
+        a[2 * x_prime] = a0;
+        a[2 * x_prime + 1] = a1;
+        b[2 * x_prime] = b0;
+        b[2 * x_prime + 1] = b1;
+        let eq_x = eq_remaining[x_prime];
+        g_one ^= eq_x.mul_unreduced(a1 * b1);
+        g_inf ^= eq_x.mul_unreduced((a0 + a1) * (b0 + b1));
+    }
+    a.truncate(2 * sixteenth);
+    b.truncate(2 * sixteenth);
+    (r_0 * g_one.reduce(), g_inf.reduce())
+}
+
 /// The equality table of a challenge suffix one shorter: `eq(r[1..])[x] =
 /// eq(r)[2x] + eq(r)[2x + 1]`, since `eq(r_0, 0) + eq(r_0, 1) = 1` exactly.
 /// One XOR per entry where a fresh table takes one product per entry.
@@ -6972,6 +7030,26 @@ mod tests {
                 round_pair_naive_with_eq(&a, &b, r[0], &build_eq(&r[1..])),
                 round_pair_naive(&a, &b, &r)
             );
+        }
+    }
+
+    #[test]
+    fn fold3_tail_matches_fold2_then_fused_round() {
+        let mut rng = Rng::new(0xf01d_3a11);
+        for log_n in 4usize..=13 {
+            let n = 1usize << log_n;
+            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
+            let (r1, r2, rho, r_0) = (rng.f128(), rng.f128(), rng.f128(), rng.f128());
+            let r: Vec<F128> = (0..log_n - 4).map(|_| rng.f128()).collect();
+            let eq = build_eq(&r);
+            let (mut a2, mut b2) = (a.clone(), b.clone());
+            fold2_in_place_pair(&mut a2, &mut b2, r1, r2);
+            let want = fold_in_place_and_round_pair_with_eq(&mut a2, &mut b2, rho, r_0, &eq);
+            let (mut a1, mut b1) = (a, b);
+            let got = fold3_in_place_and_round_pair_with_eq(&mut a1, &mut b1, r1, r2, rho, r_0, &eq);
+            assert_eq!(got, want, "log_n {log_n}");
+            assert_eq!((a1, b1), (a2, b2), "log_n {log_n}");
         }
     }
 
