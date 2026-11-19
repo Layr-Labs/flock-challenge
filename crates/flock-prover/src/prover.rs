@@ -153,13 +153,34 @@ fn ranked_identity_prefix_omission_contract(
     {
         return None;
     }
+    // The gate above already holds `r1cs.c0_is_identity()`; the statement
+    // checks reuse it instead of rescanning C (`FLOCK_NO_PINNED_STMT_CACHED_ID`).
+    let cached = pinned_stmt_cached_identity_enabled();
     if std::env::var_os(ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT).as_deref()
         != Some(std::ffi::OsStr::new("1"))
-        && let Some(statement) = r1cs.round1_pinned_one_prefix_and_output_statement()
+        && let Some(statement) = if cached {
+            r1cs.round1_pinned_one_prefix_and_output_statement_cached_identity()
+        } else {
+            r1cs.round1_pinned_one_prefix_and_output_statement()
+        }
     {
         return Some(statement);
     }
-    r1cs.round1_pinned_one_prefix_statement()
+    if cached {
+        r1cs.round1_pinned_one_prefix_statement_cached_identity()
+    } else {
+        r1cs.round1_pinned_one_prefix_statement()
+    }
+}
+
+/// Kill switch for reusing the cached C-identity check in the ranked
+/// identity-prefix statement (`FLOCK_NO_PINNED_STMT_CACHED_ID`, any value:
+/// the statement checks rescan C on every prove, as before). Read once per
+/// process.
+fn pinned_stmt_cached_identity_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_PINNED_STMT_CACHED_ID").is_none());
+    *ON
 }
 
 /// `FLOCK_NO_OPEN_C_CANONICAL_REUSE=1` makes the open re-collapse C's
@@ -672,7 +693,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             }
             _ => false,
         };
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = flock_core::phase_timing_env_on();
     flock_core::tmark::mark("open start");
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
@@ -2660,7 +2681,7 @@ where
             // The stripe fill lost the race to the graph; staging would
             // read torn bytes. Skip — the incumbent zerocheck-entry
             // submit runs.
-            if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+            if flock_core::zc_timing_env_on() {
                 eprintln!("[commit-tail-fill] skipped: stripe not ready");
             }
             return;
@@ -2842,7 +2863,7 @@ fn commit_with_round1_ab_precompute(
             flock_core::tmark::mark("ab arm end");
             flock_core::gpu_commit::note_ab_arm_running(false);
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
-            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            if flock_core::phase_timing_env_on() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
@@ -2956,7 +2977,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = flock_core::phase_timing_env_on();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
                       stripe_help: Option<&(dyn Fn() + Sync)>,
                       producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
