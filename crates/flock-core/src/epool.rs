@@ -502,16 +502,18 @@ const EPOOL_MIN_CHUNKS: usize = 4;
 /// never observable in the output, only in which pool claims each chunk.
 /// `true` while the helper pool's workers stay in [`hot_spin_body`].
 static HOT_SPIN: AtomicBool = AtomicBool::new(false);
-/// `FLOCK_NO_EPOOL_HOT`, read by [`hot_spin_arm`].
-static HOT_SPIN_OFF: AtomicBool = AtomicBool::new(false);
+/// The hot helper spin is opt-in: `FLOCK_EPOOL_HOT` (any value) turns it on,
+/// read by [`hot_spin_arm`]. Off by default.
+static HOT_SPIN_OFF: AtomicBool = AtomicBool::new(true);
 /// Upper bound on one hot spin, should [`hot_spin_release`] never be reached.
 const HOT_SPIN_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Read the hot helper spin's kill switch (`FLOCK_NO_EPOOL_HOT`, any value)
+/// Read the hot helper spin's opt-in (`FLOCK_EPOOL_HOT`, any value; unset =
+/// off, so helper workers park between drains as they did before the spin)
 /// and make sure the helper pool exists. Called where the main pool's hot
 /// spin is armed, outside any timed interval.
 pub(crate) fn hot_spin_arm() {
-    HOT_SPIN_OFF.store(std::env::var_os("FLOCK_NO_EPOOL_HOT").is_some(), Ordering::Relaxed);
+    HOT_SPIN_OFF.store(std::env::var_os("FLOCK_EPOOL_HOT").is_none(), Ordering::Relaxed);
     let _ = epool();
 }
 
