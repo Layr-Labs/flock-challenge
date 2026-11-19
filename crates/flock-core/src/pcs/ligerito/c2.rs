@@ -213,14 +213,14 @@ impl Dual {
         )
     }
 
-    pub(super) fn new_sync<'a>(
+    pub(super) fn new_sync(
         depth: usize,
         log_d: usize,
         log_inv_rate: usize,
         lane_challenges: &[F128],
         queries: &[usize],
         alpha: &[F128],
-        row: impl Fn(usize) -> &'a [F128] + Sync,
+        codeword: &[F128],
     ) -> (Self, F128) {
         assert!((2..=3).contains(&depth));
         assert!(log_inv_rate + depth < log_d);
@@ -229,6 +229,39 @@ impl Dual {
         let mask = cache_len - 1;
         let inv_layers = depth + 1;
         let lane_weights = build_eq_table(lane_challenges);
+        let lanes = lane_weights.len();
+        assert_eq!(codeword.len() / lanes, 1usize << log_d);
+        assert_eq!(codeword.len() % lanes, 0);
+        // All rows of one inverse-NTT window are adjacent. Fold four
+        // independent rows per weight load, then invert the same scalar
+        // evaluations as the single-row implementation.
+        let fold_window = |base: usize, cache: &mut [F128; 16]| {
+            use crate::field::f128_slice::fold_banked_slots4_whole_into;
+            let start = base * lanes;
+            let window = &codeword[start..start + lanes * cache_len];
+            for (input, output) in window.chunks_exact(4 * lanes)
+                .zip(cache[..cache_len].chunks_exact_mut(4))
+            {
+                macro_rules! fold4 {
+                    ($lanes:literal) => {
+                        fold_banked_slots4_whole_into::<$lanes>(
+                            lane_weights.as_slice().try_into().unwrap(), input, output, $lanes, false,
+                        )
+                    };
+                }
+                match lanes {
+                    64 => fold4!(64),
+                    8 => fold4!(8),
+                    4 => fold4!(4),
+                    2 => fold4!(2),
+                    _ => {
+                        for (row, out) in input.chunks_exact(lanes).zip(output) {
+                            *out = dot(row, &lane_weights);
+                        }
+                    }
+                }
+            }
+        };
         let weights: Vec<F128> = if queries.is_empty() {
             Vec::new()
         } else {
@@ -262,9 +295,7 @@ impl Dual {
                     let base = q & !mask;
                     let qoff = q - base;
                     let mut cache = [F128::ZERO; 16];
-                    for j in (0..cache_len).step_by(2) {
-                        [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
-                    }
+                    fold_window(base, &mut cache);
                     let enf = w.mul_unreduced(cache[qoff]);
                     *stage_out = invert_local_staged(
                         &ntt,
@@ -303,9 +334,7 @@ impl Dual {
                 let base = q & !mask;
                 let qoff = q - base;
                 let mut cache = [F128::ZERO; 16];
-                for j in (0..cache_len).step_by(2) {
-                    [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
-                }
+                fold_window(base, &mut cache);
                 enf_sum ^= w.mul_unreduced(cache[qoff]);
                 *stage_out = invert_local_staged(
                     &ntt,

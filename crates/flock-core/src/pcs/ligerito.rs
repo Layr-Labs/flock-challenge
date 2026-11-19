@@ -10641,7 +10641,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     &r_lane_fold,
                     &queries_0,
                     &alpha_0,
-                    l0_row,
+                    l0_codeword,
                 )
             },
             open_l0,
@@ -11006,7 +11006,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     &level_rs,
                     &queries_i,
                     &alpha_i,
-                    |q| wtns_prev.row(q),
+                    &wtns_prev.mat,
                 )
             };
             // Small levels (`FLOCK_NO_SMALL_SERIAL=1` kills): the dual and the
