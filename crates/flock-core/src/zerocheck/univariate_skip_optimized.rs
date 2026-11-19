@@ -1731,8 +1731,41 @@ fn ranked_ab_pre_fast_policy_hoist_shape(
 pub const ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST: &str = "FLOCK_NO_ZC_AB_PRE_FAST_POLICY_HOIST";
 
 fn zc_ab_pre_fast_policy_hoist_enabled() -> bool {
-    std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
-        != Some(std::ffi::OsStr::new("1"))
+    fn read() -> bool {
+        std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    }
+    if super::multilinear::zc_gate_latch_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *ON;
+    }
+    read()
+}
+
+fn ab_pre_transform_trim_enabled() -> bool {
+    fn read() -> bool {
+        std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref() != Some(std::ffi::OsStr::new("1"))
+    }
+    if super::multilinear::zc_gate_latch_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *ON;
+    }
+    read()
+}
+
+fn c_round_one_gates() -> (bool, bool, bool) {
+    fn read() -> (bool, bool, bool) {
+        (
+            std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none(),
+            std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none(),
+            std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none(),
+        )
+    }
+    if super::multilinear::zc_gate_latch_enabled() {
+        static ON: std::sync::LazyLock<(bool, bool, bool)> = std::sync::LazyLock::new(read);
+        return *ON;
+    }
+    read()
 }
 
 /// Compile-time default for the QS5 hetero AB-precompute drain (the ranked
@@ -1791,8 +1824,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     // Resolve the rollback once before worker/row dispatch; no table setup.
-    let transform_trim = std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref()
-        != Some(std::ffi::OsStr::new("1"));
+    let transform_trim = ab_pre_transform_trim_enabled();
     if let Some(producer) = producer {
         // Deferred A/B rows: each job produces its units one at a time into
         // a worker-local scratch and transforms them from there, so the
@@ -3348,7 +3380,16 @@ fn ab_eq_fold_from_env() -> AbEqFold {
 }
 
 fn zc_ab_bank_deferred_enabled() -> bool {
-    zc_ab_bank_deferred_enabled_from_value(std::env::var_os(ENV_NO_ZC_AB_BANK_DEFERRED).as_deref())
+    fn read() -> bool {
+        zc_ab_bank_deferred_enabled_from_value(
+            std::env::var_os(ENV_NO_ZC_AB_BANK_DEFERRED).as_deref(),
+        )
+    }
+    if super::multilinear::zc_gate_latch_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *ON;
+    }
+    read()
 }
 
 fn zc_ab_bank_deferred_enabled_from_value(value: Option<&std::ffi::OsStr>) -> bool {
@@ -5710,9 +5751,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
-    let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
-    let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
-    let c_drain4 = std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none();
+    let (split_ab_c, direct_ab_rows, c_drain4) = c_round_one_gates();
 
     // The challenge-independent AB transform finishes while the commitment is
     // still running. Its challenge-weighted completion is therefore a live
