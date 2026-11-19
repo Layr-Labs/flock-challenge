@@ -335,9 +335,9 @@ pub fn use_ranked_from_message_commit(params: &PcsParams) -> bool {
         && crate::epool::epool().is_some()
         && rayon::current_num_threads() > 1
         && params.log_inv_rate == 1
-        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
-        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
-        && std::env::var_os("FLOCK_NO_NTT_FROM_MSG").is_none()
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none())
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none())
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_NTT_FROM_MSG").is_none())
 }
 
 /// [`use_ranked_from_message_commit`] plus the buffer-geometry check
@@ -494,7 +494,7 @@ fn is_ranked_ntt_merkle_leaf_pipeline_shape(params: &PcsParams) -> bool {
 #[inline]
 fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
     is_ranked_ntt_merkle_leaf_pipeline_shape(params)
-        && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none())
 }
 
 #[derive(Clone, Copy)]
