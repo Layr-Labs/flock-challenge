@@ -764,7 +764,7 @@ fn is_ranked_direct_fold2_lookahead_shape(
 fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd)
-        && std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none())
         && crate::epool::epool().is_some()
 }
 
@@ -930,7 +930,7 @@ pub(crate) fn use_open_mat_hetero(
 ) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && is_ranked_open_mat_hetero_shape(packed_len, block_len, claim_count, has_ordinary)
-        && !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
+        && !crate::env_once_sweep!(std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1"))
         && crate::epool::epool().is_some()
 }
 

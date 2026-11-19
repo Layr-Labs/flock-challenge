@@ -17,6 +17,40 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+/// Kill switch for the environment-lookup sweep (`FLOCK_NO_ENV_ONCE_SWEEP`,
+/// any value: every gate wrapped in [`env_once_sweep!`] reads its variables
+/// from the process environment again on every call, as before). Read once
+/// per process.
+pub const ENV_NO_ENV_ONCE_SWEEP: &str = "FLOCK_NO_ENV_ONCE_SWEEP";
+
+#[doc(hidden)]
+#[inline]
+pub fn env_once_sweep_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ENV_ONCE_SWEEP).is_none());
+    *ON
+}
+
+/// Evaluate an environment-only `bool` expression once per process and keep
+/// the answer (one `LazyLock` per expansion site). Used on gates reached more
+/// than once per prove (per round, per level, per pass or from several call
+/// sites); the worker's environment never changes after start, so the first
+/// answer equals every later one. The expression must read only the process
+/// environment (the closure cannot capture locals). `FLOCK_NO_ENV_ONCE_SWEEP`
+/// restores the per-call evaluation.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! env_once_sweep {
+    ($e:expr) => {{
+        if $crate::env_once_sweep_enabled() {
+            static ENV_ONCE_SWEEP: ::std::sync::LazyLock<bool> = ::std::sync::LazyLock::new(|| $e);
+            *ENV_ONCE_SWEEP
+        } else {
+            $e
+        }
+    }};
+}
+
 pub mod bits;
 pub mod challenger;
 pub mod cpu_keepalive;
@@ -86,6 +120,20 @@ pub const ENV_NO_SMALL_SERIAL: &str = "FLOCK_NO_SMALL_SERIAL";
 pub(crate) fn small_serial_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(ENV_NO_SMALL_SERIAL).as_deref() != Some(std::ffi::OsStr::new("1")))
+}
+
+/// Kill switch for the recompute caches (`FLOCK_NO_RECOMPUTE_CACHE`, any
+/// value: every site builds its pure setup again on each call, as before).
+/// The cached values are the ones the per-call build returns: the fused
+/// three-layer twiddle rows of the standard NTTs, the flat single-layer
+/// twiddle slice, and the inverses of the fixed lookahead points. Read once
+/// per process.
+pub const ENV_NO_RECOMPUTE_CACHE: &str = "FLOCK_NO_RECOMPUTE_CACHE";
+
+pub(crate) fn recompute_cache_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_RECOMPUTE_CACHE).is_none());
+    *ON
 }
 
 /// Unlike `ab_compact_store_enabled` this does **not** latch the first read
