@@ -513,10 +513,19 @@ pub(crate) fn pow_scan_reg(
     debug_assert!((1..=32).contains(&bits));
     let fx = pow_fixed(state_digest);
     let mask = word0_mask(bits);
-    unsafe { pow_scan_reg_inner(&fx, start, len, mask) }
+    let end = start.saturating_add(len);
+    // Throughout a low window BLAKE3 message word 9 is zero. Specializing
+    // once per window removes its additions in every vector round.
+    if end <= 1u64 << 32 {
+        unsafe { pow_scan_reg_inner::<true>(&fx, start, end, mask) }
+    } else {
+        unsafe { pow_scan_reg_inner::<false>(&fx, start, end, mask) }
+    }
 }
 
-unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> Option<u64> {
+unsafe fn pow_scan_reg_inner<const LOW_WINDOW: bool>(
+    fx: &PowFixed, start: u64, end: u64, mask: u32,
+) -> Option<u64> {
     unsafe {
         // Broadcast the grind-invariant state once; these stay live across
         // every attempt in the scan.
@@ -525,20 +534,18 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
         let p05 = vdupq_n_u32(fx.p05);
         let maskv = vdupq_n_u32(mask);
 
-        let end = start.saturating_add(len);
         let mut base = start;
-        while base + 12 <= end {
+        while end - base >= 12 {
             #[cfg(feature = "hash-count")]
             crate::challenger::fs_count::POW_SHA256
                 .fetch_add(12, std::sync::atomic::Ordering::Relaxed);
-            // Nonce lanes: scalar build handles the (astronomically rare)
-            // 32-bit carry between lanes for free.
+            // Keep the carry-aware path for scans crossing the u32 boundary.
             let mut lo = [[0u32; 4]; 3];
             let mut hi = [[0u32; 4]; 3];
             for i in 0..12 {
                 let n = base + i as u64;
                 lo[i / 4][i % 4] = n as u32;
-                hi[i / 4][i % 4] = (n >> 32) as u32;
+                hi[i / 4][i % 4] = if LOW_WINDOW { 0 } else { (n >> 32) as u32 };
             }
             let n8 = [
                 vld1q_u32(lo[0].as_ptr()),
