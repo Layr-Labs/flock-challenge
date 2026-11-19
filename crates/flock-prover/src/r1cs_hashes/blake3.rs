@@ -5257,7 +5257,7 @@ impl Blake3Setup {
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && self.pcs_params.merkle_hash == HashKind::Blake3
-            && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
+            && flock_core::env_once_sweep!(std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none())
     }
 
     /// Select the reverse transpose only for the promoted benchmark geometry.
@@ -5278,7 +5278,7 @@ impl Blake3Setup {
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
-            && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+            && flock_core::env_once_sweep!(std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none())
     }
 
     #[inline]
