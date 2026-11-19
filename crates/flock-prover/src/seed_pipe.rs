@@ -461,8 +461,50 @@ static SPEC_BASE: AtomicUsize = AtomicUsize::new(0);
 static SPEC_LEN: AtomicUsize = AtomicUsize::new(0);
 static SPEC_INIT: AtomicU64 = AtomicU64::new(0);
 
+/// `FLOCK_NO_STREAM_TAPER` set (the opt-out of the tapered band schedule of
+/// the streamed witness). The process environment does not change while a
+/// worker runs, so the first answer is kept; `FLOCK_NO_WITNESS_ENV_ONCE`
+/// restores the per-call lookup.
+pub(crate) fn stream_taper_env_off() -> bool {
+    if flock_core::gpu_commit::witness_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_STREAM_TAPER").is_some());
+        return *OFF;
+    }
+    std::env::var_os("FLOCK_NO_STREAM_TAPER").is_some()
+}
+
+/// `FLOCK_NO_BAND_ANY_ORDER` set (the in-order band sequencer), kept the
+/// same way.
+pub(crate) fn band_any_order_env_off() -> bool {
+    if flock_core::gpu_commit::witness_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_BAND_ANY_ORDER").is_some());
+        return *OFF;
+    }
+    std::env::var_os("FLOCK_NO_BAND_ANY_ORDER").is_some()
+}
+
+/// `FLOCK_NO_HOT_CODEWORD` set (the opt-out of the hot codeword path), kept
+/// the same way.
+pub(crate) fn hot_codeword_env_off() -> bool {
+    if flock_core::gpu_commit::witness_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_some());
+        return *OFF;
+    }
+    std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_some()
+}
+
+
 /// Exact-`1` kill for lazy mode; anything else leaves the new path on.
 fn lazy_blocks_killed() -> bool {
+    if flock_core::gpu_commit::witness_env_once_enabled() {
+        static KILLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("FLOCK_NO_SPEC_LAZY_BLOCKS").is_ok_and(|v| v == "1")
+        });
+        return *KILLED;
+    }
     std::env::var("FLOCK_NO_SPEC_LAZY_BLOCKS").is_ok_and(|v| v == "1")
 }
 
@@ -778,6 +820,16 @@ fn speculative_publish_enabled_for(ranked: bool, kill: Option<&OsStr>) -> bool {
 }
 
 fn speculative_publish_enabled() -> bool {
+    if flock_core::gpu_commit::witness_env_once_enabled() {
+        // The worker test and the switch are both fixed for the process.
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            speculative_publish_enabled_for(
+                is_ranked_worker(),
+                std::env::var_os("FLOCK_NO_SPEC_PUBLISH").as_deref(),
+            )
+        });
+        return *ON;
+    }
     speculative_publish_enabled_for(
         is_ranked_worker(),
         std::env::var_os("FLOCK_NO_SPEC_PUBLISH").as_deref(),
@@ -1385,6 +1437,9 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     };
 
     let _ = shared();
+    // RC2 (`FLOCK_NO_RECOMPUTE_CACHE2`): keep the timed prove's AB stripe
+    // programs (pure tables) now, in the untimed warm-up.
+    crate::prover::prewarm_ab_stripe_programs();
     // Committed here, in the warm-up, so the timed expansion never faults.
     let scratch = prefaulted_blocks(1usize << log2_size);
     // The seed-pipe thread reports once it has pre-opened the publication
