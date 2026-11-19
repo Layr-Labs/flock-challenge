@@ -4243,28 +4243,11 @@ pub(crate) mod witgen_simd {
         let n_total = 1usize << n_blocks_log;
         let n_blocks = blocks.len();
         assert!(n_blocks <= n_total);
-        // QS1 seed→witness overlap: when `blocks` is the seed-pipe's lazy
-        // speculative buffer, its slots contain sentinels — the counter-based
-        // generator lets each quad regenerate its own four blocks from the
-        // init constant instead of reading them. `spec_init` is `None` for
-        // every other slice (the wrapper's own blocks, warm-up, tests), leaving
-        // them on the ordinary slab-read path. The quad loop below owns
-        // disjoint 8-block ranges. The default word-major
-        // `gen_quad_soa(init, first)` is pinned
-        // lane-by-lane to four scalar `gen_block` results; that scalar form is
-        // in turn pinned against the eager protected-generator fill.
-        let spec_init = crate::seed_pipe::spec_gen_init(blocks);
-        // Item C: resolve the gen_block ILP/scalar choice once per witgen
-        // (the quad synth below calls it per block).
-        let gen_ilp = !crate::seed_pipe::gen_block_ilp_killed();
-        // Word-major quads are written in place (`gen_quad_soa_into`) unless
-        // `FLOCK_NO_AB_SEED_INPUT_REUSE` is set; same bytes either way.
-        let seed_in_place = crate::seed_pipe::seed_input_reuse_enabled();
         assert!(
             n_total >= 8 && n_total.is_multiple_of(8),
             "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
         );
-        let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        let stripe_useful_bits = if super::full_stripe_env_on() {
             K
         } else {
             USEFUL_BITS
@@ -4411,61 +4394,7 @@ pub(crate) mod witgen_simd {
             for half in 0..2 {
                 let first = 8 * g + 4 * half;
                 let base = half * 4 * F128_PER_BLOCK;
-                // Ranked lazy input: generate the four protected-generator
-                // blocks directly in the word-major shape consumed below.
-                // The scalar generator kill switch and every partial/padded
-                // shape retain the incumbent AoS path as an exact fallback.
-                if let Some(init) = spec_init {
-                    if seed_in_place && gen_ilp && first + 4 <= n_blocks {
-                        let mut slot = std::mem::MaybeUninit::uninit();
-                        emit_quad(
-                            QuadInput::Seeded(crate::seed_pipe::gen_quad_soa_into(
-                                init, first, &mut slot,
-                            )),
-                            z_grp[base..].as_mut_ptr() as *mut u32,
-                            a_grp[base..].as_mut_ptr() as *mut u32,
-                            b_grp[base..].as_mut_ptr() as *mut u32,
-                        );
-                        continue;
-                    }
-                    if gen_ilp && first + 4 <= n_blocks {
-                        let seeded = crate::seed_pipe::gen_quad_soa(init, first);
-                        // Each quad fully owns its four block slots in every
-                        // buffer; groups are disjoint across workers.
-                        emit_quad(
-                            QuadInput::Seeded(&seeded),
-                            z_grp[base..].as_mut_ptr() as *mut u32,
-                            a_grp[base..].as_mut_ptr() as *mut u32,
-                            b_grp[base..].as_mut_ptr() as *mut u32,
-                        );
-                        continue;
-                    }
-                }
-                // Owned synth storage for the lazy path; unread when
-                // `spec_init` is `None`, so it costs nothing on the ordinary
-                // path. Declared out here so its borrows outlive the builder
-                // call below.
-                let synth: [Compression; 4];
-                let quad: [&Compression; 4] = if let Some(init) = spec_init {
-                    synth = std::array::from_fn(|j| {
-                        let idx = first + j;
-                        if idx < n_blocks {
-                            crate::seed_pipe::gen_block_with(init, idx, gen_ilp)
-                        } else {
-                            padding
-                        }
-                    });
-                    std::array::from_fn(|j| &synth[j])
-                } else {
-                    std::array::from_fn(|j| {
-                        let idx = first + j;
-                        if idx < n_blocks {
-                            &blocks[idx]
-                        } else {
-                            &padding
-                        }
-                    })
-                };
+                let quad = std::array::from_fn(|j| blocks.get(first + j).unwrap_or(&padding));
                 // Each quad fully owns its four block slots in every buffer;
                 // groups are disjoint across workers.
                 emit_quad(
@@ -4801,15 +4730,15 @@ pub(crate) mod witgen_simd {
         let rebuild_only = !defer_ab && allow_defer_ab && n_blocks == n_total && ab_copy_drain_enabled();
         let deferred = (defer_ab || rebuild_only).then(|| super::DeferredAb {
             blocks,
-            spec_init,
-            gen_ilp,
+            spec_init: None,
+            gen_ilp: false,
             a: a.as_mut_ptr() as *mut u32,
             b: b.as_mut_ptr() as *mut u32,
             n_quads: n_total / 4,
             primed_scratch: ab_primed_scratch_enabled(),
             copy_drain: ab_copy_drain_enabled(),
             input_mem: ab_input_mem_enabled(),
-            seed_in_place,
+            seed_in_place: false,
             rebuild_only,
         });
         (z, a, b, z_lincheck, stream, deferred)
@@ -5020,7 +4949,7 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+    let stripe_useful_bits = if full_stripe_env_on() {
         K
     } else {
         USEFUL_BITS
@@ -5032,11 +4961,6 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
         };
     match rate2_codeword {
         Some(codeword) => {
-            // Scalar driver: reads the block slice directly, so if this is the
-            // QS1 lazy speculative buffer, generate a separate owned input
-            // vector first. The SIMD quad path never reaches here.
-            let generated = crate::seed_pipe::materialize_spec_blocks(blocks);
-            let blocks = generated.as_deref().unwrap_or(blocks);
             super::common::drive_witness_packed_and_lincheck_full_write_with_rate2_codeword(
                 blocks,
                 &padding,
@@ -5055,9 +4979,6 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
             if witgen_simd::enabled() {
                 return witgen_simd::generate(blocks, n_blocks_log);
             }
-            // Scalar fallback reads a generated owned slice in lazy mode.
-            let generated = crate::seed_pipe::materialize_spec_blocks(blocks);
-            let blocks = generated.as_deref().unwrap_or(blocks);
             super::common::drive_witness_packed_and_lincheck_full_write(
                 blocks,
                 &padding,
@@ -5104,7 +5025,7 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
         flock_core::epool::helper_pool_available(),
         std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
-        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
+        full_stripe_env_on(),
     )
 }
 
@@ -5154,7 +5075,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     Option<flock_core::gpu_commit::FromZFirstPassStream>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+    let stripe_useful_bits = if full_stripe_env_on() {
         K
     } else {
         USEFUL_BITS
@@ -5175,9 +5096,6 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
             use_deferred_ranked_lincheck_stripe(n_blocks_log, pcs_params),
         );
     }
-    // Scalar streamed fallback reads a generated owned slice in lazy mode.
-    let generated = crate::seed_pipe::materialize_spec_blocks(blocks);
-    let blocks = generated.as_deref().unwrap_or(blocks);
     let (z, a, b, stripe, stream) =
         super::common::drive_witness_packed_and_lincheck_full_write_streamed(
             blocks,
@@ -5463,23 +5381,10 @@ impl Blake3Setup {
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         use std::sync::atomic::Ordering;
         let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
-        // Seed pipelining: on the timed call the proof for these blocks may
-        // already be several milliseconds in flight on the seed-pipe thread,
-        // started the moment the harness wrote the seed instead of after the
-        // protected wrapper's serial expansion of it. Adoption is gated on a
-        // full byte-equality check of `blocks`; see `crate::seed_pipe`. This
-        // must run before the keep-warm pause below — on the adopted path the
-        // speculative thread already issued it at its own prove entry.
         if call > 0 {
-            // The timed seed is in hand (this is the timed call). If the seed
-            // pipe is live its thread already halted the CPU keep-alive the
-            // instant it read the seed; this is the fallback for the
-            // seed-pipe-disabled path, and it is idempotent. Stop before the
-            // adoption byte-compare so no keep-alive thread overlaps timed work.
+            // Only the caller reads inputs. Stop the warm-up workers before
+            // doing any proof work for this batch.
             flock_core::cpu_keepalive::keepalive_stop();
-            if let Some(adopted) = crate::seed_pipe::try_adopt(blocks) {
-                return adopted;
-            }
         }
         // The GPU keep-warm bridge must never overlap a prove: pause it for
         // the whole prove; the warmup latch paths re-arm it on completion of
@@ -5510,10 +5415,6 @@ impl Blake3Setup {
         flock_core::cpu_keepalive::pool_spin_release();
         if call == 0 {
             let (proof, commitment) = warm_publish_path(proof, commitment);
-            // Still untimed: prove here, against the wrapper's own warm-up
-            // blocks, that both our AoS and word-major generators reproduce
-            // the protected one. That retires the timed path's 59 MiB adoption
-            // comparison and enables lazy seeded witness input.
             // Build the root-stripe plan (and read its kill switch) here,
             // outside every timed interval.
             let _ = root_stripe_rows();
@@ -5521,12 +5422,6 @@ impl Blake3Setup {
             let _ = ROOT_PLAN.cols.len();
             let _ = FIXED_INPUT_ROOT_PLAN.cols.len();
             let _ = FIXED_INPUT_CHECKS.len();
-            if self.n_blocks.is_power_of_two() {
-                crate::seed_pipe::verify_generator_at_warmup(
-                    self.n_blocks.trailing_zeros(),
-                    blocks,
-                );
-            }
             // Untimed: give the streamed first pass its first production
             // execution here instead of in the timed prove (see
             // `gpu_commit::ENV_NO_STREAM_WARM`). Ranked worker only.
@@ -5536,27 +5431,8 @@ impl Blake3Setup {
                 // first use (see `gpu_commit::ENV_NO_WARM_GPU_SPARES`).
                 flock_core::gpu_commit::warm_gpu_spares();
             }
-            // Last thing the untimed warm-up does: hand stdin to the seed-pipe
-            // thread. The worker publishes its ready file immediately after we
-            // return and only then touches `io::stdin()`, so the splice lands
-            // outside every measured interval and before the wrapper's
-            // `BufReader` binds a descriptor.
-            // `arm` holds the ready report until the seed-pipe thread has
-            // pre-opened the publication target (about a millisecond of file
-            // work). Light the keep-alive before that wait instead of after
-            // it, so the P cluster is never idle between the warm-up tail and
-            // the seed. The start below is then a no-op.
-            // `FLOCK_NO_PARK_KEEPALIVE=1` restores the incumbent order.
-            if crate::seed_pipe::is_ranked_worker() && crate::seed_pipe::park_keepalive_enabled() {
-                flock_core::cpu_keepalive::keepalive_start();
-            }
-            self.arm_seed_pipe();
-            // Last thing before the worker publishes "ready" and every thread
-            // parks for the seed: light up a P-core keep-alive so the cluster
-            // does not collapse to a deep-idle P-state across the gap. The
-            // seed-pipe thread (or the timed `prove_fast` fallback above) stops
-            // it the instant the seed arrives. Ranked-worker only, so tests /
-            // benches / examples that call `prove_fast` never spin.
+            // Preserve the existing warm-up policy. Input and publication
+            // remain exclusively the responsibility of the caller.
             if crate::seed_pipe::is_ranked_worker() {
                 flock_core::cpu_keepalive::keepalive_start();
             }
@@ -5565,40 +5441,6 @@ impl Blake3Setup {
         (proof, commitment, claim)
     }
 
-    /// Start the speculative seed pipeline for this setup. No-op outside the
-    /// ranked worker and under `FLOCK_NO_SEED_PIPE=1`.
-    fn arm_seed_pipe(&self) {
-        if !self.n_blocks.is_power_of_two() {
-            return;
-        }
-        crate::seed_pipe::arm(
-            self.n_blocks.trailing_zeros(),
-            std::ptr::from_ref(self) as usize,
-            Self::run_speculative_prove,
-        );
-    }
-
-    /// Body of a speculative proof: identical to the timed call the wrapper
-    /// would have made, including a challenger built from the benchmark domain
-    /// and hash, so the emitted proof bytes are the same ones.
-    fn run_speculative_prove(
-        setup_addr: usize,
-        blocks: &[Compression],
-    ) -> crate::seed_pipe::ProveOut {
-        // SAFETY: `setup_addr` is the address of the `Blake3Setup` the ranked
-        // worker builds in `main` and holds until the process exits, so it
-        // outlives this thread. Only shared reads happen through it — the same
-        // `&self` the Rayon pool already fans out during any prove.
-        let setup: &Self = unsafe { &*(setup_addr as *const Self) };
-        flock_core::gpu_commit::gpu_keepwarm_prove_started();
-        let mut challenger = flock_core::challenger::FsChallenger::with_hash(
-            crate::seed_pipe::BENCH_DOMAIN,
-            HashKind::Blake3,
-        );
-        let out = setup.prove_fast_inner(blocks, &mut challenger);
-        flock_core::cpu_keepalive::pool_spin_release();
-        out
-    }
 
     fn prove_fast_inner<Ch: Challenger>(
         &self,
@@ -6289,10 +6131,6 @@ pub fn generate_witness_batch_major(
     Vec<u8>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    // Batch-major reads a generated owned slice if a lazy speculative input is
-    // ever routed here.
-    let generated = crate::seed_pipe::materialize_spec_blocks(blocks);
-    let blocks = generated.as_deref().unwrap_or(blocks);
     super::common::drive_witness_batch_major(
         blocks,
         &padding,
@@ -6301,6 +6139,19 @@ pub fn generate_witness_batch_major(
         USEFUL_BITS,
         build_group_batch_major,
     )
+}
+
+/// `FLOCK_FULL_STRIPE` set (the full-width lincheck stripe instead of the
+/// useful-bit root stripe). The process environment does not change while a
+/// worker runs, so the first answer is kept; `FLOCK_NO_PATH_ENV_ONCE`
+/// restores the per-call lookup.
+fn full_stripe_env_on() -> bool {
+    if flock_core::path_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_FULL_STRIPE").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_FULL_STRIPE").is_some()
 }
 
 #[cfg(test)]
