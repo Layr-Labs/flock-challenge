@@ -88,6 +88,20 @@ pub(crate) fn small_serial_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_SMALL_SERIAL).as_deref() != Some(std::ffi::OsStr::new("1")))
 }
 
+/// Kill switch for the recompute caches (`FLOCK_NO_RECOMPUTE_CACHE`, any
+/// value: every site builds its pure setup again on each call, as before).
+/// The cached values are the ones the per-call build returns: the fused
+/// three-layer twiddle rows of the standard NTTs, the flat single-layer
+/// twiddle slice, and the inverses of the fixed lookahead points. Read once
+/// per process.
+pub const ENV_NO_RECOMPUTE_CACHE: &str = "FLOCK_NO_RECOMPUTE_CACHE";
+
+pub(crate) fn recompute_cache_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_RECOMPUTE_CACHE).is_none());
+    *ON
+}
+
 /// Unlike `ab_compact_store_enabled` this does **not** latch the first read
 /// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
 /// per-call `var_os` read is noise, and re-reading keeps same-process A/B
