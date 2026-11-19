@@ -6123,6 +6123,97 @@ pub(crate) fn ab_mixed_row_guarded(
     true
 }
 
+/// A worker's mixed-row plan ([`ab_mixed_row_planned`]): 0 = run
+/// [`ab_mixed_row_direct`] per row (the record's route); 1 = the guards and
+/// the `V0` kernel of [`ab_mixed_row_guarded`]; 2 = its guards and the `VL`
+/// kernel.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const AB_MIXED_PLAN_ROUTE: u8 = 0;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const AB_MIXED_PLAN_V0: u8 = 1;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const AB_MIXED_PLAN_VL: u8 = 2;
+
+/// The mixed-row plan of this thread: the route [`ab_mixed_row_direct`] and
+/// the kernel [`ab_mixed_row_guarded`] pick, resolved once. Every input is a
+/// per-process switch except the per-thread plain flag of
+/// [`ab_kara_enabled`], which [`ab_kara_note_worker`] sets before a worker's
+/// first job, so a worker resolves this right after that call (as the
+/// window-rows plan). [`AB_MIXED_PLAN_ROUTE`] when the direct route is off on
+/// this thread (the per-row call then returns `false` and the dispatcher
+/// runs, as before).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_mixed_row_plan() -> u8 {
+    if !(ab_kara_enabled() && ab_mixed_row_direct_route()) {
+        AB_MIXED_PLAN_ROUTE
+    } else if ab_mixed_h2_enabled() && ab_mixed_fuse_enabled() && ab_kara_lanez_enabled() {
+        AB_MIXED_PLAN_VL
+    } else {
+        AB_MIXED_PLAN_V0
+    }
+}
+
+/// [`ab_mixed_row_guarded`] with its kernel fixed by a worker's plan
+/// ([`ab_mixed_row_plan`]: `VL_FORM` for [`AB_MIXED_PLAN_VL`], otherwise
+/// [`AB_MIXED_PLAN_V0`]) and no switch read: the same guards on the same
+/// words, then the same kernel instance with the same arguments. Returns
+/// `false` with `out` untouched when a guard fails; the caller then runs the
+/// dispatcher. Only for a thread whose plan is 1 or 2 (on such a thread
+/// [`ab_mixed_row_direct`] makes exactly this call).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ab_mixed_row_planned<const VL_FORM: bool>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    w0: bool,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) -> bool {
+    const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16;
+    const VL: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_KARA_LANEZ;
+    let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
+    debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
+    let word = |packed: &[u8], k: usize| -> u64 {
+        // SAFETY: the caller keeps the row in bounds (the dispatcher reads
+        // the same words).
+        u64::from_le(unsafe { core::ptr::read_unaligned(packed.as_ptr().add(byte_base_b + k * 8).cast::<u64>()) })
+    };
+    if w0 {
+        if word(b_packed, 0) & word(b_packed, 1) != u64::MAX
+            || (word(a_packed, 0) | word(a_packed, 1)) & 0xffff_ff00_0000_0000 != 0
+        {
+            return false;
+        }
+        if VL_FORM {
+            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VL>(
+                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
+            );
+        } else {
+            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, V0>(
+                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
+            );
+        }
+    } else {
+        if word(b_packed, 4) & word(b_packed, 5) & word(b_packed, 6) & word(b_packed, 7) != u64::MAX {
+            return false;
+        }
+        if VL_FORM {
+            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VL>(
+                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
+            );
+        } else {
+            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, V0>(
+                a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
+            );
+        }
+    }
+    true
+}
+
 /// The mixed const-one rows' form on a thread with the Karatsuba apply
 /// unless `FLOCK_NO_ZC_AB_MIXED_H2` is set: the window rows' production
 /// applies and Horner steps ([`ABV_HORNER2`] K1/K0 steps, [`ABV_Z_OUT3`]
