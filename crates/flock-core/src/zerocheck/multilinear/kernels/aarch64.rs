@@ -1486,7 +1486,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7<
     head_b: F128,
 ) -> bool {
     unsafe {
-        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, true, XB>(
+        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, true, XB, false>(
             table7, rho2, anchors, deltas, a_out, b_out, eq_prep, out_pairs, degen, out, bpack,
             tail_compact, head_compact, head_b,
         )
@@ -1497,6 +1497,18 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7<
 pub(crate) fn zc_k_xb_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_XB").is_none())
+}
+
+/// Kill switch for `ONE_SKIP` of [`fold2_compact_and_round45_chunk_neon_8_fused_r1`]
+/// (the K walk's window-position-0 a rows go unscaled, `x^0 = 1`): exactly
+/// `FLOCK_NO_ZC_K_XB_ONE_SKIP=1` runs the record's instance, which scales
+/// them by `xb_q = (1, 1)`. Read once per process. Same values, same bytes.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) fn zc_k_xb_one_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_ZC_K_XB_ONE_SKIP").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -5789,6 +5801,14 @@ unsafe fn mul_prep_q(
 /// `F7`: `table_r1` is the seven-piece form of the byte banks
 /// ([`r2_fold7_table`] of them) and every lookup tree takes seven lookups
 /// ([`lookup7_acc_q`]); the same field elements, so the same stores and slots.
+///
+/// `ONE_SKIP` (with `XB` only; `FLOCK_NO_ZC_K_XB_ONE_SKIP`, see
+/// [`zc_k_xb_one_skip_enabled`]): a group at window position 0 takes its
+/// four a rows unscaled instead of through [`mul_xb_q`] by `xb_q`, which is
+/// `(1, 1)` there. Same values: with `xb = (1, 1)`, `u = pmull2(v, xb) =
+/// (v.hi, 0)`, `r = pmull2(u, k) = 0`, `zip1(r, u) = (0, v.hi)` and `o =
+/// pmull(v, xb) ^ (0, v.hi) = (v.lo, 0) ^ (0, v.hi) = v`, so `mul_xb_q(v, 1)
+/// == v` for every `v`.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
@@ -5799,6 +5819,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     const PACK: bool,
     const F7: bool,
     const XB: bool,
+    const ONE_SKIP: bool,
 >(
     table_r1: *const u8,
     rho2: F128,
@@ -5816,6 +5837,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     head_b: F128,
 ) -> bool {
     const { assert!(DEAD_TAIL || !PACK) };
+    const { assert!(XB || !ONE_SKIP) };
     use core::arch::aarch64::*;
 
     #[inline(always)]
@@ -5998,13 +6020,26 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     store_pair_nt_off::<32>(bo, b2, b3);
                 }
                 let acc = if XB { &mut wacc.0 } else { &mut acc.0 };
+                // `FLOCK_NO_ZC_K_XB_ONE_SKIP`: at window position 0 `xb_q`
+                // is `(1, 1)` (set with `in_window = 0`, see `k_xb_step!`)
+                // and `mul_xb_q(v, xb_q, k87) == v`: the rows go unscaled.
+                let one_xb = ONE_SKIP && in_window == 0;
+                macro_rules! xbs {
+                    ($v:expr) => {
+                        if one_xb { $v } else { mul_xb_q($v, xb_q, k87) }
+                    };
+                }
                 if b_flat
                     && is_zero_q(vorrq_u64(
                         vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
                         vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
                     ))
                 {
-                    if XB {
+                    if XB && ONE_SKIP {
+                        acc[0].ll = veorq_u64(acc[0].ll, xbs!(a1));
+                        acc[2].ll = veorq_u64(acc[2].ll, xbs!(a3));
+                        acc[4].ll = veorq_u64(acc[4].ll, xbs!(a2));
+                    } else if XB {
                         acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb_q, k87));
                         acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb_q, k87));
                         acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb_q, k87));
@@ -6018,7 +6053,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                         tri_acc_q_crossfused(&mut acc[4], w, a2);
                     }
                 } else {
-                    let (a0w, a1w, a2w, a3w) = if XB {
+                    let (a0w, a1w, a2w, a3w) = if XB && ONE_SKIP {
+                        (xbs!(a0), xbs!(a1), xbs!(a2), xbs!(a3))
+                    } else if XB {
                         (
                             mul_xb_q(a0, xb_q, k87),
                             mul_xb_q(a1, xb_q, k87),
@@ -11956,6 +11993,136 @@ mod tests {
                 assert_eq!(got.3, want.3, "b-one verdict, {at}");
             }
         }
+    }
+
+    /// `FLOCK_NO_ZC_K_XB_ONE_SKIP`: [`mul_xb_q`] by `xb = (1, 1)` (the
+    /// window-position-0 scale of the K walk) is the identity on random and
+    /// edge vectors; and the K walk with `ONE_SKIP` writes the a and b
+    /// outputs, returns the slots and the b-one verdict of the record's
+    /// `XB` instance: the live packed instance (with and without the b-one
+    /// pack, a failing b-one check included), the unpacked dead-tail and the
+    /// full-tail instances, `degen` on and off, the dense, tail-compacted and
+    /// head-compacted addressing (random state in each; both instances read
+    /// the same addresses), x^b window weights and random weights.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn k_xb_one_skip_matches_record() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        use core::arch::aarch64::*;
+        let mut state = 0x4b58_424f_4e45_534b;
+        let lanes = |v: uint64x2_t| unsafe { (vgetq_lane_u64::<0>(v), vgetq_lane_u64::<1>(v)) };
+        unsafe {
+            let (one, k87) = (vdupq_n_u64(1), vdupq_n_u64(0x87));
+            let edges = [[0, 0], [1, 0], [0, 1], [u64::MAX, u64::MAX], [1 << 63, 1 << 63]];
+            for i in 0..1024 + edges.len() {
+                let w = if i < 1024 { [splitmix64(&mut state), splitmix64(&mut state)] } else { edges[i - 1024] };
+                let v: uint64x2_t = std::mem::transmute(w);
+                assert_eq!(lanes(mul_xb_q(v, one, k87)), (w[0], w[1]), "mul_xb_q(v, 1) at {w:x?}");
+            }
+        }
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, rho(&mut state));
+        let (mut runs, mut failed) = (0usize, 0usize);
+        for case in 0..8 {
+            // Two and one superblocks of four 64-output blocks.
+            let out_pairs = if case % 2 == 0 { 2 * 16 * 8 } else { 2 * 16 * 4 };
+            let n_out = 2 * out_pairs;
+            let n_groups = out_pairs / 2;
+            let (rho1, rho2) = if case < 2 { (F128::ONE, F128::ONE) } else { (rho(&mut state), rho(&mut state)) };
+            let r1 = table.scaled_linear(rho1);
+            let mut anchors: Vec<F128> = (0..8 * out_pairs).map(|_| rho(&mut state)).collect();
+            let mut deltas: Vec<u8> = (0..64 * out_pairs).map(|_| splitmix64(&mut state) as u8).collect();
+            // Weights: `eq[2 (first + j) + 1] = lambda x^(2j)` per window of
+            // eight groups (what `k_full_xb_weights` accepts) or random.
+            let mut eq: Vec<F128> = (0..out_pairs).map(|_| rho(&mut state)).collect();
+            if case % 4 < 2 {
+                for first in (0..n_groups).step_by(8) {
+                    let lambda = eq[2 * first + 1];
+                    for j in 1..8 {
+                        eq[2 * (first + j) + 1] = lambda * F128::new(1u64 << (2 * j), 0);
+                    }
+                }
+                assert!(k_full_xb_weights(&eq, out_pairs));
+            }
+            // Lanes 0..3 and 59 of every 64 b == 1 (the ranked shape, so the
+            // b-flat arm runs at window position 0), others b == 1 at random.
+            for g in 0..n_out {
+                if matches!(g % 64, 0..4 | 59) || (case >= 4 && splitmix64(&mut state) % 3 == 0) {
+                    anchors[4 * g + 1] = F128::ONE;
+                    anchors[4 * g + 3] = F128::ONE;
+                    deltas[32 * g + 8..32 * g + 16].fill(0);
+                    deltas[32 * g + 24..32 * g + 32].fill(0);
+                }
+            }
+            for (degen, bpack, tail_compact, head_compact, bad) in [
+                (false, false, false, false, false),
+                (true, false, false, false, false),
+                (true, true, false, false, false),
+                (true, true, false, false, true),
+                (true, false, true, false, false),
+                (true, true, true, false, false),
+                (true, true, true, true, false),
+                (false, false, true, true, false),
+            ] {
+                let mut anc = anchors.clone();
+                if bad {
+                    // A skipped b output that is not one (block 1, output 2).
+                    anc[4 * (64 + 2) + 1] = F128::new(5, 0);
+                    anc[4 * (64 + 2) + 3] = F128::new(5, 0);
+                }
+                let head_b = if bad { F128::new(5, 0) } else { F128::ONE };
+                let poison = F128::new(0xdead, 0xbeef);
+                for kind in 0..3usize {
+                    // 0: the live packed instance, 1: unpacked dead tail,
+                    // 2: full tail (no compacted addressing, no b-one pack).
+                    if kind > 0 && (bpack || bad) || kind == 2 && tail_compact {
+                        continue;
+                    }
+                    let run = |skip: bool| {
+                        let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
+                        let mut o = [F128::ZERO; 8];
+                        macro_rules! go {
+                            ($dt:literal, $pack:literal, $skip:literal) => {
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<$dt, $pack, false, true, $skip>(
+                                    r1.as_ptr().cast(), rho2, anc.as_ptr(), deltas.as_ptr(), a.as_mut_ptr(),
+                                    b.as_mut_ptr(), eq.as_ptr(), out_pairs, degen, o.as_mut_ptr(), bpack,
+                                    tail_compact, head_compact, head_b,
+                                )
+                            };
+                        }
+                        let ok = unsafe {
+                            match (kind, skip) {
+                                (0, false) => go!(true, true, false),
+                                (0, true) => go!(true, true, true),
+                                (1, false) => go!(true, false, false),
+                                (1, true) => go!(true, false, true),
+                                (_, false) => go!(false, false, false),
+                                (_, true) => go!(false, false, true),
+                            }
+                        };
+                        (a, b, o, ok)
+                    };
+                    let at = format!(
+                        "case {case}, kind {kind}, degen {degen}, bpack {bpack}, tc {tail_compact}, \
+                         hc {head_compact}, bad {bad}"
+                    );
+                    let (want, got) = (run(false), run(true));
+                    assert_eq!(got.0, want.0, "a outputs, {at}");
+                    assert_eq!(got.1, want.1, "b outputs, {at}");
+                    assert_eq!(got.2, want.2, "slots, {at}");
+                    assert_eq!(got.3, want.3, "b-one verdict, {at}");
+                    if !tail_compact {
+                        // (The compacted addressing reads the ranked b == 1
+                        // lanes elsewhere: no expected verdict there.)
+                        assert_eq!(want.3, !bad, "b-one verdict expected, {at}");
+                    }
+                    assert!(want.2.iter().any(|&v| v != F128::ZERO), "slots all zero, {at}");
+                    runs += 1;
+                    failed += usize::from(bad && !want.3);
+                }
+            }
+        }
+        assert!(runs >= 8 * 8 && failed == 8, "runs {runs}, failed {failed}");
     }
 
     /// The tri pass over a b-one-packed b input equals the tri pass over the
