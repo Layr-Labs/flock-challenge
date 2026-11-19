@@ -4214,13 +4214,13 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     const GPU_COMMIT_DEFAULT: bool = true;
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+        && crate::env_once_sweep!(std::env::var_os(ENV_NO_GPU_COMMIT).is_none())
 }
 
 /// True after untimed warmup permanently selected the ranked GPU path.
 /// The opt-out only restores speculative CPU buffers; it does not disable GPU.
 pub(crate) fn gpu_commit_latched_on() -> bool {
-    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none() && imp::gpu_commit_latched_on()
+    crate::env_once_sweep!(std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none()) && imp::gpu_commit_latched_on()
 }
 
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
@@ -9565,7 +9565,7 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
             && super::pass_tune_enabled()
             && super::gpu_mixed_final_selected(log_d, log_d - 4, 4)
             && super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled())
-            && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+            && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none())
     }
 
     pub(crate) unsafe fn encode_ntt_and_merkle(
@@ -12892,7 +12892,7 @@ kernel void blake3_pow_seg_tail(
         let text = *TEXT.get_or_init(|| {
             super::gpu_dead_lane_enabled() && with_g4x2_dead_lanes(g4x2_msl_source()).is_some()
         });
-        text && !gpu.pso_ntt4g4x2.is_null() && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+        text && !gpu.pso_ntt4g4x2.is_null() && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none())
     }
 
     /// [`super::select_from_z_zero_store_from`] for this process and
@@ -12985,7 +12985,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if crate::env_once_sweep!(std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some()) {
                 0usize
             } else {
                 2usize
@@ -13070,7 +13070,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if crate::env_once_sweep!(std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some()) {
                 0usize
             } else {
                 2usize
@@ -13150,7 +13150,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if crate::env_once_sweep!(std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some()) {
                 0usize
             } else {
                 2usize
@@ -14501,8 +14501,16 @@ kernel void blake3_pow_seg_tail(
     }
 
     fn debug_enabled() -> bool {
-        std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
-            || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+        // This crate's own tests set `FLOCK_GPU_COMMIT_DEBUG` in-process; they
+        // keep the per-call read. Every other build keeps the first answer.
+        if cfg!(test) {
+            return std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
+                || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some();
+        }
+        crate::env_once_sweep!(
+            std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
+                || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+        )
     }
 
     /// Observability for poisoned process-global locks. The poisoning panic
@@ -15505,7 +15513,7 @@ kernel void blake3_pow_seg_tail(
             ll /= 2;
             lo = wlo;
         }
-        if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if after_ab && crate::phase_timing_env_on() {
             eprintln!(
                 "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
                  suffix units in {tail_ms:.2} ms",
@@ -17662,7 +17670,7 @@ kernel void blake3_pow_seg_tail(
                 if verified { chosen } else { 0 },
             );
         }
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let k = if verified { chosen } else { 0 };
             eprintln!(
                 "[phase-timing] hybrid split: cpu {} of 256 (ntt priority helpers {})",
@@ -26297,7 +26305,7 @@ kernel void zc_r2_horner_oracle(
             0.0
         };
         unsafe { gpu.release(cb) };
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let fold_gpu = f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
             let window = f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
             eprintln!(

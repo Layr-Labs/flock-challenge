@@ -560,7 +560,7 @@ fn l1_tail_split_count(log_d: usize, start_layer: usize, num_subs: usize) -> usi
 /// (block, tile) job writes disjoint destination rows.
 #[inline]
 fn recursive_top_hetero_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none()
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none())
 }
 
 /// Kill switch for the two-pool claim queue on the ranked L0 CPU suffix
@@ -1942,10 +1942,10 @@ impl AdditiveNttF128 {
                     }
                     tw
                 };
-                if zero_root_fused3 && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none() {
+                if zero_root_fused3 && crate::env_once_sweep!(std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()) {
                     let twiddles: Vec<[F128; 7]> = (0..num_blocks).map(block_twiddles).collect();
                     if is_ranked_top_hetero_fused3_pass(log_d, num_ntts, start_layer, n_top, layer)
-                        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+                        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none())
                     {
                         butterfly_interleaved_fused_3layer_all_blocks_hetero(
                             data, &twiddles, eighth, num_ntts,
