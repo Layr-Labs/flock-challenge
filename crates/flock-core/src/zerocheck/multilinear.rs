@@ -75,12 +75,45 @@ fn lookahead_inverse_reuse_enabled() -> bool {
 #[inline]
 fn lookahead_kappa_and_retained_inv(r: F128, reuse: bool) -> (F128, Option<F128>) {
     if reuse {
-        let r_inv = r.inv();
+        let r_inv = lookahead_point_inv(r);
         // Characteristic two: (1+r)/r = 1 + r^-1.
         (F128::ONE + r_inv, Some(r_inv))
     } else {
-        ((F128::ONE + r) * r.inv(), None)
+        ((F128::ONE + r) * lookahead_point_inv(r), None)
     }
+}
+
+/// Number of `(r, r^-1)` pairs [`lookahead_point_inv`] keeps.
+const LOOKAHEAD_INV_SLOTS: usize = 4;
+
+/// `r.inv()`. The lookahead passes invert fixed protocol points of `r`
+/// (`r[k_skip + 1]` and the medium points), the same values on every prove,
+/// so each slot keeps one point together with its inverse and a later call
+/// with an equal point takes the kept inverse (the value `inv` returns
+/// again). A different point is inverted as before; it fills a free slot,
+/// and once all slots hold other points it is inverted per call.
+/// `FLOCK_NO_RECOMPUTE_CACHE` (any value): inverted on every call.
+#[inline]
+fn lookahead_point_inv(r: F128) -> F128 {
+    if !crate::recompute_cache_enabled() {
+        return r.inv();
+    }
+    static KEPT: [std::sync::OnceLock<(F128, F128)>; LOOKAHEAD_INV_SLOTS] =
+        [const { std::sync::OnceLock::new() }; LOOKAHEAD_INV_SLOTS];
+    for slot in &KEPT {
+        match slot.get() {
+            Some(&(point, inv)) if point == r => return inv,
+            Some(_) => {}
+            None => {
+                // Another thread may fill this slot first, with its point.
+                let &(point, inv) = slot.get_or_init(|| (r, r.inv()));
+                if point == r {
+                    return inv;
+                }
+            }
+        }
+    }
+    r.inv()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -133,7 +166,13 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// value-forced work). Read once per phase call, off the hot path.
 #[cfg(target_arch = "aarch64")]
 fn r2_degen_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+    // This crate's own tests toggle the variable in-process; they keep the
+    // per-call read. Every other build keeps the first answer (one read per
+    // phase, several phases per prove).
+    if cfg!(test) {
+        return std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1");
+    }
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1"))
 }
 
 /// Kill switch for the peeled first group of the round-two Horner kernel:
@@ -155,7 +194,7 @@ fn r2_prescale_enabled() -> bool {
 /// restores the one-body compact kernel. Same stores and slots either way.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 fn cascade_k_fused_enabled() -> bool {
-    std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1")
+    crate::env_once_sweep!(std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1"))
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -5201,7 +5240,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     let eq_hi = &eq.hi;
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
+    let nt_stores = out_n >= (1usize << 20) && crate::env_once_sweep!(std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none());
     let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
     // The group weights `eq_lo[4y + 3]` as prepared pairs, one table per
     // pass shared by every chunk.
@@ -6687,6 +6726,25 @@ mod tests {
         assert!(!ranked_direct_fold4_pair_output((1 << 16) - 1));
         assert!(!ranked_direct_fold4_pair_output((1 << 16) + 1));
         assert!(!ranked_direct_fold4_pair_output(1 << 15));
+    }
+
+    /// `FLOCK_NO_RECOMPUTE_CACHE`: the kept lookahead inverses are the
+    /// inverses, for repeated points, more points than slots, and both arms.
+    #[test]
+    fn lookahead_point_inv_equals_inv() {
+        let mut rng = Rng::new(0x5EED);
+        let points: Vec<F128> = (0..3 * LOOKAHEAD_INV_SLOTS)
+            .map(|_| F128::new(rng.next_u64(), rng.next_u64()))
+            .collect();
+        for _ in 0..3 {
+            for &r in &points {
+                assert_eq!(lookahead_point_inv(r), r.inv());
+                let (kappa, kept) = lookahead_kappa_and_retained_inv(r, true);
+                assert_eq!(kept, Some(r.inv()));
+                assert_eq!(kappa, F128::ONE + r.inv());
+                assert_eq!(lookahead_kappa_and_retained_inv(r, false), ((F128::ONE + r) * r.inv(), None));
+            }
+        }
     }
 
     struct Rng(u64);
