@@ -47,48 +47,8 @@ fn ranked_direct_ab_precompute_enabled(r1cs: &BlockR1cs) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && r1cs.m == 32
         && r1cs.k_log >= pcs::LOG_PACKING + 2
-        && direct_ab_env_clear()
-}
-
-/// Kill switch for the cached prover gate environment
-/// (`FLOCK_NO_PROVER_GATE_ENV_ONCE`, any value: every gate call reads its
-/// variables from the process environment again, as before). Read once per
-/// process.
-pub const ENV_NO_PROVER_GATE_ENV_ONCE: &str = "FLOCK_NO_PROVER_GATE_ENV_ONCE";
-
-fn prover_gate_env_once_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_PROVER_GATE_ENV_ONCE).is_none());
-    *ON
-}
-
-/// The environment half of [`ranked_direct_ab_precompute_enabled`]. The
-/// ranked gates call it five times per prove (two lookups each); the
-/// process environment does not change during a prove, so the first answer
-/// is kept. `FLOCK_NO_PROVER_GATE_ENV_ONCE` restores the per-call lookups.
-#[inline]
-fn direct_ab_env_clear() -> bool {
-    if prover_gate_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
-                && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
-        });
-        return *CLEAR;
-    }
-    std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
         && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
-}
-
-/// The environment term of [`ranked_lincheck_c_reuse_enabled`], kept the same
-/// way (`FLOCK_NO_PROVER_GATE_ENV_ONCE` restores the per-call lookup).
-#[inline]
-fn lincheck_c_reuse_env_clear() -> bool {
-    if prover_gate_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none());
-        return *CLEAR;
-    }
-    std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
 }
 
 /// Whether the c-claim ships its four-bank sufficient statistic instead of the
@@ -131,7 +91,7 @@ fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
         && r1cs.useful_bits == 15_409
         && r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor
         && r1cs.c0_is_identity()
-        && lincheck_c_reuse_env_clear()
+        && std::env::var_os("FLOCK_NO_ZC_LINCHECK_C_REUSE").is_none()
 }
 
 /// C1 needs both statement properties and the exact row-major BLAKE3
@@ -1506,10 +1466,7 @@ unsafe fn emit_root_rows_ab_s256(a: *const u8, b: *const u8, dst: *mut u8, ops: 
                 vreinterpretq_u8_u64(r[2]),
                 vreinterpretq_u8_u64(r[3]),
             );
-            // `.p2align 4`: the two stores of a 64-byte write sit in one
-            // 16-byte fetch group wherever the caller lands in the binary.
             core::arch::asm!(
-                ".p2align 4",
                 "stnp {y0:q}, {y1:q}, [{dst}]",
                 "stnp {y2:q}, {y3:q}, [{dst}, #32]",
                 dst = in(reg) dst,
@@ -1628,10 +1585,7 @@ unsafe fn emit_root_rows_ab_s256_segments(a: *const u8, b: *const u8, dst: *mut 
                 vreinterpretq_u8_u64(r[2]),
                 vreinterpretq_u8_u64(r[3]),
             );
-            // `.p2align 4`: the two stores of a 64-byte write sit in one
-            // 16-byte fetch group wherever the caller lands in the binary.
             core::arch::asm!(
-                ".p2align 4",
                 "stnp {y0:q}, {y1:q}, [{dst}]",
                 "stnp {y2:q}, {y3:q}, [{dst}, #32]",
                 dst = in(reg) dst,
@@ -2791,16 +2745,7 @@ fn commit_with_round1_ab_precompute(
         ),
     );
 
-    // The prove that holds the split-tune ticket (the warm-up) starts its
-    // commit/AB join once the counted pipeline builds are done
-    // (`gpu_commit::ENV_NO_PIPE_FANOUT`; at once when none is running).
-    if run_ranked_exact_tune {
-        flock_core::gpu_commit::join_builds();
-    }
     flock_core::tmark::mark("commit join start");
-    // The CPU tail hash of the hybrid commit waits for this arm (see
-    // `gpu_commit::ENV_NO_HYBRID_CPU_TAIL_HASH`).
-    flock_core::gpu_commit::note_ab_arm_running(true);
     let result = rayon::join(
         || {
             flock_core::tmark::mark("commit arm start");
@@ -2840,7 +2785,6 @@ fn commit_with_round1_ab_precompute(
             // from this arm's measured wall (an Instant read is free; the
             // store is one relaxed atomic per prove).
             flock_core::tmark::mark("ab arm end");
-            flock_core::gpu_commit::note_ab_arm_running(false);
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
             if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
@@ -2850,8 +2794,6 @@ fn commit_with_round1_ab_precompute(
     );
 
     flock_core::tmark::mark("commit join end");
-    // The reserved workers join the spin from here (`FLOCK_NO_RESV_HOT`).
-    flock_core::cpu_keepalive::pool_spin_commit_done();
     if run_ranked_exact_tune {
         if std::env::var_os("FLOCK_NO_TUNE_REPLAY_BACKING").is_none() {
             *replay_backing.lock().unwrap() = Some(
@@ -2865,9 +2807,6 @@ fn commit_with_round1_ab_precompute(
             precompute_ab_replay,
         );
         drop(replay_backing.lock().unwrap().take());
-        // The 5+6 GPU arm's kernel compiles now, after the split retune, so
-        // it never runs beside this warm-up commit or its retune.
-        zerocheck::univariate_skip_optimized::t56_prewarm_after_tune();
     }
     result
 }
@@ -3378,7 +3317,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // scratch byte pool before the PCS open (2^(m-3) bytes — 512 MB at
     // m = 32) so the next prove reuses its resident pages.
     flock_core::tmark::mark("lc returned");
-    flock_core::gpu_commit::open_gpu_ping(100);
     drop(root_stripe_registration);
     flock_core::scratch::give_u8(z_packed_lincheck);
 

@@ -130,43 +130,6 @@ unsafe fn cross_sum_q(
 /// high limb and `m.hi · x^128 = m.hi · (x^7 + x^2 + x + 1)`, a product of
 /// at most 71 bits, lands in the low limbs. The map `m ↦ x^64 · m` is linear,
 /// so a sum of pending halves can be folded once.
-///
-/// The three terms `l`, `{0, m.lo}` and `m.hi · 0x87` are summed by one
-/// three-input `eor3` ([`xor3`]): `ext`, `pmull2` ([`pmull_hi_q`]), `eor3`.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn fold_x64_into(
-    l: core::arch::aarch64::uint64x2_t,
-    m: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe { xor3(l, vextq_u64::<1>(vdupq_n_u64(0), m), pmull_hi_q(m, vdupq_n_u64(0x87))) }
-}
-
-/// `a.hi * b.hi` as one `pmull2`, with `b` taken as a vector operand (so a
-/// splatted constant stays one hoisted register).
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn pmull_hi_q(
-    a: core::arch::aarch64::uint64x2_t,
-    b: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    let out: core::arch::aarch64::uint64x2_t;
-    unsafe {
-        core::arch::asm!(
-            "pmull2 {o:v}.1q, {a:v}.2d, {b:v}.2d",
-            a = in(vreg) a,
-            b = in(vreg) b,
-            o = lateout(vreg) out,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    out
-}
-
-/// [`fold_x64_into`] without the `sha3` extension: `ext` + `eor`, then the
-/// `pmull2` + `eor` pair.
-#[cfg(not(target_feature = "sha3"))]
 #[inline(always)]
 unsafe fn fold_x64_into(
     l: core::arch::aarch64::uint64x2_t,
@@ -177,58 +140,6 @@ unsafe fn fold_x64_into(
         let s = veorq_u64(l, vextq_u64::<1>(vdupq_n_u64(0), m));
         fused_pmull_hi_acc(s, m, vdupq_n_u64(0x87))
     }
-}
-
-/// [`fold_x64_into`] plus one more summand: `l + x^64 * m + x (mod p)`.
-///
-/// The fold's `pmull2` (`m.hi * 0x87`) takes `x` as its accumulator, so the
-/// pair issues as one macro-fused `pmull2` + `eor` slot ([`fused_pmull_hi_acc`])
-/// and the extra sum costs no instruction of its own: `ext`, fused
-/// `pmull2`+`eor`, `eor3`, exactly the three slots of the plain fold.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-unsafe fn fold_x64_plus_into(
-    l: core::arch::aarch64::uint64x2_t,
-    m: core::arch::aarch64::uint64x2_t,
-    x: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    use core::arch::aarch64::*;
-    unsafe {
-        xor3(
-            l,
-            vextq_u64::<1>(vdupq_n_u64(0), m),
-            fused_pmull_hi_acc(x, m, vdupq_n_u64(0x87)),
-        )
-    }
-}
-
-/// [`fold_x64_plus_into`] without the `sha3` extension (one extra `eor`).
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-unsafe fn fold_x64_plus_into(
-    l: core::arch::aarch64::uint64x2_t,
-    m: core::arch::aarch64::uint64x2_t,
-    x: core::arch::aarch64::uint64x2_t,
-) -> core::arch::aarch64::uint64x2_t {
-    unsafe { core::arch::aarch64::veorq_u64(fold_x64_into(l, m), x) }
-}
-
-/// Absorbed-sum variants of the prepared (fixed-twiddle) row kernels, on by
-/// default; `FLOCK_NO_NTT_ABSORB` (any value) keeps the incumbent kernels.
-///
-/// A butterfly's second output `v' = v + u'` costs one `eor`. When that row
-/// is next used only as the starting accumulator of a product chain (the
-/// `u` input of a later butterfly), the chain can start from `u'` instead,
-/// and the remaining `v` term joins the row's next x^64 fold through
-/// [`fold_x64_plus_into`], whose `pmull2` slot takes one accumulator for
-/// free. Same summands, so every output is bit-identical; only the XOR
-/// association changes. Rows that are multiplicands or outputs are
-/// materialized exactly as before.
-#[inline]
-fn use_ntt_absorb() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_ABSORB").is_none());
-    *ON
 }
 
 /// Eager butterfly with zero pending half: `u' = u + v·t`, `v' = v + u'`.
@@ -859,49 +770,6 @@ unsafe fn three_fold(
         (fu, veorq_u64(v, fu))
     }
 }
-/// [`three_lazy`] with a zero pending half: the x^64 half is the bare cross
-/// sum `v.lo * t.1.lo + v.hi * t.1.hi` ([`cross_sum_q`]) instead of that sum
-/// accumulated into a zero register. Same products, same values.
-#[inline(always)]
-unsafe fn three_lazy_zero(
-    u: core::arch::aarch64::uint64x2_t,
-    v: core::arch::aarch64::uint64x2_t,
-    t: (
-        core::arch::aarch64::uint64x2_t,
-        core::arch::aarch64::uint64x2_t,
-    ),
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    unsafe {
-        use core::arch::aarch64::*;
-        let nu = fused_pmull_hi_acc(fused_pmull_lo_acc(u, v, t.0), v, t.0);
-        let mid = cross_sum_q(v, t.1);
-        (nu, veorq_u64(v, nu), mid)
-    }
-}
-/// [`three_fold`] with a zero pending half (see [`three_lazy_zero`]).
-#[inline(always)]
-unsafe fn three_fold_zero(
-    u: core::arch::aarch64::uint64x2_t,
-    v: core::arch::aarch64::uint64x2_t,
-    t: (
-        core::arch::aarch64::uint64x2_t,
-        core::arch::aarch64::uint64x2_t,
-    ),
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    unsafe {
-        use core::arch::aarch64::*;
-        let (nu, _, mid) = three_lazy_zero(u, v, t);
-        let fu = fold_x64_into(nu, mid);
-        (fu, veorq_u64(v, fu))
-    }
-}
 #[inline(always)]
 unsafe fn fused3_prepared_q(
     v: &mut [core::arch::aarch64::uint64x2_t; 8],
@@ -912,14 +780,15 @@ unsafe fn fused3_prepared_q(
 ) {
     unsafe {
         use core::arch::aarch64::*;
-        let (a, b, p0) = three_lazy_zero(v[0], v[4], t[0]);
+        let zero = vdupq_n_u64(0);
+        let (a, b, p0) = three_lazy(v[0], v[4], t[0], zero);
         v[0] = a;
         v[4] = b;
-        let (a, b, p1) = three_lazy_zero(v[1], v[5], t[0]);
+        let (a, b, p1) = three_lazy(v[1], v[5], t[0], zero);
         v[1] = a;
         v[5] = b;
         for i in 2..4 {
-            let (a, b) = three_fold_zero(v[i], v[i + 4], t[0]);
+            let (a, b) = three_fold(v[i], v[i + 4], t[0], zero);
             v[i] = a;
             v[i + 4] = b;
         }
@@ -940,65 +809,6 @@ unsafe fn fused3_prepared_q(
             v[2 * s] = a;
             v[2 * s + 1] = b;
         }
-    }
-}
-
-/// [`fused3_prepared_q`] with three of its twelve butterfly sums absorbed
-/// (see [`use_ntt_absorb`]): 81 SIMD issue slots per row group instead of 84.
-///
-/// * Layer L, rows 4 and 5: `v4 + u0'` and `v5 + u1'` only seed the layer-L+1
-///   chains of rows 4 and 5. Those chains start from `u0'` / `u1'`; `v5`
-///   joins row 5's layer-L+1 fold and `v4` joins row 4's layer-L+2 fold
-///   (row 6 still needs row 4's full value: one `eor3`, as its `eor` before).
-/// * Layer L+1, row 2: `u2 + u0''` only seeds row 2's layer-L+2 chain, which
-///   starts from `u0''` with `u2` joining that fold.
-#[inline(always)]
-unsafe fn fused3_prepared_absorb_q(
-    v: &mut [core::arch::aarch64::uint64x2_t; 8],
-    t: &[(
-        core::arch::aarch64::uint64x2_t,
-        core::arch::aarch64::uint64x2_t,
-    ); 7],
-) {
-    unsafe {
-        use core::arch::aarch64::*;
-        let [x0, x1, x2, x3, x4, x5, x6, x7] = *v;
-        // Layer L (t[0]). Rows 0/1 stay lazy (halves p0/p1), rows 4/5 are
-        // left as `x4 + u0`, `x5 + u1` without forming the sums.
-        let u0 = fused_pmull_hi_acc(fused_pmull_lo_acc(x0, x4, t[0].0), x4, t[0].0);
-        let p0 = cross_sum_q(x4, t[0].1);
-        let u1 = fused_pmull_hi_acc(fused_pmull_lo_acc(x1, x5, t[0].0), x5, t[0].0);
-        let p1 = cross_sum_q(x5, t[0].1);
-        let (u2, r6) = three_fold_zero(x2, x6, t[0]);
-        let (u3, r7) = three_fold_zero(x3, x7, t[0]);
-        // Layer L+1, (0,2) and (1,3) under t[1].
-        let u0b = fused_pmull_hi_acc(fused_pmull_lo_acc(u0, u2, t[1].0), u2, t[1].0);
-        let q0 = fused_pmull_hi_acc(fused_pmull_lo_acc(p0, u2, t[1].1), u2, t[1].1);
-        let (u1b, r3) = three_fold(u1, u3, t[1], p1);
-        // (4,6) under t[2]: row 4 is `x4 + u0` with half p0. Its chain starts
-        // from u0; row 6 adds the full row 4 (`u4p + x4`) in one `eor3`.
-        let u4p = fused_pmull_hi_acc(fused_pmull_lo_acc(u0, r6, t[2].0), r6, t[2].0);
-        let q4 = fused_pmull_hi_acc(fused_pmull_lo_acc(p0, r6, t[2].1), r6, t[2].1);
-        let r6b = xor3(r6, u4p, x4);
-        // (5,7) under t[2]: row 5 is `x5 + u1` with half p1; x5 joins the fold.
-        let l5 = fused_pmull_hi_acc(fused_pmull_lo_acc(u1, r7, t[2].0), r7, t[2].0);
-        let m5 = fused_pmull_hi_acc(fused_pmull_lo_acc(p1, r7, t[2].1), r7, t[2].1);
-        let u5b = fold_x64_plus_into(l5, m5, x5);
-        let r7b = veorq_u64(r7, u5b);
-        // Layer L+2 (t[3..7]); every output is folded once.
-        let (o0, o1) = three_fold(u0b, u1b, t[3], q0);
-        // Row 2 is `u2 + u0b` with half q0: chain from u0b, u2 joins the fold.
-        let l2 = fused_pmull_hi_acc(fused_pmull_lo_acc(u0b, r3, t[4].0), r3, t[4].0);
-        let m2 = fused_pmull_hi_acc(fused_pmull_lo_acc(q0, r3, t[4].1), r3, t[4].1);
-        let o2 = fold_x64_plus_into(l2, m2, u2);
-        let o3 = veorq_u64(r3, o2);
-        // Row 4 is `u4p + x4` with half q4: x4 joins the fold.
-        let l4 = fused_pmull_hi_acc(fused_pmull_lo_acc(u4p, u5b, t[5].0), u5b, t[5].0);
-        let m4 = fused_pmull_hi_acc(fused_pmull_lo_acc(q4, u5b, t[5].1), u5b, t[5].1);
-        let o4 = fold_x64_plus_into(l4, m4, x4);
-        let o5 = veorq_u64(u5b, o4);
-        let (o6, o7) = three_fold(r6b, r7b, t[6], q4);
-        *v = [o0, o1, o2, o3, o4, o5, o6, o7];
     }
 }
 
@@ -1047,20 +857,21 @@ unsafe fn fused3_zero_root_prepared_q(
 ) {
     unsafe {
         use core::arch::aarch64::*;
+        let zero = vdupq_n_u64(0);
         for i in 0..4 {
             v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
         }
         for i in 0..2 {
             v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
         }
-        let (a, b, p4) = three_lazy_zero(v[4], v[6], t2);
+        let (a, b, p4) = three_lazy(v[4], v[6], t2, zero);
         v[4] = a;
         v[6] = b;
-        let (a, b) = three_fold_zero(v[5], v[7], t2);
+        let (a, b) = three_fold(v[5], v[7], t2, zero);
         v[5] = a;
         v[7] = b;
         v[1] = butterfly_zero_q(v[0], v[1]);
-        let (a, b) = three_fold_zero(v[2], v[3], t4);
+        let (a, b) = three_fold(v[2], v[3], t4, zero);
         v[2] = a;
         v[3] = b;
         let (a, b) = three_fold(v[4], v[5], t5, p4);
@@ -1074,7 +885,7 @@ unsafe fn fused3_zero_root_prepared_q(
 
 #[target_feature(enable = "aes")]
 #[inline]
-unsafe fn butterfly_fused_3layer_row_with_const_q<const ABSORB: bool>(
+unsafe fn butterfly_fused_3layer_row_with_const_q(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
@@ -1087,24 +898,15 @@ unsafe fn butterfly_fused_3layer_row_with_const_q<const ABSORB: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        // Each of the eight rows is addressed from its end at one shared
-        // negative byte offset, which is also the loop counter.
-        let step = eighth * num_ntts;
-        let ends: [*mut u8; 8] =
-            core::array::from_fn(|i| ptr.add(r * num_ntts + i * step + lanes).cast::<u8>());
-        let mut off = -((lanes * core::mem::size_of::<F128>()) as isize);
-        while off != 0 {
+        for lane in 0..lanes {
+            let base = ptr.add(r * num_ntts + lane);
+            let step = eighth * num_ntts;
             let mut v: [uint64x2_t; 8] =
-                core::array::from_fn(|i| vld1q_u64(ends[i].offset(off).cast::<u64>()));
-            if ABSORB {
-                fused3_prepared_absorb_q(&mut v, t);
-            } else {
-                fused3_prepared_q(&mut v, t);
-            }
+                core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
+            fused3_prepared_q(&mut v, t);
             for (i, value) in v.into_iter().enumerate() {
-                vst1q_u64(ends[i].offset(off).cast::<u64>(), value);
+                vst1q_u64(base.add(i * step).cast::<u64>(), value);
             }
-            off = next_lane_off(off);
         }
     }
 }
@@ -1129,15 +931,7 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         if use_three_const_fold() {
             let prepared = core::array::from_fn(|i| three_coeffs(t[i]));
-            if use_ntt_absorb() {
-                butterfly_fused_3layer_row_with_const_q::<true>(
-                    ptr, eighth, num_ntts, lanes, r, &prepared,
-                );
-            } else {
-                butterfly_fused_3layer_row_with_const_q::<false>(
-                    ptr, eighth, num_ntts, lanes, r, &prepared,
-                );
-            }
+            butterfly_fused_3layer_row_with_const_q(ptr, eighth, num_ntts, lanes, r, &prepared);
         } else {
             butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes, r, &t);
         }
@@ -1162,7 +956,7 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
         if use_three_const_fold() {
             let prepared = core::array::from_fn(|i| three_coeffs(t[i]));
             for r in row_start..row_end {
-                butterfly_fused_3layer_row_with_const_q::<false>(
+                butterfly_fused_3layer_row_with_const_q(
                     ptr, eighth, num_ntts, num_ntts, r, &prepared,
                 );
             }
@@ -1269,63 +1063,6 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
             butterfly_fused_3layer_zero_root_row_with_q(
                 ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
             );
-        }
-    }
-}
-
-/// All `eighth` row groups of one block of the deep subtree's radix-8 lead:
-/// the tile loop of [`butterfly_fused_3layer_zero_root_rows`] when
-/// `zero_root`, else that of [`butterfly_fused_3layer_rows`], with the same
-/// per-row kernels. A function of its own (never inlined), so the existing
-/// callers of those two loops compile as before.
-///
-/// # Safety
-/// As [`butterfly_fused_3layer_rows`] over rows `0..eighth`; with
-/// `zero_root`, also `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
-#[target_feature(enable = "aes")]
-#[inline(never)]
-pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    twiddles: &[F128; 7],
-    zero_root: bool,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let ld = |i: usize| vld1q_u64((&raw const twiddles[i]).cast::<u64>());
-        if zero_root {
-            debug_assert_eq!(twiddles[0], F128::ZERO);
-            debug_assert_eq!(twiddles[1], F128::ZERO);
-            debug_assert_eq!(twiddles[3], F128::ZERO);
-            let (t2, t4, t5, t6) = (ld(2), ld(4), ld(5), ld(6));
-            for r in 0..eighth {
-                butterfly_fused_3layer_zero_root_row_with_q(
-                    ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
-                );
-            }
-        } else {
-            let t = [ld(0), ld(1), ld(2), ld(3), ld(4), ld(5), ld(6)];
-            if use_three_const_fold() {
-                let prepared = [
-                    three_coeffs(t[0]),
-                    three_coeffs(t[1]),
-                    three_coeffs(t[2]),
-                    three_coeffs(t[3]),
-                    three_coeffs(t[4]),
-                    three_coeffs(t[5]),
-                    three_coeffs(t[6]),
-                ];
-                for r in 0..eighth {
-                    butterfly_fused_3layer_row_with_const_q::<false>(
-                        ptr, eighth, num_ntts, num_ntts, r, &prepared,
-                    );
-                }
-            } else {
-                for r in 0..eighth {
-                    butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
-                }
-            }
         }
     }
 }
@@ -1573,58 +1310,21 @@ unsafe fn butterfly_fused_2layer_low_lazy(
         let ta = vdupq_n_u64(t_inner_a.lo);
         let tb = vdupq_n_u64(t_inner_b.lo);
         let zero = vdupq_n_u64(0);
-        let n = a.len();
-        let [ea, eb, ec, ed] = row_ends([a, b, c, d]);
-        let mut off = -((n * core::mem::size_of::<F128>()) as isize);
-        while off != 0 {
-            let xa = vld1q_u64(ea.offset(off).cast::<u64>());
-            let xb = vld1q_u64(eb.offset(off).cast::<u64>());
-            let xc = vld1q_u64(ec.offset(off).cast::<u64>());
-            let xd = vld1q_u64(ed.offset(off).cast::<u64>());
+        for lane in 0..a.len() {
+            let xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
+            let xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
             let (na, nc, p) = butterfly_low_lazy_q(xa, xc, to, zero);
             let (nb, nd) = butterfly_low_fold_q(xb, xd, to, zero);
             let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
             let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
-            vst1q_u64(ea.offset(off).cast::<u64>(), fa);
-            vst1q_u64(eb.offset(off).cast::<u64>(), fb);
-            vst1q_u64(ec.offset(off).cast::<u64>(), fc);
-            vst1q_u64(ed.offset(off).cast::<u64>(), fd);
-            off = next_lane_off(off);
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), fa);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd);
         }
     }
-}
-
-/// `off + 16` (one `F128` lane), opaque to the optimizer: the lane loops then
-/// keep `off` as their only induction variable, address every row at
-/// `[end, off]` and test `off` itself for the exit (`add` + `cbnz` per lane).
-#[inline(always)]
-fn next_lane_off(off: isize) -> isize {
-    const _: () = assert!(core::mem::size_of::<F128>() == 16);
-    let mut o = off;
-    // SAFETY: register-only arithmetic.
-    unsafe {
-        core::arch::asm!(
-            "add {o}, {o}, #16",
-            o = inout(reg) o,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    o
-}
-
-/// One-past-the-end byte pointers of four equal-length rows. The lane loops
-/// address lane `l` of a row of `n` lanes at the negative byte offset
-/// `16 (l - n)` from its end, so one register is both the shared address
-/// offset and the loop counter (it reaches zero after the last lane).
-///
-/// Panics unless the four rows have equal length (the callers slice all four
-/// to one lane count, so the check folds away in the lane kernels).
-#[inline(always)]
-fn row_ends(rows: [&mut [F128]; 4]) -> [*mut u8; 4] {
-    let n = rows[0].len();
-    assert!(rows.iter().all(|row| row.len() == n), "lane rows must have equal length");
-    // SAFETY: one past the end of each row.
-    rows.map(|row| unsafe { row.as_mut_ptr().add(n).cast::<u8>() })
 }
 
 /// Whether [`butterfly_fused_2layer_low_twiddles`] runs its lazy form
@@ -1679,21 +1379,23 @@ pub(super) unsafe fn butterfly_fused_2layer_low_lazy_zero_tail_blocks<F>(
             butterfly_fused_2layer_low_lazy(a, b, c, d, t_outer, t_inner_a, t_inner_b);
 
             let to = vdupq_n_u64(t_outer.lo);
-            debug_assert!(
-                b_tail.iter().chain(d_tail.iter()).all(|x| *x == F128::ZERO),
-                "zero-tail final pair needs zero b and d rows in the tail lanes"
-            );
-            let [ea, eb, ec, ed] = row_ends([a_tail, b_tail, c_tail, d_tail]);
-            let mut off = -((zero_tail * core::mem::size_of::<F128>()) as isize);
-            while off != 0 {
-                let xa = vld1q_u64(ea.offset(off).cast::<u64>());
-                let xc = vld1q_u64(ec.offset(off).cast::<u64>());
+            for (((a, b), c), d) in a_tail
+                .iter_mut()
+                .zip(b_tail.iter_mut())
+                .zip(c_tail.iter_mut())
+                .zip(d_tail.iter_mut())
+            {
+                debug_assert!(
+                    *b == F128::ZERO && *d == F128::ZERO,
+                    "zero-tail final pair needs zero b and d rows in the tail lanes"
+                );
+                let xa = vld1q_u64((&raw const *a).cast::<u64>());
+                let xc = vld1q_u64((&raw const *c).cast::<u64>());
                 let (fa, fc) = butterfly_low_fold_q(xa, xc, to, zero);
-                vst1q_u64(ea.offset(off).cast::<u64>(), fa);
-                vst1q_u64(eb.offset(off).cast::<u64>(), fa);
-                vst1q_u64(ec.offset(off).cast::<u64>(), fc);
-                vst1q_u64(ed.offset(off).cast::<u64>(), fc);
-                off = next_lane_off(off);
+                vst1q_u64((&raw mut *a).cast::<u64>(), fa);
+                vst1q_u64((&raw mut *b).cast::<u64>(), fa);
+                vst1q_u64((&raw mut *c).cast::<u64>(), fc);
+                vst1q_u64((&raw mut *d).cast::<u64>(), fc);
             }
         }
     }
@@ -1719,6 +1421,7 @@ pub(super) unsafe fn butterfly_fused_2layer_low_inner_rows(
         let to = const_coeffs(vld1q_u64((&raw const t_outer).cast::<u64>()));
         let ta = vdupq_n_u64(t_inner_a.lo);
         let tb = vdupq_n_u64(t_inner_b.lo);
+        let zero = vdupq_n_u64(0);
         let stride = quarter * num_ntts;
         let (top_half, bot_half) = block.split_at_mut(2 * stride);
         let (q1, q2) = top_half.split_at_mut(stride);
@@ -1733,8 +1436,8 @@ pub(super) unsafe fn butterfly_fused_2layer_low_inner_rows(
             let xb = vld1q_u64((&raw const *b).cast::<u64>());
             let xc = vld1q_u64((&raw const *c).cast::<u64>());
             let xd = vld1q_u64((&raw const *d).cast::<u64>());
-            let (na, nc, p) = const_lazy_zero(xa, xc, to);
-            let (nb, nd) = const_fold_zero(xb, xd, to);
+            let (na, nc, p) = const_lazy(xa, xc, to, zero);
+            let (nb, nd) = const_fold(xb, xd, to, zero);
             // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
             let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
             let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
@@ -1761,11 +1464,12 @@ pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: us
         unsafe {
             let t = vld1q_u64((&raw const twiddle).cast::<u64>());
             let prep = three_coeffs(t);
+            let zero = vdupq_n_u64(0);
             let base = chunk.as_mut_ptr();
             for idx0 in 0..half {
                 let pu = base.add(idx0).cast::<u64>();
                 let pv = base.add(idx0 + half).cast::<u64>();
-                let (nu, nv) = three_fold_zero(vld1q_u64(pu), vld1q_u64(pv), prep);
+                let (nu, nv) = three_fold(vld1q_u64(pu), vld1q_u64(pv), prep, zero);
                 vst1q_u64(pu, nu);
                 vst1q_u64(pv, nv);
             }
@@ -2082,58 +1786,11 @@ unsafe fn const_fold(
         (fu, veorq_u64(v, fu))
     }
 }
-/// [`const_lazy`] with a zero pending half: the x^64 half is the bare cross
-/// sum `v.lo * t.1.lo + v.hi * t.1.hi` ([`cross_sum_q`]) instead of that sum
-/// accumulated into a zero register. Same products, same values.
-#[inline(always)]
-unsafe fn const_lazy_zero(
-    u: core::arch::aarch64::uint64x2_t,
-    v: core::arch::aarch64::uint64x2_t,
-    t: (
-        core::arch::aarch64::uint64x2_t,
-        core::arch::aarch64::uint64x2_t,
-    ),
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    unsafe {
-        use core::arch::aarch64::*;
-        let nu = fused_pmull_hi_acc(fused_pmull_lo_acc(u, v, t.0), v, t.0);
-        let mid = cross_sum_q(v, t.1);
-        (nu, veorq_u64(v, nu), mid)
-    }
-}
-/// [`const_fold`] with a zero pending half (see [`const_lazy_zero`]).
-#[inline(always)]
-unsafe fn const_fold_zero(
-    u: core::arch::aarch64::uint64x2_t,
-    v: core::arch::aarch64::uint64x2_t,
-    t: (
-        core::arch::aarch64::uint64x2_t,
-        core::arch::aarch64::uint64x2_t,
-    ),
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    unsafe {
-        use core::arch::aarch64::*;
-        let (nu, _, mid) = const_lazy_zero(u, v, t);
-        let fu = fold_x64_into(nu, mid);
-        (fu, veorq_u64(v, fu))
-    }
-}
 
-/// With `ABSORB` (see [`use_ntt_absorb`]) row c's layer-L sum `c + a'`
-/// is never formed: it only seeds row c's layer-L+1 chain, which starts
-/// from `a'` while `c` joins that row's fold. 28 SIMD issue slots per lane
-/// instead of 29.
 #[target_feature(enable = "aes")]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-unsafe fn butterfly_fused_2layer_row_with_const_q<const ABSORB: bool>(
+unsafe fn butterfly_fused_2layer_row_with_const_q(
     a: &mut [F128],
     b: &mut [F128],
     c: &mut [F128],
@@ -2153,35 +1810,20 @@ unsafe fn butterfly_fused_2layer_row_with_const_q<const ABSORB: bool>(
 ) {
     unsafe {
         use core::arch::aarch64::*;
-        let n = a.len();
-        let [ea, eb, ec, ed] = row_ends([a, b, c, d]);
-        let mut off = -((n * core::mem::size_of::<F128>()) as isize);
-        while off != 0 {
-            let xa = vld1q_u64(ea.offset(off).cast::<u64>());
-            let xb = vld1q_u64(eb.offset(off).cast::<u64>());
-            let xc = vld1q_u64(ec.offset(off).cast::<u64>());
-            let xd = vld1q_u64(ed.offset(off).cast::<u64>());
-            let (fa, fb, fc, fd) = if ABSORB {
-                let na = fused_pmull_hi_acc(fused_pmull_lo_acc(xa, xc, to.0), xc, to.0);
-                let p = cross_sum_q(xc, to.1);
-                let (nb, nd) = const_fold_zero(xb, xd, to);
-                let (fa, fb) = const_fold(na, nb, ta, p);
-                let lc = fused_pmull_hi_acc(fused_pmull_lo_acc(na, nd, tb.0), nd, tb.0);
-                let mc = fused_pmull_hi_acc(fused_pmull_lo_acc(p, nd, tb.1), nd, tb.1);
-                let fc = fold_x64_plus_into(lc, mc, xc);
-                (fa, fb, fc, veorq_u64(nd, fc))
-            } else {
-                let (na, nc, p) = const_lazy_zero(xa, xc, to);
-                let (nb, nd) = const_fold_zero(xb, xd, to);
-                let (fa, fb) = const_fold(na, nb, ta, p);
-                let (fc, fd) = const_fold(nc, nd, tb, p);
-                (fa, fb, fc, fd)
-            };
-            vst1q_u64(ea.offset(off).cast::<u64>(), fa);
-            vst1q_u64(eb.offset(off).cast::<u64>(), fb);
-            vst1q_u64(ec.offset(off).cast::<u64>(), fc);
-            vst1q_u64(ed.offset(off).cast::<u64>(), fd);
-            off = next_lane_off(off);
+        let zero = vdupq_n_u64(0);
+        for lane in 0..a.len() {
+            let xa = vld1q_u64((&raw const a[lane]).cast::<u64>());
+            let xb = vld1q_u64((&raw const b[lane]).cast::<u64>());
+            let xc = vld1q_u64((&raw const c[lane]).cast::<u64>());
+            let xd = vld1q_u64((&raw const d[lane]).cast::<u64>());
+            let (na, nc, p) = const_lazy(xa, xc, to, zero);
+            let (nb, nd) = const_fold(xb, xd, to, zero);
+            let (fa, fb) = const_fold(na, nb, ta, p);
+            let (fc, fd) = const_fold(nc, nd, tb, p);
+            vst1q_u64((&raw mut a[lane]).cast::<u64>(), fa);
+            vst1q_u64((&raw mut b[lane]).cast::<u64>(), fb);
+            vst1q_u64((&raw mut c[lane]).cast::<u64>(), fc);
+            vst1q_u64((&raw mut d[lane]).cast::<u64>(), fd);
         }
     }
 }
@@ -2275,7 +1917,7 @@ pub(super) unsafe fn butterfly_fused_2layer(
         let ta = vld1q_u64((&raw const t_inner_a).cast::<u64>());
         let tb = vld1q_u64((&raw const t_inner_b).cast::<u64>());
         if use_const_fold() {
-            butterfly_fused_2layer_row_with_const_q::<false>(
+            butterfly_fused_2layer_row_with_const_q(
                 a,
                 b,
                 c,
@@ -2346,7 +1988,7 @@ mod three_const_fold_tests {
     }
     #[test]
     fn row_matches_independent_polynomial_oracle() {
-        let mut seen = [0usize; 3];
+        let mut seen = [0usize; 2];
         for seed in 0..16u64 {
             for n in [1usize, 2, 3, 31, 64, 129, 257] {
                 let mut state = 0xbe51d7a33 ^ seed;
@@ -2378,7 +2020,7 @@ mod three_const_fold_tests {
                             }
                         }
                     }
-                    for mode in 0..3 {
+                    for mode in 0..2 {
                         seen[mode] += 1;
                         let mut actual = input.clone();
                         unsafe {
@@ -2386,19 +2028,9 @@ mod three_const_fold_tests {
                             let tv: [uint64x2_t; 7] = core::array::from_fn(|i| {
                                 vld1q_u64((&raw const t[i]).cast::<u64>())
                             });
-                            if mode == 2 {
+                            if mode == 1 {
                                 let prepared = core::array::from_fn(|i| three_coeffs(tv[i]));
-                                butterfly_fused_3layer_row_with_const_q::<true>(
-                                    actual.as_mut_ptr(),
-                                    1,
-                                    n,
-                                    n,
-                                    0,
-                                    &prepared,
-                                );
-                            } else if mode == 1 {
-                                let prepared = core::array::from_fn(|i| three_coeffs(tv[i]));
-                                butterfly_fused_3layer_row_with_const_q::<false>(
+                                butterfly_fused_3layer_row_with_const_q(
                                     actual.as_mut_ptr(),
                                     1,
                                     n,
@@ -2428,7 +2060,7 @@ mod three_const_fold_tests {
                 }
             }
         }
-        assert_eq!(seen, [672; 3]);
+        assert_eq!(seen, [672; 2]);
     }
 }
 
@@ -2454,7 +2086,6 @@ unsafe fn butterfly_fused_2layer_rows_impl<const PREPARED: bool>(
         } else {
             None
         };
-        let absorb = PREPARED && use_ntt_absorb();
         let stride = quarter * num_ntts;
         let (top_half, bot_half) = block.split_at_mut(2 * stride);
         let (q1, q2) = top_half.split_at_mut(stride);
@@ -2473,27 +2104,15 @@ unsafe fn butterfly_fused_2layer_rows_impl<const PREPARED: bool>(
                 num_ntts
             };
             if let Some((to, ta, tb)) = prepared {
-                if absorb {
-                    butterfly_fused_2layer_row_with_const_q::<true>(
-                        &mut row_a[..lanes],
-                        &mut row_b[..lanes],
-                        &mut row_c[..lanes],
-                        &mut row_d[..lanes],
-                        to,
-                        ta,
-                        tb,
-                    );
-                } else {
-                    butterfly_fused_2layer_row_with_const_q::<false>(
-                        &mut row_a[..lanes],
-                        &mut row_b[..lanes],
-                        &mut row_c[..lanes],
-                        &mut row_d[..lanes],
-                        to,
-                        ta,
-                        tb,
-                    );
-                }
+                butterfly_fused_2layer_row_with_const_q(
+                    &mut row_a[..lanes],
+                    &mut row_b[..lanes],
+                    &mut row_c[..lanes],
+                    &mut row_d[..lanes],
+                    to,
+                    ta,
+                    tb,
+                );
             } else {
                 butterfly_fused_2layer_row_with_q(
                     &mut row_a[..lanes],
@@ -2539,7 +2158,7 @@ mod const_fold_tests {
     #[test]
     fn full_pair_matches_independent_polynomial_oracle() {
         let mut cases = 0;
-        let mut modes_seen = [0usize; 3];
+        let mut modes_seen = [0usize; 2];
         for seed in 0..16u64 {
             for n in [1usize, 2, 3, 31, 64, 129, 257] {
                 let mut state = 0xbe51d7a33 ^ seed;
@@ -2570,7 +2189,7 @@ mod const_fold_tests {
                         expected[2 * n + i] = cc;
                         expected[3 * n + i] = dd;
                     }
-                    for mode in 0..3 {
+                    for mode in 0..2 {
                         modes_seen[mode] += 1;
                         let mut actual = input.clone();
                         let (a, rest) = actual.split_at_mut(n);
@@ -2581,18 +2200,8 @@ mod const_fold_tests {
                             let to = vld1q_u64((&raw const t[0]).cast::<u64>());
                             let ta = vld1q_u64((&raw const t[1]).cast::<u64>());
                             let tb = vld1q_u64((&raw const t[2]).cast::<u64>());
-                            if mode == 2 {
-                                butterfly_fused_2layer_row_with_const_q::<true>(
-                                    a,
-                                    b,
-                                    c,
-                                    d,
-                                    const_coeffs(to),
-                                    const_coeffs(ta),
-                                    const_coeffs(tb),
-                                );
-                            } else if mode == 1 {
-                                butterfly_fused_2layer_row_with_const_q::<false>(
+                            if mode == 1 {
+                                butterfly_fused_2layer_row_with_const_q(
                                     a,
                                     b,
                                     c,
@@ -2618,7 +2227,7 @@ mod const_fold_tests {
             }
         }
         assert_eq!(cases, 672);
-        assert_eq!(modes_seen, [672; 3]);
+        assert_eq!(modes_seen, [672; 2]);
     }
 }
 
@@ -2714,265 +2323,5 @@ mod low_pmull_tests {
         }
         assert_eq!(cases, 448);
         assert_eq!(modes_seen, [448; 3]);
-    }
-}
-
-#[cfg(test)]
-mod zero_pending_tests {
-    use super::*;
-
-    fn next(s: &mut u64) -> u64 {
-        *s = s.wrapping_add(0x9e3779b97f4a7c15);
-        let mut x = *s;
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        x ^ (x >> 31)
-    }
-
-    fn eq(a: core::arch::aarch64::uint64x2_t, b: core::arch::aarch64::uint64x2_t) -> bool {
-        use core::arch::aarch64::*;
-        unsafe { vgetq_lane_u64::<0>(a) == vgetq_lane_u64::<0>(b) && vgetq_lane_u64::<1>(a) == vgetq_lane_u64::<1>(b) }
-    }
-
-    /// The zero-pending twins give exactly the outputs of the general helpers
-    /// called with a zero pending half: lazy (both rows and the x^64 half) and
-    /// folded, for the radix-8 (`three_*`) and the deep-pair (`const_*`) forms.
-    #[test]
-    fn zero_pending_twins_match_zero_accumulated_forms() {
-        use core::arch::aarch64::*;
-        let specials = [0u64, 1, 0x87, u64::MAX, 1 << 63];
-        let mut state = 0x5eed_0f_2e40u64;
-        let mut cases = 0usize;
-        for i in 0..4096usize {
-            let mut word = |k: usize| {
-                if (i >> k) % 7 == 0 { specials[(i + k) % specials.len()] } else { next(&mut state) }
-            };
-            let (u0, u1, v0, v1, t0, t1) = (word(0), word(1), word(2), word(3), word(4), word(5));
-            unsafe {
-                let u = vcombine_u64(vcreate_u64(u0), vcreate_u64(u1));
-                let v = vcombine_u64(vcreate_u64(v0), vcreate_u64(v1));
-                let t = vcombine_u64(vcreate_u64(t0), vcreate_u64(t1));
-                let zero = vdupq_n_u64(0);
-
-                let prep = three_coeffs(t);
-                let (a, b, m) = three_lazy(u, v, prep, zero);
-                let (a0, b0, m0) = three_lazy_zero(u, v, prep);
-                assert!(eq(a, a0) && eq(b, b0) && eq(m, m0), "three_lazy case {i}");
-                let (a, b) = three_fold(u, v, prep, zero);
-                let (a0, b0) = three_fold_zero(u, v, prep);
-                assert!(eq(a, a0) && eq(b, b0), "three_fold case {i}");
-
-                let prep = const_coeffs(t);
-                let (a, b, m) = const_lazy(u, v, prep, zero);
-                let (a0, b0, m0) = const_lazy_zero(u, v, prep);
-                assert!(eq(a, a0) && eq(b, b0) && eq(m, m0), "const_lazy case {i}");
-                let (a, b) = const_fold(u, v, prep, zero);
-                let (a0, b0) = const_fold_zero(u, v, prep);
-                assert!(eq(a, a0) && eq(b, b0), "const_fold case {i}");
-            }
-            cases += 1;
-        }
-        assert_eq!(cases, 4096);
-    }
-}
-
-#[cfg(test)]
-mod fold_x64_tests {
-    use super::*;
-
-    fn next(s: &mut u64) -> u64 {
-        *s = s.wrapping_add(0x9e3779b97f4a7c15);
-        let mut x = *s;
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        x ^ (x >> 31)
-    }
-
-    /// `l + x^64 · m` on plain words: `m.lo` moves to the high limb and
-    /// `m.hi · x^128 = m.hi · 0x87` is a carry-less product of at most 71 bits.
-    fn fold_reference(l: [u64; 2], m: [u64; 2]) -> [u64; 2] {
-        let mut prod = 0u128;
-        for bit in 0..64 {
-            if (m[1] >> bit) & 1 == 1 {
-                prod ^= 0x87u128 << bit;
-            }
-        }
-        [l[0] ^ prod as u64, l[1] ^ m[0] ^ (prod >> 64) as u64]
-    }
-
-    /// The three-term fold equals the reference on random and edge words.
-    #[test]
-    fn fold_x64_into_matches_reference() {
-        use core::arch::aarch64::*;
-        let specials = [0u64, 1, 0x87, u64::MAX, 1 << 63, 0x8000_0000_0000_0087];
-        let mut state = 0xf01d_64u64;
-        for i in 0..8192usize {
-            let mut word = |k: usize| {
-                if (i >> k) % 5 == 0 { specials[(i + 3 * k) % specials.len()] } else { next(&mut state) }
-            };
-            let (l, m) = ([word(0), word(1)], [word(2), word(3)]);
-            let got = unsafe {
-                let r = fold_x64_into(
-                    vcombine_u64(vcreate_u64(l[0]), vcreate_u64(l[1])),
-                    vcombine_u64(vcreate_u64(m[0]), vcreate_u64(m[1])),
-                );
-                [vgetq_lane_u64::<0>(r), vgetq_lane_u64::<1>(r)]
-            };
-            assert_eq!(got, fold_reference(l, m), "case {i}: l={l:x?} m={m:x?}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod lane_loop_tests {
-    use super::*;
-
-    fn next(s: &mut u64) -> u64 {
-        *s = s.wrapping_add(0x9e3779b97f4a7c15);
-        let mut x = *s;
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        x ^ (x >> 31)
-    }
-
-    fn mul(a: F128, b: F128) -> F128 {
-        let (mut x, mut y) = (a.lo as u128 | ((a.hi as u128) << 64), b.lo as u128 | ((b.hi as u128) << 64));
-        let mut z = 0u128;
-        for _ in 0..128 {
-            if y & 1 != 0 {
-                z ^= x;
-            }
-            x = (x << 1) ^ ((x >> 127) * 0x87);
-            y >>= 1;
-        }
-        F128::new(z as u64, (z >> 64) as u64)
-    }
-
-    /// `u' = u + v·t`, `v' = v + u'` on `data[u]`, `data[v]`.
-    fn bf(data: &mut [F128], u: usize, v: usize, t: F128) {
-        let nu = data[u] + mul(data[v], t);
-        data[v] += nu;
-        data[u] = nu;
-    }
-
-    /// The deep-pair rows (`butterfly_fused_2layer_rows`, prepared form) and the
-    /// prepared radix-8 row against a per-lane scalar chain, with lane counts
-    /// below the row width: every processed lane matches, every other lane
-    /// keeps its poison.
-    #[test]
-    fn lane_loops_match_scalar_and_leave_skipped_lanes() {
-        let poison = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
-        let mut state = 0x1a7e_100bu64;
-        let mut cases = 0usize;
-        for num_ntts in [1usize, 3, 8, 64] {
-            for odd_tail in [0usize, 1, num_ntts.saturating_sub(1), num_ntts / 2] {
-                if odd_tail >= num_ntts {
-                    continue;
-                }
-                // Deep pair: quarter 2 (row groups 0 and 1; group 1 is odd).
-                let quarter = 2;
-                let len = 4 * quarter * num_ntts;
-                let mut input: Vec<F128> =
-                    (0..len).map(|_| F128::new(next(&mut state), next(&mut state))).collect();
-                // Odd row groups' tail lanes are not processed: poison them.
-                for q in 0..4 {
-                    for lane in num_ntts - odd_tail..num_ntts {
-                        input[(q * quarter + 1) * num_ntts + lane] = poison;
-                    }
-                }
-                let t: [F128; 3] = core::array::from_fn(|_| F128::new(next(&mut state), next(&mut state)));
-                let mut expected = input.clone();
-                for r in 0..quarter {
-                    let lanes = if r & 1 == 1 { num_ntts - odd_tail } else { num_ntts };
-                    for lane in 0..lanes {
-                        let at = |q: usize| (q * quarter + r) * num_ntts + lane;
-                        bf(&mut expected, at(0), at(2), t[0]);
-                        bf(&mut expected, at(1), at(3), t[0]);
-                        bf(&mut expected, at(0), at(1), t[1]);
-                        bf(&mut expected, at(2), at(3), t[2]);
-                    }
-                }
-                let mut actual = input.clone();
-                unsafe {
-                    butterfly_fused_2layer_rows_impl::<true>(&mut actual, t[0], t[1], t[2], quarter, num_ntts, odd_tail);
-                }
-                assert!(actual == expected, "deep pair num_ntts={num_ntts} odd_tail={odd_tail}");
-
-                // Radix-8 row, eighth 1: lanes 0..lanes of row 0 of eight rows.
-                for lanes in [0usize, 1, num_ntts - odd_tail, num_ntts] {
-                    let mut input: Vec<F128> =
-                        (0..8 * num_ntts).map(|_| F128::new(next(&mut state), next(&mut state))).collect();
-                    for i in 0..8 {
-                        for lane in lanes..num_ntts {
-                            input[i * num_ntts + lane] = poison;
-                        }
-                    }
-                    let tw: [F128; 7] = core::array::from_fn(|_| F128::new(next(&mut state), next(&mut state)));
-                    let mut expected = input.clone();
-                    for lane in 0..lanes {
-                        let at = |i: usize| i * num_ntts + lane;
-                        for layer in 0..3 {
-                            let stride = 4 >> layer;
-                            for block in 0..1usize << layer {
-                                for row in 0..stride {
-                                    let u = 2 * stride * block + row;
-                                    bf(&mut expected, at(u), at(u + stride), tw[(1 << layer) - 1 + block]);
-                                }
-                            }
-                        }
-                    }
-                    let mut actual = input.clone();
-                    unsafe {
-                        use core::arch::aarch64::*;
-                        let prepared: [Prep; 7] = core::array::from_fn(|i| {
-                            three_coeffs(vld1q_u64((&raw const tw[i]).cast::<u64>()))
-                        });
-                        butterfly_fused_3layer_row_with_const_q::<false>(actual.as_mut_ptr(), 1, num_ntts, lanes, 0, &prepared);
-                    }
-                    assert!(actual == expected, "radix-8 num_ntts={num_ntts} lanes={lanes}");
-                }
-                cases += 1;
-            }
-        }
-        assert!(cases >= 12, "{cases}");
-    }
-
-    /// The zero-tail final pair: dense lanes and tail lanes against the
-    /// per-lane scalar chain, over several blocks.
-    #[test]
-    fn zero_tail_final_pair_lane_loops_match_scalar() {
-        let mut state = 0xf1_9a1u64;
-        for num_ntts in [1usize, 2, 8, 64] {
-            for zero_tail in 0..num_ntts.min(9) {
-                let blocks = 3;
-                let mut input: Vec<F128> =
-                    (0..4 * num_ntts * blocks).map(|_| F128::new(next(&mut state), next(&mut state))).collect();
-                for blk in 0..blocks {
-                    for q in [1usize, 3] {
-                        for lane in num_ntts - zero_tail..num_ntts {
-                            input[(4 * blk + q) * num_ntts + lane] = F128::ZERO;
-                        }
-                    }
-                }
-                let tw: Vec<(F128, F128, F128)> = (0..blocks)
-                    .map(|_| (F128::new(next(&mut state), 0), F128::new(next(&mut state), 0), F128::new(next(&mut state), 0)))
-                    .collect();
-                let mut expected = input.clone();
-                for (blk, &(to, ta, tb)) in tw.iter().enumerate() {
-                    for lane in 0..num_ntts {
-                        let at = |q: usize| (4 * blk + q) * num_ntts + lane;
-                        bf(&mut expected, at(0), at(2), to);
-                        bf(&mut expected, at(1), at(3), to);
-                        bf(&mut expected, at(0), at(1), ta);
-                        bf(&mut expected, at(2), at(3), tb);
-                    }
-                }
-                let mut actual = input.clone();
-                unsafe {
-                    butterfly_fused_2layer_low_lazy_zero_tail_blocks(&mut actual, num_ntts, zero_tail, |i| tw[i]);
-                }
-                assert!(actual == expected, "num_ntts={num_ntts} zero_tail={zero_tail}");
-            }
-        }
     }
 }

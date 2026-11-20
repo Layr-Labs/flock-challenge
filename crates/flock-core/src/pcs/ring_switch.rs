@@ -292,40 +292,20 @@ fn build_eq_parallel(r: &[F128]) -> Vec<F128> {
     // read; uninit is safe.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = F128::ONE;
-    // The doubling levels run through the two-lane PMULL level kernel
-    // (`expand_eq_table_level`): below the crossover each level is one serial
-    // kernel call instead of a per-entry closure, above it 256-entry `lo`/`hi`
-    // chunk pairs over Rayon instead of per-element parallel zips. The
-    // kernel's `hi[x] = lo[x]·r_i`, `lo[x] = lo[x] + hi[x]` is the same pair
-    // of field operations as the closure it replaces, so the table is
-    // bit-identical. `FLOCK_NO_EQ_KERNEL_RS=1` restores the closure doubling.
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let kernel = !*OFF.get_or_init(|| std::env::var_os("FLOCK_NO_EQ_KERNEL_RS").is_some());
     // Threshold below which rayon dispatch overhead beats the parallel work.
     const PAR_THRESHOLD: usize = 1 << 12;
-    const PAR_CHUNK: usize = 1 << 8;
     for i in 0..n {
         let r_i = r[i];
         let half = 1usize << i;
         let (lo, hi_rest) = t.split_at_mut(half);
         let hi = &mut hi_rest[..half];
         if half < PAR_THRESHOLD {
-            if kernel {
-                crate::field::f128_slice::expand_eq_table_level(lo, hi, r_i);
-            } else {
-                for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
-                    let old = *lo_x;
-                    let old_r = old * r_i;
-                    *hi_x = old_r;
-                    *lo_x = old + old_r;
-                }
+            for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
+                let old = *lo_x;
+                let old_r = old * r_i;
+                *hi_x = old_r;
+                *lo_x = old + old_r;
             }
-        } else if kernel {
-            lo.par_chunks_mut(PAR_CHUNK)
-                .zip(hi.par_chunks_mut(PAR_CHUNK))
-                .for_each(|(lo_chunk, hi_chunk)| {
-                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_i);
-                });
         } else {
             lo.par_iter_mut()
                 .zip(hi.par_iter_mut())
@@ -2040,27 +2020,6 @@ fn compose_x_ladder_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_COMPOSE_X_LADDER").is_none())
 }
 
-/// Roll back the composed-byte-bank expansion without changing its generators.
-fn compose_nibble_join_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_COMPOSE_NIBBLE_JOIN").is_none())
-}
-
-/// The low and high nibbles select disjoint subsets of these eight generators.
-/// Their XOR gives every byte entry directly, without output-parent loads.
-#[inline(never)]
-fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
-    debug_assert_eq!(g.len(), 8);
-    debug_assert_eq!(out.len(), 256);
-    let low = subset_sums_4([g[0], g[1], g[2], g[3]]);
-    let high = subset_sums_4([g[4], g[5], g[6], g[7]]);
-    for (row, &h) in out.chunks_exact_mut(16).zip(&high) {
-        for (slot, &l) in row.iter_mut().zip(&low) {
-            *slot = l + h;
-        }
-    }
-}
-
 /// Compose the fold byte table with a fixed field multiplier: fills `out`
 /// (length [`FOLD_TABLE_LEN`]) with a table `C` such that
 ///
@@ -2114,20 +2073,16 @@ fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128]
             *gb = fold_one_slot(e_b * e_hi, base);
         }
     }
-    // Per byte position: subset-sum doubling is the rollback. The default
-    // joins two four-bit subset tables and writes all entries directly.
-    let nibble_join = compose_nibble_join_enabled();
+    // Per byte position: subset-sum doubling over that byte's 8 generators.
+    // Every entry is written exactly once (t[0] = 0, then each doubling round
+    // writes the upper half from the lower).
     for k in 0..FOLD_N_BYTES {
         let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
-        if nibble_join {
-            fill_composed_byte_bank(&g[k * 8..k * 8 + 8], t);
-        } else {
-            t[0] = F128::ZERO;
-            for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
-                let half = 1usize << bit;
-                for v in 0..half {
-                    t[v + half] = t[v] + gv;
-                }
+        t[0] = F128::ZERO;
+        for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
+            let half = 1usize << bit;
+            for v in 0..half {
+                t[v + half] = t[v] + gv;
             }
         }
     }
@@ -3019,33 +2974,6 @@ pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     )
 }
 
-/// The trace term of the batched ring switch (`PCS_TRACE` /
-/// `FLOCK_OPEN_TIMING`). The process environment does not change during a
-/// prove, so the first answer is kept; `FLOCK_NO_LIGERITO_ENV_ONCE` (any
-/// value) restores the per-call lookups.
-#[inline]
-fn batched_open_trace_env() -> bool {
-    if crate::pcs::ligerito::ligerito_env_once_enabled() {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
-        });
-        return *ON;
-    }
-    std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
-}
-
-/// The `FLOCK_NO_OPEN_DEFERRED_C` term of the deferred-C precondition, kept
-/// the same way.
-#[inline]
-fn open_deferred_c_env_clear() -> bool {
-    if crate::pcs::ligerito::ligerito_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none());
-        return *CLEAR;
-    }
-    std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
-}
-
 /// Move optional canonical statistics into the proof beside unchanged
 /// Fold8 views. Slots use original claim order. A supplied value must equal
 /// that claim's Fold8 collapse. Missing or wrong-size hints use the current
@@ -3061,7 +2989,8 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
     basis_elidable: bool,
 ) -> (Vec<(RingSwitchProof, RingSwitchBatchOutput)>, Vec<F128>) {
     assert!(!x_outers.is_empty());
-    let trace = batched_open_trace_env();
+    let trace =
+        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
     let n = x_outers.len();
     let l = packed_witness.len();
     for x in x_outers {
@@ -3379,7 +3308,7 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
         && use_split
         && has_quad[0]
         && !has_quad[1]
-        && open_deferred_c_env_clear();
+        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none();
 
     // Per-opening tails are independent once every γ_rs is sampled (the
     // transcript work above is complete), so run the two openings' table and
@@ -4000,31 +3929,6 @@ mod tests {
     }
 
     #[test]
-    fn build_eq_parallel_matches_scalar_doubling() {
-        // The doubling levels route through the PMULL level kernel; the table
-        // must equal the scalar closure doubling at every size.
-        let mut rng = Rng::new(0x5EED_BEEF);
-        for d in 0..=17usize {
-            let r: Vec<F128> = (0..d).map(|_| rng.f128()).collect();
-            let mut expected = crate::alloc_uninit_f128_vec(1usize << d);
-            expected[0] = F128::ONE;
-            for i in 0..d {
-                let r_i = r[i];
-                let half = 1usize << i;
-                let (lo, rest) = expected.split_at_mut(half);
-                let hi = &mut rest[..half];
-                for x in 0..half {
-                    let old = lo[x];
-                    let old_r = old * r_i;
-                    hi[x] = old_r;
-                    lo[x] = old + old_r;
-                }
-            }
-            assert_eq!(build_eq_parallel(&r), expected, "build_eq_parallel d={d}");
-        }
-    }
-
-    #[test]
     fn fold_byte_table_matches_bit_scan() {
         let mut rng = Rng::new(0xF01D_B17E);
         for trial in 0..4 {
@@ -4044,43 +3948,6 @@ mod tests {
                         "trial={trial} byte={byte} value={value}",
                     );
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn composed_nibble_join_matches_bit_scan_and_doubling() {
-        let mut rng = Rng::new(0x4e49_424a_4f49_4e53);
-        for trial in 0..160usize {
-            let generators: [F128; 8] = if trial < 128 {
-                let mut basis = [F128::ZERO; 8];
-                basis[trial % 8] = if trial < 64 {
-                    F128::new(1 << (trial % 64), 0)
-                } else {
-                    F128::new(0, 1 << (trial % 64))
-                };
-                basis
-            } else {
-                core::array::from_fn(|_| rng.f128())
-            };
-            let mut joined = [F128::new(u64::MAX, u64::MAX); 256];
-            fill_composed_byte_bank(&generators, &mut joined);
-            let mut doubled = [F128::ZERO; 256];
-            for (bit, &generator) in generators.iter().enumerate() {
-                let half = 1usize << bit;
-                for value in 0..half {
-                    doubled[value + half] = doubled[value] + generator;
-                }
-            }
-            assert_eq!(joined, doubled, "doubling trial={trial}");
-            for byte in 0..256 {
-                let mut expected = F128::ZERO;
-                for (bit, &generator) in generators.iter().enumerate() {
-                    if byte & (1 << bit) != 0 {
-                        expected += generator;
-                    }
-                }
-                assert_eq!(joined[byte], expected, "trial={trial} byte={byte}");
             }
         }
     }

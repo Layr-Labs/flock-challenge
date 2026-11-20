@@ -203,29 +203,24 @@ pub(crate) fn fold_banked_slots4<const BANKS: usize>(
 ///
 /// `odd_live` is the caller's promise about the second and fourth slot:
 /// their banks `odd_live..BANKS` are zero (pass `BANKS` to promise nothing).
-/// With an odd `odd_live < BANKS`, `odd_lo_tail` also promises a zero high
-/// limb in their bank `odd_live - 1`. Under those promises the result is
-/// bit-identical to [`fold_banked_slots4`] on every target; AArch64 skips
-/// the promised-zero bank pairs and limb products.
+/// Under that promise the result is bit-identical to [`fold_banked_slots4`]
+/// on every target; AArch64 skips the promised-zero bank pairs.
 #[inline]
 pub(crate) fn fold_banked_slots4_whole_into<const BANKS: usize>(
     weight: &[F128; BANKS],
     input: &[F128],
     out: &mut [F128],
     odd_live: usize,
-    odd_lo_tail: bool,
 ) {
     assert!(input.len() >= 4 * BANKS && out.len() >= 4);
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     if BANKS % 2 == 0 {
         // SAFETY: the cfg gate supplies PMULL through `aes`; the assertion
         // above establishes four complete banked slots and four outputs.
-        unsafe {
-            aarch64::fold_banked_slots4_whole_into::<BANKS>(weight, input, out, odd_live, odd_lo_tail)
-        }
+        unsafe { aarch64::fold_banked_slots4_whole_into::<BANKS>(weight, input, out, odd_live) }
         return;
     }
-    let _ = (odd_live, odd_lo_tail);
+    let _ = odd_live;
     out[..4].copy_from_slice(&fold_banked_slots4::<BANKS>(weight, input));
 }
 
@@ -1251,12 +1246,12 @@ mod tests {
                 let body = &input[1..=4 * BANKS];
                 let sentinel = F128::new(0xA5A5_A5A5_5A5A_5A5A, 0x0123_4567_89AB_CDEF);
                 let mut out = [sentinel; 6];
-                fold_banked_slots4_whole_into::<BANKS>(&weight, body, &mut out[1..5], BANKS, false);
+                fold_banked_slots4_whole_into::<BANKS>(&weight, body, &mut out[1..5], BANKS);
                 let incumbent = fold_banked_slots4::<BANKS>(&weight, body);
                 // Zero-tail promise: with the second and fourth slot zero from
                 // bank `live` on, every promise value down to `live` must give
                 // the incumbent's result on that input.
-                for live in [BANKS - BANKS / 8, (BANKS - BANKS / 8 + 1).min(BANKS), BANKS / 2 + 1, 1, 0] {
+                for live in [BANKS - BANKS / 8, BANKS / 2 + 1, 1, 0] {
                     let mut tail = body.to_vec();
                     for slot in [1usize, 3] {
                         tail[slot * BANKS + live..(slot + 1) * BANKS].fill(F128::ZERO);
@@ -1264,25 +1259,8 @@ mod tests {
                     let want = fold_banked_slots4::<BANKS>(&weight, &tail);
                     for promise in [live, (live + 1).min(BANKS), BANKS] {
                         let mut got = [sentinel; 4];
-                        fold_banked_slots4_whole_into::<BANKS>(&weight, &tail, &mut got, promise, false);
+                        fold_banked_slots4_whole_into::<BANKS>(&weight, &tail, &mut got, promise);
                         assert_eq!(got, want, "BANKS={BANKS} case {case} live {live} promise {promise}");
-                    }
-                    // Low-limb tail promise: bank `live - 1` of the second and
-                    // fourth slot keeps only its low limb (the ranked witness
-                    // padding: 57 live banks, 49 bits in the last word).
-                    if live >= 1 {
-                        for slot in [1usize, 3] {
-                            tail[slot * BANKS + live - 1].hi = 0;
-                        }
-                        let want = fold_banked_slots4::<BANKS>(&weight, &tail);
-                        for (promise, lo) in [(live, true), (live, false), (BANKS, true)] {
-                            let mut got = [sentinel; 4];
-                            fold_banked_slots4_whole_into::<BANKS>(&weight, &tail, &mut got, promise, lo);
-                            assert_eq!(
-                                got, want,
-                                "BANKS={BANKS} case {case} live {live} promise {promise} lo-tail {lo}"
-                            );
-                        }
                     }
                 }
                 assert_eq!(out[0], sentinel, "BANKS={BANKS} case {case}: wrote before out");

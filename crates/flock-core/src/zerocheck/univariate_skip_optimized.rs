@@ -795,13 +795,6 @@ pub fn ab_compact_backing_token_counts() -> (usize, usize) {
 pub struct Round1AbInner {
     storage: Vec<F128>,
     representation: Round1AbRepresentation,
-    /// The storage came back through the scratch pool's provenance-token
-    /// path with a HIT: this exact allocation was parked through the tagged
-    /// release of an earlier prove's AB transform and never left pool custody
-    /// since. The round-one GPU completion arm reuses its cached no-copy view
-    /// of the allocation only on such a hit (allocation identity), and
-    /// re-wraps otherwise. Never read by any CPU computation.
-    provenance_hit: bool,
 }
 
 /// Representation carried with the large round-one AB transform backing.
@@ -1047,213 +1040,6 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
 pub struct Round1AbProducer<'a> {
     pub unit_bytes: usize,
     pub produce: &'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync),
-}
-
-/// Kill switch of the round-two A/B rebuild: with
-/// `FLOCK_NO_R2_AB_REBUILD=1` the round-one AB precompute publishes every
-/// deferred A/B row to the global buffers and round two reads them there
-/// (the record path). By default a deferred-producer prove whose round-two
-/// GPU arm reads at most the R2-CS share ceiling's prefix
-/// (`gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT` of round two's chunks)
-/// publishes only that prefix, and round two's CPU walk rebuilds every later
-/// chunk's rows from the same producer into worker scratch and reads them
-/// there (see [`round2_ab_rebuild_scope`]). Same rows, same proof. Read once
-/// per process.
-pub const ENV_NO_R2_AB_REBUILD: &str = "FLOCK_NO_R2_AB_REBUILD";
-
-fn r2_ab_rebuild_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os(ENV_NO_R2_AB_REBUILD).as_deref() != Some(std::ffi::OsStr::new("1"))
-    })
-}
-
-/// Set once something in this process found the rebuild's published prefix
-/// short of what a reader wanted (a GPU share above it, a shape mismatch):
-/// every later prove takes the record path.
-static R2_AB_REBUILD_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Latch the round-two A/B rebuild off for the rest of the process.
-pub(crate) fn round2_ab_rebuild_latch_off() {
-    R2_AB_REBUILD_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-type AbProduceFn = dyn Fn(usize, *mut u8, *mut u8, bool) + Sync;
-
-/// One prove's round-two A/B rebuild (see [`round2_ab_rebuild_scope`]).
-#[derive(Clone, Copy)]
-pub(crate) struct Round2AbRebuild {
-    a: usize,
-    b: usize,
-    len: usize,
-    /// Leading bytes of A (and of B) whose rows are in the buffers (the
-    /// GPU arm reads within them).
-    pub(crate) published: usize,
-    /// Round two's CPU walk rebuilds every chunk at or past this byte
-    /// offset (at most `published`) and reads the buffers below it.
-    pub(crate) rebuild_from: usize,
-    pub(crate) unit_bytes: usize,
-    /// The producer, its lifetime erased: only reachable while the scope
-    /// that registered it lives (see [`round2_ab_rebuild_scope`]).
-    produce: &'static AbProduceFn,
-    /// Unique per registration (a worker scratch filled for one id is not
-    /// primed for another).
-    pub(crate) id: u64,
-}
-
-impl Round2AbRebuild {
-    /// Write unit `unit`'s rows into the scratch pair (`primed` as in
-    /// [`Round1AbProducer`]); units at or past the published prefix leave the
-    /// global rows unwritten.
-    ///
-    /// # Safety
-    /// Both scratch pointers valid for `unit_bytes` bytes; the registering
-    /// scope is alive.
-    #[inline(always)]
-    pub(crate) unsafe fn produce_into(&self, unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool) {
-        (self.produce)(unit, a_scratch, b_scratch, primed)
-    }
-
-    /// Publish every row past the prefix to the global buffers (the record
-    /// path's buffers, for a reader that reads them there).
-    pub(crate) fn complete_globals(&self) {
-        use rayon::prelude::*;
-        let produce = self.produce;
-        (self.published / self.unit_bytes..self.len / self.unit_bytes)
-            .into_par_iter()
-            .with_min_len(64)
-            .for_each(|unit| produce(unit, core::ptr::null_mut(), core::ptr::null_mut(), false));
-    }
-}
-
-static R2_AB_REBUILDS: std::sync::Mutex<Vec<Round2AbRebuild>> = std::sync::Mutex::new(Vec::new());
-static R2_AB_REBUILD_NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Registration of a prove's round-two A/B rebuild; dropping it withdraws
-/// the registration (round two normally takes it first).
-pub struct Round2AbRebuildScope<'a> {
-    id: u64,
-    _producer: core::marker::PhantomData<&'a ()>,
-}
-
-impl Drop for Round2AbRebuildScope<'_> {
-    fn drop(&mut self) {
-        let mut list = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
-        list.retain(|r| r.id != self.id);
-    }
-}
-
-/// Bytes of A (and of B) the AB arm must publish for the next prove when
-/// round two rebuilds the rest; `None` = the record path (publish every
-/// row). `total_bytes` is the byte length of each buffer (`2^m / 8`). The
-/// prefix is the R2-CS share ceiling's chunks of the lookahead sweep, and is
-/// offered only while the round-two GPU arm's next launch reads within it
-/// (`gpu_commit::zc_r2_gpu_read_bound`; a launch that would read past it
-/// anyway is clamped to it and latches the rebuild off).
-pub fn round2_ab_rebuild_published_bytes(total_bytes: usize) -> Option<usize> {
-    let (cap, hi_size, chunk_bytes) = round2_ab_rebuild_geometry(total_bytes)?;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_reads = crate::gpu_commit::zc_r2_gpu_read_bound(hi_size);
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let gpu_reads = {
-        let _ = hi_size;
-        0usize
-    };
-    (gpu_reads <= cap).then_some(cap * chunk_bytes)
-}
-
-/// Byte offset past which round two's CPU walk rebuilds the rows of a prove
-/// whose buffers hold complete rows (no deferred producer, e.g. the warm-up
-/// prove that calibrates the R2-CS share): the same chunks a deferred prove
-/// rebuilds, so the calibration prices the walk the timed proves run.
-/// `None` = the record path. `total_bytes` as in
-/// [`round2_ab_rebuild_published_bytes`].
-pub fn round2_ab_rebuild_complete_from_bytes(total_bytes: usize) -> Option<usize> {
-    let (cap, _, chunk_bytes) = round2_ab_rebuild_geometry(total_bytes)?;
-    Some(round2_ab_rebuild_cpu_from(cap * chunk_bytes))
-}
-
-/// Where round two's CPU walk starts rebuilding, for a prove whose AB arm
-/// published `published` bytes: right past the published prefix.
-pub fn round2_ab_rebuild_cpu_from(published: usize) -> usize {
-    published
-}
-
-/// `(cap chunks, hi_size, chunk bytes)` of the rebuild for `total_bytes`
-/// buffers, or `None` (switch, latch, shape).
-fn round2_ab_rebuild_geometry(total_bytes: usize) -> Option<(usize, usize, usize)> {
-    if !r2_ab_rebuild_enabled() || R2_AB_REBUILD_OFF.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-    if !total_bytes.is_power_of_two() {
-        return None;
-    }
-    let m = (total_bytes * 8).trailing_zeros() as usize;
-    let (hi_size, chunk_bytes) = crate::zerocheck::multilinear::round2_lookahead_chunk_geometry(m)?;
-    if hi_size * chunk_bytes != total_bytes {
-        return None;
-    }
-    let cap = hi_size * crate::gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT / 100;
-    (cap > 0 && cap < hi_size).then_some((cap, hi_size, chunk_bytes))
-}
-
-/// Register a prove's round-two A/B rebuild: the leading `published` bytes
-/// of `a_packed` / `b_packed` hold their rows (the AB arm published only
-/// those; all of them for complete buffers), and round two (which takes this
-/// registration, matched by the buffers' addresses and length) rebuilds
-/// every chunk at or past `rebuild_from` through `producer` into worker
-/// scratch. A reader that needs the global rows past the prefix publishes
-/// them first (`Round2AbRebuild::complete_globals`).
-///
-/// # Safety
-/// While the scope lives: both buffers are valid for `len` bytes and written
-/// by nothing but `producer`; `producer` keeps the [`Round1AbProducer`]
-/// contract, except that called with non-null scratch for a unit at or past
-/// `rebuild_from / unit_bytes` it writes only the scratch pair, and called
-/// with null scratch it writes the unit's global rows. The leading
-/// `published` bytes of both buffers are complete before round two runs.
-pub unsafe fn round2_ab_rebuild_scope<'a>(
-    a_packed: *const u8,
-    b_packed: *const u8,
-    len: usize,
-    published: usize,
-    rebuild_from: usize,
-    producer: Round1AbProducer<'a>,
-) -> Round2AbRebuildScope<'a> {
-    assert!(producer.unit_bytes > 0 && published.is_multiple_of(producer.unit_bytes));
-    assert!(rebuild_from <= published && rebuild_from.is_multiple_of(producer.unit_bytes));
-    assert!(published <= len && len.is_multiple_of(producer.unit_bytes));
-    let id = R2_AB_REBUILD_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // SAFETY: the registration (the only holder of this reference) is
-    // withdrawn when the scope drops, before `'a` ends; round two copies it
-    // out only while the prove that owns the scope runs.
-    let produce: &'static AbProduceFn = unsafe {
-        core::mem::transmute::<&'a (dyn Fn(usize, *mut u8, *mut u8, bool) + Sync + 'a), &'static AbProduceFn>(
-            producer.produce,
-        )
-    };
-    let mut list = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
-    list.push(Round2AbRebuild {
-        a: a_packed as usize,
-        b: b_packed as usize,
-        len,
-        published,
-        rebuild_from,
-        unit_bytes: producer.unit_bytes,
-        produce,
-        id,
-    });
-    Round2AbRebuildScope { id, _producer: core::marker::PhantomData }
-}
-
-/// Take the round-two A/B rebuild registered for these buffers, if any
-/// (once: a later round two over a recycled allocation finds nothing).
-pub(crate) fn round2_ab_rebuild_take(a_packed: &[u8], b_packed: &[u8]) -> Option<Round2AbRebuild> {
-    let mut list = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
-    let at = list.iter().position(|r| {
-        r.a == a_packed.as_ptr() as usize && r.b == b_packed.as_ptr() as usize && r.len == a_packed.len() && r.len == b_packed.len()
-    })?;
-    Some(list.swap_remove(at))
 }
 
 /// Same-binary control for the fused producer path: with exactly
@@ -1528,7 +1314,6 @@ fn precompute_round1_ab_inner_packed_padded_body(
     // raw-zero the complete allocation before constructing any reference and
     // force the historical full-store arm for that warmup/fail-safe proof.
     let storage_len = total_bytes / core::mem::size_of::<F128>();
-    let from_backing = backing.is_some();
     let (mut storage, token_hit) = if let Some(mut b) = backing {
         // Fully initialized by construction (`ExactTuneBacking::zeroed`):
         // treat as a hit so the fill is skipped and the compact arm runs.
@@ -1539,9 +1324,6 @@ fn precompute_round1_ab_inner_packed_padded_body(
     } else {
         (crate::scratch::take_f128(storage_len), false)
     };
-    // Allocation identity only (see `Round1AbInner::provenance_hit`): a
-    // tuner-supplied backing reports `token_hit` without any provenance.
-    let provenance_hit = use_provenance && token_hit && !from_backing;
     if use_provenance && token_hit {
         AB_COMPACT_BACKING_TOKEN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     } else if use_provenance {
@@ -1651,7 +1433,6 @@ fn precompute_round1_ab_inner_packed_padded_body(
         return Round1AbInner {
             storage,
             representation,
-            provenance_hit,
         };
     }
 
@@ -1689,7 +1470,6 @@ fn precompute_round1_ab_inner_packed_padded_body(
     Round1AbInner {
         storage,
         representation,
-        provenance_hit,
     }
 }
 
@@ -1790,9 +1570,6 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // distributes independent slabs dynamically.
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
-    // Resolve the rollback once before worker/row dispatch; no table setup.
-    let transform_trim = std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref()
-        != Some(std::ffi::OsStr::new("1"));
     if let Some(producer) = producer {
         // Deferred A/B rows: each job produces its units one at a time into
         // a worker-local scratch and transforms them from there, so the
@@ -1829,7 +1606,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             || {
                 #[cfg(target_arch = "aarch64")]
                 kernels::aarch64::ab_kara_note_worker();
-                let window_plan = ab_window_rows_worker_plan_with_trim(transform_trim);
+                let window_plan = ab_window_rows_worker_plan();
                 (
                     [F8::ZERO; ELL],
                     [F8::ZERO; ELL],
@@ -1881,7 +1658,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         || {
             #[cfg(target_arch = "aarch64")]
             kernels::aarch64::ab_kara_note_worker();
-            ([F8::ZERO; ELL], [F8::ZERO; ELL], ab_window_rows_worker_plan_with_trim(transform_trim))
+            ([F8::ZERO; ELL], [F8::ZERO; ELL], ab_window_rows_worker_plan())
         },
         |(a_col, b_col, window_plan), job| {
             let window_plan = *window_plan;
@@ -1992,11 +1769,7 @@ impl AbUnitScratch {
 
     fn with_pairing(unit_bytes: usize, paired: bool) -> Self {
         let slots = if paired { 2 } else { 1 };
-        let len = 2 * slots * unit_bytes + 64;
-        let storage = AB_UNIT_SCRATCH_CACHE
-            .with(|cell| cell.take())
-            .filter(|v| v.len() == len && ab_unit_scratch_reuse_enabled())
-            .unwrap_or_else(|| vec![0u8; len]);
+        let storage = vec![0u8; 2 * slots * unit_bytes + 64];
         let offset = storage.as_ptr().align_offset(64);
         assert!(offset < 64);
         Self {
@@ -2034,29 +1807,6 @@ impl AbUnitScratch {
     }
 }
 
-impl Drop for AbUnitScratch {
-    fn drop(&mut self) {
-        let storage = core::mem::take(&mut self.storage);
-        if !storage.is_empty() && ab_unit_scratch_reuse_enabled() {
-            let _ = AB_UNIT_SCRATCH_CACHE.try_with(|cell| cell.set(Some(storage)));
-        }
-    }
-}
-
-std::thread_local! {
-    static AB_UNIT_SCRATCH_CACHE: std::cell::Cell<Option<Vec<u8>>> =
-        const { std::cell::Cell::new(None) };
-}
-
-pub const ENV_NO_AB_UNIT_SCRATCH_REUSE: &str = "FLOCK_NO_AB_UNIT_SCRATCH_REUSE";
-
-fn ab_unit_scratch_reuse_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os(ENV_NO_AB_UNIT_SCRATCH_REUSE).as_deref() != Some(std::ffi::OsStr::new("1"))
-    })
-}
-
 /// Kill switch for the per-worker window-rows plan: any value of
 /// `FLOCK_NO_ZC_AB_WINDOW_PLAN` makes every chunk pick its static-B window
 /// rows through the switch chain in `precompute_ab_one_chunk` again. Read
@@ -2075,56 +1825,27 @@ type AbWindowRows =
     fn(usize, &[u8], &[u8], &InvNttTableByteSingleGf8, usize, &'static [[u8; 64]; 248], &mut [u8], bool);
 
 /// The window-rows instance the switch chain in [`precompute_ab_one_chunk`]
-/// calls on this thread: [`ab_window_rows_plan_with_trim`] with the
-/// process's `FLOCK_NO_TRANSFORM_TRIM` switch, so a worker's plan and the
-/// chain pick the same instance. Out of line: the chain is a switch-only
-/// arm of the drain bodies, which keep one call there.
-#[cfg(target_arch = "aarch64")]
-#[inline(never)]
-fn ab_window_rows_plan() -> AbWindowRows {
-    ab_window_rows_plan_with_trim(ab_transform_trim_enabled())
-}
-
-/// `FLOCK_NO_TRANSFORM_TRIM=1` (exactly "1", as [`precompute_ab_hetero`]
-/// reads it) turns the complemented static-B basis off; read once per
-/// process for the per-chunk chain.
-#[cfg(target_arch = "aarch64")]
-fn ab_transform_trim_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref() != Some(std::ffi::OsStr::new("1"))
-    })
-}
-
-/// The window-rows instance for this thread: the same checks in the same
-/// order as the switch chain. Every input is a per-process switch except the
-/// per-thread plain flag of `ab_kara_enabled`, which `ab_kara_note_worker`
-/// sets before a worker's first job, so a worker resolves this right after
-/// that call. The chain's `bstatic_horner_window_rows_hoisted::<V>` and
+/// calls on this thread: the same checks in the same order. Every input is
+/// a per-process switch except the per-thread plain flag of
+/// `ab_kara_enabled`, which `ab_kara_note_worker` sets before a worker's
+/// first job, so a worker resolves this right after that call. The chain's
+/// `bstatic_horner_window_rows_hoisted::<V>` and
 /// `bstatic_horner_window_rows::<V>` call `rows::<V, true>` and
-/// `rows::<V, false>`. `trim` selects the complemented static-B basis
-/// ([`kernels::aarch64::ABV_TRANSFORM_TRIM`]) of the two default instances;
-/// without it they take the plain instance, which writes the same rows.
+/// `rows::<V, false>`.
 #[cfg(target_arch = "aarch64")]
-fn ab_window_rows_plan_with_trim(trim: bool) -> AbWindowRows {
+fn ab_window_rows_plan() -> AbWindowRows {
     use kernels::aarch64 as k;
     use kernels::aarch64::bstatic_horner_window_rows_impl as rows;
     // The default instances: the main-pool Karatsuba rows and the helper
-    // rows, both with one bounds check per window and the complemented
-    // static-B basis. Every kill switch, `FLOCK_NO_TRANSFORM_TRIM` included,
-    // takes the plain instance (the same bytes): only these two forms of the
-    // main-pool and helper rows exist.
+    // rows. Every kill switch takes the plain instance (the same bytes).
     const MAIN: u32 = k::AB_Z_VARIANT
         | k::ABV_INLINE_WINDOW
         | k::ABV_KARA_XOR16
         | k::ABV_BSTATIC_Z
         | k::ABV_KARA_SLOT
-        | k::ABV_HORNER2
-        | k::ABV_TRANSFORM_TRIM;
-    const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2 | k::ABV_TRANSFORM_TRIM;
+        | k::ABV_HORNER2;
     if k::ab_kara_enabled() {
-        if trim
-            && k::ab_kara_unscaled_enabled()
+        if k::ab_kara_unscaled_enabled()
             && k::ab_z_enabled()
             && k::ab_kara_xor16_enabled()
             && k::ab_bstatic_z_enabled()
@@ -2138,14 +1859,7 @@ fn ab_window_rows_plan_with_trim(trim: bool) -> AbWindowRows {
             rows::<0, false>
         }
     } else if k::ab_hz_helper_enabled() && k::ab_horner2_enabled() {
-        // Lean: only the hoisted helper instance exists; its kill switches
-        // take the plain instance, which writes the same rows, as every other
-        // AB kill switch does.
-        if trim && k::ab_row_setup_hoist_enabled() && k::ab_hz_hoist_enabled() {
-            rows::<HELPER, true>
-        } else {
-            rows::<0, false>
-        }
+        rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>
     } else {
         rows::<0, false>
     }
@@ -2153,15 +1867,12 @@ fn ab_window_rows_plan_with_trim(trim: bool) -> AbWindowRows {
 
 /// A worker's `window_plan` for [`precompute_ab_one_chunk`], resolved on the
 /// worker thread after `ab_kara_note_worker`; `None` (the per-chunk chain)
-/// with [`ENV_NO_ZC_AB_WINDOW_PLAN`] set. `trim` as in
-/// [`ab_window_rows_plan_with_trim`], resolved once per drain.
-fn ab_window_rows_worker_plan_with_trim(trim: bool) -> Option<AbWindowRows> {
+/// with [`ENV_NO_ZC_AB_WINDOW_PLAN`] set.
+fn ab_window_rows_worker_plan() -> Option<AbWindowRows> {
     #[cfg(target_arch = "aarch64")]
     if ab_window_plan_enabled() {
-        return Some(ab_window_rows_plan_with_trim(trim));
+        return Some(ab_window_rows_plan());
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    let _ = trim;
     None
 }
 
@@ -2196,8 +1907,8 @@ type AbWindowUnitRun = (AbWindowUnit, [&'static [[u8; 64]; 248]; 2]);
 
 /// The unit form of the window-rows instance `rows`, which runs the same
 /// rows with the same arguments for each chunk. The default instances of
-/// the main-pool workers and of the helper threads (the complemented
-/// static-B basis) have one; `None` keeps one call per chunk.
+/// the main-pool workers and of the helper threads have one; `None` keeps
+/// one call per chunk.
 #[cfg(target_arch = "aarch64")]
 fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
     use kernels::aarch64::{
@@ -2210,10 +1921,10 @@ fn ab_window_unit_plan(rows: AbWindowRows) -> Option<AbWindowUnit> {
         | k::ABV_KARA_SLOT
         | k::ABV_HORNER2;
     const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
-    if core::ptr::fn_addr_eq(rows, per_chunk::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows) {
-        Some(unit::<{ MAIN | k::ABV_TRANSFORM_TRIM }, true>)
-    } else if core::ptr::fn_addr_eq(rows, per_chunk::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true> as AbWindowRows) {
-        Some(unit::<{ HELPER | k::ABV_TRANSFORM_TRIM }, true>)
+    if core::ptr::fn_addr_eq(rows, per_chunk::<MAIN, true> as AbWindowRows) {
+        Some(unit::<MAIN, true>)
+    } else if core::ptr::fn_addr_eq(rows, per_chunk::<HELPER, false> as AbWindowRows) {
+        Some(unit::<HELPER, false>)
     } else {
         None
     }
@@ -4005,276 +3716,6 @@ fn ab_tail_split_chunks(hi_size: usize, big_lo_size: usize, n_banks: usize) -> u
     (*N).min(hi_size)
 }
 
-/// Round-one AB completion GPU prefix arm in flight (see
-/// `gpu_commit::ENV_NO_GPU_ZC_AB_COMPLETION`). The GPU computes the per-chunk
-/// 64-lane partials of chunks `0..cpu_base()`; the CPU drains the rest with
-/// the incumbent kernel and folds both into the same XOR reduction.
-struct AbGpuPrefix {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    job: crate::gpu_commit::ZcAbJob,
-}
-
-impl AbGpuPrefix {
-    /// First chunk the CPU drains (0 during the warm-up oracle probe, when
-    /// the CPU computes every chunk itself).
-    fn cpu_base(&self) -> usize {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            self.job.cpu_base()
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            0
-        }
-    }
-
-    /// The GPU's chunk share once admitted (also during the probe).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_chunks(&self) -> usize {
-        self.job.gpu_chunks()
-    }
-
-    /// Join the GPU. Admitted prove: writes the GPU's partials into
-    /// `partials[..cpu_base()]` and returns `true`. Oracle probe: compares
-    /// the GPU's partials with the CPU's complete `partials` (verdict kept for
-    /// the process) and returns `true`. `false` = the GPU failed after
-    /// admission: the caller must CPU-compute `partials[..cpu_base()]`.
-    fn finish(self, partials: &mut [[F128; ELL]]) -> bool {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            let hi_size = partials.len();
-            match crate::gpu_commit::zc_ab_wait(self.job, partials, hi_size) {
-                crate::gpu_commit::ZcAbResult::Prefix(gpu) => {
-                    partials[..gpu.len()].copy_from_slice(&gpu);
-                    true
-                }
-                crate::gpu_commit::ZcAbResult::Calibrated => true,
-                crate::gpu_commit::ZcAbResult::Failed => false,
-            }
-        }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        {
-            let _ = partials;
-            true
-        }
-    }
-}
-
-/// The 128 F2-basis images `convert[b * 256 + (1 << k)]` (`[b][k]`) of the
-/// convert table, or `None` unless every entry is the XOR of the basis
-/// images of its set bits AND every row `b >= 1` is `x` times row `b - 1`
-/// (`convert[b][v] = mul_by_x(convert[b - 1][v])`) — the GPU arm expands its
-/// pre-scaled row 0 from the basis and derives rows 1..15 by multiplication
-/// by `x`, so it runs only when both identities reproduce the table.
-pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
-    static BASIS: OnceLock<Option<[F128; 128]>> = OnceLock::new();
-    BASIS
-        .get_or_init(|| {
-            let convert = convert_table();
-            let mut basis = [F128::ZERO; 128];
-            for b in 0..16 {
-                for k in 0..8 {
-                    basis[b * 8 + k] = convert[b * 256 + (1 << k)];
-                }
-            }
-            for b in 0..16 {
-                for v in 0..256usize {
-                    let mut expanded = F128::ZERO;
-                    for k in 0..8 {
-                        if (v >> k) & 1 == 1 {
-                            expanded += basis[b * 8 + k];
-                        }
-                    }
-                    if expanded != convert[b * 256 + v] {
-                        return None;
-                    }
-                    if b != 0 && convert[b * 256 + v] != mul_by_x(convert[(b - 1) * 256 + v]) {
-                        return None;
-                    }
-                }
-            }
-            Some(basis)
-        })
-        .as_ref()
-}
-
-/// Untimed warm-up only: build the round-one AB completion GPU arm (its
-/// Metal library, compiled from source, and its pipelines) on a background
-/// thread, so the compile overlaps the warm-up proof instead of stalling its
-/// round one and lengthening every worker start. The arm's state is a
-/// process-wide `OnceLock`, so a launch that arrives first waits for (or
-/// does) the same build; nothing else changes. A no-op when the arm is off.
-/// `FLOCK_NO_ZC_AB_PREWARM=1` builds it lazily as before.
-///
-/// The same thread then builds the K pass GPU arm's two pipelines
-/// (`gpu_commit::zc_k_prewarm`, needed only after round two), unless that arm
-/// is off or `FLOCK_NO_ZC_K_PREWARM=1`, and last the race grind tail
-/// (`gpu_commit::gpu_pow_race_tail_prewarm`, see `ENV_NO_GRIND_LAT`), which
-/// nothing waits for.
-///
-/// The 5+6 GPU arm's kernel is compiled later, after the warm-up commit's
-/// split retune ([`t56_prewarm_after_tune`]).
-///
-/// With R2-CS on (`gpu_commit::ENV_NO_ZC_R2_CS`), a thread of its own builds
-/// the R2-CS pipeline (`gpu_commit::zc_r2_cs_prewarm`), joined by the warm-up
-/// round two's calibration.
-///
-/// With the pipeline fan-out on (`gpu_commit::ENV_NO_PIPE_FANOUT`), the ranked
-/// worker starts one counted helper (`gpu_commit::spawn_build`) per build
-/// instead: the round-one arm, the K pass, the grind tail and R2-CS each on
-/// their own thread, plus the fold kernels, the opening z-fold, the 5+6 fold
-/// and the tri pass 0 kernel, whose builds otherwise wait for their first
-/// launch (or, for the last two, for the split retune). The warm-up's
-/// commit/AB join waits for all of them (`gpu_commit::join_builds`). The
-/// round-two arm is not among them: it stays built at its first launch.
-pub fn ab_completion_gpu_prewarm() {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        let ab = std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1"))
-            && crate::gpu_commit::gpu_zc_ab_completion_share() != 0;
-        let k = crate::gpu_commit::zc_k_prewarm_wanted();
-        let tail = crate::gpu_commit::pow_race_tail_wanted();
-        if crate::gpu_commit::pipe_fanout_enabled() && crate::is_ranked_worker_process() {
-            use crate::gpu_commit::spawn_build;
-            if ab {
-                spawn_build("flock-zcab-prewarm", || {
-                    if let Some(basis) = ab_completion_convert_basis() {
-                        crate::gpu_commit::zc_ab_prewarm(basis);
-                    }
-                });
-            }
-            if k {
-                spawn_build("flock-zck-prewarm", crate::gpu_commit::zc_k_prewarm);
-            }
-            if tail {
-                spawn_build("flock-tail-prewarm", crate::gpu_commit::gpu_pow_race_tail_prewarm);
-            }
-            if crate::gpu_commit::zc_r2_cs_prewarm_wanted() {
-                spawn_build("flock-zcr2cs-prewarm", crate::gpu_commit::zc_r2_cs_prewarm);
-            }
-            spawn_build("flock-fold-prewarm", crate::gpu_commit::zc_fold_prewarm);
-            spawn_build("flock-zfold-prewarm", crate::gpu_commit::zfold_prewarm);
-            if crate::gpu_commit::zc_t56_prewarm_wanted() {
-                spawn_build("flock-zct56-prewarm", crate::gpu_commit::zc_t56_prewarm);
-            }
-            spawn_build("flock-zct0-prewarm", crate::gpu_commit::zc_t0_prewarm);
-            return;
-        }
-        if ab || k || tail {
-            let _ = std::thread::Builder::new().name("flock-zcab-prewarm".into()).spawn(move || {
-                if ab && let Some(basis) = ab_completion_convert_basis() {
-                    crate::gpu_commit::zc_ab_prewarm(basis);
-                }
-                if k {
-                    crate::gpu_commit::zc_k_prewarm();
-                }
-                if tail {
-                    crate::gpu_commit::gpu_pow_race_tail_prewarm();
-                }
-            });
-        }
-        if crate::gpu_commit::zc_r2_cs_prewarm_wanted() {
-            let _ = std::thread::Builder::new()
-                .name("flock-zcr2cs-prewarm".into())
-                .spawn(crate::gpu_commit::zc_r2_cs_prewarm);
-        }
-    }
-}
-
-/// Untimed warm-up only, right after the commit's split retune: compile the
-/// 5+6 GPU arm's kernel (`gpu_commit::zc_t56_prewarm`) on a background thread,
-/// so the compile runs during the warm-up prove's zerocheck instead of beside
-/// its commit and split retune. Its pipeline is a process-wide `OnceLock`, so
-/// a launch that arrives first waits for (or does) the same build. A no-op
-/// when the arm is off.
-pub fn t56_prewarm_after_tune() {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        if crate::gpu_commit::zc_t56_prewarm_wanted() {
-            let _ = std::thread::Builder::new().name("flock-zct56-prewarm".into()).spawn(|| {
-                crate::gpu_commit::zc_t56_prewarm();
-                // The tri pass 0 arm's kernel, on the same thread, after.
-                crate::gpu_commit::zc_t0_prewarm();
-            });
-        }
-    }
-}
-
-/// Launch the GPU prefix of the folded completion, or `None` (CPU drains
-/// every chunk: kill switch / share 0, arm disabled, non-ranked geometry,
-/// no Metal). Challenge-derived inputs come from the same `r_outer` the CPU
-/// tables use, regrouped as `eq_bot' = eq(r_lo[..4])` and
-/// `e_top' = eq(r_lo[4..]) * D^-1` (their product is `eq_lo * D^-1` exactly).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn launch_ab_completion_gpu_prefix(
-    ab_inner: &Round1AbInner,
-    r_outer: &[F128],
-    n_lo: usize,
-    n_hi: usize,
-    padding: &PaddingSpec,
-) -> Option<AbGpuPrefix> {
-    let share = crate::gpu_commit::gpu_zc_ab_completion_share();
-    if share == 0 {
-        return None;
-    }
-    // Kernel geometry: 4096 `x_lo` rows (1 KiB each) per chunk, at most 128
-    // chunks, and windows selected by the low four `x_lo` bits only.
-    if n_lo != 12 || n_hi > 7 || r_outer.len() != n_lo + n_hi {
-        return None;
-    }
-    let hi_size = 1usize << n_hi;
-    if ab_inner.len_bytes() != hi_size << (n_lo + N_INNER + 3) {
-        return None;
-    }
-    let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
-    if within_outer_mask >= 16 || b_med_counts.len() <= within_outer_mask {
-        return None;
-    }
-    let basis = ab_completion_convert_basis()?;
-    // Row (x_lo, b) is gathered iff the CPU sweep reads it: window
-    // `w = x_lo & within_outer_mask` (the x_hi bits sit above bit n_lo), span
-    // `[first_materialized_b_med(w), materialized_b_med_end(w, n_b_med))`.
-    let mut bmask = [0u32; 16];
-    for bot in 0..16usize {
-        let w = bot & within_outer_mask;
-        let n_b_med = b_med_counts[w] as usize;
-        if n_b_med == 0 {
-            continue;
-        }
-        let first = ab_inner.representation.first_materialized_b_med(w);
-        let end = ab_inner.representation.materialized_b_med_end(w, n_b_med);
-        for row in bmask.iter_mut().take(end.min(16)).skip(first) {
-            *row |= 1 << bot;
-        }
-    }
-    let r_lo = &r_outer[..n_lo];
-    let eq_bot = build_eq(&r_lo[..4]);
-    let e_top = build_eq_scaled(&r_lo[4..], d_inv());
-    let eq_hi = build_eq(&r_outer[n_lo..]);
-    let job = crate::gpu_commit::launch_zc_ab_completion(
-        ab_inner.as_bytes(),
-        ab_inner.provenance_hit,
-        share.min(hi_size),
-        &bmask,
-        basis,
-        &e_top,
-        &eq_bot,
-        &eq_hi,
-    )?;
-    Some(AbGpuPrefix { job })
-}
-
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-fn launch_ab_completion_gpu_prefix(
-    _ab_inner: &Round1AbInner,
-    _r_outer: &[F128],
-    _n_lo: usize,
-    _n_hi: usize,
-    _padding: &PaddingSpec,
-) -> Option<AbGpuPrefix> {
-    None
-}
-
 /// Completion set-up: everything the chunk queue reads besides `ab_inner`.
 enum AbCompletionSetup {
     Plain {
@@ -4318,13 +3759,6 @@ where
     let n_hi = fold4_n_hi.min(r_outer.len());
     let n_lo = r_outer.len() - n_hi;
     let bank_bits = fold.bank_bits(n_lo);
-    // GPU prefix arm (`FLOCK_NO_GPU_ZC_AB_COMPLETION` kills): submitted first
-    // so the GPU starts while the CPU builds its tables. Folded drain only.
-    let gpu_prefix = if bank_bits.is_some() && n_hi > 0 {
-        launch_ab_completion_gpu_prefix(ab_inner, r_outer, n_lo, n_hi, padding)
-    } else {
-        None
-    };
     let setup = || {
         if let Some(bank_bits) = bank_bits {
             // The folded arm builds its low factors below and never reads eq.lo.
@@ -4415,67 +3849,50 @@ where
             bank_deferred,
         } => {
             let bank_len = eq_bot.len() * ELL;
-            // GPU prefix arm: in an admitted prove the GPU owns chunks
-            // `0..cpu_base` and the CPU queue starts at `cpu_base`; without the
-            // arm (or during its warm-up oracle probe) `cpu_base == 0` and the
-            // queue below is exactly the incumbent one.
-            let cpu_base = gpu_prefix.as_ref().map_or(0, AbGpuPrefix::cpu_base);
-            let cpu_chunks = hi_size - cpu_base;
-            // C fold tune fix: this prove's CPU queue length against an
-            // admitted prove's (the warm-up probe drains every chunk).
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            crate::gpu_commit::zc_fold_tune_note_ab_chunks(
-                hi_size - gpu_prefix.as_ref().map_or(0, AbGpuPrefix::gpu_chunks),
-                cpu_chunks,
-            );
             // Tail split (`FLOCK_NO_ZC_AB_TAIL_SPLIT=1` kills): the last
             // `split` chunks of the queue are claimed as two half-ranges of
             // `x_outer_lo` each, halving the queue's ragged-tail grain. The
             // two half partials XOR to the whole chunk's partial exactly.
-            let split = ab_tail_split_chunks(cpu_chunks, big_lo_size, 1usize << bank_bits);
-            let whole = cpu_chunks - split;
+            let split = ab_tail_split_chunks(hi_size, big_lo_size, 1usize << bank_bits);
+            let whole = hi_size - split;
             let half_lo = big_lo_size / 2;
             let mut half_partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(2 * split);
             let half_base = crate::epool::SyncPtr(half_partials.as_mut_ptr());
-            let fold_chunk = |x_hi: usize, range: std::ops::Range<usize>| -> [F128; ELL] {
-                let mut partial = [F128::ZERO; ELL];
-                AB_EQ_FOLD_BANKS.with(|cell| {
-                    let mut banks = cell.borrow_mut();
-                    if banks.len() != bank_len {
-                        banks.clear();
-                        banks.resize(bank_len, F128::ZERO);
-                    }
-                    process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
-                        x_hi,
-                        range,
-                        big_lo_size,
-                        n_lo_and_inner,
-                        within_outer_mask,
-                        &b_med_counts,
-                        ab_inner_bytes,
-                        ab_inner.representation,
-                        &eq_bot,
-                        eq.hi[x_hi],
-                        &tables,
-                        bank_bits,
-                        bank_deferred,
-                        &mut banks,
-                        &mut partial,
-                    );
-                });
-                partial
-            };
             let out = crate::epool::run_hetero_chunks_caller_tail(
                 whole + 2 * split,
                 |i| {
                     let (x_hi, range) = if i < whole {
-                        (cpu_base + i, 0..big_lo_size)
+                        (i, 0..big_lo_size)
                     } else {
                         let j = i - whole;
                         let h = j & 1;
-                        (cpu_base + whole + j / 2, h * half_lo..(h + 1) * half_lo)
+                        (whole + j / 2, h * half_lo..(h + 1) * half_lo)
                     };
-                    let partial = fold_chunk(x_hi, range);
+                    let mut partial = [F128::ZERO; ELL];
+                    AB_EQ_FOLD_BANKS.with(|cell| {
+                        let mut banks = cell.borrow_mut();
+                        if banks.len() != bank_len {
+                            banks.clear();
+                            banks.resize(bank_len, F128::ZERO);
+                        }
+                        process_one_x_hi_range_with_precomputed_ab_fold4_ab_eq_folded(
+                            x_hi,
+                            range,
+                            big_lo_size,
+                            n_lo_and_inner,
+                            within_outer_mask,
+                            &b_med_counts,
+                            ab_inner_bytes,
+                            ab_inner.representation,
+                            &eq_bot,
+                            eq.hi[x_hi],
+                            &tables,
+                            bank_bits,
+                            bank_deferred,
+                            &mut banks,
+                            &mut partial,
+                        );
+                    });
                     // SAFETY: each queue index owns one disjoint output slot
                     // (whole chunks in `partials`, halves in
                     // `half_partials`) and the synchronous queue join
@@ -4490,42 +3907,15 @@ where
                 },
                 tail,
             );
+            crate::scratch::give_f128(tables);
             // Reassemble each split chunk's partial (XOR is exact).
-            let reassemble = |partials: &mut [[F128; ELL]]| {
-                for k in 0..split {
-                    let (a, b) = (half_partials[2 * k], half_partials[2 * k + 1]);
-                    let mut p = a;
-                    for lane in 0..ELL {
-                        p[lane] += b[lane];
-                    }
-                    partials[cpu_base + whole + k] = p;
+            for k in 0..split {
+                let (a, b) = (half_partials[2 * k], half_partials[2 * k + 1]);
+                let mut p = a;
+                for lane in 0..ELL {
+                    p[lane] += b[lane];
                 }
-            };
-            match gpu_prefix {
-                None => {
-                    crate::scratch::give_f128(tables);
-                    reassemble(&mut partials);
-                }
-                Some(prefix) => {
-                    // The oracle probe compares against the CPU's complete
-                    // per-chunk partials, so reassemble before joining.
-                    reassemble(&mut partials);
-                    if !prefix.finish(&mut partials) {
-                        // GPU failed after admission: CPU computes its chunks
-                        // with the same kernel (the arm is now disabled).
-                        crate::epool::run_hetero_chunks_caller_tail(
-                            cpu_base,
-                            |x_hi| {
-                                let partial = fold_chunk(x_hi, 0..big_lo_size);
-                                // SAFETY: one disjoint slot per index; the
-                                // synchronous join publishes the writes.
-                                unsafe { *partials_base.ptr().add(x_hi) = partial };
-                            },
-                            || {},
-                        );
-                    }
-                    crate::scratch::give_f128(tables);
-                }
+                partials[whole + k] = p;
             }
             out
         }
@@ -4730,28 +4120,6 @@ fn round1_c_inner_fold_columns(
             claim_lo,
         );
         let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
-        // C fold tune fix (`gpu_commit::ENV_NO_ZC_FOLD_TUNE_FIX`), warm-up
-        // window only: the head from the AB completion start, and the
-        // minimum of two warm replays of this same suffix (discarded) as
-        // the CPU price; the drain below publishes the split from them.
-        if crate::gpu_commit::zc_fold_tune_take_replays() {
-            let head_ab_ms = crate::gpu_commit::zc_fold_tune_head_ab_ms(t_suffix);
-            let mut replay_ms = f64::INFINITY;
-            for _ in 0..2 {
-                let t = std::time::Instant::now();
-                let again = crate::lincheck::partial_fold_packed_z_neon_oblock_padded_suffix(
-                    c_lincheck,
-                    m,
-                    k_log,
-                    useful_bits,
-                    eq_outer.as_slice(),
-                    claim_lo,
-                );
-                replay_ms = replay_ms.min(t.elapsed().as_secs_f64() * 1e3);
-                std::hint::black_box(again);
-            }
-            crate::gpu_commit::zc_fold_tune_note_suffix(head_ab_ms, replay_ms);
-        }
         match job.finish_xor_into(&mut out, head_ms, suffix_ms) {
             Ok(()) => return out,
             Err(e) => {
@@ -4880,57 +4248,6 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     (round1_c_opt, s_hat_v_c, quad, fold4, recovered_ab)
 }
 
-/// Kill switch for the round-two C capture (`FLOCK_NO_R2_C_CAPTURE`, any
-/// value: round two folds and multiplies every live row, as before). Read once
-/// per process.
-///
-/// At the ranked shape, round two's groups 0..4 (rows 0..16 of every 256-row
-/// block, the identity prefix) and group 59 (rows 236..240, output words)
-/// have b rows that are all ones and a rows equal to the C rows (C = A AND B).
-/// Their round-two products are then the scaled a rows alone, and summed over
-/// the blocks with the instance weights they are the same linear forms of
-/// round one's completed C inner fold (`c_inner`, whose instance weights are
-/// the same challenges). With this on, round one keeps those fifteen rows of
-/// `c_inner` (odd and even rows 1..16 except rows 0, 4, 8, 12, and rows
-/// 237..240), and round two folds only the even rows of these groups (their
-/// anchors; the deltas are raw bytes), adds none of their products, and adds
-/// their exact contributions to `G(1)`, `W0` and `W1` once from the kept rows.
-/// Same field values, same transcript.
-pub const ENV_NO_R2_C_CAPTURE: &str = "FLOCK_NO_R2_C_CAPTURE";
-
-pub(crate) fn r2_c_capture_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_R2_C_CAPTURE).is_none());
-    *ON
-}
-
-/// The `c_inner` rows round two takes (see [`ENV_NO_R2_C_CAPTURE`]), in order.
-pub(crate) const R2_C_CAPTURE_ROWS: [usize; 15] = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 237, 238, 239];
-
-/// This prove's kept rows (`R2_C_CAPTURE_ROWS.len() * 64` lanes), set by
-/// round one's C fold and taken by round two of the same prove; cleared at
-/// the start of every zerocheck.
-static R2_C_CAPTURE: std::sync::Mutex<Option<Vec<F128>>> = std::sync::Mutex::new(None);
-
-pub(crate) fn r2_c_capture_clear() {
-    *R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = None;
-}
-
-pub(crate) fn r2_c_capture_take() -> Option<Vec<F128>> {
-    R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()).take()
-}
-
-fn r2_c_capture_store(c_inner: &[F128]) {
-    if c_inner.len() < 240 * ELL {
-        return;
-    }
-    let mut rows = Vec::with_capacity(R2_C_CAPTURE_ROWS.len() * ELL);
-    for t in R2_C_CAPTURE_ROWS {
-        rows.extend_from_slice(&c_inner[ELL * t..ELL * (t + 1)]);
-    }
-    *R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(rows);
-}
-
 /// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
 /// stripe fold, but six inner coordinates are retained (64 banks) for the
 /// direct-fold8 PCS consumer. The wire outputs (`round1_c_opt`, canonical
@@ -4960,11 +4277,6 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     assert_eq!(c_lincheck.len(), (1usize << m) / 8);
 
     let c_inner = round1_c_inner_fold(prelude, c_lincheck, m, k_log, useful_bits);
-    // Round-two C capture: only for the ranked producer whose omitted rows
-    // (identity prefix, output window) the AB message also takes from C.
-    if r2_c_capture_enabled() && recover_identity_prefix && recover_output_window && m == 32 {
-        r2_c_capture_store(&c_inner);
-    }
     let recovered_ab = recover_identity_prefix.then(|| {
         let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table);
         if recover_output_window {
@@ -6157,28 +5469,6 @@ fn round1_shift_reduce_extract_c_packed_serial(
 
 #[cfg(test)]
 mod tests {
-    /// The R2-CS ceiling offer (`gpu_commit::ENV_NO_R2_OFFER_CEIL`) never
-    /// reads past the rows the A/B rebuild publishes, nor past the anchors
-    /// view, at any shape the rebuild accepts.
-    #[test]
-    fn r2_offer_ceil_within_published_prefix() {
-        assert_eq!(crate::gpu_commit::zc_r2_offer_ceil_chunks(2048), 880);
-        for log_hi in 3..=14usize {
-            let hi = 1usize << log_hi;
-            let offer = crate::gpu_commit::zc_r2_offer_ceil_chunks(hi);
-            // The rebuild's cap, as `round2_ab_rebuild_geometry` computes it.
-            let cap = hi * crate::gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT / 100;
-            assert!(offer <= cap, "offer {offer} above the published prefix {cap} (hi {hi})");
-            assert!(offer <= (hi * crate::gpu_commit::ZC_R2_CS_SHARE_CEIL_PCT).div_ceil(100));
-            assert!(offer < hi);
-        }
-        for m in 20..=34usize {
-            if let Some((cap, hi, _)) = round2_ab_rebuild_geometry((1usize << m) / 8) {
-                assert!(crate::gpu_commit::zc_r2_offer_ceil_chunks(hi) <= cap);
-            }
-        }
-    }
-
     use super::*;
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
@@ -6554,10 +5844,8 @@ mod tests {
     /// The per-worker window-rows plan (`FLOCK_NO_ZC_AB_WINDOW_PLAN`). With
     /// the default switches the resolver returns the instance the per-chunk
     /// chain calls: the hoisted z form with the slot and Horner pieces on a
-    /// thread with the Karatsuba apply, the hoisted half-pair form with the
-    /// Horner piece on a `flock-ecore-*` worker and with the Karatsuba apply
-    /// off, both with the complemented static-B basis; without the basis
-    /// (`FLOCK_NO_TRANSFORM_TRIM=1`) every pick is the plain instance.
+    /// thread with the Karatsuba apply, the half-pair form with the Horner
+    /// piece on a `flock-ecore-*` worker and with the Karatsuba apply off.
     /// Whole chunks through `precompute_ab_one_chunk` with a plan write the
     /// bytes of the chain at the ranked layout for both windows, every
     /// representation, three drain instantiations and both Karatsuba states,
@@ -6572,29 +5860,10 @@ mod tests {
         let _serial = AB_KARA_FORCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         const V0: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
-        const TRIM: u32 = k::ABV_TRANSFORM_TRIM;
-        let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 | TRIM }, true>;
-        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 | TRIM }, true>;
+        let main: AbWindowRows = rows::<{ V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 }, true>;
+        let plain: AbWindowRows = rows::<{ k::AB_HZ_VARIANT | k::ABV_HORNER2 }, false>;
         assert!(!core::ptr::fn_addr_eq(main, plain));
-        // Without the complemented basis every thread takes the plain rows.
-        let untrimmed: AbWindowRows = rows::<0, false>;
-        for kara in [true, false] {
-            k::ab_kara_force(kara);
-            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan_with_trim(false), untrimmed));
-        }
-        k::ab_kara_force(true);
-        let helper_untrimmed = std::thread::Builder::new()
-            .name("flock-ecore-x".into())
-            .spawn(|| {
-                k::ab_kara_note_worker();
-                ab_window_rows_plan_with_trim(false)
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-        assert!(core::ptr::fn_addr_eq(helper_untrimmed, untrimmed));
         let switches = [
-            "FLOCK_NO_TRANSFORM_TRIM",
             "FLOCK_NO_ZC_AB_KARA",
             "FLOCK_NO_ZC_AB_KARA_UNSCALED",
             "FLOCK_NO_ZC_AB_Z",
@@ -6605,7 +5874,6 @@ mod tests {
             "FLOCK_ZC_AB_Z_MT",
             "FLOCK_NO_ZC_AB_HORNER2",
             "FLOCK_NO_ZC_AB_HZ",
-            "FLOCK_NO_ZC_AB_HZ_HOIST",
             "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN",
         ];
         // The chain's picks with every one of its switches unset.
@@ -6628,7 +5896,7 @@ mod tests {
             assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(), plain));
             k::ab_kara_force(true);
         }
-        let worker_plan = ab_window_rows_worker_plan_with_trim(ab_transform_trim_enabled());
+        let worker_plan = ab_window_rows_worker_plan();
         assert_eq!(worker_plan.is_some(), std::env::var_os(ENV_NO_ZC_AB_WINDOW_PLAN).is_none());
         if let Some(plan) = worker_plan {
             assert!(core::ptr::fn_addr_eq(plan, ab_window_rows_plan()));
@@ -7252,67 +6520,6 @@ mod tests {
         assert_eq!(checked, 5 * (1 + 3 * 2 + 3 * 3));
     }
 
-    #[test]
-    fn ab_unit_scratch_reuse_resets_primed_and_keys_length() {
-        const UNIT: usize = 1024;
-        for paired in [false, true] {
-            let first_ptr = {
-                let mut s = AbUnitScratch::with_pairing(UNIT, paired);
-                for unit in 0..4 {
-                    s.fill(unit, |a, b, _| unsafe {
-                        core::ptr::write_bytes(a, 0xa1, UNIT);
-                        core::ptr::write_bytes(b, 0xb1, UNIT);
-                    });
-                }
-                s.storage.as_ptr()
-            };
-            let mut s = AbUnitScratch::with_pairing(UNIT, paired);
-            if ab_unit_scratch_reuse_enabled() {
-                assert_eq!(s.storage.as_ptr(), first_ptr, "same thread, same shape reuses");
-            }
-            assert_eq!(s.primed, [false; 2], "primed never carried over");
-            let mut seen = Vec::new();
-            for unit in 0..2 {
-                let (a, b) = s.fill(unit, |a, b, primed| {
-                    seen.push(primed);
-                    unsafe {
-                        core::ptr::write_bytes(a, 0x22, UNIT);
-                        core::ptr::write_bytes(b, 0x33, UNIT);
-                    }
-                });
-                assert!(a.iter().all(|&x| x == 0x22) && b.iter().all(|&x| x == 0x33));
-            }
-            assert_eq!(seen, if paired { vec![false, false] } else { vec![false, true] });
-            drop(s);
-            let other = AbUnitScratch::with_pairing(2 * UNIT, paired);
-            assert!(other.storage.iter().all(|&x| x == 0), "new shape is fresh and zeroed");
-        }
-    }
-
-    #[test]
-    fn ab_unit_scratch_reuse_equal_length_different_layout() {
-        const UNIT: usize = 1024;
-        let mut old = AbUnitScratch::with_pairing(UNIT, true);
-        for unit in 0..2 {
-            old.fill(unit, |a, b, _| unsafe {
-                core::ptr::write_bytes(a, 0xa1, UNIT);
-                core::ptr::write_bytes(b, 0xb1, UNIT);
-            });
-        }
-        drop(old);
-        let mut new = AbUnitScratch::with_pairing(2 * UNIT, false);
-        assert_eq!(new.primed, [false; 2]);
-        let (a, b) = new.fill(0, |a, b, primed| {
-            assert!(!primed);
-            unsafe {
-                core::ptr::write_bytes(a, 0x12, 2 * UNIT);
-                core::ptr::write_bytes(b, 0x34, 2 * UNIT);
-            }
-        });
-        assert!(a.iter().all(|&x| x == 0x12));
-        assert!(b.iter().all(|&x| x == 0x34));
-    }
-
     /// Primed scratch slots: a producer that skips the constant half of a
     /// unit whenever `primed` is set must still leave every returned slot
     /// complete, for the single and the paired layout, in any unit order
@@ -7387,8 +6594,7 @@ mod tests {
 
     /// The unit window-rows call (`FLOCK_NO_ZC_AB_WINDOW_UNIT_CALL`). The
     /// default window-rows instances of the main-pool workers and of the
-    /// helper threads (the complemented static-B basis) map to their own
-    /// unit forms, other instances to none.
+    /// helper threads map to their own unit forms, other instances to none.
     /// Whole units through `precompute_ab_unit` with and without the unit
     /// call write the same bytes at the ranked layout: a unit of eight chunks
     /// and one of three that starts in window 1, three representations,
@@ -7408,25 +6614,16 @@ mod tests {
         let _serial = AB_KARA_FORCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         const V0: u32 = k::AB_Z_VARIANT | k::ABV_INLINE_WINDOW | k::ABV_KARA_XOR16 | k::ABV_BSTATIC_Z;
-        const TRIM: u32 = k::ABV_TRANSFORM_TRIM;
-        const MAIN: u32 = V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2 | TRIM;
-        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2 | TRIM;
+        const MAIN: u32 = V0 | k::ABV_KARA_SLOT | k::ABV_HORNER2;
+        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2;
         let maps = |r: AbWindowRows, u: AbWindowUnit| {
             ab_window_unit_plan(r).is_some_and(|got| core::ptr::fn_addr_eq(got, u))
         };
         assert!(maps(rows::<MAIN, true>, unit::<MAIN, true>));
-        assert!(maps(rows::<HELPER, true>, unit::<HELPER, true>));
-        // Lean: the unhoisted helper instance has no unit form (its kill
-        // switches take the plain rows instead), nor have the forms without
-        // the complemented basis (`FLOCK_NO_TRANSFORM_TRIM` takes the plain
-        // rows too).
-        assert!(ab_window_unit_plan(rows::<HELPER, false>).is_none());
-        assert!(ab_window_unit_plan(rows::<{ MAIN & !TRIM }, true>).is_none());
-        assert!(ab_window_unit_plan(rows::<{ HELPER & !TRIM }, true>).is_none());
+        assert!(maps(rows::<HELPER, false>, unit::<HELPER, false>));
         assert!(ab_window_unit_plan(rows::<V0, true>).is_none());
         assert!(ab_window_unit_plan(rows::<{ k::AB_ROWS_VARIANT }, false>).is_none());
         let switches = [
-            "FLOCK_NO_TRANSFORM_TRIM",
             "FLOCK_NO_ZC_AB_KARA",
             "FLOCK_NO_ZC_AB_KARA_UNSCALED",
             "FLOCK_NO_ZC_AB_Z",
@@ -7437,7 +6634,6 @@ mod tests {
             "FLOCK_ZC_AB_Z_MT",
             "FLOCK_NO_ZC_AB_HORNER2",
             "FLOCK_NO_ZC_AB_HZ",
-            "FLOCK_NO_ZC_AB_HZ_HOIST",
             "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN",
         ];
         if switches.iter().all(|s| std::env::var_os(s).is_none()) {
@@ -8398,86 +7594,11 @@ mod tests {
                         check!(AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16);
                         check!(AB_Z_VARIANT | ABV_INLINE_WINDOW | ABV_KARA_XOR16 | kernels::aarch64::ABV_BSTATIC_Z);
                         check!(AB_HZ_VARIANT);
-                        check!(AB_HZ_VARIANT | kernels::aarch64::ABV_HORNER2);
                     }
                 }
             }
         }
-        assert_eq!(cases, 32 * 2 * 2 * 2 * 7);
-    }
-
-    /// The default window rows of the main-pool workers and of the helper
-    /// threads with the complemented static-B basis write the bytes of the
-    /// plain instance, which every arm without the basis
-    /// (`FLOCK_NO_TRANSFORM_TRIM=1`) runs: random A rows, B rows that satisfy
-    /// the static masks and rows that do not (fallback), both windows, both
-    /// store flavours.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn ab_window_rows_trim_matches_plain() {
-        use kernels::aarch64::{self as k, bstatic_horner_window_rows_impl as rows};
-        const MAIN: u32 = k::AB_Z_VARIANT
-            | k::ABV_INLINE_WINDOW
-            | k::ABV_KARA_XOR16
-            | k::ABV_BSTATIC_Z
-            | k::ABV_KARA_SLOT
-            | k::ABV_HORNER2
-            | k::ABV_TRANSFORM_TRIM;
-        const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2 | k::ABV_TRANSFORM_TRIM;
-        let table = make_inv_table();
-        let mut rng = Rng::new(0xAB5A_71C0_F457_0079);
-        let context = k::prepare_static_b_context_with_policy(&table, true, false, false)
-            .expect("enabled static-B context");
-        let k::StaticBContext::Prepared { partials, .. } = context else {
-            unreachable!("prepared static-B context");
-        };
-        const N: usize = 1024;
-        let mut cases = 0usize;
-        for case in 0..32usize {
-            let a: Vec<u8> = (0..N)
-                .map(|_| match case % 4 {
-                    0 => 0,
-                    1 => 0xff,
-                    _ => (rng.next_u64() >> 11 & 0xff) as u8,
-                })
-                .collect();
-            let b: Vec<u8> = (0..N).map(|_| (rng.next_u64() >> 9 & 0xff) as u8).collect();
-            for w in 0..2usize {
-                let (lo, hi) = k::BSTATIC_HORNER_WINDOW_ROWS[w];
-                for satisfied in [true, false] {
-                    let mut bb = b.clone();
-                    if satisfied {
-                        for b_med in lo..hi {
-                            let blk = w * (1 << N_MEDIUM) + b_med;
-                            for kk in 0..N_CHUNKS {
-                                let off = b_med * N_CHUNKS * 8 + kk * N_CHUNKS;
-                                let (mask, expected) = k::BSTATIC_MASKS[blk][kk];
-                                let word = u64::from_le_bytes(bb[off..off + 8].try_into().unwrap());
-                                bb[off..off + 8]
-                                    .copy_from_slice(&((word & !mask) | expected).to_le_bytes());
-                            }
-                        }
-                    }
-                    for nt in [false, true] {
-                        let mut want = vec![0x5au8; 16 * 64];
-                        rows::<0, false>(w, &a, &bb, &table, 0, partials, &mut want, nt);
-                        assert!(want.iter().any(|&x| x != 0x5a));
-                        let trimmed: [(AbWindowRows, &str); 2] =
-                            [(rows::<MAIN, true>, "main"), (rows::<HELPER, true>, "helper")];
-                        for (form, name) in trimmed {
-                            let mut got = vec![0x5au8; 16 * 64];
-                            form(w, &a, &bb, &table, 0, partials, &mut got, nt);
-                            assert_eq!(
-                                got, want,
-                                "{name} rows differ (case={case}, w={w}, satisfied={satisfied}, nt={nt})"
-                            );
-                            cases += 1;
-                        }
-                    }
-                }
-            }
-        }
-        assert_eq!(cases, 32 * 2 * 2 * 2 * 2);
+        assert_eq!(cases, 32 * 2 * 2 * 2 * 6);
     }
 
     /// The hoisted window check rejects slices that do not hold the

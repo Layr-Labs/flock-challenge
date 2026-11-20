@@ -57,128 +57,28 @@ static GUESTS: AtomicUsize = AtomicUsize::new(0);
 /// Publishes `guest` for the duration of `body`, then closes the slot and
 /// waits for any guest still inside it before returning (also on unwind).
 fn with_guest_slot<R>(guest: &GuestFn<'_>, body: impl FnOnce() -> R) -> R {
-    with_slot(&GUEST, &GUESTS, guest, body)
-}
-
-/// Publishes `guest` in `slot` for the duration of `body` (first publisher
-/// wins; a nested drain runs unpublished), then unpublishes and waits until
-/// `hazards` is back at zero, i.e. every thread that entered `guest` through
-/// the slot has left it (also on unwind).
-fn with_slot<R>(
-    slot: &'static std::sync::atomic::AtomicPtr<&'static GuestFn<'static>>,
-    hazards: &'static AtomicUsize,
-    guest: &GuestFn<'_>,
-    body: impl FnOnce() -> R,
-) -> R {
     // SAFETY: lifetime erased only while published; `Close` unpublishes and
     // waits for every guest to leave before `guest`'s borrow ends.
     let erased: &'static GuestFn<'static> =
         unsafe { std::mem::transmute::<&GuestFn<'_>, &'static GuestFn<'static>>(guest) };
     let cell: &&'static GuestFn<'static> = &erased;
     let ptr = cell as *const &'static GuestFn<'static> as *mut &'static GuestFn<'static>;
-    let published = slot
+    let published = GUEST
         .compare_exchange(std::ptr::null_mut(), ptr, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok();
-    struct Close(
-        bool,
-        *mut &'static GuestFn<'static>,
-        &'static std::sync::atomic::AtomicPtr<&'static GuestFn<'static>>,
-        &'static AtomicUsize,
-    );
+    struct Close(bool, *mut &'static GuestFn<'static>);
     impl Drop for Close {
         fn drop(&mut self) {
             if self.0 {
-                let _ = self.2.compare_exchange(self.1, std::ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst);
-                while self.3.load(Ordering::SeqCst) != 0 {
+                let _ = GUEST.compare_exchange(self.1, std::ptr::null_mut(), Ordering::SeqCst, Ordering::SeqCst);
+                while GUESTS.load(Ordering::SeqCst) != 0 {
                     std::hint::spin_loop();
                 }
             }
         }
     }
-    let _close = Close(published, ptr, slot, hazards);
+    let _close = Close(published, ptr);
     body()
-}
-
-/// Priority claim loop: the chunk queue of the plain hetero drain (see
-/// [`run_hetero_chunks`]) currently running on a thread inside a
-/// [`PriorityScope`], published for that drain's duration. Before each claim
-/// of their own, the main-pool workers of a stateful drain run it to
-/// exhaustion, at most [`PriorityScope`]'s `helpers` of them at a time, so
-/// the scoped queue gets that many extra workers within one of their chunks
-/// instead of only once their own queue is empty. `PRIORITY_GUESTS` is the
-/// hazard count that makes closing safe (as for [`GUEST`]). Scheduling only:
-/// every chunk of either queue is still claimed exactly once from its own
-/// cursor.
-static PRIORITY: std::sync::atomic::AtomicPtr<&'static GuestFn<'static>> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static PRIORITY_GUESTS: AtomicUsize = AtomicUsize::new(0);
-/// Threads currently inside the priority claim loop through
-/// [`help_priority`], and the most allowed there at once.
-static PRIORITY_HELPERS: AtomicUsize = AtomicUsize::new(0);
-static PRIORITY_CAP: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    /// The `helpers` of this thread's innermost live [`PriorityScope`];
-    /// 0 outside any (or inside one with `helpers == 0`).
-    static PRIORITY_CALLER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// While alive, plain hetero drains started on this thread publish their
-/// claim loop as the priority queue, joined by at most `helpers` stateful
-/// drain workers at a time; `helpers == 0` publishes nothing. The previous
-/// setting is restored on drop.
-pub(crate) struct PriorityScope(usize);
-
-impl PriorityScope {
-    pub(crate) fn new(helpers: usize) -> Self {
-        Self(PRIORITY_CALLER.with(|c| c.replace(helpers)))
-    }
-}
-
-impl Drop for PriorityScope {
-    fn drop(&mut self) {
-        PRIORITY_CALLER.with(|c| c.set(self.0));
-    }
-}
-
-/// Whether this thread is inside a [`PriorityScope`] that publishes.
-#[inline]
-fn priority_caller() -> bool {
-    PRIORITY_CALLER.with(|c| c.get()) > 0
-}
-
-/// [`with_slot`] on the priority slot when this thread is inside a
-/// publishing [`PriorityScope`]; otherwise just `body`.
-fn with_priority_slot<R>(guest: &GuestFn<'_>, body: impl FnOnce() -> R) -> R {
-    let helpers = PRIORITY_CALLER.with(|c| c.get());
-    if helpers == 0 {
-        return body();
-    }
-    PRIORITY_CAP.store(helpers, Ordering::Relaxed);
-    with_slot(&PRIORITY, &PRIORITY_GUESTS, guest, body)
-}
-
-/// Run the published priority queue's claim loop on this thread until that
-/// queue is empty, unless the queue already has its cap of such helpers.
-/// One relaxed load when nothing is published.
-#[inline]
-fn help_priority() {
-    if PRIORITY.load(Ordering::Relaxed).is_null() {
-        return;
-    }
-    if PRIORITY_HELPERS.fetch_add(1, Ordering::Relaxed) >= PRIORITY_CAP.load(Ordering::Relaxed) {
-        PRIORITY_HELPERS.fetch_sub(1, Ordering::Relaxed);
-        return;
-    }
-    PRIORITY_GUESTS.fetch_add(1, Ordering::SeqCst);
-    let p = PRIORITY.load(Ordering::SeqCst);
-    if !p.is_null() {
-        // SAFETY: the publisher cannot return while PRIORITY_GUESTS > 0 and
-        // it unpublishes (SeqCst) before checking PRIORITY_GUESTS.
-        unsafe { (**p)(&|| false) };
-    }
-    PRIORITY_GUESTS.fetch_sub(1, Ordering::SeqCst);
-    PRIORITY_HELPERS.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Claim chunks of the currently draining main-pool queue on this thread
@@ -500,77 +400,6 @@ const EPOOL_MIN_CHUNKS: usize = 4;
 /// `n_chunks >= EPOOL_MIN_CHUNKS`. A drain missing any one of these runs
 /// main-pool-only (inline when single-threaded), so the two-pool shape is
 /// never observable in the output, only in which pool claims each chunk.
-/// `true` while the helper pool's workers stay in [`hot_spin_body`].
-static HOT_SPIN: AtomicBool = AtomicBool::new(false);
-/// `FLOCK_NO_EPOOL_HOT`, read by [`hot_spin_arm`].
-static HOT_SPIN_OFF: AtomicBool = AtomicBool::new(false);
-/// Upper bound on one hot spin, should [`hot_spin_release`] never be reached.
-const HOT_SPIN_MAX: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Read the hot helper spin's kill switch (`FLOCK_NO_EPOOL_HOT`, any value)
-/// and make sure the helper pool exists. Called where the main pool's hot
-/// spin is armed, outside any timed interval.
-pub(crate) fn hot_spin_arm() {
-    HOT_SPIN_OFF.store(std::env::var_os("FLOCK_NO_EPOOL_HOT").is_some(), Ordering::Relaxed);
-    let _ = epool();
-}
-
-/// Keep the helper pool's workers from parking until [`hot_spin_release`].
-/// A helper worker that finds no job sleeps after Rayon's idle rounds, and
-/// every later hetero drain's `spawn_broadcast` then has to wake it before it
-/// can claim a chunk. This hands each helper worker one broadcast job that
-/// loops on `rayon::yield_now`, which runs the worker's pending jobs (its
-/// broadcast queue first, then stolen and injected ones), and yields the core
-/// to the kernel between idle rounds. Later broadcasts therefore run nested
-/// in that job on a worker that is already running. The loop ends at the
-/// release or after [`HOT_SPIN_MAX`]; a worker still busy when the release
-/// comes runs the job later and leaves it at once. Scheduling only: the same
-/// jobs, run by the same pool. Called by the main pool's hot spin at the
-/// witness hand-off, so it engages exactly when that one does.
-pub(crate) fn hot_spin_start() {
-    if HOT_SPIN_OFF.load(Ordering::Relaxed) {
-        return;
-    }
-    let Some(ep) = epool() else {
-        return;
-    };
-    if HOT_SPIN.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let deadline = std::time::Instant::now() + HOT_SPIN_MAX;
-    ep.spawn_broadcast(move |_| hot_spin_body(deadline));
-}
-
-const HOT_SPIN_YIELD_EVERY: u32 = 32;
-
-fn hot_spin_body(deadline: std::time::Instant) {
-    let mut idle: u32 = 0;
-    while HOT_SPIN.load(Ordering::Relaxed) {
-        if let Some(rayon::Yield::Executed) = rayon::yield_now() {
-            idle = 0;
-            continue;
-        }
-        idle = idle.wrapping_add(1);
-        if idle % HOT_SPIN_YIELD_EVERY == 0 {
-            std::thread::yield_now();
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-        } else {
-            for _ in 0..16 {
-                std::hint::spin_loop();
-            }
-        }
-    }
-}
-
-/// End the hot helper spin (idempotent; a no-op when none is running).
-pub(crate) fn hot_spin_release() {
-    if HOT_SPIN.load(Ordering::Relaxed) {
-        HOT_SPIN.store(false, Ordering::Release);
-    }
-}
-
 /// Chunks claimed by the efficiency-core helper pool across all hetero
 /// drains (diagnostic only; relaxed ordering). Read deltas around a window
 /// to prove E-core engagement for that window.
@@ -907,108 +736,6 @@ where
     F: Fn(usize) + Sync,
 {
     run_chunks_with_helper(n_chunks, &f, epool());
-}
-
-/// Caller-first chunk drain (grind pack 3). Runs `f(i)` exactly once for every
-/// `i < n_chunks`. The calling thread starts claiming chunks from an atomic
-/// cursor at once; one job posted to the main pool fans out over the other
-/// pool threads, and each of them claims from the same cursor as soon as it
-/// runs (a lingering worker picks the job up within a spin). The caller never
-/// parks on a pool latch and never waits for a pool thread that has not
-/// started: once the cursor is exhausted it waits only for the chunks other
-/// threads have already claimed. A pool thread that starts late finds the
-/// cursor exhausted and touches nothing but the shared counters.
-///
-/// Which thread runs a chunk is the only thing that changes, so a body whose
-/// chunk outputs are disjoint (and independent of the running thread) gives
-/// the same bytes as the serial loop. Outside a pool, or with a one-thread
-/// pool, this is the serial loop.
-pub(crate) fn run_caller_first_chunks<F>(n_chunks: usize, f: &F)
-where
-    F: Fn(usize) + Sync,
-{
-    let threads = rayon::current_num_threads();
-    if n_chunks <= 1 || threads <= 1 || rayon::current_thread_index().is_none() {
-        for i in 0..n_chunks {
-            f(i);
-        }
-        return;
-    }
-    struct Drain {
-        next: AtomicUsize,
-        done: AtomicUsize,
-        n: usize,
-        f: *const (dyn Fn(usize) + Sync + 'static),
-    }
-    // SAFETY: `f` is only called for a claimed index below `n` (see `work`),
-    // and the publisher returns only after every claimed index completed.
-    unsafe impl Send for Drain {}
-    unsafe impl Sync for Drain {}
-    impl Drain {
-        fn work(&self) {
-            loop {
-                let i = self.next.fetch_add(1, Ordering::Relaxed);
-                if i >= self.n {
-                    return;
-                }
-                // SAFETY: `i < n` was claimed before the publisher saw the
-                // cursor exhausted, and the publisher waits for `done == n`
-                // before the borrow behind `f` ends.
-                unsafe { (*self.f)(i) };
-                self.done.fetch_add(1, Ordering::Release);
-            }
-        }
-    }
-    let f_dyn: &(dyn Fn(usize) + Sync) = f;
-    // SAFETY: lifetime erasure only; see `Drain` above.
-    let f_static: &'static (dyn Fn(usize) + Sync + 'static) = unsafe {
-        std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync + 'static)>(
-            f_dyn,
-        )
-    };
-    let drain = Arc::new(Drain {
-        next: AtomicUsize::new(0),
-        done: AtomicUsize::new(0),
-        n: n_chunks,
-        f: f_static as *const (dyn Fn(usize) + Sync + 'static),
-    });
-    /// If `f` panics on the calling thread, the unwind must not end the
-    /// borrow behind `f` while another thread still runs a chunk: close the
-    /// cursor (later claims see an index past `n`) and wait for every chunk
-    /// handed out except the caller's own, which never completes.
-    struct UnwindWait<'a>(&'a Drain);
-    impl Drop for UnwindWait<'_> {
-        fn drop(&mut self) {
-            if std::thread::panicking() {
-                let claimed = self.0.next.swap(usize::MAX / 2, Ordering::AcqRel).min(self.0.n);
-                while self.0.done.load(Ordering::Acquire) + 1 < claimed {
-                    std::hint::spin_loop();
-                }
-            }
-        }
-    }
-    {
-        let drain = Arc::clone(&drain);
-        let helpers = (threads - 1).min(n_chunks - 1);
-        rayon::spawn(move || {
-            (0..helpers).into_par_iter().with_max_len(1).for_each(|_| drain.work());
-        });
-    }
-    let guard = UnwindWait(&drain);
-    drain.work();
-    while drain.done.load(Ordering::Acquire) < n_chunks {
-        std::hint::spin_loop();
-    }
-    drop(guard);
-}
-
-/// [`run_hetero_chunks`] whose main-pool workers each run `after` once their
-/// claim loop finds the queue exhausted, while the others are still on their
-/// last chunks; returns once every chunk and every `after` has run.
-/// Efficiency-core helpers run chunks only. Scheduling only: every chunk
-/// index is still claimed exactly once from the same cursor.
-pub(crate) fn run_hetero_chunks_then(n_chunks: usize, f: &(dyn Fn(usize) + Sync), after: &(dyn Fn() + Sync)) {
-    run_chunks_with_helper_arm_after(n_chunks, &f, epool(), detached_enabled(), &after);
 }
 
 /// [`run_hetero_chunks`] plus one caller-thread tail job: the calling thread
@@ -1430,9 +1157,7 @@ fn run_chunks_with_helper_arm_after<F, A>(
             .with_max_len(1)
             .for_each(|_| worker());
     };
-    // Inside a `PriorityScope`, main-pool workers of a concurrently draining
-    // stateful queue also run `linger_guest` (see `PRIORITY`).
-    with_priority_slot(&linger_guest, || match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
+    match helper.filter(|_| n_chunks >= EPOOL_MIN_CHUNKS) {
         Some(ep) => {
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
             let helper_body = || {
@@ -1454,7 +1179,7 @@ fn run_chunks_with_helper_arm_after<F, A>(
             });
         }
         None => with_linger_slot(&linger_guest, drain_main),
-    });
+    }
     spawn_lingerers(main_threads);
 }
 
@@ -1519,20 +1244,9 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
     }
     let next = AtomicUsize::new(0);
     let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
-    let caller = rayon::current_thread_index();
     let worker = || {
-        // A thread that publishes a priority queue and picked this task up
-        // while waiting inside that queue's own drain would hold that drain
-        // until this queue is empty; it leaves this queue to the others. A
-        // pool-worker caller runs the first queue task itself and drains to
-        // the end, so every chunk is still claimed.
-        if caller.is_some() && priority_caller() && rayon::current_thread_index() != caller {
-            return;
-        }
         let mut state = init();
         loop {
-            // A published priority queue goes first (see `PRIORITY`).
-            help_priority();
             let i = next.fetch_add(1, Ordering::Relaxed);
             if i >= n_chunks {
                 break;
@@ -1631,86 +1345,6 @@ unsafe impl<T> Sync for SyncPtr<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A broadcast and a detached hetero drain issued while the helper
-    /// workers are in the hot spin reach the workers and complete, and the
-    /// spin ends at the release.
-    #[test]
-    fn hot_spin_runs_helper_jobs_and_releases() {
-        let Some(ep) = epool() else {
-            return;
-        };
-        hot_spin_start();
-        let hits = AtomicUsize::new(0);
-        ep.broadcast(|_| {
-            hits.fetch_add(1, Ordering::Relaxed);
-        });
-        assert_eq!(hits.load(Ordering::Relaxed), ep.current_num_threads());
-        // A detached hetero drain (its own cursor, so it shares no queue
-        // state with other drains).
-        let (next, sum) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let claim = || loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= 256 {
-                break;
-            }
-            sum.fetch_add(i + 1, Ordering::Relaxed);
-        };
-        drain_hetero(2, &claim, ep, &claim, true);
-        assert_eq!(sum.load(Ordering::Relaxed), 256 * 257 / 2);
-        hot_spin_release();
-        assert!(!HOT_SPIN.load(Ordering::Relaxed));
-        let hits = AtomicUsize::new(0);
-        ep.broadcast(|_| {
-            hits.fetch_add(1, Ordering::Relaxed);
-        });
-        assert_eq!(hits.load(Ordering::Relaxed), ep.current_num_threads());
-    }
-
-    /// Grind pack 3: the caller-first drain runs every chunk exactly once,
-    /// in and out of a pool; and when the body panics on the calling thread,
-    /// the unwind leaves the drain only after every chunk another thread
-    /// claimed has finished (nothing runs the body afterwards).
-    #[test]
-    fn caller_first_chunks_run_once_and_unwind_waits() {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(5).build().unwrap();
-        for n in [0usize, 1, 2, 7, 64, 333] {
-            let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-            let body = |i: usize| {
-                hits[i].fetch_add(1, Ordering::Relaxed);
-            };
-            run_caller_first_chunks(n, &body);
-            for rep in 0..20 {
-                pool.install(|| run_caller_first_chunks(n, &body));
-                let _ = rep;
-            }
-            assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 21), "n={n}");
-        }
-        for rep in 0..20 {
-            let hits: Vec<AtomicUsize> = (0..64).map(|_| AtomicUsize::new(0)).collect();
-            let unwound = pool.install(|| {
-                let me = rayon::current_thread_index();
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_caller_first_chunks(64, &|i: usize| {
-                        if rayon::current_thread_index() == me && i >= 4 {
-                            panic!("caller chunk {i}");
-                        }
-                        std::thread::sleep(std::time::Duration::from_micros(30));
-                        hits[i].fetch_add(1, Ordering::Release);
-                    })
-                }))
-                .is_err()
-            });
-            let total = |h: &[AtomicUsize]| h.iter().map(|x| x.load(Ordering::Acquire)).sum::<usize>();
-            let before = total(&hits);
-            std::thread::sleep(std::time::Duration::from_millis(3));
-            assert_eq!(total(&hits), before, "a chunk ran after the drain returned (rep={rep})");
-            assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) <= 1), "rep={rep}");
-            if !unwound {
-                assert_eq!(before, 64, "rep={rep}");
-            }
-        }
-    }
 
     /// A guest claims chunks of the draining queue one at a time, returns as
     /// soon as its own condition holds, and every chunk still runs exactly

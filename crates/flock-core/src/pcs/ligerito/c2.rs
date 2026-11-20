@@ -24,42 +24,6 @@ fn dot(a: &[F128], b: &[F128]) -> F128 {
     }
 }
 
-/// Lanes of an L0 C2 row before the shared tail.
-const ROW_HEAD: usize = 57;
-
-/// Kill switch for the shared tail of adjacent C2 rows:
-/// `FLOCK_NO_C2_SHARED_TAIL=1` (any value) forms both full dots. Read once
-/// per process.
-fn c2_shared_tail_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_SHARED_TAIL").is_none())
-}
-
-/// The lane dots `[a · w, b · w]` of two adjacent C2 rows. When both have
-/// 64 lanes and agree on lanes 57..64, that tail's seven products are formed
-/// once and added to each row's 57-lane head: the same field sums. At L0
-/// these lanes are the witness padding (banks 57..63 of every odd 64-word
-/// slot are zero), so each such lane's message has zero odd coefficients and
-/// its codeword takes equal values at positions `2i` and `2i + 1`.
-#[inline]
-fn row_dot_pair(a: &[F128], b: &[F128], w: &[F128]) -> [F128; 2] {
-    if c2_shared_tail_enabled()
-        && w.len() == 64
-        && a.len() == 64
-        && b.len() == 64
-        && a[ROW_HEAD..] == b[ROW_HEAD..]
-    {
-        use crate::field::f128_slice::fold_banked_slot;
-        let head: &[F128; ROW_HEAD] = w[..ROW_HEAD].try_into().unwrap();
-        let tail = fold_banked_slot::<{ 64 - ROW_HEAD }>(w[ROW_HEAD..].try_into().unwrap(), &a[ROW_HEAD..]);
-        return [
-            fold_banked_slot::<ROW_HEAD>(head, a) + tail,
-            fold_banked_slot::<ROW_HEAD>(head, b) + tail,
-        ];
-    }
-    [dot(a, w), dot(b, w)]
-}
-
 #[inline]
 fn dot2(local: &[F128], weights: &[F128], half: usize) -> [F128; 2] {
     debug_assert_eq!(local.len(), 2 * half);
@@ -173,8 +137,8 @@ impl Dual {
             let base = q & !mask;
             let qoff = q - base;
             let mut cache = [F128::ZERO; 16];
-            for j in (0..cache_len).step_by(2) {
-                [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
+            for j in 0..cache_len {
+                cache[j] = dot(row(base + j), &lane_weights);
             }
             enforced ^= alpha.mul_unreduced(cache[qoff]);
             stages.push(invert_local_staged(
@@ -244,7 +208,7 @@ impl Dual {
         let mut scales = crate::alloc_uninit_vec::<[F128; 4]>(n_queries);
         let mut positions = crate::alloc_uninit_vec::<usize>(n_queries);
         let mut w2_pows = crate::alloc_uninit_vec::<F128>(n_queries);
-        let par_floor = if op_dual_par_env_on() {
+        let par_floor = if std::env::var("FLOCK_NO_OP_DUAL_PAR").map_or(true, |v| v != "1") {
             256
         } else {
             1024
@@ -262,8 +226,8 @@ impl Dual {
                     let base = q & !mask;
                     let qoff = q - base;
                     let mut cache = [F128::ZERO; 16];
-                    for j in (0..cache_len).step_by(2) {
-                        [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
+                    for j in 0..cache_len {
+                        cache[j] = dot(row(base + j), &lane_weights);
                     }
                     let enf = w.mul_unreduced(cache[qoff]);
                     *stage_out = invert_local_staged(
@@ -303,8 +267,8 @@ impl Dual {
                 let base = q & !mask;
                 let qoff = q - base;
                 let mut cache = [F128::ZERO; 16];
-                for j in (0..cache_len).step_by(2) {
-                    [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
+                for j in 0..cache_len {
+                    cache[j] = dot(row(base + j), &lane_weights);
                 }
                 enf_sum ^= w.mul_unreduced(cache[qoff]);
                 *stage_out = invert_local_staged(
@@ -465,10 +429,6 @@ impl Dual {
     }
 }
 
-/// Largest prover state whose C2 fold skips the Rayon join (see
-/// [`Pending::fold`]).
-const C2_SEQ_MAX_STATE: usize = 1 << 15;
-
 pub(super) struct Pending {
     dual: Dual,
     enforced: F128,
@@ -514,36 +474,6 @@ impl Pending {
         assert!(self.glued && self.challenges.len() < d);
         self.challenges.push(r);
         let complete = self.challenges.len() == d;
-        // Small states (`FLOCK_NO_SMALL_SERIAL=1` kills): the fold and the
-        // dual's message / materialize run one after the other on this
-        // thread instead of as a Rayon join. On the ranked open these are
-        // the folds of the 2^15..2^5 states, where the join's wake and wait
-        // cost about as much as the dual's work (M4: the c2 folds of one
-        // prove take 1.04 -> 0.98 ms with 4 threads, 1.34 -> 1.20 ms with
-        // 10). Same operations on the same inputs, combined in the same
-        // order, so the message, the basis and the transcript are unchanged.
-        if sc.f.len() <= C2_SEQ_MAX_STATE && crate::small_serial_enabled() {
-            let mut message = sc.fold(r);
-            let correction = self.dual.message(&self.challenges);
-            message.u_0 += correction.u_0;
-            message.u_2 += correction.u_2;
-            *sc.transcript.last_mut().expect("fold records a message") = message;
-            if !complete {
-                return (message, false);
-            }
-            assert!(
-                sc.pending_glue.is_none()
-                    && sc.pending_fold_basis.is_none()
-                    && sc.pending_ood_eq.is_none()
-            );
-            let basis = self.dual.materialize(&self.challenges);
-            assert_eq!(basis.len(), sc.combined_basis.len());
-            for (dst, &src) in sc.combined_basis.iter_mut().zip(&basis) {
-                *dst += src;
-            }
-            crate::scratch::give_sparse_ntt_data(basis);
-            return (message, true);
-        }
         if complete {
             assert!(
                 sc.pending_glue.is_none()
@@ -592,162 +522,8 @@ impl Pending {
             (message, false)
         }
     }
-
-    /// The completing fold when it is the last fold of the open
-    /// (`FLOCK_NO_C2_TERMINAL_SKIP=1` kills). [`Self::fold`] then
-    /// materializes the dual's basis and adds it into `combined_basis` for
-    /// later rounds, but after the last fold the prover reads only `f` (the
-    /// final `yr`) and the transcript before it drops its state, so that
-    /// basis is never read. Same fold, same dual correction, same message in
-    /// the same transcript slot; only the materialize and the merge go.
-    pub(super) fn fold_terminal(&mut self, r: F128, sc: &mut SumcheckProver) -> SumcheckMessage {
-        assert!(self.glued && self.challenges.len() + 1 == self.dual.depth);
-        self.challenges.push(r);
-        let mut message = sc.fold(r);
-        let correction = self.dual.message(&self.challenges);
-        message.u_0 += correction.u_0;
-        message.u_2 += correction.u_2;
-        *sc.transcript.last_mut().expect("fold records a message") = message;
-        assert!(
-            sc.pending_glue.is_none()
-                && sc.pending_fold_basis.is_none()
-                && sc.pending_ood_eq.is_none()
-        );
-        message
-    }
-}
-
-/// Kill switch for [`Pending::fold_terminal`]: `FLOCK_NO_C2_TERMINAL_SKIP`
-/// (any value) keeps the materialize and merge on the last fold. Read once
-/// per process.
-pub(super) fn terminal_skip_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_TERMINAL_SKIP").is_none())
-}
-
-/// The `FLOCK_NO_OP_DUAL_PAR` (exact `'1'`) term of the dual-opening
-/// parallel floor. The process environment does not change during a prove,
-/// so the first answer is kept; `FLOCK_NO_LIGERITO_ENV_ONCE` (any value)
-/// restores the per-call lookup.
-#[inline]
-fn op_dual_par_env_on() -> bool {
-    if super::ligerito_env_once_enabled() {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("FLOCK_NO_OP_DUAL_PAR").map_or(true, |v| v != "1")
-        });
-        return *ON;
-    }
-    std::env::var("FLOCK_NO_OP_DUAL_PAR").map_or(true, |v| v != "1")
 }
 
 pub(super) fn enabled(lazy_l1_selected: bool, disabled: Option<&std::ffi::OsStr>) -> bool {
     lazy_l1_selected && disabled != Some(std::ffi::OsStr::new("1"))
-}
-
-#[cfg(test)]
-mod terminal_tests {
-    use super::*;
-    use crate::challenger::Challenger;
-
-    /// The terminal fold returns the same messages, transcript, folded `f` and
-    /// target as the merging fold; it only leaves `combined_basis` unmerged.
-    /// Shapes include the ranked deep one (log_msg 7, rate 5, 8 lanes, depth 3).
-    #[test]
-    fn terminal_fold_matches_merging_fold_except_the_unread_basis() {
-        for (case, (log_msg, log_rate, log_lanes, depth)) in
-            [(5usize, 1usize, 0usize, 2usize), (7, 1, 2, 2), (7, 2, 2, 3), (7, 5, 3, 3), (10, 2, 3, 3)]
-                .into_iter()
-                .enumerate()
-        {
-            let mut ch = crate::challenger::RandomChallenger::new(0xC2_7E40_0000 + case as u64);
-            let poly = ch.sample_f128_vec((1usize << log_msg) << log_lanes);
-            let lanes = ch.sample_f128_vec(log_lanes);
-            let f = partial_eval_lsb(&poly, &lanes);
-            let n = 1usize << (log_msg + log_rate);
-            let mut codeword = vec![F128::ZERO; n << log_lanes];
-            codeword[..poly.len()].copy_from_slice(&poly);
-            AdditiveNttF128::standard(log_msg + log_rate)
-                .forward_transform_interleaved(&mut codeword, 1 << log_lanes);
-            let queries = vec![0, 1, 2, 3, 6, 7, 8, 9, n / 2 - 1, n / 2, n - 2, n - 1];
-            let alpha = ch.sample_f128_vec(ceil_log2(queries.len()));
-            let initial = ch.sample_f128_vec(f.len());
-            let h = f.iter().zip(&initial).fold(F128::ZERO, |s, (&a, &b)| s + a * b);
-            let beta = ch.sample_f128();
-            let rs = ch.sample_f128_vec(depth);
-            let run = |terminal: bool| {
-                let (mut sc, _) = SumcheckProver::new(f.clone(), initial.clone(), h);
-                let (dual, enforced) = Dual::new_with_depth(
-                    depth,
-                    log_msg + log_rate,
-                    log_rate,
-                    &lanes,
-                    &queries,
-                    &alpha,
-                    |q| &codeword[q << log_lanes..(q + 1) << log_lanes],
-                );
-                let (mut pending, _) = Pending::introduce(dual, enforced, &mut sc);
-                pending.glue(beta, &mut sc);
-                let mut msgs = Vec::new();
-                for (s, &r) in rs.iter().enumerate() {
-                    if terminal && s + 1 == depth {
-                        msgs.push(pending.fold_terminal(r, &mut sc));
-                    } else {
-                        let (msg, complete) = pending.fold(r, &mut sc);
-                        assert_eq!(complete, s + 1 == depth);
-                        msgs.push(msg);
-                    }
-                }
-                (msgs, sc.transcript.clone(), sc.f.clone(), sc.t_r)
-            };
-            assert_eq!(run(true), run(false), "case {case}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod shared_tail_tests {
-    use super::*;
-
-    fn rng_f128(state: &mut u64) -> F128 {
-        let mut next = || {
-            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            *state ^ (*state >> 29)
-        };
-        F128::new(next(), next())
-    }
-
-    /// A rate-1/2 codeword of 64-lane rows whose message is zero at every odd
-    /// position in lanes 57..64 (the L0 witness padding) repeats those lanes on
-    /// rows 2i and 2i+1; the pair dot then shares the tail and equals the two
-    /// full dots and the plain field sum. Rows that differ in the tail take the
-    /// full dots.
-    #[test]
-    fn padded_lanes_repeat_on_adjacent_rows_and_pair_dots_match() {
-        let mut state = 0xC2_7A11_0001u64;
-        let log_d = 10;
-        let positions = 1usize << (log_d - 1);
-        let ntt = AdditiveNttF128::standard(log_d);
-        let mut msg: Vec<F128> = (0..positions * 64).map(|_| rng_f128(&mut state)).collect();
-        for s in (1..positions).step_by(2) {
-            msg[64 * s + ROW_HEAD..64 * s + 64].fill(F128::ZERO);
-        }
-        let mut cw = msg.clone();
-        cw.extend_from_slice(&msg);
-        ntt.forward_transform_interleaved_from_layer(&mut cw, 64, 1);
-        let w: Vec<F128> = (0..64).map(|_| rng_f128(&mut state)).collect();
-        let oracle = |r: &[F128]| r.iter().zip(&w).fold(F128::ZERO, |acc, (x, y)| acc + *x * *y);
-        for i in 0..(1usize << log_d) / 2 {
-            let a = &cw[128 * i..128 * i + 64];
-            let b = &cw[128 * i + 64..128 * i + 128];
-            assert_eq!(a[ROW_HEAD..], b[ROW_HEAD..], "rows {} and {}", 2 * i, 2 * i + 1);
-            assert_eq!(row_dot_pair(a, b, &w), [dot(a, &w), dot(b, &w)]);
-            assert_eq!(row_dot_pair(a, b, &w), [oracle(a), oracle(b)]);
-        }
-        let a: Vec<F128> = (0..64).map(|_| rng_f128(&mut state)).collect();
-        let mut b = a.clone();
-        b[63] = rng_f128(&mut state);
-        assert_eq!(row_dot_pair(&a, &b, &w), [oracle(&a), oracle(&b)]);
-        let narrow: Vec<F128> = w[..8].to_vec();
-        assert_eq!(row_dot_pair(&a[..8], &a[..8], &narrow), [dot(&a[..8], &narrow); 2]);
-    }
 }

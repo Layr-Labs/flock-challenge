@@ -389,3 +389,4 @@ mod tests {
         }
     }
 }
+// Applying the same 8-by-8 bit transpose twice restores the original matrix.

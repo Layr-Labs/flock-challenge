@@ -76,18 +76,6 @@ pub(crate) fn spawn_publish_warm_hook() {
     }
 }
 
-/// Kill switch for running small post-commit parallel regions on the calling
-/// thread: exactly `FLOCK_NO_SMALL_SERIAL=1` restores the incumbent Rayon
-/// joins. Read once per process. Only the thread that runs each piece of
-/// work changes (the pieces are independent and their results are combined
-/// in the same order), so every value and the transcript are unchanged.
-pub const ENV_NO_SMALL_SERIAL: &str = "FLOCK_NO_SMALL_SERIAL";
-
-pub(crate) fn small_serial_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_SMALL_SERIAL).as_deref() != Some(std::ffi::OsStr::new("1")))
-}
-
 /// Unlike `ab_compact_store_enabled` this does **not** latch the first read
 /// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
 /// per-call `var_os` read is noise, and re-reading keeps same-process A/B
@@ -160,7 +148,7 @@ pub const ENV_NO_READY_PAUSE: &str = "FLOCK_NO_READY_PAUSE";
 /// proof through readiness to the timed proof runs exactly as it did, so the
 /// pause cannot reach the timed proof. It is a plain sleep, the same in every
 /// worker, and reads nothing but the executable name and the argument count.
-const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(2100);
+const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1300);
 
 /// Pure selector: the pause a process takes at start-up, if any.
 fn ranked_start_pause_for(
@@ -213,91 +201,6 @@ mod ranked_start_pause_tests {
         let t = std::time::Instant::now();
         super::ranked_start_pause();
         assert!(t.elapsed() < super::RANKED_START_PAUSE);
-    }
-}
-
-/// 0 = not resolved, 1 = spin before blocking, 2 = block at once.
-static LOCK_SPIN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-/// `try_lock` attempts [`lock_spin`] makes before it blocks.
-const LOCK_SPIN_TRIES: u32 = 4096;
-
-/// Resolve the [`lock_spin`] switch from the environment
-/// (`FLOCK_NO_LOCK_SPIN`, any value, makes every caller block at once).
-pub fn lock_spin_arm() -> bool {
-    use std::sync::atomic::Ordering;
-    match LOCK_SPIN.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("FLOCK_NO_LOCK_SPIN").is_none();
-            LOCK_SPIN.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// `m.lock()` for a mutex whose critical sections are a few instructions
-/// long and which many pool workers take at the same moment (a claim cursor,
-/// a free list). A thread that finds it held retries `try_lock` for a
-/// bounded number of spins before it blocks in the kernel, so a waiter
-/// normally gets the lock without being put to sleep and woken, and the
-/// holder's unlock has no sleeper to wake. The same lock, the same critical
-/// section and the same result as `lock()`; only how a waiter waits differs.
-pub fn lock_spin<T>(m: &std::sync::Mutex<T>) -> std::sync::LockResult<std::sync::MutexGuard<'_, T>> {
-    if lock_spin_arm() {
-        return lock_spin_tries(m);
-    }
-    m.lock()
-}
-
-/// [`lock_spin`] for callers that must not read the environment (the global
-/// allocator): spins only once [`lock_spin_arm`] has resolved the switch to
-/// on, and blocks at once otherwise.
-pub fn lock_spin_if_armed<T>(m: &std::sync::Mutex<T>) -> std::sync::LockResult<std::sync::MutexGuard<'_, T>> {
-    if LOCK_SPIN.load(std::sync::atomic::Ordering::Relaxed) == 1 {
-        return lock_spin_tries(m);
-    }
-    m.lock()
-}
-
-fn lock_spin_tries<T>(m: &std::sync::Mutex<T>) -> std::sync::LockResult<std::sync::MutexGuard<'_, T>> {
-    for _ in 0..LOCK_SPIN_TRIES {
-        match m.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(e)) => return Err(e),
-            Err(std::sync::TryLockError::WouldBlock) => core::hint::spin_loop(),
-        }
-    }
-    m.lock()
-}
-
-#[cfg(test)]
-mod lock_spin_tests {
-    /// Under contention the spinning acquire excludes like `lock()`, and a
-    /// poisoned mutex comes back as the same error `lock()` gives.
-    #[test]
-    fn lock_spin_excludes_and_reports_poison() {
-        let counter = std::sync::Mutex::new(0u64);
-        std::thread::scope(|s| {
-            for _ in 0..8 {
-                s.spawn(|| {
-                    for _ in 0..20_000 {
-                        let mut g = super::lock_spin_tries(&counter).unwrap();
-                        let v = *g;
-                        std::hint::black_box(&v);
-                        *g = v + 1;
-                    }
-                });
-            }
-        });
-        assert_eq!(*super::lock_spin(&counter).unwrap(), 160_000);
-        let poisoned = std::sync::Mutex::new(7u8);
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _g = poisoned.lock().unwrap();
-            panic!("poison");
-        }));
-        assert_eq!(*super::lock_spin_tries(&poisoned).unwrap_err().into_inner(), 7);
-        assert_eq!(*super::lock_spin_if_armed(&poisoned).unwrap_err().into_inner(), 7);
     }
 }
 

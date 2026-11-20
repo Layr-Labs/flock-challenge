@@ -28,10 +28,9 @@ pub mod univariate_skip_optimized;
 
 use multilinear::{
     UniSkipFoldTable, eval_round3_lookahead, fold_and_compute_round_pair_into,
-    fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_in_place_pair, fold2_compact_and_round4_into,
+    fold_compact_and_compute_round_pair, fold_in_place_pair, fold2_compact_and_round4_into,
     fold2_plain_and_round6_into, fold2_plain_and_round67_into,
-    eq_drop_first, fold_in_place_and_round_pair_with_eq, interpolate_at_z_combined,
-    interpolate_at_z_on_lambda, round_pair_naive_with_eq,
+    interpolate_at_z_combined, interpolate_at_z_on_lambda, round_pair_naive,
     uni_skip_fold_and_round_pair_compact_padded_lookahead_for,
     uni_skip_fold_and_round_pair_compact_padded_with_deltas,
 };
@@ -39,13 +38,6 @@ use univariate_skip_optimized::{
     c_s_f128, medium_challenges_ghash, round1_shift_reduce_extract_c_packed_padded,
     small_challenges_ghash,
 };
-
-fn zc_tail_fused_fold_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_TAIL_FUSED_FOLD").is_none()
-    });
-    *ON
-}
 
 /// Test-only forced-off latch for the two-challenge lookahead. Production
 /// reads `FLOCK_NO_ZC_LOOKAHEAD`; the transcript-identity test flips this
@@ -55,19 +47,6 @@ fn zc_tail_fused_fold_enabled() -> bool {
 #[cfg(test)]
 pub(crate) static ZC_LOOKAHEAD_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-/// Kill switch for the fused tri-lookahead-reuse binds (`FLOCK_NO_ZC_TRI_REUSE_FOLD2`,
-/// any value: the two serial [`multilinear::fold_in_place_pair`] passes, as before).
-/// Both challenges are sampled before either bind, so the fusion crosses no
-/// Fiat–Shamir boundary; it keeps every field operation and its order. Read once
-/// per process.
-pub const ENV_NO_ZC_TRI_REUSE_FOLD2: &str = "FLOCK_NO_ZC_TRI_REUSE_FOLD2";
-
-fn zc_tri_reuse_fold2_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_TRI_REUSE_FOLD2).is_none());
-    *ON
-}
 
 #[inline]
 fn lookahead_off() -> bool {
@@ -152,16 +131,6 @@ fn cascade4_off() -> bool {
 #[cfg(test)]
 pub(crate) static ZC_CASCADE5_FORCED_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-/// Kill switch for the terminal tri lookahead reuse: exactly
-/// `FLOCK_NO_TRI_LOOKAHEAD_REUSE=1` keeps the record's tail, where the last tri
-/// pass's two lookahead messages are dropped and the first two numeric loop
-/// rounds rebuild them by binding and scanning the arrays. Read once per
-/// process. Same messages, same transcript, same bytes.
-fn tri_lookahead_reuse_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TRI_LOOKAHEAD_REUSE").is_none_or(|v| v != *"1"))
-}
 
 /// `FLOCK_NO_ZC_CASCADE5=1` restores the cascade4 i=8/i=9 tail route for an
 /// exact same-binary A/B. Production defaults to the fifth cascade.
@@ -565,25 +534,6 @@ fn prove_packed_padded_inner<C: Challenger>(
     }
     r[k_skip + N_INNER..].copy_from_slice(&r_outer);
 
-    // R2-CS (`gpu_commit::ENV_NO_ZC_R2_CS`), a timed prove with R2-CS
-    // admitted: round two's compact anchors are taken here and the K pass
-    // arm's view over them is premapped now (the predicate is `use_lookahead`
-    // below, all of whose inputs are fixed), so the mapping overlaps round one
-    // instead of the R2-CS command buffer that binds the view. Every other
-    // prove keeps round two taking and premapping them itself.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let early_anchors = if (m == 32 || cfg!(test))
-        && n_mlv >= 6
-        && r[k_skip + 1] != F128::ZERO
-        && !lookahead_off()
-    {
-        crate::zerocheck::multilinear::round2_anchors_premapped_early(m, k_skip)
-    } else {
-        None
-    };
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let early_anchors: Option<Vec<F128>> = None;
-
     // ---- 3. Round 1: URM (extract_c, parallel) ----
     //
     // The optimized URM drops a `C_s = φ_8(0x1C)` scalar from its accumulators
@@ -596,9 +546,6 @@ fn prove_packed_padded_inner<C: Challenger>(
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = InvNttTableByteSingleGf8::cached_standard_k6();
-    // Round-two C capture (`univariate_skip_optimized::ENV_NO_R2_C_CAPTURE`):
-    // only this prove's round one may set it.
-    crate::zerocheck::univariate_skip_optimized::r2_c_capture_clear();
     let (round1_ab_opt, round1_c_opt, s_hat_v_c) = if let Some(ab_inner) = precomputed_ab.as_ref() {
         assert!(
             capture_s_hat_v_c,
@@ -720,10 +667,6 @@ fn prove_packed_padded_inner<C: Challenger>(
             };
             let cpu_ab = crate::pcs::commit::commit_cpu_ms();
             let t_ab = std::time::Instant::now();
-            // C fold tune fix (`gpu_commit::ENV_NO_ZC_FOLD_TUNE_FIX`): the
-            // warm-up window times its head from here.
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            crate::gpu_commit::zc_fold_tune_note_ab_start();
             // ZC entry overlap (`FLOCK_NO_ZC_ENTRY_OVERLAP=1` restores the
             // serial order): the round-two GPU staging runs beside the AB
             // completion's table set-up, and the C fold runs on this thread
@@ -905,22 +848,9 @@ fn prove_packed_padded_inner<C: Challenger>(
             padding,
             compact_deltas,
             use_cascade,
-            early_anchors,
         );
         (compact, m1, mi, Some(la))
     } else {
-        // Round-two A/B rebuild (`univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`):
-        // this round two reads every row from the buffers, so the rows the
-        // AB arm left to the lookahead sweep's rebuild are published first.
-        if let Some(rebuild) = univariate_skip_optimized::round2_ab_rebuild_take(a_packed, b_packed) {
-            rebuild.complete_globals();
-        }
-        // (Taken early only on this predicate; never the case here.)
-        if let Some(anchors) = early_anchors {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            crate::gpu_commit::zc_k_premap(&[], 0);
-            crate::scratch::give_f128(anchors);
-        }
         let (compact, m1, mi) = uni_skip_fold_and_round_pair_compact_padded_with_deltas(
             a_packed,
             b_packed,
@@ -1074,30 +1004,24 @@ fn prove_packed_padded_inner<C: Challenger>(
         if use_cascade {
             // Dead-tail-packed K output only when the tri pass, the one
             // reader of that layout, comes next.
-            // `k_prefix`: the K pass GPU prefix arm's outputs, which the tri
-            // pass below reads in place of the leading entries.
-            let (m4_1, m4_inf, la5, packed, bpacked, k_prefix) =
-                multilinear::fold2_compact_and_round45_into_packed_gpu(
-                    &compact_mlv,
-                    &fold_table,
-                    mlv_rhos[0],
-                    mlv_rhos[1],
-                    &r_next4,
-                    &mut a_out,
-                    &mut b_out,
-                    tri_steps > 0 && multilinear::zc_k_dead_pack_enabled(),
-                    true,
-                );
+            let (m4_1, m4_inf, la5, packed) = multilinear::fold2_compact_and_round45_into_packed(
+                &compact_mlv,
+                &fold_table,
+                mlv_rhos[0],
+                mlv_rhos[1],
+                &r_next4,
+                &mut a_out,
+                &mut b_out,
+                tri_steps > 0 && multilinear::zc_k_dead_pack_enabled(),
+            );
             if tail_round_timing {
                 eprintln!(
-                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}, tail_compact={}, head_compact={}, packed={packed}, bpacked={bpacked}): {:.2} ms",
+                    "[zc-tail-rounds] K double fold + round4 (cascade +W', out n={n_groups}, dead_tail={}, packed={packed}): {:.2} ms",
                     compact_mlv.dead_tail,
-                    compact_mlv.tail_compact,
-                    compact_mlv.head_compact,
                     t_k.elapsed().as_secs_f64() * 1e3
                 );
             }
-            compact_mlv.recycle_after_k();
+            compact_mlv.recycle();
             multilinear_msgs.push((m4_1, m4_inf));
             challenger.observe_f128(m4_1);
             challenger.observe_f128(m4_inf);
@@ -1123,26 +1047,14 @@ fn prove_packed_padded_inner<C: Challenger>(
             let mut b2_out = crate::scratch::take_f128_unpinned(quarter);
             if tri_steps > 0 {
                 let main = if packed { n_groups / 256 * 244 } else { n_groups };
-                let main_b = if bpacked { n_groups / 64 * 56 } else { main };
-                // SAFETY: the prefix buffers are rewritten only by the next K
-                // pass.
-                let prefix = k_prefix.as_ref().map(|p| unsafe { p.slices() });
-                // Tri pass 0 GPU arm: commit its buffer now, behind an event
-                // that pass 0 sets (see `gpu_commit::ENV_NO_ZC_T0_GPU`).
-                crate::gpu_commit::zc_t0_park();
-                // `t56_prefix`: the 5+6 pass GPU prefix arm's outputs, which
-                // tri pass 0 below reads in place of the leading entries.
-                let (m6_1, m6_inf, la7, la8, t56_prefix) = multilinear::fold_cascade_t_into_packed_prefix_gpu(
+                let (m6_1, m6_inf, la7, la8) = multilinear::fold_cascade_t_into_packed(
                     &a_out[..main],
-                    &b_out[..main_b],
+                    &b_out[..main],
                     packed,
-                    bpacked,
-                    prefix,
                     &mut a2_out,
                     &mut b2_out,
                     &mlv_rhos[2..4],
                     &r_next6,
-                    true,
                 );
                 if tail_round_timing {
                     eprintln!(
@@ -1158,8 +1070,6 @@ fn prove_packed_padded_inner<C: Challenger>(
                 mlv_rhos.push(challenger.sample_f128());
                 let mut pending = Some((la7, la8));
                 let (mut cur_a, mut cur_b) = (a2_out, b2_out);
-                // Tri pass 0's carried GPU prefix, read by pass 1.
-                let mut t0_prefix: Option<multilinear::KGpuPrefix> = None;
                 for step in 0..tri_steps {
                     let (la, la2) = pending.take().expect("tri chain carries its lookaheads");
                     let k = mlv_rhos.len();
@@ -1186,49 +1096,14 @@ fn prove_packed_padded_inner<C: Challenger>(
                     // ~1.3 ms before the lincheck GPU prefix: wake the idle
                     // GPU (see `gpu_commit::ENV_NO_LC_GPU_WAKE`).
                     crate::gpu_commit::lc_gpu_wake_fire(step as u32);
-                    // Pass 0 reads the 5+6 arm's prefix; pass 1 reads the
-                    // prefix pass 0's GPU arm carried
-                    // (`gpu_commit::ENV_NO_ZC_T0_CARRY`), if any.
-                    let carried_in = match step {
-                        0 => t56_prefix.as_ref(),
-                        1 => t0_prefix.as_ref(),
-                        _ => None,
-                    };
-                    let (e1, einf, la, la2, carried_out) = match carried_in {
-                        // SAFETY: the 5+6 prefix buffers are rewritten only
-                        // by the next 5+6 GPU launch, pass 0's only by the
-                        // next prove's pass 0.
-                        Some(p) => multilinear::fold_cascade_t_into_packed_prefix_gpu(
-                            &cur_a,
-                            &cur_b,
-                            false,
-                            false,
-                            Some(unsafe { p.slices() }),
-                            &mut na,
-                            &mut nb,
-                            &mlv_rhos[k - 3..k],
-                            &r_nx,
-                            false,
-                        ),
-                        None => {
-                            let (e1, einf, la, la2) = multilinear::fold_cascade_t_into(
-                                &cur_a,
-                                &cur_b,
-                                &mut na,
-                                &mut nb,
-                                &mlv_rhos[k - 3..k],
-                                &r_nx,
-                            );
-                            (e1, einf, la, la2, None)
-                        }
-                    };
-                    // Only pass 0 can carry (its GPU arm); the leading
-                    // outputs it carried were not written into `na` / `nb`.
-                    if step == 0 {
-                        t0_prefix = carried_out;
-                    } else {
-                        assert!(carried_out.is_none(), "only tri pass 0 carries a prefix");
-                    }
+                    let (e1, einf, la, la2) = multilinear::fold_cascade_t_into(
+                        &cur_a,
+                        &cur_b,
+                        &mut na,
+                        &mut nb,
+                        &mlv_rhos[k - 3..k],
+                        &r_nx,
+                    );
                     if tail_round_timing {
                         eprintln!(
                             "[zc-tail-rounds] tri pass {step} (out n={out_n}): {:.2} ms",
@@ -1245,61 +1120,8 @@ fn prove_packed_padded_inner<C: Challenger>(
                     cur_a = na;
                     cur_b = nb;
                 }
-                // A single tri pass leaves nothing to read a carried prefix:
-                // write it into pass 0's outputs, which the loop below reads.
-                if tri_steps == 1 {
-                    if let Some(p) = t0_prefix.take() {
-                        // SAFETY: pass 0's buffers are rewritten only by the
-                        // next prove's pass 0.
-                        let (pa, pb) = unsafe { p.slices() };
-                        cur_a[..pa.len()].copy_from_slice(pa);
-                        cur_b[..pb.len()].copy_from_slice(pb);
-                    }
-                }
                 crate::gpu_commit::lc_gpu_wake_fire(99);
-                let mut loop_start = mlv_rhos.len() - 1;
-                // The last tri pass's two lookaheads are the messages of the
-                // first two numeric rounds (the next tri pass would have
-                // consumed them the same way, see the top of this loop): use
-                // them, then bind the numeric arrays at both draws instead of
-                // binding and scanning them for those messages. The loop
-                // below starts two rounds later on the same arrays.
-                if let Some((la, la2)) = pending.take().filter(|_| {
-                    tri_steps > 0
-                        && tri_lookahead_reuse_enabled()
-                        && loop_start + 2 <= n_mlv - 1
-                        && cur_a.len() >= 8
-                }) {
-                    let t_s = std::time::Instant::now();
-                    let n_in = cur_a.len();
-                    let k = mlv_rhos.len();
-                    let (n1, ninf) = eval_round3_lookahead(&la, mlv_rhos[k - 1]);
-                    multilinear_msgs.push((n1, ninf));
-                    challenger.observe_f128(n1);
-                    challenger.observe_f128(ninf);
-                    mlv_rhos.push(challenger.sample_f128());
-                    let (n1, ninf) = multilinear::eval_lookahead2(&la2, mlv_rhos[k - 1], mlv_rhos[k]);
-                    multilinear_msgs.push((n1, ninf));
-                    challenger.observe_f128(n1);
-                    challenger.observe_f128(ninf);
-                    mlv_rhos.push(challenger.sample_f128());
-                    if zc_tri_reuse_fold2_enabled() {
-                        fold2_in_place_pair(&mut cur_a, &mut cur_b, mlv_rhos[k - 1], mlv_rhos[k]);
-                    } else {
-                        fold_in_place_pair(&mut cur_a, &mut cur_b, mlv_rhos[k - 1]);
-                        fold_in_place_pair(&mut cur_a, &mut cur_b, mlv_rhos[k]);
-                    }
-                    loop_start += 2;
-                    if tail_round_timing {
-                        eprintln!(
-                            "[zc-tail-rounds] tri lookahead reuse (rounds of loop i={}, {}; binds n={n_in}->{}): {:.3} ms",
-                            loop_start - 2,
-                            loop_start - 1,
-                            cur_a.len(),
-                            t_s.elapsed().as_secs_f64() * 1e3
-                        );
-                    }
-                }
+                let loop_start = mlv_rhos.len() - 1;
                 (cur_a, cur_b, loop_start)
             } else if use_cascade3 {
                 // Level three: the composed 5+6 pass additionally carries the
@@ -1576,12 +1398,6 @@ fn prove_packed_padded_inner<C: Challenger>(
     // (T3's hetero drain is already behind us, so the delta is loop-only).
     let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
-    // The serial rounds' equality tables: each round's suffix is the previous
-    // round's minus its first challenge, so after the first serial round the
-    // table is the previous one's pair sums (`eq_drop_first`) instead of a
-    // fresh build. `FLOCK_NO_ZC_TAIL_EQ_REUSE=1` (any value) builds each one.
-    let tail_eq_reuse = zc_tail_eq_reuse_enabled();
-    let mut tail_eq: Vec<F128> = Vec::new();
     for i in loop_start..(n_mlv - 1) {
         let t_round_i = std::time::Instant::now();
         let rho_prev = mlv_rhos[i];
@@ -1613,24 +1429,8 @@ fn prove_packed_padded_inner<C: Challenger>(
             b_mlv.truncate(half);
             (m1, mi)
         } else {
-            let want = a_mlv.len() / 4;
-            tail_eq = if tail_eq_reuse && tail_eq.len() == 2 * want {
-                eq_drop_first(&tail_eq)
-            } else {
-                univariate_skip::build_eq(&r_next[1..])
-            };
-            if zc_tail_fused_fold_enabled() {
-                fold_in_place_and_round_pair_with_eq(
-                    &mut a_mlv,
-                    &mut b_mlv,
-                    rho_prev,
-                    r_next[0],
-                    &tail_eq,
-                )
-            } else {
-                fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-                round_pair_naive_with_eq(&a_mlv, &b_mlv, r_next[0], &tail_eq)
-            }
+            fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
+            round_pair_naive(&a_mlv, &b_mlv, &r_next)
         };
 
         multilinear_msgs.push((m1, mi));
@@ -1639,7 +1439,7 @@ fn prove_packed_padded_inner<C: Challenger>(
         mlv_rhos.push(challenger.sample_f128());
         if tail_round_timing {
             eprintln!(
-                "[zc-tail-rounds] loop i={i} (log_n {log_n_before}): {:.3} ms",
+                "[zc-tail-rounds] loop i={i} (log_n {log_n_before}): {:.2} ms",
                 t_round_i.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -1873,14 +1673,6 @@ pub fn verify<C: Challenger>(
         b_eval: proof.final_b_eval,
         c_eval: proof.final_c_eval,
     })
-}
-
-/// See the serial tail rounds of the prover: `FLOCK_NO_ZC_TAIL_EQ_REUSE=1`
-/// (any value) builds every serial round's equality table afresh. Read once
-/// per process.
-fn zc_tail_eq_reuse_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_TAIL_EQ_REUSE").is_none())
 }
 
 #[cfg(test)]

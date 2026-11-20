@@ -4092,183 +4092,6 @@ unsafe fn ab_kara_ninth_pair(
     (a, b)
 }
 
-/// Row-body variant bit: a word of the `x^4` image takes the lane z form
-/// ([`apply_word_kara_lanez`]): the same eighteen 16-byte entries of the same
-/// Karatsuba tables, read through eight lookup indices (six `ldp` pairs and
-/// two loads) instead of eighteen indices and eighteen loads. Same bytes.
-#[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_KARA_LANEZ: u32 = 1 << 19;
-
-/// Kill switch for [`ABV_KARA_LANEZ`]: exactly `FLOCK_NO_ZC_AB_LANEZ=1`
-/// keeps the slot-pair Karatsuba form of the `x^4` image: the mixed rows
-/// take the incumbent instance, the trimmed static-B window units the
-/// per-chunk rows (no second instance of either, build budget). Read once
-/// per process (a concurrent first read reads the same variable). Kept
-/// free of generic code: no closure and no `OnceLock` instance. The rows
-/// written are byte-identical.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_kara_lanez_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    // 0: not read yet, 1: on, 2: off.
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("FLOCK_NO_ZC_AB_LANEZ").as_deref() != Some(std::ffi::OsStr::new("1"));
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// [`apply_word_kara`] in the lane z form. The byte pair `W_p` (bytes `2p`,
-/// `2p + 1`) reaches output lane `q` as `U(W_p; C_(q^p))`, with
-/// `U(x; C) = C(x_even) ^ sw(C(x_odd))` and `sw` the 8-byte half exchange
-/// (see [`apply_word_kara`]). Over the pair index this is a convolution on
-/// `Z_2^2`; in the basis `z_i = 1 + y_i` it reads
-/// `out_q = XOR over T of U(w_T; C^T_q)` with `w_T` the XOR of the pairs
-/// `W_p` with `p ⊇ T` and `C^T_q` the XOR of the lanes `C_(q^u)` with
-/// `u ⊆ T` (each pair `p` then meets `C_(q^u)` once for every `T` with
-/// `u ⊆ T ⊆ p`, an odd number of times only for `u = p`). The four `C^T`
-/// are entries the Karatsuba image already holds: `C^{}` = lanes 0..3,
-/// `C^{l1}` = slot 4 (`C0^C1`, lanes 0 and 1) and slot 5 (`C2^C3`),
-/// `C^{l2}` = slot 6 (`C0^C2`, lanes 0 and 2) and slot 7 (`C1^C3`),
-/// `C^{l1 l2}` = the ninth entry. Their indices: `w_{}` = bytes 0, 1 of
-/// `v`, `w_{l1}` = `W1^W3` = bytes 2, 3 of `s`, `w_{l2}` = `W2^W3` = bytes
-/// 4, 5 of `u`, `w_{l1 l2}` = `W3` = bytes 6, 7 of `word`. All tables are
-/// GF(2)-linear in their index, so each lookup of an XOR of bytes is the XOR
-/// of the lookups.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn apply_word_kara_lanez(
-    kara: *const u8,
-    word: u64,
-) -> (
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-) {
-    use core::arch::aarch64::*;
-    const { assert!(AB_KARA_NINTH == 8 << 12) };
-    unsafe {
-        let u = word ^ (word >> 16);
-        let s = word ^ (word >> 32);
-        let v = s ^ (s >> 16);
-        let ld = |base: *const u8, off: usize| vld1q_u8(base.add(off));
-        // An opaque entry address, so the two or four slots of one index
-        // load as `ldp` pairs.
-        let at = |i: usize| -> *const u8 {
-            let a: usize;
-            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) kara, i = in(reg) i,
-                options(pure, nomem, nostack, preserves_flags));
-            a as *const u8
-        };
-        // T = {}: lanes 0..3 at the even and at the odd byte of `v`.
-        let a = at(ab_z_idx::<0, 7>(v));
-        let (l0, l1, l2, l3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
-        let a = at(ab_z_idx::<1, 7>(v));
-        let (h0, h1, h2, h3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
-        // T = {l1}: slots 4, 5 at bytes 2, 3 of `s`.
-        let a = at(ab_z_idx::<2, 7>(s));
-        let (m01, m23) = (ld(a, 64), ld(a, 80));
-        let a = at(ab_z_idx::<3, 7>(s));
-        let (mo01, mo23) = (ld(a, 64), ld(a, 80));
-        // T = {l2}: slots 6, 7 at bytes 4, 5 of `u`.
-        let a = at(ab_z_idx::<4, 7>(u));
-        let (n02, n13) = (ld(a, 96), ld(a, 112));
-        let a = at(ab_z_idx::<5, 7>(u));
-        let (no02, no13) = (ld(a, 96), ld(a, 112));
-        // T = {l1 l2}: the ninth table (16-byte entries) at bytes 6, 7 of
-        // `word`; one opaque base per word (no live base register).
-        let ninth: *const u8 = {
-            let a: usize;
-            core::arch::asm!(
-                "add {a}, {b}, #8, lsl #12 // {w}",
-                a = lateout(reg) a,
-                b = in(reg) kara,
-                w = in(reg) word,
-                options(pure, nomem, nostack, preserves_flags),
-            );
-            a as *const u8
-        };
-        let g = ld(ninth, ab_z_idx::<6, 4>(word));
-        let go = ld(ninth, ab_z_idx::<7, 4>(word));
-        let gg = veorq_u8(g, vextq_u8::<8>(go, go));
-        // Even and odd sums of each lane, then out_q = E_q ^ sw(O_q) ^ gg.
-        let e0 = xor3_u8(l0, m01, n02);
-        let e1 = xor3_u8(l1, m01, n13);
-        let e2 = xor3_u8(l2, m23, n02);
-        let e3 = xor3_u8(l3, m23, n13);
-        let o0 = xor3_u8(h0, mo01, no02);
-        let o1 = xor3_u8(h1, mo01, no13);
-        let o2 = xor3_u8(h2, mo23, no02);
-        let o3 = xor3_u8(h3, mo23, no13);
-        (
-            xor3_u8(e0, vextq_u8::<8>(o0, o0), gg),
-            xor3_u8(e1, vextq_u8::<8>(o1, o1), gg),
-            xor3_u8(e2, vextq_u8::<8>(o2, o2), gg),
-            xor3_u8(e3, vextq_u8::<8>(o3, o3), gg),
-        )
-    }
-}
-
-/// The lane z form ([`ABV_KARA_LANEZ`]) of the `x^4` image writes the bytes
-/// of the slot-pair Karatsuba form and of the plain apply, for the zero and
-/// all-ones words, every one-byte word (each value at each byte) and random
-/// words, out of both images.
-#[cfg(all(test, target_arch = "aarch64"))]
-#[test]
-fn ab_kara_lanez_apply_matches_kara_and_plain() {
-    use crate::ntt::AdditiveNttGf8;
-    use core::arch::aarch64::*;
-    const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_KARA_SLOT;
-    let table =
-        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
-    let kara = ab_kara_tables(&table);
-    let bytes = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| {
-        let mut out = [0u8; 64];
-        // SAFETY: four 16-byte stores into a 64-byte array.
-        unsafe {
-            vst1q_u8(out.as_mut_ptr(), v.0);
-            vst1q_u8(out.as_mut_ptr().add(16), v.1);
-            vst1q_u8(out.as_mut_ptr().add(32), v.2);
-            vst1q_u8(out.as_mut_ptr().add(48), v.3);
-        }
-        out
-    };
-    let mut x = 0x6A09_E667_F3BC_C908u64;
-    for i in 0..20000u64 {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        let w = match i {
-            0 => 0,
-            1 => u64::MAX,
-            2..=2049 => (i & 0xff) << (8 * ((i >> 8) & 7)),
-            _ => x,
-        };
-        for scaled in [false, true] {
-            let (t, sw, k) = if scaled {
-                (table.scaled_x4_data_ptr(), table.scaled_x4_half_swapped_data_ptr(), kara.wrapping_add(AB_KARA_IMAGE_BYTES))
-            } else {
-                (table.data_ptr(), table.half_swapped_data_ptr(), kara)
-            };
-            // SAFETY: the applies read inside the table images only.
-            let (lanez, slot, plain) = unsafe {
-                (
-                    bytes(apply_word_kara_lanez(k, w)),
-                    bytes(apply_word_kara::<V0, true>(k, w)),
-                    bytes(apply_word_into_4_regs(t, sw, w)),
-                )
-            };
-            assert_eq!(lanez, slot, "w={w:016x} scaled={scaled}");
-            assert_eq!(lanez, plain, "w={w:016x} scaled={scaled}");
-        }
-    }
-}
-
 /// [`apply_word_into_4_regs`] out of one image of [`ab_kara_tables`]
 /// (`kara` points at the image's first entry).
 #[cfg(target_arch = "aarch64")]
@@ -4284,9 +4107,6 @@ unsafe fn apply_word_kara<const V: u32, const SCALED: bool>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        if SCALED && V & ABV_KARA_LANEZ != 0 {
-            return apply_word_kara_lanez(kara, word);
-        }
         // Bytes 0,1 / 4,5 of `u`: W0^W1 / W2^W3. Bytes 0..4 of `s`: W0^W2,
         // W1^W3. Bytes 0,1 of `v`: W0^W1^W2^W3.
         let u = word ^ (word >> 16);
@@ -4522,193 +4342,6 @@ unsafe fn apply_word_z_low<const NB: u32>(
             (veorq_u8(l0, b0), veorq_u8(l1, b1), veorq_u8(l2, b2), veorq_u8(l3, b3))
         }
     }
-}
-
-/// Row-body variant bit (with [`ABV_TRANSFORM_TRIM`], [`ABV_FUSE`] and the
-/// z-basis plain apply): in each static-B Horner row the one `x^4` word
-/// (`k >= 4`) whose B varies only in `NB <= 4` consecutive bytes at the low
-/// or the high end of the word takes its weight on the B side. Its A word is
-/// applied out of the plain image (the z-basis form, 15 lookups instead of
-/// the 18 of the `x^4` Karatsuba image) and its B word out of the `x^4`
-/// image's Karatsuba tables restricted to the varying bytes
-/// ([`apply_word_sparse_x4`]; no table is added to the row's working set). In every lane `(x^4·T(a))·T(b)` and
-/// `T(a)·(x^4·T(b))` are 8×8-bit carry-less products of bytes that are
-/// congruent mod p, so the Horner sum, its carry folds and the final
-/// reduction write the same bytes.
-#[cfg(target_arch = "aarch64")]
-pub(crate) const ABV_SPARSE_SCALE: u32 = 1 << 20;
-
-/// Kill switch for [`ABV_SPARSE_SCALE`]: exactly `FLOCK_NO_AB_SPARSE_SCALE=1`
-/// takes the per-chunk rows in the main-pool window unit (no second unit
-/// instance, build budget), which write the same bytes. Read once per
-/// process; kept free of generic code (no closure, no `OnceLock` instance).
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_sparse_scale_enabled() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    // 0: not read yet, 1: on, 2: off.
-    static STATE: AtomicU8 = AtomicU8::new(0);
-    match STATE.load(Ordering::Relaxed) {
-        1 => true,
-        2 => false,
-        _ => {
-            let on = std::env::var_os("FLOCK_NO_AB_SPARSE_SCALE").as_deref() != Some(std::ffi::OsStr::new("1"));
-            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
-/// `x^4·T(b)` of a guarded static-B word `b` under [`ABV_TRANSFORM_TRIM`]
-/// whose varying bytes are the `NB` (1..=4) bytes `0..NB` (`HIGH = false`)
-/// or `8-NB..8` (`HIGH = true`); `nb` is `!b`, which the row guard makes
-/// zero at every other byte. `T` is GF(2)-linear and `T(all-ones)` is
-/// `[1; 64]`, so `x^4·T(b) = [x^4; 64] ^ x^4·T(nb)`.
-///
-/// `x^4·T(nb)` is read out of the `x^4` image's Karatsuba tables (`kscaled`,
-/// 128-byte entries `C0, C1, C2, C3, C0^C1, C2^C3, ...`), which the row's
-/// other `x^4` words read anyway: no table is added to the row's working
-/// set. In the lane z form of that apply (see `apply_word_kara_lanez` and
-/// [`apply_word_kara`]) every lookup indexed by a byte that is zero reads
-/// row 0, which is zero; with bytes 4..8 zero only four remain:
-/// `out_q = E_q ^ sw(O_q)` with `E_q = C_q(v0) ^ M_q(s2)` and
-/// `O_q = C_q(v1) ^ M_q(s3)`, where `v0 = b0^b2`, `v1 = b1^b3`, `s2 = b2`,
-/// `s3 = b3`, `M_0 = M_1` the `C0^C1` slot and `M_2 = M_3` the `C2^C3` slot,
-/// and `sw` the 8-byte half exchange. Lookups of bytes the width leaves zero
-/// are not made: 4, 8, 10 or 12 reads for one to four bytes.
-///
-/// High bytes: output block `n` receives `R_(n^j)(W_j)` from byte `j` (see
-/// [`xor_vary_single`]), so the byte-reversed word (byte `j` at
-/// `7 - j = j ^ 7`) gives the low form with output block `n` read from
-/// block `n ^ 7`: register `q` is register `3 - q` with its two halves
-/// exchanged, which moves `sw` from `O` to `E`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn apply_word_sparse_x4<const NB: u32, const HIGH: bool>(
-    kscaled: *const u8,
-    nb: u64,
-) -> (
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-    core::arch::aarch64::uint8x16_t,
-) {
-    use core::arch::aarch64::*;
-    const { assert!(NB >= 1 && NB <= 4) };
-    unsafe {
-        let w = if HIGH { nb.swap_bytes() } else { nb };
-        // Bytes 0, 1 of `v`: b0 ^ b2, b1 ^ b3 (b2 = b3 = 0 below width 3).
-        let v = if NB >= 3 { w ^ (w >> 16) } else { w };
-        let ld = |base: *const u8, off: usize| vld1q_u8(base.add(off));
-        // An opaque entry address, so the slots of one index load as `ldp` pairs.
-        let at = |i: usize| -> *const u8 {
-            let a: usize;
-            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) kscaled, i = in(reg) i,
-                options(pure, nomem, nostack, preserves_flags));
-            a as *const u8
-        };
-        let z = vdupq_n_u8(0);
-        let a = at(ab_z_idx::<0, 7>(v));
-        let (mut e0, mut e1, mut e2, mut e3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
-        let (mut o0, mut o1, mut o2, mut o3) = (z, z, z, z);
-        if NB >= 2 {
-            let a = at(ab_z_idx::<1, 7>(v));
-            (o0, o1, o2, o3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
-        }
-        if NB >= 3 {
-            let a = at(ab_z_idx::<2, 7>(w));
-            let (m01, m23) = (ld(a, 64), ld(a, 80));
-            (e0, e1, e2, e3) = (veorq_u8(e0, m01), veorq_u8(e1, m01), veorq_u8(e2, m23), veorq_u8(e3, m23));
-        }
-        if NB >= 4 {
-            let a = at(ab_z_idx::<3, 7>(w));
-            let (m01, m23) = (ld(a, 64), ld(a, 80));
-            (o0, o1, o2, o3) = (veorq_u8(o0, m01), veorq_u8(o1, m01), veorq_u8(o2, m23), veorq_u8(o3, m23));
-        }
-        // x^4 · 1 in GF(2^8).
-        let c = vdupq_n_u8(0x10);
-        let sw = |x: uint8x16_t| vextq_u8::<8>(x, x);
-        if NB == 1 {
-            return if HIGH {
-                (veorq_u8(c, sw(e3)), veorq_u8(c, sw(e2)), veorq_u8(c, sw(e1)), veorq_u8(c, sw(e0)))
-            } else {
-                (veorq_u8(c, e0), veorq_u8(c, e1), veorq_u8(c, e2), veorq_u8(c, e3))
-            };
-        }
-        if HIGH {
-            (xor3_u8(c, o3, sw(e3)), xor3_u8(c, o2, sw(e2)), xor3_u8(c, o1, sw(e1)), xor3_u8(c, o0, sw(e0)))
-        } else {
-            (xor3_u8(c, e0, sw(o0)), xor3_u8(c, e1, sw(o1)), xor3_u8(c, e2, sw(o2)), xor3_u8(c, e3, sw(o3)))
-        }
-    }
-}
-
-/// [`apply_word_sparse_x4`] equals the `x^4`-scaled apply of the whole word
-/// ([`apply_word_into_4_regs`] out of the scaled image) for every static-B
-/// word shape it serves (`NB` = 1..4 low or high varying bytes, all other
-/// bytes 0xff): every byte value at every varying position, and random
-/// varying bytes.
-#[cfg(all(test, target_arch = "aarch64"))]
-#[test]
-fn ab_sparse_x4_apply_matches_scaled_apply() {
-    use crate::ntt::AdditiveNttGf8;
-    use core::arch::aarch64::*;
-    let table =
-        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
-    let kara = ab_kara_tables(&table);
-    let bytes = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| {
-        let mut out = [0u8; 64];
-        // SAFETY: four 16-byte stores into a 64-byte array.
-        unsafe {
-            vst1q_u8(out.as_mut_ptr(), v.0);
-            vst1q_u8(out.as_mut_ptr().add(16), v.1);
-            vst1q_u8(out.as_mut_ptr().add(32), v.2);
-            vst1q_u8(out.as_mut_ptr().add(48), v.3);
-        }
-        out
-    };
-    let mut x = 0x5EED_5CA1_E0F4_0001u64;
-    let mut checked = 0usize;
-    macro_rules! case {
-        ($nb:literal, $high:literal) => {{
-            let vary: u64 = if $nb == 8 { u64::MAX } else { (1u64 << (8 * $nb)) - 1 };
-            let vary = if $high { vary.swap_bytes() } else { vary };
-            for i in 0..(256 * $nb + 4000) {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                let v = if i < 256 * $nb {
-                    let pos = if $high { 7 - (i / 256) } else { i / 256 };
-                    ((i % 256) as u64) << (8 * pos)
-                } else {
-                    x & vary
-                };
-                // The guarded word: every static byte 0xff, varying bytes `!v`.
-                let b = !v;
-                // SAFETY: the applies read inside the table images only.
-                let (got, want) = unsafe {
-                    (
-                        bytes(apply_word_sparse_x4::<$nb, $high>(kara.wrapping_add(AB_KARA_IMAGE_BYTES), !b)),
-                        bytes(apply_word_into_4_regs(
-                            table.scaled_x4_data_ptr(),
-                            table.scaled_x4_half_swapped_data_ptr(),
-                            b,
-                        )),
-                    )
-                };
-                assert_eq!(got, want, "nb={} high={} b={b:016x}", $nb, $high);
-                checked += 1;
-            }
-        }};
-    }
-    case!(1, false);
-    case!(1, true);
-    case!(2, false);
-    case!(2, true);
-    case!(3, false);
-    case!(3, true);
-    case!(4, false);
-    case!(4, true);
-    assert_eq!(checked, 256 * 20 + 8 * 4000);
 }
 
 /// Test access: one static-B word `(blk, k)` of a plan whose varying bytes
@@ -5486,7 +5119,6 @@ pub(crate) enum StaticBContext {
 }
 
 include!("aarch64_bstatic_gen.rs");
-include!("aarch64_transform_trim.rs");
 include!("aarch64_bstatic_horner_gen.rs");
 
 fn bstatic_legacy_enabled() -> bool {
@@ -6063,15 +5695,12 @@ pub(crate) fn ab_mixed_row_guarded(
     nt_store: bool,
 ) -> bool {
     const V0: u32 = AB_Z_VARIANT | ABV_KARA_XOR16;
-    // The production mixed rows: the H2 form with the fused products and
-    // the `x^4` words in the lane z form ([`ABV_KARA_LANEZ`]). Any of the
-    // kill switches (`FLOCK_NO_ZC_AB_MIXED_H2`, `FLOCK_NO_ZC_AB_MIXED_FUSE`,
-    // `FLOCK_NO_ZC_AB_LANEZ=1`) takes the incumbent form `V0`; the unfused
-    // H2 instance and the fused one without lane z are kept for the tests
-    // only, so the binary carries no extra mixed-row instance.
-    const VL: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_KARA_LANEZ;
+    // The production mixed rows: the H2 form with the fused products. Either
+    // kill switch (`FLOCK_NO_ZC_AB_MIXED_H2`, `FLOCK_NO_ZC_AB_MIXED_FUSE`)
+    // takes the incumbent form `V0`; the unfused H2 instance is kept for
+    // the tests only, so the binary carries no extra mixed-row instance.
+    const VF: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE;
     let fuse = ab_mixed_h2_enabled() && ab_mixed_fuse_enabled();
-    let lanez = ab_kara_lanez_enabled();
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     debug_assert!(byte_base_b + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
     let word = |packed: &[u8], k: usize| -> u64 {
@@ -6085,8 +5714,8 @@ pub(crate) fn ab_mixed_row_guarded(
         {
             return false;
         }
-        if fuse && lanez {
-            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VL>(
+        if fuse {
+            shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, VF>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
         } else {
@@ -6104,8 +5733,8 @@ pub(crate) fn ab_mixed_row_guarded(
         if word(b_packed, 4) & word(b_packed, 5) & word(b_packed, 6) & word(b_packed, 7) != u64::MAX {
             return false;
         }
-        if fuse && lanez {
-            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VL>(
+        if fuse {
+            shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, VF>(
                 a_packed, b_packed, inv_table, byte_base_b, None, out, nt_store,
             );
         } else {
@@ -6213,13 +5842,6 @@ fn ab_mixed_fuse_matches_h2_and_incumbent() {
             }
             assert_eq!(h2, inc, "h2 case {case} w0={w0} nt={nt}");
             assert_eq!(got, h2, "fuse case {case} w0={w0} nt={nt}");
-            let mut lz = [0u8; 64];
-            if w0 {
-                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { VF | ABV_KARA_LANEZ }>(&a, &b, &table, 0, None, &mut lz, nt);
-            } else {
-                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { VF | ABV_KARA_LANEZ }>(&a, &b, &table, 0, None, &mut lz, nt);
-            }
-            assert_eq!(lz, got, "lane z case {case} w0={w0} nt={nt}");
         }
     }
 }

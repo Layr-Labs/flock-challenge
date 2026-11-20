@@ -4,18 +4,12 @@
 //! returned to libmalloc. The ranked worker performs an untimed warm proof
 //! with the same allocation pattern, so the timed proof reuses resident pages
 //! for large allocations not already handled by the typed scratch pools.
-//!
-//! Size classes are registered only from the process's first prove on
-//! ([`open_classes`], kill switch [`ENV_NO_RECYCLE_SETUP_GATE`]): the setup's
-//! R1CS construction alone frees blocks of more than 512 distinct sizes
-//! between 16 and 32 KiB, which used to take every class slot before the
-//! first prove, so no prove-time size ever got a class.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
 use std::sync::atomic::{
-    AtomicU8, AtomicUsize,
-    Ordering::{Acquire, Relaxed, Release},
+    AtomicUsize,
+    Ordering::{Acquire, Release},
 };
 
 const RECYCLE_MIN: usize = 16 * 1024;
@@ -39,49 +33,6 @@ fn class_slot(size: usize) -> usize {
     (size.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 55) % MAX_CLASSES
 }
 
-/// Kill switch for the setup class gate (`FLOCK_NO_RECYCLE_SETUP_GATE`, any
-/// value: every freed size registers a class from process start, as before).
-/// With the switch unset, no class is registered until the first prove of the
-/// process calls [`open_classes`]: the setup's transient row vectors (more
-/// than 512 distinct sizes from 16 to 32 KiB, `xor_dedup`) then no longer
-/// fill the class table, so the warm-up prove's freed blocks get classes and
-/// the timed prove reuses them instead of taking ~60 blocks of 16 KiB-512 KiB
-/// (~7 MiB) from libmalloc. Blocks of a size that already has a class are
-/// handled exactly as before. Read once per process with `getenv` (no
-/// allocation: this runs inside the allocator).
-pub const ENV_NO_RECYCLE_SETUP_GATE: &str = "FLOCK_NO_RECYCLE_SETUP_GATE";
-
-const GATE_UNKNOWN: u8 = 0;
-const GATE_OPEN: u8 = 1;
-const GATE_SETUP: u8 = 2;
-static GATE: AtomicU8 = AtomicU8::new(GATE_UNKNOWN);
-
-/// Whether a new size class may be registered now.
-#[inline]
-fn classes_open() -> bool {
-    match GATE.load(Relaxed) {
-        GATE_OPEN => true,
-        GATE_SETUP => false,
-        _ => {
-            unsafe extern "C" {
-                fn getenv(name: *const core::ffi::c_char) -> *const core::ffi::c_char;
-            }
-            let killed = !unsafe { getenv(c"FLOCK_NO_RECYCLE_SETUP_GATE".as_ptr()) }.is_null();
-            let resolved = if killed { GATE_OPEN } else { GATE_SETUP };
-            let _ = GATE.compare_exchange(GATE_UNKNOWN, resolved, Relaxed, Relaxed);
-            GATE.load(Relaxed) == GATE_OPEN
-        }
-    }
-}
-
-/// Open class registration for the rest of the process (idempotent; the
-/// prover calls it at the start of every prove, so the first one opens it).
-pub fn open_classes() {
-    if !classes_open() {
-        GATE.store(GATE_OPEN, Relaxed);
-    }
-}
-
 #[inline]
 fn find_class(size: usize, insert: bool) -> Option<usize> {
     let start = class_slot(size);
@@ -92,7 +43,7 @@ fn find_class(size: usize, insert: bool) -> Option<usize> {
             return Some(i);
         }
         if s == 0 {
-            if !insert || !classes_open() {
+            if !insert {
                 return None;
             }
             if CLASSES[i]
@@ -120,7 +71,7 @@ fn pop(size: usize) -> *mut u8 {
     let Some(i) = find_class(size, false) else {
         return core::ptr::null_mut();
     };
-    let mut head = flock_core::lock_spin_if_armed(&CLASSES[i].head).unwrap();
+    let mut head = CLASSES[i].head.lock().unwrap();
     let top = *head;
     if top == 0 {
         return core::ptr::null_mut();
@@ -134,7 +85,7 @@ fn push(ptr: *mut u8, size: usize) -> bool {
     let Some(i) = find_class(size, true) else {
         return false;
     };
-    let mut head = flock_core::lock_spin_if_armed(&CLASSES[i].head).unwrap();
+    let mut head = CLASSES[i].head.lock().unwrap();
     unsafe { *(ptr as *mut usize) = *head };
     *head = ptr as usize;
     true

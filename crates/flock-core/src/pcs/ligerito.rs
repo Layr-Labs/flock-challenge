@@ -3041,11 +3041,6 @@ fn transpose_forward_ntt_fused_3layer(
 ) {
     use rayon::prelude::*;
 
-    // Read once per group, not per product; an in-process diagnostic can ablate
-    // this fold without changing the transpose schedule or prepared twiddles.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
-    let pmull_fold = std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none();
-
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
     type Twiddle = crate::field::gf2_128::aarch64::ConstPrep;
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
@@ -3066,23 +3061,21 @@ fn transpose_forward_ntt_fused_3layer(
         a: [usize; 2],
         b: [usize; 2],
         tw: [Twiddle; 2],
-        pmull_fold: bool,
     ) {
         use core::arch::aarch64::uint64x2_t;
-        use crate::field::gf2_128::aarch64::{mul_const_pair_prep, mul_const_pair_prep_pmull};
+        use crate::field::gf2_128::aarch64::mul_const_pair_prep;
 
         let bottom = [values[b[0]], values[b[1]]];
         let sums = [values[a[0]] + bottom[0], values[a[1]] + bottom[1]];
         // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
         // layout maps lo/hi to vector lanes 0/1 without padding.
         let products = unsafe {
-            let x0 = core::mem::transmute::<F128, uint64x2_t>(sums[0]);
-            let x1 = core::mem::transmute::<F128, uint64x2_t>(sums[1]);
-            let products = if pmull_fold {
-                mul_const_pair_prep_pmull(tw[0], x0, tw[1], x1)
-            } else {
-                mul_const_pair_prep(tw[0], x0, tw[1], x1)
-            };
+            let products = mul_const_pair_prep(
+                tw[0],
+                core::mem::transmute::<F128, uint64x2_t>(sums[0]),
+                tw[1],
+                core::mem::transmute::<F128, uint64x2_t>(sums[1]),
+            );
             products.map(|p| core::mem::transmute::<uint64x2_t, F128>(p))
         };
         values[a[0]] = sums[0];
@@ -3151,7 +3144,6 @@ fn transpose_forward_ntt_fused_3layer(
                         [4 * half, 4 * half + 2],
                         [4 * half + 1, 4 * half + 3],
                         [tw[3 + 2 * half], tw[4 + 2 * half]],
-                        pmull_fold,
                     );
                 }
                 for half in 0..2 {
@@ -3160,7 +3152,6 @@ fn transpose_forward_ntt_fused_3layer(
                         [4 * half, 4 * half + 1],
                         [4 * half + 2, 4 * half + 3],
                         [tw[1 + half]; 2],
-                        pmull_fold,
                     );
                 }
                 for pair in 0..2 {
@@ -3169,7 +3160,6 @@ fn transpose_forward_ntt_fused_3layer(
                         [2 * pair, 2 * pair + 1],
                         [2 * pair + 4, 2 * pair + 5],
                         [tw[0]; 2],
-                        pmull_fold,
                     );
                 }
             }
@@ -5829,7 +5819,7 @@ fn ligero_commit_select(
         target_feature = "aes"
     )) && recursive_from_message_shape
         && level_enabled
-        && recursive_from_message_env_clear();
+        && std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none();
     ligero_commit_impl_view(
         poly,
         log_msg_cols,
@@ -5878,7 +5868,7 @@ pub(crate) fn ligero_commit_with_tree_view(
         log_inv_rate,
         ntt,
         kind,
-        l1_tree_view_env_on(),
+        std::env::var("FLOCK_NO_L1_TREE_VIEW").map_or(true, |v| v != "1"),
     )
 }
 
@@ -5925,7 +5915,8 @@ fn ligero_commit_impl_view(
     assert_eq!(poly.len(), num_interleaved * msg_cols);
     assert!(log_block_len <= ntt.log_domain_size());
 
-    let timing = commit_trace_env();
+    let timing = std::env::var_os("LIG_PROVE_TRACE").is_some()
+        || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
     let total_start = timing.then(std::time::Instant::now);
 
     // LSB-lane layout: input matches `data[pos * num_interleaved + lane]`.
@@ -6289,179 +6280,6 @@ impl RoundQuad {
     }
 }
 
-/// Largest log2 prover state of a recursive level whose deep-C2 dual and
-/// opening skip their Rayon join (`FLOCK_NO_SMALL_SERIAL=1` kills).
-const SMALL_SERIAL_MAX_LOG_STATE: usize = 15;
-
-/// Kill switch for the cached ligerito / ring-switch gate environment
-/// (`FLOCK_NO_LIGERITO_ENV_ONCE`, any value: every gate call reads its
-/// variables from the process environment again, as before). Read once per
-/// process.
-pub const ENV_NO_LIGERITO_ENV_ONCE: &str = "FLOCK_NO_LIGERITO_ENV_ONCE";
-
-pub(crate) fn ligerito_env_once_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LIGERITO_ENV_ONCE).is_none());
-    *ON
-}
-
-/// The trace term of the ligerito prove (`LIG_PROVE_TRACE` /
-/// `FLOCK_OPEN_TIMING`). The process environment does not change during a
-/// prove, so the first answer is kept. `FLOCK_NO_LIGERITO_ENV_ONCE` restores
-/// the per-call lookups.
-#[inline]
-fn prove_trace_env() -> bool {
-    if ligerito_env_once_enabled() {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
-        });
-        return *ON;
-    }
-    std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
-}
-
-/// [`c2::enabled`] with the `FLOCK_NO_LIG_C2` value kept the same way (the
-/// value itself is kept, so `c2::enabled` still makes the comparison).
-#[inline]
-fn lig_c2_enabled(use_lazy_l1_ood: bool) -> bool {
-    if ligerito_env_once_enabled() {
-        static NO_LIG_C2: std::sync::LazyLock<Option<std::ffi::OsString>> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_C2"));
-        return c2::enabled(use_lazy_l1_ood, NO_LIG_C2.as_deref());
-    }
-    c2::enabled(
-        use_lazy_l1_ood,
-        std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
-    )
-}
-
-/// The timing term of the ligero commit (`LIG_PROVE_TRACE` /
-/// `FLOCK_OPEN_TIMING`, both `var_os`), kept the same way.
-#[inline]
-fn commit_trace_env() -> bool {
-    if ligerito_env_once_enabled() {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("LIG_PROVE_TRACE").is_some()
-                || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
-        });
-        return *ON;
-    }
-    std::env::var_os("LIG_PROVE_TRACE").is_some()
-        || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
-}
-
-/// The `FLOCK_NO_RECURSIVE_FROM_MESSAGE` term of the recursive commit
-/// selector, kept the same way.
-#[inline]
-fn recursive_from_message_env_clear() -> bool {
-    if ligerito_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none()
-        });
-        return *CLEAR;
-    }
-    std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none()
-}
-
-/// The `FLOCK_NO_L1_TREE_VIEW` (exact `'1'`) term of
-/// [`ligero_commit_with_tree_view`], kept the same way.
-#[inline]
-fn l1_tree_view_env_on() -> bool {
-    if ligerito_env_once_enabled() {
-        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("FLOCK_NO_L1_TREE_VIEW").map_or(true, |v| v != "1")
-        });
-        return *ON;
-    }
-    std::env::var("FLOCK_NO_L1_TREE_VIEW").map_or(true, |v| v != "1")
-}
-
-/// The environment term of [`ranked_fold2_enabled`], kept the same way.
-#[inline]
-fn lig_fold2_env_clear() -> bool {
-    if ligerito_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none());
-        return *CLEAR;
-    }
-    std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
-}
-
-/// The `FLOCK_NO_DIRECT_FOLD8_PAIR` term of the direct-fold8 slot folds, kept
-/// the same way.
-#[inline]
-fn direct_fold8_pair_env_clear() -> bool {
-    if ligerito_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none());
-        return *CLEAR;
-    }
-    std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none()
-}
-
-/// The `FLOCK_NO_DIRECT_FOLD8_QUAD` term of the direct-fold8 slot folds, kept
-/// the same way.
-#[inline]
-fn direct_fold8_quad_env_clear() -> bool {
-    if ligerito_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none());
-        return *CLEAR;
-    }
-    std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none()
-}
-
-/// The `FLOCK_NO_LIG_LAZY_OOD_EQ` term of the ranked L1 lazy-OOD selector,
-/// kept the same way.
-#[inline]
-fn lig_lazy_ood_eq_env_off() -> bool {
-    if ligerito_env_once_enabled() {
-        static OFF: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some());
-        return *OFF;
-    }
-    std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some()
-}
-
-/// The environment term of the ranked L2 lazy-OOD selector, kept the same
-/// way (`FLOCK_NO_LIGERITO_ENV_ONCE` restores the per-call lookup).
-#[inline]
-fn ranked_l2_lazy_ood_eq_env_disabled() -> bool {
-    if ligerito_env_once_enabled() {
-        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            ranked_l2_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L2_LAZY_OOD).as_deref())
-        });
-        return *OFF;
-    }
-    ranked_l2_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L2_LAZY_OOD).as_deref())
-}
-
-/// The environment term of the ranked L3 lazy-OOD selector, kept the same
-/// way (`FLOCK_NO_LIGERITO_ENV_ONCE` restores the per-call lookup).
-#[inline]
-fn ranked_l3_lazy_ood_eq_env_disabled() -> bool {
-    if ligerito_env_once_enabled() {
-        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            ranked_l3_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L3_LAZY_OOD).as_deref())
-        });
-        return *OFF;
-    }
-    ranked_l3_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L3_LAZY_OOD).as_deref())
-}
-
-/// The environment term of the ranked L4 lazy-OOD selector, kept the same
-/// way (`FLOCK_NO_LIGERITO_ENV_ONCE` restores the per-call lookup).
-#[inline]
-fn ranked_l4_lazy_ood_eq_env_disabled() -> bool {
-    if ligerito_env_once_enabled() {
-        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            ranked_l4_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L4_LAZY_OOD).as_deref())
-        });
-        return *OFF;
-    }
-    ranked_l4_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L4_LAZY_OOD).as_deref())
-}
-
 /// Enable the previously-promoted two-challenge initial-fold cadence only for
 /// the ranked opening geometry it was designed and validated for. The opt-out
 /// keeps an adjacent single-fold control available without rebuilding.
@@ -6470,7 +6288,7 @@ pub(crate) fn ranked_fold2_enabled(poly_len: usize, initial_k: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && poly_len == (1usize << 25)
         && initial_k == 6
-        && lig_fold2_env_clear()
+        && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
 }
 
 /// Compute `(u_0, u_2)` for `u(X) = Σ_x f(X, x) · b(X, x)` where `X` is the
@@ -6565,38 +6383,6 @@ fn round_msg_and_eval_lsb(f: &[F128], b: &[F128]) -> (SumcheckMessage, F128) {
             |(a0, a2, ay), (b0, b2, by)| (a0 + b0, a2 + b2, ay + by),
         );
     (SumcheckMessage { u_0, u_2 }, y)
-}
-
-/// [`round_msg_and_eval_lsb`] for an LSB-first equality table
-/// `b = eq_table(z)` with `z_0 = z[0]` (`FLOCK_NO_OOD_EQ_PAIR_SUM=1` kills).
-/// Each pair is `b[2j] = (1 + z_0) w_j`, `b[2j + 1] = z_0 w_j`, so
-/// `w_j = b[2j] + b[2j + 1]`. With `a = sum f_0 w` and `s = sum (f_0 + f_1) w`
-/// the exact field identities `u_0 = (1 + z_0) a`, `u_2 = s` and
-/// `y = a + z_0 s` give the same three values with two products per pair
-/// instead of three (ranked L5: 64 pairs, 192 -> 130 products). Shapes at or
-/// above the parallel threshold take the incumbent scan.
-fn round_msg_and_eval_lsb_eq(f: &[F128], b: &[F128], z_0: F128) -> (SumcheckMessage, F128) {
-    let n = f.len();
-    debug_assert!(n.is_power_of_two() && n >= 2);
-    debug_assert_eq!(b.len(), n);
-    let half = n / 2;
-    if half >= 4096 {
-        return round_msg_and_eval_lsb(f, b);
-    }
-    let (mut a, mut s) = (F128::ZERO, F128::ZERO);
-    for j in 0..half {
-        let f0 = f[2 * j];
-        let f1 = f[2 * j + 1];
-        let w = b[2 * j] + b[2 * j + 1];
-        a += f0 * w;
-        s += (f0 + f1) * w;
-    }
-    (SumcheckMessage { u_0: a + z_0 * a, u_2: s }, a + z_0 * s)
-}
-
-fn ood_eq_pair_sum_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_OOD_EQ_PAIR_SUM").is_none())
 }
 
 /// Default low-factor width for retained lazy-OOD equalities. Ranked L1/L2
@@ -7913,7 +7699,7 @@ const ENV_NO_GPU_ZFOLD: &str = "FLOCK_NO_GPU_ZFOLD";
 /// view of z, writing the small folded vector) while the CPU queue steals
 /// from the top; see `gpu_commit::imp::zfold`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn zfold_gpu_enabled() -> bool {
+fn zfold_gpu_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os(ENV_NO_GPU_ZFOLD).is_none() && crate::gpu_commit::gpu_commit_enabled()
@@ -7929,51 +7715,6 @@ fn zfold_debug() -> bool {
 fn zfold_debug_any() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_ZF_DEBUG").is_some())
-}
-
-/// Kill switch for the z-fold arm's wide signalled chunks
-/// (`FLOCK_NO_ZF_WIDE_CHUNK=1`, exact: the record's 8-block chunks). The GPU
-/// share is encoded as one encoder per chunk with a completion signal behind
-/// each, so the CPU queue can take finished GPU blocks while the GPU still
-/// runs. Each boundary (encoder end, signal, next encoder, and the partly
-/// idle tail of the chunk's last threadgroups) cost about 45 us of GPU time
-/// here: 32 chunks of 8 blocks kept the GPU busy 4.4 ms for its ~112 blocks.
-/// With 32-block chunks it is 3.2 ms and the GPU takes ~130 blocks. The
-/// coarser grain costs the steal only at the meeting point: the CPU steals
-/// from the top, lowering the boundary word, so the in-flight chunk ends at
-/// that word and its signal follows; its blocks' CPU remainder lands later.
-/// Same kernel, same blocks, same outputs; only how many blocks share a
-/// signal changes. Read once.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const ENV_NO_ZF_WIDE_CHUNK: &str = "FLOCK_NO_ZF_WIDE_CHUNK";
-
-/// Blocks per signalled z-fold chunk (see [`ENV_NO_ZF_WIDE_CHUNK`]).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn zfold_default_chunk() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        if std::env::var(ENV_NO_ZF_WIDE_CHUNK).is_ok_and(|v| v == "1") { 8 } else { 32 }
-    })
-}
-
-/// Kill switch for submitting the z-fold GPU share from a main-pool worker
-/// only: `FLOCK_NO_ZF_LAUNCH_MAIN=1` (any value) restores the record, where
-/// the drain's first claimant submits whichever pool it belongs to. That
-/// first claimant is often an efficiency-core helper lingering from the
-/// previous drain (`QOS_CLASS_UTILITY`). On the M4, where the main pool and
-/// the helpers oversubscribe the cores, such a helper was descheduled in the
-/// middle of the submit (4.0 ms inside its 192-byte constant copy, 6.3 ms in
-/// all), and the GPU folded no block of that drain (+1.7 ms). Now a helper
-/// that claims first just folds its block and the first main-pool claimant
-/// submits (the calling thread starts claiming at once). Same job, same
-/// blocks, same outputs; only the submitting thread changes. Read once.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const ENV_NO_ZF_LAUNCH_MAIN: &str = "FLOCK_NO_ZF_LAUNCH_MAIN";
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn zfold_launch_main_only() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZF_LAUNCH_MAIN).is_none())
 }
 
 /// Diagnostic tuning knobs (unset in ranked runs).
@@ -8025,24 +7766,6 @@ pub(crate) fn with_witness_padding<T>(
         cell.replace(Some((padding.k_log, padding.useful_bits_per_block)))
     }));
     f()
-}
-
-/// Low-limb tail of the odd slots in the four-slot witness fold (default on,
-/// with the zero tail). The ranked witness's useful prefix ends 49 bits into
-/// the odd slots' bank 56, so that bank's high limb is padding zero and its
-/// pair (56, 57) needs two of its eight limb products (see
-/// `f128_slice::fold_banked_slots4_whole_into`).
-/// `FLOCK_NO_DIRECT_FOLD8_LO_TAIL=1` (any value) runs the full pair. Read
-/// once per process.
-fn direct_fold8_lo_tail_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DIRECT_FOLD8_LO_TAIL").is_none())
-}
-
-/// Whether a padding descriptor's useful prefix ends in the low limb of its
-/// last word (`1..=64` useful bits there), so that word's high limb is zero.
-fn direct_fold8_last_word_lo_only(padding: Option<(usize, usize)>) -> bool {
-    matches!(padding, Some((_, useful_bits)) if (1..=64).contains(&(useful_bits % 128)))
 }
 
 /// Leading banks that can be nonzero in the odd 64-word slots of the packed
@@ -8195,8 +7918,9 @@ fn materialize_direct_fold8(
     // The rollback retains the incumbent two single-slot calls for A/B.
     let pair_fold64 = deferred_reduce
         && cfg!(all(target_arch = "aarch64", target_feature = "aes"))
-        && direct_fold8_pair_env_clear();
-    let quad_fold64 = pair_fold64 && direct_fold8_quad_env_clear();
+        && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_PAIR").is_none();
+    let quad_fold64 =
+        pair_fold64 && std::env::var_os("FLOCK_NO_DIRECT_FOLD8_QUAD").is_none();
     // Whole-element loads in the four-slot fold (same products, same sums;
     // see `f128_slice::fold_banked_slots4_whole_into`). The rollback runs
     // the incumbent block body.
@@ -8211,11 +7935,6 @@ fn materialize_direct_fold8(
     } else {
         64
     };
-    // The odd slots' last live bank (56 at 57 live banks) has a zero high
-    // limb when the useful prefix ends in a word's low limb.
-    let odd_slot_lo_tail = odd_slot_live == 57
-        && direct_fold8_lo_tail_enabled()
-        && direct_fold8_last_word_lo_only(WITNESS_PADDING.with(|cell| cell.get()));
 
     // One shared per-block body for both drains below, so the scheduling
     // choice cannot drift from the value computation. For block `i` it fully
@@ -8274,7 +7993,6 @@ fn materialize_direct_fold8(
                         &f_in[base..base + 256],
                         &mut f_out[slot..slot + 4],
                         $odd_live,
-                        $odd_live == 57 && odd_slot_lo_tail,
                     );
                 } else {
                     let folded_f = crate::field::f128_slice::fold_banked_slots4::<64>(
@@ -8369,95 +8087,6 @@ fn materialize_direct_fold8(
             fold8_block_incumbent(scratch, block, b_out, f_out)
         }
     };
-    // Opening z rebuild (`super::ENV_NO_OPEN_Z_REBUILD`): with a producer
-    // registered for this buffer, a CPU-folded block gets its z rows quad by
-    // quad from the producer into the worker's 512-element scratch and
-    // folds them from there. Only the whole-load four-slot form without an
-    // ordinary basis has a rebuild body; it is that form's block body with
-    // `f_in` read from the scratch: the same kernel calls on the same words
-    // in the same order (one 128-word row = two slots, one quad = eight).
-    let z_rebuild = if super::open_z_rebuild_enabled()
-        && whole_fold64
-        && !has_ordinary
-        && block_len.is_multiple_of(8)
-        && packed_witness.len().is_multiple_of(512)
-    {
-        super::open_z_rebuild_take(&packed_witness).filter(|r| r.n_quads() * 512 == packed_witness.len())
-    } else {
-        None
-    };
-    let z_rebuild_p_only = z_rebuild.is_some() && super::open_z_rebuild_p_only();
-    let zr_blocks = std::sync::atomic::AtomicUsize::new(0);
-    let zr_helper_blocks = std::sync::atomic::AtomicUsize::new(0);
-    let fold8_block_rebuilt = |zr: &super::OpenZRebuild,
-                               scratch: &mut Vec<F128>,
-                               zs: &mut Vec<F128>,
-                               block: usize,
-                               b_out: &mut [F128],
-                               f_out: &mut [F128]|
-     -> (F128, F128) {
-        debug_assert!(!has_ordinary && whole_fold64 && zs.len() >= 512);
-        let (first_claim, rest_claims) = claims.split_first().unwrap();
-        let (first_table, rest_tables) = direct_tables.split_first().unwrap();
-        super::ring_switch::compose_fold_byte_table_into(
-            first_claim.eq_hi[block],
-            first_table,
-            scratch,
-        );
-        let q0 = block * block_len / 8;
-        let mut slot = 0usize;
-        while slot < block_len {
-            // SAFETY: `zs` holds 512 elements; the registration outlives
-            // this materialize (it belongs to the prove that called it).
-            unsafe { zr.produce_quad(q0 + slot / 8, zs.as_mut_ptr()) };
-            for half in 0..2 {
-                let base = 256 * half;
-                crate::field::f128_slice::fold_banked_slots4_whole_into::<64>(
-                    &fold_weight,
-                    &zs[base..base + 256],
-                    &mut f_out[slot..slot + 4],
-                    odd_slot_live,
-                    odd_slot_lo_tail,
-                );
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
-                let direct2 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
-                let direct3 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
-                b_out[slot] = direct0;
-                b_out[slot + 1] = direct1;
-                b_out[slot + 2] = direct2;
-                b_out[slot + 3] = direct3;
-                slot += 4;
-            }
-        }
-        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
-    };
-    // A CPU-folded block: rebuilt rows when registered (and, under the
-    // P-only knob, on a main-pool worker), else read from the buffer.
-    let fold8_cpu = |st: &mut (Vec<F128>, Vec<F128>),
-                     block: usize,
-                     b_out: &mut [F128],
-                     f_out: &mut [F128]|
-     -> (F128, F128) {
-        if let Some(zr) = z_rebuild.as_ref() {
-            let helper = crate::epool::epool().is_some_and(|p| p.current_thread_index().is_some());
-            if !(z_rebuild_p_only && helper) {
-                if st.1.len() < 512 {
-                    st.1 = crate::alloc_uninit_f128_vec(512);
-                }
-                zr_blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if helper {
-                    zr_helper_blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                let (scratch, zs) = (&mut st.0, &mut st.1);
-                return fold8_block_rebuilt(zr, scratch, zs, block, b_out, f_out);
-            }
-        }
-        fold8_block(&mut st.0, block, b_out, f_out)
-    };
     // The same block body when `f_out` already holds the GPU's witness fold
     // (an exact field sum, bit-identical to the banked CPU fold): only the
     // direct basis part and the round-0 partial remain. Ranked shape only
@@ -8515,9 +8144,6 @@ fn materialize_direct_fold8(
             std::sync::OnceLock::new();
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let zf_launch_claimed = std::sync::atomic::AtomicBool::new(!zf_want);
-        // Only a main-pool worker submits (see `ENV_NO_ZF_LAUNCH_MAIN`).
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let zf_launch_main_only = zfold_launch_main_only();
         let zf_ns_full = std::sync::atomic::AtomicU64::new(0);
         let zf_ns_bonly = std::sync::atomic::AtomicU64::new(0);
         let zf_launch_ns = std::sync::atomic::AtomicU64::new(0);
@@ -8525,22 +8151,18 @@ fn materialize_direct_fold8(
         let zf_setup_ms = zf_t0.elapsed().as_secs_f64() * 1e3;
         crate::epool::run_hetero_chunks_stateful(
             n_blocks,
-            || (crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN), Vec::new()),
-            |st: &mut (Vec<F128>, Vec<F128>), block| {
+            || crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN),
+            |scratch, block| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 if zf_want {
-                    if !zf_launch_claimed.load(std::sync::atomic::Ordering::Relaxed)
-                        && !(zf_launch_main_only
-                            && crate::epool::epool().is_some_and(|p| p.current_thread_index().is_some()))
-                        && !zf_launch_claimed.swap(true, std::sync::atomic::Ordering::AcqRel)
-                    {
+                    if !zf_launch_claimed.swap(true, std::sync::atomic::Ordering::AcqRel) {
                         let tl = std::time::Instant::now();
                         let _ = zf_cell.set(crate::gpu_commit::zfold_launch(
                             &packed_witness,
                             &challenges,
                             block_len,
                             zfold_env_usize("FLOCK_ZF_GPU_BLOCKS", n_blocks),
-                            zfold_env_usize("FLOCK_ZF_CHUNK", zfold_default_chunk()),
+                            zfold_env_usize("FLOCK_ZF_CHUNK", 8),
                         ));
                         zf_launch_ns.store(
                             tl.elapsed().as_nanos() as u64,
@@ -8549,7 +8171,7 @@ fn materialize_direct_fold8(
                     }
                     let job = zf_cell.get().and_then(|j| j.as_ref());
                     let (block, from_gpu) = {
-                        let mut g = crate::lock_spin(&zf_claims).unwrap_or_else(|e| e.into_inner());
+                        let mut g = zf_claims.lock().unwrap_or_else(|e| e.into_inner());
                         assert!(g.0 < g.1, "z-fold claim queue overrun");
                         if job.is_some_and(|job| job.block_ready(g.0)) {
                             g.0 += 1;
@@ -8577,9 +8199,9 @@ fn materialize_direct_fold8(
                         let tb = zfold_debug_any().then(std::time::Instant::now);
                         let partial = if let (true, Some(job)) = (from_gpu, job) {
                             f_out.copy_from_slice(job.block_out(block));
-                            fold8_b_only(&mut st.0, block, b_out, f_out)
+                            fold8_b_only(scratch, block, b_out, f_out)
                         } else {
-                            fold8_cpu(st, block, b_out, f_out)
+                            fold8_block(scratch, block, b_out, f_out)
                         };
                         if let Some(tb) = tb {
                             let ns = tb.elapsed().as_nanos() as u64;
@@ -8607,7 +8229,7 @@ fn materialize_direct_fold8(
                     partials_base
                         .ptr()
                         .add(block)
-                        .write(fold8_cpu(st, block, b_out, f_out));
+                        .write(fold8_block(scratch, block, b_out, f_out));
                     if let Some(tb) = tb {
                         zf_ns_full.fetch_add(
                             tb.elapsed().as_nanos() as u64,
@@ -8636,14 +8258,6 @@ fn materialize_direct_fold8(
                 );
             }
         }
-        if zfold_debug_any() && z_rebuild.is_some() {
-            eprintln!(
-                "    [zfold] z rebuild: {} CPU blocks rebuilt ({} on helper threads){}",
-                zr_blocks.load(std::sync::atomic::Ordering::Relaxed),
-                zr_helper_blocks.load(std::sync::atomic::Ordering::Relaxed),
-                if z_rebuild_p_only { ", P-only" } else { "" },
-            );
-        }
         if zfold_debug_any() {
             let full = n_blocks - zf_used;
             let nf = zf_ns_full.load(std::sync::atomic::Ordering::Relaxed);
@@ -8669,8 +8283,8 @@ fn materialize_direct_fold8(
             .zip(folded_f.par_chunks_mut(block_len))
             .enumerate()
             .map_init(
-                || (crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN), Vec::new()),
-                |st, (block, (b_out, f_out))| fold8_cpu(st, block, b_out, f_out),
+                || crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN),
+                |scratch, (block, (b_out, f_out))| fold8_block(scratch, block, b_out, f_out),
             )
             .reduce(
                 || (F128::ZERO, F128::ZERO),
@@ -8714,7 +8328,7 @@ fn ranked_l1_lazy_ood_eq_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        lig_lazy_ood_eq_env_off(),
+        std::env::var_os("FLOCK_NO_LIG_LAZY_OOD_EQ").is_some(),
     )
 }
 
@@ -8814,7 +8428,7 @@ fn ranked_l2_lazy_ood_eq_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_lazy_ood_eq_env_disabled(),
+        ranked_l2_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L2_LAZY_OOD).as_deref()),
     )
 }
 
@@ -8939,7 +8553,7 @@ fn ranked_l3_lazy_ood_eq_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l3_lazy_ood_eq_env_disabled(),
+        ranked_l3_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L3_LAZY_OOD).as_deref()),
     )
 }
 
@@ -9063,7 +8677,7 @@ fn ranked_l4_lazy_ood_eq_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l4_lazy_ood_eq_env_disabled(),
+        ranked_l4_lazy_ood_eq_disabled_value(std::env::var_os(ENV_NO_LIG_L4_LAZY_OOD).as_deref()),
     )
 }
 
@@ -9479,25 +9093,6 @@ impl SumcheckProver {
         (msg, h_new)
     }
 
-    /// [`Self::introduce_new_with_eval`] for `b_new = eq_table(z)` with
-    /// `z_0 = z[0]`: same message, same `h_new`, same pending glue, from
-    /// [`round_msg_and_eval_lsb_eq`].
-    fn introduce_new_with_eval_eq(&mut self, b_new: Vec<F128>, z_0: F128) -> (SumcheckMessage, F128) {
-        assert_eq!(b_new.len(), self.f.len());
-        assert!(
-            self.pending_glue.is_none(),
-            "ordinary introduction already pending"
-        );
-        assert!(
-            self.pending_fold_basis.is_none(),
-            "ordinary introduction across deferred glue"
-        );
-        let (msg, h_new) = round_msg_and_eval_lsb_eq(&self.f, &b_new, z_0);
-        self.transcript.push(msg);
-        self.pending_glue = Some((b_new, h_new));
-        (msg, h_new)
-    }
-
     /// Introduce `eq(z, ·)` as retained low/high factors rather than a dense
     /// table. Returns `None` without changing state for unsupported geometry
     /// or any outstanding introduction. A caller may use the full-table path
@@ -9787,22 +9382,7 @@ fn op_serial_opens_enabled() -> bool {
 }
 
 fn merkle_multi_proof_for(tree: &[Hash], block_len: usize, queries: &[usize]) -> Vec<Hash> {
-    // Every caller passes `sample_distinct_queries` output, which is sorted
-    // and unique, so the sorted entry skips a sort and dedup that would
-    // leave the list unchanged.
-    if multiproof_sorted_entry_enabled() {
-        merkle::merkle_multi_proof_sorted(tree, block_len, queries)
-    } else {
-        merkle::merkle_multi_proof(tree, block_len, queries)
-    }
-}
-
-/// Kill switch for the sorted multi-proof entry:
-/// `FLOCK_NO_MP_SORTED_ENTRY` (any value) restores the general
-/// entry's sort and dedup. Same hashes. Read once per process.
-fn multiproof_sorted_entry_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_MP_SORTED_ENTRY").is_none())
+    merkle::merkle_multi_proof(tree, block_len, queries)
 }
 
 /// Drive the recursive Ligerito prover to prove `poly(eval_point) = claimed_value`.
@@ -10226,7 +9806,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     assert_eq!(l0_codeword.len(), block_len_0 * num_interleaved_0);
     assert_eq!(l0_tree.len(), 2 * block_len_0 - 1);
 
-    let trace = prove_trace_env();
+    let trace =
+        std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
     let mut t_init_sumcheck = std::time::Duration::ZERO;
     let mut t_commits = std::time::Duration::ZERO;
     let mut t_opens = std::time::Duration::ZERO;
@@ -10330,7 +9911,6 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         // round than the worst (j=0) round `fold_grinding_bits` is sized for.
         // Derived from fold_grinding_bits + round index; not stored.
         let bits = fold_bits(0).saturating_sub(j as u32);
-        crate::gpu_commit::open_gpu_ping(j as u32);
         if bits > 0 {
             let _tg = std::time::Instant::now();
             fold_grinding_nonces.push(challenger.grind_pow(bits));
@@ -10617,7 +10197,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let num_queries_0 = config.queries[0];
     let queries_0 = sample_distinct_queries(challenger, l0_block_len, num_queries_0);
     let alpha_0 = challenger.sample_f128_vec(ceil_log2(num_queries_0));
-    let use_c2 = lig_c2_enabled(use_lazy_l1_ood);
+    let use_c2 = c2::enabled(
+        use_lazy_l1_ood,
+        std::env::var_os("FLOCK_NO_LIG_C2").as_deref(),
+    );
     let open_l0 = || {
         use rayon::prelude::*;
         rayon::join(
@@ -10734,23 +10317,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
             }
             let ri = challenger.sample_f128();
             let msg = if let Some(pending) = pending_c2.as_mut() {
-                // The last fold of the open: past it the prover reads only
-                // `f` (the final `yr`) and the transcript, so the dual's
-                // basis is never merged (see `c2::Pending::fold_terminal`).
-                if i + 1 == r && j + 1 == k_i && c2::terminal_skip_enabled() {
-                    let msg = pending.fold_terminal(ri, &mut sc_prover);
+                let (msg, complete) = pending.fold(ri, &mut sc_prover);
+                if complete {
                     pending_c2 = None;
-                    msg
-                } else {
-                    let (msg, complete) = pending.fold(ri, &mut sc_prover);
-                    if complete {
-                        pending_c2 = None;
-                        if trace {
-                            eprintln!("  C2 merged after fold 2");
-                        }
+                    if trace {
+                        eprintln!("  C2 merged after fold 2");
                     }
-                    msg
                 }
+                msg
             } else {
                 sc_prover.fold(ri)
             };
@@ -10946,11 +10520,7 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     } else {
                         build_eq_table(&z)
                     };
-                    let (intro, y) = if ood_eq_pair_sum_enabled() {
-                        sc_prover.introduce_new_with_eval_eq(eq_z, z[0])
-                    } else {
-                        sc_prover.introduce_new_with_eval(eq_z)
-                    };
+                    let (intro, y) = sc_prover.introduce_new_with_eval(eq_z);
                     (intro, y, false)
                 };
                 challenger.observe_f128(y);
@@ -10998,26 +10568,20 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
         };
         let _t = std::time::Instant::now();
         let ((merkle_proof_i, opened_rows_i), sparse_deep_i) = if use_deep_c2 {
-            let dual_i = || {
-                c2::Dual::new_sync(
-                    3,
-                    n_next + config.log_inv_rates[i + 1],
-                    config.log_inv_rates[i + 1],
-                    &level_rs,
-                    &queries_i,
-                    &alpha_i,
-                    |q| wtns_prev.row(q),
-                )
-            };
-            // Small levels (`FLOCK_NO_SMALL_SERIAL=1` kills): the dual and the
-            // opening are a few microseconds each from the 2^15-state level
-            // down, so they run one after the other on this thread instead
-            // of as a Rayon join. Same two computations, same results.
-            let (dual, opened) = if n_next <= SMALL_SERIAL_MAX_LOG_STATE && crate::small_serial_enabled() {
-                (dual_i(), open_i())
-            } else {
-                rayon::join(dual_i, open_i)
-            };
+            let (dual, opened) = rayon::join(
+                || {
+                    c2::Dual::new_sync(
+                        3,
+                        n_next + config.log_inv_rates[i + 1],
+                        config.log_inv_rates[i + 1],
+                        &level_rs,
+                        &queries_i,
+                        &alpha_i,
+                        |q| wtns_prev.row(q),
+                    )
+                },
+                open_i,
+            );
             (opened, Some(dual))
         } else {
             (open_i(), None)
@@ -12961,31 +12525,6 @@ mod tests {
     }
 
     use super::*;
-
-    /// The pair-sum OOD scan equals the three-product scan on both equality
-    /// builders, for every serial size (the ranked L5 one is 128 entries) and
-    /// for z_0 in {0, 1, random}; the parallel sizes take the incumbent scan.
-    #[test]
-    fn ood_eq_pair_sum_matches_three_product_scan() {
-        use crate::challenger::Challenger;
-        let mut rng = crate::challenger::RandomChallenger::new(0x00D5_0041);
-        for log_n in 1..=14usize {
-            let f = rng.sample_f128_vec(1usize << log_n);
-            for case in 0..3 {
-                let mut z = rng.sample_f128_vec(log_n);
-                if case < 2 {
-                    z[0] = if case == 0 { F128::ZERO } else { F128::ONE };
-                }
-                for b in [build_eq_table(&z), crate::lincheck::build_eq_table_optimized(&z)] {
-                    assert_eq!(
-                        round_msg_and_eval_lsb_eq(&f, &b, z[0]),
-                        round_msg_and_eval_lsb(&f, &b),
-                        "log_n={log_n} case={case}"
-                    );
-                }
-            }
-        }
-    }
 
     /// The recursive from-message first pass preserves every encoded element
     /// and every node of the ordinary Merkle tree for both production rates.
@@ -19937,59 +19476,6 @@ mod tests {
             Some(round1),
             &mut ordinary_challenger,
         );
-        // Opening z rebuild (`pcs::ENV_NO_OPEN_Z_REBUILD`): the same proof
-        // with a producer registered for the witness buffer. The producer
-        // copies the rows from a clone; the materializer must take the
-        // registration, fold every block from the rebuilt rows and emit the
-        // same proof bytes.
-        let rows = poly.clone();
-        let direct_again = direct.clone();
-        let mut rebuilt_witness = poly.clone();
-        // Scribble a buffer pattern the rebuild must never read: the
-        // registered buffer's own rows are replaced by garbage, so a block
-        // folded from the buffer instead of the producer changes the proof.
-        for value in rebuilt_witness.iter_mut() {
-            *value = F128::new(0xDEAD_BEEF_0BAD_F00D, 0x5EED_5EED_5EED_5EED);
-        }
-        let produced = std::sync::atomic::AtomicUsize::new(0);
-        let producer = |q: usize, zs: *mut u32| {
-            produced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // SAFETY: the materializer hands a 512-element scratch.
-            unsafe {
-                core::ptr::copy_nonoverlapping(rows.as_ptr().add(512 * q), zs.cast::<F128>(), 512);
-            }
-        };
-        let got_rebuilt = if crate::pcs::open_z_rebuild_enabled() {
-            // SAFETY: the buffer lives (moved, not copied) until the prover
-            // returns; the producer reproduces `rows`, the true witness.
-            let _scope = unsafe {
-                crate::pcs::open_z_rebuild_scope(
-                    rebuilt_witness.as_ptr(),
-                    rebuilt_witness.len(),
-                    rebuilt_witness.len() / 512,
-                    &producer,
-                )
-            };
-            let witness_ptr = rebuilt_witness.as_ptr();
-            let witness_len = rebuilt_witness.len();
-            let mut rebuilt_challenger =
-                crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
-            let proof = recursive_prover_with_basis_direct_fold8(
-                &cfg,
-                rebuilt_witness,
-                Vec::new(),
-                direct_again,
-                target,
-                &wtns_0.mat,
-                &wtns_0.tree,
-                round0,
-                &mut rebuilt_challenger,
-            );
-            let leftover = open_z_rebuild_pending(witness_ptr, witness_len);
-            Some((proof, leftover))
-        } else {
-            None
-        };
         let mut direct_challenger =
             crate::challenger::FsChallenger::new(b"direct-fold8-proof-byte-oracle");
         let got = recursive_prover_with_basis_direct_fold8(
@@ -20003,20 +19489,6 @@ mod tests {
             round0,
             &mut direct_challenger,
         );
-        if let Some((proof, leftover)) = got_rebuilt {
-            // Only the whole-load four-slot form has a rebuild body (the
-            // AArch64 PMULL build); elsewhere the registration stays unused
-            // and the scribbled buffer would change the proof.
-            if cfg!(all(target_arch = "aarch64", target_feature = "aes")) {
-                assert!(!leftover, "the materializer must take the z registration");
-                assert_eq!(
-                    produced.load(std::sync::atomic::Ordering::Relaxed),
-                    rows.len() / 512,
-                    "one producer call per quad"
-                );
-                assert_eq!(proof, got, "rebuilt-row proof must equal the buffer-read proof");
-            }
-        }
 
         assert_eq!(got, ordinary);
         assert_eq!(
@@ -20051,12 +19523,6 @@ mod tests {
             &wtns_0.root(),
             &mut verifier_challenger,
         ));
-    }
-
-    /// Whether a z-rebuild registration for this buffer is still pending
-    /// (taking it out, so a leftover cannot leak into a later test).
-    fn open_z_rebuild_pending(ptr: *const F128, len: usize) -> bool {
-        crate::pcs::open_z_rebuild_take_raw(ptr as usize, len).is_some()
     }
 
     /// `induce_sumcheck_evaluate_at_residual` matches dense

@@ -65,51 +65,27 @@ pub fn build_eq_scaled(r: &[F128], root: F128) -> Vec<F128> {
     // every slot in t[0..2^n] is written exactly once before any read.
     let mut t = crate::alloc_uninit_f128_vec(1usize << n);
     t[0] = root;
-    // The doubling levels run through the two-lane PMULL level kernel
-    // (`expand_eq_table_level`): below the crossover each level is one serial
-    // kernel call instead of a per-entry closure, above it 256-entry `lo`/`hi`
-    // chunk pairs over Rayon instead of per-element parallel zips. The kernel's
-    // `hi[x] = lo[x]·r_i`, `lo[x] = lo[x] + hi[x]` is the same pair of field
-    // operations as the closure it replaces, so the table (root seed included)
-    // is bit-identical. `FLOCK_NO_EQ_KERNEL_SKIP=1` restores the closure
-    // doubling.
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let kernel = !*OFF.get_or_init(|| std::env::var_os("FLOCK_NO_EQ_KERNEL_SKIP").is_some());
     const PAR_THRESHOLD: usize = 1 << 12;
-    const PAR_CHUNK: usize = 1 << 8;
     for i in 0..n {
         let r_i = r[i];
         let half = 1usize << i;
         let (lo, rest) = t.split_at_mut(half);
         let hi = &mut rest[..half];
+        let build_pair = |lo_x: &mut F128, hi_x: &mut F128| {
+            let v = *lo_x;
+            let vr = v * r_i;
+            *hi_x = vr;
+            // v * (1 + r_i) = v + v * r_i in characteristic two.
+            *lo_x = v + vr;
+        };
         if half < PAR_THRESHOLD {
-            if kernel {
-                crate::field::f128_slice::expand_eq_table_level(lo, hi, r_i);
-            } else {
-                for (lo_x, hi_x) in lo.iter_mut().zip(hi.iter_mut()) {
-                    let v = *lo_x;
-                    let vr = v * r_i;
-                    *hi_x = vr;
-                    // v * (1 + r_i) = v + v * r_i in characteristic two.
-                    *lo_x = v + vr;
-                }
-            }
-        } else if kernel {
-            lo.par_chunks_mut(PAR_CHUNK)
-                .zip(hi.par_chunks_mut(PAR_CHUNK))
-                .for_each(|(lo_chunk, hi_chunk)| {
-                    crate::field::f128_slice::expand_eq_table_level(lo_chunk, hi_chunk, r_i);
-                });
+            lo.iter_mut()
+                .zip(hi.iter_mut())
+                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
         } else {
             lo.par_iter_mut()
                 .zip(hi.par_iter_mut())
-                .for_each(|(lo_x, hi_x)| {
-                    let v = *lo_x;
-                    let vr = v * r_i;
-                    *hi_x = vr;
-                    // v * (1 + r_i) = v + v * r_i in characteristic two.
-                    *lo_x = v + vr;
-                });
+                .for_each(|(lo_x, hi_x)| build_pair(lo_x, hi_x));
         }
     }
     t
@@ -279,82 +255,7 @@ impl SplitEqGhash {
 /// Ports `ntt_extend_f128_vec_ghash` (scalar form). The NTT is F_2-linear and
 /// φ_8 commutes with that linearity, which is what makes the bit-by-bit
 /// decomposition equal to the direct F_8-valued NTT extension.
-///
-/// With the standard `k = 6` table (the ranked round one's) the extension
-/// runs as a 64 × 64 F128 matrix product instead (`FLOCK_NO_ZC_NTT_EXT_MATRIX`
-/// kills, see [`ntt_ext_matrix_k6`]): the same field elements.
 pub fn ntt_extend_f128_vec_ghash(in_s: &[F128], inv_table: &InvNttTableByteSingleGf8) -> Vec<F128> {
-    if in_s.len() == NTT_EXT_ELL
-        && inv_table.ell == NTT_EXT_ELL
-        && ntt_ext_matrix_enabled()
-        && std::ptr::eq(inv_table, InvNttTableByteSingleGf8::cached_standard_k6())
-    {
-        return ntt_extend_matrix(in_s, ntt_ext_matrix_k6());
-    }
-    ntt_extend_f128_vec_ghash_bitplanes(in_s, inv_table)
-}
-
-/// Length of the matrix-form extension (`2^k_skip` at `k_skip = 6`).
-const NTT_EXT_ELL: usize = 64;
-
-/// Kill switch for the matrix form of [`ntt_extend_f128_vec_ghash`]
-/// (`FLOCK_NO_ZC_NTT_EXT_MATRIX`, any value): every extension takes the
-/// 128 bit planes, as before. Read once per process.
-fn ntt_ext_matrix_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_NTT_EXT_MATRIX").is_none())
-}
-
-/// The standard `k = 6` extension as its matrix `Φ` (row-major, `Φ[λ][s]` at
-/// `64 λ + s`), built once per process (at the warm-up prove's first round
-/// one; nothing in it depends on the seed).
-///
-/// The extension is F128-linear: with `v[s] = Σ_b bit_b(v[s]) γ^b` (`γ^b = x^b`
-/// is bit `b` of the F128 representation), the bit-plane form computes
-/// `out[λ] = Σ_b γ^b φ₈(T(bits_b)[λ])`, and since the table NTT `T` is
-/// F₂-linear in its bit vector and `φ₈` is additive,
-/// `out[λ] = Σ_s (Σ_b bit_b(v[s]) γ^b) φ₈(T(e_s)[λ]) = Σ_s v[s] · Φ[λ][s]`
-/// with `Φ[λ][s] = φ₈(T(e_s)[λ])`, the bit-plane extension of the unit
-/// vector `e_s` (ONE at `s`). Column `s` is built exactly that way.
-fn ntt_ext_matrix_k6() -> &'static [F128] {
-    static PHI: std::sync::OnceLock<Vec<F128>> = std::sync::OnceLock::new();
-    PHI.get_or_init(|| {
-        let table = InvNttTableByteSingleGf8::cached_standard_k6();
-        let mut phi = vec![F128::ZERO; NTT_EXT_ELL * NTT_EXT_ELL];
-        let mut unit = vec![F128::ZERO; NTT_EXT_ELL];
-        for s in 0..NTT_EXT_ELL {
-            unit[s] = F128::ONE;
-            let col = ntt_extend_f128_vec_ghash_bitplanes(&unit, table);
-            unit[s] = F128::ZERO;
-            for (lambda, value) in col.into_iter().enumerate() {
-                phi[lambda * NTT_EXT_ELL + s] = value;
-            }
-        }
-        phi
-    })
-}
-
-/// `out[λ] = Σ_s Φ[λ][s] · v[s]`, each row summed unreduced and reduced once.
-fn ntt_extend_matrix(in_s: &[F128], phi: &[F128]) -> Vec<F128> {
-    debug_assert_eq!(in_s.len(), NTT_EXT_ELL);
-    debug_assert_eq!(phi.len(), NTT_EXT_ELL * NTT_EXT_ELL);
-    phi.chunks_exact(NTT_EXT_ELL)
-        .map(|row| {
-            let mut acc = crate::field::F256Unreduced::ZERO;
-            for (m, v) in row.iter().zip(in_s) {
-                acc ^= m.mul_unreduced(*v);
-            }
-            acc.reduce()
-        })
-        .collect()
-}
-
-/// [`ntt_extend_f128_vec_ghash`] through the 128 bit planes (the reference
-/// form, and the builder of the matrix form).
-pub fn ntt_extend_f128_vec_ghash_bitplanes(
-    in_s: &[F128],
-    inv_table: &InvNttTableByteSingleGf8,
-) -> Vec<F128> {
     let ell = inv_table.ell;
     assert_eq!(in_s.len(), ell);
     assert_eq!(ell, 1usize << inv_table.k);
@@ -787,53 +688,6 @@ pub fn round1_evals_on_s(
 
 #[cfg(test)]
 mod tests {
-    /// The matrix form of the standard k = 6 extension equals the bit-plane
-    /// form on random, sparse, single-bit, zero and all-ones inputs.
-    #[test]
-    fn ntt_extend_matrix_matches_bitplanes() {
-        let table = InvNttTableByteSingleGf8::cached_standard_k6();
-        let phi = super::ntt_ext_matrix_k6();
-        let mut state = 0x4e54_5445_5854_4d58u64;
-        let mut next = || {
-            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        };
-        let mut cases: Vec<Vec<F128>> = Vec::new();
-        cases.push(vec![F128::ZERO; 64]);
-        cases.push(vec![F128 { lo: u64::MAX, hi: u64::MAX }; 64]);
-        for bit in [0u32, 1, 63, 64, 100, 127] {
-            for s in [0usize, 7, 63] {
-                let mut v = vec![F128::ZERO; 64];
-                v[s] = if bit < 64 {
-                    F128 { lo: 1u64 << bit, hi: 0 }
-                } else {
-                    F128 { lo: 0, hi: 1u64 << (bit - 64) }
-                };
-                cases.push(v);
-            }
-        }
-        for case in 0..64 {
-            let v: Vec<F128> = (0..64)
-                .map(|i| {
-                    if case % 4 == 1 && i % 5 != 0 {
-                        F128::ZERO
-                    } else {
-                        F128 { lo: next(), hi: next() }
-                    }
-                })
-                .collect();
-            cases.push(v);
-        }
-        for (i, v) in cases.iter().enumerate() {
-            let want = super::ntt_extend_f128_vec_ghash_bitplanes(v, table);
-            assert_eq!(super::ntt_extend_matrix(v, phi), want, "case {i}");
-            assert_eq!(super::ntt_extend_f128_vec_ghash(v, table), want, "dispatch, case {i}");
-        }
-    }
-
     use super::*;
 
     struct Rng(u64);
@@ -862,33 +716,6 @@ mod tests {
         }
         fn f128_vec(&mut self, n: usize) -> Vec<F128> {
             (0..n).map(|_| self.f128()).collect()
-        }
-    }
-
-    #[test]
-    fn build_eq_scaled_matches_scalar_doubling_with_root() {
-        // The doubling levels route through the PMULL level kernel; with a
-        // non-one root seed the table must still equal the scalar closure
-        // doubling at every size.
-        let mut rng = Rng::new(0x5CA1_E5ED);
-        for d in 0..=17usize {
-            let r = rng.f128_vec(d);
-            let root = rng.f128();
-            let mut expected = crate::alloc_uninit_f128_vec(1usize << d);
-            expected[0] = root;
-            for i in 0..d {
-                let r_i = r[i];
-                let half = 1usize << i;
-                let (lo, rest) = expected.split_at_mut(half);
-                let hi = &mut rest[..half];
-                for x in 0..half {
-                    let v = lo[x];
-                    let vr = v * r_i;
-                    hi[x] = vr;
-                    lo[x] = v + vr;
-                }
-            }
-            assert_eq!(build_eq_scaled(&r, root), expected, "build_eq_scaled d={d}");
         }
     }
 

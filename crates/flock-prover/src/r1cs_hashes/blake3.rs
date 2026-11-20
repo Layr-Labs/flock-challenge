@@ -245,9 +245,6 @@ pub(crate) struct DeferredAb<'a> {
     /// instead of by value; `FLOCK_NO_AB_SEED_INPUT_REUSE` restores the
     /// latter.
     seed_in_place: bool,
-    /// The buffers already hold every row (no deferral): the handle only
-    /// rebuilds rows into round two's scratch (round-two A/B rebuild).
-    rebuild_only: bool,
 }
 
 // SAFETY: `fill_quad` writes only the four blocks of its own quad; distinct
@@ -273,34 +270,8 @@ impl DeferredAb<'_> {
         b_scratch: *mut u8,
         scratch_primed: bool,
     ) {
-        self.fill_quad_to(q, a_scratch, b_scratch, scratch_primed, true);
-    }
-
-    /// Whether [`Self::fill_quad_to`] can leave a quad's rows unpublished
-    /// (the copy-drain forms copy them out of the scratch, so they can skip
-    /// that copy).
-    pub(crate) fn unpublished_fill_supported(&self) -> bool {
-        self.copy_drain
-    }
-
-    /// [`Self::fill_quad`]; with `publish == false` and a scratch pair the
-    /// rows go to the scratch only and the buffers' rows of quad `q` are not
-    /// written (round-two A/B rebuild,
-    /// `flock_core::zerocheck::univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`).
-    /// Without a scratch, or on a form that cannot skip the copy, the rows
-    /// are always published.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
-    pub(crate) fn fill_quad_to(
-        &self,
-        q: usize,
-        a_scratch: *mut u8,
-        b_scratch: *mut u8,
-        scratch_primed: bool,
-        publish: bool,
-    ) {
         assert!(q < self.n_quads);
         assert_eq!(a_scratch.is_null(), b_scratch.is_null());
-        let publish = publish || a_scratch.is_null() || !self.copy_drain;
         #[cfg(target_arch = "aarch64")]
         {
             use witgen_simd::QuadInput;
@@ -308,14 +279,10 @@ impl DeferredAb<'_> {
             let words = Self::UNIT_BYTES / 4;
             // SAFETY: quad `q` owns words `q * words .. (q + 1) * words` of
             // both buffers (see the `Sync` impl); the scratch contract is
-            // the caller's. Unpublished: the copy-drain forms take null
-            // buffers and write the scratch only.
+            // the caller's.
             let emit = |input: QuadInput<'_>| unsafe {
-                let (a, b) = if publish {
-                    (self.a.add(q * words), self.b.add(q * words))
-                } else {
-                    (core::ptr::null_mut(), core::ptr::null_mut())
-                };
+                let a = self.a.add(q * words);
+                let b = self.b.add(q * words);
                 let (sa, sb) = (a_scratch.cast::<u32>(), b_scratch.cast::<u32>());
                 let none = std::ptr::null_mut::<u32>();
                 let primed = scratch_primed && self.primed_scratch;
@@ -353,50 +320,6 @@ impl DeferredAb<'_> {
                     emit(QuadInput::Seeded(crate::seed_pipe::gen_quad_soa_into(
                         init, first, &mut slot,
                     )));
-                }
-                Some(init) if self.gen_ilp => {
-                    let seeded = crate::seed_pipe::gen_quad_soa(init, first);
-                    emit(QuadInput::Seeded(&seeded));
-                }
-                Some(init) => {
-                    let synth: [Compression; 4] = std::array::from_fn(|j| {
-                        crate::seed_pipe::gen_block_with(init, first + j, self.gen_ilp)
-                    });
-                    emit(QuadInput::Blocks(std::array::from_fn(|j| &synth[j])));
-                }
-                None => {
-                    emit(QuadInput::Blocks(std::array::from_fn(|j| &self.blocks[first + j])));
-                }
-            }
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        unreachable!("deferred A/B handles are minted by the aarch64 SIMD driver only");
-    }
-
-    /// Write the z rows of quad `q` (compressions `4q..4q + 4`, 512 u32
-    /// words each, back to back) into `zs`, from the same inputs the driver
-    /// used: u32 words `0..488` of each row are the bytes the driver put in
-    /// the z buffer; words `488..512` of each row are left unwritten (the
-    /// opening's z rebuild never reads them; see
-    /// `flock_core::pcs::ENV_NO_OPEN_Z_REBUILD`). Neither buffer is touched.
-    ///
-    /// # Safety
-    /// `zs` is valid for `4 * (K / 32)` u32 writes.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
-    pub(crate) unsafe fn fill_z_quad(&self, q: usize, zs: *mut u32) {
-        assert!(q < self.n_quads);
-        #[cfg(target_arch = "aarch64")]
-        {
-            use witgen_simd::QuadInput;
-            let first = 4 * q;
-            // SAFETY: the scratch contract is the caller's.
-            let emit = |input: QuadInput<'_>| unsafe { witgen_simd::build_quad_z_rows_plain(input, zs) };
-            // Same input selection as `fill_quad_to` (and the driver's
-            // `process_group`).
-            match self.spec_init {
-                Some(init) if self.gen_ilp && self.seed_in_place => {
-                    let mut slot = std::mem::MaybeUninit::uninit();
-                    emit(QuadInput::Seeded(crate::seed_pipe::gen_quad_soa_into(init, first, &mut slot)));
                 }
                 Some(init) if self.gen_ilp => {
                     let seeded = crate::seed_pipe::gen_quad_soa(init, first);
@@ -2730,60 +2653,15 @@ pub(crate) mod witgen_simd {
 
     /// `(x ^ y).rotate_right(N)` — NEON has no vector ROR. M = 32 − N is
     /// spelled out at the call site (stable Rust cannot derive const
+    /// arguments from const parameters). The `vsri` shift-right-and-insert
+    /// form fuses the shl+shr+orr into one insert instruction, mirroring
+    /// the BLAKE3 rotate idiom in `merkle/blake3_neon_apple.rs`.
     #[inline(always)]
     fn xor_rotr<const N: i32, const M: i32>(x: V4, y: V4) -> V4 {
         debug_assert_eq!(N + M, 32);
         unsafe {
             let v = veorq_u32(x, y);
-            if N == 16 {
-                vreinterpretq_u32_u16(vrev32q_u16(vreinterpretq_u16_u32(v)))
-            } else if N == 8 && cfg!(target_endian = "little") {
-                let indices = [1u8, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
-                vreinterpretq_u32_u8(vqtbl1q_u8(
-                    vreinterpretq_u8_u32(v), vld1q_u8(indices.as_ptr()),
-                ))
-            } else {
-                vsriq_n_u32(vshlq_n_u32::<M>(v), v, N)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    #[test]
-    fn rotate8_byte_permutation_matches_scalar() {
-        fn check<const N: i32, const M: i32>(x: [u32; 4], y: [u32; 4]) {
-            let got: [u32; 4] = unsafe {
-                core::mem::transmute(xor_rotr::<N, M>(
-                    vld1q_u32(x.as_ptr()), vld1q_u32(y.as_ptr()),
-                ))
-            };
-            let want = core::array::from_fn(|i| (x[i] ^ y[i]).rotate_right(N as u32));
-            assert_eq!(got, want, "rotation {N}: x={x:?} y={y:?}");
-        }
-        let mut state = 0x5238_5749_544e_4553u64;
-        for case in 0..1154usize {
-            let x = core::array::from_fn(|lane| {
-                if case < 128 {
-                    if lane == case / 32 { 1u32 << (case % 32) } else { 0 }
-                } else if case == 128 {
-                    u32::MAX
-                } else if case == 129 {
-                    0
-                } else {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    (state >> 32) as u32
-                }
-            });
-            let y = core::array::from_fn(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                (state >> 32) as u32
-            });
-            for mask in [[0; 4], y] {
-                check::<8, 24>(x, mask);
-                check::<16, 16>(x, mask);
-                check::<12, 20>(x, mask);
-                check::<7, 25>(x, mask);
-            }
+            vsriq_n_u32(vshlq_n_u32::<M>(v), v, N)
         }
     }
 
@@ -3196,50 +3074,6 @@ pub(crate) mod witgen_simd {
         }
     }
 
-    /// One complete word group `start..start + 4` (`start = WORD & !3`) of
-    /// a four-block scratch: block `j` receives lane `j` of `w0`, `w1`,
-    /// `w2`, `w3` at words `j * U32_PER_BLOCK + start .. + 4`, the 16 bytes
-    /// that `vst4q_lane_u32::<j>` writes there. The lanes are paired in
-    /// registers first (`trn1` / `trn2`). Blocks 0 and 1 are then the low
-    /// halves of two pairs and go out as one `STP` of two 8-byte registers
-    /// each; blocks 2 and 3 are the high halves and go out as one 16-byte
-    /// `STR` each after a `zip2`. `STP` reaches 504 bytes, so its base is
-    /// the 128-word window that holds `start`.
-    #[inline(always)]
-    unsafe fn store_group_rows<const WORD: usize>(dst: *mut u32, w0: V4, w1: V4, w2: V4, w3: V4) {
-        unsafe {
-            // t0 = [w0[0], w1[0], w0[2], w1[2]], t1 = [w0[1], w1[1], w0[3], w1[3]],
-            // t2 = [w2[0], w3[0], w2[2], w3[2]], t3 = [w2[1], w3[1], w2[3], w3[3]].
-            let t0 = vtrn1q_u32(w0, w1);
-            let t1 = vtrn2q_u32(w0, w1);
-            let t2 = vtrn1q_u32(w2, w3);
-            let t3 = vtrn2q_u32(w2, w3);
-            let start = WORD & !3;
-            let window = (start / 128) * 128;
-            // Block 0: [w0[0], w1[0], w2[0], w3[0]] = low(t0), low(t2).
-            core::arch::asm!(
-                "stp {x:d}, {y:d}, [{p}, #{off}]",
-                x = in(vreg) t0, y = in(vreg) t2,
-                p = in(reg) dst.add(window),
-                off = const ((WORD & !3) % 128) * 4,
-                options(nostack, preserves_flags),
-            );
-            // Block 1: [w0[1], w1[1], w2[1], w3[1]] = low(t1), low(t3).
-            core::arch::asm!(
-                "stp {x:d}, {y:d}, [{p}, #{off}]",
-                x = in(vreg) t1, y = in(vreg) t3,
-                p = in(reg) dst.add(U32_PER_BLOCK + window),
-                off = const ((WORD & !3) % 128) * 4,
-                options(nostack, preserves_flags),
-            );
-            // Blocks 2 and 3: high(t0), high(t2) and high(t1), high(t3).
-            let r2 = vzip2q_u64(vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2));
-            let r3 = vzip2q_u64(vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3));
-            vst1q_u32(dst.add(2 * U32_PER_BLOCK + start), vreinterpretq_u32_u64(r2));
-            vst1q_u32(dst.add(3 * U32_PER_BLOCK + start), vreinterpretq_u32_u64(r3));
-        }
-    }
-
     /// Paired a/b bit-stream writer: the [`W32::push`] contract applied to
     /// both streams at once (their field boundaries are identical).
     struct W32Pair {
@@ -3255,8 +3089,6 @@ pub(crate) mod witgen_simd {
         even_b: V4,
         direct: bool,
         primed_boundaries: bool,
-        // Primed direct groups as paired rows ([`store_group_rows`]).
-        wide: bool,
         da: *mut u32,
         db: *mut u32,
         qa: [V4; 3],
@@ -3271,11 +3103,6 @@ pub(crate) mod witgen_simd {
                     if WORD % 4 < 3 {
                         self.qa[WORD % 4] = va;
                         if WORD < 472 { self.qb[WORD % 4] = vb; }
-                    } else if self.wide {
-                        store_group_rows::<WORD>(self.da, self.qa[0], self.qa[1], self.qa[2], va);
-                        if WORD < 472 {
-                            store_group_rows::<WORD>(self.db, self.qb[0], self.qb[1], self.qb[2], vb);
-                        }
                     } else {
                         let aa = uint32x4x4_t(self.qa[0], self.qa[1], self.qa[2], va);
                         let start = WORD & !3;
@@ -3513,72 +3340,10 @@ pub(crate) mod witgen_simd {
             } else {
                 nt1
             };
-            // A null `dst`: the scratch only (the rows stay unpublished; see
-            // `DeferredAb::fill_quad_to`).
-            if !dst.is_null() {
-                copy_out_imm(scratch, dst, nt0, end);
-            }
-        }
-    }
-
-    /// Every dump chunk index, ascending, as a literal.
-    macro_rules! for_each_dump_chunk {
-        ($m:ident) => {
-            $m!(0); $m!(1); $m!(2); $m!(3); $m!(4); $m!(5); $m!(6); $m!(7);
-            $m!(8); $m!(9); $m!(10); $m!(11); $m!(12); $m!(13); $m!(14); $m!(15);
-            $m!(16); $m!(17); $m!(18); $m!(19); $m!(20); $m!(21); $m!(22); $m!(23);
-            $m!(24); $m!(25); $m!(26); $m!(27); $m!(28); $m!(29); $m!(30); $m!(31);
-            $m!(32); $m!(33); $m!(34); $m!(35); $m!(36); $m!(37); $m!(38); $m!(39);
-            $m!(40); $m!(41); $m!(42); $m!(43); $m!(44); $m!(45); $m!(46); $m!(47);
-            $m!(48); $m!(49); $m!(50); $m!(51); $m!(52); $m!(53); $m!(54); $m!(55);
-            $m!(56); $m!(57); $m!(58); $m!(59); $m!(60); $m!(61); $m!(62); $m!(63);
-        };
-    }
-
-    /// The non-temporal copy-out of [`dump_dual_copy`]: chunks `g0..g1` of
-    /// each of the four blocks, block by block, ascending, one `ldp` /
-    /// `stnp` pair per chunk.  Both sides of a block are addressed from one
-    /// base 1 KiB into the block, so every chunk offset `32 g - 1024`
-    /// (`-1024..=992`) is an immediate of the pair: no per-chunk address
-    /// arithmetic and no loop control (`g0`, `g1` are constants at every
-    /// call site).
-    #[inline(always)]
-    pub(super) unsafe fn copy_out_imm(scratch: *const u32, dst: *mut u32, g0: usize, g1: usize) {
-        debug_assert!(g0 <= g1 && g1 <= DUMP_CHUNKS);
-        unsafe {
-            for j in 0..4usize {
-                let src = scratch.add(j * U32_PER_BLOCK + 256);
-                let out = dst.add(j * U32_PER_BLOCK + 256);
-                macro_rules! chunk {
-                    ($g:literal) => {
-                        if g0 <= $g && $g < g1 {
-                            core::arch::asm!(
-                                "ldp {a:q}, {b:q}, [{s}, #{o}]",
-                                "stnp {a:q}, {b:q}, [{d}, #{o}]",
-                                s = in(reg) src,
-                                d = in(reg) out,
-                                o = const 32 * $g - 1024,
-                                a = out(vreg) _,
-                                b = out(vreg) _,
-                                options(nostack)
-                            );
-                        }
-                    };
-                }
-                for_each_dump_chunk!(chunk);
-            }
-        }
-    }
-
-    /// The copy-out loop [`copy_out_imm`] replaced (one address pair per
-    /// chunk), kept as the test reference.
-    #[cfg(test)]
-    pub(super) unsafe fn copy_out_loop(scratch: *const u32, dst: *mut u32, g0: usize, g1: usize) {
-        unsafe {
             for j in 0..4usize {
                 let src = scratch.add(j * U32_PER_BLOCK);
                 let out = dst.add(j * U32_PER_BLOCK);
-                for g in g0..g1 {
+                for g in nt0..end {
                     core::arch::asm!(
                         "ldp {a:q}, {b:q}, [{s}]",
                         "stnp {a:q}, {b:q}, [{d}]",
@@ -3624,9 +3389,9 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false>(inputs, z, a, b, sa, sb)
             } else {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false>(inputs, z, a, b, sa, sb)
             }
         }
     }
@@ -3640,16 +3405,6 @@ pub(crate) mod witgen_simd {
     fn ab_rebuild_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_AB_REBUILD").is_none())
-    }
-
-    /// Kill switch for the paired-row form of the primed memory form's
-    /// direct scratch stores ([`store_group_rows`]): any value of
-    /// `FLOCK_NO_WITGEN_WIDE_STORES` keeps the four single-lane `ST4`
-    /// stores per word group. Read once per process. Same scratch, a and b
-    /// bytes either way.
-    fn wide_stores_enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_WIDE_STORES").is_none())
     }
 
     /// The copy-drain a/b form of [`build_quad_split_neon`]
@@ -3674,17 +3429,8 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            if PRIMED && ab_rebuild_enabled() && wide_stores_enabled() {
-                build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, true>(
-                    inputs,
-                    core::ptr::null_mut(),
-                    a,
-                    b,
-                    sa,
-                    sb,
-                )
-            } else if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false, false>(
+            if ab_rebuild_enabled() {
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3693,7 +3439,7 @@ pub(crate) mod witgen_simd {
                     sb,
                 )
             } else {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false, false>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3703,30 +3449,6 @@ pub(crate) mod witgen_simd {
                 )
             }
         }
-    }
-
-    /// Test-only: the primed memory form with the given direct-group stores
-    /// (`WIDE`: paired rows; otherwise the four single-lane `ST4` stores),
-    /// whatever `FLOCK_NO_WITGEN_WIDE_STORES` says.
-    #[cfg(test)]
-    pub(crate) unsafe fn build_quad_split_neon_mem_primed_stores<const WIDE: bool>(
-        inputs: QuadInput<'_>,
-        a: *mut u32,
-        b: *mut u32,
-        sa: *mut u32,
-        sb: *mut u32,
-    ) {
-        unsafe {
-            build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, WIDE>(
-                inputs, core::ptr::null_mut(), a, b, sa, sb,
-            )
-        }
-    }
-
-    /// Test-only: [`store_group_rows`] for one group.
-    #[cfg(test)]
-    pub(crate) unsafe fn store_group_rows_for_test<const WORD: usize>(dst: *mut u32, w: [V4; 4]) {
-        unsafe { store_group_rows::<WORD>(dst, w[0], w[1], w[2], w[3]) }
     }
 
     /// Test-only ship3 paired-stage incumbent; only direct scratch emission differs.
@@ -3739,36 +3461,12 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false, false, false>(
+            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false>(
                 inputs, core::ptr::null_mut(), a, b, sa, sb,
             )
         }
     }
 
-
-    /// The z rows of one quad (compressions `4q..4q + 4`) written to `zs` with
-    /// plain stores, for a caller that folds them straight out of that
-    /// scratch (the opening's z rebuild, `flock_core::pcs::ENV_NO_OPEN_Z_REBUILD`).
-    /// The same builder, inputs and z stage as the ranked z-only form
-    /// (`build_quad_split_neon::<true, ..>`); only the drain differs: u32
-    /// words `0..488` of each 512-word row (`4 * U32_PER_BLOCK` words in all,
-    /// rows back to back) get exactly the bytes that form publishes — words
-    /// `482..488` zero — and words `488..512` of each row are not written.
-    ///
-    /// # Safety
-    /// `zs` is valid for `4 * U32_PER_BLOCK` u32 writes.
-    pub(crate) unsafe fn build_quad_z_rows_plain(inputs: QuadInput<'_>, zs: *mut u32) {
-        unsafe {
-            build_quad_split_neon_impl::<true, false, false, false, false, false, false, false, true, false>(
-                inputs,
-                zs,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            )
-        }
-    }
 
     /// One 16-byte load at a constant byte offset that the optimizer cannot
     /// merge with other loads of the same word (a merged load would be held
@@ -3801,8 +3499,6 @@ pub(crate) mod witgen_simd {
         const ELIDE_B_STAGE_TAIL: bool,
         const PAIR_STAGE_STORES: bool,
         const DIRECT_SCRATCH: bool,
-        const ZPLAIN: bool,
-        const WIDE_STORES: bool,
     >(
         inputs: QuadInput<'_>,
         z: *mut u32,
@@ -3812,8 +3508,6 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         const {
-            assert!(!ZPLAIN || WZ);
-            assert!(!WIDE_STORES || (DIRECT_SCRATCH && PRIMED));
             assert!(!MEM || (!WZ && SCRATCH && COPY));
             assert!(!DIRECT_SCRATCH || (!WZ && SCRATCH && COPY));
             assert!(!(WZ && SCRATCH));
@@ -4027,7 +3721,6 @@ pub(crate) mod witgen_simd {
                 even_b: zero,
                 direct: DIRECT_SCRATCH,
                 primed_boundaries: DIRECT_SCRATCH && PRIMED,
-                wide: WIDE_STORES,
                 da: sa,
                 db: sb,
                 qa: [zero; 3],
@@ -4165,15 +3858,7 @@ pub(crate) mod witgen_simd {
             }
 
             // ---- drain ----
-            if WZ && ZPLAIN {
-                // Scratch rows: words 484..488 are the zeros the sparse tail
-                // publisher supplies (482/483 were zeroed above); chunks
-                // 0..61 then drain with plain stores.
-                for w in RANKED_SPARSE_TAIL_WORD + 4..8 * ELIDE_ZERO_CHUNK {
-                    vst1q_u32(za.add(w) as *mut u32, zero);
-                }
-                dump_range::<false>(za, z, 0, ELIDE_ZERO_CHUNK);
-            } else if WZ {
+            if WZ {
                 dump_range_lines_nt(za, z, 0, RANKED_SPARSE_TAIL_CHUNK);
                 dump_ranked_sparse_tail_nt(za, z);
             } else if SCRATCH && COPY {
@@ -4791,15 +4476,7 @@ pub(crate) mod witgen_simd {
         // The a/b tokens staged above describe the buffers once the handle
         // has produced every quad, which the prover guarantees before it
         // gives them back.
-        //
-        // Without deferral (e.g. the warm-up prove that calibrates the R2-CS
-        // share) the rows are complete here; a rebuild-only handle over the
-        // same inputs lets round two rebuild the chunks a deferred prove's
-        // round two rebuilds, so that walk is the one the calibration prices
-        // (round-two A/B rebuild,
-        // `flock_core::zerocheck::univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`).
-        let rebuild_only = !defer_ab && allow_defer_ab && n_blocks == n_total && ab_copy_drain_enabled();
-        let deferred = (defer_ab || rebuild_only).then(|| super::DeferredAb {
+        let deferred = defer_ab.then(|| super::DeferredAb {
             blocks,
             spec_init,
             gen_ilp,
@@ -4810,7 +4487,6 @@ pub(crate) mod witgen_simd {
             copy_drain: ab_copy_drain_enabled(),
             input_mem: ab_input_mem_enabled(),
             seed_in_place,
-            rebuild_only,
         });
         (z, a, b, z_lincheck, stream, deferred)
     }
@@ -5423,44 +5099,6 @@ impl Blake3Setup {
         blocks: &[Compression],
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
-        // The first prove opens the recycler's size classes (see
-        // `recycle_alloc::ENV_NO_RECYCLE_SETUP_GATE`).
-        #[cfg(all(target_os = "macos", not(test)))]
-        crate::recycle_alloc::open_classes();
-        // Build-time only: the Fiat-Shamir challenger goes through one
-        // non-generic instance compiled here, so a downstream caller (the
-        // benchmark worker) does not re-instantiate the generic prover tree
-        // for `FsChallenger` (the seed pipe already instantiates it in this
-        // crate). `Ch::IS_FS` is a constant after monomorphization, so the
-        // other arm is never collected for `FsChallenger`. Same code, same
-        // bytes; see `Challenger::IS_FS`.
-        if Ch::IS_FS {
-            match challenger.as_fs_challenger() {
-                Some(fs) => self.prove_fast_fs(blocks, fs),
-                None => unreachable!("Challenger::IS_FS without as_fs_challenger"),
-            }
-        } else {
-            self.prove_fast_generic(blocks, challenger)
-        }
-    }
-
-    /// [`Self::prove_fast`] for the Fiat-Shamir challenger: the single
-    /// instance every crate links to.
-    #[inline(never)]
-    pub fn prove_fast_fs(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut flock_core::challenger::FsChallenger,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
-        self.prove_fast_generic(blocks, challenger)
-    }
-
-    /// Body of [`Self::prove_fast`] (see its docs above).
-    fn prove_fast_generic<Ch: Challenger>(
-        &self,
-        blocks: &[Compression],
-        challenger: &mut Ch,
-    ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         use std::sync::atomic::Ordering;
         let call = PROVE_FAST_CALLS.fetch_add(1, Ordering::Relaxed);
         // Seed pipelining: on the timed call the proof for these blocks may
@@ -5486,13 +5124,6 @@ impl Blake3Setup {
         // the first ranked commit (untimed), bridging the warmup CPU tail
         // and the ready->seed gap.
         flock_core::gpu_commit::gpu_keepwarm_prove_started();
-        // Untimed warm-up: start building the round-one AB completion GPU
-        // arm (a Metal source compile) on a background thread now, so it
-        // overlaps witness generation and the commit instead of stalling the
-        // warm-up's round one.
-        if call == 0 {
-            flock_core::zerocheck::univariate_skip_optimized::ab_completion_gpu_prewarm();
-        }
         // Call zero is the untimed warmup but materializes an eager lincheck
         // stripe before the timed proof establishes streaming. Issue the
         // exact-contention ticket here, before witness generation, so only
@@ -5527,29 +5158,11 @@ impl Blake3Setup {
                     blocks,
                 );
             }
-            // Untimed: give the streamed first pass its first production
-            // execution here instead of in the timed prove (see
-            // `gpu_commit::ENV_NO_STREAM_WARM`). Ranked worker only.
-            if crate::seed_pipe::is_ranked_worker() {
-                flock_core::gpu_commit::warm_streamed_first_pass(&self.pcs_params);
-                // Untimed: the two GPU objects the timed prove still made on
-                // first use (see `gpu_commit::ENV_NO_WARM_GPU_SPARES`).
-                flock_core::gpu_commit::warm_gpu_spares();
-            }
             // Last thing the untimed warm-up does: hand stdin to the seed-pipe
             // thread. The worker publishes its ready file immediately after we
             // return and only then touches `io::stdin()`, so the splice lands
             // outside every measured interval and before the wrapper's
             // `BufReader` binds a descriptor.
-            // `arm` holds the ready report until the seed-pipe thread has
-            // pre-opened the publication target (about a millisecond of file
-            // work). Light the keep-alive before that wait instead of after
-            // it, so the P cluster is never idle between the warm-up tail and
-            // the seed. The start below is then a no-op.
-            // `FLOCK_NO_PARK_KEEPALIVE=1` restores the incumbent order.
-            if crate::seed_pipe::is_ranked_worker() && crate::seed_pipe::park_keepalive_enabled() {
-                flock_core::cpu_keepalive::keepalive_start();
-            }
             self.arm_seed_pipe();
             // Last thing before the worker publishes "ready" and every thread
             // parks for the seed: light up a P-core keep-alive so the cluster
@@ -5656,43 +5269,20 @@ impl Blake3Setup {
                     &self.pcs_params,
                 );
                 flock_core::tmark::mark("witgen end");
-                // A rebuild-only handle (complete rows; round-two A/B
-                // rebuild) is not a deferral.
-                let (deferred_ab, r2_rebuild_only) = match deferred_ab {
-                    Some(handle) if handle.rebuild_only => (None, Some(handle)),
-                    handle => (handle, None),
-                };
                 // Deferred A/B rows are produced inside the round-one AB
                 // precompute of the deferred-stripe route below; every other
                 // route gets complete buffers first.
-                let ab_bytes = a_packed_f128.len() * std::mem::size_of::<F128>();
-                // Round-two A/B rebuild
-                // (`flock_core::zerocheck::univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`):
-                // on the fused deferred-stripe route the AB arm publishes the
-                // quads below `r2_published_quads` only, and round two
-                // rebuilds the rest from this producer. Every quad otherwise.
-                let r2_published_quads = match &deferred_ab {
-                    Some(deferred)
-                        if gpu_first_pass.is_some()
-                            && z_packed_lincheck.is_none()
-                            && deferred.unpublished_fill_supported()
-                            && flock_core::zerocheck::univariate_skip_optimized::zc_ab_producer_fused_active() =>
-                    {
-                        flock_core::zerocheck::univariate_skip_optimized::round2_ab_rebuild_published_bytes(ab_bytes)
-                            .map_or(deferred.n_quads(), |bytes| (bytes / DeferredAb::UNIT_BYTES).min(deferred.n_quads()))
-                    }
-                    Some(deferred) => deferred.n_quads(),
-                    None => 0,
-                };
                 let ab_produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool| {
                     if let Some(deferred) = &deferred_ab {
-                        // A null scratch always publishes (see `fill_quad_to`).
-                        deferred.fill_quad_to(unit, a_scratch, b_scratch, primed, unit < r2_published_quads);
+                        deferred.fill_quad(unit, a_scratch, b_scratch, primed);
                     }
                 };
                 let ab_producer = match &deferred_ab {
                     Some(deferred) if gpu_first_pass.is_some() && z_packed_lincheck.is_none() => {
-                        debug_assert_eq!(deferred.n_quads() * DeferredAb::UNIT_BYTES, ab_bytes);
+                        debug_assert_eq!(
+                            deferred.n_quads() * DeferredAb::UNIT_BYTES,
+                            a_packed_f128.len() * std::mem::size_of::<F128>()
+                        );
                         Some(flock_core::zerocheck::univariate_skip_optimized::Round1AbProducer {
                             unit_bytes: DeferredAb::UNIT_BYTES,
                             produce: &ab_produce,
@@ -5704,107 +5294,16 @@ impl Blake3Setup {
                     }
                     None => None,
                 };
-                // Complete rows: round two rebuilds the same chunks from the
-                // rebuild-only handle (scratch only; a null scratch would
-                // rewrite identical rows).
-                let r2_rebuild_only_produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool| {
-                    if let Some(handle) = &r2_rebuild_only {
-                        handle.fill_quad_to(unit, a_scratch, b_scratch, primed, false);
-                    }
-                };
-                // Round two takes this registration (matched by the buffers'
-                // addresses); it is withdrawn when the prove returns.
-                let _r2_ab_rebuild = match (&ab_producer, &deferred_ab, &r2_rebuild_only) {
-                    (Some(producer), Some(deferred), _) if r2_published_quads < deferred.n_quads() => {
-                        let published = r2_published_quads * DeferredAb::UNIT_BYTES;
-                        // SAFETY: both buffers live until the prove below
-                        // returns, before this scope drops, and only the
-                        // producer writes them; `ab_produce` leaves the
-                        // quads past the prefix unpublished exactly when it
-                        // is handed a scratch pair, and the AB arm publishes
-                        // the prefix before round two (the fused precompute
-                        // calls the producer once per unit).
-                        Some(unsafe {
-                            flock_core::zerocheck::univariate_skip_optimized::round2_ab_rebuild_scope(
-                                a_packed_f128.as_ptr().cast::<u8>(),
-                                b_packed_f128.as_ptr().cast::<u8>(),
-                                ab_bytes,
-                                published,
-                                flock_core::zerocheck::univariate_skip_optimized::round2_ab_rebuild_cpu_from(published),
-                                *producer,
-                            )
-                        })
-                    }
-                    (None, None, Some(_)) => {
-                        flock_core::zerocheck::univariate_skip_optimized::round2_ab_rebuild_complete_from_bytes(ab_bytes)
-                            .map(|from| {
-                                // SAFETY: as above; every row is in the
-                                // buffers already, and the handle writes only
-                                // round two's scratch (identical rows with a
-                                // null scratch).
-                                unsafe {
-                                    flock_core::zerocheck::univariate_skip_optimized::round2_ab_rebuild_scope(
-                                        a_packed_f128.as_ptr().cast::<u8>(),
-                                        b_packed_f128.as_ptr().cast::<u8>(),
-                                        ab_bytes,
-                                        ab_bytes,
-                                        from,
-                                        flock_core::zerocheck::univariate_skip_optimized::Round1AbProducer {
-                                            unit_bytes: DeferredAb::UNIT_BYTES,
-                                            produce: &r2_rebuild_only_produce,
-                                        },
-                                    )
-                                }
-                            })
-                    }
-                    _ => None,
-                };
-                // Opening z rebuild (`flock_core::pcs::ENV_NO_OPEN_Z_REBUILD`):
-                // the round-5 materialize rebuilds the z rows of the blocks
-                // its CPU workers fold from the same inputs (either handle),
-                // instead of reading them back from the z buffer.
-                let z_handle = deferred_ab.as_ref().or(r2_rebuild_only.as_ref());
-                let open_z_produce = |q: usize, zs: *mut u32| {
-                    if let Some(handle) = z_handle {
-                        // SAFETY: the materialize hands a scratch of four
-                        // complete rows (the registration's contract).
-                        unsafe { handle.fill_z_quad(q, zs) };
-                    }
-                };
-                let _open_z_rebuild = match z_handle {
-                    Some(handle) if flock_core::pcs::open_z_rebuild_enabled() && z_packed.len() == handle.n_quads() * 4 * (K / 128) => {
-                        // SAFETY: the z buffer keeps its allocation (the
-                        // prover moves the Vec, never its contents) and no
-                        // one writes it until the prove below returns, before
-                        // this scope drops; the producer reproduces the
-                        // driver's z rows (`DeferredAb::fill_z_quad`).
-                        Some(unsafe {
-                            flock_core::pcs::open_z_rebuild_scope(
-                                z_packed.as_ptr(),
-                                z_packed.len(),
-                                handle.n_quads(),
-                                &open_z_produce,
-                            )
-                        })
-                    }
-                    _ => None,
-                };
                 if phase_timing {
                     eprintln!(
-                        "[phase-timing] deferred a/b: handle={} producer={} r2_published_quads={}/{} r2_rebuild_only={} r2_registered={}",
+                        "[phase-timing] deferred a/b: handle={} producer={}",
                         deferred_ab.is_some(),
-                        ab_producer.is_some(),
-                        r2_published_quads,
-                        deferred_ab.as_ref().map_or(0, |d| d.n_quads()),
-                        r2_rebuild_only.is_some(),
-                        _r2_ab_rebuild.is_some(),
+                        ab_producer.is_some()
                     );
                 }
-                // Witness work is all handed out. The hot pool spin (ready→seed
-                // gap + witness phase) used to end here; its workers now stay
-                // on-core, yielding, until the proof is done
-                // (`FLOCK_NO_HOT_PROVE=1` releases them here as before).
-                flock_core::cpu_keepalive::pool_spin_witness_done();
+                // Witness work is all handed out; the hot pool spin (ready→seed
+                // gap + witness phase) ends here.
+                flock_core::cpu_keepalive::pool_spin_release();
                 let identity_prefix_witness = Some(
                     Blake3IdentityPrefixWitness::from_row_major_generator(
                         &z_packed, &a_packed_f128, &b_packed_f128,
@@ -7285,187 +6784,6 @@ mod tests {
         check_split_quad_memory_form(false);
     }
 
-    /// Paired-row group stores write exactly the bytes of the four
-    /// single-lane `ST4` stores and nothing else, for every group of the
-    /// primed direct range (starts 36..476: all four 128-word windows and
-    /// their edges); zero, one and all-ones lanes included.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn store_group_rows_matches_lane_stores() {
-        use super::witgen_simd;
-        use core::arch::aarch64::*;
-        const BLK: usize = K / 32;
-        const GUARD: usize = 16;
-        const W: usize = 4 * BLK + 2 * GUARD;
-        let mut rng = Rng::new(0x5eed_57_0001);
-        let mut checked = 0usize;
-        macro_rules! check {
-            ($($word:literal),*) => {$({
-                for round in 0..4usize {
-                    let lanes: [[u32; 4]; 4] = std::array::from_fn(|i| {
-                        std::array::from_fn(|l| match (i + l + round) % 7 {
-                            0 => 0,
-                            1 => 1,
-                            2 => u32::MAX,
-                            _ => rng.next_u32(),
-                        })
-                    });
-                    let fill = rng.next_u32();
-                    let mut want = vec![fill; W];
-                    let mut got = vec![fill; W];
-                    let start = $word & !3;
-                    unsafe {
-                        let w: [uint32x4_t; 4] = std::array::from_fn(|i| vld1q_u32(lanes[i].as_ptr()));
-                        let x = uint32x4x4_t(w[0], w[1], w[2], w[3]);
-                        let d = want.as_mut_ptr().add(GUARD);
-                        vst4q_lane_u32::<0>(d.add(start), x);
-                        vst4q_lane_u32::<1>(d.add(BLK + start), x);
-                        vst4q_lane_u32::<2>(d.add(2 * BLK + start), x);
-                        vst4q_lane_u32::<3>(d.add(3 * BLK + start), x);
-                        witgen_simd::store_group_rows_for_test::<$word>(got.as_mut_ptr().add(GUARD), w);
-                    }
-                    assert_eq!(got, want, "word {}", $word);
-                    for j in 0..4 {
-                        for i in 0..4 {
-                            assert_eq!(got[GUARD + j * BLK + start + i], lanes[i][j]);
-                        }
-                    }
-                    checked += 1;
-                }
-            })*};
-        }
-        check!(
-            39, 43, 47, 51, 55, 59, 63, 67, 71, 75, 79, 83, 87, 91,
-            95, 99, 103, 107, 111, 115, 119, 123, 127, 131, 135, 139, 143, 147,
-            151, 155, 159, 163, 167, 171, 175, 179, 183, 187, 191, 195, 199, 203,
-            207, 211, 215, 219, 223, 227, 231, 235, 239, 243, 247, 251, 255, 259,
-            263, 267, 271, 275, 279, 283, 287, 291, 295, 299, 303, 307, 311, 315,
-            319, 323, 327, 331, 335, 339, 343, 347, 351, 355, 359, 363, 367, 371,
-            375, 379, 383, 387, 391, 395, 399, 403, 407, 411, 415, 419, 423, 427,
-            431, 435, 439, 443, 447, 451, 455, 459, 463, 467, 471, 475, 479
-        );
-        assert_eq!(checked, 111 * 4);
-    }
-
-    /// The primed memory form writes the same a, b and scratch words with
-    /// paired-row group stores as with single-lane `ST4` stores: each slot
-    /// gets one cold fill, then two different primed quads; seeded and
-    /// block inputs, guard words included.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn split_quad_mem_wide_group_stores_match_lane_stores() {
-        use super::witgen_simd::{self, QuadInput};
-        const GUARD: usize = 16;
-        const PAYLOAD: usize = 4 * (K / 32);
-        const U32S: usize = PAYLOAD + 2 * GUARD;
-        let mut rng = Rng::new(0x5eed_57_0002);
-        let mut checked = 0usize;
-        for case in 0..24usize {
-            let init = u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32());
-            let seeded: [_; 3] = std::array::from_fn(|phase| {
-                crate::seed_pipe::gen_quad_soa(init, 4 * ((case * 977 + phase) % 65_536))
-            });
-            let mut blocks: [[Compression; 4]; 3] = std::array::from_fn(|_| {
-                std::array::from_fn(|_| {
-                    (
-                        std::array::from_fn(|_| rng.next_u32()),
-                        std::array::from_fn(|_| rng.next_u32()),
-                        u64::from(rng.next_u32()) << 32 | u64::from(rng.next_u32()),
-                        rng.next_u32(),
-                        rng.next_u32(),
-                    )
-                })
-            });
-            match case % 4 {
-                1 => blocks[1][0] = ([u32::MAX; 8], [u32::MAX; 16], u64::MAX, u32::MAX, u32::MAX),
-                2 => blocks[2][1] = ([0; 8], [0; 16], 0, 0, 0),
-                3 => blocks[1][2] = ([0x8000_0000; 8], [0x7fff_ffff; 16], 1 << 63, 1 << 31, 1 << 31),
-                _ => {}
-            }
-            let stale: Vec<u32> = (0..U32S).map(|_| rng.next_u32()).collect();
-            for seeded_path in [true, false] {
-                let input = |phase: usize| {
-                    if seeded_path {
-                        QuadInput::Seeded(&seeded[phase])
-                    } else {
-                        QuadInput::Blocks(std::array::from_fn(|j| &blocks[phase][j]))
-                    }
-                };
-                let run = |wide: bool| {
-                    let (mut a, mut b) = (stale.clone(), stale.clone());
-                    let (mut sa, mut sb) = (stale.clone(), stale.clone());
-                    let mut results = Vec::new();
-                    for phase in 0..3 {
-                        unsafe {
-                            let (pa, pb) = (a.as_mut_ptr().add(GUARD), b.as_mut_ptr().add(GUARD));
-                            let (psa, psb) = (sa.as_mut_ptr().add(GUARD), sb.as_mut_ptr().add(GUARD));
-                            match (phase, wide) {
-                                (0, _) => witgen_simd::build_quad_split_neon_mem::<false>(
-                                    input(0), pa, pb, psa, psb,
-                                ),
-                                (_, true) => witgen_simd::build_quad_split_neon_mem_primed_stores::<true>(
-                                    input(phase), pa, pb, psa, psb,
-                                ),
-                                (_, false) => witgen_simd::build_quad_split_neon_mem_primed_stores::<false>(
-                                    input(phase), pa, pb, psa, psb,
-                                ),
-                            }
-                        }
-                        results.push((a.clone(), b.clone(), sa.clone(), sb.clone()));
-                    }
-                    results
-                };
-                let lanes = run(false);
-                let wide = run(true);
-                assert_ne!(lanes[1].2, lanes[2].2, "successive primed quads must differ");
-                assert_eq!(wide, lanes, "case={case} seeded={seeded_path}");
-                checked += 1;
-            }
-        }
-        assert_eq!(checked, 24 * 2);
-    }
-
-    /// The immediate-offset copy-out writes exactly the words the per-chunk
-    /// addressed loop wrote, for the a and b ranges of the copy drain and
-    /// edge ranges, and nothing else; zero, one and all-ones words included.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn copy_out_imm_matches_addressed_loop() {
-        const BLK: usize = K / 32;
-        const GUARD: usize = 16;
-        const W: usize = 4 * BLK + 2 * GUARD;
-        let mut rng = Rng::new(0x5eed_c0f7_0002);
-        let ranges = [(0, 61), (4, 59), (0, 64), (0, 0), (5, 6), (31, 33), (63, 64), (0, 32)];
-        for (round, &(g0, g1)) in ranges.iter().enumerate() {
-            let scratch: Vec<u32> = (0..4 * BLK)
-                .map(|i| match (i + round) % 9 {
-                    0 => 0,
-                    1 => 1,
-                    2 => u32::MAX,
-                    _ => rng.next_u32(),
-                })
-                .collect();
-            let fill = rng.next_u32();
-            let mut want = vec![fill; W];
-            let mut got = vec![fill; W];
-            unsafe {
-                witgen_simd::copy_out_loop(scratch.as_ptr(), want.as_mut_ptr().add(GUARD), g0, g1);
-                witgen_simd::copy_out_imm(scratch.as_ptr(), got.as_mut_ptr().add(GUARD), g0, g1);
-            }
-            assert_eq!(got, want, "chunks {g0}..{g1}");
-            for j in 0..4 {
-                for w in 0..BLK {
-                    let x = got[GUARD + j * BLK + w];
-                    if (8 * g0..8 * g1).contains(&w) {
-                        assert_eq!(x, scratch[j * BLK + w]);
-                    } else {
-                        assert_eq!(x, fill);
-                    }
-                }
-            }
-        }
-    }
-
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn b_stage_tail_matches_incumbent_and_preserves_guards() {
@@ -7573,7 +6891,6 @@ mod tests {
                 copy_drain: true,
                 input_mem,
                 seed_in_place: true,
-                rebuild_only: false,
             };
             for q in 0..n_quads {
                 let sa = scratch.as_mut_ptr().cast::<u8>();
@@ -7618,7 +6935,6 @@ mod tests {
                 copy_drain: true,
                 input_mem,
                 seed_in_place: in_place,
-                rebuild_only: false,
             };
             for q in 0..n_quads {
                 if scratch_mode == 0 {
@@ -7646,222 +6962,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// Round-two A/B rebuild (`FLOCK_NO_R2_AB_REBUILD`): the rows round two
-    /// rebuilds per 128-block chunk (32 quads into one contiguous scratch,
-    /// cold and primed) equal the record's global bytes of that chunk; an
-    /// unpublished fill leaves the buffers' rows untouched; a published fill
-    /// with a scratch writes the record's bytes. Buffers start with a
-    /// previous witness in place (its per-block constants are the ranked
-    /// arm's token-certified chunks), both kernel input forms, several inits.
-    /// Opening z rebuild (`flock_core::pcs::ENV_NO_OPEN_Z_REBUILD`): the z rows
-    /// a handle writes into a scratch (`DeferredAb::fill_z_quad`) are the
-    /// driver's z bytes in u32 words `0..488` of every row — against the
-    /// full z/a/b builder and the ranked z-only form — for every input
-    /// selection the handle can hold, and words `488..512` stay untouched.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn deferred_ab_fill_z_quad_matches_driver_z_rows() {
-        use super::witgen_simd::{self, QuadInput};
-        const ROW: usize = K / 32;
-        const U32S: usize = 4 * ROW;
-        const N_QUADS: usize = 6;
-        const LIVE: usize = 488;
-        for (case, init) in [0u64, 0x0123_4567_89ab_cdef, 0x9e37_79b9_7f4a_7c15].into_iter().enumerate() {
-            // Truth: the full builder's z rows (every chunk written).
-            let blocks: Vec<Compression> =
-                (0..4 * N_QUADS).map(|j| crate::seed_pipe::gen_block_with(init, j, true)).collect();
-            let mut truth = vec![0u32; N_QUADS * U32S];
-            let mut a = vec![0u32; N_QUADS * U32S];
-            let mut b = vec![0u32; N_QUADS * U32S];
-            for q in 0..N_QUADS {
-                let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * q);
-                unsafe {
-                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
-                        QuadInput::Seeded(&seeded),
-                        truth.as_mut_ptr().add(q * U32S),
-                        a.as_mut_ptr().add(q * U32S),
-                        b.as_mut_ptr().add(q * U32S),
-                        false,
-                        false,
-                        [false; 3],
-                        false,
-                    );
-                }
-            }
-            // The ranked z-only form (what the deferred driver publishes).
-            let mut z_only = vec![0x7777_7777u32; N_QUADS * U32S];
-            for q in 0..N_QUADS {
-                let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * q);
-                let none = core::ptr::null_mut::<u32>();
-                unsafe {
-                    witgen_simd::build_quad_split_neon::<true, false, false, false>(
-                        QuadInput::Seeded(&seeded),
-                        z_only.as_mut_ptr().add(q * U32S),
-                        none,
-                        none,
-                        none,
-                        none,
-                    );
-                }
-            }
-            for q in 0..N_QUADS {
-                for r in 0..4 {
-                    let at = q * U32S + r * ROW;
-                    assert_eq!(&z_only[at..at + LIVE], &truth[at..at + LIVE], "z-only form row (case {case} q {q} r {r})");
-                }
-            }
-            // Every input selection of the handle.
-            for (spec_init, gen_ilp, seed_in_place) in
-                [(Some(init), true, true), (Some(init), true, false), (Some(init), false, false), (None, true, true)]
-            {
-                let (mut ha, mut hb) = (a.clone(), b.clone());
-                let handle = super::DeferredAb {
-                    blocks: &blocks,
-                    spec_init,
-                    gen_ilp,
-                    a: ha.as_mut_ptr(),
-                    b: hb.as_mut_ptr(),
-                    n_quads: N_QUADS,
-                    primed_scratch: true,
-                    copy_drain: true,
-                    input_mem: true,
-                    seed_in_place,
-                    rebuild_only: false,
-                };
-                for q in 0..N_QUADS {
-                    let mut zs = vec![0xA5A5_A5A5u32; U32S];
-                    unsafe { handle.fill_z_quad(q, zs.as_mut_ptr()) };
-                    for r in 0..4 {
-                        let at = q * U32S + r * ROW;
-                        assert_eq!(
-                            &zs[r * ROW..r * ROW + LIVE],
-                            &truth[at..at + LIVE],
-                            "rebuilt z row (case {case} spec {spec_init:?} ilp {gen_ilp} in-place {seed_in_place} q {q} r {r})"
-                        );
-                        assert!(
-                            zs[r * ROW + LIVE..(r + 1) * ROW].iter().all(|&w| w == 0xA5A5_A5A5),
-                            "words past 488 are left alone"
-                        );
-                    }
-                }
-                assert!(ha == a && hb == b, "the z fill touches neither buffer");
-            }
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn deferred_ab_rebuilt_chunks_match_record_globals() {
-        use super::witgen_simd::{self, QuadInput};
-        const U32S: usize = 4 * (K / 32);
-        const QUADS_PER_CHUNK: usize = 32;
-        const CHUNKS: usize = 3;
-        const N_QUADS: usize = QUADS_PER_CHUNK * CHUNKS;
-        // Quads below this are published by the AB arm (one chunk).
-        const PUBLISHED: usize = QUADS_PER_CHUNK;
-        let blocks: Vec<Compression> = vec![([0; 8], [0; 16], 0, 0, 0); 4 * N_QUADS];
-        let full_rows = |init: u64| {
-            let mut z = vec![0u32; N_QUADS * U32S];
-            let mut a = vec![0u32; N_QUADS * U32S];
-            let mut b = vec![0u32; N_QUADS * U32S];
-            for q in 0..N_QUADS {
-                let seeded = crate::seed_pipe::gen_quad_soa(init, 4 * q);
-                unsafe {
-                    witgen_simd::build_quad_witness_ab_stream_neon_elide(
-                        QuadInput::Seeded(&seeded),
-                        z.as_mut_ptr().add(q * U32S),
-                        a.as_mut_ptr().add(q * U32S),
-                        b.as_mut_ptr().add(q * U32S),
-                        false,
-                        false,
-                        [false; 3],
-                        false,
-                    );
-                }
-            }
-            (a, b)
-        };
-        let handle = |a: &mut Vec<u32>, b: &mut Vec<u32>, init: u64, input_mem: bool| super::DeferredAb {
-            blocks: &blocks,
-            spec_init: Some(init),
-            gen_ilp: true,
-            a: a.as_mut_ptr(),
-            b: b.as_mut_ptr(),
-            n_quads: N_QUADS,
-            primed_scratch: true,
-            copy_drain: true,
-            input_mem,
-            seed_in_place: true,
-            rebuild_only: false,
-        };
-        let mut checked = 0usize;
-        for (case, init) in [0u64, 0x0123_4567_89ab_cdef, 0x9e37_79b9_7f4a_7c15].into_iter().enumerate() {
-            let (prev_a, prev_b) = full_rows(init ^ 0x5a5a_0000_0000_0001 ^ case as u64);
-            let (truth_a, truth_b) = full_rows(init);
-            assert_ne!(prev_a, truth_a, "the previous witness must differ");
-            for input_mem in [true, false] {
-                // Record: the AB arm publishes every quad (unit scratch, primed
-                // after the first fill).
-                let (mut rec_a, mut rec_b) = (prev_a.clone(), prev_b.clone());
-                {
-                    let h = handle(&mut rec_a, &mut rec_b, init, input_mem);
-                    let mut unit = vec![0x3333_3333u32; 2 * U32S];
-                    for q in 0..N_QUADS {
-                        let (sa, sb) = unsafe { (unit.as_mut_ptr(), unit.as_mut_ptr().add(U32S)) };
-                        h.fill_quad(q, sa.cast(), sb.cast(), q > 0);
-                    }
-                }
-                assert!(rec_a == truth_a && rec_b == truth_b, "record globals (case {case} mem {input_mem})");
-
-                // Rebuild: the AB arm publishes the first chunk only.
-                let (mut new_a, mut new_b) = (prev_a.clone(), prev_b.clone());
-                let h = handle(&mut new_a, &mut new_b, init, input_mem);
-                let mut unit = vec![0x3333_3333u32; 2 * U32S];
-                for q in 0..N_QUADS {
-                    let (sa, sb) = unsafe { (unit.as_mut_ptr(), unit.as_mut_ptr().add(U32S)) };
-                    h.fill_quad_to(q, sa.cast(), sb.cast(), q > 0, q < PUBLISHED);
-                    assert_eq!(&unit[..U32S], &truth_a[q * U32S..(q + 1) * U32S], "AB arm a scratch q={q}");
-                    assert_eq!(&unit[U32S..], &truth_b[q * U32S..(q + 1) * U32S], "AB arm b scratch q={q}");
-                }
-                // Round two's per-chunk rebuild: cold on the first chunk it
-                // rebuilds, primed on the next; and a cold rebuild of each.
-                let chunk_words = QUADS_PER_CHUNK * U32S;
-                for cold_each in [false, true] {
-                    let mut chunk = vec![0x4444_4444u32; 2 * chunk_words];
-                    for (n, c) in (PUBLISHED / QUADS_PER_CHUNK..CHUNKS).enumerate() {
-                        if cold_each {
-                            chunk.fill(0x4444_4444);
-                        }
-                        let primed = !cold_each && n > 0;
-                        for j in 0..QUADS_PER_CHUNK {
-                            let q = c * QUADS_PER_CHUNK + j;
-                            let (sa, sb) = unsafe {
-                                (chunk.as_mut_ptr().add(j * U32S), chunk.as_mut_ptr().add(chunk_words + j * U32S))
-                            };
-                            h.fill_quad_to(q, sa.cast(), sb.cast(), primed, false);
-                        }
-                        let rows = c * chunk_words..(c + 1) * chunk_words;
-                        assert!(
-                            chunk[..chunk_words] == rec_a[rows.clone()],
-                            "rebuilt a of chunk {c} (case {case} mem {input_mem} cold {cold_each})"
-                        );
-                        assert!(
-                            chunk[chunk_words..] == rec_b[rows],
-                            "rebuilt b of chunk {c} (case {case} mem {input_mem} cold {cold_each})"
-                        );
-                        checked += 1;
-                    }
-                }
-                drop(h);
-                let split = PUBLISHED * U32S;
-                assert!(new_a[..split] == rec_a[..split] && new_b[..split] == rec_b[..split], "published prefix");
-                assert!(new_a[split..] == prev_a[split..], "unpublished a rows were written");
-                assert!(new_b[split..] == prev_b[split..], "unpublished b rows were written");
-            }
-        }
-        assert_eq!(checked, 3 * 2 * 2 * (CHUNKS - PUBLISHED / QUADS_PER_CHUNK));
     }
 
     /// Paired timing probe (ignored): the a/b copy-drain kernel, register

@@ -182,31 +182,6 @@ fn r2_dead_pair_skip_enabled() -> bool {
     std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1")
 }
 
-/// Kill switch for the tail-compacted round-two compact state
-/// (`FLOCK_NO_ZC_TAIL_COMPACT`, any value): with the dead-pair skip, round two
-/// lays each 128-pair block out without slots for its dead pairs (anchors 244
-/// instead of 256 per block, deltas 1984 instead of 2048 bytes), so the K
-/// pass reads a gap-free stream (holes inside a stream are still mostly
-/// fetched by the prefetcher). Same values in the live slots, same K
-/// outputs and messages. Read once per process.
-pub(crate) fn zc_r2_tail_compact_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_TAIL_COMPACT").is_none())
-}
-
-/// Kill switch for the head-compacted round-two compact state
-/// (`FLOCK_NO_ZC_HEAD_COMPACT`, any value): with the tail-compacted layout,
-/// pairs 0..7 of every 128-pair block, whose b rows are all ones at the
-/// ranked shape, keep only their a anchors and a deltas (2 + 1 lines instead
-/// of 4 + 2): 48 MiB fewer round-two writes and K reads per ranked proof.
-/// A head pair whose b rows are not all ones makes round two rewrite the
-/// whole state in the tail-compacted layout. Same values, same messages.
-/// Read once per process.
-pub(crate) fn zc_r2_head_compact_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_HEAD_COMPACT").is_none())
-}
-
 /// Kill switch for adopting the round-two GPU arm's odd-parity products as the
 /// round-three lookahead's `W1`/`W2`: `FLOCK_NO_ZC_R2_ODD_OFFLOAD=1` makes the
 /// CPU recompute the odd pair on offloaded chunks, which is the incumbent
@@ -743,23 +718,14 @@ pub fn fold_at_z_naive(witness: &[bool], m: usize, k_skip: usize, weights: &[F12
 /// quantity sent on the wire is `Π(1) = eq(r[0], 1) · G(1) = r[0] · G(1)`,
 /// where `Π(X) = eq(r[0], X) · G(X)` is the actual round polynomial.
 pub fn round_pair_naive(a_mlv: &[F128], b_mlv: &[F128], r: &[F128]) -> (F128, F128) {
-    let log_n = a_mlv.len().trailing_zeros() as usize;
-    assert_eq!(r.len(), log_n);
-    round_pair_naive_with_eq(a_mlv, b_mlv, r[0], &build_eq(&r[1..]))
-}
-
-/// [`round_pair_naive`] with `eq_remaining = build_eq(&r[1..])` supplied
-/// (any table holding the same values) and `r_0 = r[0]`.
-pub fn round_pair_naive_with_eq(
-    a_mlv: &[F128],
-    b_mlv: &[F128],
-    r_0: F128,
-    eq_remaining: &[F128],
-) -> (F128, F128) {
     let n = a_mlv.len();
     assert_eq!(b_mlv.len(), n);
     assert!(n.is_power_of_two() && n >= 2);
     let half = n / 2;
+    let log_n = n.trailing_zeros() as usize;
+    assert_eq!(r.len(), log_n);
+
+    let eq_remaining = build_eq(&r[1..]);
     assert_eq!(eq_remaining.len(), half);
 
     // Reduction is F2-linear, so reduce each sum only after the loop.
@@ -775,48 +741,7 @@ pub fn round_pair_naive_with_eq(
         // Char-2: (a_1 − a_0)(b_1 − b_0) = (a_0 + a_1)(b_0 + b_1).
         g_inf ^= eq_x.mul_unreduced((a0 + a1) * (b0 + b1));
     }
-    (r_0 * g_one.reduce(), g_inf.reduce())
-}
-
-pub fn fold_in_place_and_round_pair_with_eq(
-    a: &mut Vec<F128>,
-    b: &mut Vec<F128>,
-    challenge: F128,
-    r_0: F128,
-    eq_remaining: &[F128],
-) -> (F128, F128) {
-    let n = a.len();
-    assert_eq!(b.len(), n);
-    assert!(n.is_power_of_two() && n >= 4);
-    let quarter = n / 4;
-    assert_eq!(eq_remaining.len(), quarter);
-
-    let mut g_one = F256Unreduced::ZERO;
-    let mut g_inf = F256Unreduced::ZERO;
-    for x_prime in 0..quarter {
-        let i = 4 * x_prime;
-        let a0 = a[i] + challenge * (a[i + 1] + a[i]);
-        let a1 = a[i + 2] + challenge * (a[i + 3] + a[i + 2]);
-        let b0 = b[i] + challenge * (b[i + 1] + b[i]);
-        let b1 = b[i + 2] + challenge * (b[i + 3] + b[i + 2]);
-        a[2 * x_prime] = a0;
-        a[2 * x_prime + 1] = a1;
-        b[2 * x_prime] = b0;
-        b[2 * x_prime + 1] = b1;
-        let eq_x = eq_remaining[x_prime];
-        g_one ^= eq_x.mul_unreduced(a1 * b1);
-        g_inf ^= eq_x.mul_unreduced((a0 + a1) * (b0 + b1));
-    }
-    a.truncate(2 * quarter);
-    b.truncate(2 * quarter);
-    (r_0 * g_one.reduce(), g_inf.reduce())
-}
-
-/// The equality table of a challenge suffix one shorter: `eq(r[1..])[x] =
-/// eq(r)[2x] + eq(r)[2x + 1]`, since `eq(r_0, 0) + eq(r_0, 1) = 1` exactly.
-/// One XOR per entry where a fresh table takes one product per entry.
-pub fn eq_drop_first(eq: &[F128]) -> Vec<F128> {
-    eq.chunks_exact(2).map(|p| p[0] + p[1]).collect()
+    (r[0] * g_one.reduce(), g_inf.reduce())
 }
 
 // ---------------------------------------------------------------------------
@@ -990,27 +915,6 @@ pub struct UniSkipCompactFold {
     /// ([`fold2_compact_and_round45_into`]) accepts such a state; it treats
     /// those pairs as the known zeros the dense state stores.
     pub dead_tail: bool,
-    /// With `dead_tail`: the state is in the tail-compacted layout, whose
-    /// 128-pair blocks have no slots for the dead pairs 122..127 (anchors,
-    /// `kernels::aarch64::TC_ANCHORS_PER_BLOCK` = 244 per block) and 124..127
-    /// (deltas, `TC_DELTA_BYTES_PER_BLOCK` = 1984 bytes per block), so the K
-    /// pass streams 92 instead of 96 lines per block. Only the one-table
-    /// fused K kernel reads it. See [`zc_r2_tail_compact_enabled`].
-    pub tail_compact: bool,
-    /// With `tail_compact`: the compacted blocks start this many blocks'
-    /// worth of shortfall (12 anchors and 64 delta bytes per block) into the
-    /// buffers, at least the block count of any producer or K chunk, so the
-    /// per-block rebase of a chunk walk (`chunk - shortfall * block`) never
-    /// points before the allocation. The buffers keep their dense length.
-    pub tail_base_blocks: usize,
-    /// With `tail_compact`: the state is head-compacted as well (pairs 0..7
-    /// of every block, whose b rows are all ones at the ranked shape, keep
-    /// only their a anchors and a deltas: 59 + 30 lines per block instead of
-    /// 61 + 31). Their b anchor is `head_b` (the fold of the all-ones row)
-    /// and their b delta zero. See [`zc_r2_head_compact_enabled`].
-    pub head_compact: bool,
-    /// The b anchor of every head pair of a head-compacted state.
-    pub head_b: F128,
 }
 
 impl UniSkipCompactFold {
@@ -1024,69 +928,9 @@ impl UniSkipCompactFold {
         self.anchors.is_empty()
     }
 
-    /// Index in `anchors` of pair `p`'s `[a, b]` anchor slots (a live pair
-    /// in the tail-compacted layout). In the head-compacted layout a head
-    /// pair (`p % 128 < 8`) has only its a slot here.
-    pub fn anchor_index(&self, p: usize) -> usize {
-        #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-        if self.head_compact {
-            use kernels::aarch64::{HC_ANCHORS_PER_BLOCK, HC_ANCHOR_GAP, HC_ANCHOR_SHIFT, HC_HEAD_PAIRS};
-            let q = p % 128;
-            let inner = if q < HC_HEAD_PAIRS { q } else { 2 * q - HC_ANCHOR_SHIFT };
-            return self.tail_base_blocks * HC_ANCHOR_GAP + HC_ANCHOR_SHIFT + p / 128 * HC_ANCHORS_PER_BLOCK + inner;
-        }
-        #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-        if self.tail_compact {
-            return self.tail_base_blocks * kernels::aarch64::TC_ANCHOR_GAP
-                + p / 128 * kernels::aarch64::TC_ANCHORS_PER_BLOCK
-                + 2 * (p % 128);
-        }
-        2 * p
-    }
-
-    /// Byte offset in `deltas` of pair `p`'s sixteen delta bytes (a live
-    /// pair in the tail-compacted layout). In the head-compacted layout a
-    /// head pair has only its eight a delta bytes here.
-    pub fn delta_offset(&self, p: usize) -> usize {
-        #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-        if self.head_compact {
-            use kernels::aarch64::{HC_DELTA_BYTES_PER_BLOCK, HC_DELTA_GAP, HC_DELTA_SHIFT, HC_HEAD_PAIRS};
-            let q = p % 128;
-            let inner = if q < HC_HEAD_PAIRS { 8 * q } else { 16 * q - HC_DELTA_SHIFT };
-            return self.tail_base_blocks * HC_DELTA_GAP + HC_DELTA_SHIFT + p / 128 * HC_DELTA_BYTES_PER_BLOCK + inner;
-        }
-        #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-        if self.tail_compact {
-            return self.tail_base_blocks * kernels::aarch64::TC_DELTA_GAP
-                + p / 128 * kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK
-                + 16 * (p % 128);
-        }
-        16 * p
-    }
-
     /// Return both large buffers to their process-wide scratch pools.
     pub fn recycle(self) {
         let Self { anchors, deltas, .. } = self;
-        crate::scratch::give_f128(anchors);
-        deltas.recycle();
-    }
-
-    /// [`Self::recycle`] after the cascade K pass: the anchors may instead be
-    /// kept, with their K view mapped, for the next prove's round two
-    /// (`gpu_commit::ENV_NO_ZC_K_HANDOVER`, once per process).
-    pub fn recycle_after_k(self) {
-        let Self { anchors, deltas, .. } = self;
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let anchors = {
-            let bytes = zc_k_premap_bytes(anchors.len() / 2);
-            match crate::gpu_commit::zc_k_handover_keep(anchors, bytes) {
-                Some(anchors) => anchors,
-                None => {
-                    deltas.recycle();
-                    return;
-                }
-            }
-        };
         crate::scratch::give_f128(anchors);
         deltas.recycle();
     }
@@ -1154,10 +998,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
         dead_tail: false,
-        tail_compact: false,
-        tail_base_blocks: 0,
-        head_compact: false,
-        head_b: F128::ZERO,
     };
 
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1340,9 +1180,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_with_deltas(
         );
         match res {
             crate::gpu_commit::ZcR2Result::Calibrated => {}
-            // (This sweep never launches R2-CS; its partials merge the same.)
-            crate::gpu_commit::ZcR2Result::Prefix(vals)
-            | crate::gpu_commit::ZcR2Result::PrefixCs { prefix: vals, .. } => {
+            crate::gpu_commit::ZcR2Result::Prefix(vals) => {
                 // XOR the parities back together: this sweep only ever wanted
                 // the summed pair the arm used to return.
                 for (x_hi, v) in vals.iter().enumerate() {
@@ -1442,10 +1280,6 @@ pub fn uni_skip_fold_and_round_pair_compact_padded_stream(
             anchors: crate::scratch::take_f128(2 * n_pairs),
             deltas: ScratchBytes::take_full_overwrite(2 * n_pairs * n_chunks),
             dead_tail: false,
-            tail_compact: false,
-            tail_base_blocks: 0,
-            head_compact: false,
-            head_b: F128::ZERO,
         };
 
         let eq = take_or_build_r2_eq(&mlv_challenges[1..], COMPACT_RECONSTRUCTION_N_HI);
@@ -1935,215 +1769,6 @@ fn lookahead_n_hi(n_vars: usize) -> usize {
     COMPACT_RECONSTRUCTION_N_HI.min(n_vars.saturating_sub(1))
 }
 
-/// `(hi_size, bytes of A per chunk)` of the lookahead round-two sweep over
-/// `2^m`-bit A/B buffers (k_skip = 6): the chunking
-/// [`uni_skip_fold_and_round_pair_compact_padded_lookahead_for`] walks, for
-/// the round-two A/B rebuild (`univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`).
-pub(crate) fn round2_lookahead_chunk_geometry(m: usize) -> Option<(usize, usize)> {
-    const K_SKIP: usize = 6;
-    if m < K_SKIP + 7 || m >= usize::BITS as usize {
-        return None;
-    }
-    let n_vars = m - K_SKIP - 1;
-    let hi_size = 1usize << lookahead_n_hi(n_vars);
-    let lo_size = (1usize << n_vars) / hi_size;
-    // Two rows of eight bytes per pair.
-    Some((hi_size, 2 * lo_size * 8))
-}
-
-/// Round-two A/B rebuild: this worker's scratch for one chunk's rebuilt a
-/// rows followed by its b rows (allocated on first use, kept for the
-/// thread's life).
-struct R2AbScratch {
-    ptr: core::cell::Cell<*mut u8>,
-    /// Bytes of each of the two halves.
-    bytes: core::cell::Cell<usize>,
-    /// The rebuild whose producer last filled every unit slot (0 = none).
-    primed_id: core::cell::Cell<u64>,
-}
-
-impl R2AbScratch {
-    const ALIGN: usize = 16384;
-}
-
-impl Drop for R2AbScratch {
-    fn drop(&mut self) {
-        let ptr = self.ptr.get();
-        if !ptr.is_null() {
-            let layout = std::alloc::Layout::from_size_align(2 * self.bytes.get(), Self::ALIGN).expect("layout");
-            // SAFETY: allocated below with this layout.
-            unsafe { std::alloc::dealloc(ptr, layout) };
-        }
-    }
-}
-
-thread_local! {
-    static R2_AB_SCRATCH: R2AbScratch = const {
-        R2AbScratch {
-            ptr: core::cell::Cell::new(core::ptr::null_mut()),
-            bytes: core::cell::Cell::new(0),
-            primed_id: core::cell::Cell::new(0),
-        }
-    };
-}
-
-/// Rebuild chunk `x_hi`'s a and b rows (`chunk_bytes` each) through the
-/// round-two A/B rebuild's producer into this thread's scratch. Returns the
-/// rows' addresses, valid until this thread's next call.
-fn r2_rebuild_chunk(
-    rebuild: &crate::zerocheck::univariate_skip_optimized::Round2AbRebuild,
-    x_hi: usize,
-    chunk_bytes: usize,
-) -> (*const u8, *const u8) {
-    R2_AB_SCRATCH.with(|s| {
-        if s.bytes.get() != chunk_bytes {
-            let old = s.ptr.replace(core::ptr::null_mut());
-            if !old.is_null() {
-                let layout =
-                    std::alloc::Layout::from_size_align(2 * s.bytes.get(), R2AbScratch::ALIGN).expect("layout");
-                // SAFETY: allocated below with this layout.
-                unsafe { std::alloc::dealloc(old, layout) };
-            }
-            let layout = std::alloc::Layout::from_size_align(2 * chunk_bytes, R2AbScratch::ALIGN).expect("layout");
-            // SAFETY: non-zero size.
-            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-            if ptr.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            s.ptr.set(ptr);
-            s.bytes.set(chunk_bytes);
-            s.primed_id.set(0);
-        }
-        let a = s.ptr.get();
-        // SAFETY: the allocation holds `2 * chunk_bytes` bytes.
-        let b = unsafe { a.add(chunk_bytes) };
-        let unit = rebuild.unit_bytes;
-        let units = chunk_bytes / unit;
-        let primed = s.primed_id.get() == rebuild.id;
-        for j in 0..units {
-            // SAFETY: slot `j` of both halves holds `unit` bytes; the
-            // registering prove is running (round two holds its rebuild).
-            unsafe { rebuild.produce_into(x_hi * units + j, a.add(j * unit), b.add(j * unit), primed) };
-        }
-        s.primed_id.set(rebuild.id);
-        (a.cast_const(), b.cast_const())
-    })
-}
-
-/// Any value restores chunk-wide A/B materialization before round two.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-fn r2_ab_quad_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_AB_QUAD").is_none())
-}
-
-/// R2 C capture (`univariate_skip_optimized::ENV_NO_R2_C_CAPTURE`): the
-/// round-two terms of the groups the walks left out, `(ΔG(1), ΔW0, ΔW1)`.
-///
-/// `rows` holds round one's C inner fold rows `R2_C_CAPTURE_ROWS` (64 lanes
-/// each, instance weights `eq(r[14..32], ·)` = round two's instance weights).
-/// In those groups (0..4 and 59 of every 256-row block) b folds to ONE and
-/// a = C, so a row's folded a summed over the instances is
-/// `a(t) = Σ_s fold(e_s)·c(t, s)`, and with `h_g = eq(ρ[2..8], g)`, `d = ρ[1]`:
-/// `ΔG(1) = Σ_g h_g·((1+d)·a(4g+1) + d·a(4g+3))`, `ΔW0 = Σ_g h_g·a(4g+2)`,
-/// `ΔW1 = Σ_g h_g·a(4g+3)`; every other round-two and round-three term of
-/// these groups is zero (b is constant across them).
-fn r2_c_capture_terms(table: &UniSkipFoldTable, rows: &[F128], mlv_challenges: &[F128]) -> (F128, F128, F128) {
-    use crate::zerocheck::univariate_skip_optimized::R2_C_CAPTURE_ROWS;
-    const GROUPS: [usize; 5] = [0, 1, 2, 3, 59];
-    assert_eq!(rows.len(), R2_C_CAPTURE_ROWS.len() * 64);
-    assert!(mlv_challenges.len() >= 8);
-    let lane_fold: Vec<F128> = (0..64).map(|s| table.fold_one_row(&(1u64 << s).to_le_bytes())).collect();
-    let d = mlv_challenges[1];
-    let (mut g1, mut t0, mut t1) = (F128::ZERO, F128::ZERO, F128::ZERO);
-    for (k, &g) in GROUPS.iter().enumerate() {
-        let h = (0..6).fold(F128::ONE, |h, bit| {
-            let c = mlv_challenges[2 + bit];
-            h * if (g >> bit) & 1 == 1 { c } else { F128::ONE + c }
-        });
-        let mut a = [F128::ZERO; 3];
-        for (j, a) in a.iter_mut().enumerate() {
-            let idx = 3 * k + j;
-            debug_assert_eq!(R2_C_CAPTURE_ROWS[idx], 4 * g + 1 + j);
-            let row = &rows[64 * idx..64 * (idx + 1)];
-            *a = lane_fold.iter().zip(row).fold(F128::ZERO, |acc, (l, c)| acc + *l * *c);
-        }
-        g1 += h * ((F128::ONE + d) * a[0] + d * a[2]);
-        t0 += h * a[1];
-        t1 += h * a[2];
-    }
-    (g1, t0, t1)
-}
-
-/// Interleave rebuilt ranked A/B quads and the existing full round-two walk.
-/// The original chunk still owns all outputs and partials. Reduction is linear
-/// over XOR, so XORing the eight reduced unit sums equals reducing once after
-/// the original chunk. No producer call may outlive the registering scope.
-///
-/// # Safety
-/// Inputs and outputs satisfy the full kernel's contract for `lo` pairs. The
-/// producer supplies complete 8192-byte A/B units, whose constant primed rows
-/// are identical between quads, and the chunk is exclusively CPU owned.
-#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-#[allow(clippy::too_many_arguments)]
-unsafe fn r2_rebuild_quad_walk(
-    r: &crate::zerocheck::univariate_skip_optimized::Round2AbRebuild,
-    x_hi: usize, table: *const u8, fold7: usize, anchors: *mut F128,
-    deltas: *mut u8, eq: *const F128, prep: *const F128, lo: usize,
-    pair_base: usize, tail: bool, head: *const std::sync::atomic::AtomicBool,
-    xb_rho: *const F128, skip_pure: bool,
-) -> [F128; 8] {
-    // R2 C capture: only the window-scaled walk leaves groups out.
-    assert!(!skip_pure || !xb_rho.is_null());
-    let unit = r.unit_bytes;
-    assert!(unit > 0 && unit.is_multiple_of(2048));
-    assert!((16 * lo).is_multiple_of(unit));
-    let pairs = unit / 16;
-    let units = 16 * lo / unit;
-    let mut out = [F128::ZERO; 8];
-    for j in 0..units {
-        // One scratch slot is reused. r2_rebuild_chunk marks it primed
-        // only after the first complete write for this registration.
-        let (a, b) = r2_rebuild_chunk(r, x_hi * units + j, unit);
-        let at = j * pairs;
-        let blocks = at / 128;
-        let (anchor_at, delta_at) = if !head.is_null() {
-            (blocks * kernels::aarch64::HC_ANCHORS_PER_BLOCK,
-             blocks * kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK)
-        } else if tail {
-            (blocks * kernels::aarch64::TC_ANCHORS_PER_BLOCK,
-             blocks * kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK)
-        } else {
-            (2 * at, 16 * at)
-        };
-        let mut part = [F128::ZERO; 8];
-        unsafe {
-            let ap = anchors.add(anchor_at);
-            let dp = deltas.add(delta_at);
-            let ep = eq.add(at);
-            let pp = if prep.is_null() { prep } else { prep.add(at) };
-            if !xb_rho.is_null() {
-                // Each unit contains whole 32-group windows. Their rho
-                // table is common; lambda comes from this unit's eq slice.
-                kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_xb(
-                    table, fold7 as *const u8, a, b, ap, dp, ep, xb_rho,
-                    pairs, true, tail, head, skip_pure, part.as_mut_ptr());
-            } else if fold7 != 0 {
-                kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
-                    table, fold7 as *const u8, a, b, ap, dp, ep, pp,
-                    pairs, pair_base + at, 127, 121, true, true, true,
-                    tail, head, part.as_mut_ptr());
-            } else {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                    table, a, b, ap, dp, ep, pp, pairs, pair_base + at,
-                    127, 121, true, true, true, tail, head, part.as_mut_ptr());
-            }
-        }
-        for lane in 0..8 { out[lane] += part[lane]; }
-    }
-    out
-}
-
 /// Round-two compact producer **plus** the deferred round-three coefficients.
 ///
 /// The compact state, the round-two wire message and every store are
@@ -2186,56 +1811,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         padding,
         deltas_backing,
         false,
-        None,
     )
-}
-
-/// The K pass GPU prefix arm's premap length over a compact state of
-/// `n_pairs` pairs: its dense anchors prefix in bytes, which covers every
-/// compacted layout's prefix (0 = no premap).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn zc_k_premap_bytes(n_pairs: usize) -> usize {
-    if n_pairs < 16 {
-        return 0;
-    }
-    let share = crate::gpu_commit::gpu_zc_k_share();
-    if share == 0 {
-        return 0;
-    }
-    let k_hi = 1usize << cascade_k_pass_n_hi(n_pairs.trailing_zeros() as usize - 2);
-    let prefix_pairs = share.min(k_hi) * (n_pairs / k_hi);
-    // The R2-CS kernel stores through this view too: with the measured
-    // R2-CS share (`gpu_commit::ENV_NO_ZC_R2_CS_SHARE`) it covers that
-    // share's ceiling, which lies above the K share (0 otherwise).
-    let r2_pairs = crate::gpu_commit::zc_r2_cs_view_chunks(k_hi) * (n_pairs / k_hi);
-    prefix_pairs.max(r2_pairs).min(n_pairs) * 32
-}
-
-/// R2-CS (`gpu_commit::ENV_NO_ZC_R2_CS`): before round one of a prove whose
-/// round two runs the lookahead sweep, take that sweep's compact anchors and
-/// premap the K pass arm's view over them ([`crate::gpu_commit::zc_k_premap`])
-/// when R2-CS is admitted for timed launches and that view will exist. The
-/// sweep then takes these anchors (`anchors_premapped`) instead of its own.
-/// `None` = the sweep takes and premaps them itself.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn round2_anchors_premapped_early(m: usize, k_skip: usize) -> Option<Vec<F128>> {
-    if k_skip != 6 || m <= k_skip || !crate::gpu_commit::zc_r2_cs_premap_early() {
-        return None;
-    }
-    let n_pairs = (1usize << (m - k_skip)) / 2;
-    let bytes = zc_k_premap_bytes(n_pairs);
-    if bytes == 0 {
-        return None;
-    }
-    // K view hand-over (`gpu_commit::ENV_NO_ZC_K_HANDOVER`): the anchors the
-    // previous prove's K pass kept, with their view already mapped and now
-    // published as this prove's premap.
-    if let Some(anchors) = crate::gpu_commit::zc_k_handover_take(2 * n_pairs, bytes) {
-        return Some(anchors);
-    }
-    let anchors = crate::scratch::take_f128(2 * n_pairs);
-    crate::gpu_commit::zc_k_premap(&anchors, bytes);
-    Some(anchors)
 }
 
 /// Pair count per cascade K-pass output chunk for a compact state of
@@ -2265,7 +1841,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     padding: &PaddingSpec,
     deltas_backing: Option<ScratchBytes>,
     k_pass_only: bool,
-    anchors_premapped: Option<Vec<F128>>,
 ) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
     assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -2285,39 +1860,11 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         deltas_len,
         "donated compact delta backing has the wrong byte length"
     );
-    // Anchors taken (and the K view premapped) before round one, see
-    // `round2_anchors_premapped_early`; else taken here.
-    let (anchors, premapped) = match anchors_premapped {
-        Some(a) if a.len() == 2 * n_pairs => (a, true),
-        other => {
-            if let Some(a) = other {
-                crate::scratch::give_f128(a);
-            }
-            (crate::scratch::take_f128(2 * n_pairs), false)
-        }
-    };
     let mut compact = UniSkipCompactFold {
-        anchors,
+        anchors: crate::scratch::take_f128(2 * n_pairs),
         deltas,
         dead_tail: false,
-        tail_compact: false,
-        tail_base_blocks: 0,
-        head_compact: false,
-        head_b: F128::ZERO,
     };
-    // K pass GPU prefix arm (`FLOCK_NO_ZC_K_PREMAP` kills this step): map
-    // its view of the anchors prefix now, while round two runs, so the K
-    // command buffer does not wait for the mapping. The dense prefix covers
-    // every compacted layout's prefix.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if !premapped {
-        let bytes = zc_k_premap_bytes(n_pairs);
-        if bytes > 0 {
-            crate::gpu_commit::zc_k_premap(&compact.anchors, bytes);
-        }
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let _ = premapped;
 
     let n_vars = mlv_challenges.len() - 1;
     let eq = take_or_build_r2_eq(&mlv_challenges[1..], lookahead_n_hi(n_vars));
@@ -2325,42 +1872,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let hi_size = 1usize << eq.n_hi;
     assert_eq!(lo_size * hi_size, n_pairs);
     assert!(lo_size >= 2, "lookahead sweep pairs two x_lo per group");
-    // Round-two A/B rebuild (`univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`):
-    // the AB arm published only chunks `..rebuild_from` of A and B, and every
-    // walk below rebuilds a later chunk's rows into worker scratch before it
-    // reads them (the GPU arm reads the prefix only). A prefix that is not
-    // whole chunks of this sweep gets the rest published first: the record
-    // path.
-    let chunk_ab_bytes = 2 * lo_size * n_chunks;
-    let rebuild = crate::zerocheck::univariate_skip_optimized::round2_ab_rebuild_take(a_packed, b_packed).and_then(|r| {
-        if r.published.is_multiple_of(chunk_ab_bytes)
-            && r.rebuild_from.is_multiple_of(chunk_ab_bytes)
-            && chunk_ab_bytes.is_multiple_of(r.unit_bytes)
-        {
-            Some(r)
-        } else {
-            r.complete_globals();
-            crate::zerocheck::univariate_skip_optimized::round2_ab_rebuild_latch_off();
-            None
-        }
-    });
-    // CPU walks rebuild chunks `rebuild_from..`; the GPU arm reads chunks
-    // below `ab_ready` only.
-    let rebuild_from = rebuild.map_or(hi_size, |r| r.rebuild_from / chunk_ab_bytes);
-    #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(unused_variables))]
-    let ab_ready = rebuild.map_or(hi_size, |r| r.published / chunk_ab_bytes);
-    // Chunk `x_hi`'s a and b rows: in the buffers, or (past the published
-    // prefix) rebuilt into this worker's scratch, valid until its next
-    // rebuild.
-    let r2_rows = |x_hi: usize| -> (*const u8, *const u8) {
-        match &rebuild {
-            Some(r) if x_hi >= rebuild_from => r2_rebuild_chunk(r, x_hi, chunk_ab_bytes),
-            // SAFETY: chunk `x_hi` lies inside both buffers.
-            _ => unsafe {
-                (a_packed.as_ptr().add(x_hi * chunk_ab_bytes), b_packed.as_ptr().add(x_hi * chunk_ab_bytes))
-            },
-        }
-    };
     // `eq₂(2y) = (1+r₁)·eq₃(y)` and `eq₂(2y+1) = r₁·eq₃(y)`, so the sweep uses
     // the odd lane as the group's single weight and the two constants below
     // put every aggregate back on its own scale, once, off the hot path.
@@ -2413,100 +1924,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let horner_prescale = false;
 
-    // R2 C capture (`univariate_skip_optimized::ENV_NO_R2_C_CAPTURE`): round
-    // one's kept C rows (taken here in every case, so none outlives this
-    // round), used only on the ranked head-compacted window-scaled walk.
-    let r2_capture = crate::zerocheck::univariate_skip_optimized::r2_c_capture_take();
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let pure_wanted = r2_capture.is_some()
-        && m == 32
-        && lo_size.is_multiple_of(128)
-        && skip_dead
-        && horner_weights
-        && periodic_padding
-        && degen
-        && zc_r2_tail_compact_enabled()
-        && cascade_k_fused_enabled()
-        && zc_k_one_table_enabled()
-        && zc_r2_head_compact_enabled()
-        && kernels::aarch64::r2_head_compact_supported()
-        && kernels::aarch64::r2_full_xb_enabled()
-        && table.fold_one_row(&[0xFF; 8]) == F128::ONE;
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
-    let pure_wanted = false;
-
-    // R2-CS (`gpu_commit::ENV_NO_ZC_R2_CS`): the compact layout this sweep
-    // writes when the arm runs, decided here (the same expressions as
-    // `tail_compact` and `head_compact` below with the arm admitted) so the
-    // arm's kernel can store the same bytes at the same offsets. Only the
-    // ranked walk: dead pairs skipped, prefix chunks on the prescaled walk.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    let cs_layout = if crate::gpu_commit::zc_r2_cs_enabled()
-        && skip_dead
-        && zc_r2_odd_offload_enabled()
-        && horner_weights
-        && horner_prescale
-    {
-        let tc = periodic_padding
-            && zc_r2_tail_compact_enabled()
-            && cascade_k_fused_enabled()
-            && zc_k_one_table_enabled();
-        let hc = tc
-            && zc_r2_head_compact_enabled()
-            && kernels::aarch64::r2_head_compact_supported()
-            && degen
-            && table.fold_one_row(&[0xFF; 8]) == F128::ONE;
-        let tbb = if tc { (lo_size / 128).max(cascade_k_pairs_per_chunk(n_pairs) / 128) } else { 0 };
-        use kernels::aarch64::{
-            HC_ANCHOR_GAP, HC_ANCHOR_SHIFT, HC_ANCHORS_PER_BLOCK, HC_DELTA_BYTES_PER_BLOCK, HC_DELTA_GAP,
-            HC_DELTA_SHIFT, TC_ANCHOR_GAP, TC_ANCHORS_PER_BLOCK, TC_DELTA_BYTES_PER_BLOCK, TC_DELTA_GAP,
-        };
-        Some(if hc {
-            crate::gpu_commit::ZcR2CsLayout {
-                hc: true,
-                a_base: tbb * HC_ANCHOR_GAP + HC_ANCHOR_SHIFT,
-                a_stride: HC_ANCHORS_PER_BLOCK,
-                d_base: tbb * HC_DELTA_GAP + HC_DELTA_SHIFT,
-                d_stride: HC_DELTA_BYTES_PER_BLOCK,
-            }
-        } else if tc {
-            crate::gpu_commit::ZcR2CsLayout {
-                hc: false,
-                a_base: tbb * TC_ANCHOR_GAP,
-                a_stride: TC_ANCHORS_PER_BLOCK,
-                d_base: tbb * TC_DELTA_GAP,
-                d_stride: TC_DELTA_BYTES_PER_BLOCK,
-            }
-        } else {
-            crate::gpu_commit::ZcR2CsLayout { hc: false, a_base: 0, a_stride: 256, d_base: 0, d_stride: 2048 }
-        })
-    } else {
-        None
-    };
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_feature = "sha3")))]
-    let cs_layout: Option<crate::gpu_commit::ZcR2CsLayout> = None;
-
-    // R2-CS stores a timed prefix through this prove's existing views of
-    // the two allocations, never a new one: the K premap above (anchors) and
-    // round one's handed-over view of the donated deltas backing; the launch
-    // checks that both exist and cover its prefix. `cs_live` = (anchors
-    // base, deltas base, deltas bytes).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let cs_live = cs_layout.map(|_| {
-        (
-            compact.anchors.as_ptr() as usize,
-            compact.deltas.full_overwrite_ptr() as usize,
-            compact.deltas.len(),
-        )
-    });
-
     // Same GPU round-two products arm as the incumbent sweep: it still
     // receives byte-identical anchors/deltas for every chunk and still owns
     // the *summed* `(p1, pinf)` for its prefix. The CPU keeps producing the
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products_cs(
+    let gpu_job = crate::gpu_commit::launch_zc_r2_products(
         a_packed,
         b_packed,
         &table.data,
@@ -2516,17 +1940,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         hi_size,
         pair_in_block_mask,
         useful_pairs_inclusive,
-        cs_layout,
-        cs_live,
-        ab_ready,
-        pure_wanted,
     );
-    // R2-CS owns this timed launch's prefix chunks (the CPU skips them).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let r2cs = gpu_job.as_ref().is_some_and(|j| j.cs_active());
-    // R2-CS calibration launch: (chunks, layout) for its compact-state oracle.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let cs_calib = gpu_job.as_ref().and_then(|j| j.cs_calibration());
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let gpu_prefix = gpu_job.as_ref().map_or(0, |j| j.cpu_split());
     // The GPU arm now returns its round-two products parity-split, so on an
@@ -2552,262 +1966,34 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let eq_prep_addr = eq_prep.as_ptr() as usize;
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let eq_prep_addr = 0usize;
-    // The fold table in seven pieces (`FLOCK_NO_R2_FOLD7`), for the full
-    // chunks' ranked walks on the performance-core workers: one lookup fewer
-    // per row, the same folded rows (none when a byte bank is not linear).
-    #[cfg(target_arch = "aarch64")]
-    let fold7 = if kernels::aarch64::r2_fold7_enabled() {
-        kernels::aarch64::r2_fold7_table(&table.data)
-    } else {
-        None
-    };
-    #[cfg(target_arch = "aarch64")]
-    let fold7_addr = fold7.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
-    // Tail-compacted layout: the dead-pair skip is on, every chunk's
-    // producer runs its ranked periodic walk (the lookahead, prescaled and
-    // Horner producers all rebase per block there) and the one-table fused
-    // K kernel is the reader.
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let tail_compact = skip_dead
-        && periodic_padding
-        && zc_r2_tail_compact_enabled()
-        && cascade_k_fused_enabled()
-        && zc_k_one_table_enabled();
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
-    let tail_compact = false;
-    compact.tail_compact = tail_compact;
-    // Full chunks (the suffix after the round-two GPU prefix, stolen prefix
-    // chunks, every chunk without the arm) on the window-scaled walk
-    // (`FLOCK_NO_R2_FULL_XB` keeps the prepared-weight walk): it needs the
-    // fixed medium weights (`horner_weights`, which also pins the ranked
-    // periodic block shape), the dead pairs skipped and the odd groups'
-    // weights a constant multiple of the even ones' (checked when the table
-    // is built). Same state bytes and slots as the prepared-weight walk.
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let xb_rho = if horner_weights && skip_dead && kernels::aarch64::r2_full_xb_enabled() {
-        kernels::aarch64::r2_full_xb_rho_prep(eq_lo)
-    } else {
-        None
-    };
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let xb_rho_addr = xb_rho.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let full_xb = xb_rho_addr != 0;
-    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-    let full_xb = false;
-    // Head-compacted layout on top: every chunk's producer must be one of the
-    // two ranked walks that write it (the full lookahead walk, or the
-    // prescaled ranked-invariant walk on GPU-offloaded chunks).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_used = gpu_prefix > 0;
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let gpu_used = false;
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let head_compact = tail_compact
-        && zc_r2_head_compact_enabled()
-        && kernels::aarch64::r2_head_compact_supported()
-        && degen
-        && table.fold_one_row(&[0xFF; 8]) == F128::ONE
-        && (!gpu_used || (odd_on_gpu && horner_weights && horner_prescale));
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
-    let head_compact = {
-        let _ = gpu_used;
-        false
-    };
-    let head_fail = std::sync::atomic::AtomicBool::new(false);
-    let head_fail_addr = if head_compact { &head_fail as *const std::sync::atomic::AtomicBool as usize } else { 0 };
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    if tail_compact {
-        // Room for the deepest rebase of either chunking (this one and the
-        // K pass's) in front of the first block.
-        compact.tail_base_blocks = (lo_size / 128).max(cascade_k_pairs_per_chunk(n_pairs) / 128);
-    }
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let (anchor_chunk_stride, delta_chunk_stride, anchor_base, delta_base) = if head_compact {
-        compact.head_compact = true;
-        compact.head_b = table.fold_one_row(&[0xFF; 8]);
-        (
-            lo_size / 128 * kernels::aarch64::HC_ANCHORS_PER_BLOCK,
-            lo_size / 128 * kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK,
-            compact.anchor_index(0),
-            compact.delta_offset(0),
-        )
-    } else if tail_compact {
-        (
-            lo_size / 128 * kernels::aarch64::TC_ANCHORS_PER_BLOCK,
-            lo_size / 128 * kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK,
-            compact.anchor_index(0),
-            compact.delta_offset(0),
-        )
-    } else {
-        (anchor_chunk_size, delta_chunk_size, 0, 0)
-    };
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
-    let (anchor_chunk_stride, delta_chunk_stride, anchor_base, delta_base) =
-        (anchor_chunk_size, delta_chunk_size, 0usize, 0usize);
-    // R2-CS: the arm stores the prefix chunks at the planned layout, which
-    // is this sweep's by construction (same expressions, arm admitted). Were
-    // it not, the CPU walks every chunk and the whole round is redone
-    // serially once the arm has joined (`cs_redo_all`, below).
-    // R2 C capture: the CPU's walks can leave the capture's groups out only
-    // on the head-compacted window-scaled walk; a GPU prefix that left them
-    // out while the CPU cannot is redone with the whole round below.
-    let pure_cpu = pure_wanted && full_xb && head_compact;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_pure = gpu_job.as_ref().is_some_and(|j| j.pure_active());
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    let gpu_pure = false;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    let cs_redo_all = r2cs
-        && (!cs_layout.is_some_and(|l| {
-            l.hc == compact.head_compact
-                && l.a_base == anchor_base
-                && l.d_base == delta_base
-                && l.a_stride * (lo_size / 128) == anchor_chunk_stride
-                && l.d_stride * (lo_size / 128) == delta_chunk_stride
-        }) || (gpu_pure && !pure_cpu));
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    let r2cs = r2cs && !cs_redo_all;
-    // Every chunk the CPU walks is then a full window-scaled walk, and every
-    // GPU chunk whose sums are used left the same groups out.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    let skip_pure = pure_cpu
-        && !cs_redo_all
-        && !gpu_job.as_ref().is_some_and(|j| j.is_calibration())
-        && (!gpu_used || (r2cs && gpu_pure));
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3")))]
-    let skip_pure = {
-        let _ = (pure_cpu, gpu_pure);
-        false
-    };
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if crate::gpu_commit::gpu_zc_r2_debug() {
-        eprintln!(
-            "[zc-r2] round-two layout: head_compact={} tail_compact={tail_compact} skip_dead={skip_dead} \
-             odd_on_gpu={odd_on_gpu} horner_weights={horner_weights} prescale={horner_prescale} \
-             gpu_prefix={gpu_prefix}/{hi_size} calibration={} r2cs={r2cs} ab_rebuild_from={} \
-             c_capture={skip_pure}",
-            compact.head_compact,
-            gpu_job.as_ref().is_some_and(|j| j.is_calibration()),
-            if rebuild.is_some() { rebuild_from.to_string() } else { "off".to_string() },
-        );
-    }
-    let anchors_base = crate::epool::SyncPtr(unsafe { compact.anchors.as_mut_ptr().add(anchor_base) });
-    let deltas_base = crate::epool::SyncPtr(unsafe { compact.deltas.full_overwrite_ptr().add(delta_base) });
+    let anchors_base = crate::epool::SyncPtr(compact.anchors.as_mut_ptr());
+    let deltas_base = crate::epool::SyncPtr(compact.deltas.full_overwrite_ptr());
     let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
     let la_base = crate::epool::SyncPtr(la_partials.as_mut_ptr());
-    // `stolen`: R2-CS steal (`gpu_commit::ENV_NO_R2_STEAL`), a prefix chunk
-    // the CPU took from the GPU, walked in full as a chunk after the prefix.
-    let chunk_body = |x_hi: usize, stolen: bool| {
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let _ = stolen;
-        // SAFETY: the queue (or the steal's claim) hands out each x_hi
-        // exactly once; chunk x_hi exclusively owns its anchors/deltas ranges
-        // and both partial slots.
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
+        // SAFETY: the queue hands out each x_hi exactly once; chunk x_hi
+        // exclusively owns its anchors/deltas ranges and both partial slots.
         let (anchors, deltas) = unsafe {
             (
-                anchors_base.ptr().add(x_hi * anchor_chunk_stride),
-                deltas_base.ptr().add(x_hi * delta_chunk_stride),
+                anchors_base.ptr().add(x_hi * anchor_chunk_size),
+                deltas_base.ptr().add(x_hi * delta_chunk_size),
             )
         };
         let pair_idx_base = x_hi * lo_size;
         let row_base = pair_idx_base * 2;
         let mut out = [F128::ZERO; 8];
-        let head_fail_ptr = head_fail_addr as *const std::sync::atomic::AtomicBool;
-
-        // R2-CS: the arm owns this prefix chunk outright (compact state,
-        // products, lookahead terms); its slots are filled after the join.
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if r2cs && x_hi < gpu_prefix && !stolen {
-            // SAFETY: exclusive owner of both partial slots (see above).
-            unsafe {
-                *partials_base.ptr().add(x_hi) = (F128::ZERO, F128::ZERO);
-                *la_base.ptr().add(x_hi) = [F128::ZERO; 6];
-            }
-            return;
-        }
 
         #[cfg(target_arch = "aarch64")]
         {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            let full = stolen || x_hi >= gpu_prefix;
+            let full = x_hi >= gpu_prefix;
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             let full = true;
             unsafe {
                 let t = table.data.as_ptr().cast::<u8>();
-                // Round-two A/B rebuild: a chunk past the published prefix
-                // reads its rows from this worker's scratch, rebuilt now.
-                debug_assert_eq!(row_base * n_chunks, x_hi * chunk_ab_bytes);
-                #[cfg(target_feature = "sha3")]
-                let quad = rebuild.as_ref().filter(|r| {
-                    full && m == 32 && x_hi >= rebuild_from && r2_ab_quad_enabled()
-                        && r.unit_bytes == 8192 && chunk_ab_bytes.is_multiple_of(r.unit_bytes)
-                        && periodic_padding && pair_in_block_mask == 127
-                        && useful_pairs_inclusive == 121 && pair_idx_base.is_multiple_of(128)
-                        && degen && skip_dead && eq_prep_addr != 0
-                });
-                #[cfg(not(target_feature = "sha3"))]
-                let quad: Option<&crate::zerocheck::univariate_skip_optimized::Round2AbRebuild> = None;
-                #[cfg(target_feature = "sha3")]
-                if let Some(r) = quad {
-                    let table7 = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
-                        fold7_addr
-                    } else { 0 };
-                    out = r2_rebuild_quad_walk(r, x_hi, t, table7, anchors, deltas,
-                        eq_lo.as_ptr(), eq_prep_addr as *const F128, lo_size,
-                        pair_idx_base, tail_compact, head_fail_ptr,
-                        if full_xb { xb_rho_addr as *const F128 } else { core::ptr::null() },
-                        skip_pure);
-                }
-                if quad.is_none() {
-                let (ap, bp) = r2_rows(x_hi);
-                if full && full_xb {
-                    // Full chunk on the window-scaled walk
-                    // (`FLOCK_NO_R2_FULL_XB`): the seven-piece table on the
-                    // performance-core workers, the byte banks on the helpers.
-                    #[cfg(target_feature = "sha3")]
-                    kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_xb(
-                        t,
-                        if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
-                            fold7_addr as *const u8
-                        } else {
-                            core::ptr::null()
-                        },
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        xb_rho_addr as *const F128,
-                        lo_size,
-                        degen,
-                        tail_compact,
-                        head_fail_ptr,
-                        skip_pure,
-                        out.as_mut_ptr(),
-                    );
-                } else if full && fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
-                    kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
-                        t,
-                        fold7_addr as *const u8,
-                        ap,
-                        bp,
-                        anchors,
-                        deltas,
-                        eq_lo.as_ptr(),
-                        eq_prep_addr as *const F128,
-                        lo_size,
-                        pair_idx_base,
-                        pair_in_block_mask,
-                        useful_pairs_inclusive,
-                        degen,
-                        periodic_padding,
-                        skip_dead,
-                        tail_compact,
-                        head_fail_ptr,
-                        out.as_mut_ptr(),
-                    );
-                } else if full {
+                let ap = a_packed.as_ptr().add(row_base * n_chunks);
+                let bp = b_packed.as_ptr().add(row_base * n_chunks);
+                if full {
                     fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                         t,
                         ap,
@@ -2823,8 +2009,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         degen,
                         periodic_padding,
                         skip_dead,
-                        tail_compact,
-                        head_fail_ptr,
                         out.as_mut_ptr(),
                     );
                 } else if odd_on_gpu && horner_weights {
@@ -2843,8 +2027,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             useful_pairs_inclusive,
                             degen,
                             skip_dead,
-                            tail_compact,
-                            head_fail_ptr,
                             out.as_mut_ptr(),
                         );
                     } else if horner_skip_first {
@@ -2861,8 +2043,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             useful_pairs_inclusive,
                             degen,
                             skip_dead,
-                            tail_compact,
-                            head_fail_ptr,
                             out.as_mut_ptr(),
                         );
                     } else {
@@ -2879,8 +2059,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             useful_pairs_inclusive,
                             degen,
                             skip_dead,
-                            tail_compact,
-                            head_fail_ptr,
                             out.as_mut_ptr(),
                         );
                     }
@@ -2911,8 +2089,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         degen,
                         periodic_padding,
                         skip_dead,
-                        tail_compact,
-                        head_fail_ptr,
                         out.as_mut_ptr(),
                     );
                 } else {
@@ -2931,11 +2107,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         degen,
                         periodic_padding,
                         skip_dead,
-                        tail_compact,
-                        head_fail_ptr,
                         out.as_mut_ptr(),
                     );
-                }
                 }
             }
         }
@@ -2943,30 +2116,15 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         #[cfg(not(target_arch = "aarch64"))]
         {
             let anchors = unsafe { std::slice::from_raw_parts_mut(anchors, anchor_chunk_size) };
-            // Round-two A/B rebuild: past the published prefix, the rebuilt
-            // chunk (its rows from 0).
-            let (rows_a, rows_b, rows_base) = if rebuild.is_some() && x_hi >= rebuild_from {
-                let (pa, pb) = r2_rows(x_hi);
-                // SAFETY: the scratch holds `chunk_ab_bytes` bytes of each.
-                unsafe {
-                    (
-                        std::slice::from_raw_parts(pa, chunk_ab_bytes),
-                        std::slice::from_raw_parts(pb, chunk_ab_bytes),
-                        0,
-                    )
-                }
-            } else {
-                (a_packed, b_packed, row_base)
-            };
             out = round2_lookahead_chunk_scalar(
-                rows_a,
-                rows_b,
+                a_packed,
+                b_packed,
                 table,
                 anchors,
                 deltas,
                 eq_lo,
                 lo_size,
-                rows_base,
+                row_base,
                 pair_idx_base,
                 pair_in_block_mask,
                 useful_pairs_inclusive,
@@ -2990,42 +2148,18 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 eq_h * out[7],
             ];
         }
-    };
-    // R2-CS steal (`gpu_commit::ENV_NO_R2_STEAL`): the queue walks the chunks
-    // after the prefix; each main-pool worker that finds them claimed then
-    // takes the GPU's chunks from the top of the prefix until the prefix's
-    // signal has been seen. Otherwise the record's queue over every chunk.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let steal = gpu_job.as_ref().and_then(|j| j.steal()).filter(|_| r2cs);
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if let Some(steal) = steal {
-        crate::epool::run_hetero_chunks_then(hi_size - gpu_prefix, &|i| chunk_body(gpu_prefix + i, false), &|| {
-            while let Some(x_hi) = steal.claim() {
-                chunk_body(x_hi, true);
-            }
-        });
-    } else {
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| chunk_body(x_hi, false));
-    }
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    crate::epool::run_hetero_chunks(hi_size, |x_hi| chunk_body(x_hi, false));
+    });
 
     // Drain the GPU products arm. The arm returns `[p1_even, pinf_even,
     // p1_odd, pinf_odd]`; XORing the parities back together reproduces the
     // summed pair the incumbent contract delivered, and the odd half is
     // adopted as the lookahead's `W1`/`W2` state exactly when the CPU was told
     // to skip it.
-    // R2 C capture: the arm failed after the CPU left the capture's groups
-    // out of its chunks; the whole round is redone without the capture below.
-    #[allow(unused_mut)]
-    let mut capture_gpu_failed = false;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
         let calib = job.is_calibration();
-        // R2-CS steal: the GPU's chunks are those below the lowest chunk the
-        // CPU took (the CPU walked the rest of the prefix).
-        let prefix = job.steal().map_or(job.cpu_split(), |s| s.taken().0);
+        let prefix = job.cpu_split();
         let res = crate::gpu_commit::zc_r2_wait(
             job,
             if calib {
@@ -3052,60 +2186,25 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     }
                 }
             }
-            crate::gpu_commit::ZcR2Result::PrefixCs { prefix: vals, lookahead, head_bad } => {
-                // R2-CS: the arm owned these chunks outright, so their
-                // lookahead slots 2..6 are its [W0, W3, W4, W5] as well, and its
-                // head-pair flag joins the CPU walk's. (Without `r2cs` the CPU
-                // walked them after all: the incumbent merge.)
-                for (x_hi, (v, w)) in vals.iter().zip(&lookahead).enumerate() {
-                    partials[x_hi] = (v[0] + v[2], v[1] + v[3]);
-                    if r2cs {
-                        la_partials[x_hi] = [v[2], v[3], w[0], w[1], w[2], w[3]];
-                    } else if odd_on_gpu {
-                        la_partials[x_hi][0] = v[2];
-                        la_partials[x_hi][1] = v[3];
-                    }
-                }
-                if r2cs && head_bad {
-                    head_fail.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            crate::gpu_commit::ZcR2Result::Failed if skip_pure => capture_gpu_failed = true,
             crate::gpu_commit::ZcR2Result::Failed => {
                 // Redo exactly the skipped prefix products — slower, still
                 // exact. Throwaway anchor/delta scratch: the real ranges were
                 // already written by the lookahead pass. The full-lookahead
                 // monomorphization is used so the odd-parity slots are
-                // recovered too when the CPU sweep skipped them. R2-CS: the
-                // sweep skipped these chunks outright, so the redo writes their
-                // real compact state and lookahead slots with the sweep's own
-                // walk.
+                // recovered too when the CPU sweep skipped them.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
-                    let (ap, bp) = r2_rows(x_hi);
+                    let row_base = pair_idx_base * 2;
                     let mut out = [F128::ZERO; 8];
-                    let (anchors, deltas, dead, tail, head) = if r2cs {
-                        unsafe {
-                            (
-                                anchors_base.ptr().add(x_hi * anchor_chunk_stride),
-                                deltas_base.ptr().add(x_hi * delta_chunk_stride),
-                                skip_dead,
-                                tail_compact,
-                                head_fail_addr as *const std::sync::atomic::AtomicBool,
-                            )
-                        }
-                    } else {
-                        (scr_anchors.as_mut_ptr(), scr_deltas.as_mut_ptr(), false, false, core::ptr::null())
-                    };
                     unsafe {
                         fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
                             table.data.as_ptr().cast::<u8>(),
-                            ap,
-                            bp,
-                            anchors,
-                            deltas,
+                            a_packed.as_ptr().add(row_base * n_chunks),
+                            b_packed.as_ptr().add(row_base * n_chunks),
+                            scr_anchors.as_mut_ptr(),
+                            scr_deltas.as_mut_ptr(),
                             eq_lo.as_ptr(),
                             eq_prep_addr as *const F128,
                             lo_size,
@@ -3114,9 +2213,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             useful_pairs_inclusive,
                             degen,
                             periodic_padding,
-                            dead,
-                            tail,
-                            head,
+                            false,
                             out.as_mut_ptr(),
                         );
                     }
@@ -3125,223 +2222,13 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         eq_h * (kappa * out[0] + out[2]),
                         eq_h * (kappa * out[1] + out[3]),
                     );
-                    if r2cs {
-                        la_partials[x_hi] = [
-                            eq_h * out[2],
-                            eq_h * out[3],
-                            eq_h * out[4],
-                            eq_h * out[5],
-                            eq_h * out[6],
-                            eq_h * out[7],
-                        ];
-                    } else if odd_on_gpu {
+                    if odd_on_gpu {
                         la_partials[x_hi][0] = eq_h * out[2];
                         la_partials[x_hi][1] = eq_h * out[3];
                     }
                 }
             }
         }
-    }
-
-    // R2-CS stored at a layout this sweep does not write (never at the
-    // ranked shape, see `cs_redo_all`): the arm has joined, so redo the whole
-    // round serially with the full walk, every store and every slot.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    if cs_redo_all {
-        for x_hi in 0..hi_size {
-            let pair_idx_base = x_hi * lo_size;
-            let (ap, bp) = r2_rows(x_hi);
-            let mut out = [F128::ZERO; 8];
-            // SAFETY: every writer has joined; chunk x_hi's ranges, serially.
-            unsafe {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                    table.data.as_ptr().cast::<u8>(),
-                    ap,
-                    bp,
-                    anchors_base.ptr().add(x_hi * anchor_chunk_stride),
-                    deltas_base.ptr().add(x_hi * delta_chunk_stride),
-                    eq_lo.as_ptr(),
-                    eq_prep_addr as *const F128,
-                    lo_size,
-                    pair_idx_base,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                    degen,
-                    periodic_padding,
-                    skip_dead,
-                    tail_compact,
-                    head_fail_addr as *const std::sync::atomic::AtomicBool,
-                    out.as_mut_ptr(),
-                );
-            }
-            let eq_h = eq_hi[x_hi];
-            partials[x_hi] = (eq_h * (kappa * out[0] + out[2]), eq_h * (kappa * out[1] + out[3]));
-            la_partials[x_hi] = [
-                eq_h * out[2],
-                eq_h * out[3],
-                eq_h * out[4],
-                eq_h * out[5],
-                eq_h * out[6],
-                eq_h * out[7],
-            ];
-        }
-    }
-
-    // R2 C capture: a capture group whose b rows are not all ones (the head
-    // flag), or a failed arm: redo the whole round serially without the
-    // capture, every store and every slot, in the head-compacted layout or,
-    // after a head failure, the tail-compacted one (never at the ranked shape
-    // with a satisfying witness).
-    #[allow(unused_mut)]
-    let mut capture_sums = skip_pure;
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    if skip_pure && (capture_gpu_failed || head_fail.load(std::sync::atomic::Ordering::Relaxed)) {
-        capture_sums = false;
-        let to_tail = head_fail.load(std::sync::atomic::Ordering::Relaxed);
-        let (a_base, d_base, a_stride, d_stride, head) = if to_tail {
-            compact.head_compact = false;
-            compact.head_b = F128::ZERO;
-            (
-                unsafe { compact.anchors.as_mut_ptr().add(compact.anchor_index(0)) },
-                unsafe { compact.deltas.full_overwrite_ptr().add(compact.delta_offset(0)) },
-                lo_size / 128 * kernels::aarch64::TC_ANCHORS_PER_BLOCK,
-                lo_size / 128 * kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK,
-                core::ptr::null(),
-            )
-        } else {
-            (
-                anchors_base.ptr(),
-                deltas_base.ptr(),
-                anchor_chunk_stride,
-                delta_chunk_stride,
-                head_fail_addr as *const std::sync::atomic::AtomicBool,
-            )
-        };
-        for x_hi in 0..hi_size {
-            let (ap, bp) = r2_rows(x_hi);
-            let mut out = [F128::ZERO; 8];
-            // SAFETY: every writer has joined; chunk x_hi's ranges, serially.
-            unsafe {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                    table.data.as_ptr().cast::<u8>(),
-                    ap,
-                    bp,
-                    a_base.add(x_hi * a_stride),
-                    d_base.add(x_hi * d_stride),
-                    eq_lo.as_ptr(),
-                    eq_prep_addr as *const F128,
-                    lo_size,
-                    x_hi * lo_size,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                    degen,
-                    periodic_padding,
-                    skip_dead,
-                    true,
-                    head,
-                    out.as_mut_ptr(),
-                );
-            }
-            let eq_h = eq_hi[x_hi];
-            partials[x_hi] = (eq_h * (kappa * out[0] + out[2]), eq_h * (kappa * out[1] + out[3]));
-            la_partials[x_hi] = [
-                eq_h * out[2],
-                eq_h * out[3],
-                eq_h * out[4],
-                eq_h * out[5],
-                eq_h * out[6],
-                eq_h * out[7],
-            ];
-        }
-    }
-
-    // A head pair whose b rows are not all ones: the head-compacted state
-    // cannot hold its b anchor and delta, so rewrite the whole state (anchors
-    // and deltas only; the products above stand, they do not depend on the
-    // layout) in the tail-compacted layout with the full lookahead walk.
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    if head_compact && compact.head_compact && head_fail.load(std::sync::atomic::Ordering::Relaxed) {
-        compact.head_compact = false;
-        compact.head_b = F128::ZERO;
-        let a_base = unsafe { compact.anchors.as_mut_ptr().add(compact.anchor_index(0)) };
-        let d_base = unsafe { compact.deltas.full_overwrite_ptr().add(compact.delta_offset(0)) };
-        let a_stride = lo_size / 128 * kernels::aarch64::TC_ANCHORS_PER_BLOCK;
-        let d_stride = lo_size / 128 * kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK;
-        // Serial: this path never runs at the ranked shape, and a plain loop
-        // adds no queue instantiation to the build.
-        for x_hi in 0..hi_size {
-            let pair_idx_base = x_hi * lo_size;
-            let (ap, bp) = r2_rows(x_hi);
-            let mut out = [F128::ZERO; 8];
-            // SAFETY: chunk x_hi's anchor and delta ranges, one chunk at a time.
-            unsafe {
-                fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                    table.data.as_ptr().cast::<u8>(),
-                    ap,
-                    bp,
-                    a_base.add(x_hi * a_stride),
-                    d_base.add(x_hi * d_stride),
-                    eq_lo.as_ptr(),
-                    eq_prep_addr as *const F128,
-                    lo_size,
-                    pair_idx_base,
-                    pair_in_block_mask,
-                    useful_pairs_inclusive,
-                    degen,
-                    periodic_padding,
-                    skip_dead,
-                    true,
-                    core::ptr::null(),
-                    out.as_mut_ptr(),
-                );
-            }
-        }
-    }
-
-    // R2-CS calibration (warm-up prove, after every writer joined): the
-    // arm's scratch compact state against the CPU's final compact state,
-    // every live slot of the calibration chunks at the state's own
-    // `anchor_index` / `delta_offset`; the verdict admits R2-CS for the
-    // process (the lookahead partials were compared at the drain).
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    if let Some((chunks, layout)) = cs_calib {
-        let laid_out = compact.head_compact == layout.hc
-            && compact.anchor_index(0) == layout.a_base
-            && compact.anchor_index(128) == layout.a_base + layout.a_stride
-            && compact.delta_offset(0) == layout.d_base
-            && compact.delta_offset(128) == layout.d_base + layout.d_stride;
-        let deltas_ptr = compact.deltas.full_overwrite_ptr().cast_const();
-        let res = if laid_out {
-            // SAFETY: the joined sweep wrote the state; `deltas_ptr` spans
-            // `compact.deltas.len()` bytes.
-            unsafe {
-                crate::gpu_commit::zc_r2_cs_oracle(
-                    chunks * lo_size,
-                    &compact.anchors,
-                    deltas_ptr,
-                    compact.deltas.len(),
-                    |p| (p & pair_in_block_mask) < useful_pairs_inclusive,
-                    |p| {
-                        (
-                            compact.anchor_index(p),
-                            compact.delta_offset(p),
-                            compact.head_compact && p % 128 < kernels::aarch64::HC_HEAD_PAIRS,
-                        )
-                    },
-                )
-            }
-        } else {
-            Err(format!(
-                "planned layout {layout:?} is not the state's (head_compact={})",
-                compact.head_compact
-            ))
-        };
-        if let Err(e) = &res
-            && crate::gpu_commit::gpu_zc_r2_debug()
-        {
-            eprintln!("[zc-r2] R2-CS ORACLE MISMATCH: {e} -> R2-CS disabled");
-        }
-        crate::gpu_commit::zc_r2_cs_verdict(res.is_ok(), chunks, hi_size);
     }
 
     // Both the standard and lookahead round-two producers promise identical
@@ -3352,8 +2239,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // fallback have joined, covering every byte including padding rows.
     unsafe { compact.deltas.mark_fully_initialized() };
 
-    #[allow(unused_mut)]
-    let (mut sum1, sum_inf) = partials
+    let (sum1, sum_inf) = partials
         .iter()
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
             (s1 + c1, sinf + cinf)
@@ -3367,19 +2253,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // Every aggregate was accumulated on the odd lane's weight `r₁·eq₃`, so a
     // single `r₁⁻¹` puts all six back on `eq₃`.
     let r1_inv = retained_r1_inv.unwrap_or_else(|| r1.inv());
-    #[allow(unused_mut)]
-    let mut w1 = r1_inv * agg[0];
+    let w1 = r1_inv * agg[0];
     let w2 = r1_inv * agg[1];
-    #[allow(unused_mut)]
-    let mut w0 = r1_inv * agg[2];
-    // R2 C capture: the left-out groups' exact terms, from round one's kept
-    // C rows (`r2_c_capture_terms`).
-    if capture_sums && let Some(rows) = r2_capture.as_deref() {
-        let (g1, t0, t1) = r2_c_capture_terms(table, rows, mlv_challenges);
-        sum1 += g1;
-        w0 += t0;
-        w1 += t1;
-    }
+    let w0 = r1_inv * agg[2];
     let w3 = r1_inv * agg[3];
     let w4 = r1_inv * agg[4];
     let w5 = r1_inv * agg[5];
@@ -3672,7 +2548,7 @@ pub(crate) fn fold2_compact_and_round45_into(
     a_out: &mut [F128],
     b_out: &mut [F128],
 ) -> (F128, F128, Round3Lookahead) {
-    let (m1, minf, la, _, _) =
+    let (m1, minf, la, _) =
         fold2_compact_and_round45_into_packed(compact, table, rho1, rho2, r_next4, a_out, b_out, false);
     (m1, minf, la)
 }
@@ -3688,31 +2564,14 @@ pub(crate) fn zc_k_dead_pack_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_DEAD_PACK").is_none())
 }
 
-/// Kill switch for the b-one-packed K b output (`FLOCK_NO_ZC_K_BONE_PACK`,
-/// any value): with the dead-tail pack, the K pass writes b outputs 0..3 and
-/// 59 of every 64 (one at the ranked shape: const-one wires of BLAKE3's
-/// linear constraints) and the tri pass reads them back. Packed, the K pass
-/// writes 56 b entries per 64 outputs (`kernels::aarch64::B_PACK_BLOCK`, 14
-/// lines instead of 61/4 + ...: 56 lines per 256 outputs instead of 61) and
-/// the tri pass takes those ones as one registers; it checks every skipped
-/// value and reruns the pass unpacked if one is not one. Same values, same
-/// messages. Read once per process.
-pub(crate) fn zc_k_bone_pack_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_BONE_PACK").is_none())
-}
-
 /// [`fold2_compact_and_round45_into`] that, with `pack` and when the state
 /// and split allow it (one-table fused kernel, dead-tail state, chunks of
 /// whole four-block superblocks), writes the dead-tail-packed layout: the
 /// first `n_groups / 256 * 244` entries of `a_out` / `b_out` (see
 /// `kernels::aarch64::PACK_SUPER`); outputs 61..63 of every 64 are zero and
 /// are not written. Returns whether it packed (otherwise every output is
-/// written as usual) and whether b is in the b-one-packed layout instead
-/// (the first `n_groups / 64 * 56` entries of `b_out`, see
-/// [`zc_k_bone_pack_enabled`]).
+/// written as usual).
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fold2_compact_and_round45_into_packed(
     compact: &UniSkipCompactFold,
     table: &UniSkipFoldTable,
@@ -3722,85 +2581,7 @@ pub(crate) fn fold2_compact_and_round45_into_packed(
     a_out: &mut [F128],
     b_out: &mut [F128],
     pack: bool,
-) -> (F128, F128, Round3Lookahead, bool, bool) {
-    let (m1, minf, la, packed, bpacked, _) = fold2_compact_and_round45_into_packed_gpu(
-        compact, table, rho1, rho2, r_next4, a_out, b_out, pack, false,
-    );
-    (m1, minf, la, packed, bpacked)
-}
-
-/// Outputs of the leading K chunks that the K pass GPU prefix arm folded (see
-/// `gpu_commit::ENV_NO_ZC_K_GPU`): `len_a` / `len_b` entries of the packed a
-/// and b-one-packed b layouts, held in the arm's process-lifetime buffers.
-/// The same entries of `a_out` / `b_out` were not written; the tri pass reads
-/// them from here. Valid until the next K pass. Also the leading outputs of
-/// the composed 5+6 pass that its GPU prefix arm folded (see
-/// `gpu_commit::ENV_NO_ZC_T56_GPU`), valid until that arm's next launch.
-pub(crate) struct KGpuPrefix {
-    a: *const F128,
-    b: *const F128,
-    len_a: usize,
-    len_b: usize,
-}
-
-impl KGpuPrefix {
-    /// SAFETY: call before the next K pass of the process (which rewrites
-    /// the buffers).
-    pub(crate) unsafe fn slices<'a>(&self) -> (&'a [F128], &'a [F128]) {
-        unsafe {
-            (
-                std::slice::from_raw_parts(self.a, self.len_a),
-                std::slice::from_raw_parts(self.b, self.len_b),
-            )
-        }
-    }
-}
-
-/// [`fold2_compact_and_round45_into_packed`] with the K pass GPU prefix arm
-/// when `gpu` is set (b-one-packed tail-compacted pass only). Also returns the
-/// GPU prefix the tri pass must read in place of the leading entries of
-/// `a_out` / `b_out`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold2_compact_and_round45_into_packed_gpu(
-    compact: &UniSkipCompactFold,
-    table: &UniSkipFoldTable,
-    rho1: F128,
-    rho2: F128,
-    r_next4: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    pack: bool,
-    gpu: bool,
-) -> (F128, F128, Round3Lookahead, bool, bool, Option<KGpuPrefix>) {
-    let bpack = pack && zc_k_bone_pack_enabled();
-    if bpack {
-        if let Some(r) =
-            fold2_compact_and_round45_into_packed_b(compact, table, rho1, rho2, r_next4, a_out, b_out, pack, true, gpu)
-        {
-            return r;
-        }
-    }
-    fold2_compact_and_round45_into_packed_b(compact, table, rho1, rho2, r_next4, a_out, b_out, pack, false, false)
-        .expect("a K pass without the b-one pack always completes")
-}
-
-/// [`fold2_compact_and_round45_into_packed`] with the b-one pack requested
-/// by `bpack`; `None` when a b output the pack skips is not one (every output
-/// is then rewritten by the caller's unpacked rerun).
-#[allow(clippy::too_many_arguments)]
-fn fold2_compact_and_round45_into_packed_b(
-    compact: &UniSkipCompactFold,
-    table: &UniSkipFoldTable,
-    rho1: F128,
-    rho2: F128,
-    r_next4: &[F128],
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    pack: bool,
-    bpack: bool,
-    gpu: bool,
-) -> Option<(F128, F128, Round3Lookahead, bool, bool, Option<KGpuPrefix>)> {
-    let _ = gpu;
+) -> (F128, F128, Round3Lookahead, bool) {
     let n_pairs = compact.len();
     let n_groups = n_pairs / 2;
     assert!(n_groups >= 4 && n_groups.is_power_of_two());
@@ -3812,9 +2593,6 @@ fn fold2_compact_and_round45_into_packed_b(
     assert_eq!(r_next4.len(), n_groups.trailing_zeros() as usize);
     let r_par = r_next4[1];
     assert_ne!(r_par, F128::ZERO, "cascade requires a non-zero r_next4[1]");
-    assert!(!compact.tail_compact || compact.dead_tail);
-    // Every K chunk's per-block rebase stays inside the buffers.
-    assert!(!compact.tail_compact || compact.tail_base_blocks >= cascade_k_pairs_per_chunk(n_pairs) / 128);
 
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let fused_k = cascade_k_fused_enabled();
@@ -3824,10 +2602,6 @@ fn fold2_compact_and_round45_into_packed_b(
     let one_table = fused_k && zc_k_one_table_enabled();
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let one_table = false;
-    assert!(
-        !compact.tail_compact || one_table,
-        "a tail-compacted state is read by the one-table fused K kernel only"
-    );
     let (table_l1, table_l3) = if one_table {
         (table.scaled_linear(rho1), Vec::new())
     } else {
@@ -3882,98 +2656,17 @@ fn fold2_compact_and_round45_into_packed_b(
         let _ = pack;
         false
     };
+    // The one-table kernel reads its group weights `eq_lo[2t + 1]` in
+    // prepared form, one table shared by every chunk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let k_xb =
-        one_table && kernels::aarch64::zc_k_xb_enabled() && kernels::aarch64::k_full_xb_weights(eq_lo, lo_size);
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
-    let k_xb = false;
-    if std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some() && one_table {
-        let n_groups = lo_size / 2;
-        let armed = k_xb;
-        let first_window_ok = (0..n_groups.min(8)).all(|j| {
-            j == 0 || eq_lo[2 * j + 1] == eq_lo[1] * F128::new(1u64 << (2 * j), 0)
-        });
-        eprintln!(
-            "[zc-k-xb] armed={} n_groups={} first_window_ok={}",
-            armed, n_groups, first_window_ok
-        );
-    }
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let eq_prep = if one_table && !k_xb { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
-    // The scaled table in seven pieces (`FLOCK_ZC_K_FOLD7=1`, off by default) for the packed
-    // chunks on the performance-core workers: one lookup fewer per tree, the
-    // same values (none when a byte bank is not linear).
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let fold7 = if one_table && pack && kernels::aarch64::zc_k_fold7_enabled() {
-        kernels::aarch64::r2_fold7_table(&table_l1)
-    } else {
-        None
-    };
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let fold7_addr = fold7.as_ref().map_or(0usize, |t| t.as_ptr() as usize);
-    // b-one pack (packed outputs only): each 64-output block's b takes
-    // `B_PACK_BLOCK` entries; a kernel that meets a skipped b output that is
-    // not one says so, and the whole pass is rerun without it.
-    let bpack = bpack && pack;
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let b_block = kernels::aarch64::B_PACK_BLOCK;
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
-    let b_block = 61;
-    let b_failed = std::sync::atomic::AtomicBool::new(false);
-    // K pass GPU prefix arm (`FLOCK_NO_ZC_K_GPU` kills): the GPU folds the
-    // fixed leading chunks `0..cpu_base` into its own buffers, submitted
-    // before the CPU queue, which starts at `cpu_base`. Only on the
-    // tail-compacted b-one-packed pass (the arm's layouts). During the arm's
-    // first launch (oracle probe) `cpu_base == 0` and the queue is exactly the
-    // incumbent one.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    let gpu_job = {
-        let share = crate::gpu_commit::gpu_zc_k_share().min(hi_size);
-        if gpu && bpack && compact.tail_compact && share > 0 {
-            let share = crate::gpu_commit::zc_k_launch_share().min(hi_size);
-            let hc = compact.head_compact;
-            let layout = crate::gpu_commit::ZcKLayout {
-                hc,
-                a_base: compact.anchor_index(0),
-                a_stride: if hc { kernels::aarch64::HC_ANCHORS_PER_BLOCK } else { kernels::aarch64::TC_ANCHORS_PER_BLOCK },
-                a_shift: if hc { kernels::aarch64::HC_ANCHOR_SHIFT } else { 0 },
-                d_base: compact.delta_offset(0),
-                d_stride: if hc {
-                    kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK
-                } else {
-                    kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK
-                },
-                d_shift: if hc { kernels::aarch64::HC_DELTA_SHIFT } else { 0 },
-            };
-            crate::gpu_commit::launch_zc_k_prefix(
-                &compact.anchors,
-                &compact.deltas,
-                &layout,
-                &table_l1,
-                rho2,
-                compact.head_b,
-                eq_lo,
-                eq_hi,
-                share,
-                out_chunk / 256 * 244,
-                out_chunk / 64 * b_block,
-            )
-        } else {
-            None
-        }
-    };
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    let cpu_base = gpu_job.as_ref().map_or(0, crate::gpu_commit::ZcKJob::cpu_base);
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3")))]
-    let cpu_base = 0usize;
-    let chunk_body = |x_hi: usize| {
+    let eq_prep = if one_table { kernels::aarch64::round2_eq_prep(eq_lo) } else { Vec::new() };
+    crate::epool::run_hetero_chunks(hi_size, |x_hi| {
         // SAFETY: exclusive per-chunk ownership; the queue join publishes the
         // writes before the reduction below reads them. Packed: each of a
         // chunk's `out_chunk / 256` superblocks takes 244 entries.
         let (a_ptr, b_ptr) = unsafe {
             let o = if pack { x_hi * out_chunk / 256 * 244 } else { x_hi * out_chunk };
-            let ob = if bpack { x_hi * out_chunk / 64 * b_block } else { o };
-            (a_base.ptr().add(o), b_base.ptr().add(ob))
+            (a_base.ptr().add(o), b_base.ptr().add(o))
         };
         // Each output chunk covers `out_chunk` groups = 2·out_chunk pairs.
         let pair_base = 2 * x_hi * out_chunk;
@@ -3981,94 +2674,31 @@ fn fold2_compact_and_round45_into_packed_b(
 
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            // Tail-compacted state: whole 128-pair blocks of 244 anchors and
-            // 1984 delta bytes (chunks start on a block, asserted above).
-            #[cfg(target_feature = "sha3")]
-            let (anchors, deltas) = if compact.tail_compact {
-                // `anchor_index` / `delta_offset` of the chunk's first pair.
-                (
-                    compact.anchors.as_ptr().add(compact.anchor_index(pair_base)),
-                    compact.deltas.as_ptr().add(compact.delta_offset(pair_base)),
-                )
-            } else {
-                (
-                    compact.anchors.as_ptr().add(2 * pair_base),
-                    compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
-                )
-            };
-            #[cfg(not(target_feature = "sha3"))]
-            let (anchors, deltas) = (
-                compact.anchors.as_ptr().add(2 * pair_base),
-                compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2),
-            );
+            let anchors = compact.anchors.as_ptr().add(2 * pair_base);
+            let deltas = compact.deltas.as_ptr().add(pair_base * table.n_chunks * 2);
             let (t1, t3) = (
                 table_l1.as_ptr().cast::<u8>(),
                 table_l3.as_ptr().cast::<u8>(),
             );
             let eq_ptr = eq_lo.as_ptr();
             #[cfg(target_feature = "sha3")]
-            let prep_ptr = if k_xb { eq_lo.as_ptr() } else { eq_prep.as_ptr() };
+            let prep_ptr = eq_prep.as_ptr();
             let out_ptr = outv.as_mut_ptr();
             match (fused_k, compact.dead_tail) {
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
-                    let ok = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
-                        if k_xb {
-                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true>(
-                                fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
-                                degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
-                            )
-                        } else {
-                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false>(
-                                fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
-                                degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
-                            )
-                        }
-                    } else {
-                        if k_xb {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true>(
-                                t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
-                                compact.tail_compact, compact.head_compact, compact.head_b,
-                            )
-                        } else {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
-                                t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
-                                compact.tail_compact, compact.head_compact, compact.head_b,
-                            )
-                        }
-                    };
-                    if !ok {
-                        b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true>(
+                        t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
+                    )
                 }
                 #[cfg(target_feature = "sha3")]
-                (true, true) if one_table => {
-                    if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true>(
-                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
-                            compact.tail_compact, compact.head_compact, compact.head_b,
-                        );
-                    } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
-                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
-                            compact.tail_compact, compact.head_compact, compact.head_b,
-                        );
-                    }
-                }
+                (true, true) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false>(
+                    t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
+                ),
                 #[cfg(target_feature = "sha3")]
-                (true, false) if one_table => {
-                    if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true>(
-                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
-                            false, false, F128::ZERO,
-                        );
-                    } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false>(
-                            t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
-                            false, false, F128::ZERO,
-                        );
-                    }
-                }
+                (true, false) if one_table => fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false>(
+                    t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr,
+                ),
                 #[cfg(target_feature = "sha3")]
                 (true, true) => fold2_compact_and_round45_chunk_neon_8_fused::<true>(
                     t1, t3, rho2, anchors, deltas, a_ptr, b_ptr, eq_ptr, lo_size, degen, out_ptr,
@@ -4100,60 +2730,7 @@ fn fold2_compact_and_round45_into_packed_b(
         unsafe {
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
-    };
-    crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
-
-    // Join the GPU prefix (it was submitted first and is normally done).
-    #[allow(unused_mut)]
-    let mut gpu_prefix: Option<KGpuPrefix> = None;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
-    if let Some(job) = gpu_job {
-        let calibration = job.calibration();
-        let chunks = job.chunks();
-        match crate::gpu_commit::zc_k_wait(job, hi_size) {
-            crate::gpu_commit::ZcKResult::Prefix { parts, a, b, len_a, len_b, b_ones } => {
-                if !b_ones {
-                    // A b output of the GPU's chunks that the pack skips is
-                    // not one: the pass reruns without the b-one pack, as
-                    // for the CPU's chunks.
-                    b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                } else if calibration {
-                    // Oracle probe: the CPU folded every chunk; the GPU's
-                    // outputs and weighted sums must equal the CPU's.
-                    if !b_failed.load(std::sync::atomic::Ordering::Relaxed) {
-                        // SAFETY: the joined job's buffers hold `len_a` / `len_b` entries.
-                        let (ga, gb) = unsafe {
-                            (std::slice::from_raw_parts(a, len_a), std::slice::from_raw_parts(b, len_b))
-                        };
-                        let equal = len_a <= a_out.len()
-                            && len_b <= b_out.len()
-                            && ga == &a_out[..len_a]
-                            && gb == &b_out[..len_b]
-                            && parts.as_slice() == &partials[..chunks];
-                        crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
-                        // With the 5+6 GPU arm on, an admitted probe hands its
-                        // buffers (byte-equal to the CPU's outputs above) to
-                        // the 5+6 pass, so that arm's own first launch, its
-                        // oracle, chains on them in this prove too.
-                        if equal && crate::gpu_commit::gpu_zc_t56_enabled() {
-                            gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
-                        }
-                    }
-                } else {
-                    partials[..chunks].copy_from_slice(&parts);
-                    gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
-                }
-            }
-            crate::gpu_commit::ZcKResult::Failed => {
-                // The GPU failed after admission: the CPU folds the prefix
-                // chunks with the same kernel (the arm is now disabled).
-                crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
-            }
-        }
-    }
-    if b_failed.into_inner() {
-        return None;
-    }
+    });
 
     let mut agg = [F128::ZERO; 8];
     for slot in &partials {
@@ -4176,7 +2753,7 @@ fn fold2_compact_and_round45_into_packed_b(
         c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
     };
 
-    Some((r_next4[0] * sum1, sum_inf, la5, pack, bpack, gpu_prefix))
+    (r_next4[0] * sum1, sum_inf, la5, pack)
 }
 
 /// Portable reference for one cascade K chunk (non-AArch64 builds). Same
@@ -4742,7 +3319,7 @@ fn tri_n_hi(n_vars: usize) -> usize {
     SplitEqGhash::MAX_N_HI.min(n_vars.saturating_sub(8))
 }
 
-pub(crate) fn tri_chunk_scalar(
+fn tri_chunk_scalar(
     a_in: &[F128],
     b_in: &[F128],
     a_out: &mut [F128],
@@ -4813,362 +3390,24 @@ pub(crate) fn fold_cascade_t_into(
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
-    fold_cascade_t_into_packed(a, b, false, false, a_out, b_out, rhos, r_next)
+    fold_cascade_t_into_packed(a, b, false, a_out, b_out, rhos, r_next)
 }
 
 /// [`fold_cascade_t_into`] whose input, with `packed`, is in the
 /// dead-tail-packed layout of [`fold2_compact_and_round45_into_packed`]
 /// (depth two only): `a` / `b` hold 244 entries per 256 logical inputs and
-/// logical inputs 61..63 of every 64 are zero. With `bpacked` (and
-/// `packed`), `b` is in the K pass's b-one-packed layout instead: 56 entries
-/// per 64 logical inputs, inputs 0..3 and 59 of every 64 are one.
-#[allow(clippy::too_many_arguments)]
+/// logical inputs 61..63 of every 64 are zero.
 pub(crate) fn fold_cascade_t_into_packed(
     a: &[F128],
     b: &[F128],
     packed: bool,
-    bpacked: bool,
     a_out: &mut [F128],
     b_out: &mut [F128],
     rhos: &[F128],
     r_next: &[F128],
 ) -> (F128, F128, Round3Lookahead, Lookahead2) {
-    fold_cascade_t_into_packed_prefix(a, b, packed, bpacked, None, a_out, b_out, rhos, r_next)
-}
-
-/// Entries `lo..hi` of an input whose leading `pre.len()` entries come from
-/// `pre` instead of `main` (a range across the boundary is assembled).
-fn prefixed_input<'a>(main: &'a [F128], pre: &'a [F128], lo: usize, hi: usize) -> std::borrow::Cow<'a, [F128]> {
-    let p = pre.len();
-    if hi <= p {
-        pre[lo..hi].into()
-    } else if lo >= p {
-        main[lo..hi].into()
-    } else {
-        [&pre[lo..], &main[p..hi]].concat().into()
-    }
-}
-
-/// [`fold_cascade_t_into_packed`] whose leading input entries come from
-/// `prefix = Some((pa, pb))` (the K pass GPU prefix, [`KGpuPrefix`], or the
-/// 5+6 one): entries `0..pa.len()` of `a` and `0..pb.len()` of `b` are read
-/// there, not in `a` / `b`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold_cascade_t_into_packed_prefix(
-    a: &[F128],
-    b: &[F128],
-    packed: bool,
-    bpacked: bool,
-    prefix: Option<(&[F128], &[F128])>,
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rhos: &[F128],
-    r_next: &[F128],
-) -> (F128, F128, Round3Lookahead, Lookahead2) {
-    let (m1, minf, la, la2, carried) =
-        fold_cascade_t_into_packed_prefix_gpu(a, b, packed, bpacked, prefix, a_out, b_out, rhos, r_next, false);
-    // With `gpu` off, a prefix comes back only from the tri pass 0 carry
-    // (`gpu_commit::ENV_NO_ZC_T0_CARRY`); this wrapper's callers read every
-    // output entry, so write the carried leading outputs in.
-    if let Some(p) = carried {
-        // SAFETY: the arm's buffers are rewritten only by the next prove's
-        // pass 0; the carried chunks were observed complete.
-        let (pa, pb) = unsafe { p.slices() };
-        a_out[..pa.len()].copy_from_slice(pa);
-        b_out[..pb.len()].copy_from_slice(pb);
-    }
-    (m1, minf, la, la2)
-}
-
-/// Allocate tri-pass partial rows without clearing storage that each chunk
-/// overwrites in full. The legacy switch restores the original zero fill.
-fn tri_partial_storage(len: usize) -> Vec<std::mem::MaybeUninit<[F128; 26]>> {
-    use std::mem::MaybeUninit;
-    #[cfg(test)]
-    {
-        let mode = TRI_PARTIAL_TEST_MODE.with(|m| m.get());
-        if mode == 1 {
-            return vec![MaybeUninit::new([F128::ZERO; 26]); len];
-        }
-        if mode == 2 {
-            return (0..len)
-                .map(|row| MaybeUninit::new(std::array::from_fn(|lane| {
-                    F128::new(
-                        0xa5a5_6b6b_1234_5678 ^ (row as u64).wrapping_mul(0x9e37_79b9),
-                        0x5a5a_9494_fedc_ba98 ^ (lane as u64).wrapping_mul(0x85eb_ca6b),
-                    )
-                })))
-                .collect();
-        }
-        if mode == 3 {
-            return vec![MaybeUninit::uninit(); len];
-        }
-    }
-    static UNCLEARED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_NO_ZC_TRI_PARTIALS_UNINIT").is_none()
-    });
-    if *UNCLEARED {
-        vec![MaybeUninit::uninit(); len]
-    } else {
-        vec![MaybeUninit::new([F128::ZERO; 26]); len]
-    }
-}
-
-/// Borrow only the prefix already initialized by the completed CPU queue.
-///
-/// # Safety
-/// Every row in `0..len` must be fully written and no concurrent writer may
-/// touch that prefix for the returned borrow's lifetime.
-unsafe fn tri_partial_prefix(
-    rows: &[std::mem::MaybeUninit<[F128; 26]>],
-    len: usize,
-) -> &[[F128; 26]] {
-    let prefix = &rows[..len];
-    // SAFETY: caller establishes initialization and exclusive completion;
-    // MaybeUninit<T> has exactly T's layout and alignment.
-    unsafe { std::slice::from_raw_parts(prefix.as_ptr().cast(), prefix.len()) }
-}
-
-/// Reuse the allocation after all CPU/GPU owners have initialized their rows.
-///
-/// # Safety
-/// Every element must be fully initialized, with all writes joined. Abandoned
-/// incomplete passes must drop the MaybeUninit vector instead of calling this.
-unsafe fn tri_partials_assume_init(
-    rows: Vec<std::mem::MaybeUninit<[F128; 26]>>,
-) -> Vec<[F128; 26]> {
-    let mut rows = std::mem::ManuallyDrop::new(rows);
-    // SAFETY: caller establishes initialization; element layouts, lengths and
-    // capacities are identical, and ManuallyDrop transfers the allocation once.
-    let initialized: Vec<[F128; 26]> = unsafe {
-        Vec::from_raw_parts(rows.as_mut_ptr().cast(), rows.len(), rows.capacity())
-    };
-    #[cfg(test)]
-    if TRI_PARTIAL_TEST_MODE.with(|m| m.get() != 0) {
-        TRI_PARTIAL_TEST_ROWS.with(|capture| *capture.borrow_mut() = Some(initialized.clone()));
-    }
-    initialized
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static TRI_PARTIAL_TEST_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-    static TRI_PARTIAL_TEST_ROWS: std::cell::RefCell<Option<Vec<[F128; 26]>>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Tri pass 0's claim queue with the GPU arm (see
-/// `gpu_commit::ENV_NO_ZC_T0_GPU`). `hi_size` claims, one per queue job,
-/// each under one mutex: `(g0, g1)` = (next chunk to take from the GPU,
-/// lowest chunk the CPU has taken), always `g0 < g1` before a claim, so each
-/// chunk is claimed once. A claim takes `g0` from the GPU when its encoder
-/// has signalled completion (the job's `chunk_ready`), else folds `g1 - 1`
-/// on the CPU and publishes that boundary so the GPU skips it. A GPU chunk's
-/// outputs are copied into its output ranges and its 26 slots into its
-/// partial row, exactly what `body` writes for it. At the arm's first
-/// launch (oracle) the CPU folds every chunk and the GPU's outputs and
-/// slots of every offered chunk must equal the CPU's. `FLOCK_ZC_T0_FORCE`
-/// (test hook) keeps chunks below it for the GPU and waits for them.
-///
-/// Carry (`gpu_commit::ENV_NO_ZC_T0_CARRY`): outside the oracle and the
-/// test hook, the chunks taken from the GPU are exactly `0..taken` (the GPU
-/// side of the queue only advances `g0` from 0, one ready chunk at a time).
-/// Their outputs are then not copied: they stay in the arm's buffers, and
-/// the returned prefix (`taken * chunk_out` entries of each) is what tri
-/// pass 1 reads in place of the leading entries of this pass's `a_out` /
-/// `b_out`, which are left unwritten there. `None` = nothing carried (every
-/// output range written, as before).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[allow(clippy::too_many_arguments)]
-fn tri0_gpu_queue(
-    job: crate::gpu_commit::ZcT0Job,
-    hi_size: usize,
-    chunk_out: usize,
-    a_base: crate::epool::SyncPtr<F128>,
-    b_base: crate::epool::SyncPtr<F128>,
-    partials_base: crate::epool::SyncPtr<std::mem::MaybeUninit<[F128; 26]>>,
-    body: &(dyn Fn(usize) + Sync),
-    weigh: Option<&[F128]>,
-) -> Option<KGpuPrefix> {
-    let calibration = job.calibration();
-    // Raw rows for the oracle below.
-    let weigh = weigh.filter(|_| !calibration);
-    let force = if calibration { 0 } else { crate::gpu_commit::gpu_zc_t0_force().min(job.offer()) };
-    let carry = !calibration && force == 0 && crate::gpu_commit::gpu_zc_t0_carry_enabled();
-    let claims = std::sync::Mutex::new((0usize, hi_size, 0usize));
-    crate::epool::run_hetero_chunks(hi_size, |_| {
-        let (x_hi, from_gpu) = {
-            let mut g = crate::lock_spin(&claims).unwrap_or_else(|e| e.into_inner());
-            assert!(g.0 < g.1, "tri pass 0 claim queue overrun");
-            if !calibration && job.chunk_ready(g.0) {
-                g.0 += 1;
-                g.2 += 1;
-                (g.0 - 1, true)
-            } else if !calibration && g.1 <= force {
-                // Test hook: the rest is the GPU's; wait for it.
-                g.0 += 1;
-                if job.wait_chunk(g.0 - 1) {
-                    g.2 += 1;
-                    (g.0 - 1, true)
-                } else {
-                    (g.0 - 1, false)
-                }
-            } else {
-                g.1 -= 1;
-                if !calibration {
-                    job.set_cut(g.1);
-                }
-                (g.1, false)
-            }
-        };
-        if from_gpu {
-            let (ga, gb, slots) = job.chunk_out(x_hi);
-            // Tri partials weighted on their producers: this worker weighs
-            // the GPU's row (`FLOCK_NO_TRI_WEIGHT_WORKERS`).
-            let slots = match weigh {
-                Some(eq_hi) => tri_weigh(eq_hi[x_hi], slots),
-                None => slots,
-            };
-            // SAFETY: exclusive owner of chunk `x_hi`'s output ranges and
-            // partial slot (claimed above); the queue join publishes them.
-            unsafe {
-                if !carry {
-                    std::ptr::copy_nonoverlapping(ga.as_ptr(), a_base.ptr().add(x_hi * chunk_out), chunk_out);
-                    std::ptr::copy_nonoverlapping(gb.as_ptr(), b_base.ptr().add(x_hi * chunk_out), chunk_out);
-                }
-                partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(slots));
-            }
-        } else {
-            body(x_hi);
-        }
-    });
-    let (g0, _, taken) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
-    // Carry: the GPU-taken chunks are `0..g0` (no forced claims), all of
-    // them observed complete; hand them to the next pass uncopied.
-    let carried = if carry && taken > 0 {
-        assert_eq!(g0, taken, "tri pass 0 carry: GPU chunks are not a prefix");
-        let (a, b) = job.outputs();
-        if crate::gpu_commit::gpu_zc_t0_debug() {
-            eprintln!(
-                "[zc-t0-gpu] carry: chunks 0..{taken} handed to tri pass 1 uncopied ({} KiB not copied)",
-                taken * 2 * chunk_out * std::mem::size_of::<F128>() / 1024
-            );
-        }
-        Some(KGpuPrefix { a, b, len_a: taken * chunk_out, len_b: taken * chunk_out })
-    } else {
-        None
-    };
-    if calibration {
-        let equal = job.wait_all()
-            && (0..job.offer()).all(|c| {
-                let (ga, gb, slots) = job.chunk_out(c);
-                // SAFETY: the queue has drained; no other access.
-                unsafe {
-                    std::slice::from_raw_parts(a_base.ptr().add(c * chunk_out).cast_const(), chunk_out) == ga
-                        && std::slice::from_raw_parts(b_base.ptr().add(c * chunk_out).cast_const(), chunk_out) == gb
-                        && (&*partials_base.ptr().add(c)).assume_init_ref() == &slots
-                }
-            });
-        crate::gpu_commit::zc_t0_verdict(equal, job.offer());
-    }
-    job.finish(taken, hi_size);
-    carried
-}
-
-/// Tri partials weighted on their producers (`FLOCK_NO_TRI_WEIGHT_WORKERS`, any
-/// value, keeps the record's combine). After a tri pass's chunks have joined,
-/// the record's caller multiplies every chunk's 26 raw slots by the chunk's
-/// `eq_hi` weight and sums them, serially (`hi_size * 26` products per pass).
-/// With this on, the worker that produces a chunk's row (the CPU fold, the
-/// steal, the tri pass 0 queue's copy of a ready GPU chunk) stores it already
-/// weighted by the same products, the caller weights only the rows it copies
-/// from an admitted GPU prefix, and the combine is a sum. Same products, the
-/// same terms summed in GF(2^128) (exact, order-free), so the same 26 values.
-/// Calibration launches (raw-row oracles) keep raw rows. Read once per process.
-fn tri_weight_workers_enabled() -> bool {
-    use std::sync::LazyLock;
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_TRI_WEIGHT_WORKERS").is_none());
-    *ON
-}
-
-/// A chunk's 26 tri slots times its `eq_hi` weight (the record's combine's
-/// products).
-#[inline]
-fn tri_weigh(eq_h: F128, v: [F128; 26]) -> [F128; 26] {
-    let mut w = v;
-    for x in w.iter_mut() {
-        *x = eq_h * *x;
-    }
-    w
-}
-
-/// The 26 tri sums: of weighted rows (`weighted`) or of raw rows times their
-/// `eq_hi` weights (the record's combine).
-fn tri_combine(partials: &[[F128; 26]], eq_hi: &[F128], weighted: bool) -> [F128; 26] {
-    let mut s = [F128::ZERO; 26];
-    if weighted {
-        for outv in partials {
-            for (slot, &v) in s.iter_mut().zip(outv.iter()) {
-                *slot += v;
-            }
-        }
-    } else {
-        for (x_hi, outv) in partials.iter().enumerate() {
-            let eq_h = eq_hi[x_hi];
-            for (slot, &v) in s.iter_mut().zip(outv.iter()) {
-                *slot += eq_h * v;
-            }
-        }
-    }
-    s
-}
-
-/// `FLOCK_ZC_TAIL_ROUND_TIMING` (read once): the tri combine's timing line.
-fn tri_combine_timing() -> bool {
-    use std::sync::LazyLock;
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some());
-    *ON
-}
-
-/// Caller-first main-pool tri passes (`FLOCK_NO_ZC_TRI_CF`, any value,
-/// restores the rayon `par_chunks_mut` collect; c1fbbc9e's piece). The tri
-/// passes below the hetero floor run through
-/// [`crate::epool::run_caller_first_chunks`]: the calling thread starts on
-/// chunk 0 at once and never parks on a pool latch. Same `x_hi` chunk grid
-/// and chunk closure; each chunk writes its own output range and its own
-/// `partials[x_hi]`, combined in index order, so bytes are identical. Read
-/// once per process.
-fn zc_tri_caller_first_enabled() -> bool {
-    use std::sync::LazyLock;
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TRI_CF").is_none());
-    *ON
-}
-
-/// [`fold_cascade_t_into_packed_prefix`] with the 5+6 GPU prefix arm when
-/// `gpu` is set (see `gpu_commit::ENV_NO_ZC_T56_GPU`): on the ranked packed
-/// b-one-packed depth-two pass whose `prefix` is the K arm's, the GPU folds
-/// the leading chunks that lie wholly inside that prefix. Also returns the
-/// arm's prefix (`None` unless it was used for this pass's outputs): its
-/// `len` leading outputs of `a_out` / `b_out` were not written, and the next
-/// tri pass reads them from there. Tri pass 0 returns its own GPU arm's
-/// prefix the same way when it carries (`gpu_commit::ENV_NO_ZC_T0_CARRY`),
-/// whatever `gpu` is.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
-    a: &[F128],
-    b: &[F128],
-    packed: bool,
-    bpacked: bool,
-    prefix: Option<(&[F128], &[F128])>,
-    a_out: &mut [F128],
-    b_out: &mut [F128],
-    rhos: &[F128],
-    r_next: &[F128],
-    gpu: bool,
-) -> (F128, F128, Round3Lookahead, Lookahead2, Option<KGpuPrefix>) {
-    let _ = gpu;
     let depth = rhos.len();
     assert!(depth == 2 || depth == 3);
-    let bpacked = packed && bpacked;
     let n = if packed {
         assert_eq!(depth, 2, "a packed input is the K pass output (depth two)");
         assert!(a.len().is_multiple_of(244));
@@ -5176,11 +3415,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     } else {
         a.len()
     };
-    if bpacked {
-        assert_eq!(b.len(), n / 64 * 56);
-    } else {
-        assert_eq!(b.len(), a.len());
-    }
+    assert_eq!(b.len(), a.len());
     let out_n = n >> depth;
     assert!(n.is_power_of_two() && out_n >= 8);
     assert_eq!(a_out.len(), out_n);
@@ -5203,10 +3438,6 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
     let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
-    // The group weights `eq_lo[4y + 3]` as prepared pairs, one table per
-    // pass shared by every chunk.
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let eq_prep = kernels::aarch64::round2_eq_prep(eq_lo);
 
     // Chunk `x_hi`'s input entries: `chunk_in` logical inputs, 244 entries
     // per 256 of them when packed.
@@ -5216,14 +3447,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     } else {
         chunk_in
     };
-    // The packed tri kernel tells the b layout from the slice length.
-    let per_chunk_b = if bpacked { chunk_in / 64 * 56 } else { per_chunk };
-    let (pre_a, pre_b) = prefix.unwrap_or((&[], &[]));
-    assert!(pre_a.len() <= a.len() && pre_b.len() <= b.len());
-    let inputs = |x_hi: usize| -> (std::borrow::Cow<'_, [F128]>, std::borrow::Cow<'_, [F128]>) {
+    let inputs = |x_hi: usize| -> (&[F128], &[F128]) {
         (
-            prefixed_input(a, pre_a, x_hi * per_chunk, (x_hi + 1) * per_chunk),
-            prefixed_input(b, pre_b, x_hi * per_chunk_b, (x_hi + 1) * per_chunk_b),
+            &a[x_hi * per_chunk..(x_hi + 1) * per_chunk],
+            &b[x_hi * per_chunk..(x_hi + 1) * per_chunk],
         )
     };
     let chunk = |a_in: &[F128], b_in: &[F128], a_o: &mut [F128], b_o: &mut [F128]| -> [F128; 26] {
@@ -5232,18 +3459,17 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
             if packed {
                 use kernels::aarch64::fold_tri_and_message_packed_aarch64 as kp;
                 return if nt_stores {
-                    kp::<true>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo, &eq_prep)
+                    kp::<true>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo)
                 } else {
-                    kp::<false>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo, &eq_prep)
+                    kp::<false>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], eq_lo)
                 };
             }
             use kernels::aarch64::fold_tri_and_message_aarch64 as k;
-            let ep = &eq_prep;
             match (depth, nt_stores) {
-                (2, true) => k::<2, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo, ep),
-                (2, false) => k::<2, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo, ep),
-                (_, true) => k::<3, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo, ep),
-                (_, false) => k::<3, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo, ep),
+                (2, true) => k::<2, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                (2, false) => k::<2, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                (_, true) => k::<3, true, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
+                (_, false) => k::<3, false, 0>(a_in, b_in, a_o, b_o, rhos[0], rhos[1], rho_c, eq_lo),
             }
         }
         #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
@@ -5259,211 +3485,12 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     #[cfg(not(target_arch = "aarch64"))]
     let hetero = false;
 
-    #[allow(unused_mut)]
-    let mut gpu_prefix: Option<KGpuPrefix> = None;
-    #[cfg(test)]
-    let hetero = hetero || TRI_PARTIAL_TEST_MODE.with(|m| m.get() != 0);
-    // Tri partials weighted on their producers (`FLOCK_NO_TRI_WEIGHT_WORKERS`).
-    let ww = tri_weight_workers_enabled();
-    let timing = tri_combine_timing();
-    #[allow(unused_mut)]
-    let mut rows_us = 0.0f64;
-    let (partials, weighted): (Vec<[F128; 26]>, bool) = if hetero {
-        let mut partials = tri_partial_storage(hi_size);
+    let partials: Vec<[F128; 26]> = if hetero {
+        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
         let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        // 5+6 GPU prefix arm (`FLOCK_NO_ZC_T56_GPU` kills): the GPU folds
-        // chunks `0..cpu_base` (those wholly inside the K arm's prefix) from
-        // the K arm's buffers into its own, submitted before the CPU queue,
-        // which starts at `cpu_base`. During the arm's first launch (oracle)
-        // `cpu_base == 0` and the queue is exactly the incumbent one.
-        // Late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1` keeps the record's join
-        // below): in an admitted prove the launch, the share and the CPU
-        // queue are the record's. If the GPU's buffer is complete when the
-        // queue has drained, that is all. If not, the CPU does not wait: it
-        // folds the GPU's chunks itself from the top of the share downward
-        // and asks at every claim whether the buffer has completed.
-        //
-        // The seam: the boundary `lo` and the completion flag change only
-        // under the claim lock; once completion is seen the boundary never
-        // moves again. The kernel skips a chunk only at or above a boundary
-        // value the CPU wrote, and every value written is the chunk the CPU
-        // claimed with it, so a chunk below the final `lo` was never skipped
-        // (the completed buffer folded it) and never claimed (no CPU write).
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let loop_arm = match prefix {
-            Some((pa, pb))
-                if gpu
-                    && crate::gpu_commit::zc_t56_loop_admitted()
-                    && packed
-                    && bpacked
-                    && depth == 2
-                    && hi_size == crate::gpu_commit::zc_t56::HI
-                    && chunk_out == crate::gpu_commit::zc_t56::OUT
-                    && per_chunk == crate::gpu_commit::zc_t56::IN_A
-                    && per_chunk_b == crate::gpu_commit::zc_t56::IN_B =>
-            {
-                let chunks =
-                    (pa.len() / per_chunk).min(pb.len() / per_chunk_b).min(crate::gpu_commit::gpu_zc_t56_cap());
-                Some((pa, pb, chunks))
-            }
-            _ => None,
-        };
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let Some((pa, pb, share)) = loop_arm {
-            let fold = |x_hi: usize| {
-                // SAFETY: exclusive per-chunk ownership (queue index or
-                // claim); the queue join publishes the writes.
-                let (a_o, b_o) = unsafe {
-                    (
-                        std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
-                        std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
-                    )
-                };
-                let (a_in, b_in) = inputs(x_hi);
-                let outv = chunk(&a_in, &b_in, a_o, b_o);
-                let outv = if ww { tri_weigh(eq_hi[x_hi], outv) } else { outv };
-                // SAFETY: exclusive owner of this row; write a complete value
-                // without forming a reference to uninitialized storage.
-                unsafe {
-                    partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
-                }
-            };
-            // The record's launch and queue: the GPU's share first, the CPU
-            // folds the chunks after it in ascending order.
-            let job = crate::gpu_commit::launch_zc_t56_loop(pa, pb, share, rhos[0], rhos[1], eq_lo);
-            let cpu_base = job.as_ref().map_or(0, |j| j.chunks());
-            crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| fold(cpu_base + i));
-            if let Some(job) = job {
-                let mut lo = cpu_base;
-                let mut gpu_done = job.done();
-                if !gpu_done {
-                    // The GPU is late: steal from the top of its share.
-                    let claims = std::sync::Mutex::new((cpu_base, false));
-                    crate::epool::run_hetero_chunks(cpu_base, |_| {
-                        let x_hi = {
-                            let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
-                            if g.1 || g.0 == 0 {
-                                return;
-                            }
-                            if job.done() {
-                                g.1 = true;
-                                return;
-                            }
-                            // Test builds only (see `t56_loop_hold`, the
-                            // constant 0 otherwise): do not steal below
-                            // chunk `n`; wait for the GPU instead, so a slow
-                            // GPU still keeps `min(n, share)` chunks and
-                            // that path can be checked.
-                            if g.0 <= t56_loop_hold() {
-                                while !job.done() {
-                                    std::hint::spin_loop();
-                                }
-                                g.1 = true;
-                                return;
-                            }
-                            job.set_cut(g.0 - 1);
-                            g.0 -= 1;
-                            g.0
-                        };
-                        fold(x_hi);
-                    });
-                    (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
-                    // Without the completion seen, the CPU folded every
-                    // chunk and nothing of the GPU's is read.
-                    assert!(gpu_done || lo == 0, "5+6 steal ended early");
-                }
-                // A buffer that signalled and still reports an error is not
-                // trusted (the record's join checks the status too): the CPU
-                // folds what it had left to the GPU; `finish` turns the arm
-                // off.
-                let gpu_ok = gpu_done && !job.failed();
-                if gpu_done && !gpu_ok {
-                    crate::epool::run_hetero_chunks(lo, &fold);
-                }
-                let taken = if gpu_ok { lo } else { 0 };
-                let t_rows = timing.then(std::time::Instant::now);
-                if ww && taken >= 64 {
-                    // Tri partials weighted on their producers: the GPU's
-                    // rows (each finished from its banks, then weighted) by
-                    // the pool, eight rows per claim, instead of the caller.
-                    let rows = |g: usize| {
-                        for c in 8 * g..(8 * g + 8).min(taken) {
-                            // SAFETY: row `c` belongs to claim `g` alone; the
-                            // run's join publishes it.
-                            unsafe {
-                                partials_base
-                                    .ptr()
-                                    .add(c)
-                                    .write(std::mem::MaybeUninit::new(tri_weigh(eq_hi[c], job.part(c))));
-                            }
-                        }
-                    };
-                    crate::epool::run_hetero_chunks_then(taken.div_ceil(8), &rows, &|| {});
-                } else {
-                    for c in 0..taken {
-                        let part = job.part(c);
-                        partials[c].write(if ww { tri_weigh(eq_hi[c], part) } else { part });
-                    }
-                }
-                rows_us = t_rows.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-                if taken > 0 {
-                    let (a, b) = job.outputs();
-                    gpu_prefix = Some(KGpuPrefix { a, b, len_a: taken * chunk_out, len_b: taken * chunk_out });
-                }
-                job.finish(taken, hi_size);
-            }
-            return {
-                // SAFETY: the joined CPU suffix/steals and the copied GPU
-                // prefix partition every row; failure paths recompute the rest.
-                let partials = unsafe { tri_partials_assume_init(partials) };
-                let t_comb = timing.then(std::time::Instant::now);
-                let s = tri_combine(&partials, eq_hi, ww);
-                let comb_us = t_comb.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-                let (m1, minf, la, la2) = tri_finish(&s, r_next);
-                if timing {
-                    eprintln!(
-                        "[zc-tail-rounds] tri combine (rows={hi_size}, weighted on workers={ww}): \
-                         gpu rows {rows_us:.1} us + sum {comb_us:.1} us"
-                    );
-                }
-                (m1, minf, la, la2, gpu_prefix)
-            };
-        }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let gpu_job = match prefix {
-            Some((pa, pb))
-                if gpu
-                    && crate::gpu_commit::gpu_zc_t56_enabled()
-                    && packed
-                    && bpacked
-                    && depth == 2
-                    && hi_size == crate::gpu_commit::zc_t56::HI
-                    && chunk_out == crate::gpu_commit::zc_t56::OUT
-                    && per_chunk == crate::gpu_commit::zc_t56::IN_A
-                    && per_chunk_b == crate::gpu_commit::zc_t56::IN_B =>
-            {
-                let chunks =
-                    (pa.len() / per_chunk).min(pb.len() / per_chunk_b).min(crate::gpu_commit::gpu_zc_t56_cap());
-                crate::gpu_commit::launch_zc_t56_prefix(pa, pb, chunks, rhos[0], rhos[1], eq_lo)
-            }
-            _ => None,
-        };
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let cpu_base = gpu_job.as_ref().map_or(0, crate::gpu_commit::ZcT56Job::cpu_base);
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let cpu_base = 0usize;
-        // One queue closure for both drains below (CPU chunks from `base`).
-        let base = std::sync::atomic::AtomicUsize::new(cpu_base);
-        // Tri partials weighted on their producers, unless a launch here is a
-        // calibration (its oracle compares raw rows).
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let ww_h = std::sync::atomic::AtomicBool::new(ww && !gpu_job.as_ref().is_some_and(|j| j.calibration()));
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let ww_h = std::sync::atomic::AtomicBool::new(ww);
-        let body = |i: usize| {
-            let x_hi = base.load(std::sync::atomic::Ordering::Relaxed) + i;
+        crate::epool::run_hetero_chunks(hi_size, |x_hi| {
             // SAFETY: exclusive per-chunk ownership; queue join publishes writes.
             let (a_o, b_o) = unsafe {
                 (
@@ -5472,181 +3499,37 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                 )
             };
             let (a_in, b_in) = inputs(x_hi);
-            let outv = chunk(&a_in, &b_in, a_o, b_o);
-            let outv =
-                if ww_h.load(std::sync::atomic::Ordering::Relaxed) { tri_weigh(eq_hi[x_hi], outv) } else { outv };
-            // SAFETY: exclusive owner; initialize the complete row by value.
-            unsafe {
-                partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
-            }
-        };
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let t_cpu = std::time::Instant::now();
-        // Tri pass 0 GPU arm (`FLOCK_NO_ZC_T0_GPU` kills): this pass's
-        // leading inputs are the 5+6 arm's buffers; the GPU folds the chunks
-        // wholly inside them from chunk 0 up while the queue claims from the
-        // top, and the queue takes a chunk from the GPU only once its encoder
-        // has signalled (see `tri0_gpu_queue`).
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let t0_job = match prefix {
-            Some((pa, pb))
-                if depth == 3
-                    && !packed
-                    && cpu_base == 0
-                    && crate::gpu_commit::gpu_zc_t0_enabled()
-                    && hi_size == crate::gpu_commit::T0_HI
-                    && chunk_out == crate::gpu_commit::T0_OUT
-                    && chunk_in == crate::gpu_commit::T0_IN =>
-            {
-                crate::gpu_commit::zc_t0_fire(pa, pb, [rhos[0], rhos[1], rhos[2]], eq_lo)
-            }
-            _ => None,
-        };
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let t0_job: Option<()> = None;
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if t0_job.as_ref().is_some_and(|j| j.calibration()) {
-            ww_h.store(false, std::sync::atomic::Ordering::Relaxed);
-        }
-        match t0_job {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            Some(job) => {
-                let weigh = if ww_h.load(std::sync::atomic::Ordering::Relaxed) { Some(eq_hi.as_slice()) } else { None };
-                // Carry (`ENV_NO_ZC_T0_CARRY`): the GPU-taken leading
-                // outputs stay in the arm's buffers; returned below for tri
-                // pass 1, which reads them in place of `a_out` / `b_out`'s
-                // leading entries (not written in that case).
-                if let Some(p) = tri0_gpu_queue(job, hi_size, chunk_out, a_base, b_base, partials_base, &body, weigh) {
-                    gpu_prefix = Some(p);
-                }
-            }
-            _ => crate::epool::run_hetero_chunks(hi_size - cpu_base, &body),
-        }
-        // Join the GPU prefix (submitted first; normally done).
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if let Some(job) = gpu_job {
-            let calibration = job.calibration();
-            let chunks = job.chunks();
-            let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1e3;
-            match crate::gpu_commit::zc_t56_wait(job, hi_size, cpu_ms) {
-                crate::gpu_commit::ZcT56Result::Prefix { parts, a, b, len } => {
-                    if calibration {
-                        // Oracle: the CPU folded every chunk; the GPU's
-                        // outputs and slots must equal the CPU's.
-                        // SAFETY: the joined job's buffers hold `len` entries each.
-                        let (ga, gb) =
-                            unsafe { (std::slice::from_raw_parts(a, len), std::slice::from_raw_parts(b, len)) };
-                        let equal = len <= a_out.len()
-                            && ga == &a_out[..len]
-                            && gb == &b_out[..len]
-                            // SAFETY: calibration uses cpu_base=0; the CPU
-                            // queue has completed every row before this oracle.
-                            && parts.as_slice() == unsafe { tri_partial_prefix(&partials, chunks) };
-                        crate::gpu_commit::zc_t56_verdict(equal, chunks, hi_size);
-                        // With the tri pass 0 arm on, an admitted oracle hands
-                        // its buffers (byte-equal to the CPU's outputs above)
-                        // to pass 0, so that arm's own first launch, its
-                        // oracle, chains on them in this prove too.
-                        if equal && crate::gpu_commit::gpu_zc_t0_enabled() {
-                            gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
-                        }
-                    } else {
-                        assert_eq!(parts.len(), chunks);
-                        let ww_rows = ww_h.load(std::sync::atomic::Ordering::Relaxed);
-                        let t_rows = timing.then(std::time::Instant::now);
-                        for (c, (dst, value)) in partials[..chunks].iter_mut().zip(parts).enumerate() {
-                            dst.write(if ww_rows { tri_weigh(eq_hi[c], value) } else { value });
-                        }
-                        rows_us = t_rows.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-                        gpu_prefix = Some(KGpuPrefix { a, b, len_a: len, len_b: len });
-                    }
-                }
-                crate::gpu_commit::ZcT56Result::Failed => {
-                    // The GPU failed after admission: the CPU folds the
-                    // prefix chunks (the arm is now disabled).
-                    base.store(0, std::sync::atomic::Ordering::Relaxed);
-                    crate::epool::run_hetero_chunks(cpu_base, &body);
-                }
-            }
-        }
-        // SAFETY: each CPU row is assigned in full; admitted GPU prefix rows
-        // are copied in full, and any failed prefix was recomputed on the CPU.
-        // The tri0 queue likewise writes each claimed row before returning.
-        (unsafe { tri_partials_assume_init(partials) }, ww_h.into_inner())
-    } else if hi_size == 1 {
-        let (a_in, b_in) = inputs(0);
-        (vec![chunk(&a_in, &b_in, a_out, b_out)], false)
-    } else if zc_tri_caller_first_enabled() {
-        // The `par_chunks_mut(chunk_out)` grid below: `hi_size` chunks.
-        let mut partials: Vec<[F128; 26]> = vec![[F128::ZERO; 26]; hi_size];
-        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
-        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_caller_first_chunks(hi_size, &|x_hi| {
-            // SAFETY: the drain runs each `x_hi` exactly once; its output
-            // ranges are disjoint per chunk, and the drain publishes every
-            // write before the combine below reads them.
-            let (a_o, b_o) = unsafe {
-                (
-                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
-                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
-                )
-            };
-            let (a_in, b_in) = inputs(x_hi);
-            let outv = chunk(&a_in, &b_in, a_o, b_o);
-            let outv = if ww { tri_weigh(eq_hi[x_hi], outv) } else { outv };
+            let outv = chunk(a_in, b_in, a_o, b_o);
             // SAFETY: exclusive owner of partials[x_hi].
             unsafe {
                 *partials_base.ptr().add(x_hi) = outv;
             }
         });
-        (partials, ww)
+        partials
+    } else if hi_size == 1 {
+        let (a_in, b_in) = inputs(0);
+        vec![chunk(a_in, b_in, a_out, b_out)]
     } else {
         use rayon::prelude::*;
-        (
-            a_out
+        a_out
             .par_chunks_mut(chunk_out)
             .zip(b_out.par_chunks_mut(chunk_out))
             .enumerate()
             .map(|(x_hi, (a_o, b_o))| {
                 let (a_in, b_in) = inputs(x_hi);
-                chunk(&a_in, &b_in, a_o, b_o)
+                chunk(a_in, b_in, a_o, b_o)
             })
-            .collect::<Vec<_>>(),
-            false,
-        )
+            .collect()
     };
 
-    let t_comb = timing.then(std::time::Instant::now);
-    let s = tri_combine(&partials, eq_hi, weighted);
-    let comb_us = t_comb.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
-    let (m1, minf, la, la2) = tri_finish(&s, r_next);
-    if timing {
-        eprintln!(
-            "[zc-tail-rounds] tri combine (rows={hi_size}, weighted on workers={weighted}): \
-             gpu rows {rows_us:.1} us + sum {comb_us:.1} us"
-        );
+    let mut s = [F128::ZERO; 26];
+    for (x_hi, outv) in partials.iter().enumerate() {
+        let eq_h = eq_hi[x_hi];
+        for (slot, &v) in s.iter_mut().zip(outv.iter()) {
+            *slot += eq_h * v;
+        }
     }
-    (m1, minf, la, la2, gpu_prefix)
-}
-
-/// Test hook of the 5+6 arm's late-GPU steal (see its claim queue). It exists only
-/// in a build made with `FLOCK_ZC_T56_TEST_HOOK` set in the BUILD
-/// environment (`option_env!`): such a build holds at chunk
-/// `FLOCK_ZC_T56_LOOP_HOLD` (run time), or at the build variable's value when
-/// that is unset. In every other build this is the constant 0 and nothing in
-/// the process environment can change the claim queue.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn t56_loop_hold() -> usize {
-    const HOOK: Option<&str> = option_env!("FLOCK_ZC_T56_TEST_HOOK");
-    let Some(built) = HOOK else { return 0 };
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("FLOCK_ZC_T56_LOOP_HOLD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| built.parse().unwrap_or(0))
-    })
+    tri_finish(&s, r_next)
 }
 
 /// Kill switch for the shared inversion of the tri-cascade finish:
@@ -6024,28 +3907,6 @@ pub fn fold_packed_witness_at_z(
 ///
 /// Used at the tail of the multilinear-round sequence where the polynomial is
 /// small enough that parallel/fusion overhead outweighs benefit.
-/// Two consecutive [`fold_in_place_pair`] binds (`r1`, then `r2`) in one pass:
-/// per output `x` it computes `a01 = a[4x] + r1·(a[4x+1] + a[4x])`,
-/// `a23 = a[4x+2] + r1·(a[4x+3] + a[4x+2])` and `a01 + r2·(a23 + a01)` — the
-/// same field operations in the same order as the two passes, without storing
-/// the half-size intermediate tables. Same for `b`.
-pub fn fold2_in_place_pair(a: &mut Vec<F128>, b: &mut Vec<F128>, r1: F128, r2: F128) {
-    let n = a.len();
-    assert_eq!(b.len(), n);
-    assert!(n.is_power_of_two() && n >= 4);
-    let quarter = n / 4;
-    for x in 0..quarter {
-        let a01 = a[4 * x] + r1 * (a[4 * x + 1] + a[4 * x]);
-        let a23 = a[4 * x + 2] + r1 * (a[4 * x + 3] + a[4 * x + 2]);
-        let b01 = b[4 * x] + r1 * (b[4 * x + 1] + b[4 * x]);
-        let b23 = b[4 * x + 2] + r1 * (b[4 * x + 3] + b[4 * x + 2]);
-        a[x] = a01 + r2 * (a23 + a01);
-        b[x] = b01 + r2 * (b23 + b01);
-    }
-    a.truncate(quarter);
-    b.truncate(quarter);
-}
-
 pub fn fold_in_place_pair(a: &mut Vec<F128>, b: &mut Vec<F128>, challenge: F128) {
     let n = a.len();
     assert_eq!(b.len(), n);
@@ -6501,39 +4362,6 @@ fn fold_and_compute_round_pair_into_with_n_hi(
             .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
                 (s1 + c1, sinf + cinf)
             })
-    } else if hi_size > 1 && zc_tail_caller_first_enabled() {
-        // Caller-first drain of the same `x_hi` chunk grid (see
-        // `zc_tail_caller_first_enabled`): each chunk writes its own output
-        // ranges and its own partial slot; the sums are XORs of the same
-        // per-chunk terms, so the order cannot change a bit.
-        let mut partials: Vec<(F128, F128)> = vec![(F128::ZERO, F128::ZERO); hi_size];
-        let a_base = crate::epool::SyncPtr(a_out.as_mut_ptr());
-        let b_base = crate::epool::SyncPtr(b_out.as_mut_ptr());
-        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
-        crate::epool::run_caller_first_chunks(hi_size, &|x_hi| {
-            // SAFETY: the drain runs each `x_hi` exactly once; output ranges
-            // are disjoint per chunk and published before the sum below.
-            let (a_o, b_o) = unsafe {
-                (
-                    std::slice::from_raw_parts_mut(a_base.ptr().add(x_hi * chunk_out), chunk_out),
-                    std::slice::from_raw_parts_mut(b_base.ptr().add(x_hi * chunk_out), chunk_out),
-                )
-            };
-            let (p1, pinf) = chunk_partial(
-                &a[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                &b[x_hi * chunk_in..(x_hi + 1) * chunk_in],
-                a_o,
-                b_o,
-            );
-            let eq_h = eq_hi[x_hi];
-            // SAFETY: exclusive owner of partials[x_hi].
-            unsafe {
-                *partials_base.ptr().add(x_hi) = (eq_h * p1, eq_h * pinf);
-            }
-        });
-        partials
-            .iter()
-            .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| (s1 + c1, sinf + cinf))
     } else {
         a_out
             .par_chunks_mut(chunk_out)
@@ -6556,18 +4384,6 @@ fn fold_and_compute_round_pair_into_with_n_hi(
     };
 
     (r_next[0] * sum1, sum_inf)
-}
-
-/// Caller-first main-pool zerocheck tail rounds below the hetero floor
-/// (`FLOCK_NO_ZC_TAIL_CF`, any value, restores the rayon
-/// `par_chunks_mut` reduce): the calling thread starts on chunk 0 at once and
-/// never parks on a pool latch (the lincheck wide rounds' caller-first, one
-/// phase later). Same chunk grid and chunk closure; the message sums are XORs
-/// of the same per-chunk terms. Read once per process.
-fn zc_tail_caller_first_enabled() -> bool {
-    use std::sync::LazyLock;
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_TAIL_CF").is_none());
-    *ON
 }
 
 /// Serial reference — identical I/O contract to
@@ -6718,202 +4534,6 @@ mod tests {
         }
     }
 
-    /// Timing probe (ignored): the ranked-size cascade K pass and composed
-    /// 5+6 pass with the b-one pack on and off, interleaved in one process
-    /// on a synthetic compact state with the ranked b == 1 pairs. Prints the
-    /// per-mode medians and the paired differences; asserts equal messages.
-    /// `KBONE_LOG_GROUPS` (default 24) and `KBONE_SAMPLES` (default 21).
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    #[test]
-    #[ignore = "timing probe"]
-    fn k_bone_pack_timing() {
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(8).build_global();
-        crate::set_calling_thread_prover_qos();
-        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let log_groups = env("KBONE_LOG_GROUPS", 24);
-        let samples = env("KBONE_SAMPLES", 21);
-        let n_groups = 1usize << log_groups;
-        let n_pairs = 2 * n_groups;
-        let mut rng = Rng::new(0x6b62_6f6e_6531);
-        let table = UniSkipFoldTable::new(6, rng.f128());
-        let mut anchors = rng.f128_vec(2 * n_pairs);
-        let mut deltas = crate::scratch::ScratchBytes::take(16 * n_pairs);
-        for chunk in deltas.chunks_exact_mut(8) {
-            chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
-        }
-        for p in 0..n_pairs {
-            if matches!(p % 128, 0..=8 | 118 | 119) {
-                anchors[2 * p + 1] = F128::ONE;
-                deltas[16 * p + 8..16 * p + 16].fill(0);
-            }
-        }
-        let compact = UniSkipCompactFold { anchors, deltas, dead_tail: true, tail_compact: false, tail_base_blocks: 0, head_compact: false, head_b: F128::ZERO };
-        let (rho1, rho2) = (rng.f128(), rng.f128());
-        let mut r_next4 = vec![F128::ONE; log_groups];
-        for r in &mut r_next4[1..] {
-            *r = rng.f128();
-        }
-        let rhos = [rng.f128(), rng.f128()];
-        let mut r_next6 = vec![F128::ONE; log_groups - 2];
-        for r in &mut r_next6[1..] {
-            *r = rng.f128();
-        }
-        let mut a_out = vec![F128::ZERO; n_groups];
-        let mut b_out = vec![F128::ZERO; n_groups];
-        let mut a2 = vec![F128::ZERO; n_groups / 4];
-        let mut b2 = vec![F128::ZERO; n_groups / 4];
-        let mut run = |bpack: bool| {
-            let t = std::time::Instant::now();
-            let (m1, minf, la, packed, bpacked, _) = fold2_compact_and_round45_into_packed_b(
-                &compact, &table, rho1, rho2, &r_next4, &mut a_out, &mut b_out, true, bpack, false,
-            )
-            .expect("ranked b == 1 pairs");
-            let k_ms = t.elapsed().as_secs_f64() * 1e3;
-            assert!(packed && bpacked == bpack);
-            let main = n_groups / 256 * 244;
-            let main_b = if bpacked { n_groups / 64 * 56 } else { main };
-            let t = std::time::Instant::now();
-            let (e1, einf, _, _) = fold_cascade_t_into_packed(
-                &a_out[..main], &b_out[..main_b], true, bpacked, &mut a2, &mut b2, &rhos, &r_next6,
-            );
-            let c_ms = t.elapsed().as_secs_f64() * 1e3;
-            (k_ms, c_ms, (m1, minf, la.c, e1, einf, a2[a2.len() - 1], b2[1]))
-        };
-        let want = run(false).2;
-        assert_eq!(run(true).2, want);
-        let (mut k_off, mut k_on, mut c_off, mut c_on) = (vec![], vec![], vec![], vec![]);
-        for i in 0..samples {
-            let order = if i % 2 == 0 { [false, true] } else { [true, false] };
-            for bpack in order {
-                let (k, c, v) = run(bpack);
-                assert_eq!(v, want);
-                if bpack {
-                    k_on.push(k);
-                    c_on.push(c);
-                } else {
-                    k_off.push(k);
-                    c_off.push(c);
-                }
-            }
-        }
-        let med = |v: &[f64]| {
-            let mut s = v.to_vec();
-            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            s[s.len() / 2]
-        };
-        let diff = |on: &[f64], off: &[f64]| -> (f64, f64, f64, usize) {
-            let d: Vec<f64> = on.iter().zip(off).map(|(a, b)| a - b).collect();
-            let n = d.len() as f64;
-            let mean = d.iter().sum::<f64>() / n;
-            let sd = (d.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
-            (mean, sd / n.sqrt(), med(&d), d.iter().filter(|&&x| x < 0.0).count())
-        };
-        let (km, kse, kmed, kn) = diff(&k_on, &k_off);
-        let (cm, cse, cmed, cn) = diff(&c_on, &c_off);
-        println!(
-            "KBONE n_groups 2^{log_groups} samples {samples}: K off med {:.3} on med {:.3} ms, paired on-off mean {km:+.3} se {kse:.3} med {kmed:+.3} faster {kn}/{samples} | 5+6 off med {:.3} on med {:.3} ms, paired mean {cm:+.3} se {cse:.3} med {cmed:+.3} faster {cn}/{samples}",
-            med(&k_off),
-            med(&k_on),
-            med(&c_off),
-            med(&c_on),
-        );
-    }
-
-    /// Timing probe (ignored): the ranked-size cascade K pass (b-one pack on)
-    /// over the same synthetic dead-tail compact state in the dense and the
-    /// tail-compacted layout, interleaved in one process. Asserts equal
-    /// messages and outputs. `KBONE_LOG_GROUPS`, `KBONE_SAMPLES`.
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    #[test]
-    #[ignore = "timing probe"]
-    fn k_tail_compact_timing() {
-        use kernels::aarch64::{TC_ANCHORS_PER_BLOCK, TC_DELTA_BYTES_PER_BLOCK};
-        let _ = rayon::ThreadPoolBuilder::new().num_threads(8).build_global();
-        crate::set_calling_thread_prover_qos();
-        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let log_groups = env("KBONE_LOG_GROUPS", 24);
-        let samples = env("KBONE_SAMPLES", 21);
-        let n_groups = 1usize << log_groups;
-        let n_pairs = 2 * n_groups;
-        let mut rng = Rng::new(0x7463_6f6d_7031);
-        let table = UniSkipFoldTable::new(6, rng.f128());
-        let mut anchors = rng.f128_vec(2 * n_pairs);
-        let mut deltas = crate::scratch::ScratchBytes::take(16 * n_pairs);
-        for chunk in deltas.chunks_exact_mut(8) {
-            chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
-        }
-        for p in 0..n_pairs {
-            if matches!(p % 128, 0..=8 | 118 | 119) {
-                anchors[2 * p + 1] = F128::ONE;
-                deltas[16 * p + 8..16 * p + 16].fill(0);
-            }
-        }
-        let dense = UniSkipCompactFold { anchors, deltas, dead_tail: true, tail_compact: false, tail_base_blocks: 0, head_compact: false, head_b: F128::ZERO };
-        let mut tc = UniSkipCompactFold {
-            anchors: vec![F128::new(3, 3); 2 * n_pairs],
-            deltas: crate::scratch::ScratchBytes::take(16 * n_pairs),
-            dead_tail: true,
-            tail_compact: true,
-            tail_base_blocks: cascade_k_pairs_per_chunk(n_pairs) / 128,
-            head_compact: false,
-            head_b: F128::ZERO,
-        };
-        for blk in 0..n_pairs / 128 {
-            let (ia, id) = (tc.anchor_index(128 * blk), tc.delta_offset(128 * blk));
-            tc.anchors[ia..ia + TC_ANCHORS_PER_BLOCK]
-                .copy_from_slice(&dense.anchors[256 * blk..256 * blk + TC_ANCHORS_PER_BLOCK]);
-            tc.deltas[id..id + TC_DELTA_BYTES_PER_BLOCK]
-                .copy_from_slice(&dense.deltas[2048 * blk..2048 * blk + TC_DELTA_BYTES_PER_BLOCK]);
-        }
-        let (rho1, rho2) = (rng.f128(), rng.f128());
-        let mut r_next4 = vec![F128::ONE; log_groups];
-        for r in &mut r_next4[1..] {
-            *r = rng.f128();
-        }
-        let mut a_out = vec![F128::ZERO; n_groups];
-        let mut b_out = vec![F128::ZERO; n_groups];
-        let mut run = |c: &UniSkipCompactFold| {
-            let t = std::time::Instant::now();
-            let (m1, minf, la, _, _, _) = fold2_compact_and_round45_into_packed_b(
-                c, &table, rho1, rho2, &r_next4, &mut a_out, &mut b_out, true, true, false,
-            )
-            .expect("ranked b == 1 pairs");
-            let k_ms = t.elapsed().as_secs_f64() * 1e3;
-            (k_ms, (m1, minf, la.c, a_out[n_groups / 2 + 7], b_out[n_groups / 3 + 5]))
-        };
-        let want = run(&dense).1;
-        assert_eq!(run(&tc).1, want);
-        let (mut off, mut on) = (vec![], vec![]);
-        for i in 0..samples {
-            let order = if i % 2 == 0 { [false, true] } else { [true, false] };
-            for compact in order {
-                let (k, v) = run(if compact { &tc } else { &dense });
-                assert_eq!(v, want);
-                if compact {
-                    on.push(k);
-                } else {
-                    off.push(k);
-                }
-            }
-        }
-        let med = |v: &[f64]| {
-            let mut s = v.to_vec();
-            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            s[s.len() / 2]
-        };
-        let d: Vec<f64> = on.iter().zip(&off).map(|(a, b)| a - b).collect();
-        let n = d.len() as f64;
-        let mean = d.iter().sum::<f64>() / n;
-        let se = (d.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt() / n.sqrt();
-        println!(
-            "KTC n_groups 2^{log_groups} samples {samples}: K dense med {:.3} compacted med {:.3} ms, paired mean {mean:+.3} se {se:.3} med {:+.3} faster {}/{samples}",
-            med(&off),
-            med(&on),
-            med(&d),
-            d.iter().filter(|&&x| x < 0.0).count(),
-        );
-    }
-
     #[test]
     fn lookahead_kappa_inverse_reuse_matches_incumbent_algebra() {
         let mut rng = Rng::new(0x51a7_1e5e);
@@ -6946,56 +4566,6 @@ mod tests {
     // ----------------------------------------------------------------------
 
     /// `Σ_i L_i(z) = 1` for all z. The polynomial `1` interpolates to constant
-    /// Dropping the first challenge of an equality table by pair sums gives
-    /// the fresh table of the shorter suffix, entry for entry (both builder
-    /// routes: below and from three challenges), and the serial round on that
-    /// table equals `round_pair_naive`; a chain of drops (as in the serial
-    /// zerocheck tail) stays exact down to the one-entry table.
-    #[test]
-    fn eq_drop_first_matches_fresh_suffix_tables() {
-        let mut rng = Rng::new(0x5a7a_11e9);
-        for len in 1usize..=12 {
-            let r: Vec<F128> = (0..len).map(|_| rng.f128()).collect();
-            let mut eq = build_eq(&r);
-            for d in 1..=len {
-                eq = eq_drop_first(&eq);
-                assert_eq!(eq, build_eq(&r[d..]), "len {len} drop {d}");
-            }
-            let n = 1usize << len;
-            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let mut rr = vec![F128::ONE];
-            rr.extend_from_slice(&r[1..]);
-            let tab = eq_drop_first(&build_eq(&r));
-            assert_eq!(round_pair_naive_with_eq(&a, &b, rr[0], &tab), round_pair_naive(&a, &b, &rr));
-            assert_eq!(
-                round_pair_naive_with_eq(&a, &b, r[0], &build_eq(&r[1..])),
-                round_pair_naive(&a, &b, &r)
-            );
-        }
-    }
-
-    #[test]
-    fn fused_tail_fold_and_round_matches_two_passes() {
-        let mut rng = Rng::new(0x7a11_f01d);
-        for log_n in 2usize..=12 {
-            let n = 1usize << log_n;
-            let a: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let b: Vec<F128> = (0..n).map(|_| rng.f128()).collect();
-            let rho = rng.f128();
-            let r_0 = rng.f128();
-            let r: Vec<F128> = (0..log_n - 2).map(|_| rng.f128()).collect();
-            let eq = build_eq(&r);
-            let (mut a2, mut b2) = (a.clone(), b.clone());
-            fold_in_place_pair(&mut a2, &mut b2, rho);
-            let want = round_pair_naive_with_eq(&a2, &b2, r_0, &eq);
-            let (mut a1, mut b1) = (a, b);
-            let got = fold_in_place_and_round_pair_with_eq(&mut a1, &mut b1, rho, r_0, &eq);
-            assert_eq!(got, want, "log_n {log_n}");
-            assert_eq!((a1, b1), (a2, b2), "log_n {log_n}");
-        }
-    }
-
     /// `1` at every node, so its evaluation at z is `Σ_i 1·L_i(z) = Σ_i L_i(z)`.
     #[test]
     fn lagrange_weights_sum_to_one() {
@@ -7791,260 +5361,6 @@ mod tests {
         crate::scratch::clear();
     }
 
-    /// Round-two A/B rebuild (`univariate_skip_optimized::ENV_NO_R2_AB_REBUILD`):
-    /// with the rows past the CPU rebuild boundary garbage and the producer
-    /// registered, the lookahead sweep returns the same message, lookahead
-    /// and compact state as over the complete buffers, it takes the
-    /// registration, and it never publishes the rest: the walk read the
-    /// rebuilt rows. Several prefixes and boundaries, ranked and dense.
-    #[test]
-    fn round2_ab_rebuild_matches_complete_buffers() {
-        use crate::zerocheck::univariate_skip_optimized::{Round1AbProducer, round2_ab_rebuild_scope};
-        for (m, ranked) in [(20usize, true), (16, false), (25, true)] {
-            let f = la_fixture(m, 0x2AB0_0001 ^ (m as u64), ranked);
-            let (hi_size, chunk_bytes) = round2_lookahead_chunk_geometry(m).expect("geometry");
-            assert_eq!(hi_size * chunk_bytes, f.a_packed.len());
-            let (want, want_m1, want_mi, want_la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
-                &f.a_packed, &f.b_packed, f.m, 6, &f.table, &f.mlv, &f.padding, None,
-            );
-            // Units of one chunk, or of half a chunk when it splits evenly.
-            let unit_bytes = if chunk_bytes.is_multiple_of(32) { chunk_bytes / 2 } else { chunk_bytes };
-            // (published chunks, CPU rebuild boundary, garbage from): the
-            // AB arm's prefix; complete buffers whose walk still rebuilds past
-            // the cap (the warm-up calibration's registration); every chunk
-            // rebuilt. The GPU arm (absent at these shapes) is the only
-            // reader of the published rows past the boundary.
-            let caps = [0usize, 1, hi_size * 43 / 100, hi_size - 1];
-            let cases = caps
-                .iter()
-                .map(|&c| (c, c, c))
-                .chain(caps.iter().map(|&c| (hi_size, c, c)))
-                .chain([(hi_size * 43 / 100, 0, 0)]);
-            for (cap, from, garbage) in cases {
-                let published = cap * chunk_bytes;
-                let rebuild_from = from * chunk_bytes;
-                let garbage = garbage * chunk_bytes;
-                let mut a = f.a_packed.clone();
-                let mut b = f.b_packed.clone();
-                a[garbage..].fill(0xA5);
-                b[garbage..].fill(0x5A);
-                let (a_ptr, b_ptr) = (a.as_mut_ptr() as usize, b.as_mut_ptr() as usize);
-                let produce = |unit: usize, sa: *mut u8, sb: *mut u8, _primed: bool| {
-                    let at = unit * unit_bytes;
-                    let (da, db) = if sa.is_null() {
-                        // SAFETY: the test's buffers, one unit each.
-                        unsafe { ((a_ptr as *mut u8).add(at), (b_ptr as *mut u8).add(at)) }
-                    } else {
-                        (sa, sb)
-                    };
-                    // SAFETY: `unit_bytes` bytes at both ends.
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(f.a_packed.as_ptr().add(at), da, unit_bytes);
-                        core::ptr::copy_nonoverlapping(f.b_packed.as_ptr().add(at), db, unit_bytes);
-                    }
-                };
-                let len = a.len();
-                // SAFETY: the buffers outlive the scope; only `produce`
-                // writes them (null scratch only).
-                let scope = unsafe {
-                    round2_ab_rebuild_scope(
-                        a_ptr as *const u8,
-                        b_ptr as *const u8,
-                        len,
-                        published,
-                        rebuild_from,
-                        Round1AbProducer { unit_bytes, produce: &produce },
-                    )
-                };
-                let (got, got_m1, got_mi, got_la) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
-                    &a, &b, f.m, 6, &f.table, &f.mlv, &f.padding, None,
-                );
-                assert_eq!((got_m1, got_mi, got_la), (want_m1, want_mi, want_la), "message, m={m} cap={cap} from={from}");
-                assert_eq!(got.anchors, want.anchors, "anchors, m={m} cap={cap} from={from}");
-                assert_eq!(&got.deltas[..], &want.deltas[..], "deltas, m={m} cap={cap} from={from}");
-                assert!(
-                    crate::zerocheck::univariate_skip_optimized::round2_ab_rebuild_take(&a, &b).is_none(),
-                    "round two must take its registration"
-                );
-                drop(scope);
-                assert!(a[garbage..].iter().all(|&x| x == 0xA5), "a rows published, m={m} cap={cap} from={from}");
-                assert!(b[garbage..].iter().all(|&x| x == 0x5A), "b rows published, m={m} cap={cap} from={from}");
-                got.recycle();
-            }
-            want.recycle();
-        }
-    }
-
-
-    #[test]
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    fn round2_ab_quad_matches_whole_chunk() {
-        use crate::zerocheck::univariate_skip_optimized::{Round1AbProducer, round2_ab_rebuild_scope, round2_ab_rebuild_take};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        const LO: usize = 16384;
-        const UNIT: usize = 8192;
-        let mut rng = Rng::new(0x2AB0_512);
-        let table = UniSkipFoldTable::new(6, rng.f128());
-        let eq: Vec<_> = (0..LO).map(|_| rng.f128()).collect();
-        let prep = kernels::aarch64::round2_eq_prep(&eq);
-        let fold7 = kernels::aarch64::r2_fold7_table(&table.data).expect("linear table");
-        let mut a = vec![0u8; 3 * LO * 16];
-        let mut b = a.clone();
-        // Generate every unit from its index; only each block's constant
-        // all-ones b head may be retained when scratch is primed.
-        let calls = AtomicUsize::new(0);
-        let first_primed = AtomicUsize::new(0);
-        let produce = |q: usize, sa: *mut u8, sb: *mut u8, primed: bool| {
-            if calls.fetch_add(1, Ordering::Relaxed) == 0 && primed {
-                first_primed.fetch_add(1, Ordering::Relaxed);
-            }
-            unsafe {
-                for i in 0..UNIT {
-                    let global = q * UNIT + i;
-                    *sa.add(i) = (global.wrapping_mul(73) ^ (global >> 7) ^ (global >> 13)) as u8;
-                    if !primed || i % 2048 >= 128 {
-                        *sb.add(i) = if i % 2048 < 128 { 255 } else {
-                            (global.wrapping_mul(31) ^ (global >> 5) ^ (global >> 11)) as u8
-                        };
-                    }
-                }
-            }
-        };
-        for q in 0..a.len() / UNIT {
-            produce(q, unsafe { a.as_mut_ptr().add(q * UNIT) }, unsafe { b.as_mut_ptr().add(q * UNIT) }, false);
-        }
-        for x_hi in [1usize, 2] {
-            for (tail, head_enabled) in [(false, false), (true, false), (true, true)] {
-                for f7 in [0usize, fold7.as_ptr() as usize] {
-                    calls.store(0, Ordering::Relaxed);
-                    first_primed.store(0, Ordering::Relaxed);
-                    let scope = unsafe { round2_ab_rebuild_scope(a.as_ptr(), b.as_ptr(), a.len(), 0, 0,
-                        Round1AbProducer { unit_bytes: UNIT, produce: &produce }) };
-                    let r = round2_ab_rebuild_take(&a, &b).unwrap();
-                    // Nonzero allocation offsets catch compact pointer rebases.
-                    let mut want_a = vec![LA_POISON; 2 * LO + 512];
-                    let mut got_a = want_a.clone();
-                    let mut want_d = vec![0xA5; 16 * LO + 8192];
-                    let mut got_d = want_d.clone();
-                    let want_head = std::sync::atomic::AtomicBool::new(false);
-                    let got_head = std::sync::atomic::AtomicBool::new(false);
-                    let mut want = [F128::ZERO; 8];
-                    let offset_a = 256;
-                    let offset_d = 4096;
-                    let hp = |h: &std::sync::atomic::AtomicBool| if head_enabled { h as *const _ } else { core::ptr::null() };
-                    unsafe {
-                        let (ap, bp) = r2_rebuild_chunk(&r, x_hi, LO * 16);
-                        if f7 != 0 {
-                            kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_pieces7(
-                                table.data.as_ptr().cast(), f7 as *const u8, ap, bp,
-                                want_a.as_mut_ptr().add(offset_a), want_d.as_mut_ptr().add(offset_d),
-                                eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, 127, 121,
-                                true, true, true, tail, hp(&want_head), want.as_mut_ptr());
-                        } else {
-                            fold_round2_compact_chunk_neon_lookahead_8::<true, false>(
-                                table.data.as_ptr().cast(), ap, bp,
-                                want_a.as_mut_ptr().add(offset_a), want_d.as_mut_ptr().add(offset_d),
-                                eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, 127, 121,
-                                true, true, true, tail, hp(&want_head), want.as_mut_ptr());
-                        }
-                        // A new registration must never inherit primed state.
-                        calls.store(0, Ordering::Relaxed);
-                        R2_AB_SCRATCH.with(|s| s.primed_id.set(0));
-                        let got = r2_rebuild_quad_walk(&r, x_hi, table.data.as_ptr().cast(), f7,
-                            got_a.as_mut_ptr().add(offset_a), got_d.as_mut_ptr().add(offset_d),
-                            eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, tail, hp(&got_head), core::ptr::null(), false);
-                        assert_eq!(got, want, "all eight sums: x_hi={x_hi} tail={tail} head={head_enabled} f7={f7}");
-                    }
-                    assert_eq!(got_a, want_a, "all live anchors and poison guards");
-                    assert_eq!(got_d, want_d, "all live deltas and poison guards");
-                    assert!(!want_head.load(Ordering::Relaxed));
-                    assert!(!got_head.load(Ordering::Relaxed));
-                    assert_eq!(calls.load(Ordering::Relaxed), LO * 16 / UNIT);
-                    assert_eq!(first_primed.load(Ordering::Relaxed), 0);
-                    assert_eq!(R2_AB_SCRATCH.with(|s| s.bytes.get()), UNIT,
-                        "quad engagement: scratch must hold one producer unit per A/B half");
-                    drop(scope);
-                }
-            }
-        }
-        eprintln!("quad differential: 12 cases, 8 sums, all compact bytes, nonzero offsets, scratch={} bytes", 2 * UNIT);
-    }
-
-    #[test]
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    fn round2_ab_quad_preserves_xb_kernel() {
-        use crate::zerocheck::univariate_skip_optimized::{Round1AbProducer, round2_ab_rebuild_scope, round2_ab_rebuild_take};
-        use std::sync::atomic::{AtomicBool, Ordering};
-        const LO: usize = 2048;
-        const UNIT: usize = 8192;
-        let mut rng = Rng::new(0x2ab0_5842_512);
-        let table = UniSkipFoldTable::new(6, rng.f128());
-        let mut eq: Vec<_> = (0..LO).map(|_| rng.f128()).collect();
-        let rho = rng.f128();
-        for first in (0..LO / 2).step_by(32) {
-            eq[2 * first + 3] = rho * eq[2 * first + 1];
-            for t in 0..2 {
-                for power in 1..16 {
-                    eq[2 * (first + 2 * power + t) + 1] =
-                        eq[2 * (first + t) + 1] * F128::new(1u64 << power, 0);
-                }
-            }
-        }
-        let prep = kernels::aarch64::round2_eq_prep(&eq);
-        let xb = kernels::aarch64::r2_full_xb_rho_prep(&eq).expect("valid XB weights");
-        let f7 = kernels::aarch64::r2_fold7_table(&table.data).expect("linear table");
-        let a = vec![0u8; 3 * LO * 16];
-        let b = a.clone();
-        let produce = |q: usize, sa: *mut u8, sb: *mut u8, primed: bool| {
-            unsafe {
-                for i in 0..UNIT {
-                    let at = q * UNIT + i;
-                    *sa.add(i) = (at.wrapping_mul(73) ^ (at >> 9)) as u8;
-                    if !primed || i % 2048 >= 128 {
-                        *sb.add(i) = if i % 2048 < 128 { 255 } else {
-                            (at.wrapping_mul(47) ^ (at >> 5)) as u8
-                        };
-                    }
-                }
-            }
-        };
-        for x_hi in [1usize, 2] {
-            for (tail, head) in [(false, false), (true, false), (true, true)] {
-                for pieces in [false, true] {
-                    let scope = unsafe { round2_ab_rebuild_scope(a.as_ptr(), b.as_ptr(), a.len(), 0, 0,
-                        Round1AbProducer { unit_bytes: UNIT, produce: &produce }) };
-                    let r = round2_ab_rebuild_take(&a, &b).unwrap();
-                    let mut want_a = vec![LA_POISON; 2 * LO + 512];
-                    let mut got_a = want_a.clone();
-                    let mut want_d = vec![0xa5u8; 16 * LO + 8192];
-                    let mut got_d = want_d.clone();
-                    let wh = AtomicBool::new(false);
-                    let gh = AtomicBool::new(false);
-                    let hp = |h: &AtomicBool| if head { h as *const _ } else { core::ptr::null() };
-                    let table7 = if pieces { f7.as_ptr() as usize } else { 0 };
-                    let mut want = [F128::ZERO; 8];
-                    unsafe {
-                        let (ap, bp) = r2_rebuild_chunk(&r, x_hi, LO * 16);
-                        kernels::aarch64::fold_round2_compact_chunk_neon_lookahead_8_xb(
-                            table.data.as_ptr().cast(), table7 as *const u8, ap, bp,
-                            want_a.as_mut_ptr().add(256), want_d.as_mut_ptr().add(4096),
-                            eq.as_ptr(), xb.as_ptr(), LO, true, tail, hp(&wh), false, want.as_mut_ptr());
-                        let got = r2_rebuild_quad_walk(&r, x_hi, table.data.as_ptr().cast(), table7,
-                            got_a.as_mut_ptr().add(256), got_d.as_mut_ptr().add(4096),
-                            eq.as_ptr(), prep.as_ptr(), LO, x_hi * LO, tail, hp(&gh), xb.as_ptr(), false);
-                        assert_eq!(got, want, "XB slots: {x_hi} {tail} {head} {pieces}");
-                    }
-                    assert_eq!(got_a, want_a, "XB anchors and guards");
-                    assert_eq!(got_d, want_d, "XB deltas and guards");
-                    assert_eq!(gh.load(Ordering::Relaxed), wh.load(Ordering::Relaxed));
-                    assert_eq!(R2_AB_SCRATCH.with(|s| s.bytes.get()), UNIT);
-                    drop(scope);
-                }
-            }
-        }
-        eprintln!("XB quad differential: 12 cases, all 8 sums and compact bytes");
-    }
-
     /// T1 — the core oracle. Round-two message identical, and the deferred
     /// quadratic evaluates to the incumbent round-three message at every ρ₁.
     /// Four distinct ρ₁ over-determine a quadratic, so agreement at all of
@@ -8285,141 +5601,25 @@ mod tests {
     /// whole 128-pair blocks.
     #[test]
     fn dead_pair_skip_matches_dense_k_pass() {
-        // Random b rows (a head pair's b rows are not all ones: round two
-        // falls back from the head-compacted layout) and the ranked
-        // structure (head pairs 0..7 of every block have all-ones b rows).
-        for ones_head in [false, true] {
-            let mut f = la_fixture(25, 0xDEAD_0001, true);
-            if ones_head {
-                for blk in 0..f.b_packed.len() / 2048 {
-                    f.b_packed[2048 * blk..2048 * blk + 128].fill(0xFF);
-                }
-            }
-            let r_next4 = la_r_next4(&f);
-            // 16 delta bytes per pair = one F128 per pair.
-            let deltas_f128 = 1usize << (f.m - 7);
-            let mut tc_seen = false;
-            with_round2_settings(|| {
-                crate::scratch::clear();
-                let (dense, d1, di, dla) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
-                    &f.a_packed,
-                    &f.b_packed,
-                    f.m,
-                    6,
-                    &f.table,
-                    &f.mlv,
-                    &f.padding,
-                    None,
-                );
-                assert!(!dense.dead_tail);
-                let backing = ScratchBytes::from_initialized_f128(vec![LA_POISON; deltas_f128]);
-                let (sparse, s1, si, sla) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
-                    &f.a_packed,
-                    &f.b_packed,
-                    f.m,
-                    6,
-                    &f.table,
-                    &f.mlv,
-                    &f.padding,
-                    Some(backing),
-                    true,
-                    None,
-                );
-                let skip_on = std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none();
-                assert_eq!(sparse.dead_tail, cfg!(target_arch = "aarch64") && skip_on);
-                assert_eq!((s1, si), (d1, di), "round-two message");
-                assert_eq!(sla.c, dla.c, "round-three lookahead");
-                let n_pairs = dense.len();
-                let poison_bytes = {
-                    let v = [LA_POISON];
-                    unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), 16) }.to_vec()
-                };
-                // Other tests flip the round-two switches concurrently, so the
-                // layout is checked for consistency, not predicted.
-                assert!(!sparse.tail_compact || sparse.dead_tail);
-                assert!(!sparse.head_compact || sparse.tail_compact);
-                tc_seen |= sparse.tail_compact;
-                if ones_head && sparse.tail_compact && !sparse.head_compact {
-                    eprintln!("dead_pair_skip_matches_dense_k_pass: head-compacted layout not taken");
-                }
-                if !ones_head {
-                    assert!(!sparse.head_compact, "random head b rows must fall back");
-                }
-                for p in 0..n_pairs {
-                    let dead = (p & 127) >= 121;
-                    let (sa, so) = (sparse.anchor_index(p), sparse.delta_offset(p));
-                    if dead {
-                        assert!(dense.anchors[2 * p..2 * p + 2].iter().all(|x| *x == F128::ZERO));
-                        // The tail-compacted layout keeps delta slots for the
-                        // dead pairs 121..123 only (they share pair 120's line).
-                        // After a head-compaction fallback (random head b rows)
-                        // they may hold the first layout's bytes: never read.
-                        if sparse.dead_tail
-                            && (!sparse.tail_compact || ((p & 127) < 124 && ones_head))
-                        {
-                            let sd = &sparse.deltas[so..so + 16];
-                            assert_eq!(sd, &poison_bytes[..], "dead delta written at pair {p}");
-                        }
-                    } else if sparse.head_compact && (p & 127) < 8 {
-                        // Head pair: a anchor and a delta only.
-                        assert_eq!(sparse.anchors[sa], dense.anchors[2 * p], "head a anchor at {p}");
-                        assert_eq!(dense.anchors[2 * p + 1], sparse.head_b, "head b anchor at {p}");
-                        assert_eq!(&sparse.deltas[so..so + 8], &dense.deltas[16 * p..16 * p + 8]);
-                        assert!(dense.deltas[16 * p + 8..16 * p + 16].iter().all(|&x| x == 0));
-                    } else {
-                        let sd = &sparse.deltas[so..so + 16];
-                        assert_eq!(&sparse.anchors[sa..sa + 2], &dense.anchors[2 * p..2 * p + 2]);
-                        assert_eq!(sd, &dense.deltas[16 * p..16 * p + 16], "delta at pair {p}");
-                    }
-                }
-                if sparse.tail_compact {
-                    // Nothing is written in front of or past the compacted blocks.
-                    let lo = sparse.delta_offset(0);
-                    // The compacted layouts exist only in the aarch64 kernels.
-                    #[cfg(target_arch = "aarch64")]
-                    let (hc_bpb, tc_bpb) = (
-                        kernels::aarch64::HC_DELTA_BYTES_PER_BLOCK,
-                        kernels::aarch64::TC_DELTA_BYTES_PER_BLOCK,
-                    );
-                    #[cfg(not(target_arch = "aarch64"))]
-                    let (hc_bpb, tc_bpb): (usize, usize) =
-                        unreachable!("tail compaction is an aarch64-only layout");
-                    let per_block = if sparse.head_compact { hc_bpb } else { tc_bpb };
-                    let hi = sparse.delta_offset(n_pairs - 128) + per_block;
-                    assert!(sparse.deltas[..lo].chunks_exact(16).all(|c| c == &poison_bytes[..]));
-                    assert!(sparse.deltas[hi..].chunks_exact(16).all(|c| c == &poison_bytes[..]));
-                }
-                let n_groups = n_pairs / 2;
-                for &(rho1, rho2) in &[
-                    (f.rho_grid[3], f.rho_grid[2]),
-                    (F128::ONE, f.rho_grid[3]),
-                    (F128::ZERO, F128::ONE),
-                ] {
-                    let mut a_d = vec![LA_POISON; n_groups];
-                    let mut b_d = vec![LA_POISON; n_groups];
-                    let (m1_d, mi_d, la_d) = fold2_compact_and_round45_into(
-                        &dense, &f.table, rho1, rho2, &r_next4, &mut a_d, &mut b_d,
-                    );
-                    let mut a_s = vec![LA_POISON; n_groups];
-                    let mut b_s = vec![LA_POISON; n_groups];
-                    let (m1_s, mi_s, la_s) = fold2_compact_and_round45_into(
-                        &sparse, &f.table, rho1, rho2, &r_next4, &mut a_s, &mut b_s,
-                    );
-                    assert_eq!((m1_s, mi_s), (m1_d, mi_d), "round-four message");
-                    assert_eq!(la_s.c, la_d.c, "round-five lookahead");
-                    assert!(a_s == a_d, "A'' outputs differ");
-                    assert!(b_s == b_d, "B'' outputs differ");
-                }
-                dense.recycle();
-                sparse.recycle();
-                crate::scratch::clear();
-            });
-            if cfg!(all(target_arch = "aarch64", target_feature = "sha3")) && !tc_seen {
-                eprintln!("dead_pair_skip_matches_dense_k_pass: tail-compacted layout not exercised (switch set)");
-            }
-            unsafe { std::env::set_var("FLOCK_NO_R2_DEADPAIR_SKIP", "1") };
+        let f = la_fixture(25, 0xDEAD_0001, true);
+        let r_next4 = la_r_next4(&f);
+        // 16 delta bytes per pair = one F128 per pair.
+        let deltas_f128 = 1usize << (f.m - 7);
+        with_round2_settings(|| {
+            crate::scratch::clear();
+            let (dense, d1, di, dla) = uni_skip_fold_and_round_pair_compact_padded_lookahead(
+                &f.a_packed,
+                &f.b_packed,
+                f.m,
+                6,
+                &f.table,
+                &f.mlv,
+                &f.padding,
+                None,
+            );
+            assert!(!dense.dead_tail);
             let backing = ScratchBytes::from_initialized_f128(vec![LA_POISON; deltas_f128]);
-            let (off, _, _, _) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+            let (sparse, s1, si, sla) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 &f.a_packed,
                 &f.b_packed,
                 f.m,
@@ -8429,15 +5629,72 @@ mod tests {
                 &f.padding,
                 Some(backing),
                 true,
-                None,
             );
-            unsafe { std::env::remove_var("FLOCK_NO_R2_DEADPAIR_SKIP") };
-            assert!(!off.dead_tail, "kill switch keeps the dense state");
-            off.recycle();
+            let skip_on = std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none();
+            assert_eq!(sparse.dead_tail, cfg!(target_arch = "aarch64") && skip_on);
+            assert_eq!((s1, si), (d1, di), "round-two message");
+            assert_eq!(sla.c, dla.c, "round-three lookahead");
+            let n_pairs = dense.len();
+            let poison_bytes = {
+                let v = [LA_POISON];
+                unsafe { core::slice::from_raw_parts(v.as_ptr().cast::<u8>(), 16) }.to_vec()
+            };
+            for p in 0..n_pairs {
+                let dead = (p & 127) >= 121;
+                let sd = &sparse.deltas[16 * p..16 * p + 16];
+                if dead {
+                    assert!(dense.anchors[2 * p..2 * p + 2].iter().all(|x| *x == F128::ZERO));
+                    if sparse.dead_tail {
+                        assert_eq!(sd, &poison_bytes[..], "dead delta written at pair {p}");
+                    }
+                } else {
+                    assert_eq!(&sparse.anchors[2 * p..2 * p + 2], &dense.anchors[2 * p..2 * p + 2]);
+                    assert_eq!(sd, &dense.deltas[16 * p..16 * p + 16], "delta at pair {p}");
+                }
+            }
+            let n_groups = n_pairs / 2;
+            for &(rho1, rho2) in &[
+                (f.rho_grid[3], f.rho_grid[2]),
+                (F128::ONE, f.rho_grid[3]),
+                (F128::ZERO, F128::ONE),
+            ] {
+                let mut a_d = vec![LA_POISON; n_groups];
+                let mut b_d = vec![LA_POISON; n_groups];
+                let (m1_d, mi_d, la_d) = fold2_compact_and_round45_into(
+                    &dense, &f.table, rho1, rho2, &r_next4, &mut a_d, &mut b_d,
+                );
+                let mut a_s = vec![LA_POISON; n_groups];
+                let mut b_s = vec![LA_POISON; n_groups];
+                let (m1_s, mi_s, la_s) = fold2_compact_and_round45_into(
+                    &sparse, &f.table, rho1, rho2, &r_next4, &mut a_s, &mut b_s,
+                );
+                assert_eq!((m1_s, mi_s), (m1_d, mi_d), "round-four message");
+                assert_eq!(la_s.c, la_d.c, "round-five lookahead");
+                assert!(a_s == a_d, "A'' outputs differ");
+                assert!(b_s == b_d, "B'' outputs differ");
+            }
+            dense.recycle();
+            sparse.recycle();
             crate::scratch::clear();
-        }
+        });
+        unsafe { std::env::set_var("FLOCK_NO_R2_DEADPAIR_SKIP", "1") };
+        let backing = ScratchBytes::from_initialized_f128(vec![LA_POISON; deltas_f128]);
+        let (off, _, _, _) = uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
+            &f.a_packed,
+            &f.b_packed,
+            f.m,
+            6,
+            &f.table,
+            &f.mlv,
+            &f.padding,
+            Some(backing),
+            true,
+        );
+        unsafe { std::env::remove_var("FLOCK_NO_R2_DEADPAIR_SKIP") };
+        assert!(!off.dead_tail, "kill switch keeps the dense state");
+        off.recycle();
+        crate::scratch::clear();
     }
-
 
     /// C1 — the cascade K-pass oracle. Outputs and the round-four message
     /// must match the incumbent K pass **elementwise** (poison-filled
@@ -9074,101 +6331,6 @@ mod tests {
         }
     }
 
-    /// Force the real heterogeneous CPU path at small sizes and compare every
-    /// unweighted partial row, not only the final XOR reduction. A repeated
-    /// poison could cancel in the reduction, so retain the full row snapshots.
-    #[test]
-    fn tri_partials_no_clear_matches_zero_and_poison() {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                TRI_PARTIAL_TEST_MODE.with(|m| m.set(0));
-                TRI_PARTIAL_TEST_ROWS.with(|r| *r.borrow_mut() = None);
-            }
-        }
-        let _reset = Reset;
-        let mut rng = Rng::new(0x7472_6970_6172_746c);
-        for (depth, packed, bpacked) in [(2, false, false), (3, false, false), (2, true, false), (2, true, true)] {
-            if packed && !cfg!(all(target_arch = "aarch64", target_feature = "aes")) {
-                continue;
-            }
-            for log_out in [3usize, 8, 11] {
-                let n = 1usize << (log_out + depth);
-                if packed && n < 256 { continue; }
-                let mut a = rng.f128_vec(n);
-                let mut b = rng.f128_vec(n);
-                if packed {
-                    for i in 0..n {
-                        if i % 64 >= 61 {
-                            a[i] = F128::ZERO;
-                            b[i] = F128::ZERO;
-                        } else if bpacked && matches!(i % 64, 0..=3 | 59) {
-                            b[i] = F128::ONE;
-                        }
-                    }
-                    a = a.into_iter().enumerate().filter_map(|(i, v)| (i % 64 <= 60).then_some(v)).collect();
-                    b = b.into_iter().enumerate().filter_map(|(i, v)| {
-                        (i % 64 <= 60 && !(bpacked && matches!(i % 64, 0..=3 | 59))).then_some(v)
-                    }).collect();
-                }
-                let rhos = rng.f128_vec(depth);
-                let mut r_next = rng.f128_vec(log_out);
-                r_next[0] = F128::ONE;
-                r_next[1] = F128::new(7, 13);
-                r_next[2] = F128::new(17, 19);
-                let run = |mode| {
-                    TRI_PARTIAL_TEST_MODE.with(|m| m.set(mode));
-                    TRI_PARTIAL_TEST_ROWS.with(|r| *r.borrow_mut() = None);
-                    let mut a_out = vec![LA_POISON; 1 << log_out];
-                    let mut b_out = vec![LA_POISON; 1 << log_out];
-                    let (m1, mi, la, la2, prefix) = fold_cascade_t_into_packed_prefix_gpu(
-                        &a, &b, packed, bpacked, None, &mut a_out, &mut b_out,
-                        &rhos, &r_next, false,
-                    );
-                    assert!(prefix.is_none());
-                    let rows = TRI_PARTIAL_TEST_ROWS.with(|r| r.borrow_mut().take()).expect("heterogeneous rows captured");
-                    (a_out, b_out, m1, mi, la, la2, rows)
-                };
-                let reference = run(1);
-                assert_eq!(run(2), reference, "poison depth={depth} packed={packed} bpacked={bpacked} log_out={log_out}");
-                assert_eq!(run(3), reference, "uninit depth={depth} packed={packed} bpacked={bpacked} log_out={log_out}");
-            }
-        }
-    }
-
-    /// Model only ownership handoffs, not Metal execution. Each producer
-    /// writes a complete row; read a prefix only after it has been written.
-    #[test]
-    fn tri_partial_storage_prefix_and_failure_handoffs() {
-        const N: usize = 17;
-        let expected: Vec<[F128; 26]> = (0..N).map(|row| {
-            std::array::from_fn(|lane| F128::new((row * 31 + lane + 1) as u64, (row * 71 + lane * 13 + 3) as u64))
-        }).collect();
-        for mode in [1, 2, 3] {
-            TRI_PARTIAL_TEST_MODE.with(|m| m.set(mode));
-            for prefix in [0, 1, N / 2, N] {
-                for failed in [false, true] {
-                    let mut rows = tri_partial_storage(N);
-                    for row in prefix..N { rows[row].write(expected[row]); }
-                    if failed {
-                        // Failed or declined GPU: CPU recomputes its prefix.
-                        for row in 0..prefix { rows[row].write(expected[row]); }
-                    } else {
-                        for row in 0..prefix { rows[row].write(expected[row]); }
-                        // SAFETY: that prefix has just been fully written.
-                        assert_eq!(unsafe { tri_partial_prefix(&rows, prefix) }, &expected[..prefix]);
-                    }
-                    // SAFETY: prefix and suffix partition all complete rows.
-                    assert_eq!(unsafe { tri_partials_assume_init(rows) }, expected);
-                }
-            }
-        }
-        TRI_PARTIAL_TEST_MODE.with(|m| m.set(0));
-        TRI_PARTIAL_TEST_ROWS.with(|r| *r.borrow_mut() = None);
-        // Dropping incomplete storage is safe; it never assumes initialization.
-        drop(tri_partial_storage(N));
-    }
-
     #[test]
     fn tri_inverse_pair_matches_separate_inversions() {
         let mut rng = Rng::new(0x7121_1A57);
@@ -9221,7 +6383,6 @@ mod tests {
         let nck = a.len() / (8 * eq_lo.len());
         let ci = 8 * eq_lo.len();
         let co = 2 * eq_lo.len();
-        let ep = kernels::aarch64::round2_eq_prep(&eq_lo);
         for c in 0..nck {
             let (ai, bi) = (&a[c * ci..(c + 1) * ci], &b[c * ci..(c + 1) * ci]);
             let mut a1 = vec![LA_POISON; co];
@@ -9232,7 +6393,7 @@ mod tests {
             let mut a2 = vec![LA_POISON; co];
             let mut b2 = vec![LA_POISON; co];
             let tri = kernels::aarch64::fold_tri_and_message_aarch64::<2, true, 0>(
-                ai, bi, &mut a2, &mut b2, rho3, rho4, F128::ZERO, &eq_lo, &ep,
+                ai, bi, &mut a2, &mut b2, rho3, rho4, F128::ZERO, &eq_lo,
             );
             let mut a3 = vec![LA_POISON; co];
             let mut b3 = vec![LA_POISON; co];
@@ -9276,14 +6437,10 @@ mod tests {
         }
 
         fn qos() {
-            // macOS-only call: elsewhere (aarch64 Linux test runs) a no-op.
-            #[cfg(target_os = "macos")]
-            {
-                unsafe extern "C" {
-                    fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
-                }
-                unsafe { pthread_set_qos_class_self_np(0x21, 0) };
+            unsafe extern "C" {
+                fn pthread_set_qos_class_self_np(q: u32, p: i32) -> i32;
             }
+            unsafe { pthread_set_qos_class_self_np(0x21, 0) };
         }
 
         fn lq(v: &mut [f64]) -> (f64, f64) {
@@ -9346,7 +6503,6 @@ mod tests {
             let ao_p = ao.as_mut_ptr();
             let bo_p = bo.as_mut_ptr();
             let eq8 = &eq56[..lo / 2];
-            let (ep56, ep8) = (round2_eq_prep(&eq56), round2_eq_prep(eq8));
             macro_rules! outs {
                 ($n:expr) => {
                     unsafe {
@@ -9394,7 +6550,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 0>(
-                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56, &ep56,
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
                         ));
                     }),
                     cif,
@@ -9404,7 +6560,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 1>(
-                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56, &ep56,
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
                         ));
                     }),
                     cif,
@@ -9414,7 +6570,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 2>(
-                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56, &ep56,
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
                         ));
                     }),
                     cif,
@@ -9424,7 +6580,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 3>(
-                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56, &ep56,
+                            a_c, b_c, x, y, rho3, rho4, F128::ZERO, &eq56,
                         ));
                     }),
                     cif,
@@ -9434,7 +6590,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co / 2);
                         std::hint::black_box(fold_tri_and_message_aarch64::<3, false, 0>(
-                            a_c, b_c, x, y, rho3, rho4, rho5, eq8, &ep8,
+                            a_c, b_c, x, y, rho3, rho4, rho5, eq8,
                         ));
                     }),
                     cif,
@@ -9444,7 +6600,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co / 2);
                         std::hint::black_box(fold_tri_and_message_aarch64::<3, true, 0>(
-                            a_c, b_c, x, y, rho3, rho4, rho5, eq8, &ep8,
+                            a_c, b_c, x, y, rho3, rho4, rho5, eq8,
                         ));
                     }),
                     cif,
@@ -9454,7 +6610,7 @@ mod tests {
                     Box::new(|_| {
                         let (x, y) = outs!(co / 2);
                         std::hint::black_box(fold_tri_and_message_aarch64::<3, false, 1>(
-                            a_c, b_c, x, y, rho3, rho4, rho5, eq8, &ep8,
+                            a_c, b_c, x, y, rho3, rho4, rho5, eq8,
                         ));
                     }),
                     cif,
@@ -9504,7 +6660,7 @@ mod tests {
                     Box::new(|c| {
                         let (x, y, p, q) = sl!(c, 4);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 0>(
-                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56, &ep56,
+                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56,
                         ));
                     }),
                     cif,
@@ -9514,7 +6670,7 @@ mod tests {
                     Box::new(|c| {
                         let (x, y, p, q) = sl!(c, 4);
                         std::hint::black_box(fold_tri_and_message_aarch64::<2, true, 1>(
-                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56, &ep56,
+                            x, y, p, q, rho3, rho4, F128::ZERO, &eq56,
                         ));
                     }),
                     cif,
@@ -9524,7 +6680,7 @@ mod tests {
                     Box::new(|c| {
                         let (x, y, p, q) = sl!(c, 8);
                         std::hint::black_box(fold_tri_and_message_aarch64::<3, true, 0>(
-                            x, y, p, q, rho3, rho4, rho5, eq8, &ep8,
+                            x, y, p, q, rho3, rho4, rho5, eq8,
                         ));
                     }),
                     cif,

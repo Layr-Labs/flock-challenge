@@ -741,7 +741,7 @@ pub(crate) fn merkle_tree_into_subtrees(
     kind: HashKind,
     sub_log: usize,
 ) -> Vec<Hash> {
-    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, SubtreeMode::Hetero)
+    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, false)
 }
 
 pub(crate) fn merkle_tree_into_subtrees_serial(
@@ -751,44 +751,7 @@ pub(crate) fn merkle_tree_into_subtrees_serial(
     kind: HashKind,
     sub_log: usize,
 ) -> Vec<Hash> {
-    merkle_tree_into_subtrees_drain(
-        tree,
-        data,
-        num_leaves,
-        kind,
-        sub_log,
-        crate::gpu_commit::subtree_drain_enabled(),
-    )
-}
-
-/// The "serial" subtree build with its subtree loop either on the calling
-/// thread alone (`drain = false`, the incumbent) or through the caller-first
-/// chunk drain (`drain = true`, grind pack 3, `FLOCK_NO_SUBTREE_DRAIN`): the
-/// caller starts on subtree 0 at once and pool threads claim the next
-/// subtrees as they arrive. Every subtree is still built by exactly one
-/// claimant with the same kernels into its own disjoint node ranges, and the
-/// shared top is finished afterwards on the caller, so the tree is
-/// byte-identical.
-pub(crate) fn merkle_tree_into_subtrees_drain(
-    tree: Vec<Hash>,
-    data: &[u8],
-    num_leaves: usize,
-    kind: HashKind,
-    sub_log: usize,
-    drain: bool,
-) -> Vec<Hash> {
-    let mode = if drain { SubtreeMode::CallerFirst } else { SubtreeMode::Serial };
-    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, mode)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SubtreeMode {
-    /// P+E chunk queue.
-    Hetero,
-    /// One subtree after another on the calling thread.
-    Serial,
-    /// Caller-first chunk drain over the main pool.
-    CallerFirst,
+    merkle_tree_into_subtrees_impl(tree, data, num_leaves, kind, sub_log, true)
 }
 
 fn merkle_tree_into_subtrees_impl(
@@ -797,7 +760,7 @@ fn merkle_tree_into_subtrees_impl(
     num_leaves: usize,
     kind: HashKind,
     sub_log: usize,
-    mode: SubtreeMode,
+    serial: bool,
 ) -> Vec<Hash> {
     assert!(num_leaves.is_power_of_two() && num_leaves > 0);
     assert_eq!(data.len() % num_leaves, 0);
@@ -855,14 +818,12 @@ fn merkle_tree_into_subtrees_impl(
     // Same P+E chunk queue as the level-by-level leaf/parent passes: the
     // efficiency cores carry a real share of the hashing (a main-pool-only
     // split measured ~1.7x slower at 2^16 leaves on the M4).
-    match mode {
-        SubtreeMode::Serial => {
-            for s in 0..n_sub {
-                build(s);
-            }
+    if serial {
+        for s in 0..n_sub {
+            build(s);
         }
-        SubtreeMode::CallerFirst => crate::epool::run_caller_first_chunks(n_sub, &build),
-        SubtreeMode::Hetero => crate::epool::run_hetero_chunks(n_sub, build),
+    } else {
+        crate::epool::run_hetero_chunks(n_sub, build);
     }
     merkle_tree_from_prehashed_level(tree, num_leaves, kind, sub_log)
 }
@@ -1032,17 +993,6 @@ pub fn verify_merkle_proof(
 // positions, deduplicating siblings that lie on multiple paths.
 // ---------------------------------------------------------------------------
 
-/// Kill switch for the reserved multi-proof output (`FLOCK_NO_MP_PROOF_RESERVE`,
-/// any value: the output vector grows by reallocation, as before). Read once per
-/// process.
-pub const ENV_NO_MP_PROOF_RESERVE: &str = "FLOCK_NO_MP_PROOF_RESERVE";
-
-fn mp_proof_reserve_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_MP_PROOF_RESERVE).is_none());
-    *ON
-}
-
 /// Build a Merkle multi-proof for `positions`. Returns the sibling hashes
 /// needed to verify ALL positions against the root, in the canonical
 /// bottom-up sorted-by-position traversal order.
@@ -1064,36 +1014,9 @@ pub fn merkle_multi_proof(tree: &[Hash], num_leaves: usize, positions: &[usize])
     let mut active: Vec<usize> = positions.to_vec();
     active.sort_unstable();
     active.dedup();
-    multi_proof_from_active(tree, num_leaves, active)
-}
-
-/// [`merkle_multi_proof`] for positions that are already strictly ascending
-/// (sorted and unique), as the opening's query sampler returns them. The
-/// general entry's sort and dedup leave such a list unchanged, so the same
-/// traversal on the same list emits the same hashes.
-pub fn merkle_multi_proof_sorted(
-    tree: &[Hash],
-    num_leaves: usize,
-    sorted_unique_positions: &[usize],
-) -> Vec<Hash> {
-    assert!(num_leaves.is_power_of_two() && num_leaves > 0);
-    assert_eq!(tree.len(), 2 * num_leaves - 1);
-
-    if sorted_unique_positions.is_empty() || num_leaves == 1 {
-        return Vec::new();
-    }
-    debug_assert!(sorted_unique_positions.windows(2).all(|w| w[0] < w[1]));
-    multi_proof_from_active(tree, num_leaves, sorted_unique_positions.to_vec())
-}
-
-/// Bottom-up traversal shared by both entries; `active` is sorted-unique.
-fn multi_proof_from_active(tree: &[Hash], num_leaves: usize, mut active: Vec<usize>) -> Vec<Hash> {
     debug_assert!(active.iter().all(|&p| p < num_leaves));
 
-    // Each active leaf emits at most one sibling per level (`q · d` above), so
-    // this is a true upper bound; capacity never changes the pushed sequence.
-    let cap = if mp_proof_reserve_enabled() { active.len() * num_leaves.trailing_zeros() as usize } else { 0 };
-    let mut proof = Vec::with_capacity(cap);
+    let mut proof = Vec::new();
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
     let mut next = Vec::with_capacity(active.len());
@@ -1391,41 +1314,6 @@ mod tests {
                     sub_log,
                 );
                 assert_eq!(got_serial, want, "serial log_n={log_n} sub_log={sub_log}");
-                for drain in [false, true] {
-                    let got_drain = merkle_tree_into_subtrees_drain(
-                        crate::alloc_uninit_vec(2 * n - 1),
-                        &data,
-                        n,
-                        HashKind::Blake3,
-                        sub_log,
-                        drain,
-                    );
-                    assert_eq!(got_drain, want, "drain={drain} log_n={log_n} sub_log={sub_log}");
-                }
-            }
-        }
-        // Grind pack 3 subtree drain: the caller-first drain inside a real
-        // pool (the path the opening takes), many repetitions so late and
-        // early pool threads both occur, against the serial subtree loop.
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(6).build().unwrap();
-        for log_n in [6usize, 10, 12] {
-            let n = 1usize << log_n;
-            let data = random_data(n, 128, 300 + log_n as u64);
-            let want = merkle_tree(&data, n, HashKind::Blake3);
-            for sub_log in [1usize, 3, 5] {
-                for rep in 0..40 {
-                    let got = pool.install(|| {
-                        merkle_tree_into_subtrees_drain(
-                            crate::alloc_uninit_vec(2 * n - 1),
-                            &data,
-                            n,
-                            HashKind::Blake3,
-                            sub_log,
-                            true,
-                        )
-                    });
-                    assert_eq!(got, want, "pool drain log_n={log_n} sub_log={sub_log} rep={rep}");
-                }
             }
         }
         let data = random_data(1024, 64, 9);
@@ -1876,38 +1764,6 @@ mod tests {
                 assert!(
                     multi.len() <= sorted.len() * log_n,
                     "multi-proof can't exceed sum of independent paths"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn multi_proof_sorted_entry_matches_general_entry() {
-        let leaf_size = 4;
-        for (n_leaves, seed) in [(2usize, 7u64), (64, 2025), (4096, 2026)] {
-            let data = random_data(n_leaves, leaf_size, seed);
-            for kind in KINDS {
-                let tree = merkle_tree(&data, n_leaves, kind);
-                let mut state = seed;
-                for count in [1usize, 2, 3, 36, 43, 218] {
-                    let mut positions: Vec<usize> = (0..count)
-                        .map(|_| {
-                            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                            ((state >> 33) as usize) % n_leaves
-                        })
-                        .collect();
-                    positions.sort_unstable();
-                    positions.dedup();
-                    assert_eq!(
-                        merkle_multi_proof_sorted(&tree, n_leaves, &positions),
-                        merkle_multi_proof(&tree, n_leaves, &positions),
-                        "{kind}: n_leaves={n_leaves} count={count}"
-                    );
-                }
-                let all: Vec<usize> = (0..n_leaves).collect();
-                assert_eq!(
-                    merkle_multi_proof_sorted(&tree, n_leaves, &all),
-                    merkle_multi_proof(&tree, n_leaves, &all)
                 );
             }
         }
