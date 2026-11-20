@@ -3236,6 +3236,316 @@ pub(crate) fn gpu_g4x2_tab_dbuf_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_TAB_DBUF").is_none())
 }
 
+/// Block-0 split of the head pass (the zero-lane g4x2 pass over layers
+/// 4..7, s = 12): `FLOCK_NO_B0_ZERO_TWIDDLE=1` (exactly "1") keeps the
+/// record's single dispatch of `ntt_fused_reg4g4x2_zl` (and never builds the
+/// block-0 kernel). Otherwise the head's GPU groups are dispatched as two
+/// grids in the same encoder: block 0's `gpb` groups run
+/// `ntt_fused_reg4g4x2_zl_b0`, the record's zero-lane text with `B = 0`
+/// fixed and sub-layer twiddle `c = 0` peeled at preprocessor level (no
+/// runtime branch); blocks `1..` run the record's own pipeline, unchanged,
+/// with the data bound one block in and the twiddles bound to
+/// [`b0_relocated_twiddles`]. Entry 0 of every layer of the breadth-first
+/// twiddle table is zero (`precompute_twiddles` pushes `F128::ZERO` first;
+/// uncached, `twiddle(l, 0)` is the empty span sum) and block 0's twiddle
+/// `c = 0` of sub-layer `j` is exactly that entry of layer `4 + j`; its
+/// byte table is all zero, every product by it is zero, and the butterfly
+/// `u' = u + t v, v' = v + u'` is `v ^= u`. Same field elements: the
+/// codeword is unchanged. Read once per process.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_b0_zero_twiddle_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLOCK_NO_B0_ZERO_TWIDDLE").as_deref() != Ok("1"))
+}
+
+/// The twiddle table the record zero-lane kernel is bound to for the
+/// head's blocks `1..` (the block-0 split, see
+/// [`gpu_b0_zero_twiddle_enabled`]). That kernel reads, for its block `B`
+/// (from `tgid`), `twiddles[2^(l+jj) - 1 + (B << jj) + cj]` with
+/// `jj = 0..3`, `cj < 2^jj`. Metal has no base threadgroup, so the second
+/// grid starts at `tgid = 0` again: entry `2^(l+jj) - 1 + x` of this table
+/// holds entry `2^(l+jj) - 1 + x + 2^jj` of `table` (layer `l + jj`
+/// shifted by one block), so kernel block `B` loads block `B + 1`'s
+/// twiddles. Layers below `l` and the last block of each layer are never
+/// read there (`B + 1 < 2^l`) and stay zero. Length `2^(l+4) - 1`.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn b0_relocated_twiddles(table: &[[u8; 16]], l: usize) -> Vec<[u8; 16]> {
+    let n = (1usize << (l + 4)) - 1;
+    assert!(table.len() >= n, "twiddle table shorter than layers l..l+3");
+    let mut out = vec![[0u8; 16]; n];
+    for jj in 0..4 {
+        let base = (1usize << (l + jj)) - 1;
+        let width = 1usize << (l + jj);
+        let sh = 1usize << jj;
+        out[base..base + width - sh].copy_from_slice(&table[base + sh..base + width]);
+    }
+    out
+}
+
+/// Host checks of the block-0 split (any target): the zero premise on the
+/// table the GPU commit uploads, a CPU emulation of the g4x2 byte-table
+/// product and of `NTT_G4X2_SUBLAYER` with c = 0 peeled, and the index
+/// algebra of the second grid (data one block in, relocated twiddles).
+#[cfg(test)]
+mod b0_zero_twiddle_tests {
+    use super::*;
+
+    fn xs(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+    fn rnd(x: &mut u64) -> u128 {
+        (xs(x) as u128) | ((xs(x) as u128) << 64)
+    }
+    fn to_u(v: F128) -> u128 {
+        (v.lo as u128) | ((v.hi as u128) << 64)
+    }
+    fn to_f(v: u128) -> F128 {
+        F128::new(v as u64, (v >> 64) as u64)
+    }
+    /// The kernel's `gf_mulx` on the uint4 words (x = bits 0..31).
+    fn mulx(v: u128) -> u128 {
+        (v << 1) ^ ((v >> 127) * 0x87)
+    }
+    /// The kernel's `gf_shl16`.
+    fn shl16(a: u128) -> u128 {
+        let h = a >> 112;
+        (a << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h)
+    }
+    /// `gf_build_byte16_twl`'s 512 entries for twiddle `g` (bank 0: `g`,
+    /// bank 1: `g * x^8`; entry `i` is the XOR of `x^b * g` over the bits
+    /// `b` of `i`).
+    fn build(g: u128) -> Vec<u128> {
+        let mut g8 = g;
+        for _ in 0..8 {
+            g8 = mulx(g8);
+        }
+        let mut tab = vec![0u128; 512];
+        for (t, base) in [g, g8].into_iter().enumerate() {
+            let mut p = [0u128; 8];
+            p[0] = base;
+            for b in 1..8 {
+                p[b] = mulx(p[b - 1]);
+            }
+            for i in 0..256usize {
+                tab[(t << 8) + i] = (0..8).filter(|b| (i >> b) & 1 == 1).fold(0, |a, b| a ^ p[b]);
+            }
+        }
+        tab
+    }
+    /// One chain of `gf_mul_byte16_x2`.
+    fn mul_tab(v: u128, tab: &[u128]) -> u128 {
+        let mut a = 0u128;
+        for i in (0..8).rev() {
+            a = shl16(a);
+            let h = ((v >> (16 * i)) & 0xffff) as usize;
+            a ^= tab[h & 255] ^ tab[256 + (h >> 8)];
+        }
+        a
+    }
+    /// `NTT_G4X2_SUBLAYER(0..3)` over one 16-element tile with the group's
+    /// 15 twiddles `twl` (k = 2^j - 1 + c). `peeled`: the block-0 kernel's
+    /// form, c = 0 as `ev ^= eu` (no table, no product), then the record
+    /// loop from c = 1.
+    fn sublayers(e: &mut [u128; 16], twl: &[u128; 15], peeled: bool) {
+        const F: usize = 4;
+        const NF: usize = 16;
+        for j in 0..F {
+            let bpos = F - 1 - j;
+            let nc = 1usize << j;
+            let bper = (NF >> 1) >> j;
+            let c0 = if peeled {
+                for bb in 0..bper {
+                    let low = bb & ((1 << bpos) - 1);
+                    let eu = ((bb >> bpos) << (bpos + 1)) | low;
+                    let ev = eu | (1 << bpos);
+                    e[ev] ^= e[eu];
+                }
+                1
+            } else {
+                0
+            };
+            for c in c0..nc {
+                let tab = build(twl[(1 << j) - 1 + c]);
+                for bb in 0..bper {
+                    let b = c * bper + bb;
+                    let low = b & ((1 << bpos) - 1);
+                    let eu = ((b >> bpos) << (bpos + 1)) | low;
+                    let ev = eu | (1 << bpos);
+                    let na = e[eu] ^ mul_tab(e[ev], &tab);
+                    e[eu] = na;
+                    e[ev] ^= na;
+                }
+            }
+        }
+    }
+    /// The group's twiddle prefetch: `twl[lid] = twiddles[2^(l+jj) - 1 +
+    /// (B << jj) + cj]` for `lid + 1 = 2^jj + cj`.
+    fn group_twiddles(tws: &[u128], l: usize, b: usize) -> [u128; 15] {
+        let mut out = [0u128; 15];
+        for (lid, o) in out.iter_mut().enumerate() {
+            let q = lid + 1;
+            let jj = 31 - (q as u32).leading_zeros() as usize;
+            let cj = q - (1 << jj);
+            *o = tws[(1usize << (l + jj)) - 1 + (b << jj) + cj];
+        }
+        out
+    }
+    fn table20() -> Vec<u128> {
+        flat_twiddle_table(&AdditiveNttF128::standard(20), 20).into_iter().map(to_u).collect()
+    }
+
+    /// Premise: entry 0 of every layer of the uploaded table is zero, for
+    /// the ranked size (cached table), an uncached size (span sum) and a
+    /// random basis; and at the head (l = 4) the zero twiddles of a group
+    /// are exactly its `c = 0` ones when `B = 0`.
+    #[test]
+    fn layer_start_twiddles_are_zero() {
+        let ntt = AdditiveNttF128::standard(20);
+        let tws = table20();
+        for layer in 0..20 {
+            assert_eq!(tws[(1usize << layer) - 1], 0, "layer {layer}");
+            assert_eq!(ntt.twiddle(layer, 0), F128::ZERO);
+        }
+        let big = AdditiveNttF128::standard(24);
+        assert!(big.precomputed_twiddle_table().is_none(), "expected the span-sum path");
+        for layer in 0..24 {
+            assert_eq!(big.twiddle(layer, 0), F128::ZERO, "uncached layer {layer}");
+        }
+        let mut x = 0xB0_2E_7700_1234u64;
+        let basis: Vec<F128> = (0..12).map(|_| to_f(rnd(&mut x))).collect();
+        let r = AdditiveNttF128::new(&basis);
+        let rt = flat_twiddle_table(&r, 12);
+        for layer in 0..12 {
+            assert_eq!(rt[(1usize << layer) - 1], F128::ZERO, "random basis layer {layer}");
+        }
+        for b in 0..16usize {
+            let twl = group_twiddles(&tws, 4, b);
+            for (k, &t) in twl.iter().enumerate() {
+                let q = k + 1;
+                let c = q - (1 << (31 - (q as u32).leading_zeros()));
+                assert_eq!(t == 0, b == 0 && c == 0, "B={b} k={k}");
+            }
+        }
+    }
+
+    /// The emulated byte-table product is the field product, and a zero
+    /// twiddle's table is all zero (so its product is zero for any input).
+    #[test]
+    fn byte_table_product_matches_field_and_zero_table() {
+        let mut x = 0x5EED_B0B0_u64;
+        for _ in 0..64 {
+            let (g, v) = (rnd(&mut x), rnd(&mut x));
+            assert_eq!(mul_tab(v, &build(g)), to_u(to_f(v) * to_f(g)));
+        }
+        let z = build(0);
+        assert!(z.iter().all(|&e| e == 0));
+        for _ in 0..64 {
+            assert_eq!(mul_tab(rnd(&mut x), &z), 0);
+        }
+    }
+
+    /// Block 0's peeled sub-layers vs the record's on random tiles with
+    /// block 0's real twiddles: identical bytes; the record path is also
+    /// the field-multiply butterflies.
+    #[test]
+    fn b0_peeled_sublayers_match_record() {
+        let tws = table20();
+        let twl = group_twiddles(&tws, 4, 0);
+        let mut x = 0x0B0_51C1_u64;
+        for _ in 0..200 {
+            let mut full = [0u128; 16];
+            for v in full.iter_mut() {
+                *v = rnd(&mut x);
+            }
+            let mut peeled = full;
+            let mut field = full;
+            sublayers(&mut full, &twl, false);
+            sublayers(&mut peeled, &twl, true);
+            assert_eq!(full, peeled);
+            for j in 0..4 {
+                let bpos = 3 - j;
+                for c in 0..(1usize << j) {
+                    let t = to_f(twl[(1 << j) - 1 + c]);
+                    let bper = 8 >> j;
+                    for bb in 0..bper {
+                        let bi = c * bper + bb;
+                        let eu = ((bi >> bpos) << (bpos + 1)) | (bi & ((1 << bpos) - 1));
+                        let ev = eu | (1 << bpos);
+                        let nu = to_f(field[eu]) + t * to_f(field[ev]);
+                        field[eu] = to_u(nu);
+                        field[ev] ^= field[eu];
+                    }
+                }
+            }
+            assert_eq!(full, field, "emulated g4x2 butterflies are not the field ones");
+        }
+    }
+
+    /// The second grid of the split: kernel block `B'` (from `tgid'`) with
+    /// the data bound one block in and the relocated twiddles reads and
+    /// writes exactly what the record's group `tgid' + gpb` (block `B' + 1`)
+    /// does, for every GPU prefix of 1..16 sixteenths; block 0's grid plus
+    /// it cover the record's groups once each. Index formulas transcribed
+    /// from the zero-lane text (`ZL_COL`, the data index, the prefetch).
+    #[test]
+    fn b0_split_second_grid_is_record_blocks_1_up() {
+        let (log_d, l, s) = (20usize, 4usize, 12usize);
+        let gpb = zero_lane_groups_per_block(s) as usize;
+        assert_eq!(gpb, 968);
+        let tws = table20();
+        let bytes: Vec<[u8; 16]> = tws.iter().map(|v| v.to_le_bytes()).collect();
+        let rel: Vec<u128> = b0_relocated_twiddles(&bytes, l).into_iter().map(u128::from_le_bytes).collect();
+        assert_eq!(rel.len(), (1 << (l + 4)) - 1);
+        for bp in 0..15usize {
+            assert_eq!(group_twiddles(&rel, l, bp), group_twiddles(&tws, l, bp + 1), "B'={bp}");
+        }
+        // Data: the kernel's element index for (B, g, column slot, e).
+        let col = |c: usize, pblk: usize| -> (usize, usize) {
+            let q = c / 121;
+            let m = c - q * 121;
+            let o = usize::from(m >= 64);
+            (pblk + (q << 1) + o, m - (o << 6))
+        };
+        let idx = |tgid: usize, slot: usize, e: usize| -> usize {
+            let b = tgid / gpb;
+            let g = tgid - b * gpb;
+            let pblk = b << (log_d - l);
+            let (pos, ln) = col((g << 8) + slot, pblk);
+            ((pos + (e << s)) << 6) + ln
+        };
+        let off = (1usize << (log_d - l)) << 6; // one block, in uint4 elements
+        for prefix in 1..=16usize {
+            let groups = prefix * gpb;
+            let rest = groups - gpb;
+            assert_eq!(rest % gpb, 0);
+            for t in (0..rest).step_by(97).chain([0, rest.saturating_sub(1)]) {
+                if rest == 0 {
+                    break;
+                }
+                for slot in [0usize, 63, 64, 127, 128, 191, 192, 255] {
+                    for e in [0usize, 7, 15] {
+                        assert_eq!(off + idx(t, slot, e), idx(t + gpb, slot, e), "prefix={prefix} tgid'={t}");
+                    }
+                }
+            }
+        }
+        // Exhaustive over one block's groups at both ends of the grid.
+        for bp in [0usize, 14] {
+            for g in 0..gpb {
+                let t = bp * gpb + g;
+                for slot in 0..256 {
+                    for e in 0..16 {
+                        assert_eq!(off + idx(t, slot, e), idx(t + gpb, slot, e));
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_T3_BYTETAB2").is_none())
@@ -7016,6 +7326,59 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
         ))
     }
 
+    /// The block-0 kernel of the head split (see
+    /// [`super::gpu_b0_zero_twiddle_enabled`]): the live zero-lane text
+    /// (`zl`, the text `pso_ntt4g4x2_zl` was built from, so the same thread
+    /// count) renamed `ntt_fused_reg4g4x2_zl_b0`, with `B = 0` fixed and
+    /// sub-layer twiddle `c = 0` peeled out of `NTT_G4X2_SUBLAYER`'s loop:
+    /// no runtime branch. Only block 0's `gpb` groups run it; every other
+    /// group runs the record's pipeline. `None` if an anchor drifted (the
+    /// encoders then keep the record's single dispatch).
+    pub(crate) fn g4x2_b0_msl_source(zl: &str) -> Option<String> {
+        splice_exact(
+            zl,
+            &[
+                ("kernel void ntt_fused_reg4g4x2_zl(", "kernel void ntt_fused_reg4g4x2_zl_b0("),
+                (G4X2_B0_BLOCK_ANCHOR, G4X2_B0_BLOCK),
+                (G4X2_B0_LOOP_ANCHOR, G4X2_B0_LOOP_PEELED),
+            ],
+        )
+    }
+
+    /// The zero-lane kernel's block index (its `tgid / gpb`).
+    const G4X2_B0_BLOCK_ANCHOR: &str = "    const uint B = tgid / gpb;\n";
+    /// Block 0's: the kernel is dispatched with exactly `gpb` groups, so
+    /// `tgid / gpb` is 0 there; the constant lets the compiler fold it.
+    const G4X2_B0_BLOCK: &str = "    const uint B = 0u;   // block-0 kernel: dispatched with exactly gpb groups\n";
+    /// The sub-layer twiddle loop of `NTT_G4X2_SUBLAYER` (record text,
+    /// untouched by the zero-lane, one-round and double-buffer splices).
+    const G4X2_B0_LOOP_ANCHOR: &str =
+        "        for (uint c = 0; c < NC; c++) {                                        \\\n";
+    /// Block 0's loop: `c = 0` as `ev ^= eu` behind one barrier (exactness:
+    /// [`super::gpu_b0_zero_twiddle_enabled`]; the barrier keeps the
+    /// double-buffered order: build `k + 1` has no leading barrier and
+    /// relies on build `k`'s to separate it from the reads of table
+    /// `k - 1`), then the record's loop body from `c = 1`. For `c = 0`,
+    /// `b = bb`, so `eu`/`ev` are the record's. No `//` comments: every line
+    /// ends in the macro's continuation.
+    const G4X2_B0_LOOP_PEELED: &str = r#"        {                                                                      \
+            /* Block 0 only (B = 0): twiddle c = 0 of sub-layer j is */        \
+            /* twiddles[2^(l+j) - 1], entry 0 of layer l + j: zero. Its */     \
+            /* table is zero, its products are zero, so the butterfly */       \
+            /* is ev ^= eu. One barrier stands in for the build (the */        \
+            /* double-buffered build k + 1 has no leading barrier). */         \
+            threadgroup_barrier(mem_flags::mem_threadgroup);                   \
+            for (uint bb = 0; bb < BPER; bb++) {                               \
+                const uint low = bb & ((1u << bpos) - 1u);                     \
+                const uint eu  = ((bb >> bpos) << (bpos + 1u)) | low;          \
+                const uint ev  = eu | (1u << bpos);                            \
+                ea[ev] ^= ea[eu];                                              \
+                eb[ev] ^= eb[eu];                                              \
+            }                                                                  \
+        }                                                                      \
+        for (uint c = 1; c < NC; c++) {                                        \
+"#;
+
     const NTT_G4X2_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -7736,6 +8099,211 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
             assert_eq!(super::super::zero_lane_groups_per_block(4), 4);
             // s = 12: the compacted grid is exactly full (no partial group).
             assert_eq!(super::super::zero_lane_groups_per_block(12) * 256, 121u64 << 11);
+        }
+
+        /// The block-0 kernel splices into every zero-lane text (two-round,
+        /// one-round, one-round double-buffered) and changes exactly its
+        /// three anchors; the zero-lane text itself (the record's main-grid
+        /// pipeline) and the record constant are untouched.
+        #[test]
+        fn b0_split_source_splices_every_zl_text() {
+            let two = g4x2_zero_lane_two_round_source().expect("zero-lane anchors drifted");
+            let one = g4x2_one_round_common(&two).expect("one-round anchors drifted");
+            let mut texts = vec![two.clone(), one];
+            if let Some(o) = g4x2_one_round_zl(&two) {
+                texts.push(o);
+            }
+            texts.push(g4x2_zero_lane_msl_source().unwrap());
+            for t in &texts {
+                let b = g4x2_b0_msl_source(t).expect("block-0 anchors drifted");
+                assert!(b.contains("kernel void ntt_fused_reg4g4x2_zl_b0("));
+                assert!(!b.contains("kernel void ntt_fused_reg4g4x2_zl("));
+                assert_eq!(b.matches(G4X2_B0_BLOCK).count(), 1);
+                assert!(!b.contains("for (uint c = 0; c < NC; c++)"));
+                assert_eq!(b.matches("for (uint c = 1; c < NC; c++)").count(), 1);
+                let back = b
+                    .replacen("kernel void ntt_fused_reg4g4x2_zl_b0(", "kernel void ntt_fused_reg4g4x2_zl(", 1)
+                    .replacen(G4X2_B0_BLOCK, G4X2_B0_BLOCK_ANCHOR, 1)
+                    .replacen(G4X2_B0_LOOP_PEELED, G4X2_B0_LOOP_ANCHOR, 1);
+                assert_eq!(back, *t, "the block-0 kernel changed more than its three anchors");
+            }
+            assert!(G4X2_B0_LOOP_PEELED.lines().all(|l| l.ends_with('\\')), "a macro line lost its continuation");
+            assert!(!G4X2_B0_LOOP_PEELED.contains("//"), "a // comment would swallow the next macro line");
+            assert!(!g4x2_zero_lane_msl_source().unwrap().contains("zl_b0"), "main-grid text touched");
+            assert!(!NTT_G4X2_TWL_MSL_SOURCE.contains("zl_b0"), "record text touched");
+        }
+
+        /// `blocks` l = 4 blocks of the 1 GiB ranked layout (64 MiB each)
+        /// with the zero columns, and the standard twiddles.
+        unsafe fn zl_fixture_blocks(gpu: &Gpu, blocks: usize) -> (Id, Id, Vec<u8>, usize) {
+            unsafe {
+                let log_d = 20usize;
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let positions = blocks << 16;
+                let len = positions * 64 * 16;
+                let mut x = 0x2E0_1A5E_B0B0_u64;
+                let mut input: Vec<u8> = (0..len / 8)
+                    .flat_map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x.to_le_bytes()
+                    })
+                    .collect();
+                for p in (1..positions).step_by(2) {
+                    for lane in 57..64 {
+                        let o = (p * 64 + lane) * 16;
+                        input[o..o + 16].fill(0);
+                    }
+                }
+                let data = gpu.new_buffer(len).unwrap();
+                (tw, data, input, len)
+            }
+        }
+
+        /// The head pass over `blocks` blocks, then (same encoder, no
+        /// rebinding, as the production encoders) the l = 8 pass over the
+        /// same prefix: one record dispatch, or the block-0 split. GPU ms.
+        unsafe fn head_then_l8(gpu: &Gpu, zl: Id, b0: Option<Id>, data: Id, tw: Id, blocks: u64) -> f64 {
+            unsafe {
+                let tpg = g4x2_test_tpg(gpu, zl);
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_buffer(enc, data, 0, 0);
+                gpu.set_buffer(enc, tw, 0, 1);
+                gpu.set_pipeline(enc, zl);
+                set_ntt_params(gpu, enc, NttParams { log_d: 20, l: 4, f: 4, s: 12 }, None);
+                let head = blocks * super::super::zero_lane_groups_per_block(12);
+                match b0 {
+                    Some(b0) => assert!(encode_zl_b0_split_with(gpu, enc, zl, b0, data, tw, 20, 4, 12, head, tpg)),
+                    None => gpu.dispatch(enc, head, tpg),
+                }
+                gpu.set_pipeline(enc, zl);
+                set_ntt_params(gpu, enc, NttParams { log_d: 20, l: 8, f: 4, s: 8 }, None);
+                gpu.dispatch(enc, blocks * 16 * super::super::zero_lane_groups_per_block(8), tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            }
+        }
+
+        /// The block-0 split (block-0 kernel + record pipeline over blocks
+        /// 1.. with the data one block in and the relocated twiddles) vs the
+        /// record's single dispatch, followed in the same encoder by the
+        /// l = 8 pass (catches a binding not restored): byte-equal over 1, 2
+        /// and 4 blocks, three repetitions (to catch a barrier race). Also the
+        /// split with the record kernel on block 0, which isolates the second
+        /// grid's data offset and relocated twiddles.
+        #[test]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn b0_split_matches_record_dispatch() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let (tw, data, input, len) = zl_fixture_blocks(gpu, 4);
+                let text = g4x2_zero_lane_msl_source().unwrap();
+                let zl = compile_supplemental_pipeline(gpu, &text, "ntt_fused_reg4g4x2_zl").unwrap();
+                let b0 = compile_supplemental_pipeline(gpu, &g4x2_b0_msl_source(&text).unwrap(), "ntt_fused_reg4g4x2_zl_b0").unwrap();
+                let read = || std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec();
+                let load = || std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                for _rep in 0..3 {
+                    for blocks in [1u64, 2, 4] {
+                        load();
+                        head_then_l8(gpu, zl, None, data, tw, blocks);
+                        let a = read();
+                        load();
+                        head_then_l8(gpu, zl, Some(b0), data, tw, blocks);
+                        let b = read();
+                        // The split with the record kernel on block 0 too: a
+                        // failure here (and in the line above) is the second
+                        // grid's relocation, not the block-0 kernel.
+                        load();
+                        head_then_l8(gpu, zl, Some(zl), data, tw, blocks);
+                        let c = read();
+                        assert!(a != input, "record passes did not run ({blocks} blocks)");
+                        assert!(a == c, "second grid (data offset + relocated twiddles) diverges over {blocks} blocks");
+                        assert!(a == b, "block-0 split diverges over {blocks} blocks");
+                    }
+                }
+                for p in [zl, b0] {
+                    gpu.release(p);
+                }
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
+        }
+
+        /// GPU ms of the head pass alone over 4 and 12 blocks (the device's
+        /// usual GPU share), interleaved, best of 15 each: the record's single
+        /// dispatch, the block-0 split, and the split with the record kernel
+        /// on block 0 too (the pure cost of the second grid: no work saved).
+        #[test]
+        #[ignore = "timing probe"]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn b0_split_probe() {
+            let gpu = match gpu() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                let (tw, data, input, len) = zl_fixture_blocks(gpu, 12);
+                std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
+                let text = g4x2_zero_lane_msl_source().unwrap();
+                let zl = compile_supplemental_pipeline(gpu, &text, "ntt_fused_reg4g4x2_zl").unwrap();
+                let b0 = compile_supplemental_pipeline(gpu, &g4x2_b0_msl_source(&text).unwrap(), "ntt_fused_reg4g4x2_zl_b0").unwrap();
+                let tpg = g4x2_test_tpg(gpu, zl);
+                // 0: record single dispatch; 1: split; 2: split, record kernel on block 0.
+                let head = |mode: u8, blocks: u64| -> f64 {
+                    let cb = gpu.command_buffer().unwrap();
+                    let enc = gpu.compute_encoder(cb).unwrap();
+                    gpu.set_buffer(enc, data, 0, 0);
+                    gpu.set_buffer(enc, tw, 0, 1);
+                    gpu.set_pipeline(enc, zl);
+                    set_ntt_params(gpu, enc, NttParams { log_d: 20, l: 4, f: 4, s: 12 }, None);
+                    let g = blocks * super::super::zero_lane_groups_per_block(12);
+                    let first = if mode == 1 { b0 } else { zl };
+                    if !(mode != 0 && encode_zl_b0_split_with(gpu, enc, zl, first, data, tw, 20, 4, 12, g, tpg)) {
+                        gpu.dispatch(enc, g, tpg);
+                    }
+                    gpu.end_encoding(enc);
+                    gpu.commit_and_wait(cb).unwrap();
+                    let (s, e) = cb_gpu_interval(gpu, cb);
+                    (e - s) * 1e3
+                };
+                let warm = std::time::Instant::now();
+                while warm.elapsed().as_secs_f64() < 2.0 {
+                    head(0, 12);
+                }
+                for blocks in [4u64, 12] {
+                    let (mut a, mut b, mut c) = (f64::MAX, f64::MAX, f64::MAX);
+                    for _ in 0..15 {
+                        a = a.min(head(0, blocks));
+                        b = b.min(head(1, blocks));
+                        c = c.min(head(2, blocks));
+                    }
+                    eprintln!(
+                        "[b0-split-probe] head over {blocks} blocks: record {a:.3} ms, split {b:.3} ms (saved {:.3}), \
+                         split with the record kernel on block 0 {c:.3} ms (boundary cost {:.3})",
+                        a - b,
+                        c - a
+                    );
+                }
+                for p in [zl, b0] {
+                    gpu.release(p);
+                }
+                gpu.release(tw);
+                gpu.release(data);
+                gpu.pool_pop(pool);
+            }
         }
 
         #[test]
@@ -11102,6 +11670,11 @@ kernel void blake3_pow_seg_tail(
         pub(crate) pso_ntt4g4x2: Id,
         /// Zero-lane compacted g4x2 (`ntt_fused_reg4g4x2_zl`), NIL when off.
         pub(crate) pso_ntt4g4x2_zl: Id,
+        /// Block-0 kernel of the head split (`ntt_fused_reg4g4x2_zl_b0`, see
+        /// `super::gpu_b0_zero_twiddle_enabled`). NIL when off, when it did not
+        /// build, or when `pso_ntt4g4x2_zl` is NIL: the head then keeps the
+        /// record's single dispatch.
+        pub(crate) pso_ntt4g4x2_zl_b0: Id,
         /// Supplemental ranked final pass (`ntt_final_t3`). `NIL` when its
         /// compile failed, its pipeline cannot run 64-thread groups, or
         /// `FLOCK_NO_GPU_FINAL_T3` is set; the NTT encoders then keep
@@ -11867,7 +12440,7 @@ kernel void blake3_pow_seg_tail(
                         }
                         Ok(pso)
                     };
-                    match make() {
+                    let zl = match make() {
                         Err(e) if g4x2_zl_tpg() == 128 => {
                             if debug_enabled() {
                                 eprintln!("[gpu-commit] one-round zero-lane g4x2: {e}; keeping two rounds");
@@ -11882,9 +12455,70 @@ kernel void blake3_pow_seg_tail(
                             eprintln!("[gpu-commit] {e}; keeping the dense g4x2 grid");
                         }
                         NIL
-                    })
+                    });
+                    // Block-0 kernel of the head split, from the text `zl`
+                    // was just built from (same thread count), in this same
+                    // job: no thread of its own. Any failure leaves NIL and
+                    // the head keeps the record's single dispatch.
+                    let b0 = if !zl.is_null() && super::gpu_b0_zero_twiddle_enabled() {
+                        (|| -> Result<Id, String> {
+                            let need = g4x2_zl_tpg();
+                            let zl_text = g4x2_zero_lane_msl_source().ok_or("zero-lane splice anchor drifted")?;
+                            let text = g4x2_b0_msl_source(&zl_text).ok_or("block-0 splice anchor drifted")?;
+                            let src = api.nsstring(&text)?;
+                            let mut err: Id = NIL;
+                            let library: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                                device,
+                                c"newLibraryWithSource:options:error:",
+                                src,
+                                NIL,
+                                &mut err
+                            );
+                            if library.is_null() {
+                                return Err(format!("block-0 g4x2 compile failed: {}", api.error_string(err)));
+                            }
+                            let ns = api.nsstring("ntt_fused_reg4g4x2_zl_b0")?;
+                            let f: Id = send!(api, unsafe extern "C" fn(Id, Sel, Id) -> Id, library, c"newFunctionWithName:", ns);
+                            if f.is_null() {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                                return Err("block-0 g4x2 kernel not found".into());
+                            }
+                            let mut pso_err: Id = NIL;
+                            let pso: Id = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                device,
+                                c"newComputePipelineStateWithFunction:error:",
+                                f,
+                                &mut pso_err
+                            );
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+                            if pso.is_null() {
+                                return Err(format!("block-0 g4x2 pipeline: {}", api.error_string(pso_err)));
+                            }
+                            let max_threads: u64 =
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> u64, pso, c"maxTotalThreadsPerThreadgroup");
+                            if max_threads < need {
+                                send!(api, unsafe extern "C" fn(Id, Sel) -> Id, pso, c"release");
+                                return Err(format!("block-0 g4x2 pipeline allows {max_threads} threads"));
+                            }
+                            Ok(pso)
+                        })()
+                        .unwrap_or_else(|e| {
+                            if debug_enabled() {
+                                eprintln!("[gpu-commit] block-0 split: {e}; keeping the record's single head dispatch");
+                            }
+                            NIL
+                        })
+                    } else {
+                        NIL
+                    };
+                    (zl, b0)
                 } else {
-                    NIL
+                    (NIL, NIL)
                 });
                 // Supplemental ranked final pass, its own library. Any
                 // failure, or a pipeline that cannot run a 64-thread group,
@@ -12061,10 +12695,13 @@ kernel void blake3_pow_seg_tail(
                 let (pso_leaf_v4, pso_parent3_v4) = leaf_v4_job.get();
                 let (pso_pow, pow_out) = pow_job.get();
                 let pso_ntt4g4x2 = g4x2_job.get();
-                let pso_ntt4g4x2_zl = match g4x2_zl_job.get() {
-                    zl if pso_ntt4g4x2.is_null() && !zl.is_null() => {
+                let (pso_ntt4g4x2_zl, pso_ntt4g4x2_zl_b0) = match g4x2_zl_job.get() {
+                    (zl, b0) if pso_ntt4g4x2.is_null() && !zl.is_null() => {
                         send!(api, unsafe extern "C" fn(Id, Sel) -> Id, zl, c"release");
-                        NIL
+                        if !b0.is_null() {
+                            send!(api, unsafe extern "C" fn(Id, Sel) -> Id, b0, c"release");
+                        }
+                        (NIL, NIL)
                     }
                     zl => zl,
                 };
@@ -12093,6 +12730,7 @@ kernel void blake3_pow_seg_tail(
                     pso_parent3_v4,
                     pso_ntt4g4x2,
                     pso_ntt4g4x2_zl,
+                    pso_ntt4g4x2_zl_b0,
                     pso_ntt5t3,
                     pso_final_leaf,
                     pso_pow,
@@ -12957,6 +13595,135 @@ kernel void blake3_pow_seg_tail(
         }
     }
 
+    /// The relocated head twiddles ([`super::b0_relocated_twiddles`]) of the
+    /// table in `tw_buf`, as a GPU buffer. Made from `tw_buf`'s own bytes the
+    /// first time a table is seen, then reused while those bytes (layers
+    /// `l..l+3`, 3.8 KiB at the head) are unchanged; a different table gets
+    /// its own buffer. `None` if `tw_buf` is too short or not CPU-visible
+    /// (the head then keeps the record's single dispatch). In flight, a
+    /// command buffer retains the buffers it binds, so an evicted entry may
+    /// be released here.
+    unsafe fn b0_relocated_twiddle_buf(gpu: &Gpu, tw_buf: Id, l: usize) -> Option<Id> {
+        static CACHE: Mutex<Vec<(usize, Vec<u8>, usize)>> = Mutex::new(Vec::new());
+        unsafe {
+            let n = (1usize << (l + 4)) - 1;
+            let len: u64 = send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> u64, tw_buf, c"length");
+            let ptr = gpu.buffer_contents(tw_buf);
+            if ptr.is_null() || (len as usize) < n * 16 {
+                return None;
+            }
+            let table = std::slice::from_raw_parts(ptr.cast::<[u8; 16]>(), n);
+            let key = std::slice::from_raw_parts(ptr.add(((1usize << l) - 1) * 16), (n + 1 - (1usize << l)) * 16);
+            let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = cache.iter().find(|e| e.0 == l && e.1 == key) {
+                return Some(e.2 as Id);
+            }
+            let rel = super::b0_relocated_twiddles(table, l);
+            let buf = gpu.new_buffer(n * 16).ok()?;
+            std::ptr::copy_nonoverlapping(rel.as_ptr().cast::<u8>(), gpu.buffer_contents(buf), n * 16);
+            if cache.len() >= 8 {
+                let (_, _, old) = cache.remove(0);
+                gpu.release(old as Id);
+            }
+            cache.push((l, key.to_vec(), buf as usize));
+            Some(buf)
+        }
+    }
+
+    /// The head pass's GPU groups as the block-0 split (see
+    /// [`super::gpu_b0_zero_twiddle_enabled`]), in the caller's encoder, with
+    /// its pass parameters already set: block 0's `gpb` groups on `b0`
+    /// (bindings `data_buf`, `tw_buf` at offset 0, as the encoders bind
+    /// them), then the remaining `groups - gpb` on `zl` (the record's
+    /// pipeline, unchanged) with `data_buf` bound one block in and the
+    /// relocated twiddles, so its group `t` is the record's group
+    /// `t + gpb`. Restores `zl`, `data_buf` and `tw_buf` at offset 0 for the
+    /// encoder's next passes. The encoder is serial: the second grid starts
+    /// after the first, and the next pass after both, as after the record's
+    /// one grid. `false` (nothing encoded) when the split does not apply.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn encode_zl_b0_split_with(
+        gpu: &Gpu,
+        enc: Id,
+        zl: Id,
+        b0: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        log_d: usize,
+        l: usize,
+        s: usize,
+        groups: u64,
+        tpg: u64,
+    ) -> bool {
+        unsafe {
+            let gpb = super::zero_lane_groups_per_block(s);
+            if zl.is_null() || b0.is_null() || groups < gpb || groups % gpb != 0 {
+                return false;
+            }
+            let rest = groups - gpb;
+            let rel = if rest > 0 {
+                match b0_relocated_twiddle_buf(gpu, tw_buf, l) {
+                    Some(b) => b,
+                    None => return false,
+                }
+            } else {
+                NIL
+            };
+            if debug_enabled() {
+                eprintln!("[gpu-commit] block-0 split l={l} s={s}: b0 groups {gpb}, record groups {rest}");
+            }
+            gpu.set_pipeline(enc, b0);
+            gpu.set_buffer(enc, data_buf, 0, 0);
+            gpu.set_buffer(enc, tw_buf, 0, 1);
+            gpu.dispatch(enc, gpb, tpg);
+            gpu.set_pipeline(enc, zl);
+            if rest > 0 {
+                gpu.set_buffer(enc, data_buf, (1usize << (log_d - l)) * 64 * 16, 0);
+                gpu.set_buffer(enc, rel, 0, 1);
+                gpu.dispatch(enc, rest, tpg);
+                gpu.set_buffer(enc, data_buf, 0, 0);
+                gpu.set_buffer(enc, tw_buf, 0, 1);
+            }
+            true
+        }
+    }
+
+    /// The production gate of [`encode_zl_b0_split_with`]: the head pass
+    /// only (l = 4, s = 12; the l = 8 pass keeps its single record
+    /// dispatch), the switch on and the block-0 pipeline built.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_zl_b0_split(
+        gpu: &Gpu,
+        enc: Id,
+        data_buf: Id,
+        tw_buf: Id,
+        log_d: usize,
+        l: usize,
+        s: usize,
+        groups: u64,
+        tpg: u64,
+    ) -> bool {
+        l == 4
+            && s == 12
+            && !gpu.pso_ntt4g4x2_zl_b0.is_null()
+            && super::gpu_b0_zero_twiddle_enabled()
+            && unsafe {
+                encode_zl_b0_split_with(
+                    gpu,
+                    enc,
+                    gpu.pso_ntt4g4x2_zl,
+                    gpu.pso_ntt4g4x2_zl_b0,
+                    data_buf,
+                    tw_buf,
+                    log_d,
+                    l,
+                    s,
+                    groups,
+                    tpg,
+                )
+            }
+    }
+
     /// Encode the fused NTT passes for `layers [start_layer, log_d)` over a
     /// 64-lane interleaved buffer bound at `data_buf`.
     pub(crate) unsafe fn encode_ntt_passes(
@@ -13047,7 +13814,12 @@ kernel void blake3_pow_seg_tail(
                 // The dense g4x2 pipeline also reads the dead-lane count.
                 let zt = (!pso.is_null() && pso == gpu.pso_ntt4g4x2).then(|| super::gpu_dead_lanes(log_d));
                 set_ntt_params(gpu, enc, p, zt);
-                gpu.dispatch(enc, groups, tpg);
+                if !(!pso.is_null()
+                    && pso == gpu.pso_ntt4g4x2_zl
+                    && encode_zl_b0_split(gpu, enc, data_buf, tw_buf, log_d, l, s, groups, tpg))
+                {
+                    gpu.dispatch(enc, groups, tpg);
+                }
             }
         }
     }
@@ -13124,7 +13896,12 @@ kernel void blake3_pow_seg_tail(
                 let zt = (!pso.is_null() && pso == gpu.pso_ntt4g4x2).then(|| super::gpu_dead_lanes(log_d));
                 set_ntt_params(gpu, enc, p, zt);
                 debug_assert_eq!(groups % 16, 0);
-                gpu.dispatch(enc, groups / 16 * prefix16, tpg);
+                if !(!pso.is_null()
+                    && pso == gpu.pso_ntt4g4x2_zl
+                    && encode_zl_b0_split(gpu, enc, data_buf, tw_buf, log_d, l, s, groups / 16 * prefix16, tpg))
+                {
+                    gpu.dispatch(enc, groups / 16 * prefix16, tpg);
+                }
             }
         }
     }
@@ -13203,7 +13980,12 @@ kernel void blake3_pow_seg_tail(
                 let zt = (!pso.is_null() && pso == gpu.pso_ntt4g4x2).then(|| super::gpu_dead_lanes(log_d));
                 set_ntt_params(gpu, enc, p, zt);
                 debug_assert_eq!(groups % den, 0);
-                gpu.dispatch(enc, groups / den * num, tpg);
+                if !(!pso.is_null()
+                    && pso == gpu.pso_ntt4g4x2_zl
+                    && encode_zl_b0_split(gpu, enc, data_buf, tw_buf, log_d, l, s, groups / den * num, tpg))
+                {
+                    gpu.dispatch(enc, groups / den * num, tpg);
+                }
             }
         }
     }
@@ -17884,6 +18666,15 @@ kernel void blake3_pow_seg_tail(
         let key = if super::gpu_zero_lane_enabled() && super::gpu_g4x2_enabled() {
             key ^ fnv1a64(g4x2_zero_lane_msl_source().as_deref().unwrap_or("")).rotate_left(6)
                 ^ 0x5A45_524F_4C41_4E45 // "ZEROLANE"
+        } else {
+            key
+        };
+        // The block-0 split changes the GPU head's cost; its kill switch
+        // gives the record's key.
+        let key = if super::gpu_zero_lane_enabled() && super::gpu_g4x2_enabled() && super::gpu_b0_zero_twiddle_enabled() {
+            key ^ fnv1a64(g4x2_zero_lane_msl_source().as_deref().and_then(g4x2_b0_msl_source).as_deref().unwrap_or(""))
+                .rotate_left(7)
+                ^ 0x4230_5350_4C49_5448 // "B0SPLITH"
         } else {
             key
         };
