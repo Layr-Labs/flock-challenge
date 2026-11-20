@@ -4073,6 +4073,107 @@ pub(crate) fn tail_hash_reserve_pct() -> usize {
     *PCT
 }
 
+/// Kill switch for the proportional tail-hash reserve
+/// (`FLOCK_NO_TAIL_RESERVE_PROP=1`, exact `1`: every claim publishes cb3's
+/// count the fixed reserve, [`tail_hash_reserve_pct`] of the whole suffix,
+/// below the unclaimed top, as before).
+///
+/// The reserve is the CPU's share of the hashing left at cb2's end: the
+/// claimers hash down to the last published count while cb3 hashes the
+/// units below it. A fixed reserve of 10% of the whole suffix is a 10%
+/// share only while nothing has been claimed; once the claimers have taken
+/// part of the suffix before cb2 ends, the same fixed number of units is a
+/// larger share of what is left, and the CPU (a few tens of units per ms)
+/// finishes its reserve well after cb3 (hundreds of units per ms) has
+/// finished the units below it. With this on, each claim reserves the same
+/// percentage of the units still unclaimed, never more than the fixed
+/// reserve: the first claim publishes exactly the record's count, and later
+/// counts are at most the record's. The count still never rises
+/// ([`tail_reserve_units`] grows by at most one unit per unclaimed unit, and
+/// the claim keeps the `min` with the last published count), the floor is
+/// still the last published count, and every unit is still hashed by at
+/// least one side with the same bytes into the same slots, so the root is
+/// unchanged. Only the number of units each side hashes after cb2's end
+/// moves. Read once per process.
+pub const ENV_NO_TAIL_RESERVE_PROP: &str = "FLOCK_NO_TAIL_RESERVE_PROP";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tail_reserve_prop_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_TAIL_RESERVE_PROP));
+    *ON
+}
+
+/// Units a claim keeps from cb3 below the unclaimed top: `reserve` (the
+/// fixed reserve, `pct` of the whole suffix) when `prop` is off, else `pct`
+/// of the `left` units still unclaimed (rounded up), capped at `reserve`.
+/// Non-decreasing in `left`, and one more unclaimed unit raises it by at
+/// most one, so `left - tail_reserve_units(..)` never rises as `left`
+/// falls.
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn tail_reserve_units(reserve: usize, left: usize, pct: usize, prop: bool) -> usize {
+    if prop {
+        reserve.min((left * pct.min(100)).div_ceil(100))
+    } else {
+        reserve
+    }
+}
+
+#[cfg(test)]
+mod tail_reserve_prop_tests {
+    use super::tail_reserve_units as r;
+
+    /// The count a claim publishes with `left` units unclaimed, as the tail
+    /// hash forms it (`left - reserve`, saturating).
+    fn count(reserve: usize, left: usize, pct: usize, prop: bool) -> usize {
+        left.saturating_sub(r(reserve, left, pct, prop))
+    }
+
+    #[test]
+    fn first_claim_matches_the_fixed_reserve_and_counts_never_rise() {
+        // Suffix sizes of the ranked splits (512-leaf and 1,024-leaf units)
+        // and a few odd ones; every reserve percentage the switch admits.
+        for total in [1usize, 2, 7, 64, 128, 320, 448, 576, 640, 704, 896, 928, 960, 1280, 1920] {
+            for pct in 0..=50usize {
+                let reserve = total * pct / 100;
+                // The first claim of the eager form starts from the count
+                // written before cb3's commit (`total - reserve`) and the
+                // late form from the full count; a claim sees `total - 1`.
+                assert_eq!(r(reserve, total, pct, true), reserve, "total {total} pct {pct}");
+                assert_eq!(
+                    r(reserve, total - 1, pct, true),
+                    reserve,
+                    "first claim must publish the record's count (total {total} pct {pct})"
+                );
+                let mut last = total - reserve;
+                for left in (0..total).rev() {
+                    let c_prop = count(reserve, left, pct, true);
+                    let c_fixed = count(reserve, left, pct, false);
+                    // Never above the unclaimed top, never below the record's.
+                    assert!(c_prop <= left && c_prop >= c_fixed, "total {total} pct {pct} left {left}");
+                    // Non-increasing as claims proceed (one unit at a time).
+                    assert!(c_prop <= last, "count rose: total {total} pct {pct} left {left}");
+                    assert!(last - c_prop <= 1, "count fell by more than one unit");
+                    // The reserve is never above the fixed one.
+                    assert!(r(reserve, left, pct, true) <= reserve);
+                    last = c_prop;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn off_is_the_fixed_reserve() {
+        for left in [0usize, 1, 50, 640] {
+            assert_eq!(r(64, left, 10, false), 64);
+        }
+        // With the proportional form a nearly drained suffix keeps a small
+        // reserve: 10% of 100 units left is 10, of 7 is 1, of 0 is 0.
+        assert_eq!(r(64, 100, 10, true), 10);
+        assert_eq!(r(64, 7, 10, true), 1);
+        assert_eq!(r(64, 0, 10, true), 0);
+    }
+}
+
 /// Test hook of the CPU tail hash: 1,024-leaf units the CPU hashes before it
 /// looks at cb2 (so a fast GPU still leaves it a chosen share; `usize::MAX`
 /// or any count past the suffix = all of it), and the path is taken even if
@@ -15301,6 +15402,10 @@ kernel void blake3_pow_seg_tail(
         let late_wait_ms = t_late.elapsed().as_secs_f64() * 1e3;
         let t_tail = std::time::Instant::now();
         let mut h = n_leaves;
+        // Proportional reserve (`super::ENV_NO_TAIL_RESERVE_PROP`): the same
+        // percentage of the units still unclaimed, capped at `reserve`.
+        let reserve_prop = super::tail_reserve_prop_enabled();
+        let reserve_pct = super::tail_hash_reserve_pct();
         // Claim one unit: lower cb3's count first, then hash it.
         // With the reserve the count is published `reserve` units below the
         // unclaimed top, never above the last one published, and not at all
@@ -15308,7 +15413,9 @@ kernel void blake3_pow_seg_tail(
         let claim = move |g: &mut (usize, bool, usize, usize)| -> usize {
             g.0 -= unit;
             if g.2 == usize::MAX {
-                let c = ((g.0 - suffix_start) / unit).saturating_sub(reserve).min(g.3);
+                let left = (g.0 - suffix_start) / unit;
+                let keep = super::tail_reserve_units(reserve, left, reserve_pct, reserve_prop);
+                let c = left.saturating_sub(keep).min(g.3);
                 // SAFETY: the args buffer is the arm's; counts only decrease.
                 unsafe { write_tail_counts(args_base.ptr(), per_unit, c) };
                 g.3 = c;
@@ -15439,6 +15546,8 @@ kernel void blake3_pow_seg_tail(
             super::help_pool_until(|| unsafe { gpu.cb_done(cb3, sig3_ref) });
         }
         let tail_ms = t_tail.elapsed().as_secs_f64() * 1e3;
+        // The last count published to cb3 (its units, for the traces).
+        let cb3_units = claims.lock().unwrap_or_else(|e| e.into_inner()).3;
         crate::tmark::mark("tail hash workers done");
         if sig2.is_some() && !window_trace_enabled() {
             gpu.join_cb_sig(cb2, sig2.as_ref(), 0.0)?;
@@ -15463,6 +15572,7 @@ kernel void blake3_pow_seg_tail(
             let (s2, e2) = cb2_gpu_interval(gpu, cb2);
             eprintln!(
                 "[gpu-window] tail hash: CPU took {} of {total_units} suffix units in {tail_ms:.2} ms; \
+                 cb3 count {cb3_units} (reserve {reserve}, prop {reserve_prop}); \
                  cb3 start {:.3} ms after cb2's end, gpu dur {:.2} ms; cb2 gpu dur {:.2} ms",
                 (n_leaves - h) / unit,
                 (s3 - e2) * 1e3,
@@ -15508,7 +15618,7 @@ kernel void blake3_pow_seg_tail(
         if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
             eprintln!(
                 "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
-                 suffix units in {tail_ms:.2} ms",
+                 suffix units in {tail_ms:.2} ms; cb3 count {cb3_units} (reserve {reserve}, prop {reserve_prop})",
                 if run_claims { "AB arm returned with cb2 running" } else { "cb2 completed first" },
                 (n_leaves - h) / unit,
             );
