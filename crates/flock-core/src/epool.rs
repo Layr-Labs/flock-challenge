@@ -773,20 +773,23 @@ impl Drop for CloseOnDrop {
 /// QUEUE SEMANTICS. Neither arm touches the shared cursor or the chunk
 /// closure: which worker set drains the queue is unobservable in the output by
 /// construction.
-pub(crate) fn drain_hetero<H>(
+///
+/// The scheduler has one body. Each helper calls its queue loop once through
+/// `helper`, and that loop keeps its concrete per-chunk callback.
+#[inline(never)]
+pub(crate) fn drain_hetero(
     main_threads: usize,
     worker: &(dyn Fn() + Sync),
     ep: &rayon::ThreadPool,
-    helper: &H,
+    helper: &(dyn Fn() + Sync),
     detached: bool,
-) where
-    H: Fn() + Sync,
-{
+) {
     if detached {
         let gate = Arc::new(Gate {
             state: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
-            body: JobPtr::new(helper),
+            // The gate closes and drains before this frame ends.
+            body: JobPtr::new(&helper),
         });
         let close = CloseOnDrop(Arc::clone(&gate));
         let posted = AtomicBool::new(false);
