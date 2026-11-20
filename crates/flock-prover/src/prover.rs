@@ -1126,11 +1126,13 @@ struct AbStripeEmitter<'a> {
     /// Paired-scratch mode (see `zc_ab_pair_scratch_active`): the odd quad
     /// reads the even quad's rows in place; nothing is copied.
     direct: bool,
+    /// Kept for the process or built for this emitter
+    /// (`FLOCK_NO_RECOMPUTE_CACHE2`, see [`ab_stripe_programs`]).
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    program: Option<Box<[StripeRowOp]>>,
+    program: Option<std::borrow::Cow<'static, [StripeRowOp]>>,
     /// `program` regrouped into segments (`None`: run it op by op).
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    segments: Option<StripeSegmentProgram>,
+    segments: Option<std::borrow::Cow<'static, StripeSegmentProgram>>,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     checks: Box<[(usize, u64, u64)]>,
 }
@@ -1150,15 +1152,12 @@ impl<'a> AbStripeEmitter<'a> {
         assert!(rows.len() <= AB_STRIPE_MAX_ROWS && rows.len() * 64 <= group_bytes);
         assert!(rows.iter().all(|r| r.lo_word + usize::from(r.hi_mask != 0) < AB_STRIPE_WORDS));
         let n_groups = stripe_len / group_bytes;
-        let program = if cfg!(target_arch = "aarch64") && ab_stripe_row_program_enabled() {
-            build_stripe_row_program(rows)
-        } else {
-            None
-        };
-        let segments = program
-            .as_deref()
-            .filter(|_| ab_stripe_segments_enabled())
-            .and_then(build_stripe_segment_program);
+        let (program, segments) = ab_stripe_programs(
+            rows,
+            cfg!(target_arch = "aarch64") && ab_stripe_row_program_enabled(),
+            ab_stripe_segments_enabled(),
+            recompute_cache2_enabled(),
+        );
         Self {
             stripe,
             group_bytes,
@@ -1358,7 +1357,7 @@ enum StripeRowKind {
     Masked,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 struct StripeRowOp {
     off: usize,
@@ -1416,7 +1415,7 @@ struct StripeSegment {
 /// A row program regrouped as its leading Pair ops, the Full ops after
 /// them, a run of [`StripeSegment`]s and at most one trailing Masked op,
 /// each with its output offset precomputed. Same ops, same order.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 struct StripeSegmentProgram {
     /// `(off, out)` of each leading Pair op.
@@ -1470,6 +1469,108 @@ fn build_stripe_segment_program(ops: &[StripeRowOp]) -> Option<StripeSegmentProg
         segments: segments.into_boxed_slice(),
         masked,
     })
+}
+
+/// Kill switch for the second recompute cache (`FLOCK_NO_RECOMPUTE_CACHE2`,
+/// any value: [`AbStripeEmitter::new`] builds its row and segment programs
+/// on every call, as before). Read once per process.
+const ENV_NO_RECOMPUTE_CACHE2: &str = "FLOCK_NO_RECOMPUTE_CACHE2";
+
+fn recompute_cache2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_RECOMPUTE_CACHE2).is_none());
+    *ON
+}
+
+/// The row program of `rows` and its segment form, both built without the
+/// process gates: exactly what [`AbStripeEmitter::new`] builds per call when
+/// both gates are on.
+fn build_stripe_programs(
+    rows: &[crate::r1cs_hashes::blake3::RootRow],
+) -> (Option<Box<[StripeRowOp]>>, Option<StripeSegmentProgram>) {
+    let program = build_stripe_row_program(rows);
+    let segments = program.as_deref().and_then(build_stripe_segment_program);
+    (program, segments)
+}
+
+/// One kept [`build_stripe_programs`] result, stored next to a copy of the
+/// rows it was built from (its key).
+struct KeptStripePrograms {
+    rows: Box<[crate::r1cs_hashes::blake3::RootRow]>,
+    program: Option<Box<[StripeRowOp]>>,
+    segments: Option<StripeSegmentProgram>,
+}
+
+type StripeProgramSlots = [std::sync::OnceLock<KeptStripePrograms>; 2];
+
+/// Two slots: the ranked prove has one row set (176 rows, or 177 under
+/// `FLOCK_NO_FIXED_INPUT_ROOTS`); the second slot holds the other.
+static STRIPE_PROGRAM_SLOTS: StripeProgramSlots = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+
+/// The kept programs of `rows`: the first slot whose stored rows equal
+/// `rows` element for element, filling an empty slot on the way. `None`
+/// when both slots hold other rows (the caller then builds per call).
+fn kept_stripe_programs(
+    slots: &'static StripeProgramSlots,
+    rows: &[crate::r1cs_hashes::blake3::RootRow],
+) -> Option<&'static KeptStripePrograms> {
+    slots.iter().find_map(|slot| {
+        let kept = slot.get_or_init(|| {
+            let (program, segments) = build_stripe_programs(rows);
+            KeptStripePrograms { rows: rows.into(), program, segments }
+        });
+        (*kept.rows == *rows).then_some(kept)
+    })
+}
+
+/// Warm-up fill for [`STRIPE_PROGRAM_SLOTS`], called from `seed_pipe::arm`
+/// (the untimed tail of the ranked worker's warm-up, before the ready file).
+/// Keeps the programs of the rows that the timed prove's
+/// [`AbStripeEmitter::new`] asks for (the fixed-input root rows, else the full
+/// root rows), under the same gates, so that call is a hit instead of the
+/// first fill. `FLOCK_NO_RECOMPUTE_CACHE2` skips it. Pure table build: no wait,
+/// thread or I/O, and no proof byte depends on it.
+pub(crate) fn prewarm_ab_stripe_programs() {
+    if !(cfg!(target_arch = "aarch64") && ab_stripe_row_program_enabled() && recompute_cache2_enabled()) {
+        return;
+    }
+    let rows = crate::r1cs_hashes::blake3::fixed_input_root_stripe_rows()
+        .or(crate::r1cs_hashes::blake3::root_stripe_rows());
+    if let Some(rows) = rows {
+        let _ = kept_stripe_programs(&STRIPE_PROGRAM_SLOTS, rows);
+    }
+}
+
+/// The `program` and `segments` of [`AbStripeEmitter::new`]. `program_on`
+/// and `segments_on` are its gates; with `cache` (`FLOCK_NO_RECOMPUTE_CACHE2`
+/// unset) both are borrowed from [`STRIPE_PROGRAM_SLOTS`], which hold the
+/// same values a per-call build returns, otherwise built here as before.
+#[allow(clippy::type_complexity)]
+fn ab_stripe_programs(
+    rows: &[crate::r1cs_hashes::blake3::RootRow],
+    program_on: bool,
+    segments_on: bool,
+    cache: bool,
+) -> (
+    Option<std::borrow::Cow<'static, [StripeRowOp]>>,
+    Option<std::borrow::Cow<'static, StripeSegmentProgram>>,
+) {
+    use std::borrow::Cow;
+    if !program_on {
+        return (None, None);
+    }
+    if cache && let Some(kept) = kept_stripe_programs(&STRIPE_PROGRAM_SLOTS, rows) {
+        return (
+            kept.program.as_deref().map(Cow::Borrowed),
+            kept.segments.as_ref().filter(|_| segments_on).map(Cow::Borrowed),
+        );
+    }
+    let program = build_stripe_row_program(rows);
+    let segments = program
+        .as_deref()
+        .filter(|_| segments_on)
+        .and_then(build_stripe_segment_program);
+    (program.map(|p| Cow::Owned(p.into_vec())), segments.map(Cow::Owned))
 }
 
 ///
@@ -2467,6 +2568,88 @@ mod deferred_stripe_tests {
         ] {
             assert!(build_stripe_segment_program(&ops).is_none(), "{ops:?}");
         }
+    }
+
+    /// `FLOCK_NO_RECOMPUTE_CACHE2`: for both ranked row sets, on repeated
+    /// calls and under every gate setting, the kept row and segment programs
+    /// equal the incumbent per-call build, and the cache-off arm builds them
+    /// as before; other rows, once both slots are taken, are built fresh with
+    /// the cache on. In private slots holding both ranked sets, rows that differ
+    /// in one mask, or are a prefix, find no slot (the caller builds fresh),
+    /// while an equal copy at another address hits.
+    #[test]
+    fn ab_stripe_programs_kept_equal_fresh() {
+        use crate::r1cs_hashes::blake3 as b3;
+        use std::borrow::Cow;
+        let full = b3::root_stripe_rows().expect("root stripe on by default");
+        let fixed = b3::fixed_input_root_stripe_rows().expect("fixed-input stripe on by default");
+        assert_ne!(full, fixed);
+        // The incumbent `AbStripeEmitter::new` build, with its gates as arguments.
+        let fresh = |rows: &[b3::RootRow], program_on: bool, segments_on: bool| {
+            let program = if program_on { build_stripe_row_program(rows) } else { None };
+            let segments = program
+                .as_deref()
+                .filter(|_| segments_on)
+                .and_then(build_stripe_segment_program);
+            (program, segments)
+        };
+        for _round in 0..3 {
+            for rows in [fixed, full] {
+                let (p, s) = fresh(rows, true, true);
+                assert!(p.is_some() && s.is_some(), "ranked rows compile and regroup");
+                for program_on in [false, true] {
+                    for segments_on in [false, true] {
+                        for cache in [false, true] {
+                            let (program, segments) = ab_stripe_programs(rows, program_on, segments_on, cache);
+                            let (want_p, want_s) = fresh(rows, program_on, segments_on);
+                            assert_eq!(program.as_deref(), want_p.as_deref());
+                            assert_eq!(segments.as_deref(), want_s.as_ref());
+                            let kept = |c: &Option<Cow<'static, [StripeRowOp]>>| matches!(c, Some(Cow::Borrowed(_)));
+                            assert_eq!(kept(&program), cache && program_on, "{program_on} {segments_on} {cache}");
+                            if let Some(s) = &segments {
+                                assert_eq!(matches!(s, Cow::Borrowed(_)), cache);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Both process slots now hold the ranked sets: other rows (a prefix,
+        // which still compiles) miss with the cache on and are built fresh.
+        let prefix = &fixed[..fixed.len() - 1];
+        for segments_on in [false, true] {
+            let (program, segments) = ab_stripe_programs(prefix, true, segments_on, true);
+            let (want_p, want_s) = fresh(prefix, true, segments_on);
+            assert!(want_p.is_some(), "a prefix compiles");
+            assert!(matches!(program, Some(Cow::Owned(_))), "a miss builds fresh");
+            assert!(segments.as_ref().is_none_or(|s| matches!(s, Cow::Owned(_))));
+            assert_eq!(program.as_deref(), want_p.as_deref());
+            assert_eq!(segments.as_deref(), want_s.as_ref());
+            let (again, _) = ab_stripe_programs(fixed, true, segments_on, true);
+            assert!(matches!(again, Some(Cow::Borrowed(_))), "the ranked set stays kept");
+        }
+        let a = kept_stripe_programs(&STRIPE_PROGRAM_SLOTS, fixed).expect("ranked set kept");
+        let b = kept_stripe_programs(&STRIPE_PROGRAM_SLOTS, fixed).expect("ranked set kept");
+        assert!(std::ptr::eq(a, b), "a repeat call returns the kept entry");
+        assert_eq!(*a.rows, *fixed);
+        assert_eq!((a.program.clone(), a.segments.clone()), build_stripe_programs(fixed));
+
+        static SLOTS: StripeProgramSlots = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+        let kf = kept_stripe_programs(&SLOTS, fixed).expect("empty slot fills");
+        let kg = kept_stripe_programs(&SLOTS, full).expect("second slot fills");
+        assert!(!std::ptr::eq(kf, kg));
+        assert_eq!((kf.program.clone(), kf.segments.clone()), build_stripe_programs(fixed));
+        assert_eq!((kg.program.clone(), kg.segments.clone()), build_stripe_programs(full));
+        let copy: Vec<b3::RootRow> = fixed.to_vec();
+        assert!(std::ptr::eq(kept_stripe_programs(&SLOTS, &copy).expect("equal rows hit"), kf));
+        for k in [0, fixed.len() / 2, fixed.len() - 1] {
+            let mut other = fixed.to_vec();
+            other[k].lo_mask ^= 1;
+            assert_ne!(build_stripe_programs(&other), build_stripe_programs(fixed), "row {k}");
+            assert!(kept_stripe_programs(&SLOTS, &other).is_none(), "one mask differs at row {k}");
+        }
+        assert!(kept_stripe_programs(&SLOTS, &fixed[..fixed.len() - 1]).is_none(), "a prefix is other rows");
+        assert!(std::ptr::eq(kept_stripe_programs(&SLOTS, fixed).expect("still kept"), kf));
     }
 
     /// Single-thread cost of the AB stripe emitter (scratch in L1) and
