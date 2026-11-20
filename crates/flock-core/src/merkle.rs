@@ -1086,16 +1086,86 @@ pub fn merkle_multi_proof_sorted(
     multi_proof_from_active(tree, num_leaves, sorted_unique_positions.to_vec())
 }
 
+/// Kill switch for the frontier-capped multi-proof (`FLOCK_NO_MP_FRONTIER_CAP`,
+/// any value, keeps the record's `q · d` reservation and its second frontier
+/// buffer). Read once per process.
+pub const ENV_NO_MP_FRONTIER_CAP: &str = "FLOCK_NO_MP_FRONTIER_CAP";
+
+fn mp_frontier_cap_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_MP_FRONTIER_CAP).is_none());
+    *ON
+}
+
+/// Upper bound on the number of sibling hashes a multi-proof of `q`
+/// sorted-unique positions in a depth-`d` tree emits.
+///
+/// With `a_l` active nodes at level `l` (`a_0 = q`, `a_d = 1`), level `l`
+/// emits `2·a_(l+1) − a_l` siblings, so the total telescopes to
+/// `2 − q + Σ_{l=1..d−1} a_l`, and `a_l ≤ min(q, 2^(d−l))`. The sum is formed
+/// first and `q` subtracted with saturation, so no negative intermediate is
+/// ever represented. `d = 0` or `q = 0` emit nothing.
+fn multi_proof_sibling_bound(q: usize, d: usize) -> usize {
+    if q == 0 || d == 0 {
+        return 0;
+    }
+    let mut s = 2usize;
+    for l in 1..d {
+        let width = if d - l >= usize::BITS as usize { usize::MAX } else { 1usize << (d - l) };
+        s += q.min(width);
+    }
+    s.saturating_sub(q)
+}
+
 /// Bottom-up traversal shared by both entries; `active` is sorted-unique.
 fn multi_proof_from_active(tree: &[Hash], num_leaves: usize, mut active: Vec<usize>) -> Vec<Hash> {
     debug_assert!(active.iter().all(|&p| p < num_leaves));
+    let depth = num_leaves.trailing_zeros() as usize;
+    let frontier_cap = mp_frontier_cap_enabled();
 
     // Each active leaf emits at most one sibling per level (`q · d` above), so
     // this is a true upper bound; capacity never changes the pushed sequence.
-    let cap = if mp_proof_reserve_enabled() { active.len() * num_leaves.trailing_zeros() as usize } else { 0 };
+    // With the frontier cap the reservation is the exact-count bound of
+    // [`multi_proof_sibling_bound`] instead (never below the final length).
+    let cap = if !mp_proof_reserve_enabled() {
+        0
+    } else if frontier_cap {
+        multi_proof_sibling_bound(active.len(), depth)
+    } else {
+        active.len() * depth
+    };
     let mut proof = Vec::with_capacity(cap);
     let mut level_start = 0usize;
     let mut level_len = num_leaves;
+
+    if frontier_cap {
+        // In-place frontier: the parent list is written over the child list.
+        // Write index `w` never passes read index `i` (each step reads at
+        // least one entry and writes exactly one), so every entry is read
+        // before it can be overwritten. Same parents in the same order.
+        while level_len > 1 {
+            let n = active.len();
+            let mut i = 0;
+            let mut w = 0;
+            while i < n {
+                let p = active[i];
+                if i + 1 < n && active[i + 1] == (p ^ 1) {
+                    i += 2;
+                } else {
+                    proof.push(tree[level_start + (p ^ 1)]);
+                    i += 1;
+                }
+                active[w] = p >> 1;
+                w += 1;
+            }
+            active.truncate(w);
+            level_start += level_len;
+            level_len >>= 1;
+        }
+        debug_assert!(proof.len() <= cap || cap == 0);
+        return proof;
+    }
+
     let mut next = Vec::with_capacity(active.len());
 
     while level_len > 1 {
@@ -1215,6 +1285,54 @@ mod tests {
     /// multi-proof logic is hash-agnostic, so anything true of one must hold
     /// for the other.
     const KINDS: [HashKind; 2] = [HashKind::Sha256, HashKind::Blake3];
+
+    /// The record's two-buffer traversal, kept verbatim as the oracle of the
+    /// in-place frontier.
+    fn multi_proof_two_buffer(tree: &[Hash], num_leaves: usize, mut active: Vec<usize>) -> Vec<Hash> {
+        let mut proof = Vec::new();
+        let (mut level_start, mut level_len) = (0usize, num_leaves);
+        let mut next = Vec::new();
+        while level_len > 1 {
+            next.clear();
+            let mut i = 0;
+            while i < active.len() {
+                let p = active[i];
+                if i + 1 < active.len() && active[i + 1] == (p ^ 1) {
+                    i += 2;
+                } else {
+                    proof.push(tree[level_start + (p ^ 1)]);
+                    i += 1;
+                }
+                next.push(p >> 1);
+            }
+            core::mem::swap(&mut active, &mut next);
+            level_start += level_len;
+            level_len >>= 1;
+        }
+        proof
+    }
+
+    #[test]
+    fn frontier_cap_matches_two_buffer_on_every_subset() {
+        for log_n in 0..=4usize {
+            let n = 1usize << log_n;
+            let data: Vec<u8> = (0..n * 8).map(|i| (i * 37 + 11) as u8).collect();
+            let tree = merkle_tree(&data, n, HashKind::Blake3);
+            for mask in 0u32..(1u32 << n) {
+                let active: Vec<usize> = (0..n).filter(|&i| mask >> i & 1 == 1).collect();
+                let want = if active.is_empty() || n == 1 {
+                    Vec::new()
+                } else {
+                    multi_proof_two_buffer(&tree, n, active.clone())
+                };
+                assert_eq!(merkle_multi_proof_sorted(&tree, n, &active), want, "n {n} mask {mask:#x}");
+                assert!(want.len() <= multi_proof_sibling_bound(active.len(), log_n), "n {n} mask {mask:#x}");
+                if !active.is_empty() && log_n > 0 {
+                    assert!(multi_proof_sibling_bound(active.len(), log_n) <= active.len() * log_n);
+                }
+            }
+        }
+    }
 
     #[test]
     fn two_leaves_matches_hand_computation() {
