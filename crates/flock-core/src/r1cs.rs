@@ -184,6 +184,18 @@ impl BlockR1cs {
     /// that A's evaluated prefix equals C; the packed-value producer must
     /// provide that separate invariant.
     pub fn round1_pinned_one_prefix_statement(&self) -> Option<Round1PinnedOnePrefixStatement> {
+        self.round1_pinned_one_prefix_statement_impl(false)
+    }
+
+    /// [`Self::round1_pinned_one_prefix_statement`] with C's identity taken from
+    /// [`Self::c0_is_identity`] (the digest-cached result when the statement
+    /// digest is warm, the same scan otherwise) instead of a fresh scan. For
+    /// callers that already rely on `c0_is_identity()` for the same statement.
+    pub fn round1_pinned_one_prefix_statement_cached_identity(&self) -> Option<Round1PinnedOnePrefixStatement> {
+        self.round1_pinned_one_prefix_statement_impl(true)
+    }
+
+    fn round1_pinned_one_prefix_statement_impl(&self, cached_identity: bool) -> Option<Round1PinnedOnePrefixStatement> {
         const PREFIX_BITS: usize = 1_024;
         let k = self.k();
         let const_pin = self.const_pin.filter(|pin| *pin < k)?;
@@ -195,7 +207,7 @@ impl BlockR1cs {
             || self.b_0.num_cols != k
             || self.b_0.rows.len() != k
             || self.c_0.rows.len() != k
-            || !c0_is_identity_scan(k, &self.c_0)
+            || !(if cached_identity { self.c0_is_identity() } else { c0_is_identity_scan(k, &self.c_0) })
         {
             return None;
         }
@@ -212,7 +224,18 @@ impl BlockR1cs {
     /// Live A rows are computed output expressions, not identity rows; a
     /// joined BLAKE3 producer must separately certify their evaluated A=Z.
     pub fn round1_pinned_one_prefix_and_output_statement(&self) -> Option<Round1PinnedOnePrefixStatement> {
-        let mut statement = self.round1_pinned_one_prefix_statement()?;
+        self.round1_pinned_one_prefix_and_output_statement_impl(false)
+    }
+
+    /// [`Self::round1_pinned_one_prefix_and_output_statement`] with C's identity
+    /// taken from [`Self::c0_is_identity`], as in
+    /// [`Self::round1_pinned_one_prefix_statement_cached_identity`].
+    pub fn round1_pinned_one_prefix_and_output_statement_cached_identity(&self) -> Option<Round1PinnedOnePrefixStatement> {
+        self.round1_pinned_one_prefix_and_output_statement_impl(true)
+    }
+
+    fn round1_pinned_one_prefix_and_output_statement_impl(&self, cached_identity: bool) -> Option<Round1PinnedOnePrefixStatement> {
+        let mut statement = self.round1_pinned_one_prefix_statement_impl(cached_identity)?;
         if self.k_log != 14 || self.k_skip != 6 || self.useful_bits != 15_409
             || self.layout != WitnessLayout::RowMajor || self.const_pin != Some(512)
             || !(15_360..15_409).all(|i| self.b_0.rows[i].as_slice() == [512])
