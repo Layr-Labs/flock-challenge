@@ -23,8 +23,8 @@ mod r2cs_fast {
     /// Whether [`source`] selects the b == 1 kernel of `r2cs_fast2.metal`
     /// (the only text that reads the R2 C capture flag), by the same reads.
     pub(super) fn fast2_selected() -> bool {
-        std::env::var_os("FLOCK_NO_R2CS_FAST").as_deref() != Some(OsStr::new("1"))
-            && std::env::var_os("FLOCK_NO_R2CS_FAST2").as_deref() != Some(OsStr::new("1"))
+        crate::env_var_once!("FLOCK_NO_R2CS_FAST").as_deref() != Some(OsStr::new("1"))
+            && crate::env_var_once!("FLOCK_NO_R2CS_FAST2").as_deref() != Some(OsStr::new("1"))
             && KERNEL.contains(ENTRY)
     }
 

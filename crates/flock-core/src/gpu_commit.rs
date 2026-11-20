@@ -1149,6 +1149,20 @@ pub(crate) fn gpu_zc_ab_one_cb_enabled() -> bool {
     *ON
 }
 
+/// Kill switch for the AB arm's direct write (`FLOCK_NO_ZC_AB_PARTS_DIRECT`,
+/// any value): an admitted prove's GPU partials are copied once, from the
+/// arm's part buffer straight into the caller's `partials` (under the arm's
+/// lock, where the copy was taken), instead of into a fresh `Vec` that the
+/// caller copies again. Same rows, same bytes. The oracle probe keeps its
+/// copy. Read once per process.
+pub const ENV_NO_ZC_AB_PARTS_DIRECT: &str = "FLOCK_NO_ZC_AB_PARTS_DIRECT";
+
+pub(crate) fn gpu_zc_ab_parts_direct_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_AB_PARTS_DIRECT).is_none());
+    *ON
+}
+
 /// Diagnostic trace for the round-one AB completion arm: the warm-up oracle
 /// verdict and, per prove that folds GPU partials, one `[zc-ab-gpu] fired`
 /// line (`FLOCK_ZC_AB_GPU_DEBUG=1`, or any `FLOCK_PHASE_TIMING` run).
@@ -1192,6 +1206,20 @@ pub const ENV_NO_ZC_K_PREMAP: &str = "FLOCK_NO_ZC_K_PREMAP";
 pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_K_PREMAP).is_none());
+    *ON
+}
+
+/// Kill switch for the K arm's view hand-over (`FLOCK_NO_ZC_K_PARTS_VIEW`,
+/// any value): an admitted prove's per-chunk weighted sums are returned as a
+/// view of the arm's part buffer (process-lifetime, valid until the next
+/// launch, like the `a` / `b` outputs) instead of a fresh `Vec` copy, so the
+/// caller copies the rows once, straight into its `partials`. Same rows, same
+/// bytes. The oracle probe keeps its copy. Read once per process.
+pub const ENV_NO_ZC_K_PARTS_VIEW: &str = "FLOCK_NO_ZC_K_PARTS_VIEW";
+
+pub(crate) fn gpu_zc_k_parts_view_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_K_PARTS_VIEW).is_none());
     *ON
 }
 
@@ -2971,9 +2999,10 @@ pub(crate) fn gpu_zero_lane_pass(log_d: usize, s: usize) -> bool {
         && GPU_ZERO_TAIL_LANES.load(std::sync::atomic::Ordering::SeqCst) == GPU_ZERO_TAIL_LANES_RANKED
 }
 
-/// Exact-`1`, uncached rollback for first-pass zero-column compaction.
+/// Exact-`1` rollback for first-pass zero-column compaction.
 /// All output stores remain: only known-zero input loads, products and table
 /// builds disappear. The ranked padding descriptor must also be published.
+/// Read once per process (`FLOCK_NO_ENV_HOIST2`: on every call, as before).
 pub const ENV_NO_GPU_FROM_Z_ZERO_COLUMNS: &str = "FLOCK_NO_GPU_FROM_Z_ZERO_COLUMNS";
 
 fn gpu_from_z_zero_columns_value_enabled(value: Option<&std::ffi::OsStr>) -> bool {
@@ -2981,6 +3010,14 @@ fn gpu_from_z_zero_columns_value_enabled(value: Option<&std::ffi::OsStr>) -> boo
 }
 
 fn gpu_from_z_zero_columns_enabled() -> bool {
+    if env_hoist2_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            gpu_from_z_zero_columns_value_enabled(
+                std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_COLUMNS).as_deref(),
+            )
+        });
+        return *ON;
+    }
     gpu_from_z_zero_columns_value_enabled(
         std::env::var_os(ENV_NO_GPU_FROM_Z_ZERO_COLUMNS).as_deref(),
     )
@@ -4212,9 +4249,26 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     // (the benchmark harness env-clears workers, so the env kill switch
     // cannot reach them; it still serves in-process tests and tooling).
     const GPU_COMMIT_DEFAULT: bool = true;
+    // Called on hot paths: the switch is read once per process.
+    static UNSET: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_COMMIT).is_none());
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+        && if env_hoist2_enabled() { *UNSET } else { std::env::var_os(ENV_NO_GPU_COMMIT).is_none() }
+}
+
+/// Kill switch for reading two per-call env switches once per process:
+/// `FLOCK_NO_GPU_COMMIT` in [`gpu_commit_enabled`] and
+/// [`ENV_NO_GPU_FROM_Z_ZERO_COLUMNS`]. `FLOCK_NO_ENV_HOIST2` (any value) reads
+/// both on every call again. A worker's environment is fixed for its lifetime
+/// (no runtime `set_var` touches either variable), so both forms return the
+/// same value. Read once per process.
+pub const ENV_NO_ENV_HOIST2: &str = "FLOCK_NO_ENV_HOIST2";
+
+fn env_hoist2_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ENV_HOIST2).is_none());
+    *ON
 }
 
 /// True after untimed warmup permanently selected the ranked GPU path.
@@ -9565,7 +9619,7 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
             && super::pass_tune_enabled()
             && super::gpu_mixed_final_selected(log_d, log_d - 4, 4)
             && super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled())
-            && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+            && crate::env_var_once!("FLOCK_NO_GPU_TABLE_REUSE").is_none()
     }
 
     pub(crate) unsafe fn encode_ntt_and_merkle(
@@ -12892,7 +12946,7 @@ kernel void blake3_pow_seg_tail(
         let text = *TEXT.get_or_init(|| {
             super::gpu_dead_lane_enabled() && with_g4x2_dead_lanes(g4x2_msl_source()).is_some()
         });
-        text && !gpu.pso_ntt4g4x2.is_null() && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+        text && !gpu.pso_ntt4g4x2.is_null() && crate::env_var_once!("FLOCK_NO_GPU_TABLE_REUSE").is_none()
     }
 
     /// [`super::select_from_z_zero_store_from`] for this process and
@@ -13150,7 +13204,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if crate::env_var_once!("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
                 0usize
             } else {
                 2usize
@@ -14316,7 +14370,7 @@ kernel void blake3_pow_seg_tail(
         if !super::gpu_commit_enabled()
             || !super::is_ranked_gpu_shape(params)
             || rayon::current_num_threads() <= 1
-            || std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
+            || crate::env_var_once!("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
             || z_len != 1usize << params.log_msg_len()
         {
             return None;
@@ -14358,7 +14412,7 @@ kernel void blake3_pow_seg_tail(
         // the sweep publishes before any timed prove, so this matches the
         // value `finish` will read; `finish` still re-checks and recovers if
         // it changed (possible only around warmup).
-        let early_k = if std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some() {
+        let early_k = if crate::env_var_once!("FLOCK_NO_EARLY_GPU_PREFIX").is_some() {
             0
         } else {
             match hybrid_cpu_sixteenths() {
@@ -14501,8 +14555,8 @@ kernel void blake3_pow_seg_tail(
     }
 
     fn debug_enabled() -> bool {
-        std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
-            || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+        crate::env_var_once!("FLOCK_COMMIT_TIMING").is_some()
+            || crate::env_var_once!("FLOCK_GPU_COMMIT_DEBUG").is_some()
     }
 
     /// Observability for poisoned process-global locks. The poisoning panic
@@ -15505,7 +15559,7 @@ kernel void blake3_pow_seg_tail(
             ll /= 2;
             lo = wlo;
         }
-        if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if after_ab && crate::env_var_once!("FLOCK_PHASE_TIMING").is_some() {
             eprintln!(
                 "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
                  suffix units in {tail_ms:.2} ms",
@@ -18856,7 +18910,7 @@ kernel void blake3_pow_seg_tail(
                 total_nodes,
             )
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if crate::env_var_once!("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
             let wall_ms = stream.started.elapsed().as_secs_f64() * 1e3;
             eprintln!(
                 "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"
@@ -26297,7 +26351,7 @@ kernel void zc_r2_horner_oracle(
             0.0
         };
         unsafe { gpu.release(cb) };
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::env_var_once!("FLOCK_PHASE_TIMING").is_some() {
             let fold_gpu = f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
             let window = f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
             eprintln!(
@@ -27835,6 +27889,9 @@ kernel void zc_ab_finish(
         /// Admitted prove: the GPU's per-chunk 64-lane partials of chunks
         /// `0..chunks`, eq_hi-weighted exactly like the CPU's.
         Prefix(Vec<[F128; 64]>),
+        /// Admitted prove, already written: the GPU's partials of chunks
+        /// `0..chunks` are in the caller's `partials` (`ENV_NO_ZC_AB_PARTS_DIRECT`).
+        PrefixWritten,
         /// Warm-up oracle probe compared (verdict recorded for the process);
         /// the caller's CPU partials are authoritative.
         Calibrated,
@@ -28017,8 +28074,10 @@ kernel void zc_ab_finish(
     /// Join the GPU prefix. During the warm-up oracle probe, `cpu_partials`
     /// must hold the CPU's own per-chunk partials of every chunk; the GPU's
     /// `0..chunks` are byte-compared against them and the arm is admitted
-    /// only on full equality (disabled for the process otherwise).
-    pub(crate) fn zc_ab_wait(job: ZcAbJob, cpu_partials: &[[F128; 64]], hi_size: usize) -> ZcAbResult {
+    /// only on full equality (disabled for the process otherwise). An
+    /// admitted prove writes the GPU's `0..chunks` into `cpu_partials` here
+    /// and returns `PrefixWritten` (`ENV_NO_ZC_AB_PARTS_DIRECT`).
+    pub(crate) fn zc_ab_wait(job: ZcAbJob, cpu_partials: &mut [[F128; 64]], hi_size: usize) -> ZcAbResult {
         use std::sync::atomic::Ordering;
         let debug = super::gpu_zc_ab_debug();
         let gpu = match gpu() {
@@ -28079,7 +28138,17 @@ kernel void zc_ab_finish(
                 }
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 64]>();
-            let out: Vec<[F128; 64]> = std::slice::from_raw_parts(parts, job.chunks).to_vec();
+            // An admitted prove writes its rows straight into the caller's
+            // partials (see `ENV_NO_ZC_AB_PARTS_DIRECT`); the oracle probe keeps its copy.
+            let direct = !job.calibration
+                && cpu_partials.len() >= job.chunks
+                && super::gpu_zc_ab_parts_direct_enabled();
+            let out: Vec<[F128; 64]> = if direct {
+                cpu_partials[..job.chunks].copy_from_slice(std::slice::from_raw_parts(parts, job.chunks));
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(parts, job.chunks).to_vec()
+            };
             // This prove's launch validated (or created) the cached view of
             // `ab_inner`, which the cascade donates as the compact deltas:
             // hand it to the K pass arm of the same prove.
@@ -28102,7 +28171,7 @@ kernel void zc_ab_finish(
                         job.submitted.elapsed().as_secs_f64() * 1e3,
                     );
                 }
-                return ZcAbResult::Prefix(out);
+                return if direct { ZcAbResult::PrefixWritten } else { ZcAbResult::Prefix(out) };
             }
             // ---- Warm-up oracle: GPU partials must equal the CPU's own ----
             let mismatch = if cpu_partials.len() < job.chunks {
@@ -28532,13 +28601,16 @@ kernel void zc_ab_finish(
 
     /// Result of joining the K pass GPU prefix.
     pub(crate) enum ZcKResult {
-        /// Chunks `0..parts.len()`: the eight eq_hi-weighted sums per chunk
-        /// (the CPU's `partials` slots) and the outputs in the K pass's packed
-        /// layouts, `len_a` / `len_b` entries at `a` / `b` (process-lifetime
-        /// buffers, valid until the next launch). `b_ones` = every b output
-        /// the b-one pack skips was one (else the pass must be rerun unpacked).
+        /// The job's chunks: the eight eq_hi-weighted sums per chunk (the
+        /// CPU's `partials` slots), in `parts`, or, when `parts_view` is not
+        /// null, at `parts_view` (`ENV_NO_ZC_K_PARTS_VIEW`; `parts` is then
+        /// empty), and the outputs in the K pass's packed layouts, `len_a` /
+        /// `len_b` entries at `a` / `b` (process-lifetime buffers, valid until
+        /// the next launch). `b_ones` = every b output the b-one pack skips
+        /// was one (else the pass must be rerun unpacked).
         Prefix {
             parts: Vec<[F128; 8]>,
+            parts_view: *const [F128; 8],
             a: *const F128,
             b: *const F128,
             len_a: usize,
@@ -29109,8 +29181,13 @@ kernel void zc_ab_finish(
                     return ZcKResult::Failed;
                 }
             };
-            let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 8]>();
-            let parts: Vec<[F128; 8]> = std::slice::from_raw_parts(parts, job.chunks).to_vec();
+            let parts_ptr = gpu.buffer_contents(state.part_buf).cast::<[F128; 8]>().cast_const();
+            // An admitted prove hands over the part buffer itself (see
+            // `ENV_NO_ZC_K_PARTS_VIEW`); the oracle probe keeps its own copy.
+            let view = !job.calibration && super::gpu_zc_k_parts_view_enabled();
+            let parts: Vec<[F128; 8]> =
+                if view { Vec::new() } else { std::slice::from_raw_parts(parts_ptr, job.chunks).to_vec() };
+            let parts_view = if view { parts_ptr } else { std::ptr::null() };
             let a = gpu.buffer_contents(state.out_a).cast::<F128>().cast_const();
             let b = gpu.buffer_contents(state.out_b).cast::<F128>().cast_const();
             let b_ones = *gpu.buffer_contents(state.flag_buf).cast::<u32>() == 0;
@@ -29133,6 +29210,7 @@ kernel void zc_ab_finish(
             }
             ZcKResult::Prefix {
                 parts,
+                parts_view,
                 a,
                 b,
                 len_a: job.chunks * job.per_chunk_a,

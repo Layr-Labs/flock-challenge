@@ -2291,10 +2291,10 @@ pub(crate) mod witgen_simd {
     }
 
     /// Exact-`1` kill switch for the constant-region elision (item B).
-    /// Read per witgen call (uncached) so same-process A/B tests can
-    /// toggle it.
+    /// Read once per process through `flock_core::env_var_once!`, which test
+    /// builds bypass so same-process A/B tests can toggle it.
     fn const_elide_killed() -> bool {
-        std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1")
+        flock_core::env_var_once!("FLOCK_NO_SCRATCH_CONST_ELIDE").is_some_and(|v| v == "1")
     }
 
     /// Bitmask of token hits (bit0 z, bit1 a, bit2 b) of the most recent
@@ -4264,7 +4264,7 @@ pub(crate) mod witgen_simd {
             n_total >= 8 && n_total.is_multiple_of(8),
             "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
         );
-        let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        let stripe_useful_bits = if flock_core::env_var_once!("FLOCK_FULL_STRIPE").is_some() {
             K
         } else {
             USEFUL_BITS
@@ -4537,7 +4537,7 @@ pub(crate) mod witgen_simd {
             // build. The env kill switch exists for same-binary diagnostics.
             const STREAM_TAPER_DEFAULT: bool = true;
             let tapered =
-                STREAM_TAPER_DEFAULT && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
+                STREAM_TAPER_DEFAULT && flock_core::env_var_once!("FLOCK_NO_STREAM_TAPER").is_none();
             let schedule = if tapered {
                 TAPERED_SCHEDULE
             } else {
@@ -4556,7 +4556,7 @@ pub(crate) mod witgen_simd {
             // worker-thread submission needs no extra pool handling.
             // `FLOCK_NO_WITGEN_CONT_QUEUE=1` restores the incumbent band
             // loop exactly.
-            let cont_queue = !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE").is_ok_and(|v| v == "1");
+            let cont_queue = !flock_core::env_var_once!("FLOCK_NO_WITGEN_CONT_QUEUE").is_some_and(|v| v == "1");
             if cont_queue {
                 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
                 const SLAB: usize = super::super::common::WITGEN_HETERO_SLAB;
@@ -4590,7 +4590,7 @@ pub(crate) mod witgen_simd {
                     .map(|&gps| AtomicUsize::new(SEGMENTS * gps / SLAB))
                     .collect();
                 let done: Vec<AtomicBool> = (0..n_bands).map(|_| AtomicBool::new(false)).collect();
-                let timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+                let timing = flock_core::env_var_once!("FLOCK_PHASE_TIMING").is_some();
                 let t0 = std::time::Instant::now();
                 let done_ns: Vec<AtomicU64> = (0..n_bands).map(|_| AtomicU64::new(0)).collect();
                 let submit_ns: Vec<AtomicU64> = (0..n_bands).map(|_| AtomicU64::new(0)).collect();
@@ -4602,7 +4602,7 @@ pub(crate) mod witgen_simd {
                 // Publish each band the moment its last slab lands instead of
                 // strictly in band order. `FLOCK_NO_BAND_ANY_ORDER=1` restores
                 // the in-order sequencer.
-                let any_order = std::env::var_os("FLOCK_NO_BAND_ANY_ORDER").is_none();
+                let any_order = flock_core::env_var_once!("FLOCK_NO_BAND_ANY_ORDER").is_none();
                 let seq = std::sync::Mutex::new(SubmitSeq {
                     next: 0,
                     submitted: vec![false; n_bands],
@@ -5103,8 +5103,8 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
         pcs_params,
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
         flock_core::epool::helper_pool_available(),
-        std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
-        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
+        flock_core::env_var_once!("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
+        flock_core::env_var_once!("FLOCK_FULL_STRIPE").is_some(),
     )
 }
 
@@ -5257,7 +5257,7 @@ impl Blake3Setup {
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && self.pcs_params.merkle_hash == HashKind::Blake3
-            && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
+            && flock_core::env_var_once!("FLOCK_NO_HOT_CODEWORD").is_none()
     }
 
     /// Select the reverse transpose only for the promoted benchmark geometry.
@@ -5278,7 +5278,7 @@ impl Blake3Setup {
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
-            && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+            && flock_core::env_var_once!("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
     }
 
     #[inline]
@@ -5606,7 +5606,7 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+        let phase_timing = flock_core::env_var_once!("FLOCK_PHASE_TIMING").is_some();
         // The padding rows force the same zero columns the CPU suffix skips
         // (`ZeroOddTailLanes`); the GPU commit graph is encoded during
         // witness generation, so publish them for the whole proof.

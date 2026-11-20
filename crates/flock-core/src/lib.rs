@@ -20,6 +20,7 @@
 pub mod bits;
 pub mod challenger;
 pub mod cpu_keepalive;
+pub mod env_once;
 // Public but hidden: flock-prover's witness driver drains its groups through
 // the hetero queue (W-H1). Not a stable API surface.
 #[doc(hidden)]

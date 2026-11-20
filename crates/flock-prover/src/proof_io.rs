@@ -712,6 +712,9 @@ pub(crate) struct GatherBundle<'a> {
     prefix: Vec<u8>,
     arena: Vec<u8>,
     segs: Vec<GatherSeg<'a>>,
+    /// Sum of the lengths of `segs`, counted as `u64` and `bytes` (their only
+    /// writers) append.
+    seg_len: usize,
 }
 
 enum GatherSeg<'a> {
@@ -728,10 +731,12 @@ impl<'a> GatherBundle<'a> {
         } else {
             self.segs.push(GatherSeg::Arena(start, 8));
         }
+        self.seg_len += 8;
     }
     fn bytes(&mut self, b: &'a [u8]) {
         if !b.is_empty() {
             self.segs.push(GatherSeg::Ext(b));
+            self.seg_len += b.len();
         }
     }
     fn f128s(&mut self, v: &'a [F128]) {
@@ -761,8 +766,13 @@ impl<'a> GatherBundle<'a> {
         self.hashes(merkle_proof);
     }
 
-    /// Total encoded length.
+    /// Total encoded length: the prefix plus `seg_len`, which equals the sum
+    /// of the segment lengths by construction (`FLOCK_NO_GATHER_LEN_INCR=1`
+    /// sums the segments instead).
     pub(crate) fn len(&self) -> usize {
+        if gather_len_incr_enabled() {
+            return self.prefix.len() + self.seg_len;
+        }
         self.prefix.len()
             + self
                 .segs
@@ -841,6 +851,13 @@ pub(crate) fn gather_publish_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FLOCK_NO_GATHER_PUBLISH").map_or(true, |v| v != "1"))
 }
 
+/// `FLOCK_NO_GATHER_LEN_INCR=1` makes [`GatherBundle::len`] sum the segment
+/// lengths instead of reading the running total.
+fn gather_len_incr_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FLOCK_NO_GATHER_LEN_INCR").map_or(true, |v| v != "1"))
+}
+
 /// Gather form of [`r1cs_parts_to_bytes`]. `None` unless the flat encoder's
 /// bulk paths are all live and the pre-encoded prefix matches — the exact
 /// conditions under which `r1cs_parts_to_bytes` emits stash ‖ flat
@@ -870,6 +887,7 @@ pub(crate) fn r1cs_parts_gather<'a>(
         prefix,
         arena: take_gather_arena_scratch(64 * 1024),
         segs: Vec::with_capacity(4096),
+        seg_len: 0,
     };
     let BatchOpeningProofLigerito {
         ring_switches,
@@ -946,6 +964,7 @@ pub(crate) fn warm_gather_publish(
             mut prefix,
             mut arena,
             segs,
+            seg_len: _,
         } = g;
         drop(segs);
         prefix.clear();
@@ -1520,6 +1539,7 @@ mod tests {
             prefix: (0..4_321u32).map(|i| (i * 7 + 3) as u8).collect(),
             arena: Vec::new(),
             segs: Vec::new(),
+            seg_len: 0,
         };
         gather.rows(&rows);
         gather.hashes(&hashes);
@@ -1530,6 +1550,16 @@ mod tests {
         let mut written = Vec::new();
         gather.write_all_to(&mut written).expect("vectored write");
         assert_eq!(written.len(), gather.len());
+        // Both `FLOCK_NO_GATHER_LEN_INCR` forms of the length agree.
+        let summed: usize = gather
+            .segs
+            .iter()
+            .map(|s| match s {
+                GatherSeg::Arena(_, l) => *l,
+                GatherSeg::Ext(b) => b.len(),
+            })
+            .sum();
+        assert_eq!(gather.seg_len, summed);
         assert_eq!(written, gather.to_vec());
 
         // Split inside a part, on a part boundary, at both ends.

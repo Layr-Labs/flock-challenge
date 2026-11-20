@@ -1986,7 +1986,7 @@ fn prove_padded_inner<Ch: Challenger>(
         z_vec
     };
     let ((mut comb_vec, eq_inner), mut z_vec) =
-        if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
+        if crate::env_var_once!("FLOCK_NO_LINCHECK_JOIN").is_some() {
             (comb_branch(), z_branch())
         } else {
             rayon::join(comb_branch, z_branch)

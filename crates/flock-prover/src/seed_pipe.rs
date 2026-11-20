@@ -201,12 +201,12 @@ pub(crate) fn gen_block(init: u64, block: usize) -> Compression {
 }
 
 /// Exact-`1` kill for the ILP-unrolled [`gen_block`]; anything else leaves
-/// it on. Deliberately UNCACHED (one getenv per call) so same-process A/B
-/// tests can toggle it: the hot paths (the lazy witgen quad synth and the
-/// eager parallel fill) resolve it once per prove/fill and pass the bool
-/// down via [`gen_block_with`]; only cold callers pay the per-call read.
+/// it on. Read once per process through `flock_core::env_var_once!`, which
+/// test builds bypass so same-process A/B tests can toggle it. The hot paths
+/// (the lazy witgen quad synth and the eager parallel fill) resolve it once
+/// per prove/fill and pass the bool down via [`gen_block_with`].
 pub(crate) fn gen_block_ilp_killed() -> bool {
-    std::env::var("FLOCK_NO_GEN_BLOCK_SIMD").is_ok_and(|v| v == "1")
+    flock_core::env_var_once!("FLOCK_NO_GEN_BLOCK_SIMD").is_some_and(|v| v == "1")
 }
 
 /// [`gen_block`] with the ILP/scalar choice resolved by the caller (hot
@@ -463,7 +463,7 @@ static SPEC_INIT: AtomicU64 = AtomicU64::new(0);
 
 /// Exact-`1` kill for lazy mode; anything else leaves the new path on.
 fn lazy_blocks_killed() -> bool {
-    std::env::var("FLOCK_NO_SPEC_LAZY_BLOCKS").is_ok_and(|v| v == "1")
+    flock_core::env_var_once!("FLOCK_NO_SPEC_LAZY_BLOCKS").is_some_and(|v| v == "1")
 }
 
 /// If `blocks` is the live lazy speculative buffer, return the generator
@@ -780,7 +780,7 @@ fn speculative_publish_enabled_for(ranked: bool, kill: Option<&OsStr>) -> bool {
 fn speculative_publish_enabled() -> bool {
     speculative_publish_enabled_for(
         is_ranked_worker(),
-        std::env::var_os("FLOCK_NO_SPEC_PUBLISH").as_deref(),
+        flock_core::env_var_once!("FLOCK_NO_SPEC_PUBLISH").as_deref(),
     )
 }
 
@@ -922,7 +922,7 @@ fn preopen_publish_enabled_for(kill: Option<&OsStr>) -> bool {
 /// Whether the pre-opened publish descriptor is closed after the rename
 /// rather than before it. Exact-`1` kill: `FLOCK_NO_LATE_CLOSE`.
 fn late_close_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_LATE_CLOSE").as_deref() != Some(OsStr::new("1"))
+    flock_core::env_var_once!("FLOCK_NO_LATE_CLOSE").as_deref() != Some(OsStr::new("1"))
 }
 
 /// Whether a publication through the pre-opened file leaves the published
@@ -1520,7 +1520,7 @@ fn speculative_main(
     // that pure serial join time is off the timed window's first microseconds.
     // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
     let defer_join =
-        std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
+        flock_core::env_var_once!("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
     if defer_join {
         flock_core::cpu_keepalive::keepalive_signal();
     } else {

@@ -3044,7 +3044,7 @@ fn transpose_forward_ntt_fused_3layer(
     // Read once per group, not per product; an in-process diagnostic can ablate
     // this fold without changing the transpose schedule or prepared twiddles.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
-    let pmull_fold = std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none();
+    let pmull_fold = crate::env_var_once!("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none();
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
     type Twiddle = crate::field::gf2_128::aarch64::ConstPrep;
@@ -5806,6 +5806,40 @@ pub(crate) fn ligero_commit(
     )
 }
 
+/// Kill switch for the per-proof environment reads hoisted into once-per-process
+/// statics (`FLOCK_NO_ENV_HOIST`, any value: every listed site reads the
+/// environment on each call, as before). Covers the recursive-commit
+/// from-message gates.
+/// The prover never writes these variables, so each read returns the same value
+/// for the whole process. Read once per process.
+pub const ENV_NO_ENV_HOIST: &str = "FLOCK_NO_ENV_HOIST";
+
+pub(crate) fn env_hoist_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ENV_HOIST).is_none());
+    *ON
+}
+
+/// `std::env::var_os(name).is_none()` for the recursive-commit gates, cached once
+/// per process while the env hoist is on (see [`ENV_NO_ENV_HOIST`]).
+fn env_unset_hoisted(name: &'static str) -> bool {
+    if !env_hoist_enabled() {
+        return std::env::var_os(name).is_none();
+    }
+    static ALL: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none());
+    static L1: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1").is_none());
+    static L2: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2").is_none());
+    match name {
+        "FLOCK_NO_RECURSIVE_FROM_MESSAGE" => *ALL,
+        "FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1" => *L1,
+        "FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2" => *L2,
+        _ => std::env::var_os(name).is_none(),
+    }
+}
+
 /// Shared dispatch of [`ligero_commit`] / [`ligero_commit_with_tree_view`].
 fn ligero_commit_select(
     poly: &[F128],
@@ -5822,7 +5856,7 @@ fn ligero_commit_select(
         _ => None,
     };
     let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
-    let level_enabled = level_opt_out.is_some_and(|name| std::env::var_os(name).is_none());
+    let level_enabled = level_opt_out.is_some_and(env_unset_hoisted);
     let fuse_from_message = cfg!(all(
         target_os = "macos",
         target_arch = "aarch64",

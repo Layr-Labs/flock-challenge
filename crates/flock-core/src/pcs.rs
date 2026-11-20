@@ -143,7 +143,7 @@ pub fn open_batch_mixed_ligerito_with_owned_canonical_fold8<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
     let trace =
-        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+        std::env::var("PCS_TRACE").is_ok() || crate::env_var_once!("FLOCK_OPEN_TIMING").is_some();
     let t_total = std::time::Instant::now();
 
     assert_eq!(
@@ -930,7 +930,7 @@ pub(crate) fn use_open_mat_hetero(
 ) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && is_ranked_open_mat_hetero_shape(packed_len, block_len, claim_count, has_ordinary)
-        && !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
+        && !crate::env_var_once!("FLOCK_NO_OPEN_MAT_HETERO").is_some_and(|v| v == "1")
         && crate::epool::epool().is_some()
 }
 
@@ -1107,18 +1107,26 @@ fn direct_fold4_all_claim_mix_supported(
 
 /// Direct-fold8 route: both ranked claims must expose a complete
 /// direct-fold8 bundle, so no ordinary basis sweep or duplicate statistics
-/// path is needed.
+/// path is needed. This route reads no basis value, so it also admits a basis
+/// that ring-switch elided ([`ring_switch::RsEqInd::DeferredDenseElided`]).
 #[inline]
 fn direct_fold8_all_claim_mix_supported(
     rs_results: &[(RingSwitchProof, ring_switch::RingSwitchBatchOutput)],
 ) -> bool {
+    let deferred = |basis: &ring_switch::RsEqInd| {
+        matches!(
+            basis,
+            ring_switch::RsEqInd::DeferredDense { .. }
+                | ring_switch::RsEqInd::DeferredDenseElided { .. }
+        )
+    };
     matches!(
         rs_results,
         [(_, ab), (_, c)]
             if ab.direct_fold8.is_some()
                 && c.direct_fold8.is_some()
-                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+                && deferred(&ab.rs_eq_ind)
+                && deferred(&c.rs_eq_ind)
     )
 }
 
@@ -1205,7 +1213,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && n_rs == 2
         && n_pd == 0
         && packed_witness.len() == (1usize << 25)
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+        && crate::env_var_once!("FLOCK_NO_OPEN_DIRECT_AB").is_none();
     let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
@@ -1266,7 +1274,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && l == (1usize << 25)
         && n_rs == 2
         && n_pd == 0
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+        && crate::env_var_once!("FLOCK_NO_OPEN_DIRECT_AB").is_none();
     let use_direct_fold8 = direct_common
         && ranked_direct_fold8_enabled()
         && direct_fold8_all_claim_mix_supported(&rs_results);
@@ -1625,6 +1633,9 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
                     eq_hi,
                     table,
                 } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
+                ring_switch::RsEqInd::DeferredDenseElided { .. } => {
+                    unreachable!("an elided basis is admitted only by the direct-fold8 route")
+                }
                 _ => None,
             })
             .collect();

@@ -1552,7 +1552,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         // `total_bytes`; zero is a valid object representation for F128.
         unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
     }
-    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+    if use_provenance && crate::env_var_once!("FLOCK_ZC_TIMING").is_some() {
         let (hits, misses) = ab_compact_backing_token_counts();
         eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
     }
@@ -1731,7 +1731,7 @@ fn ranked_ab_pre_fast_policy_hoist_shape(
 pub const ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST: &str = "FLOCK_NO_ZC_AB_PRE_FAST_POLICY_HOIST";
 
 fn zc_ab_pre_fast_policy_hoist_enabled() -> bool {
-    std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
+    crate::env_var_once!(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
         != Some(std::ffi::OsStr::new("1"))
 }
 
@@ -1791,7 +1791,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     // Resolve the rollback once before worker/row dispatch; no table setup.
-    let transform_trim = std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref()
+    let transform_trim = crate::env_var_once!("FLOCK_NO_TRANSFORM_TRIM").as_deref()
         != Some(std::ffi::OsStr::new("1"));
     if let Some(producer) = producer {
         // Deferred A/B rows: each job produces its units one at a time into
@@ -3348,7 +3348,7 @@ fn ab_eq_fold_from_env() -> AbEqFold {
 }
 
 fn zc_ab_bank_deferred_enabled() -> bool {
-    zc_ab_bank_deferred_enabled_from_value(std::env::var_os(ENV_NO_ZC_AB_BANK_DEFERRED).as_deref())
+    zc_ab_bank_deferred_enabled_from_value(crate::env_var_once!(ENV_NO_ZC_AB_BANK_DEFERRED).as_deref())
 }
 
 fn zc_ab_bank_deferred_enabled_from_value(value: Option<&std::ffi::OsStr>) -> bool {
@@ -4048,6 +4048,7 @@ impl AbGpuPrefix {
                     partials[..gpu.len()].copy_from_slice(&gpu);
                     true
                 }
+                crate::gpu_commit::ZcAbResult::PrefixWritten => true,
                 crate::gpu_commit::ZcAbResult::Calibrated => true,
                 crate::gpu_commit::ZcAbResult::Failed => false,
             }
@@ -4931,12 +4932,51 @@ fn r2_c_capture_store(c_inner: &[F128]) {
     *R2_C_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(rows);
 }
 
+/// Kill switch for skipping C's four-bank `quad` on the fold8 route
+/// (`FLOCK_NO_ZC_QUAD_SKIP`, any value: round one folds the sixty-four banks
+/// down to `quad` and collapses that to `s_hat_v_c`, as before). Read once per
+/// process.
+///
+/// On the fold8 route the open takes C's sixty-four-bank tensor, so nothing
+/// reads `quad`: [`round1_c_fold8_from_lincheck_stripe`] returns it empty and
+/// collapses `s_hat_v_c` straight from the sixty-four banks under
+/// `inner_tail[..6]`. Exact: `build_eq` indexes bit `i` by `r_i`, so
+/// `eq(t[..6])[e + 4q] = eq(t[..2])[e] · eq(t[2..6])[q]`, and both orders sum
+/// the same products in GF(2^128), where multiplication is associative and
+/// addition is XOR. Same field values, same transcript.
+pub const ENV_NO_ZC_QUAD_SKIP: &str = "FLOCK_NO_ZC_QUAD_SKIP";
+
+fn zc_quad_skip_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_QUAD_SKIP).is_none());
+    *ON
+}
+
+/// Kill switch for returning round one's C inner fold to the lincheck pool
+/// (`FLOCK_NO_ZC_C_INNER_GIVE`, any value: the fold8 C derivation drops it at
+/// its end, as before). Read once per process.
+///
+/// At the ranked shape `c_inner` is the stripe fold's output buffer, taken
+/// from the lincheck z-vector pool (`scratch::take_lincheck_z_vec`), and its
+/// last reader is the sixty-four-bank fold. Returning it right after lets
+/// lincheck's own z fold, later in the same prove, take it instead of a new
+/// allocation. Every taker of that pool writes each slot before reading it,
+/// so the old values are never observed.
+pub const ENV_NO_ZC_C_INNER_GIVE: &str = "FLOCK_NO_ZC_C_INNER_GIVE";
+
+fn zc_c_inner_give_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_C_INNER_GIVE).is_none());
+    *ON
+}
+
 /// Fold8 sibling of [`round1_c_fold4_from_lincheck_stripe`]: same single
 /// stripe fold, but six inner coordinates are retained (64 banks) for the
 /// direct-fold8 PCS consumer. The wire outputs (`round1_c_opt`, canonical
-/// `s_hat_v_c`, `quad`) are derived by collapsing the wider statistic and are
+/// `s_hat_v_c`) are derived by collapsing the wider statistic and are
 /// bitwise identical to the fold4 variant's — the extra two retained
-/// coordinates only widen the exported tensor.
+/// coordinates only widen the exported tensor. `quad` is returned empty
+/// unless [`ENV_NO_ZC_QUAD_SKIP`] is set; then it too is the fold4 variant's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     c_lincheck: &[u8],
@@ -4974,22 +5014,34 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     });
     let inner_tail = &r[k_skip + 1..k_log];
     let fold8 = crate::pcs::ring_switch::s_hat_v_fold8_from_z_vec(&c_inner, inner_tail);
+    // `c_inner` has no reader past this point (see [`ENV_NO_ZC_C_INNER_GIVE`]).
+    if zc_c_inner_give_enabled() {
+        crate::scratch::give_lincheck_z_vec(c_inner);
+    }
 
-    // Fold retained coordinates 2..6 to recover the incumbent four-bank
-    // tensor (coordinates 0 and 1 remain bank selectors).
-    let retained_hi_eq = build_eq(&inner_tail[2..6]);
-    let n_packed = 1usize << crate::pcs::LOG_PACKING;
-    let mut quad = vec![F128::ZERO; 4 * n_packed];
-    for q in 0..16 {
-        for e in 0..4 {
-            let src = (e + 4 * q) * n_packed;
-            let dst = e * n_packed;
-            for packed in 0..n_packed {
-                quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
+    let (s_hat_v_c, quad) = if zc_quad_skip_enabled() {
+        // No four-bank tensor (see [`ENV_NO_ZC_QUAD_SKIP`]).
+        let s_hat_v_c =
+            crate::pcs::ring_switch::collapse_s_hat_v_fold8(&fold8, &inner_tail[..6]);
+        (s_hat_v_c, Vec::new())
+    } else {
+        // Fold retained coordinates 2..6 to recover the incumbent four-bank
+        // tensor (coordinates 0 and 1 remain bank selectors).
+        let retained_hi_eq = build_eq(&inner_tail[2..6]);
+        let n_packed = 1usize << crate::pcs::LOG_PACKING;
+        let mut quad = vec![F128::ZERO; 4 * n_packed];
+        for q in 0..16 {
+            for e in 0..4 {
+                let src = (e + 4 * q) * n_packed;
+                let dst = e * n_packed;
+                for packed in 0..n_packed {
+                    quad[dst + packed] += retained_hi_eq[q] * fold8[src + packed];
+                }
             }
         }
-    }
-    let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+        let s_hat_v_c = crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad, &inner_tail[..2]);
+        (s_hat_v_c, quad)
+    };
 
     // RingSwitch leaves global bit k_skip as its 128-way prefix. Fold that
     // bit at the original C point to recover C's 64 S-domain evaluations.
@@ -5774,7 +5826,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
 /// Resolve the Fold4-only lo/hi split tuning seam. Invalid values fail loudly:
 /// silently accepting a typo would make component profiles incomparable.
 fn fold4_n_hi_from_env() -> usize {
-    match std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_N_HI") {
+    match crate::env_var_once!("FLOCK_EXPERIMENTAL_FOLD4_N_HI") {
         None => 7,
         Some(value) => match value.to_str() {
             Some("5") => 5,
@@ -11129,10 +11181,14 @@ mod tests {
                 got_c8.1, incumbent.2,
                 "fold8 canonical C mismatch in case {case}"
             );
-            assert_eq!(
-                got_c8.2, incumbent.3,
-                "fold8 quad C mismatch in case {case}"
-            );
+            // `quad` is built only with `ENV_NO_ZC_QUAD_SKIP` set; the
+            // reduction check below covers the sixty-four banks either way.
+            if !got_c8.2.is_empty() {
+                assert_eq!(
+                    got_c8.2, incumbent.3,
+                    "fold8 quad C mismatch in case {case}"
+                );
+            }
             let inner_tail = &r[K_SKIP + 1..K_LOG];
             assert_eq!(
                 crate::pcs::ring_switch::collapse_s_hat_v_fold8(&got_c8.3, &inner_tail[..6]),
@@ -11157,6 +11213,28 @@ mod tests {
             assert_eq!(
                 fold4_from_8, incumbent.4,
                 "fold8 → fold4 reduction mismatch in case {case}"
+            );
+            // Both `s_hat_v_c` derivations of `ENV_NO_ZC_QUAD_SKIP`: through
+            // the four-bank tensor, and straight from the sixty-four banks.
+            let quad_eq = build_eq(&inner_tail[2..6]);
+            let mut quad_from_8 = vec![F128::ZERO; 4 * n_packed];
+            for q in 0..16 {
+                for e in 0..4 {
+                    let src = (e + 4 * q) * n_packed;
+                    let dst = e * n_packed;
+                    for packed in 0..n_packed {
+                        quad_from_8[dst + packed] += quad_eq[q] * got_c8.3[src + packed];
+                    }
+                }
+            }
+            assert_eq!(
+                quad_from_8, incumbent.3,
+                "fold8 to quad reduction mismatch in case {case}"
+            );
+            assert_eq!(
+                crate::pcs::ring_switch::collapse_s_hat_v_quad(&quad_from_8, &inner_tail[..2]),
+                crate::pcs::ring_switch::collapse_s_hat_v_fold8(&got_c8.3, &inner_tail[..6]),
+                "quad-skip canonical C mismatch in case {case}"
             );
         }
     }

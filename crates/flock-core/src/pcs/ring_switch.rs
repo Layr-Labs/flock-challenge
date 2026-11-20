@@ -1508,7 +1508,13 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         let (z0, z1) = z_vec.split_at(half);
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
-            let mut out = vec![F128::ZERO; half];
+            // Every output is appended once, in index order, so the buffer
+            // needs no zero fill first (see `fold8_uninit_enabled`).
+            let mut out = Vec::with_capacity(half);
+            if !fold8_uninit_enabled() {
+                out.resize(half, F128::ZERO);
+                out.clear();
+            }
             let mut i = 0;
             while i < half {
                 let x0 = z0[i] + z1[i];
@@ -1521,10 +1527,12 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
                 let prod1 = unsafe {
                     crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(r, [x2, x3])
                 };
-                out[i] = z0[i] + prod0[0];
-                out[i + 1] = z0[i + 1] + prod0[1];
-                out[i + 2] = z0[i + 2] + prod1[0];
-                out[i + 3] = z0[i + 3] + prod1[1];
+                out.extend_from_slice(&[
+                    z0[i] + prod0[0],
+                    z0[i + 1] + prod0[1],
+                    z0[i + 2] + prod1[0],
+                    z0[i + 3] + prod1[1],
+                ]);
                 i += 4;
             }
             return out;
@@ -2727,6 +2735,16 @@ pub enum RsEqInd {
         eq_hi: Vec<F128>,
         table: Vec<F128>,
     },
+    /// Deferred dense whose basis the caller proved dead (see
+    /// [`prove_batched_padded_with_precomputed_elidable`]): neither
+    /// `build_eq_split` factor is built or allocated; only the logical length
+    /// and the γ-baked byte table are kept. The direct-fold8 route, the only
+    /// consumer that admits it, takes the claim from its factor bundle and
+    /// reads no basis value; the materializing readers below panic on it.
+    DeferredDenseElided {
+        len: usize,
+        table: Vec<F128>,
+    },
     Sparse {
         len: usize,
         entries: Vec<(usize, F128)>,
@@ -2757,12 +2775,32 @@ fn rs_elide_dead_basis_enabled() -> bool {
     *ON
 }
 
+/// `FLOCK_NO_RS_ELIDE_NOALLOC` (any value) makes an elided basis carry
+/// length-correct factor buffers in [`RsEqInd::DeferredDense`] again instead of
+/// [`RsEqInd::DeferredDenseElided`]. Read once per process.
+fn rs_elide_noalloc_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RS_ELIDE_NOALLOC").is_none());
+    *ON
+}
+
+/// `FLOCK_NO_FOLD8_UNINIT` (any value) zero-fills the scored-shape
+/// [`s_hat_v_fold8_from_z_vec`] output before writing it, as before. Read once
+/// per process.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn fold8_uninit_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_FOLD8_UNINIT").is_none());
+    *ON
+}
+
 impl RsEqInd {
     /// Logical length of the underlying vector.
     pub fn len(&self) -> usize {
         match self {
             Self::Dense(v) => v.len(),
             Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
+            Self::DeferredDenseElided { len, .. } => *len,
             Self::Sparse { len, .. } => *len,
         }
     }
@@ -2791,6 +2829,9 @@ impl RsEqInd {
                     *o += gamma * deferred_dense_value(eq_lo, eq_hi, table, log_b, j);
                 }
             }
+            Self::DeferredDenseElided { .. } => {
+                unreachable!("an elided deferred-dense basis has no slot values")
+            }
             Self::Sparse { entries, .. } => {
                 for &(idx, val) in entries {
                     out[idx] += gamma * val;
@@ -2814,6 +2855,9 @@ impl RsEqInd {
                     .map(|j| deferred_dense_value(eq_lo, eq_hi, table, log_b, j))
                     .collect()
             }
+            Self::DeferredDenseElided { .. } => {
+                unreachable!("an elided deferred-dense basis has no slot values")
+            }
             Self::Sparse { len, entries } => {
                 let mut out = vec![F128::ZERO; *len];
                 for &(idx, val) in entries {
@@ -2829,7 +2873,7 @@ impl RsEqInd {
     pub fn into_dense(self) -> Vec<F128> {
         match self {
             Self::Dense(v) => v,
-            Self::DeferredDense { .. } => self.to_dense(),
+            Self::DeferredDense { .. } | Self::DeferredDenseElided { .. } => self.to_dense(),
             Self::Sparse { len, entries } => {
                 let mut out = vec![F128::ZERO; len];
                 for (idx, val) in entries {
@@ -3001,10 +3045,14 @@ pub fn prove_batched_padded_with_precomputed<Ch: Challenger>(
 /// its own inputs before eliding any work.  Every miss retains the ordinary
 /// factor construction.
 ///
-/// When the contract holds, length-correct zero factors replace the unused
-/// `build_eq_split` outputs.  `RsEqInd::len()` therefore remains unchanged;
-/// the direct-fold8 consumer filters every claim before any factor value can
-/// be observed.  `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1` restores the full build.
+/// When the contract holds, each claim's `rs_eq_ind` is
+/// [`RsEqInd::DeferredDenseElided`]: the logical length and the byte table,
+/// with neither unused `build_eq_split` factor allocated
+/// (`FLOCK_NO_RS_ELIDE_NOALLOC`, any value, carries length-correct factor
+/// buffers that are never written or read instead).  `RsEqInd::len()`
+/// therefore remains unchanged; the direct-fold8 consumer filters every claim
+/// before any factor value can be observed.  `FLOCK_NO_RS_ELIDE_DEAD_BASIS=1`
+/// restores the full build.
 pub fn prove_batched_padded_with_precomputed_elidable<Ch: Challenger>(
     packed_witness: &[F128],
     x_outers: &[&[F128]],
@@ -3154,6 +3202,7 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
         && sparse_needs_fold.is_empty()
         && crate::pcs::ranked_direct_fold8_enabled()
         && rs_elide_dead_basis_enabled();
+    let elide_noalloc = elide_basis && rs_elide_noalloc_enabled();
     let t = std::time::Instant::now();
     let dense_splits: Vec<(Vec<F128>, Vec<F128>)> = if use_split {
         dense_suffixes
@@ -3627,6 +3676,13 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
                     _ => None,
                 };
                 let rs_eq_ind = match kinds[i] {
+                    // Elided basis: the direct-fold8 route observes only the
+                    // logical length, `l = 2^suffix.len()`, which is the
+                    // product of the two factor lengths the full build gives.
+                    // Keep it and the table; allocate neither dead factor.
+                    Kind::Dense(_) if use_split && elide_noalloc => {
+                        RsEqInd::DeferredDenseElided { len: l, table }
+                    }
                     Kind::Dense(d) => {
                         if use_split {
                             // Defer the fold: carry split factors + the γ-baked byte
@@ -5123,19 +5179,24 @@ mod tests {
                 } => (eq_lo, eq_hi, table),
                 _ => panic!("control claim must be deferred dense"),
             };
-            let (candidate_lo, candidate_hi, candidate_table) = match &candidate[claim].1.rs_eq_ind
-            {
+            let candidate_table = match &candidate[claim].1.rs_eq_ind {
+                RsEqInd::DeferredDenseElided { len, table } => {
+                    assert_eq!(*len, control_lo.len() * control_hi.len());
+                    table
+                }
+                // `FLOCK_NO_RS_ELIDE_NOALLOC`: length-correct factor buffers
+                // that are never written, so only their lengths are checked.
                 RsEqInd::DeferredDense {
                     eq_lo,
                     eq_hi,
                     table,
-                } => (eq_lo, eq_hi, table),
+                } => {
+                    assert_eq!(eq_lo.len(), control_lo.len());
+                    assert_eq!(eq_hi.len(), control_hi.len());
+                    table
+                }
                 _ => panic!("candidate claim must be deferred dense"),
             };
-            assert_eq!(candidate_lo.len(), control_lo.len());
-            assert_eq!(candidate_hi.len(), control_hi.len());
-            assert!(candidate_lo.iter().all(|&value| value == F128::ZERO));
-            assert!(candidate_hi.iter().all(|&value| value == F128::ZERO));
             assert_eq!(candidate_table, control_table);
 
             let control_direct = control[claim]

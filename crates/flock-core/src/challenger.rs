@@ -990,7 +990,7 @@ mod grind_worker {
 
     fn worker() -> Option<&'static Worker> {
         static W: OnceLock<Option<Worker>> = OnceLock::new();
-        if std::env::var_os("FLOCK_NO_GRIND_WORKER").is_some() {
+        if crate::env_var_once!("FLOCK_NO_GRIND_WORKER").is_some() {
             return None;
         }
         W.get_or_init(|| {
