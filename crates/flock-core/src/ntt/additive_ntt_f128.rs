@@ -126,15 +126,18 @@ fn precompute_twiddles(evals: &[Vec<F128>]) -> Option<Vec<F128>> {
     Some(twiddles)
 }
 
+/// The shared standard-basis twiddle tables, one per dimension. A table is
+/// never replaced or freed once made.
+static STANDARD_TWIDDLE_TABLES: OnceLock<[OnceLock<Arc<[F128]>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]> =
+    OnceLock::new();
+
 /// Share immutable standard-basis tables across all NTT objects. The worker's
 /// mandatory untimed proof initializes these before measured requests.
 fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128]>> {
     if dim > MAX_PRECOMPUTED_TWIDDLE_LOG {
         return None;
     }
-    static TABLES: OnceLock<[OnceLock<Arc<[F128]>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]> =
-        OnceLock::new();
-    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    let tables = STANDARD_TWIDDLE_TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     Some(
         tables[dim]
             .get_or_init(|| {
@@ -776,6 +779,18 @@ impl AdditiveNttF128 {
     /// commit uploads this table once at init.
     pub(crate) fn precomputed_twiddle_table(&self) -> Option<&[F128]> {
         self.precomputed_twiddles.as_deref()
+    }
+
+    /// `Some(dim)` when this NTT reads the shared standard twiddle table of
+    /// its dimension (the very table, not an equal copy). Such an NTT's
+    /// `twiddle(layer, block)` is a fixed function of `(dim, layer, block)`
+    /// for the life of the process, so derived per-layer rows may be kept
+    /// per `(dim, layer)`. `None` for any other NTT (e.g. [`Self::new`]).
+    pub(crate) fn shared_standard_dim(&self) -> Option<usize> {
+        let dim = self.log_domain_size();
+        let own = self.precomputed_twiddles.as_ref()?;
+        let shared = STANDARD_TWIDDLE_TABLES.get()?.get(dim)?.get()?;
+        Arc::ptr_eq(own, shared).then_some(dim)
     }
 
     /// Twiddle at `(layer, block)` for the forward NTT and FRI fold.
