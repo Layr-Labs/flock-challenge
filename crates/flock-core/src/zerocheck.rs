@@ -646,6 +646,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             };
             let recover_identity_prefix = ab_inner.identity_prefix_was_omitted();
             let recover_output_window = ab_inner.output_window_was_omitted();
+            let recover_mixed_ones = ab_inner.mixed_ones_were_omitted();
+            if zc_timing && recover_mixed_ones {
+                eprintln!("[zc-timing] round1 C recovery: six mixed-one terms");
+            }
             let r_ref: &[F128] = &r;
             // The C fold reads only the stripe, r and the C prelude — never
             // the AB completion — so it may run anywhere before z is sampled.
@@ -667,6 +671,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                             c_prelude,
                             recover_identity_prefix,
                             recover_output_window,
+                            recover_mixed_ones,
                         );
                     if zc_timing {
                         eprintln!(
@@ -698,6 +703,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                             c_prelude,
                             recover_identity_prefix,
                             recover_output_window,
+                            recover_mixed_ones,
                         );
                     if zc_timing {
                         eprintln!(
