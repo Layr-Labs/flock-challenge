@@ -29146,6 +29146,7 @@ kernel void zc_ab_finish(
     // the K arm's output buffers above.
     // Tri pass 0 GPU arm (see `ENV_NO_ZC_T0_GPU`): chained on the 5+6
     // arm's output buffers.
+    pub(crate) mod r1_ab_band;
     mod t0_metal;
     pub(crate) use t0_metal::{T0_HI, T0_IN, T0_OUT, ZcT0Job, zc_t0_fire, zc_t0_park, zc_t0_prewarm, zc_t0_verdict};
     mod t56_metal;
@@ -31298,6 +31299,9 @@ pub(crate) use imp::{
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm, zc_ab_wait};
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::r1_ab_band;
 
 /// Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
