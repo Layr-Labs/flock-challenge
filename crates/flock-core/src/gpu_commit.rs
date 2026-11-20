@@ -3192,6 +3192,21 @@ pub(crate) fn gpu_g4x2_build_linear_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_BUILD_LINEAR").is_none())
 }
 
+/// Lane-linear table stores in the zero-lane g4x2 pipeline too (layers 4..7
+/// and 8..11 at the ranked size; `FLOCK_NO_G4X2_ZL_BUILD_LINEAR`, any value,
+/// keeps the record's store map there, as before). The dense pass already
+/// has them (`FLOCK_NO_G4X2_BUILD_LINEAR` turns both off). The zero-lane
+/// source is derived from the same twiddle-prefetch text and only the build
+/// function's store map changes: entry `i` is still the XOR of the generators
+/// over the set bits of `i`, so every table, the codeword and the tree are
+/// unchanged. On an M4 the 64-thread table build's stores hit two bank sets
+/// 16-way; with 32 consecutive entries per store a 1 GiB pass is ~3.4%
+/// faster. Read once per process, when the zero-lane source is made.
+pub(crate) fn gpu_g4x2_zl_build_linear_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_ZL_BUILD_LINEAR").is_none())
+}
+
 /// One-round zero-lane g4x2 groups (`FLOCK_NO_G4X2_ZL_ONE_ROUND`, any
 /// value, keeps the record's 64-thread, two-round groups). A zero-lane g4x2
 /// group (the layers 4..7 and 8..11 passes) runs 2 x 128 columns of one
@@ -6969,8 +6984,19 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
 
     /// The record's (two-round) zero-lane text; see
     /// [`g4x2_zero_lane_msl_source`].
+    fn g4x2_zl_base_source() -> &'static str {
+        if super::gpu_g4x2_zl_build_linear_enabled() {
+            g4x2_twl_source()
+        } else {
+            NTT_G4X2_TWL_MSL_SOURCE
+        }
+    }
+
     fn g4x2_zero_lane_two_round_source() -> Option<String> {
-        let base = NTT_G4X2_TWL_MSL_SOURCE;
+        g4x2_zero_lane_two_round_from(g4x2_zl_base_source())
+    }
+
+    fn g4x2_zero_lane_two_round_from(base: &str) -> Option<String> {
         // Column c of block B -> (position, lane): tile pair q = c / 121, the
         // pair's first 64 columns are the even tile's lanes, the next 57 the
         // odd tile's lanes 0..56. Recomputed at the stores (not held live
@@ -7940,6 +7966,81 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     /// Dead-lane loads (`FLOCK_NO_GPU_DEAD_LANE`): the dense g4x2 pass and
     /// the fused final-leaf pass never use the bytes of the zero tail lanes
     /// of odd positions (they load the last live lane and select zero).
+    #[cfg(test)]
+    mod zl_linear_probe_tests {
+        use super::*;
+        unsafe fn run(gpu: &Gpu, pso: Id, data: Id, tw: Id, l: usize, groups: u64, tpg: u64) -> f64 {
+            unsafe {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, data, 0, 0);
+                gpu.set_buffer(enc, tw, 0, 1);
+                set_ntt_params(gpu, enc, NttParams { log_d: 20, l: l as u32, f: 4, s: (16 - l) as u32 }, None);
+                gpu.dispatch(enc, groups, tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            }
+        }
+        /// The production zero-lane g4x2 pass (layers 4..7, 8..11) with the record's
+        /// store map vs lane-linear stores: bit-identical output, GPU time per 1 GiB pass.
+        #[test]
+        #[ignore = "timing probe"]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn zl_linear_probe() {
+            let gpu = match gpu() { Ok(g) => g, Err(_) => return };
+            let record = g4x2_zero_lane_two_round_from(NTT_G4X2_TWL_MSL_SOURCE).unwrap();
+            let linear_base = splice_exact(NTT_G4X2_TWL_MSL_SOURCE, &[(G4X2_BUILD_TAIL_RECORD, G4X2_BUILD_TAIL_LINEAR)]).unwrap();
+            let linear = g4x2_zero_lane_two_round_from(&linear_base).unwrap();
+            assert!(record != linear);
+            unsafe {
+                let pool = gpu.pool_push();
+                let log_d = 20usize;
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = (1usize << log_d) * 64 * 16;
+                let data = gpu.new_buffer(len).unwrap();
+                let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+                let input: Vec<u64> = (0..len / 8).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x }).collect();
+                let load = || std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), gpu.buffer_contents(data), len);
+                let read = || std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec();
+                let pr = compile_supplemental_pipeline(gpu, &record, "ntt_fused_reg4g4x2_zl").unwrap();
+                let pl = compile_supplemental_pipeline(gpu, &linear, "ntt_fused_reg4g4x2_zl").unwrap();
+                let tpg = g4x2_test_tpg(gpu, pr);
+                assert_eq!(tpg, g4x2_test_tpg(gpu, pl));
+                let groups = |l: usize| (1u64 << l) * super::super::zero_lane_groups_per_block(16 - l);
+                for &l in &[4usize, 8] {
+                    load(); run(gpu, pr, data, tw, l, groups(l), tpg); let a = read();
+                    load(); run(gpu, pl, data, tw, l, groups(l), tpg);
+                    assert!(read() == a, "lane-linear zero-lane pass diverges at l={l}");
+                }
+                eprintln!("zero-lane lane-linear EXACT at l=4,8 (tpg {tpg})");
+                load();
+                for _ in 0..6 { run(gpu, pr, data, tw, 4, groups(4), tpg); }
+                for &l in &[4usize, 8] {
+                    let (mut tr, mut tl) = (vec![], vec![]);
+                    for r in 0..11 {
+                        for k in 0..2 {
+                            let v = (k + r) % 2; let mut b = f64::MAX;
+                            for _ in 0..5 { b = b.min(if v == 0 { run(gpu, pr, data, tw, l, groups(l), tpg) } else { run(gpu, pl, data, tw, l, groups(l), tpg) }); }
+                            if v == 0 { tr.push(b) } else { tl.push(b) }
+                        }
+                    }
+                    let mut d: Vec<f64> = tl.iter().zip(&tr).map(|(a, b)| a - b).collect();
+                    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let mr = { let mut v = tr.clone(); v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+                    let lower = tl.iter().zip(&tr).filter(|(a, b)| a < b).count();
+                    eprintln!("l={l}: record stores {mr:.3} ms, lane-linear paired {:+.3} ms ({:+.2}%), lower {lower}/11", d[d.len() / 2], 100.0 * d[d.len() / 2] / mr);
+                }
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
     #[cfg(test)]
     mod dead_lane_tests {
         use super::*;
