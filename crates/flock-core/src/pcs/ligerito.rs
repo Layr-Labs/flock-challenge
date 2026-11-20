@@ -9664,24 +9664,49 @@ fn query_probe_set_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_QUERY_PROBE_SET").is_none())
 }
 
+/// Kill switch for the generation-tagged query probe set
+/// (`FLOCK_NO_QUERY_PROBE_TAG`, any value: every use clears all 1024 slots
+/// afterwards, as before). Read once per process.
+fn query_probe_tag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_QUERY_PROBE_TAG").is_none())
+}
+
 /// Fixed 1024-slot open-addressing membership set for query dedupe (port of
 /// the x86 track's `Gl2QSet`, e-man07 fd1b67de item 6). Thread-local and
 /// reused: one 4 KiB array, cleared after each use, no SipHash and no
 /// allocation. Only answers membership, so the kept positions and their
 /// first-occurrence order are exactly the `HashSet` path's.
+///
+/// Tagged mode (positions below 2^24): a slot holds `tag << 24 | q`, where
+/// `tag` (1..=255) is the current use's generation. A slot whose tag is not
+/// the current one counts as empty, so a new use starts with an empty set
+/// without clearing anything; the array is refilled only when the 8-bit
+/// generation wraps (once every 255 uses) or when the set switches between
+/// tagged and plain use. Membership answers, and therefore the kept queries
+/// and their order, are the same as with the per-use clear.
 struct QueryProbeSet {
     slots: [u32; 1024],
+    /// 0: plain mode, every slot `EMPTY`. 1..=255: tagged mode, last tag used.
+    tag: u32,
 }
 
 impl QueryProbeSet {
     const EMPTY: u32 = u32::MAX;
+    /// Positions the tagged mode can hold (`q` occupies the low 24 bits).
+    const TAG_LIMIT: usize = 1 << 24;
+
+    #[inline]
+    fn home(key: u32) -> usize {
+        (key.wrapping_mul(0x9E37_79B1) >> 22) as usize
+    }
 
     /// Insert `q`; true when it was not present. Needs `q < u32::MAX` and at
     /// most 256 members (load factor <= 1/4).
     #[inline]
     fn insert(&mut self, q: usize) -> bool {
         let key = q as u32;
-        let mut i = (key.wrapping_mul(0x9E37_79B1) >> 22) as usize;
+        let mut i = Self::home(key);
         loop {
             let s = self.slots[i];
             if s == key {
@@ -9695,16 +9720,64 @@ impl QueryProbeSet {
         }
     }
 
-    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+    /// Tagged insert (`q < 2^24`, at most 256 members): same probe sequence
+    /// as [`Self::insert`] (home slot from `q`); a slot of another tag is an
+    /// empty slot of this use.
+    #[inline]
+    fn insert_tagged(&mut self, q: usize, tag: u32) -> bool {
+        let key = q as u32;
+        let tagged = (tag << 24) | key;
+        let mut i = Self::home(key);
+        loop {
+            let s = self.slots[i];
+            if s == tagged {
+                return false;
+            }
+            if s >> 24 != tag {
+                self.slots[i] = tagged;
+                return true;
+            }
+            i = (i + 1) & 1023;
+        }
+    }
+
+    fn cell() -> &'static std::thread::LocalKey<std::cell::RefCell<Box<QueryProbeSet>>> {
         thread_local! {
             static SET: std::cell::RefCell<Box<QueryProbeSet>> =
-                std::cell::RefCell::new(Box::new(QueryProbeSet { slots: [QueryProbeSet::EMPTY; 1024] }));
+                std::cell::RefCell::new(Box::new(QueryProbeSet { slots: [QueryProbeSet::EMPTY; 1024], tag: 0 }));
         }
-        SET.with(|c| {
+        &SET
+    }
+
+    fn with<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        Self::cell().with(|c| {
             let mut set = c.borrow_mut();
+            if set.tag != 0 {
+                // Leaving tagged mode: plain mode needs every slot EMPTY.
+                set.slots.fill(Self::EMPTY);
+                set.tag = 0;
+            }
             let r = f(&mut set);
             set.slots.fill(Self::EMPTY);
             r
+        })
+    }
+
+    /// One tagged use: `f` gets the set and this use's tag; nothing is
+    /// cleared afterwards.
+    fn with_tagged<R>(f: impl FnOnce(&mut Self, u32) -> R) -> R {
+        Self::cell().with(|c| {
+            let mut set = c.borrow_mut();
+            let tag = if set.tag == 0 || set.tag == 255 {
+                // Entering tagged mode, or the 8-bit generation wraps: no
+                // slot may carry a tag that a later use could take.
+                set.slots.fill(0);
+                1
+            } else {
+                set.tag + 1
+            };
+            set.tag = tag;
+            f(&mut set, tag)
         })
     }
 }
@@ -9736,15 +9809,27 @@ fn sample_distinct_queries_probe<Ch: Challenger>(
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
     let mut out = Vec::with_capacity(count);
-    QueryProbeSet::with(|seen| {
-        while out.len() < count {
-            let v = challenger.sample_f128();
-            let q = (v.lo as usize) % block_len;
-            if seen.insert(q) {
-                out.push(q);
+    if query_probe_tag_enabled() && block_len <= QueryProbeSet::TAG_LIMIT {
+        QueryProbeSet::with_tagged(|seen, tag| {
+            while out.len() < count {
+                let v = challenger.sample_f128();
+                let q = (v.lo as usize) % block_len;
+                if seen.insert_tagged(q, tag) {
+                    out.push(q);
+                }
             }
-        }
-    });
+        });
+    } else {
+        QueryProbeSet::with(|seen| {
+            while out.len() < count {
+                let v = challenger.sample_f128();
+                let q = (v.lo as usize) % block_len;
+                if seen.insert(q) {
+                    out.push(q);
+                }
+            }
+        });
+    }
     out.sort_unstable();
     out
 }
@@ -12751,6 +12836,47 @@ mod tests {
                 }
                 sum + coefficient * weight
             })
+    }
+
+    #[test]
+    fn query_probe_tagged_matches_hashset_across_calls() {
+        use crate::challenger::Challenger;
+        // One challenger stream, 300+ consecutive samplings (past the 8-bit
+        // generation wrap), mixing tagged shapes (block_len <= 2^24) with
+        // plain-mode shapes (block_len > 2^24) on the shared thread-local set:
+        // same draws consumed, same sorted queries as the HashSet path.
+        let shapes: [(usize, usize); 10] = [
+            (1, 1),
+            (2, 1),
+            (4, 4),
+            (64, 64),
+            (1 << 20, 218),
+            (1 << 18, 106),
+            (256, 256),
+            (300, 0),
+            (1 << 24, 43),
+            ((1 << 24) + 1, 36),
+        ];
+        let mut probe = crate::challenger::FsChallenger::new(b"query-probe-tag");
+        let mut hash = crate::challenger::FsChallenger::new(b"query-probe-tag");
+        for round in 0..32 {
+            for &(block_len, count) in &shapes {
+                let a = sample_distinct_queries_probe(&mut probe, block_len, count);
+                let b = sample_distinct_queries_with(&mut hash, block_len, count, true);
+                assert_eq!(a, b, "round {round} block_len {block_len} count {count}");
+            }
+            assert_eq!(probe.sample_f128(), hash.sample_f128(), "streams diverged in round {round}");
+        }
+        // Tagged shapes only: 40 x 9 = 360 consecutive tagged uses, so the
+        // 8-bit generation wraps (and refills) at least once.
+        for round in 0..40 {
+            for &(block_len, count) in &shapes[..9] {
+                let a = sample_distinct_queries_probe(&mut probe, block_len, count);
+                let b = sample_distinct_queries_with(&mut hash, block_len, count, true);
+                assert_eq!(a, b, "tagged-only round {round} block_len {block_len} count {count}");
+            }
+        }
+        assert_eq!(probe.sample_f128(), hash.sample_f128(), "streams diverged after the wrap");
     }
 
     #[test]
