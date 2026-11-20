@@ -388,6 +388,17 @@ pub fn commit_from_streamed_first_pass(
     params: &PcsParams,
     stream: crate::gpu_commit::FromZFirstPassStream,
 ) -> (Commitment, ProverData) {
+    commit_from_streamed_first_pass_with_ab_band(z_packed, codeword, params, stream, None)
+}
+
+#[doc(hidden)]
+pub fn commit_from_streamed_first_pass_with_ab_band(
+    z_packed: &[F128],
+    codeword: Vec<F128>,
+    params: &PcsParams,
+    stream: crate::gpu_commit::FromZFirstPassStream,
+    ab_band: Option<&crate::zerocheck::univariate_skip_optimized::Round1AbGpuBand>,
+) -> (Commitment, ProverData) {
     params.validate();
     assert_eq!(z_packed.len(), 1usize << params.log_msg_len());
     // Empty marker: the latched caller omitted the speculative CPU fallback
@@ -401,6 +412,7 @@ pub fn commit_from_streamed_first_pass(
         z_packed,
         codeword,
         params,
+        ab_band,
         |cw| cpu_transform_and_tree(cw, params, Some(z_packed)),
     );
     let root = *merkle_tree.last().expect("merkle tree non-empty");
