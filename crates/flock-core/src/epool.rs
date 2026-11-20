@@ -773,20 +773,24 @@ impl Drop for CloseOnDrop {
 /// QUEUE SEMANTICS. Neither arm touches the shared cursor or the chunk
 /// closure: which worker set drains the queue is unobservable in the output by
 /// construction.
-pub(crate) fn drain_hetero<H>(
+///
+/// `helper` is a trait object, like `worker`; each helper thread makes one
+/// call through it per drain.
+pub(crate) fn drain_hetero(
     main_threads: usize,
     worker: &(dyn Fn() + Sync),
     ep: &rayon::ThreadPool,
-    helper: &H,
+    helper: &(dyn Fn() + Sync),
     detached: bool,
-) where
-    H: Fn() + Sync,
-{
+) {
     if detached {
+        // `JobPtr` keeps a thin pointer to a sized callable: the reference
+        // `helper` on this frame, which outlives every admitted helper (the
+        // gate below is closed and drained before this function returns).
         let gate = Arc::new(Gate {
             state: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
-            body: JobPtr::new(helper),
+            body: JobPtr::new(&helper),
         });
         let close = CloseOnDrop(Arc::clone(&gate));
         let posted = AtomicBool::new(false);
@@ -1008,7 +1012,7 @@ where
 /// Efficiency-core helpers run chunks only. Scheduling only: every chunk
 /// index is still claimed exactly once from the same cursor.
 pub(crate) fn run_hetero_chunks_then(n_chunks: usize, f: &(dyn Fn(usize) + Sync), after: &(dyn Fn() + Sync)) {
-    run_chunks_with_helper_arm_after(n_chunks, &f, epool(), detached_enabled(), &after);
+    run_chunks_with_helper_arm_after(n_chunks, f, epool(), detached_enabled(), after);
 }
 
 /// [`run_hetero_chunks`] plus one caller-thread tail job: the calling thread
@@ -1373,16 +1377,15 @@ fn run_chunks_with_helper_arm<F>(
 
 /// [`run_chunks_with_helper_arm`] with `after` run by every main-pool queue
 /// task once its claim loop finds the queue exhausted.
-fn run_chunks_with_helper_arm_after<F, A>(
+///
+/// `f` and `after` are trait objects; each chunk makes one call through `f`.
+fn run_chunks_with_helper_arm_after(
     n_chunks: usize,
-    f: &F,
+    f: &(dyn Fn(usize) + Sync),
     helper: Option<&rayon::ThreadPool>,
     detached: bool,
-    after: &A,
-) where
-    F: Fn(usize) + Sync,
-    A: Fn() + Sync,
-{
+    after: &(dyn Fn() + Sync),
+) {
     if n_chunks == 0 {
         after();
         return;
