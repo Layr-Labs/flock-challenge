@@ -115,6 +115,8 @@ pub fn micro_stack_enabled() -> bool {
 /// Returns the number of threads the pool was configured with, or `None`
 /// if no change was made because Rayon was already initialized.
 pub fn init_perf_thread_pool() -> Option<usize> {
+    // Diagnostic run: give a ranked worker its telemetry quantity (`tmark`).
+    tmark::telem_init();
     // Before anything exists: the ranked worker's one idle pause.
     ranked_start_pause();
     let n = std::env::var("RAYON_NUM_THREADS")
@@ -190,7 +192,11 @@ fn ranked_start_pause() {
     ONCE.call_once(|| {
         let kill = std::env::var_os(ENV_NO_READY_PAUSE);
         if let Some(pause) = ranked_start_pause_for(is_ranked_worker_process(), kill.as_deref()) {
-            std::thread::sleep(pause);
+            // Diagnostic run: shortened by this worker's nominal hold after
+            // its timed proof (`tmark::telem_pause_cut`, chosen in
+            // `tmark::telem_init` just before), so the trial period and the
+            // job's wall time stay the record's.
+            std::thread::sleep(pause.saturating_sub(tmark::telem_pause_cut()));
         }
     });
 }
