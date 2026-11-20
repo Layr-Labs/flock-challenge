@@ -3887,7 +3887,7 @@ fn fold2_compact_and_round45_into_packed_b(
         one_table && kernels::aarch64::zc_k_xb_enabled() && kernels::aarch64::k_full_xb_weights(eq_lo, lo_size);
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let k_xb = false;
-    if std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some() && one_table {
+    if env_latched!(std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some()) && one_table {
         let n_groups = lo_size / 2;
         let armed = k_xb;
         let first_window_ok = (0..n_groups.min(8)).all(|j| {
@@ -5201,7 +5201,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     let eq_hi = &eq.hi;
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
+    let nt_stores = out_n >= (1usize << 20) && env_latched!(std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none());
     let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
     // The group weights `eq_lo[4y + 3]` as prepared pairs, one table per
     // pass shared by every chunk.

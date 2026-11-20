@@ -1231,7 +1231,7 @@ impl AdditiveNttF128 {
             tw
         };
 
-        let pass_timing = std::env::var_os("FLOCK_NTT_PASS_TIMING").is_some();
+        let pass_timing = env_latched!(std::env::var_os("FLOCK_NTT_PASS_TIMING").is_some());
         let t_l1 = std::time::Instant::now();
         // Layer-1 fused-3 pass from the message: 2 blocks, identical input.
         {
@@ -1942,10 +1942,10 @@ impl AdditiveNttF128 {
                     }
                     tw
                 };
-                if zero_root_fused3 && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none() {
+                if zero_root_fused3 && env_latched!(std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()) {
                     let twiddles: Vec<[F128; 7]> = (0..num_blocks).map(block_twiddles).collect();
                     if is_ranked_top_hetero_fused3_pass(log_d, num_ntts, start_layer, n_top, layer)
-                        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+                        && env_latched!(std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none())
                     {
                         butterfly_interleaved_fused_3layer_all_blocks_hetero(
                             data, &twiddles, eighth, num_ntts,

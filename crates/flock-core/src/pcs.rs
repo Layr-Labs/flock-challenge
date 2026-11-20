@@ -764,7 +764,7 @@ fn is_ranked_direct_fold2_lookahead_shape(
 fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd)
-        && std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
+        && env_latched!(std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none())
         && crate::epool::epool().is_some()
 }
 
@@ -1205,7 +1205,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && n_rs == 2
         && n_pd == 0
         && packed_witness.len() == (1usize << 25)
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+        && env_latched!(std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none());
     let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
@@ -1266,7 +1266,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && l == (1usize << 25)
         && n_rs == 2
         && n_pd == 0
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+        && env_latched!(std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none());
     let use_direct_fold8 = direct_common
         && ranked_direct_fold8_enabled()
         && direct_fold8_all_claim_mix_supported(&rs_results);
@@ -1350,7 +1350,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // the completed path, which needs no sweep at all.
     let mut deferred_c_candidate = if use_direct_ab
         && !use_direct_all
-        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
+        && env_latched!(std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none())
     {
         rs_results[1].1.deferred_c_fold2.take()
     } else {

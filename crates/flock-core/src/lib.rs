@@ -17,6 +17,33 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+/// Process-latched environment term (`FLOCK_NO_ENV_LATCH`, any value: every
+/// site reads the process environment on every call again, as before). The
+/// prover never changes these variables while it runs (the ranked worker's
+/// environment is fixed before its first prove), so the first answer of each
+/// call site is kept in its own `LazyLock` and later calls skip the
+/// environment lock and scan. Used only for pure `bool` environment terms
+/// (debug/timing switches and kill switches) that no test toggles in-process;
+/// gates that tests flip at run time keep their per-call reads. Same gates,
+/// same values, so the same proof bytes.
+macro_rules! env_latched {
+    ($e:expr) => {{
+        if $crate::env_latch_enabled() {
+            static LATCHED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| $e);
+            *LATCHED
+        } else {
+            $e
+        }
+    }};
+}
+
+/// Kill switch of [`env_latched`]; read once per process.
+pub(crate) fn env_latch_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ENV_LATCH").is_none());
+    *ON
+}
+
 pub mod bits;
 pub mod challenger;
 pub mod cpu_keepalive;
