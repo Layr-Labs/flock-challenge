@@ -1597,6 +1597,20 @@ pub(crate) fn partial_fold_packed_z_neon_oblock_padded_range(
     )
 }
 
+/// `FLOCK_NO_LINCHECK_BLOCK16` unset (the environment term of the ranked
+/// 16-row block gate below). The process environment does not change while a
+/// worker runs, so the first answer is kept; `FLOCK_NO_PATH_ENV_ONCE`
+/// restores the per-call lookup.
+#[inline]
+fn lincheck_block16_env_clear() -> bool {
+    if crate::path_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none()
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     z_packed: &[u8],
@@ -1614,7 +1628,7 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         // (`lincheck::RootStripe`; 11_249 also drops the fixed block_len/flags
         // input columns).
         && (useful_bits == 15_409 || useful_bits == 11_313 || useful_bits == 11_249)
-        && std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none();
+        && lincheck_block16_env_clear();
     oblock_padded_tiled_impl::<TILE_T>(
         z_packed,
         m,
