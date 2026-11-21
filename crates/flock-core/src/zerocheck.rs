@@ -75,6 +75,11 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
+    if crate::path_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some());
+        return *OFF;
+    }
     std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
 }
 

@@ -153,13 +153,34 @@ fn ranked_identity_prefix_omission_contract(
     {
         return None;
     }
+    // The gate above already holds `r1cs.c0_is_identity()`; the statement
+    // checks reuse it instead of rescanning C (`FLOCK_NO_PINNED_STMT_CACHED_ID`).
+    let cached = pinned_stmt_cached_identity_enabled();
     if std::env::var_os(ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT).as_deref()
         != Some(std::ffi::OsStr::new("1"))
-        && let Some(statement) = r1cs.round1_pinned_one_prefix_and_output_statement()
+        && let Some(statement) = if cached {
+            r1cs.round1_pinned_one_prefix_and_output_statement_cached_identity()
+        } else {
+            r1cs.round1_pinned_one_prefix_and_output_statement()
+        }
     {
         return Some(statement);
     }
-    r1cs.round1_pinned_one_prefix_statement()
+    if cached {
+        r1cs.round1_pinned_one_prefix_statement_cached_identity()
+    } else {
+        r1cs.round1_pinned_one_prefix_statement()
+    }
+}
+
+/// Kill switch for reusing the cached C-identity check in the ranked
+/// identity-prefix statement (`FLOCK_NO_PINNED_STMT_CACHED_ID`, any value:
+/// the statement checks rescan C on every prove, as before). Read once per
+/// process.
+fn pinned_stmt_cached_identity_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_PINNED_STMT_CACHED_ID").is_none());
+    *ON
 }
 
 /// `FLOCK_NO_OPEN_C_CANONICAL_REUSE=1` makes the open re-collapse C's
