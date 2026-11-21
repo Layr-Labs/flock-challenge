@@ -1756,6 +1756,46 @@ pub(crate) fn cache_dir_fallback_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os(ENV_NO_CACHE_DIR_FALLBACK).is_none())
 }
 
+/// Kill switch for keeping the witness-stream and seed-pipe gate environment
+/// reads once per process (`FLOCK_NO_WITNESS_ENV_ONCE`, any value: each gate
+/// reads its variable from the process environment on every call, as
+/// before). Read once per process. The prover crate's seed-pipe and witness
+/// gates read it through [`witness_env_once_enabled`].
+pub const ENV_NO_WITNESS_ENV_ONCE: &str = "FLOCK_NO_WITNESS_ENV_ONCE";
+
+pub fn witness_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_WITNESS_ENV_ONCE).is_none());
+    *ON
+}
+
+/// `FLOCK_NO_WITNESS_GPU_STREAM` set (the opt-out of the streamed witness
+/// first pass). The process environment does not change while a worker runs,
+/// so the first answer is kept; `FLOCK_NO_WITNESS_ENV_ONCE` restores the
+/// per-call lookup.
+#[inline]
+fn witness_gpu_stream_env_off() -> bool {
+    if witness_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some());
+        return *OFF;
+    }
+    std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
+}
+
+/// `FLOCK_NO_EARLY_GPU_PREFIX` set (the opt-out of the early hybrid GPU
+/// prefix), kept the same way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+fn early_gpu_prefix_env_off() -> bool {
+    if witness_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some());
+        return *OFF;
+    }
+    std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some()
+}
+
 /// Kill switch for the static warmup latch: `FLOCK_NO_STATIC_WARMUP_LATCH=1`
 /// restores the incumbent full dual-run + broad exact-AB sweep in every
 /// worker process.
@@ -3746,7 +3786,7 @@ pub fn warm_streamed_first_pass(params: &crate::pcs::commit::PcsParams) {
     if !on
         || !gpu_commit_enabled()
         || !is_ranked_gpu_shape(params)
-        || std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
+        || witness_gpu_stream_env_off()
     {
         return;
     }
@@ -14316,7 +14356,7 @@ kernel void blake3_pow_seg_tail(
         if !super::gpu_commit_enabled()
             || !super::is_ranked_gpu_shape(params)
             || rayon::current_num_threads() <= 1
-            || std::env::var_os("FLOCK_NO_WITNESS_GPU_STREAM").is_some()
+            || super::witness_gpu_stream_env_off()
             || z_len != 1usize << params.log_msg_len()
         {
             return None;
@@ -14358,7 +14398,7 @@ kernel void blake3_pow_seg_tail(
         // the sweep publishes before any timed prove, so this matches the
         // value `finish` will read; `finish` still re-checks and recovers if
         // it changed (possible only around warmup).
-        let early_k = if std::env::var_os("FLOCK_NO_EARLY_GPU_PREFIX").is_some() {
+        let early_k = if super::early_gpu_prefix_env_off() {
             0
         } else {
             match hybrid_cpu_sixteenths() {
@@ -15505,7 +15545,7 @@ kernel void blake3_pow_seg_tail(
             ll /= 2;
             lo = wlo;
         }
-        if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if after_ab && crate::phase_timing_env_on() {
             eprintln!(
                 "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
                  suffix units in {tail_ms:.2} ms",
@@ -17662,7 +17702,7 @@ kernel void blake3_pow_seg_tail(
                 if verified { chosen } else { 0 },
             );
         }
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let k = if verified { chosen } else { 0 };
             eprintln!(
                 "[phase-timing] hybrid split: cpu {} of 256 (ntt priority helpers {})",
@@ -26297,7 +26337,7 @@ kernel void zc_r2_horner_oracle(
             0.0
         };
         unsafe { gpu.release(cb) };
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let fold_gpu = f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
             let window = f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
             eprintln!(
