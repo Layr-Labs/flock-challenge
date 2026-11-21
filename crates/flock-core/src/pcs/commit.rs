@@ -323,6 +323,72 @@ pub fn commit_into(
     finalize_commit_impl(z_packed, codeword, params, false)
 }
 
+/// The `FLOCK_NO_NTT_TOP_EPOOL` / `FLOCK_NTT_BLOCK_REGIONS` term shared by
+/// [`use_ranked_from_message_commit`] and the split ranked top. The process
+/// environment does not change during a prove, so the first answer is kept;
+/// `FLOCK_NO_PCS_ENV_ONCE` (any value) restores the per-call lookups.
+#[inline]
+fn ntt_top_epool_env_clear() -> bool {
+    if crate::pcs::pcs_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+                && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+        });
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+}
+
+/// The `FLOCK_NO_NTT_FROM_MSG` term of [`use_ranked_from_message_commit`],
+/// kept the same way.
+#[inline]
+fn ntt_from_msg_env_clear() -> bool {
+    if crate::pcs::pcs_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_FROM_MSG").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_NTT_FROM_MSG").is_none()
+}
+
+/// The environment term of [`use_ranked_ntt_merkle_leaf_pipeline`], kept the
+/// same way.
+#[inline]
+fn ntt_merkle_pipeline_env_clear() -> bool {
+    if crate::pcs::pcs_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
+}
+
+/// The `FLOCK_NO_MERKLE_SUBTREE_PARENTS` opt-out of the pipelined leaf jobs,
+/// kept the same way.
+#[inline]
+fn merkle_subtree_parents_env_off() -> bool {
+    if crate::pcs::pcs_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some()
+        });
+        return *OFF;
+    }
+    std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some()
+}
+
+/// The `FLOCK_NO_PREFAULT` opt-out of [`prefault_codeword_during`], kept the
+/// same way.
+#[inline]
+fn prefault_env_off() -> bool {
+    if crate::pcs::pcs_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_PREFAULT").is_some());
+        return *OFF;
+    }
+    std::env::var_os("FLOCK_NO_PREFAULT").is_some()
+}
+
 /// Whether the ranked rate-1/2 commit will fuse the replicate-fill into the
 /// first NTT top pass (see
 /// `forward_transform_interleaved_ranked_top_from_message`). Mirrors every
@@ -335,9 +401,8 @@ pub fn use_ranked_from_message_commit(params: &PcsParams) -> bool {
         && crate::epool::epool().is_some()
         && rayon::current_num_threads() > 1
         && params.log_inv_rate == 1
-        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
-        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
-        && std::env::var_os("FLOCK_NO_NTT_FROM_MSG").is_none()
+        && ntt_top_epool_env_clear()
+        && ntt_from_msg_env_clear()
 }
 
 /// [`use_ranked_from_message_commit`] plus the buffer-geometry check
@@ -494,7 +559,7 @@ fn is_ranked_ntt_merkle_leaf_pipeline_shape(params: &PcsParams) -> bool {
 #[inline]
 fn use_ranked_ntt_merkle_leaf_pipeline(params: &PcsParams) -> bool {
     is_ranked_ntt_merkle_leaf_pipeline_shape(params)
-        && std::env::var_os("FLOCK_NO_NTT_MERKLE_PIPELINE").is_none()
+        && ntt_merkle_pipeline_env_clear()
 }
 
 #[derive(Clone, Copy)]
@@ -529,7 +594,7 @@ fn ranked_ntt_with_pipelined_leaves(
     // local levels cover 1,020 of each subtree's 1,023 parent nodes while
     // leaving the shared top for the level-wide builder.
     const LOCAL_PARENT_LEVELS: usize = 8;
-    let local_parent_levels = if std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some() {
+    let local_parent_levels = if merkle_subtree_parents_env_off() {
         0
     } else {
         LOCAL_PARENT_LEVELS
@@ -597,9 +662,8 @@ fn ranked_ntt_with_pipelined_leaves(
     // worker would be parked on `recv` and a nested top-pass broadcast could
     // never begin. The deep transform and callback-driven leaf pipeline below
     // retain their existing overlap and scheduling.
-    let split_ranked_top = is_ranked_ntt_merkle_leaf_pipeline_shape(params)
-        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
-        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none();
+    let split_ranked_top =
+        is_ranked_ntt_merkle_leaf_pipeline_shape(params) && ntt_top_epool_env_clear();
     if split_ranked_top {
         match from_message {
             Some(msg) => ntt.forward_transform_interleaved_ranked_top_from_message(
@@ -851,7 +915,7 @@ pub fn prefault_codeword_during<R>(
     params: &PcsParams,
     generate: impl FnOnce() -> R,
 ) -> (Option<Vec<F128>>, R) {
-    if rayon::current_num_threads() <= 1 || std::env::var_os("FLOCK_NO_PREFAULT").is_some() {
+    if rayon::current_num_threads() <= 1 || prefault_env_off() {
         // Truly single-threaded (or explicitly disabled): no extra OS thread;
         // commit allocates inline. FLOCK_NO_PREFAULT lets benchmarks A/B the
         // offload and keeps fixed-thread-count sweeps honest.
