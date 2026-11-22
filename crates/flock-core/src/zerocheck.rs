@@ -75,6 +75,11 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
+    if crate::path_env_once_enabled() {
+        static OFF: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some());
+        return *OFF;
+    }
     std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
 }
 
@@ -504,7 +509,7 @@ pub fn stage_commit_tail_fill<C: Challenger>(
             padding.useful_bits_per_block,
             &r,
         );
-        if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+        if crate::zc_timing_env_on() {
             eprintln!(
                 "[commit-tail-fill] stage at graph completion: staged={staged} {:.2} ms",
                 t_stage.elapsed().as_secs_f64() * 1e3
@@ -591,7 +596,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    let zc_timing = crate::zc_timing_env_on();
     let cpu_r1 = crate::pcs::commit::commit_cpu_ms();
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
