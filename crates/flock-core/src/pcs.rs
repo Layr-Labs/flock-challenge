@@ -142,8 +142,7 @@ pub fn open_batch_mixed_ligerito_with_owned_canonical_fold8<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
-    let trace =
-        std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some();
+    let trace = open_trace_env();
     let t_total = std::time::Instant::now();
 
     assert_eq!(
@@ -760,11 +759,86 @@ fn is_ranked_direct_fold2_lookahead_shape(
         && ((claim_count == 1 && has_ordinary) || (claim_count == 2 && !has_ordinary))
 }
 
+/// Kill switch for the cached `pcs` / `pcs::commit` gate environment
+/// (`FLOCK_NO_PCS_ENV_ONCE`, any value: every gate call reads its variables
+/// from the process environment again, as before). Read once per process.
+pub const ENV_NO_PCS_ENV_ONCE: &str = "FLOCK_NO_PCS_ENV_ONCE";
+
+pub(crate) fn pcs_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_PCS_ENV_ONCE).is_none());
+    *ON
+}
+
+/// The trace term of the batched opening (`PCS_TRACE` / `FLOCK_OPEN_TIMING`),
+/// evaluated once per opening. The process environment does not change
+/// during a prove, so the first answer is kept. `FLOCK_NO_PCS_ENV_ONCE`
+/// restores the per-call lookups.
+#[inline]
+fn open_trace_env() -> bool {
+    if pcs_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+        });
+        return *ON;
+    }
+    std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+}
+
+/// The environment term of [`use_ranked_hetero_open_combine`], kept the same
+/// way (`FLOCK_NO_PCS_ENV_ONCE` restores the per-call lookup).
+#[inline]
+fn hetero_open_combine_env_clear() -> bool {
+    if pcs_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
+}
+
+/// The environment term of [`use_open_mat_hetero`] (exact `'1'` opt-out),
+/// kept the same way.
+#[inline]
+fn open_mat_hetero_env_on() -> bool {
+    if pcs_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
+        });
+        return *ON;
+    }
+    !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
+}
+
+/// The `FLOCK_NO_OPEN_DIRECT_AB` term of the opening's basis-elision and
+/// direct-claim predicates, kept the same way.
+#[inline]
+fn open_direct_ab_env_clear() -> bool {
+    if pcs_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
+}
+
+/// The `FLOCK_NO_OPEN_DEFERRED_C` term of the opening's deferred-C candidate,
+/// kept the same way.
+#[inline]
+fn open_deferred_c_env_clear() -> bool {
+    if pcs_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
+}
+
 #[inline]
 fn use_ranked_hetero_open_combine(l: usize, b: usize, n_rs: usize, n_pd: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && is_ranked_hetero_open_combine_shape(l, b, n_rs, n_pd)
-        && std::env::var_os("FLOCK_NO_HETERO_OPEN_COMBINE").is_none()
+        && hetero_open_combine_env_clear()
         && crate::epool::epool().is_some()
 }
 
@@ -930,7 +1004,7 @@ pub(crate) fn use_open_mat_hetero(
 ) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
         && is_ranked_open_mat_hetero_shape(packed_len, block_len, claim_count, has_ordinary)
-        && !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
+        && open_mat_hetero_env_on()
         && crate::epool::epool().is_some()
 }
 
@@ -1205,7 +1279,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && n_rs == 2
         && n_pd == 0
         && packed_witness.len() == (1usize << 25)
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+        && open_direct_ab_env_clear();
     let (mut rs_results, gammas_rs): (
         Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
         Vec<F128>,
@@ -1266,7 +1340,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
         && l == (1usize << 25)
         && n_rs == 2
         && n_pd == 0
-        && std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none();
+        && open_direct_ab_env_clear();
     let use_direct_fold8 = direct_common
         && ranked_direct_fold8_enabled()
         && direct_fold8_all_claim_mix_supported(&rs_results);
@@ -1350,7 +1424,7 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     // the completed path, which needs no sweep at all.
     let mut deferred_c_candidate = if use_direct_ab
         && !use_direct_all
-        && std::env::var_os("FLOCK_NO_OPEN_DEFERRED_C").is_none()
+        && open_deferred_c_env_clear()
     {
         rs_results[1].1.deferred_c_fold2.take()
     } else {
