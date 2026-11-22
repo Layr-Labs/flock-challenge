@@ -988,9 +988,21 @@ mod grind_worker {
         _thread: std::thread::JoinHandle<()>,
     }
 
+    /// `FLOCK_NO_GRIND_WORKER` set. The process environment does not change
+    /// while a worker runs, so the first answer is kept;
+    /// `FLOCK_NO_PATH_ENV_ONCE` restores the per-call lookup.
+    fn grind_worker_env_off() -> bool {
+        if crate::path_env_once_enabled() {
+            static OFF: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GRIND_WORKER").is_some());
+            return *OFF;
+        }
+        std::env::var_os("FLOCK_NO_GRIND_WORKER").is_some()
+    }
+
     fn worker() -> Option<&'static Worker> {
         static W: OnceLock<Option<Worker>> = OnceLock::new();
-        if std::env::var_os("FLOCK_NO_GRIND_WORKER").is_some() {
+        if grind_worker_env_off() {
             return None;
         }
         W.get_or_init(|| {
