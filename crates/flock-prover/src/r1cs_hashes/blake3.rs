@@ -4537,7 +4537,7 @@ pub(crate) mod witgen_simd {
             // build. The env kill switch exists for same-binary diagnostics.
             const STREAM_TAPER_DEFAULT: bool = true;
             let tapered =
-                STREAM_TAPER_DEFAULT && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
+                STREAM_TAPER_DEFAULT && !crate::seed_pipe::stream_taper_env_off();
             let schedule = if tapered {
                 TAPERED_SCHEDULE
             } else {
@@ -4602,7 +4602,7 @@ pub(crate) mod witgen_simd {
                 // Publish each band the moment its last slab lands instead of
                 // strictly in band order. `FLOCK_NO_BAND_ANY_ORDER=1` restores
                 // the in-order sequencer.
-                let any_order = std::env::var_os("FLOCK_NO_BAND_ANY_ORDER").is_none();
+                let any_order = !crate::seed_pipe::band_any_order_env_off();
                 let seq = std::sync::Mutex::new(SubmitSeq {
                     next: 0,
                     submitted: vec![false; n_bands],
@@ -5257,7 +5257,7 @@ impl Blake3Setup {
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && self.pcs_params.merkle_hash == HashKind::Blake3
-            && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
+            && !crate::seed_pipe::hot_codeword_env_off()
     }
 
     /// Select the reverse transpose only for the promoted benchmark geometry.
