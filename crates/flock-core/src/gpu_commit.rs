@@ -656,6 +656,43 @@ pub fn open_gpu_ping(point: u32) {
     }
 }
 
+/// Kill switch for the GPU keep-alive (`FLOCK_NO_GPU_KEEPALIVE`, any value). From the tail of the untimed
+/// warm-up proof to the seed read, the ranked worker commits one tiny GPU dispatch about every millisecond
+/// from a helper thread, so the GPU does not fall into its idle state across the harness gap: with it off, the
+/// first command buffer of the timed prove (committed within a millisecond of the seed) started on the GPU
+/// 24-44 ms later on an M4. The dispatch is the lincheck wake's one-threadgroup leaf kernel over its own
+/// scratch buffers (no prove buffer), nothing waits on it, so no proof byte changes. The thread stops at the
+/// seed read and in any case after 8 s. Ranked worker only. Read once per process.
+pub const ENV_NO_GPU_KEEPALIVE: &str = "FLOCK_NO_GPU_KEEPALIVE";
+static GPU_KA_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static GPU_KA_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn gpu_keepalive_start() {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_KEEPALIVE).is_some());
+    if *OFF || !gpu_commit_enabled() {
+        return;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        use std::sync::atomic::Ordering;
+        if GPU_KA_RUNNING.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        GPU_KA_STOP.store(false, Ordering::Release);
+        let spawned = std::thread::Builder::new().name("gpu-keepalive".into()).spawn(|| {
+            imp::gpu_keepalive_loop(&GPU_KA_STOP, std::time::Duration::from_secs(8));
+            GPU_KA_RUNNING.store(false, Ordering::Release);
+        });
+        if spawned.is_err() {
+            GPU_KA_RUNNING.store(false, Ordering::Release);
+        }
+    }
+}
+/// Stop the GPU keep-alive (idempotent); called at the seed read.
+pub fn gpu_keepalive_stop() {
+    GPU_KA_STOP.store(true, std::sync::atomic::Ordering::Release);
+}
+
 pub(crate) fn gpu_lincheck_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_LINCHECK).is_none());
@@ -3190,6 +3227,21 @@ pub(crate) fn gpu_l17_sibling_enabled() -> bool {
 pub(crate) fn gpu_g4x2_build_linear_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_BUILD_LINEAR").is_none())
+}
+
+/// Lane-linear table stores in the zero-lane g4x2 pipeline too (layers 4..7
+/// and 8..11 at the ranked size; `FLOCK_NO_G4X2_ZL_BUILD_LINEAR`, any value,
+/// keeps the record's store map there, as before). The dense pass already
+/// has them (`FLOCK_NO_G4X2_BUILD_LINEAR` turns both off). The zero-lane
+/// source is derived from the same twiddle-prefetch text and only the build
+/// function's store map changes: entry `i` is still the XOR of the generators
+/// over the set bits of `i`, so every table, the codeword and the tree are
+/// unchanged. On an M4 the 64-thread table build's stores hit two bank sets
+/// 16-way; with 32 consecutive entries per store a 1 GiB pass is ~3.4%
+/// faster. Read once per process, when the zero-lane source is made.
+pub(crate) fn gpu_g4x2_zl_build_linear_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_ZL_BUILD_LINEAR").is_none())
 }
 
 /// One-round zero-lane g4x2 groups (`FLOCK_NO_G4X2_ZL_ONE_ROUND`, any
@@ -6969,8 +7021,19 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
 
     /// The record's (two-round) zero-lane text; see
     /// [`g4x2_zero_lane_msl_source`].
+    fn g4x2_zl_base_source() -> &'static str {
+        if super::gpu_g4x2_zl_build_linear_enabled() {
+            g4x2_twl_source()
+        } else {
+            NTT_G4X2_TWL_MSL_SOURCE
+        }
+    }
+
     fn g4x2_zero_lane_two_round_source() -> Option<String> {
-        let base = NTT_G4X2_TWL_MSL_SOURCE;
+        g4x2_zero_lane_two_round_from(g4x2_zl_base_source())
+    }
+
+    fn g4x2_zero_lane_two_round_from(base: &str) -> Option<String> {
         // Column c of block B -> (position, lane): tile pair q = c / 121, the
         // pair's first 64 columns are the even tile's lanes, the next 57 the
         // odd tile's lanes 0..56. Recomputed at the stores (not held live
@@ -7940,6 +8003,81 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     /// Dead-lane loads (`FLOCK_NO_GPU_DEAD_LANE`): the dense g4x2 pass and
     /// the fused final-leaf pass never use the bytes of the zero tail lanes
     /// of odd positions (they load the last live lane and select zero).
+    #[cfg(test)]
+    mod zl_linear_probe_tests {
+        use super::*;
+        unsafe fn run(gpu: &Gpu, pso: Id, data: Id, tw: Id, l: usize, groups: u64, tpg: u64) -> f64 {
+            unsafe {
+                let cb = gpu.command_buffer().unwrap();
+                let enc = gpu.compute_encoder(cb).unwrap();
+                gpu.set_pipeline(enc, pso);
+                gpu.set_buffer(enc, data, 0, 0);
+                gpu.set_buffer(enc, tw, 0, 1);
+                set_ntt_params(gpu, enc, NttParams { log_d: 20, l: l as u32, f: 4, s: (16 - l) as u32 }, None);
+                gpu.dispatch(enc, groups, tpg);
+                gpu.end_encoding(enc);
+                gpu.commit_and_wait(cb).unwrap();
+                let (s, e) = cb_gpu_interval(gpu, cb);
+                (e - s) * 1e3
+            }
+        }
+        /// The production zero-lane g4x2 pass (layers 4..7, 8..11) with the record's
+        /// store map vs lane-linear stores: bit-identical output, GPU time per 1 GiB pass.
+        #[test]
+        #[ignore = "timing probe"]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        fn zl_linear_probe() {
+            let gpu = match gpu() { Ok(g) => g, Err(_) => return };
+            let record = g4x2_zero_lane_two_round_from(NTT_G4X2_TWL_MSL_SOURCE).unwrap();
+            let linear_base = splice_exact(NTT_G4X2_TWL_MSL_SOURCE, &[(G4X2_BUILD_TAIL_RECORD, G4X2_BUILD_TAIL_LINEAR)]).unwrap();
+            let linear = g4x2_zero_lane_two_round_from(&linear_base).unwrap();
+            assert!(record != linear);
+            unsafe {
+                let pool = gpu.pool_push();
+                let log_d = 20usize;
+                let ntt = AdditiveNttF128::standard(log_d);
+                let tws = super::super::flat_twiddle_table(&ntt, log_d);
+                let tw = gpu.new_buffer(tws.len() * 16).unwrap();
+                std::ptr::copy_nonoverlapping(tws.as_ptr().cast::<u8>(), gpu.buffer_contents(tw), tws.len() * 16);
+                let len = (1usize << log_d) * 64 * 16;
+                let data = gpu.new_buffer(len).unwrap();
+                let mut x = 0x9E37_79B9_7F4A_7C15_u64;
+                let input: Vec<u64> = (0..len / 8).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x }).collect();
+                let load = || std::ptr::copy_nonoverlapping(input.as_ptr().cast::<u8>(), gpu.buffer_contents(data), len);
+                let read = || std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec();
+                let pr = compile_supplemental_pipeline(gpu, &record, "ntt_fused_reg4g4x2_zl").unwrap();
+                let pl = compile_supplemental_pipeline(gpu, &linear, "ntt_fused_reg4g4x2_zl").unwrap();
+                let tpg = g4x2_test_tpg(gpu, pr);
+                assert_eq!(tpg, g4x2_test_tpg(gpu, pl));
+                let groups = |l: usize| (1u64 << l) * super::super::zero_lane_groups_per_block(16 - l);
+                for &l in &[4usize, 8] {
+                    load(); run(gpu, pr, data, tw, l, groups(l), tpg); let a = read();
+                    load(); run(gpu, pl, data, tw, l, groups(l), tpg);
+                    assert!(read() == a, "lane-linear zero-lane pass diverges at l={l}");
+                }
+                eprintln!("zero-lane lane-linear EXACT at l=4,8 (tpg {tpg})");
+                load();
+                for _ in 0..6 { run(gpu, pr, data, tw, 4, groups(4), tpg); }
+                for &l in &[4usize, 8] {
+                    let (mut tr, mut tl) = (vec![], vec![]);
+                    for r in 0..11 {
+                        for k in 0..2 {
+                            let v = (k + r) % 2; let mut b = f64::MAX;
+                            for _ in 0..5 { b = b.min(if v == 0 { run(gpu, pr, data, tw, l, groups(l), tpg) } else { run(gpu, pl, data, tw, l, groups(l), tpg) }); }
+                            if v == 0 { tr.push(b) } else { tl.push(b) }
+                        }
+                    }
+                    let mut d: Vec<f64> = tl.iter().zip(&tr).map(|(a, b)| a - b).collect();
+                    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let mr = { let mut v = tr.clone(); v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+                    let lower = tl.iter().zip(&tr).filter(|(a, b)| a < b).count();
+                    eprintln!("l={l}: record stores {mr:.3} ms, lane-linear paired {:+.3} ms ({:+.2}%), lower {lower}/11", d[d.len() / 2], 100.0 * d[d.len() / 2] / mr);
+                }
+                gpu.pool_pop(pool);
+            }
+        }
+    }
+
     #[cfg(test)]
     mod dead_lane_tests {
         use super::*;
@@ -15505,7 +15643,7 @@ kernel void blake3_pow_seg_tail(
             ll /= 2;
             lo = wlo;
         }
-        if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if after_ab && crate::phase_timing_env_on() {
             eprintln!(
                 "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
                  suffix units in {tail_ms:.2} ms",
@@ -17662,7 +17800,7 @@ kernel void blake3_pow_seg_tail(
                 if verified { chosen } else { 0 },
             );
         }
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let k = if verified { chosen } else { 0 };
             eprintln!(
                 "[phase-timing] hybrid split: cpu {} of 256 (ntt priority helpers {})",
@@ -22541,6 +22679,56 @@ kernel void zc_eq_rows(
 
     /// The lincheck wake's private scratch pair (made on first use, or by the
     /// warm-up's [`warm_gpu_spares`]).
+    /// GPU keep-alive loop (see [`super::gpu_keepalive_start`]): one one-threadgroup leaf dispatch,
+    /// committed without waiting, about every millisecond, until the stop flag or the deadline.
+    pub(crate) fn gpu_keepalive_loop(stop: &std::sync::atomic::AtomicBool, max: std::time::Duration) {
+        let Ok(gpu) = gpu() else { return };
+        let Some((data, tree)) = lc_wake_scratch(gpu) else { return };
+        // Touch kernel: reads one word of each bound buffer, writes nothing unless a value matches a
+        // sentinel that never occurs in a legitimate buffer state (scratch `out` only), so binding the
+        // latched commit buffers keeps them resident without changing a byte of them.
+        const KA_TOUCH: &str = "#include <metal_stdlib>\nusing namespace metal;\nkernel void ka_touch(device const uint4* a [[buffer(0)]], device const uint4* b [[buffer(1)]], device const uint4* c [[buffer(2)]], device const uint4* d [[buffer(3)]], device uint* out [[buffer(4)]], uint t [[thread_position_in_grid]]) { uint4 x = a[0] ^ b[0] ^ c[0] ^ d[0]; if (t == 0xFFFFFFFFu) { out[0] = x.x; } }\n";
+        let touch = unsafe { compile_supplemental_pipeline(gpu, KA_TOUCH, "ka_touch").ok() };
+        let end = std::time::Instant::now() + max;
+        while !stop.load(std::sync::atomic::Ordering::Acquire) && std::time::Instant::now() < end {
+            let latched = match LATCH.lock() {
+                Ok(g) => match &*g {
+                    LatchState::On(l) => Some((l.staging, l.tree_buf, l.tw_buf, l.wraps.first().map(|w| w.2))),
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            unsafe {
+                let pool = gpu.pool_push();
+                if let Ok(cb) = gpu.command_buffer()
+                    && let Ok(enc) = gpu.compute_encoder(cb)
+                {
+                    match (touch, latched) {
+                        (Some(pso), Some((st, tr, tw, Some(z)))) => {
+                            gpu.set_pipeline(enc, pso);
+                            gpu.set_buffer(enc, st, 0, 0);
+                            gpu.set_buffer(enc, tr, 0, 1);
+                            gpu.set_buffer(enc, tw, 0, 2);
+                            gpu.set_buffer(enc, z, 0, 3);
+                            gpu.set_buffer(enc, data as Id, 0, 4);
+                            gpu.dispatch(enc, 1, 32);
+                        }
+                        _ => {
+                            gpu.set_pipeline(enc, gpu.pso_leaf);
+                            gpu.set_buffer(enc, data as Id, 0, 0);
+                            gpu.set_buffer(enc, tree as Id, 0, 1);
+                            gpu.dispatch(enc, 1, 256);
+                        }
+                    }
+                    gpu.end_encoding(enc);
+                    gpu.commit_async(cb);
+                }
+                gpu.pool_pop(pool);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     fn lc_wake_scratch(gpu: &Gpu) -> Option<(usize, usize)> {
         static SCRATCH: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
         *SCRATCH.get_or_init(|| unsafe {
@@ -26297,7 +26485,7 @@ kernel void zc_r2_horner_oracle(
             0.0
         };
         unsafe { gpu.release(cb) };
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let fold_gpu = f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
             let window = f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
             eprintln!(

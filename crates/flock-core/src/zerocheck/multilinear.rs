@@ -127,13 +127,28 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// when `useful_bits` is odd in chunk units) is INSIDE the useful range and
 /// processed normally — its padding side has value 0 so the message
 /// contribution is naturally correct.
+/// Read once per process.
+pub const ENV_NO_ZC_GATE_LATCH: &str = "FLOCK_NO_ZC_GATE_LATCH";
+
+pub(crate) fn zc_gate_latch_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_GATE_LATCH).is_none());
+    !cfg!(test) && *ON
+}
+
 /// Kill switch for the b≡1 chunk-class degeneration in the compact round-2 /
 /// round-3 kernels: `FLOCK_NO_R2_DEGEN=1` restores the plain gather path
 /// (bit-identical output either way — the degeneration only skips
-/// value-forced work). Read once per phase call, off the hot path.
 #[cfg(target_arch = "aarch64")]
 fn r2_degen_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+    fn read() -> bool {
+        std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+    }
+    if zc_gate_latch_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *ON;
+    }
+    read()
 }
 
 /// Kill switch for the peeled first group of the round-two Horner kernel:
@@ -141,7 +156,14 @@ fn r2_degen_enabled() -> bool {
 /// zero accumulators in front of every window's first group. Same outputs.
 #[cfg(target_arch = "aarch64")]
 fn r2_first_shift_skip_enabled() -> bool {
-    std::env::var_os("FLOCK_OFF_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1")
+    fn read() -> bool {
+        std::env::var_os("FLOCK_OFF_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1")
+    }
+    if zc_gate_latch_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *ON;
+    }
+    read()
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -155,7 +177,14 @@ fn r2_prescale_enabled() -> bool {
 /// restores the one-body compact kernel. Same stores and slots either way.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 fn cascade_k_fused_enabled() -> bool {
-    std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1")
+    fn read() -> bool {
+        std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1")
+    }
+    if zc_gate_latch_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *ON;
+    }
+    read()
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -170,16 +199,29 @@ fn zc_k_one_table_enabled() -> bool {
 /// and padded group executes the same arithmetic and stores as the oracle.
 #[cfg(target_arch = "aarch64")]
 fn r2_periodic_padding_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
+    fn read() -> bool {
+        std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
+    }
+    if zc_gate_latch_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *ON;
+    }
+    read()
 }
 
 /// Kill switch for the round-two dead-pair skip: `FLOCK_NO_R2_DEADPAIR_SKIP=1`
 /// restores the zero-filled padding slots and the cascade K pass's blind
 /// read of them. Bit-identical either way: the skipped slots hold structural
-/// zeros the K pass substitutes exactly. Read once per phase call.
 #[cfg(target_arch = "aarch64")]
 fn r2_dead_pair_skip_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1")
+    fn read() -> bool {
+        std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1")
+    }
+    if zc_gate_latch_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(read);
+        return *ON;
+    }
+    read()
 }
 
 /// Kill switch for the tail-compacted round-two compact state
