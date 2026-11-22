@@ -560,6 +560,11 @@ fn l1_tail_split_count(log_d: usize, start_layer: usize, num_subs: usize) -> usi
 /// (block, tile) job writes disjoint destination rows.
 #[inline]
 fn recursive_top_hetero_enabled() -> bool {
+    if crate::path_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none());
+        return *ON;
+    }
     std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none()
 }
 
