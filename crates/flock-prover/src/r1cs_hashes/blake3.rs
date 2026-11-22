@@ -5549,6 +5549,7 @@ impl Blake3Setup {
             // `FLOCK_NO_PARK_KEEPALIVE=1` restores the incumbent order.
             if crate::seed_pipe::is_ranked_worker() && crate::seed_pipe::park_keepalive_enabled() {
                 flock_core::cpu_keepalive::keepalive_start();
+                flock_core::gpu_commit::gpu_keepalive_start();
             }
             self.arm_seed_pipe();
             // Last thing before the worker publishes "ready" and every thread
@@ -5559,6 +5560,7 @@ impl Blake3Setup {
             // benches / examples that call `prove_fast` never spin.
             if crate::seed_pipe::is_ranked_worker() {
                 flock_core::cpu_keepalive::keepalive_start();
+                flock_core::gpu_commit::gpu_keepalive_start();
             }
             return (proof, commitment, claim);
         }
