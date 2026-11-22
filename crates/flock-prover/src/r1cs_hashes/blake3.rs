@@ -4264,7 +4264,7 @@ pub(crate) mod witgen_simd {
             n_total >= 8 && n_total.is_multiple_of(8),
             "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
         );
-        let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        let stripe_useful_bits = if super::full_stripe_env_on() {
             K
         } else {
             USEFUL_BITS
@@ -5020,7 +5020,7 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+    let stripe_useful_bits = if full_stripe_env_on() {
         K
     } else {
         USEFUL_BITS
@@ -5104,7 +5104,7 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
         flock_core::epool::helper_pool_available(),
         std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
-        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
+        full_stripe_env_on(),
     )
 }
 
@@ -5154,7 +5154,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     Option<flock_core::gpu_commit::FromZFirstPassStream>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+    let stripe_useful_bits = if full_stripe_env_on() {
         K
     } else {
         USEFUL_BITS
@@ -6301,6 +6301,19 @@ pub fn generate_witness_batch_major(
         USEFUL_BITS,
         build_group_batch_major,
     )
+}
+
+/// `FLOCK_FULL_STRIPE` set (the full-width lincheck stripe instead of the
+/// useful-bit root stripe). The process environment does not change while a
+/// worker runs, so the first answer is kept; `FLOCK_NO_PATH_ENV_ONCE`
+/// restores the per-call lookup.
+fn full_stripe_env_on() -> bool {
+    if flock_core::path_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_FULL_STRIPE").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_FULL_STRIPE").is_some()
 }
 
 #[cfg(test)]
