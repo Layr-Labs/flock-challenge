@@ -9720,8 +9720,9 @@ fn sample_distinct_queries<Ch: Challenger>(
     sample_distinct_queries_with(challenger, block_len, count, query_set_presized_enabled())
 }
 
-/// For bounded counts, use sorted output to detect sparse collisions and a
-/// probe set for denser draws. Larger inputs retain the general HashSet path.
+/// [`sample_distinct_queries_with`] with the probe set for the ranked shapes
+/// (`count <= 256`, `block_len < 2^32`); other shapes take the `HashSet`.
+/// Same draws, same first-occurrence dedupe, same sort.
 fn sample_distinct_queries_probe<Ch: Challenger>(
     challenger: &mut Ch,
     block_len: usize,
@@ -9734,13 +9735,6 @@ fn sample_distinct_queries_probe<Ch: Challenger>(
         count <= block_len,
         "sample_distinct_queries: count ({count}) > block_len ({block_len}) — config is too thin for this query count"
     );
-    // For uniform draws, the first batch expects at most one colliding pair
-    // at these densities. Reuse the required output sort for membership.
-    if count * count.saturating_sub(1) / 2 <= block_len {
-        return sample_sort_then_repair(count, || {
-            (challenger.sample_f128().lo as usize) % block_len
-        });
-    }
     let mut out = Vec::with_capacity(count);
     QueryProbeSet::with(|seen| {
         while out.len() < count {
@@ -9753,21 +9747,6 @@ fn sample_distinct_queries_probe<Ch: Challenger>(
     });
     out.sort_unstable();
     out
-}
-
-fn sample_sort_then_repair(count: usize, mut draw: impl FnMut() -> usize) -> Vec<usize> {
-    // Neither sampler can finish before draw `count`. From there, both
-    // accept exactly the first unseen position and stop at the same draw.
-    let mut positions: Vec<_> = (0..count).map(|_| draw()).collect();
-    positions.sort_unstable();
-    positions.dedup();
-    while positions.len() < count {
-        let q = draw();
-        if let Err(index) = positions.binary_search(&q) {
-            positions.insert(index, q);
-        }
-    }
-    positions
 }
 
 fn sample_distinct_queries_with<Ch: Challenger>(
@@ -16760,14 +16739,6 @@ mod tests {
             assert_eq!(presized, grown, "log_len={log_len} count={count}");
             assert_eq!(presized.len(), count);
         }
-    }
-
-    #[test]
-    fn sparse_query_repairs_consume_exactly_the_needed_draws() {
-        let mut draws = [7, 7, 7, 7, 12, 7, 3, 3, 9, 99].into_iter();
-        assert_eq!(sample_sort_then_repair(4, || draws.next().unwrap()), [3, 7, 9, 12]);
-        assert_eq!(draws.next(), Some(99));
-        assert!(sample_sort_then_repair(0, || panic!("empty query drew a position")).is_empty());
     }
 
     #[test]

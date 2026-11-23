@@ -452,14 +452,23 @@ fn zc_cascade_fold4_pair_direct_enabled() -> bool {
 /// formula, with the nodes being the F_8 elements `0..2^k_skip` embedded into
 /// F_{2^128} via `φ_8`. Subtraction is XOR in characteristic 2.
 ///
-/// The default prefix/suffix pass takes linear time. Both node sets are
-/// translates of the same additive subspace and share one denominator.
+/// O(2^{2·k_skip}) field multiplies — one-time cost.
+///
+/// Fast path (default): the denominators `∏_{j≠i}(s_i + s_j)` do not depend
+/// on `z`, so their inverses are computed once per process and cached; the
+/// numerators `∏_{j≠i}(z + s_j)` are assembled from prefix/suffix products
+/// in O(ell) multiplies instead of O(ell²). This deletes `ell` field
+/// inversions (each ~254 muls) and ~`ell²` muls of FS-serial critical-path
+/// time from every call. Outputs are bit-identical to the reference loop:
+/// GF(2^128) multiplication is exactly associative and commutative, so
+/// regrouping the numerator product cannot change any bit, and the cached
+/// inverse is produced by the reference denominator loop itself.
 /// `FLOCK_NO_LAGRANGE_FAST=1` restores the reference implementation.
 pub fn lagrange_weights_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(ell <= 256, "k_skip > 8 would exceed PHI_8_TABLE");
     if lagrange_fast_enabled() {
-        return lagrange_weights_fast(k_skip, z, 0);
+        return lagrange_weights_fast(k_skip, z, 0, lagrange_s_den_inv(k_skip));
     }
     lagrange_weights_naive_reference(k_skip, z)
 }
@@ -492,28 +501,72 @@ fn lagrange_fast_enabled() -> bool {
     *ENABLED
 }
 
-/// AES-field encodings of (∏_{t=1}^{2^k-1} t)^(-1), including the empty
-/// product for k=0. At node i, adding the other nodes enumerates exactly
-/// these nonzero differences: j ↦ i XOR j permutes the subspace and a
-/// common coset offset cancels. The φ_8 embedding preserves the product.
-const LAGRANGE_DEN_INV_F8: [u8; 9] = [0x01, 0x01, 0x7b, 0x45, 0x3c, 0x42, 0x6c, 0x03, 0x01];
+/// Cached `(∏_{j≠i}(s_i + s_j))^{-1}` for the S-domain nodes
+/// `s_i = φ_8(i)`, indexed by `k_skip`. z-independent, so one inversion
+/// pass per process instead of one per call.
+static LAGRANGE_S_DEN_INV: [std::sync::OnceLock<Vec<F128>>; 9] =
+    [const { std::sync::OnceLock::new() }; 9];
 
-fn lagrange_weights_fast(k_skip: usize, z: F128, node_offset: usize) -> Vec<F128> {
+/// Same cache for the Λ-domain nodes `s_i = φ_8(2^k_skip + i)` (k_skip ≤ 7).
+static LAGRANGE_LAMBDA_DEN_INV: [std::sync::OnceLock<Vec<F128>>; 8] =
+    [const { std::sync::OnceLock::new() }; 8];
+
+fn lagrange_s_den_inv(k_skip: usize) -> &'static [F128] {
+    LAGRANGE_S_DEN_INV[k_skip].get_or_init(|| {
+        let ell = 1usize << k_skip;
+        (0..ell)
+            .map(|i| {
+                let si = PHI_8_TABLE[i];
+                let mut den = F128::ONE;
+                for j in 0..ell {
+                    if j != i {
+                        den *= si + PHI_8_TABLE[j];
+                    }
+                }
+                den.inv()
+            })
+            .collect()
+    })
+}
+
+fn lagrange_lambda_den_inv(k_skip: usize) -> &'static [F128] {
+    LAGRANGE_LAMBDA_DEN_INV[k_skip].get_or_init(|| {
+        let ell = 1usize << k_skip;
+        (0..ell)
+            .map(|i| {
+                let si = PHI_8_TABLE[ell + i];
+                let mut den = F128::ONE;
+                for j in 0..ell {
+                    if j != i {
+                        den *= si + PHI_8_TABLE[ell + j];
+                    }
+                }
+                den.inv()
+            })
+            .collect()
+    })
+}
+
+/// O(ell) Lagrange weights: `weights[i] = P_i · S_i · den_inv[i]` with
+/// `P_i = ∏_{j<i}(z + s_j)` and `S_i = ∏_{j>i}(z + s_j)`. Exact-field
+/// regrouping of the reference `∏_{j≠i}(z + s_j) · den.inv()`.
+fn lagrange_weights_fast(
+    k_skip: usize,
+    z: F128,
+    node_offset: usize,
+    den_inv: &[F128],
+) -> Vec<F128> {
     let ell = 1usize << k_skip;
-    let nodes = &PHI_8_TABLE[node_offset..node_offset + ell];
-    let mut weights = Vec::with_capacity(ell);
-    let mut prefix = PHI_8_TABLE[LAGRANGE_DEN_INV_F8[k_skip] as usize];
-    weights.push(prefix);
-    for &node in &nodes[..ell - 1] {
-        prefix *= z + node;
-        weights.push(prefix);
+    let mut weights = vec![F128::ZERO; ell];
+    let mut prefix = F128::ONE;
+    for i in 0..ell {
+        weights[i] = prefix;
+        prefix *= z + PHI_8_TABLE[node_offset + i];
     }
-    // weights[i] already includes the inverse denominator and every factor
-    // left of i. Multiply by each right suffix, which may itself be zero.
     let mut suffix = F128::ONE;
-    for i in (1..ell).rev() {
-        suffix *= z + nodes[i];
-        weights[i - 1] *= suffix;
+    for i in (0..ell).rev() {
+        weights[i] = weights[i] * suffix * den_inv[i];
+        suffix *= z + PHI_8_TABLE[node_offset + i];
     }
     weights
 }
@@ -528,7 +581,7 @@ pub fn lagrange_weights_lambda_naive(k_skip: usize, z: F128) -> Vec<F128> {
     let ell = 1usize << k_skip;
     assert!(2 * ell <= 256, "Λ ∪ S must fit in F_8 (need k_skip ≤ 7)");
     if lagrange_fast_enabled() {
-        return lagrange_weights_fast(k_skip, z, ell);
+        return lagrange_weights_fast(k_skip, z, ell, lagrange_lambda_den_inv(k_skip));
     }
     lagrange_weights_lambda_naive_reference(k_skip, z)
 }
@@ -6957,45 +7010,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lagrange_denominator_matches_every_node_in_both_domains() {
-        for (k, &index) in LAGRANGE_DEN_INV_F8.iter().enumerate() {
-            let ell = 1usize << k;
-            for nodes in PHI_8_TABLE.chunks_exact(ell).take(2) {
-                for &node in nodes {
-                    let mut product = PHI_8_TABLE[index as usize];
-                    for &other in nodes {
-                        if other != node {
-                            product *= node + other;
-                        }
-                    }
-                    assert_eq!(product, F128::ONE);
-                }
-            }
-        }
-    }
-
-    /// The normalized prefix/suffix products match the quadratic loop on both
+    /// The O(ell) fast path (cached denominator inverses + prefix/suffix
+    /// numerators) is bit-identical to the reference quadratic loop on both
     /// node domains, for random and node-coincident fold points.
     #[test]
     fn lagrange_fast_matches_reference() {
         let mut rng = Rng::new(42);
-        for k_skip in 0..=8 {
+        for &k_skip in &[1usize, 2, 3, 4, 5, 6, 7] {
             let ell = 1usize << k_skip;
             for t in 0..6 {
-                let z = match t {
-                    4 => PHI_8_TABLE[0],
-                    5 => PHI_8_TABLE[(2 * ell - 1).min(255)],
-                    _ => rng.f128(),
+                let z = if t < 4 {
+                    rng.f128()
+                } else {
+                    PHI_8_TABLE[t - 4]
                 };
                 assert_eq!(
-                    lagrange_weights_fast(k_skip, z, 0),
+                    lagrange_weights_fast(k_skip, z, 0, lagrange_s_den_inv(k_skip)),
                     lagrange_weights_naive_reference(k_skip, z),
                     "S-domain mismatch at k_skip={k_skip}, t={t}"
                 );
                 if 2 * ell <= 256 {
                     assert_eq!(
-                        lagrange_weights_fast(k_skip, z, ell),
+                        lagrange_weights_fast(k_skip, z, ell, lagrange_lambda_den_inv(k_skip)),
                         lagrange_weights_lambda_naive_reference(k_skip, z),
                         "Λ-domain mismatch at k_skip={k_skip}, t={t}"
                     );
