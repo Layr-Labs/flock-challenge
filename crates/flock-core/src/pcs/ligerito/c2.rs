@@ -74,15 +74,6 @@ fn dot2(local: &[F128], weights: &[F128], half: usize) -> [F128; 2] {
 }
 
 #[inline]
-fn one_plus_scale(ntt: &AdditiveNttF128, log_d: usize, s: usize, query: usize) -> F128 {
-    let mut val = ntt.twiddle(log_d - 1 - s, query >> (s + 1));
-    if (query >> s) & 1 == 0 {
-        val += F128::ONE;
-    }
-    val
-}
-
-#[inline]
 fn invert_local_staged(
     ntt: &AdditiveNttF128,
     log_d: usize,
@@ -91,13 +82,20 @@ fn invert_local_staged(
     base: usize,
     qoff: usize,
     cache: &mut [F128; 16],
-) -> [F128; 30] {
+) -> ([F128; 30], [F128; 4]) {
+    let mut scales = [F128::ZERO; 4];
     let mut stages = [F128::ZERO; 30];
     for (stage, layer) in ((log_d - inv_layers)..log_d).rev().enumerate() {
         let size = 1usize << (log_d - layer);
         let half = size / 2;
+        let start = qoff & !(size - 1);
         for off in (0..cache_len).step_by(size) {
             let twiddle = ntt.twiddle(layer, (base + off) / size);
+            // base is cache-aligned. In the query's block this is exactly
+            // twiddle(layer, query / size); the half selects the unit offset.
+            if off == start {
+                scales[stage] = twiddle + F128::new(u64::from(qoff & half == 0), 0);
+            }
             for j in 0..half {
                 let y0 = cache[off + j];
                 let v = y0 + cache[off + half + j];
@@ -105,11 +103,9 @@ fn invert_local_staged(
                 cache[off + half + j] = v;
             }
         }
-        let len = 2usize << stage;
-        let start = qoff & !(len - 1);
-        stages[len - 2..2 * len - 2].copy_from_slice(&cache[start..start + len]);
+        stages[size - 2..2 * size - 2].copy_from_slice(&cache[start..start + size]);
     }
-    stages
+    (stages, scales)
 }
 
 pub(super) struct Dual {
@@ -177,7 +173,7 @@ impl Dual {
                 [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
             }
             enforced ^= alpha.mul_unreduced(cache[qoff]);
-            stages.push(invert_local_staged(
+            let (query_stages, qscales) = invert_local_staged(
                 &ntt,
                 log_d,
                 inv_layers,
@@ -185,11 +181,8 @@ impl Dual {
                 base,
                 qoff,
                 &mut cache,
-            ));
-            let mut qscales = [F128::ZERO; 4];
-            for s in 0..=depth {
-                qscales[s] = one_plus_scale(&ntt, log_d, s, q);
-            }
+            );
+            stages.push(query_stages);
             w2_pows.push(mul(alpha, qscales[0]));
             scales.push(qscales);
             positions.push(q >> depth);
@@ -266,7 +259,7 @@ impl Dual {
                         [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
                     }
                     let enf = w.mul_unreduced(cache[qoff]);
-                    *stage_out = invert_local_staged(
+                    (*stage_out, *scale_out) = invert_local_staged(
                         &ntt,
                         log_d,
                         inv_layers,
@@ -275,9 +268,6 @@ impl Dual {
                         qoff,
                         &mut cache,
                     );
-                    for s in 0..=depth {
-                        scale_out[s] = one_plus_scale(&ntt, log_d, s, q);
-                    }
                     *pos_out = q >> depth;
                     *w2_out = mul(w, scale_out[0]);
                     enf
@@ -307,7 +297,7 @@ impl Dual {
                     [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
                 }
                 enf_sum ^= w.mul_unreduced(cache[qoff]);
-                *stage_out = invert_local_staged(
+                (*stage_out, *scale_out) = invert_local_staged(
                     &ntt,
                     log_d,
                     inv_layers,
@@ -316,9 +306,6 @@ impl Dual {
                     qoff,
                     &mut cache,
                 );
-                for s in 0..=depth {
-                    scale_out[s] = one_plus_scale(&ntt, log_d, s, q);
-                }
                 *pos_out = q >> depth;
                 *w2_out = mul(w, scale_out[0]);
             }
@@ -648,6 +635,47 @@ pub(super) fn enabled(lazy_l1_selected: bool, disabled: Option<&std::ffi::OsStr>
 mod terminal_tests {
     use super::*;
     use crate::challenger::Challenger;
+
+    #[test]
+    fn staged_twiddles_match_global_query_scales() {
+        for log_d in [6usize, 21] {
+            let ntt = AdditiveNttF128::standard(log_d);
+            for depth in [2usize, 3] {
+                let layers = depth + 1;
+                let len = 1 << layers;
+                for base in [0, len, (1 << log_d) - len] {
+                    for offset in 0..len {
+                        let q = base + offset;
+                        let mut cache = std::array::from_fn(|i| F128::new(q as u64, i as u64));
+                        let mut reference = cache;
+                        let (stages, scales) = invert_local_staged(
+                            &ntt, log_d, layers, len, base, offset, &mut cache,
+                        );
+                        for s in 0..layers {
+                            let layer = log_d - 1 - s;
+                            let half = 1 << s;
+                            let size = 2 * half;
+                            let t = ntt.twiddle(layer, q >> (s + 1));
+                            let expected = if (q >> s) & 1 == 0 { t + F128::ONE } else { t };
+                            assert_eq!(scales[s], expected);
+                            for (block, chunk) in reference[..len].chunks_exact_mut(size).enumerate() {
+                                let w = ntt.twiddle(layer, base / size + block);
+                                let (lo, hi) = chunk.split_at_mut(half);
+                                for (a, b) in lo.iter_mut().zip(hi) {
+                                    *b += *a;
+                                    *a += *b * w;
+                                }
+                            }
+                            let start = offset / size * size;
+                            assert_eq!(&stages[size - 2..2 * size - 2], &reference[start..start + size]);
+                        }
+                        assert_eq!(cache, reference);
+                        assert!(scales[layers..].iter().all(|&v| v == F128::ZERO));
+                    }
+                }
+            }
+        }
+    }
 
     /// The terminal fold returns the same messages, transcript, folded `f` and
     /// target as the merging fold; it only leaves `combined_basis` unmerged.
