@@ -1437,6 +1437,9 @@ pub(crate) fn arm(log2_size: u32, setup_addr: usize, run: fn(usize, &[Compressio
     };
 
     let _ = shared();
+    // RC2 (`FLOCK_NO_RECOMPUTE_CACHE2`): keep the timed prove's AB stripe
+    // programs (pure tables) now, in the untimed warm-up.
+    crate::prover::prewarm_ab_stripe_programs();
     // Committed here, in the warm-up, so the timed expansion never faults.
     let scratch = prefaulted_blocks(1usize << log2_size);
     // The seed-pipe thread reports once it has pre-opened the publication
