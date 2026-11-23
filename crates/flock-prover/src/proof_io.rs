@@ -794,15 +794,23 @@ impl<'a> GatherBundle<'a> {
     /// appended to `tail`. [`Self::len`] must be at least `head.len()`. The
     /// userspace counterpart of [`Self::write_all_to`] for a destination whose
     /// front is already memory (a mapped publish file).
-    pub(crate) fn copy_split(&self, head: &mut [u8], tail: &mut Vec<u8>) {
-        let mut at = 0;
-        for part in self.parts() {
-            let n = part.len().min(head.len() - at);
-            head[at..at + n].copy_from_slice(&part[..n]);
-            at += n;
-            tail.extend_from_slice(&part[n..]);
+    pub(crate) fn copy_split(&self, mut head: &mut [u8], tail: &mut Vec<u8>) {
+        let mut parts = self.parts();
+        while !head.is_empty() {
+            let part = parts.next().expect("gather shorter than its head");
+            if part.len() > head.len() {
+                let (first, rest) = part.split_at(head.len());
+                head.copy_from_slice(first);
+                tail.extend_from_slice(rest);
+                break;
+            }
+            let (dst, remaining) = head.split_at_mut(part.len());
+            dst.copy_from_slice(part);
+            head = remaining;
         }
-        assert_eq!(at, head.len(), "gather shorter than its head");
+        for part in parts {
+            tail.extend_from_slice(part);
+        }
     }
 
     /// Write every byte to `w` with vectored writes (at most 1024 slices per
@@ -1504,6 +1512,32 @@ mod tests {
     fn rejects_truncated() {
         let res = R1csProofBundleLigerito::from_bytes(&[0u8; 3]);
         assert!(matches!(res, Err(DeserializeError::Truncated)));
+    }
+
+    #[test]
+    fn gather_split_at_every_byte_with_empty_prefix() {
+        let mut gather = GatherBundle {
+            prefix: Vec::new(),
+            arena: Vec::new(),
+            segs: Vec::new(),
+        };
+        gather.u64(3);
+        gather.bytes(b"abc");
+        gather.u64(0);
+        gather.bytes(b"");
+        gather.u64(1);
+        gather.bytes(b"z");
+        let expected = [
+            &3u64.to_le_bytes()[..], b"abc", &0u64.to_le_bytes(), &1u64.to_le_bytes(), b"z",
+        ].concat();
+        for split in 0..=expected.len() {
+            let mut head = vec![0xff; split];
+            let mut tail = vec![0xab];
+            gather.copy_split(&mut head, &mut tail);
+            assert_eq!(head, expected[..split]);
+            assert_eq!(tail[0], 0xab);
+            assert_eq!(tail[1..], expected[split..]);
+        }
     }
 
     #[test]
