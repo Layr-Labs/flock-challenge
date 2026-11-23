@@ -389,3 +389,4 @@ mod tests {
         }
     }
 }
+// An 8-by-8 bit transpose maps each input row to an output column.
