@@ -4264,7 +4264,7 @@ pub(crate) mod witgen_simd {
             n_total >= 8 && n_total.is_multiple_of(8),
             "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
         );
-        let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        let stripe_useful_bits = if super::full_stripe_env_on() {
             K
         } else {
             USEFUL_BITS
@@ -4537,7 +4537,7 @@ pub(crate) mod witgen_simd {
             // build. The env kill switch exists for same-binary diagnostics.
             const STREAM_TAPER_DEFAULT: bool = true;
             let tapered =
-                STREAM_TAPER_DEFAULT && std::env::var_os("FLOCK_NO_STREAM_TAPER").is_none();
+                STREAM_TAPER_DEFAULT && !crate::seed_pipe::stream_taper_env_off();
             let schedule = if tapered {
                 TAPERED_SCHEDULE
             } else {
@@ -4602,7 +4602,7 @@ pub(crate) mod witgen_simd {
                 // Publish each band the moment its last slab lands instead of
                 // strictly in band order. `FLOCK_NO_BAND_ANY_ORDER=1` restores
                 // the in-order sequencer.
-                let any_order = std::env::var_os("FLOCK_NO_BAND_ANY_ORDER").is_none();
+                let any_order = !crate::seed_pipe::band_any_order_env_off();
                 let seq = std::sync::Mutex::new(SubmitSeq {
                     next: 0,
                     submitted: vec![false; n_bands],
@@ -5020,7 +5020,7 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+    let stripe_useful_bits = if full_stripe_env_on() {
         K
     } else {
         USEFUL_BITS
@@ -5104,7 +5104,7 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
         flock_core::epool::helper_pool_available(),
         std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
-        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
+        full_stripe_env_on(),
     )
 }
 
@@ -5154,7 +5154,7 @@ fn generate_witness_with_ab_packed_and_lincheck_streamed(
     Option<flock_core::gpu_commit::FromZFirstPassStream>,
 ) {
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+    let stripe_useful_bits = if full_stripe_env_on() {
         K
     } else {
         USEFUL_BITS
@@ -5257,7 +5257,7 @@ impl Blake3Setup {
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
             && self.pcs_params.merkle_hash == HashKind::Blake3
-            && std::env::var_os("FLOCK_NO_HOT_CODEWORD").is_none()
+            && !crate::seed_pipe::hot_codeword_env_off()
     }
 
     /// Select the reverse transpose only for the promoted benchmark geometry.
@@ -6301,6 +6301,19 @@ pub fn generate_witness_batch_major(
         USEFUL_BITS,
         build_group_batch_major,
     )
+}
+
+/// `FLOCK_FULL_STRIPE` set (the full-width lincheck stripe instead of the
+/// useful-bit root stripe). The process environment does not change while a
+/// worker runs, so the first answer is kept; `FLOCK_NO_PATH_ENV_ONCE`
+/// restores the per-call lookup.
+fn full_stripe_env_on() -> bool {
+    if flock_core::path_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_FULL_STRIPE").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_FULL_STRIPE").is_some()
 }
 
 #[cfg(test)]
