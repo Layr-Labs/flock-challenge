@@ -2202,6 +2202,12 @@ fn zc_k_premap_bytes(n_pairs: usize) -> usize {
     if share == 0 {
         return 0;
     }
+    // A measured share above the constant needs the longer view.
+    let share = if crate::gpu_commit::zc_k_measured_share_enabled() {
+        share.max(crate::gpu_commit::ZC_K_MEASURED_SHARE.load(std::sync::atomic::Ordering::Relaxed))
+    } else {
+        share
+    };
     let k_hi = 1usize << cascade_k_pass_n_hi(n_pairs.trailing_zeros() as usize - 2);
     let prefix_pairs = share.min(k_hi) * (n_pairs / k_hi);
     // The R2-CS kernel stores through this view too: with the measured
@@ -3927,6 +3933,8 @@ fn fold2_compact_and_round45_into_packed_b(
     // first launch (oracle probe) `cpu_base == 0` and the queue is exactly the
     // incumbent one.
     #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let mut k_layout: Option<crate::gpu_commit::ZcKLayout> = None;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
     let gpu_job = {
         let share = crate::gpu_commit::gpu_zc_k_share().min(hi_size);
         if gpu && bpack && compact.tail_compact && share > 0 {
@@ -3945,6 +3953,7 @@ fn fold2_compact_and_round45_into_packed_b(
                 },
                 d_shift: if hc { kernels::aarch64::HC_DELTA_SHIFT } else { 0 },
             };
+            k_layout = Some(layout);
             crate::gpu_commit::launch_zc_k_prefix(
                 &compact.anchors,
                 &compact.deltas,
@@ -4103,6 +4112,45 @@ fn fold2_compact_and_round45_into_packed_b(
     };
     crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
 
+    // Late-GPU steal (`gpu_commit::zc_k_steal_enabled`): take the GPU's
+    // chunks from the top until its buffer completes; `steal_lo` is the
+    // lowest chunk taken (the prefix length the join reads).
+    #[allow(unused_mut)]
+    let mut steal_lo = cpu_base;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    if let Some(job) = gpu_job.as_ref()
+        && job.steal_active()
+    {
+        let top = std::sync::atomic::AtomicUsize::new(job.chunks());
+        let t_steal = std::time::Instant::now();
+        crate::epool::run_hetero_chunks(32, |_| loop {
+            if job.poll_done() {
+                break;
+            }
+            let cur = top.load(std::sync::atomic::Ordering::Acquire);
+            if cur == 0 {
+                break;
+            }
+            if top
+                .compare_exchange(cur, cur - 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            job.publish_cut(cur - 1);
+            chunk_body(cur - 1);
+        });
+        steal_lo = top.load(std::sync::atomic::Ordering::Acquire);
+        if crate::gpu_commit::gpu_zc_k_debug() {
+            eprintln!(
+                "[zc-k-steal] CPU took {} of {} GPU chunks in {:.2} ms",
+                job.chunks() - steal_lo,
+                job.chunks(),
+                t_steal.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+
     // Join the GPU prefix (it was submitted first and is normally done).
     #[allow(unused_mut)]
     let mut gpu_prefix: Option<KGpuPrefix> = None;
@@ -4131,6 +4179,67 @@ fn fold2_compact_and_round45_into_packed_b(
                             && gb == &b_out[..len_b]
                             && parts.as_slice() == &partials[..chunks];
                         crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
+                        // Measured share (`gpu_commit::zc_k_measured_share_enabled`):
+                        // untimed steady replays right after the admitted oracle.
+                        if equal
+                            && crate::gpu_commit::zc_k_measured_share_enabled()
+                            && crate::gpu_commit::zc_k_share_is_v2_default()
+                            && crate::gpu_commit::ZC_K_MEASURED_SHARE.load(std::sync::atomic::Ordering::Relaxed) == 0
+                            && let Some(layout) = k_layout
+                        {
+                            // Two 256-chunk CPU replays (the faster one: a
+                            // contended sample only reads slow) and one GPU
+                            // replay of the same prefix right after the oracle
+                            // (the second back-to-back GPU run, at a ramped
+                            // clock): ~40 ms of untimed warm-up.
+                            let n_rep = 256usize.min(hi_size);
+                            let mut u_cpu = f64::MAX;
+                            for _ in 0..2 {
+                                let t_cpu = std::time::Instant::now();
+                                crate::epool::run_hetero_chunks(n_rep, &chunk_body);
+                                u_cpu = u_cpu.min(t_cpu.elapsed().as_secs_f64() * 1e3 / n_rep as f64);
+                            }
+                            let g_rep = chunks;
+                            let mut gpu_ms = 0.0f64;
+                            if crate::gpu_commit::gpu_zc_k_debug() {
+                                eprintln!("[zc-k] measure replays: cpu {u_cpu:.4} ms/chunk over {n_rep}, gpu prefix {g_rep}");
+                            }
+                            for _ in 0..1 {
+                                let Some(replay) = crate::gpu_commit::launch_zc_k_prefix(
+                                    &compact.anchors,
+                                    &compact.deltas,
+                                    &layout,
+                                    &table_l1,
+                                    rho2,
+                                    compact.head_b,
+                                    eq_lo,
+                                    eq_hi,
+                                    g_rep,
+                                    out_chunk / 256 * 244,
+                                    out_chunk / 64 * b_block,
+                                ) else {
+                                    if crate::gpu_commit::gpu_zc_k_debug() {
+                                        eprintln!("[zc-k] measure replay launch declined");
+                                    }
+                                    gpu_ms = 0.0;
+                                    break;
+                                };
+                                match crate::gpu_commit::zc_k_wait(replay, hi_size) {
+                                    crate::gpu_commit::ZcKResult::Prefix { .. } => {
+                                        gpu_ms = f64::from_bits(
+                                            crate::gpu_commit::ZC_K_LAST_GPU_MS.load(std::sync::atomic::Ordering::Relaxed),
+                                        );
+                                    }
+                                    crate::gpu_commit::ZcKResult::Failed => {
+                                        gpu_ms = 0.0;
+                                        break;
+                                    }
+                                }
+                            }
+                            if gpu_ms > 0.0 {
+                                crate::gpu_commit::zc_k_publish_measured_share(gpu_ms / g_rep as f64, u_cpu, hi_size);
+                            }
+                        }
                         // With the 5+6 GPU arm on, an admitted probe hands its
                         // buffers (byte-equal to the CPU's outputs above) to
                         // the 5+6 pass, so that arm's own first launch, its
@@ -4140,14 +4249,18 @@ fn fold2_compact_and_round45_into_packed_b(
                         }
                     }
                 } else {
-                    partials[..chunks].copy_from_slice(&parts);
+                    // Chunks at or above `steal_lo` were folded by the CPU
+                    // into its own slots and buffers.
+                    let lo = steal_lo.min(chunks);
+                    partials[..lo].copy_from_slice(&parts[..lo]);
+                    let (len_a, len_b) = (len_a / chunks.max(1) * lo, len_b / chunks.max(1) * lo);
                     gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
                 }
             }
             crate::gpu_commit::ZcKResult::Failed => {
                 // The GPU failed after admission: the CPU folds the prefix
                 // chunks with the same kernel (the arm is now disabled).
-                crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
+                crate::epool::run_hetero_chunks(steal_lo.min(cpu_base), &chunk_body);
             }
         }
     }
