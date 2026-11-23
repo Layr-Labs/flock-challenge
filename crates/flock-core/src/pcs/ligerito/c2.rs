@@ -61,12 +61,19 @@ fn row_dot_pair(a: &[F128], b: &[F128], w: &[F128]) -> [F128; 2] {
 }
 
 #[inline]
-fn dot2(local: &[F128], weights: &[F128], half: usize) -> [F128; 2] {
+fn dot2_eq(local: &[F128], weights: &[F128], half: usize) -> [F128; 2] {
     debug_assert_eq!(local.len(), 2 * half);
     debug_assert_eq!(weights.len(), half);
     match half {
         1 => [local[0], local[1]],
-        2 => crate::field::f128_slice::fold_banked_slots2::<2>(weights.try_into().unwrap(), local),
+        2 => {
+            // A one-coordinate equality table is [1 + r, r]. Both rows
+            // fold at the same r, which is the paired ARM kernel's input.
+            debug_assert_eq!(weights[0] + weights[1], F128::ONE);
+            let mut folded = [F128::ZERO; 2];
+            crate::field::f128_slice::fold_pairs(local, 0, &mut folded, weights[1]);
+            folded
+        }
         4 => crate::field::f128_slice::fold_banked_slots2::<4>(weights.try_into().unwrap(), local),
         8 => crate::field::f128_slice::fold_banked_slots2::<8>(weights.try_into().unwrap(), local),
         _ => [dot(&local[..half], weights), dot(&local[half..2 * half], weights)],
@@ -375,7 +382,7 @@ impl Dual {
                 .zip(&mut self.w2_pows)
             {
                 let local = &stage[size - 2..2 * size - 2];
-                let [f0, f1] = dot2(local, &eq_weights, half);
+                let [f0, f1] = dot2_eq(local, &eq_weights, half);
                 let c0 = *w0 + mul(r_prev, *w2);
                 let c2 = mul(c0, qscales[k - 1]);
                 *w0 = c0;
@@ -389,7 +396,7 @@ impl Dual {
                 self.stages.iter().zip(&self.scales).zip(&self.weights)
             {
                 let local = &stage[size - 2..2 * size - 2];
-                let [f0, f1] = dot2(local, &eq_weights, half);
+                let [f0, f1] = dot2_eq(local, &eq_weights, half);
                 let mut c0 = w_init;
                 for (s, &r_s) in rs.iter().enumerate() {
                     c0 = mul(c0, F128::ONE + mul(r_s, qscales[s]));
@@ -648,6 +655,22 @@ pub(super) fn enabled(lazy_l1_selected: bool, disabled: Option<&std::ffi::OsStr>
 mod terminal_tests {
     use super::*;
     use crate::challenger::Challenger;
+
+    #[test]
+    fn paired_eq_fold_matches_two_term_dots() {
+        let x = F128::new(!0, 1 << 63);
+        let y = F128::new(17, !0);
+        for local in [[x, y, y, x], [x, x, F128::ZERO, y]] {
+            for r in [F128::ZERO, F128::ONE, x, y] {
+                let weights = build_eq_table(&[r]);
+                let expected = [
+                    local[0] * weights[0] + local[1] * weights[1],
+                    local[2] * weights[0] + local[3] * weights[1],
+                ];
+                assert_eq!(dot2_eq(&local, &weights, 2), expected);
+            }
+        }
+    }
 
     /// The terminal fold returns the same messages, transcript, folded `f` and
     /// target as the merging fold; it only leaves `combined_basis` unmerged.
