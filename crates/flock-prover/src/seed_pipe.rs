@@ -1521,6 +1521,7 @@ fn speculative_main(
     // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
     let defer_join =
         std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
+    flock_core::gpu_commit::gpu_keepalive_stop();
     if defer_join {
         flock_core::cpu_keepalive::keepalive_signal();
     } else {
