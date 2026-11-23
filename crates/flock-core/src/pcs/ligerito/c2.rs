@@ -406,6 +406,21 @@ impl Dual {
     }
 
     pub(super) fn scale(&mut self, beta: F128) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        if self.step_depth == 0 {
+            // At depth zero w2 already equals w * scales[0]. Scaling both
+            // by beta also works after an earlier scale, including beta=0.
+            for ((w, w0), w2) in self.weights.iter_mut().zip(&mut self.w0_pows).zip(&mut self.w2_pows) {
+                // SAFETY: the compile-time AES gate provides PMULL.
+                let [scaled, scaled_w2] = unsafe {
+                    crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(beta, [*w, *w2])
+                };
+                *w = scaled;
+                *w0 = scaled;
+                *w2 = scaled_w2;
+            }
+            return;
+        }
         for (((w, w0), w2), qscales) in self
             .weights
             .iter_mut()
@@ -648,6 +663,31 @@ pub(super) fn enabled(lazy_l1_selected: bool, disabled: Option<&std::ffi::OsStr>
 mod terminal_tests {
     use super::*;
     use crate::challenger::Challenger;
+
+    #[test]
+    fn glue_scale_matches_scalar_reset() {
+        let x = F128::new(!0, 1 << 63);
+        let y = F128::new(0x87, !0);
+        let row = [x, y];
+        for qs in [&[][..], &[0, 7, 30][..]] {
+            let (mut dual, _) = Dual::new_with_depth(
+                2, 5, 1, &[y], qs, &[x, y], |_| &row,
+            );
+            for (advance, beta) in [(false, x), (false, y), (true, F128::ONE), (true, F128::ZERO)] {
+                if advance {
+                    dual.message(&[y]);
+                }
+                let want: Vec<_> = dual.weights.iter().map(|&w| w * beta).collect();
+                let want2: Vec<_> = want.iter().zip(&dual.scales)
+                    .map(|(&w, s)| w * s[0]).collect();
+                dual.scale(beta);
+                assert_eq!(dual.weights, want);
+                assert_eq!(dual.w0_pows, want);
+                assert_eq!(dual.w2_pows, want2);
+                assert_eq!(dual.step_depth, 0);
+            }
+        }
+    }
 
     /// The terminal fold returns the same messages, transcript, folded `f` and
     /// target as the merging fold; it only leaves `combined_basis` unmerged.
