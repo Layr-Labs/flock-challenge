@@ -449,22 +449,40 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
 ) -> [F128; 2] {
     unsafe {
         debug_assert!(input.len() >= 2 * BANKS);
+        let first = input.as_ptr();
+        let second = first.add(BANKS);
+        fold_banked_slot_pair::<BANKS, BANKS>(weight, first, second)
+    }
+}
+
+/// # Safety
+/// Requires AES. Both slots must hold BANKS readable elements and must
+/// agree from SHARED_START onward. SHARED_START must be at most BANKS.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_slot_pair<const BANKS: usize, const SHARED_START: usize>(
+    weight: &[F128; BANKS],
+    x0: *const F128,
+    x1: *const F128,
+) -> [F128; 2] {
+    unsafe {
         let zero = vdupq_n_u64(0);
-        let mut first = KaratsubaNeon {
-            ll: zero,
-            hh: zero,
-            mm: zero,
-        };
-        let mut second = KaratsubaNeon {
+        let mut shared = KaratsubaNeon {
             ll: zero,
             hh: zero,
             mm: zero,
         };
 
         let w = weight.as_ptr();
-        let x0 = input.as_ptr();
-        let x1 = input.as_ptr().add(BANKS);
-        let main = BANKS & !1;
+        for bank in SHARED_START..BANKS {
+            let wk = vld1q_u64(w.add(bank).cast::<u64>());
+            let first_x = vld1q_u64(x0.add(bank).cast::<u64>());
+            xor_karatsuba_variable(&mut shared, wk, first_x);
+        }
+
+        let mut first = shared;
+        let mut second = shared;
+        let main = SHARED_START & !1;
         let mut bank = 0usize;
         while bank < main {
             let w0 = vld1q_u64(w.add(bank).cast::<u64>());
@@ -477,7 +495,7 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
             xor_karatsuba_const_pair(&mut first, &mut second, x01, x11, w1);
             bank += 2;
         }
-        if bank < BANKS {
+        if bank < SHARED_START {
             let wk = vld1q_u64(w.add(bank).cast::<u64>());
             let first_x = vld1q_u64(x0.add(bank).cast::<u64>());
             let second_x = vld1q_u64(x1.add(bank).cast::<u64>());

@@ -49,13 +49,11 @@ fn row_dot_pair(a: &[F128], b: &[F128], w: &[F128]) -> [F128; 2] {
         && b.len() == 64
         && a[ROW_HEAD..] == b[ROW_HEAD..]
     {
-        use crate::field::f128_slice::fold_banked_slot;
-        let head: &[F128; ROW_HEAD] = w[..ROW_HEAD].try_into().unwrap();
-        let tail = fold_banked_slot::<{ 64 - ROW_HEAD }>(w[ROW_HEAD..].try_into().unwrap(), &a[ROW_HEAD..]);
-        return [
-            fold_banked_slot::<ROW_HEAD>(head, a) + tail,
-            fold_banked_slot::<ROW_HEAD>(head, b) + tail,
-        ];
+        return crate::field::f128_slice::fold_banked_slots2_shared_tail::<64, ROW_HEAD>(
+            w.try_into().unwrap(),
+            a.try_into().unwrap(),
+            b.try_into().unwrap(),
+        );
     }
     [dot(a, w), dot(b, w)]
 }
@@ -735,7 +733,12 @@ mod shared_tail_tests {
         cw.extend_from_slice(&msg);
         ntt.forward_transform_interleaved_from_layer(&mut cw, 64, 1);
         let w: Vec<F128> = (0..64).map(|_| rng_f128(&mut state)).collect();
-        let oracle = |r: &[F128]| r.iter().zip(&w).fold(F128::ZERO, |acc, (x, y)| acc + *x * *y);
+        let oracle = |r: &[F128]| {
+            use crate::field::gf2_128::software::ghash_mul;
+            r.iter()
+                .zip(&w)
+                .fold(F128::ZERO, |acc, (&x, &y)| acc + ghash_mul(x, y))
+        };
         for i in 0..(1usize << log_d) / 2 {
             let a = &cw[128 * i..128 * i + 64];
             let b = &cw[128 * i + 64..128 * i + 128];
@@ -745,8 +748,13 @@ mod shared_tail_tests {
         }
         let a: Vec<F128> = (0..64).map(|_| rng_f128(&mut state)).collect();
         let mut b = a.clone();
-        b[63] = rng_f128(&mut state);
-        assert_eq!(row_dot_pair(&a, &b, &w), [oracle(&a), oracle(&b)]);
+        for lane in ROW_HEAD..64 {
+            b[lane] += F128::ONE;
+            let expected = [oracle(&a), oracle(&b)];
+            assert_ne!(expected[0], expected[1]);
+            assert_eq!(row_dot_pair(&a, &b, &w), expected);
+            b[lane] = a[lane];
+        }
         let narrow: Vec<F128> = w[..8].to_vec();
         assert_eq!(row_dot_pair(&a[..8], &a[..8], &narrow), [dot(&a[..8], &narrow); 2]);
     }
