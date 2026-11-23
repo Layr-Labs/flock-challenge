@@ -11680,14 +11680,14 @@ mod tests {
                                 OUT_PAIRS, true, out.as_mut_ptr(),
                             ),
                             (false, false) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
                                 );
                             }
                             (false, true) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
@@ -11771,12 +11771,12 @@ mod tests {
                 let (mut ap, mut bp) = (vec![poison; n_out], vec![poison; n_out]);
                 let (mut o_full, mut o_pack) = ([F128::ZERO; 8], [F128::ZERO; 8]);
                 unsafe {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_full.as_mut_ptr(), false, false, false, F128::ONE,
                     );
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         ap.as_mut_ptr(), bp.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_pack.as_mut_ptr(), false, false, false, F128::ONE,
@@ -11860,7 +11860,7 @@ mod tests {
                     let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
                     let mut o = [F128::ZERO; 8];
                     let ok = unsafe {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
                             r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                             a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                             o.as_mut_ptr(), bpack, false, false, F128::ONE,
@@ -11933,13 +11933,13 @@ mod tests {
                     let mut o = [F128::ZERO; 8];
                     let ok = unsafe {
                         if pieces {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false>(
                                 t7.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                                 o.as_mut_ptr(), bpack, false, false, F128::ONE,
                             )
                         } else {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
                                 r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                                 o.as_mut_ptr(), bpack, false, false, F128::ONE,
@@ -11956,6 +11956,158 @@ mod tests {
                 assert_eq!(got.3, want.3, "b-one verdict, {at}");
             }
         }
+    }
+
+    /// K chunk-body timing probe (ignored): one chunk at the ranked shape's
+    /// 4096 output pairs, best of `FLOCK_KPROBE_REPS` (default 1000), for the
+    /// seven-piece and byte-bank kernels, `k_xb` off/on.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    #[ignore]
+    fn k_chunk_probe() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        let reps: usize = std::env::var("FLOCK_KPROBE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+        let mut state = 0x4b50_524f_4245_0001;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, rho(&mut state));
+        let out_pairs = 4096usize;
+        let n_out = 2 * out_pairs;
+        let (rho1, rho2) = (rho(&mut state), rho(&mut state));
+        let r1 = table.scaled_linear(rho1);
+        let t7 = r2_fold7_table(&r1).expect("scaled banks are linear");
+        let mut anchors: Vec<F128> = (0..8 * out_pairs).map(|_| rho(&mut state)).collect();
+        let mut deltas: Vec<u8> = (0..64 * out_pairs).map(|_| splitmix64(&mut state) as u8).collect();
+        let eq: Vec<F128> = (0..out_pairs).map(|_| rho(&mut state)).collect();
+        let eq_prep = round2_eq_prep(&eq);
+        let eq_lo: Vec<F128> = (0..4 * n_out).map(|_| rho(&mut state)).collect();
+        for g in 0..n_out {
+            if matches!(g % 64, 0..4 | 59) {
+                anchors[4 * g + 1] = F128::ONE;
+                anchors[4 * g + 3] = F128::ONE;
+                deltas[32 * g + 8..32 * g + 16].fill(0);
+                deltas[32 * g + 24..32 * g + 32].fill(0);
+            }
+        }
+        let (mut a, mut b) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+        let mut o = [F128::ZERO; 8];
+        let mut time = |name: &str, f: &mut dyn FnMut(&mut [F128], &mut [F128], &mut [F128; 8])| {
+            let mut best = f64::MAX;
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                f(&mut a, &mut b, &mut o);
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!("[kprobe] {name}: {:.1} us/chunk, {:.2} ns/pair", best * 1e6, best * 1e9 / out_pairs as f64);
+        };
+        // Cold: cycle through 48 distinct chunk inputs (~36 MiB, past the caches).
+        {
+            let nc = 48usize;
+            let ca: Vec<Vec<F128>> = (0..nc).map(|_| anchors.clone()).collect();
+            let cd: Vec<Vec<u8>> = (0..nc).map(|_| deltas.clone()).collect();
+            let (mut a2, mut b2) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+            let mut o2 = [F128::ZERO; 8];
+            let mut tot = 0.0f64;
+            let mut best_hot = f64::MAX;
+            for rep in 0..reps.max(nc) {
+                let i = rep % nc;
+                let t = std::time::Instant::now();
+                unsafe {
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true>(
+                        t7.as_ptr().cast(), rho2, ca[i].as_ptr(), cd[i].as_ptr(), a2.as_mut_ptr(), b2.as_mut_ptr(),
+                        eq_lo.as_ptr(), out_pairs, false, o2.as_mut_ptr(), true, false, false, F128::ONE,
+                    );
+                }
+                let e = t.elapsed().as_secs_f64();
+                tot += e;
+                best_hot = best_hot.min(e);
+            }
+            let n = reps.max(nc) as f64;
+            eprintln!(
+                "[kprobe] COLD pieces7 xb=true: mean {:.1} us/chunk ({:.2} ns/pair), input {:.0} KiB/chunk -> {:.1} GB/s",
+                tot / n * 1e6,
+                tot / n * 1e9 / out_pairs as f64,
+                (anchors.len() * 16 + deltas.len()) as f64 / 1024.0,
+                (anchors.len() * 16 + deltas.len()) as f64 / (tot / n) / 1e9
+            );
+        }
+        for degen in [false, true] {
+            time(&format!("pieces7 xb=false degen={degen}"), &mut |a, b, o| unsafe {
+                fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false>(
+                    t7.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(), a.as_mut_ptr(), b.as_mut_ptr(),
+                    eq_prep.as_ptr(), out_pairs, degen, o.as_mut_ptr(), true, false, false, F128::ONE,
+                );
+            });
+            time(&format!("pieces7 xb=true degen={degen}"), &mut |a, b, o| unsafe {
+                fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true>(
+                    t7.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(), a.as_mut_ptr(), b.as_mut_ptr(),
+                    eq_lo.as_ptr(), out_pairs, degen, o.as_mut_ptr(), true, false, false, F128::ONE,
+                );
+            });
+            time(&format!("bytebanks xb=false degen={degen}"), &mut |a, b, o| unsafe {
+                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
+                    r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(), a.as_mut_ptr(), b.as_mut_ptr(),
+                    eq_prep.as_ptr(), out_pairs, degen, o.as_mut_ptr(), true, false, false, F128::ONE,
+                );
+            });
+        }
+    }
+
+    /// Composed 5+6 tri chunk timing probe (ignored): one production-size
+    /// chunk (8192 outputs from 32768 packed inputs, b b-one packed), the
+    /// non-temporal store flavour, hot (best of N) and cold (48 chunks cycled).
+    #[test]
+    #[ignore]
+    fn tri56_chunk_probe() {
+        let reps: usize = std::env::var("FLOCK_KPROBE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+        let mut state = 0x7472_6935_3670_7262;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let n_out = 8192usize;
+        let n_in = 4 * n_out;
+        let mut a: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+        let mut b: Vec<F128> = (0..n_in).map(|_| rho(&mut state)).collect();
+        for blk in 0..n_in / 64 {
+            a[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+            b[64 * blk + 61..64 * blk + 64].fill(F128::ZERO);
+            b[64 * blk..64 * blk + 4].fill(F128::ONE);
+            b[64 * blk + 59] = F128::ONE;
+        }
+        let mut ap = vec![F128::new(1, 2); n_in / 256 * PACK_SUPER];
+        for (i, &x) in a.iter().enumerate() {
+            if let Some(k) = packed_index(i) {
+                ap[k] = x;
+            }
+        }
+        let mut bb = vec![F128::new(3, 4); n_in / 64 * B_PACK_BLOCK];
+        for (i, &x) in b.iter().enumerate() {
+            if let Some(k) = bpack_index(i) {
+                bb[k] = x;
+            }
+        }
+        let eq: Vec<F128> = (0..n_out / 2).map(|_| rho(&mut state)).collect();
+        let ep = round2_eq_prep(&eq);
+        let (ra, rb) = (rho(&mut state), rho(&mut state));
+        let (mut ao, mut bo) = (vec![F128::ZERO; n_out], vec![F128::ZERO; n_out]);
+        let mut best = f64::MAX;
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            std::hint::black_box(fold_tri_and_message_packed_aarch64::<true>(&ap, &bb, &mut ao, &mut bo, ra, rb, &eq, &ep));
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let bytes = ((ap.len() + bb.len()) * 16 + 2 * n_out * 16) as f64;
+        eprintln!("[t56probe] HOT: {:.1} us/chunk, {:.2} ns/output, {:.1} GB/s", best * 1e6, best * 1e9 / n_out as f64, bytes / best / 1e9);
+        let nc = 48usize;
+        let cap: Vec<Vec<F128>> = (0..nc).map(|_| ap.clone()).collect();
+        let cbb: Vec<Vec<F128>> = (0..nc).map(|_| bb.clone()).collect();
+        let mut tot = 0.0f64;
+        let n = reps.max(nc);
+        for rep in 0..n {
+            let i = rep % nc;
+            let t = std::time::Instant::now();
+            std::hint::black_box(fold_tri_and_message_packed_aarch64::<true>(&cap[i], &cbb[i], &mut ao, &mut bo, ra, rb, &eq, &ep));
+            tot += t.elapsed().as_secs_f64();
+        }
+        let m = tot / n as f64;
+        eprintln!("[t56probe] COLD: mean {:.1} us/chunk, {:.2} ns/output, {:.1} GB/s ({:.0} KiB in+out/chunk)", m * 1e6, m * 1e9 / n_out as f64, bytes / m / 1e9, bytes / 1024.0);
     }
 
     /// The tri pass over a b-one-packed b input equals the tri pass over the
