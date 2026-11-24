@@ -126,15 +126,18 @@ fn precompute_twiddles(evals: &[Vec<F128>]) -> Option<Vec<F128>> {
     Some(twiddles)
 }
 
+/// The shared standard-basis twiddle tables, one per dimension. A table is
+/// never replaced or freed once made.
+static STANDARD_TWIDDLE_TABLES: OnceLock<[OnceLock<Arc<[F128]>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]> =
+    OnceLock::new();
+
 /// Share immutable standard-basis tables across all NTT objects. The worker's
 /// mandatory untimed proof initializes these before measured requests.
 fn cached_standard_twiddles(dim: usize, evals: &[Vec<F128>]) -> Option<Arc<[F128]>> {
     if dim > MAX_PRECOMPUTED_TWIDDLE_LOG {
         return None;
     }
-    static TABLES: OnceLock<[OnceLock<Arc<[F128]>>; MAX_PRECOMPUTED_TWIDDLE_LOG + 1]> =
-        OnceLock::new();
-    let tables = TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    let tables = STANDARD_TWIDDLE_TABLES.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
     Some(
         tables[dim]
             .get_or_init(|| {
@@ -372,7 +375,7 @@ fn use_ranked_low_twiddle_final_pair(log_d: usize, num_ntts: usize, n_top: usize
     )) && log_d == 20
         && num_ntts == 64
         && n_top == 10
-        && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none()
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none())
 }
 
 /// The ranked low-twiddle final pair runs each sub-transform's blocks in one
@@ -560,7 +563,7 @@ fn l1_tail_split_count(log_d: usize, start_layer: usize, num_subs: usize) -> usi
 /// (block, tile) job writes disjoint destination rows.
 #[inline]
 fn recursive_top_hetero_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none()
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none())
 }
 
 /// Kill switch for the two-pool claim queue on the ranked L0 CPU suffix
@@ -776,6 +779,18 @@ impl AdditiveNttF128 {
     /// commit uploads this table once at init.
     pub(crate) fn precomputed_twiddle_table(&self) -> Option<&[F128]> {
         self.precomputed_twiddles.as_deref()
+    }
+
+    /// `Some(dim)` when this NTT reads the shared standard twiddle table of
+    /// its dimension (the very table, not an equal copy). Such an NTT's
+    /// `twiddle(layer, block)` is a fixed function of `(dim, layer, block)`
+    /// for the life of the process, so derived per-layer rows may be kept
+    /// per `(dim, layer)`. `None` for any other NTT (e.g. [`Self::new`]).
+    pub(crate) fn shared_standard_dim(&self) -> Option<usize> {
+        let dim = self.log_domain_size();
+        let own = self.precomputed_twiddles.as_ref()?;
+        let shared = STANDARD_TWIDDLE_TABLES.get()?.get(dim)?.get()?;
+        Arc::ptr_eq(own, shared).then_some(dim)
     }
 
     /// Twiddle at `(layer, block)` for the forward NTT and FRI fold.
@@ -1231,7 +1246,7 @@ impl AdditiveNttF128 {
             tw
         };
 
-        let pass_timing = std::env::var_os("FLOCK_NTT_PASS_TIMING").is_some();
+        let pass_timing = crate::env_once_sweep!(std::env::var_os("FLOCK_NTT_PASS_TIMING").is_some());
         let t_l1 = std::time::Instant::now();
         // Layer-1 fused-3 pass from the message: 2 blocks, identical input.
         {
@@ -1942,10 +1957,10 @@ impl AdditiveNttF128 {
                     }
                     tw
                 };
-                if zero_root_fused3 && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none() {
+                if zero_root_fused3 && crate::env_once_sweep!(std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()) {
                     let twiddles: Vec<[F128; 7]> = (0..num_blocks).map(block_twiddles).collect();
                     if is_ranked_top_hetero_fused3_pass(log_d, num_ntts, start_layer, n_top, layer)
-                        && std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
+                        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none())
                     {
                         butterfly_interleaved_fused_3layer_all_blocks_hetero(
                             data, &twiddles, eighth, num_ntts,

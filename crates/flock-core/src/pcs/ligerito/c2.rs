@@ -637,7 +637,7 @@ fn op_dual_par_env_on() -> bool {
         });
         return *ON;
     }
-    std::env::var("FLOCK_NO_OP_DUAL_PAR").map_or(true, |v| v != "1")
+    crate::env_once_sweep!(std::env::var("FLOCK_NO_OP_DUAL_PAR").map_or(true, |v| v != "1"))
 }
 
 pub(super) fn enabled(lazy_l1_selected: bool, disabled: Option<&std::ffi::OsStr>) -> bool {

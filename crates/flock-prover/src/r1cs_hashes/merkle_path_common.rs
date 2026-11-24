@@ -324,7 +324,7 @@ pub fn prove_merkle_paths_ligerito_generic<Ch: Challenger>(
     lincheck_circuit: &dyn flock_core::lincheck::LincheckCircuit,
     challenger: &mut Ch,
 ) -> (MerklePathProofLigerito, Commitment) {
-    let trace = std::env::var("MERKLE_TRACE").is_ok();
+    let trace = flock_core::env_once_sweep!(std::env::var("MERKLE_TRACE").is_ok());
 
     let lig_config = pcs_params
         .ligerito_prover_config()

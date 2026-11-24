@@ -1552,7 +1552,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         // `total_bytes`; zero is a valid object representation for F128.
         unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
     }
-    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+    if use_provenance && crate::env_once_sweep!(std::env::var_os("FLOCK_ZC_TIMING").is_some()) {
         let (hits, misses) = ab_compact_backing_token_counts();
         eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
     }
@@ -1682,6 +1682,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     a_col,
                     b_col,
                     None,
+                    0,
                 );
             },
         );
@@ -1836,11 +1837,13 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     AbUnitScratch::new(unit_bytes),
                     window_plan,
                     ab_window_unit_worker_plan(window_plan).zip(window_runs),
+                    ab_mixed_row_worker_plan(),
                 )
             },
-            |(a_col, b_col, scratch, window_plan, window_unit), job| {
+            |(a_col, b_col, scratch, window_plan, window_unit, mixed_plan), job| {
                 let window_plan = *window_plan;
                 let window_unit = *window_unit;
+                let mixed_plan = *mixed_plan;
                 let unit_start = job * units_per_job;
                 let unit_end = (unit_start + units_per_job).min(n_units);
                 for unit in unit_start..unit_end {
@@ -1867,6 +1870,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                             b_col,
                             window_plan,
                             window_unit,
+                            mixed_plan,
                         );
                     }
                 }
@@ -1881,10 +1885,16 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         || {
             #[cfg(target_arch = "aarch64")]
             kernels::aarch64::ab_kara_note_worker();
-            ([F8::ZERO; ELL], [F8::ZERO; ELL], ab_window_rows_worker_plan_with_trim(transform_trim))
+            (
+                [F8::ZERO; ELL],
+                [F8::ZERO; ELL],
+                ab_window_rows_worker_plan_with_trim(transform_trim),
+                ab_mixed_row_worker_plan(),
+            )
         },
-        |(a_col, b_col, window_plan), job| {
+        |(a_col, b_col, window_plan, mixed_plan), job| {
             let window_plan = *window_plan;
+            let mixed_plan = *mixed_plan;
             let chunk_start = job * chunks_per_job;
             let chunk_end = (chunk_start + chunks_per_job).min(n_chunks);
             let slab_len = chunk_end - chunk_start;
@@ -1937,6 +1947,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     a_col,
                     b_col,
                     window_plan,
+                    mixed_plan,
                 );
             }
         },
@@ -2165,6 +2176,33 @@ fn ab_window_rows_worker_plan_with_trim(trim: bool) -> Option<AbWindowRows> {
     None
 }
 
+/// Kill switch for the per-worker mixed-row plan: exactly
+/// `FLOCK_NO_ZC_AB_MIXED_PLAN=1` makes the two mixed const-one rows of a
+/// chunk resolve their route per row again
+/// (`kernels::aarch64::ab_mixed_row_direct`, the record's call). Read once
+/// per process. The same kernel runs on the same row either way.
+pub const ENV_NO_ZC_AB_MIXED_PLAN: &str = "FLOCK_NO_ZC_AB_MIXED_PLAN";
+
+#[cfg(target_arch = "aarch64")]
+fn ab_mixed_plan_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os(ENV_NO_ZC_AB_MIXED_PLAN).as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// A worker's `mixed_plan` for [`precompute_ab_one_chunk`]: resolved on the
+/// worker thread after `ab_kara_note_worker` (see
+/// `kernels::aarch64::ab_mixed_row_plan`); 0 (the per-row route) with
+/// [`ENV_NO_ZC_AB_MIXED_PLAN`] set to 1 and off aarch64.
+fn ab_mixed_row_worker_plan() -> u8 {
+    #[cfg(target_arch = "aarch64")]
+    if ab_mixed_plan_enabled() {
+        return kernels::aarch64::ab_mixed_row_plan();
+    }
+    0
+}
+
 /// Kill switch for the unit window-rows call: any value of
 /// `FLOCK_NO_ZC_AB_WINDOW_UNIT_CALL` makes every chunk of a producer unit
 /// call its static-B window rows itself again. Read once per process. The
@@ -2307,6 +2345,7 @@ unsafe fn precompute_ab_unit<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     b_col: &mut [F8; ELL],
     window_plan: Option<AbWindowRows>,
     window_unit: Option<AbWindowUnitRun>,
+    mixed_plan: u8,
 ) {
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     let window_run_done = if let Some((rows, partials)) = window_unit {
@@ -2344,6 +2383,7 @@ unsafe fn precompute_ab_unit<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             b_col,
             window_plan,
             window_run_done,
+            mixed_plan,
         );
     }
 }
@@ -2372,6 +2412,9 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // The worker's window-rows instance (see `ab_window_rows_worker_plan`);
     // `None` picks it per chunk through the switch chain below.
     #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] window_plan: Option<AbWindowRows>,
+    // The worker's mixed-row plan (see `ab_mixed_row_worker_plan`); 0 picks
+    // the mixed rows' route per row.
+    mixed_plan: u8,
 ) {
     precompute_ab_one_chunk_with::<FAST_POLICY, FORCE_DIRECT>(
         a_packed,
@@ -2391,6 +2434,7 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         b_col,
         window_plan,
         false,
+        mixed_plan,
     );
 }
 
@@ -2417,6 +2461,7 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
     b_col: &mut [F8; ELL],
     #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] window_plan: Option<AbWindowRows>,
     #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] window_run_done: bool,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] mixed_plan: u8,
 ) {
     // `chunk_byte_base` is where this chunk's 1 KiB of rows starts inside
     // `a_packed` / `b_packed`: `x_outer * OUTER_BYTES` for the complete
@@ -2518,19 +2563,43 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
         // The two mixed const-one rows call the kernel the dispatcher picks
         // for them directly when its guards hold (same kernel, same inputs);
         // any other case, or `FLOCK_NO_ZC_AB_MIXED_ROW_DIRECT`, runs the
-        // dispatcher.
+        // dispatcher. A worker's `mixed_plan` (1, 2) is the route and kernel
+        // `ab_mixed_row_direct` resolves on its thread, resolved once
+        // (`FLOCK_NO_ZC_AB_MIXED_PLAN=1`: 0, the per-row route).
         #[cfg(target_arch = "aarch64")]
         let done = const_one_mask != 0
-            && kernels::aarch64::ab_mixed_row_direct(
-                a_packed,
-                b_packed,
-                inv_table,
-                chunk_byte_base,
-                b_med,
-                const_one_mask == 0x03,
-                dst,
-                direct,
-            );
+            && match mixed_plan {
+                kernels::aarch64::AB_MIXED_PLAN_VL => kernels::aarch64::ab_mixed_row_planned::<true>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    const_one_mask == 0x03,
+                    dst,
+                    direct,
+                ),
+                kernels::aarch64::AB_MIXED_PLAN_V0 => kernels::aarch64::ab_mixed_row_planned::<false>(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    const_one_mask == 0x03,
+                    dst,
+                    direct,
+                ),
+                _ => kernels::aarch64::ab_mixed_row_direct(
+                    a_packed,
+                    b_packed,
+                    inv_table,
+                    chunk_byte_base,
+                    b_med,
+                    const_one_mask == 0x03,
+                    dst,
+                    direct,
+                ),
+            };
         #[cfg(not(target_arch = "aarch64"))]
         let done = false;
         if !done {
@@ -4634,7 +4703,7 @@ pub(crate) fn round1_c_prelude(
             if let Some((eq_outer, job, submitted)) =
                 crate::gpu_commit::adopt_staged_zc_fold(c_lincheck, r)
             {
-                if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                if crate::env_once_sweep!(std::env::var_os("FLOCK_ZC_TIMING").is_some()) {
                     eprintln!("[commit-tail-fill] staged C prelude adopted");
                 }
                 return Round1CPrelude {
@@ -5710,9 +5779,9 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
-    let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
-    let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
-    let c_drain4 = std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none();
+    let split_ab_c = crate::env_once_sweep!(std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none());
+    let direct_ab_rows = crate::env_once_sweep!(std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none());
+    let c_drain4 = crate::env_once_sweep!(std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none());
 
     // The challenge-independent AB transform finishes while the commitment is
     // still running. Its challenge-weighted completion is therefore a live
@@ -6493,6 +6562,7 @@ mod tests {
             &mut cached_a_col,
             &mut cached_b_col,
             None,
+            0,
         );
 
         let mut direct = [0u8; OUTER_BYTES];
@@ -6515,6 +6585,7 @@ mod tests {
             &mut direct_a_col,
             &mut direct_b_col,
             None,
+            0,
         );
 
         assert_eq!(direct, cached);
@@ -6614,16 +6685,19 @@ mod tests {
             k::ab_kara_force(true);
             k::ab_kara_note_worker();
             assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(), main));
-            let helper = std::thread::Builder::new()
+            let (helper, helper_mixed) = std::thread::Builder::new()
                 .name("flock-ecore-x".into())
                 .spawn(|| {
                     k::ab_kara_note_worker();
-                    ab_window_rows_plan()
+                    (ab_window_rows_plan(), ab_mixed_row_worker_plan())
                 })
                 .unwrap()
                 .join()
                 .unwrap();
             assert!(core::ptr::fn_addr_eq(helper, plain));
+            // A helper thread keeps the plain apply: the per-row route
+            // (which returns `false` there, so the dispatcher runs).
+            assert_eq!(helper_mixed, 0);
             k::ab_kara_force(false);
             assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(), plain));
             k::ab_kara_force(true);
@@ -6633,6 +6707,24 @@ mod tests {
         if let Some(plan) = worker_plan {
             assert!(core::ptr::fn_addr_eq(plan, ab_window_rows_plan()));
         }
+        // The mixed-row plan (`FLOCK_NO_ZC_AB_MIXED_PLAN`): exactly "1" keeps
+        // the per-row route (0); otherwise the thread's resolved route and
+        // kernel, which with every `FLOCK_` switch unset and the Karatsuba
+        // apply on is the production `VL` kernel, and 0 with it off.
+        let mixed_route = std::env::var_os(ENV_NO_ZC_AB_MIXED_PLAN).as_deref() == Some(std::ffi::OsStr::new("1"));
+        let no_flock_env = std::env::vars_os()
+            .all(|(key, _)| !key.to_string_lossy().starts_with("FLOCK_") || key == ENV_NO_ZC_AB_MIXED_PLAN);
+        for kara in [true, false] {
+            k::ab_kara_force(kara);
+            let want = if mixed_route { 0 } else { k::ab_mixed_row_plan() };
+            assert_eq!(ab_mixed_row_worker_plan(), want);
+            if !kara {
+                assert_eq!(k::ab_mixed_row_plan(), k::AB_MIXED_PLAN_ROUTE);
+            } else if no_flock_env {
+                assert_eq!(k::ab_mixed_row_plan(), k::AB_MIXED_PLAN_VL);
+            }
+        }
+        k::ab_kara_force(true);
 
         let table = make_inv_table();
         let padding = PaddingSpec {
@@ -6672,6 +6764,9 @@ mod tests {
             }
             for kara in [true, false] {
                 k::ab_kara_force(kara);
+                // This thread's mixed-row plan in this state, then both
+                // planned kernels against the per-row route (plan 0).
+                let mixed_worker = ab_mixed_row_worker_plan();
                 for representation in [
                     Round1AbRepresentation::Complete,
                     Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false },
@@ -6682,7 +6777,12 @@ mod tests {
                             for static_layout in [true, false] {
                                 let context = if static_layout { static_b_context } else { None };
                                 let mut outs: Vec<Vec<u8>> = Vec::new();
-                                for plan in [None, Some(counted_window_rows as AbWindowRows)] {
+                                for (plan, mixed_plan) in [
+                                    (None, 0),
+                                    (Some(counted_window_rows as AbWindowRows), mixed_worker),
+                                    (None, k::AB_MIXED_PLAN_V0),
+                                    (None, k::AB_MIXED_PLAN_VL),
+                                ] {
                                     let mut out = vec![0x3cu8; OUTER_BYTES];
                                     macro_rules! go {
                                         ($policy:expr, $direct:literal, $nt:expr) => {
@@ -6690,6 +6790,7 @@ mod tests {
                                                 &a, &b, &table, within_outer_mask, &b_med_counts, static_layout,
                                                 context, $nt, false, representation, window,
                                                 window * OUTER_BYTES, &mut out, &mut a_col, &mut b_col, plan,
+                                                mixed_plan,
                                             )
                                         };
                                     }
@@ -6717,6 +6818,8 @@ mod tests {
                                 );
                                 assert_eq!(calls, want, "plan calls ({at})");
                                 assert_eq!(outs[0], outs[1], "chunk differs ({at})");
+                                assert_eq!(outs[0], outs[2], "mixed plan V0 differs ({at})");
+                                assert_eq!(outs[0], outs[3], "mixed plan VL differs ({at})");
                                 planned += calls.len();
                                 checked += 1;
                             }
@@ -7494,6 +7597,8 @@ mod tests {
                 for kara in [true, false] {
                     k::ab_kara_force(kara);
                     let mapped = ab_window_unit_plan(ab_window_rows_plan()).is_some();
+                    // This thread's mixed-row plan in this state.
+                    let mixed_worker = ab_mixed_row_worker_plan();
                     for representation in [
                         Round1AbRepresentation::Complete,
                         Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false },
@@ -7514,7 +7619,15 @@ mod tests {
                                     };
                                     let mut outs: Vec<Vec<u8>> = Vec::new();
                                     let mut gate = Vec::new();
-                                    for with_unit in [false, true] {
+                                    // Without and with the unit call (the latter with
+                                    // the worker's mixed-row plan), then both planned
+                                    // mixed-row kernels without it.
+                                    for (with_unit, mixed_plan) in [
+                                        (false, 0),
+                                        (true, mixed_worker),
+                                        (false, k::AB_MIXED_PLAN_V0),
+                                        (false, k::AB_MIXED_PLAN_VL),
+                                    ] {
                                         let mut out = vec![0x3cu8; n * OUTER_BYTES];
                                         let plan = with_unit.then_some(counted_window_rows as AbWindowRows);
                                         macro_rules! go {
@@ -7532,7 +7645,7 @@ mod tests {
                                                         a_in, b_in, &table, within_outer_mask, &b_med_counts,
                                                         static_layout, context, $nt, false, representation, x0, n,
                                                         base, out.as_mut_ptr(), &mut a_col, &mut b_col, plan,
-                                                        window_unit,
+                                                        window_unit, mixed_plan,
                                                     )
                                                 };
                                                 runs.is_some()
@@ -7555,7 +7668,7 @@ mod tests {
                                         "x0={x0}, case={case}, kara={kara}, flavor={flavor}, layout={layout}, \
                                          in_scratch={in_scratch}, {representation:?}"
                                     );
-                                    assert_eq!(gate, [runs, runs], "gate ({at})");
+                                    assert_eq!(gate, [runs; 4], "gate ({at})");
                                     let want_units = if runs && mapped {
                                         vec![(x0, within_outer_mask, base, n, nt_store)]
                                     } else {
@@ -7565,6 +7678,8 @@ mod tests {
                                     let chunk_calls = WINDOW_ROWS_CALLS.take().len();
                                     assert_eq!(chunk_calls, if runs && !mapped { n } else { 0 }, "chunk calls ({at})");
                                     assert_eq!(outs[0], outs[1], "unit differs ({at})");
+                                    assert_eq!(outs[0], outs[2], "mixed plan V0 differs ({at})");
+                                    assert_eq!(outs[0], outs[3], "mixed plan VL differs ({at})");
                                     unit_runs += want_units.len();
                                     checked += 1;
                                 }
@@ -8771,6 +8886,8 @@ mod tests {
                         let mut outs: Vec<Vec<u8>> = Vec::new();
                         for kara in [false, true] {
                             kernels::aarch64::ab_kara_force(kara);
+                            // The mixed-row plan of this thread in this state.
+                            let mixed_plan = ab_mixed_row_worker_plan();
                             let mut out = vec![0x3cu8; OUTER_BYTES];
                             macro_rules! go {
                                 ($policy:expr, $direct:literal, $nt:expr) => {
@@ -8778,6 +8895,7 @@ mod tests {
                                         &a, &b, &table, within_outer_mask, &b_med_counts, true,
                                         static_b_context, $nt, false, representation, window,
                                         window * OUTER_BYTES, &mut out, &mut a_col, &mut b_col, None,
+                                        mixed_plan,
                                     )
                                 };
                             }
@@ -9278,6 +9396,22 @@ mod tests {
                             assert_eq!(routed, want, "routed row: {what}");
                         } else {
                             assert_eq!(routed, [0xc3; 64], "routed miss writes nothing: {what}");
+                        }
+                        // The worker-planned calls (`FLOCK_NO_ZC_AB_MIXED_PLAN`),
+                        // both kernels: the guarded call's verdict and bytes.
+                        for vl in [false, true] {
+                            let mut planned = [0x96u8; 64];
+                            let ok = if vl {
+                                kernels::aarch64::ab_mixed_row_planned::<true>(
+                                    &a, &b, &table, base, b_med, w0, &mut planned, nt,
+                                )
+                            } else {
+                                kernels::aarch64::ab_mixed_row_planned::<false>(
+                                    &a, &b, &table, base, b_med, w0, &mut planned, nt,
+                                )
+                            };
+                            assert_eq!(ok, done, "planned guards (vl={vl}): {what}");
+                            assert_eq!(planned, if ok { want } else { [0x96; 64] }, "planned row (vl={vl}): {what}");
                         }
                         let i = usize::from(!w0);
                         if done {
