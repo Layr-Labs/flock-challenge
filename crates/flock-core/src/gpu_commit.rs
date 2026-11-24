@@ -6657,31 +6657,101 @@ kernel void export_from_z_zero_root_tabs(
     pub(crate) fn zero_root_shl4_bases_source() -> &'static str {
         static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         SRC.get_or_init(|| {
-            let helper_anchor = "static inline uint4 gf_shl16_zero_root(uint4 a) {";
-            let helper = "static inline uint4 gf_shl4_zero_root(uint4 a) {
+            let replace_span = |s: &str, a: &str, b: &str, rep: &str| -> String {
+                let i = s.find(a).expect("zero-root start anchor");
+                let j = s[i..].find(b).expect("zero-root end anchor") + i + b.len();
+                format!("{}{}{}", &s[..i], rep, &s[j..])
+            };
+            let helper = r#"static inline uint4 gf_shl4_zero_root(uint4 a) {
     uint h = a.w >> 28;
-    uint4 r;
-    r.w = (a.w << 4) | (a.z >> 28);
-    r.z = (a.z << 4) | (a.y >> 28);
-    r.y = (a.y << 4) | (a.x >> 28);
-    r.x = (a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
-    return r;
+    return uint4((a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h), (a.y << 4) | (a.x >> 28), (a.z << 4) | (a.y >> 28), (a.w << 4) | (a.z >> 28));
+}
+static inline uint4 gf_shl8_zero_root(uint4 a) {
+    uint h = a.w >> 24;
+    return uint4((a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h), (a.y << 8) | (a.x >> 24), (a.z << 8) | (a.y >> 24), (a.w << 8) | (a.z >> 24));
 }
 
-";
-            let bases_old = "        for (uint m = 0u; m < bank * 4u; m++) {
-            p = gf_mulx_zero_root(p);
+static inline uint4 gf_shl16_zero_root(uint4 a) {"#;
+            let mul_new = r#"static inline uint4 gf_mul_tab4_zero_root(uint4 v, threadgroup const uint4* tabs, uint off) {
+    uint4 acc = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        acc = gf_shl16_zero_root(acc);
+        uint h = (v[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        acc ^= tabs[off + (h & 15u)] ^ tabs[off + 16u + ((h >> 4) & 15u)]
+             ^ tabs[off + 32u + ((h >> 8) & 15u)] ^ tabs[off + 48u + (h >> 12)];
+    }
+    return acc;
+}
+static inline void gf_mul_tab4_x2_zero_root(
+    uint4 va, uint4 vb, threadgroup const uint4* tabs, uint oa, uint ob,
+    thread uint4& ra, thread uint4& rb)
+{
+    uint4 a = uint4(0u), b = uint4(0u);
+    for (int i = 7; i >= 0; i--) {
+        a = gf_shl16_zero_root(a);
+        b = gf_shl16_zero_root(b);
+        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+        a ^= tabs[oa + (ha & 15u)] ^ tabs[oa + 16u + ((ha >> 4) & 15u)]
+           ^ tabs[oa + 32u + ((ha >> 8) & 15u)] ^ tabs[oa + 48u + (ha >> 12)];
+        b ^= tabs[ob + (hb & 15u)] ^ tabs[ob + 16u + ((hb >> 4) & 15u)]
+           ^ tabs[ob + 32u + ((hb >> 8) & 15u)] ^ tabs[ob + 48u + (hb >> 12)];
+    }
+    ra = a; rb = b;
+}"#;
+            let bld_new = r#"    if (lid < NTW * 4u) {
+        uint bank = lid & 3u;
+        uint4 b0 = twiddles[zero_root_raw_twiddle(lid >> 2)];
+        if (bank & 1u) { b0 = gf_shl4_zero_root(b0); }
+        if (bank & 2u) { b0 = gf_shl8_zero_root(b0); }
+        bases[lid] = b0;
+        uint4 b1 = gf_mulx_zero_root(b0), b2 = gf_mulx_zero_root(b1), b3 = gf_mulx_zero_root(b2);
+        uint4 b01 = b0 ^ b1, b23 = b2 ^ b3;
+        threadgroup uint4* d = &tabs[lid << 4];
+        d[0] = uint4(0u); d[1] = b0;       d[2] = b1;       d[3] = b01;
+        d[4] = b2;        d[5] = b2 ^ b0;  d[6] = b2 ^ b1;  d[7] = b2 ^ b01;
+        d[8] = b3;        d[9] = b3 ^ b0;  d[10] = b3 ^ b1; d[11] = b3 ^ b01;
+        d[12] = b23;      d[13] = b23 ^ b0; d[14] = b23 ^ b1; d[15] = b23 ^ b01;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);"#;
+            let body_new = r#"        uint4 elems[NF];
+        const uint base_off = (r << 6) + lane, sh = P.s + 6u;
+        for (uint e = 0u; e < NF / 2u; e++) { elems[e] = z[base_off + (e << sh)]; }
+        #define STORE_E(E) data[base_off + ((E) << sh)] = elems[E];
+        #define TAB_BFLY_X2(EU0, EV0, CT0, EU1, EV1, CT1) { \
+            uint4 p0, p1; \
+            gf_mul_tab4_x2_zero_root(elems[EV0], elems[EV1], tabs, (CT0) * 64u, (CT1) * 64u, p0, p1); \
+            uint4 n0 = elems[EU0] ^ p0, n1 = elems[EU1] ^ p1; \
+            elems[EU0] = n0; elems[EV0] ^= n0; elems[EU1] = n1; elems[EV1] ^= n1; \
         }
-        bases[lid] = p;";
-            let bases_new = "        for (uint m = 0u; m < bank; m++) {
-            p = gf_shl4_zero_root(p);
+        {
+            uint4 p0, p1;
+            gf_mul_tab4_x2_zero_root(elems[4], elems[5], tabs, 0u, 0u, p0, p1);
+            elems[8] = elems[0] ^ p0; elems[12] = elems[4] ^ elems[8]; elems[4] ^= elems[0];
+            elems[9] = elems[1] ^ p1; elems[13] = elems[5] ^ elems[9]; elems[5] ^= elems[1];
+            gf_mul_tab4_x2_zero_root(elems[6], elems[7], tabs, 0u, 0u, p0, p1);
+            elems[10] = elems[2] ^ p0; elems[14] = elems[6] ^ elems[10]; elems[6] ^= elems[2];
+            elems[11] = elems[3] ^ p1; elems[15] = elems[7] ^ elems[11]; elems[7] ^= elems[3];
         }
-        bases[lid] = p;";
-            let src = FROM_Z_ZERO_ROOT_MSL_SOURCE;
-            assert_eq!(src.matches(helper_anchor).count(), 1, "zero-root helper anchor");
-            assert_eq!(src.matches(bases_old).count(), 1, "zero-root bases anchor");
-            src.replacen(helper_anchor, &format!("{helper}{helper_anchor}"), 1)
-                .replacen(bases_old, bases_new, 1)
+        elems[2] ^= elems[0]; elems[3] ^= elems[1]; elems[1] ^= elems[0];
+        STORE_E(0u) STORE_E(1u)
+        { uint4 nu = elems[2] ^ gf_mul_tab4_zero_root(elems[3], tabs, 4u * 64u); elems[2] = nu; elems[3] ^= nu; }
+        STORE_E(2u) STORE_E(3u)
+        TAB_BFLY_X2(4, 6, 1, 5, 7, 1) TAB_BFLY_X2(4, 5, 5, 6, 7, 6)
+        STORE_E(4u) STORE_E(5u) STORE_E(6u) STORE_E(7u)
+        TAB_BFLY_X2(8, 10, 2, 9, 11, 2) TAB_BFLY_X2(8, 9, 7, 10, 11, 8)
+        STORE_E(8u) STORE_E(9u) STORE_E(10u) STORE_E(11u)
+        TAB_BFLY_X2(12, 14, 3, 13, 15, 3) TAB_BFLY_X2(12, 13, 9, 14, 15, 10)
+        STORE_E(12u) STORE_E(13u) STORE_E(14u) STORE_E(15u)
+        #undef TAB_BFLY_X2
+        #undef STORE_E"#;
+            let s = FROM_Z_ZERO_ROOT_MSL_SOURCE.replacen(
+                "static inline uint4 gf_shl16_zero_root(uint4 a) {", helper, 1,
+            );
+            let s = replace_span(&s, "static inline uint4 gf_mul_tab4_zero_root(", "    return acc;\n}", mul_new);
+            let s = replace_span(&s, "    if (lid < NTW * 4u) {", "        }\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);", bld_new);
+            let s = s.replacen("        pad[lid % 256u] = tabs[lid];", "        pad[lid % 256u] = tabs[lid] ^ bases[lid % 44u];", 1);
+            replace_span(&s, "        uint4 elems[NF];", "            data[((r + (e << P.s)) << 6) + lane] = elems[e];\n        }", body_new)
         })
     }
 
