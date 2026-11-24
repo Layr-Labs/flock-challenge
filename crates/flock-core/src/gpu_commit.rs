@@ -4254,13 +4254,91 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     const GPU_COMMIT_DEFAULT: bool = true;
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+        && gpu_commit_env_clear()
 }
 
 /// True after untimed warmup permanently selected the ranked GPU path.
 /// The opt-out only restores speculative CPU buffers; it does not disable GPU.
 pub(crate) fn gpu_commit_latched_on() -> bool {
-    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none() && imp::gpu_commit_latched_on()
+    lazy_gpu_codeword_env_clear() && imp::gpu_commit_latched_on()
+}
+
+/// Kill switch for keeping the GPU commit's gate environment reads once per
+/// process (`FLOCK_NO_GPU_ENV_ONCE`, any value: every gate below reads its
+/// variable from the process environment on every call, as before). Read
+/// once per process.
+pub const ENV_NO_GPU_ENV_ONCE: &str = "FLOCK_NO_GPU_ENV_ONCE";
+
+pub(crate) fn gpu_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ENV_ONCE).is_none());
+    *ON
+}
+
+/// `FLOCK_NO_GPU_COMMIT` unset (the environment term of
+/// [`gpu_commit_enabled`]). The process environment does not change while a
+/// worker runs, so the first answer is kept; `FLOCK_NO_GPU_ENV_ONCE`
+/// restores the per-call lookup.
+#[inline]
+fn gpu_commit_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_COMMIT).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+}
+
+/// `FLOCK_NO_LAZY_GPU_CODEWORD` unset (the environment term of
+/// [`gpu_commit_latched_on`]), kept the same way.
+#[inline]
+fn lazy_gpu_codeword_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none()
+}
+
+/// `FLOCK_NO_GPU_TABLE_REUSE` unset (the shared-table term of the final
+/// leaf pass, the g4x2 dead-lane pass and the table share of the three NTT
+/// tile encoders), kept the same way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_table_reuse_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+}
+
+/// `FLOCK_COMMIT_TIMING` set (the commit's timing trace term), kept the same
+/// way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn commit_timing_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
+}
+
+/// `FLOCK_GPU_COMMIT_DEBUG` set (the GPU commit's debug trace term), kept
+/// the same way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_commit_debug_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
 }
 
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
@@ -9605,7 +9683,7 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
             && super::pass_tune_enabled()
             && super::gpu_mixed_final_selected(log_d, log_d - 4, 4)
             && super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled())
-            && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+            && super::gpu_table_reuse_env_clear()
     }
 
     pub(crate) unsafe fn encode_ntt_and_merkle(
@@ -12932,7 +13010,7 @@ kernel void blake3_pow_seg_tail(
         let text = *TEXT.get_or_init(|| {
             super::gpu_dead_lane_enabled() && with_g4x2_dead_lanes(g4x2_msl_source()).is_some()
         });
-        text && !gpu.pso_ntt4g4x2.is_null() && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+        text && !gpu.pso_ntt4g4x2.is_null() && super::gpu_table_reuse_env_clear()
     }
 
     /// [`super::select_from_z_zero_store_from`] for this process and
@@ -13025,7 +13103,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13110,7 +13188,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13190,7 +13268,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -14541,8 +14619,7 @@ kernel void blake3_pow_seg_tail(
     }
 
     fn debug_enabled() -> bool {
-        std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
-            || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+        super::commit_timing_env_on() || super::gpu_commit_debug_env_on()
     }
 
     /// Observability for poisoned process-global locks. The poisoning panic
@@ -14550,7 +14627,7 @@ kernel void blake3_pow_seg_tail(
     /// `catch_unwind`); the score-relevant symptom — a GPU arm silently
     /// degraded or recovered — must be visible under FLOCK_GPU_COMMIT_DEBUG.
     fn note_poisoned_lock(tag: &str, recovered: bool) {
-        if std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some() {
+        if super::gpu_commit_debug_env_on() {
             eprintln!(
                 "[gpu-commit] {tag}: poisoned lock {}",
                 if recovered {
@@ -16955,7 +17032,7 @@ kernel void blake3_pow_seg_tail(
         {
             return;
         }
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         if super::ranked_exact_contention_tune_pending() {
             // The outer warmup join will replay its real A/B branch beside a
             // balanced broad sweep. Avoid double-tuning against a synthetic
@@ -17262,7 +17339,7 @@ kernel void blake3_pow_seg_tail(
             return;
         }
 
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         let latch = latch_lock();
         let LatchState::On(latched) = &*latch else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -18624,7 +18701,7 @@ kernel void blake3_pow_seg_tail(
         let tree = unsafe {
             super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
         }
         // The replicated input codeword was never read by the from-z graph;
@@ -18896,7 +18973,7 @@ kernel void blake3_pow_seg_tail(
                 total_nodes,
             )
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             let wall_ms = stream.started.elapsed().as_secs_f64() * 1e3;
             eprintln!(
                 "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"
@@ -24633,12 +24710,14 @@ static inline ulong clmul_plane_pair(uint a0, uint a1, uint b0, uint b1) {
 // 16x16 carry-less product from 9 native 32-bit products of bit-position-
 // mod-3 parts (at most 6 terms per result bit: no carry reaches a kept bit).
 static inline uint clmul16_m3(uint a, uint b) {
+    // 16-bit masks: the ushort parts hold the same values, and
+    // uint(ushort) products can lower to native 16x16->32 multiplies.
     const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
-    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
-    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
-    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
-    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
+    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
@@ -24679,6 +24758,38 @@ static inline U128k clmul64(ulong a, ulong b) {
     return r;
 }
 
+#if defined(FLOCK_ZC_R2_CLMUL16) && !defined(FLOCK_ZC_R2_CLMUL_INCUMBENT)
+// The 16-bit form's two Karatsuba levels on 32-bit lanes (no 64-bit shifts or
+// ORs). A 64-bit value v is uint2(v, v >> 32): lo ^ (mid << 16) ^ (hi << 32)
+// is uint2(lo ^ (mid << 16), hi ^ (mid >> 16)), and p_lo ^ (p_mid << 32),
+// p_hi ^ (p_mid >> 32) are the uint4 words below, so every limb is unchanged.
+static inline uint2 clmul32_u(uint a, uint b) {
+    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
+    uint lo = clmul16_m3(al, bl);
+    uint hi = clmul16_m3(ah, bh);
+    uint mid = clmul16_m3(al ^ ah, bl ^ bh) ^ lo ^ hi;
+    return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
+}
+
+static inline uint4 clmul64_u(uint2 a, uint2 b) {
+    uint2 p0 = clmul32_u(a.x, b.x);
+    uint2 p2 = clmul32_u(a.y, b.y);
+    uint2 pm = clmul32_u(a.x ^ a.y, b.x ^ b.y) ^ p0 ^ p2;
+    return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
+}
+
+static inline U256k clmul128(uint4 a, uint4 b) {
+    uint4 p0 = clmul64_u(a.xy, b.xy);
+    uint4 p2 = clmul64_u(a.zw, b.zw);
+    uint4 pm = clmul64_u(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
+    U256k r;
+    r.r0 = (ulong(p0.y) << 32) | p0.x;
+    r.r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
+    r.r2 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
+    r.r3 = (ulong(p2.w) << 32) | p2.z;
+    return r;
+}
+#else
 static inline U256k clmul128(uint4 a, uint4 b) {
     ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
     ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
@@ -24694,6 +24805,7 @@ static inline U256k clmul128(uint4 a, uint4 b) {
     r.r3 = p2.hi;
     return r;
 }
+#endif
 
 // Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
 static inline uint4 gf_reduce(U256k p) {
@@ -25096,12 +25208,14 @@ static inline void zc_r2_cs_store(
 // bit-position-mod-3 parts: a result bit sums at most six terms, so no carry
 // reaches the next bit of the same part.
 static inline uint zc_r2_cs_clmul16(uint a, uint b) {
+    // 16-bit masks: the ushort parts hold the same values, and
+    // uint(ushort) products can lower to native 16x16->32 multiplies.
     const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
-    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
-    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
-    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
-    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
+    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
@@ -25128,19 +25242,34 @@ static inline U128k zc_r2_cs_clmul64(ulong a, ulong b) {
     return r;
 }
 
+// The same two Karatsuba levels on 32-bit lanes (no 64-bit shifts or ORs
+// in the inner levels). Word for word: a 64-bit value v is uint2(v, v >> 32),
+// so lo ^ (mid << 16) ^ (hi << 32) is uint2(lo ^ (mid << 16), hi ^ (mid >> 16))
+// and p_lo ^ (p_mid << 32), p_hi ^ (p_mid >> 32) are the uint4 words below.
+static inline uint2 zc_r2_cs_clmul32_u(uint a, uint b) {
+    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
+    uint lo = zc_r2_cs_clmul16(al, bl);
+    uint hi = zc_r2_cs_clmul16(ah, bh);
+    uint mid = zc_r2_cs_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
+    return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
+}
+
+static inline uint4 zc_r2_cs_clmul64_u(uint2 a, uint2 b) {
+    uint2 p0 = zc_r2_cs_clmul32_u(a.x, b.x);
+    uint2 p2 = zc_r2_cs_clmul32_u(a.y, b.y);
+    uint2 pm = zc_r2_cs_clmul32_u(a.x ^ a.y, b.x ^ b.y) ^ p0 ^ p2;
+    return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
+}
+
 static inline U256k zc_r2_cs_clmul128(uint4 a, uint4 b) {
-    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
-    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
-    U128k p0 = zc_r2_cs_clmul64(al, bl);
-    U128k p2 = zc_r2_cs_clmul64(ah, bh);
-    U128k pm = zc_r2_cs_clmul64(al ^ ah, bl ^ bh);
-    pm.lo ^= p0.lo ^ p2.lo;
-    pm.hi ^= p0.hi ^ p2.hi;
+    uint4 p0 = zc_r2_cs_clmul64_u(a.xy, b.xy);
+    uint4 p2 = zc_r2_cs_clmul64_u(a.zw, b.zw);
+    uint4 pm = zc_r2_cs_clmul64_u(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
     U256k r;
-    r.r0 = p0.lo;
-    r.r1 = p0.hi ^ pm.lo;
-    r.r2 = p2.lo ^ pm.hi;
-    r.r3 = p2.hi;
+    r.r0 = (ulong(p0.y) << 32) | p0.x;
+    r.r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
+    r.r2 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
+    r.r3 = (ulong(p2.w) << 32) | p2.z;
     return r;
 }
 
