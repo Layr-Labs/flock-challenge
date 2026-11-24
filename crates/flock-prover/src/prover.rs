@@ -693,7 +693,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             }
             _ => false,
         };
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = flock_core::phase_timing_env_on();
     flock_core::tmark::mark("open start");
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
@@ -1156,6 +1156,13 @@ struct AbStripeEmitter<'a> {
     segments: Option<std::borrow::Cow<'static, StripeSegmentProgram>>,
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     checks: Box<[(usize, u64, u64)]>,
+    /// Number of leading stripe groups read by the GPU C-fold prefix. When
+    /// `on_prefix_ready` is `Some`, each emitted group `< prefix_groups`
+    /// decrements `prefix_remaining` (`AcqRel`); the thread that brings it
+    /// to zero invokes `on_prefix_ready` if no fixed-input mismatch occurred.
+    prefix_groups: usize,
+    prefix_remaining: std::sync::atomic::AtomicUsize,
+    on_prefix_ready: Option<&'a (dyn Fn() + Sync)>,
 }
 
 impl<'a> AbStripeEmitter<'a> {
@@ -1200,6 +1207,38 @@ impl<'a> AbStripeEmitter<'a> {
             program,
             segments,
             checks: crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter().copied().collect(),
+            prefix_groups: 0,
+            prefix_remaining: std::sync::atomic::AtomicUsize::new(0),
+            on_prefix_ready: None,
+        }
+    }
+
+    /// Arm a one-shot callback invoked as soon as every group in
+    /// `[0..prefix_groups)` has been emitted with no fixed-input mismatch.
+    fn with_prefix_ready(
+        mut self,
+        prefix_groups: usize,
+        on_prefix_ready: &'a (dyn Fn() + Sync),
+    ) -> Self {
+        let prefix_groups = prefix_groups.min(self.n_groups);
+        if prefix_groups > 0 {
+            debug_assert!(prefix_groups.is_multiple_of(DEFERRED_STRIPE_GROUPS_PER_JOB));
+            self.prefix_groups = prefix_groups;
+            self.prefix_remaining = std::sync::atomic::AtomicUsize::new(prefix_groups);
+            self.on_prefix_ready = Some(on_prefix_ready);
+        }
+        self
+    }
+
+    #[inline]
+    fn mark_emitted(&self, group: usize) {
+        self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
+        if group < self.prefix_groups
+            && self.prefix_remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1
+            && !self.mismatch.load(std::sync::atomic::Ordering::Acquire)
+            && let Some(cb) = self.on_prefix_ready
+        {
+            cb();
         }
     }
 
@@ -1259,9 +1298,9 @@ impl<'a> AbStripeEmitter<'a> {
             let group_f128 = 8 * AB_STRIPE_WORDS / 2;
             fill_root_lincheck_stripe_group(&st.words, dst, 0, group_f128, AB_STRIPE_WORDS, self.rows);
             if self.fixed_inputs && !fixed_inputs_hold(&st.words, 0, group_f128, AB_STRIPE_WORDS) {
-                self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.mismatch.store(true, std::sync::atomic::Ordering::Release);
             }
-            self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
+            self.mark_emitted(group);
         });
     }
 
@@ -1312,7 +1351,7 @@ impl<'a> AbStripeEmitter<'a> {
                     None => emit_root_rows_ab_s256(a.cast(), b.cast(), dst.as_mut_ptr(), program),
                 }
                 if self.fixed_inputs && !fixed_inputs_hold_ab_resolved(a, b, &self.checks) {
-                    self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.mismatch.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
             true
@@ -1325,11 +1364,11 @@ impl<'a> AbStripeEmitter<'a> {
             unsafe {
                 fill_root_lincheck_stripe_group_ab(a, b, dst, AB_STRIPE_WORDS, self.rows);
                 if self.fixed_inputs && !fixed_inputs_hold_ab(a, b, AB_STRIPE_WORDS) {
-                    self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.mismatch.store(true, std::sync::atomic::Ordering::Release);
                 }
             }
         }
-        self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
+        self.mark_emitted(group);
     }
 
     /// After every unit was produced (the AB arm has joined its workers):
@@ -2825,6 +2864,60 @@ mod deferred_stripe_tests {
             assert_eq!(stripe, expected, "delay {delay_us} us");
         }
     }
+
+    #[test]
+    fn commit_tail_fill_gate_fires_once_in_either_order_and_under_race() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dummy = Commitment {
+            root: [7u8; 32],
+            params: PcsParams {
+                m: 32,
+                log_inv_rate: 1,
+                log_batch_size: 5,
+                profile: flock_core::pcs::ligerito::LigeritoProfile::default(),
+                merkle_hash: flock_core::merkle::HashKind::default(),
+            },
+        };
+        // Commit first, then prefix ready (plus duplicate prefix-ready).
+        {
+            let fires = AtomicUsize::new(0);
+            let gate = CommitTailFillGate::new(Box::new(|c: &Commitment| {
+                assert_eq!(c.root, [7u8; 32]);
+                fires.fetch_add(1, Ordering::SeqCst);
+            }));
+            gate.on_commit(&dummy);
+            assert_eq!(fires.load(Ordering::SeqCst), 0);
+            gate.on_prefix_ready();
+            assert_eq!(fires.load(Ordering::SeqCst), 1);
+            gate.on_prefix_ready();
+            assert_eq!(fires.load(Ordering::SeqCst), 1);
+        }
+        // Prefix ready first, then commit.
+        {
+            let fires = AtomicUsize::new(0);
+            let gate = CommitTailFillGate::new(Box::new(|c: &Commitment| {
+                assert_eq!(c.root, [7u8; 32]);
+                fires.fetch_add(1, Ordering::SeqCst);
+            }));
+            gate.on_prefix_ready();
+            assert_eq!(fires.load(Ordering::SeqCst), 0);
+            gate.on_commit(&dummy);
+            assert_eq!(fires.load(Ordering::SeqCst), 1);
+        }
+        // Concurrent race across many iterations: must always fire exactly once.
+        for _ in 0..256 {
+            let fires = AtomicUsize::new(0);
+            let gate = CommitTailFillGate::new(Box::new(|c: &Commitment| {
+                assert_eq!(c.root, [7u8; 32]);
+                fires.fetch_add(1, Ordering::SeqCst);
+            }));
+            std::thread::scope(|s| {
+                s.spawn(|| gate.on_commit(&dummy));
+                s.spawn(|| gate.on_prefix_ready());
+            });
+            assert_eq!(fires.load(Ordering::SeqCst), 1);
+        }
+    }
 }
 
 /// Build the witness commitment and the challenge-independent half of
@@ -2864,7 +2957,7 @@ where
             // The stripe fill lost the race to the graph; staging would
             // read torn bytes. Skip — the incumbent zerocheck-entry
             // submit runs.
-            if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+            if flock_core::zc_timing_env_on() {
                 eprintln!("[commit-tail-fill] skipped: stripe not ready");
             }
             return;
@@ -2878,6 +2971,98 @@ where
             unsafe { std::slice::from_raw_parts(stripe_ptr as *const u8, stripe_len) };
         flock_core::zerocheck::stage_commit_tail_fill(forked, r1cs, commitment, stripe, padding);
     }))
+}
+
+/// Race-free 2-event handshake that fires a commit-tail-fill hook the instant
+/// BOTH (1) the Merkle commitment is final AND (2) the GPU C-fold's stripe
+/// prefix `[0..prefix_groups)` has been written. Uses a single `AtomicU8`
+/// bitmask with `fetch_or(..., AcqRel)` so neither event can miss the other
+/// under ARM64 StoreLoad reordering, and whichever arrives second fires the
+/// hook exactly once.
+struct CommitTailFillGate<'a> {
+    state: std::sync::atomic::AtomicU8,
+    commitment: std::sync::OnceLock<Commitment>,
+    hook: std::sync::Mutex<Option<CommitTailFillHook<'a>>>,
+}
+
+impl<'a> CommitTailFillGate<'a> {
+    const COMMIT_DONE: u8 = 1;
+    const PREFIX_READY: u8 = 2;
+
+    fn new(hook: CommitTailFillHook<'a>) -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(0),
+            commitment: std::sync::OnceLock::new(),
+            hook: std::sync::Mutex::new(Some(hook)),
+        }
+    }
+
+    fn on_commit(&self, commitment: &Commitment) {
+        let _ = self.commitment.set(commitment.clone());
+        let prev = self
+            .state
+            .fetch_or(Self::COMMIT_DONE, std::sync::atomic::Ordering::AcqRel);
+        if prev == Self::PREFIX_READY {
+            self.fire("commit");
+        }
+    }
+
+    fn on_prefix_ready(&self) {
+        let prev = self
+            .state
+            .fetch_or(Self::PREFIX_READY, std::sync::atomic::Ordering::AcqRel);
+        if prev == Self::COMMIT_DONE {
+            self.fire("ab-prefix");
+        }
+    }
+
+    fn fire(&self, trigger: &'static str) {
+        let Some(hook) = self.hook.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let commitment = self
+            .commitment
+            .get()
+            .expect("commitment published before COMMIT_DONE");
+        if flock_core::zc_timing_env_on() {
+            eprintln!("[commit-tail-fill] firing on {trigger}");
+        }
+        hook(commitment);
+    }
+}
+
+/// Build the commit-tail-fill gate for `stripe_in_ab`: stages the GPU C-fold
+/// prefix as soon as both `commit` and the emitter's leading `prefix_groups`
+/// complete (whichever finishes second).
+fn make_commit_tail_fill_gate<'a, Ch: Challenger>(
+    challenger: &Ch,
+    r1cs: &'a BlockR1cs,
+    padding: &'a zerocheck::PaddingSpec,
+    stripe_ptr: usize,
+    stripe_len: usize,
+) -> Option<CommitTailFillGate<'a>>
+where
+    Ch: 'a,
+{
+    if !flock_core::gpu_commit::commit_tail_fill_enabled() || !ranked_lincheck_c_reuse_enabled(r1cs)
+    {
+        return None;
+    }
+    let forked = challenger.fork()?;
+    Some(CommitTailFillGate::new(Box::new(
+        move |commitment: &Commitment| {
+            // SAFETY: `CommitTailFillGate` fires only after `AcqRel`
+            // synchronization with `AbStripeEmitter::mark_emitted` (which
+            // acquired every emitter thread's `Release` on `prefix_remaining`)
+            // or `emitter.finish()` after the AB join. The GPU C-fold prefix
+            // reads only stripes `[0..prefix_groups)`, which are never written
+            // again until after `run_commit` joins (and any fixed-input
+            // mismatch fallback calls `abandon_staged_zc_fold` first).
+            let stripe: &[u8] =
+                unsafe { std::slice::from_raw_parts(stripe_ptr as *const u8, stripe_len) };
+            flock_core::zerocheck::stage_commit_tail_fill(forked, r1cs, commitment, stripe, padding);
+        },
+    )))
 }
 
 fn commit_with_round1_ab_precompute(
@@ -3046,7 +3231,7 @@ fn commit_with_round1_ab_precompute(
             flock_core::tmark::mark("ab arm end");
             flock_core::gpu_commit::note_ab_arm_running(false);
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
-            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            if flock_core::phase_timing_env_on() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
@@ -3160,7 +3345,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = flock_core::phase_timing_env_on();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
                       stripe_help: Option<&(dyn Fn() + Sync)>,
                       producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
@@ -3274,14 +3459,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             let stripe_ready = std::sync::atomic::AtomicBool::new(false);
             let stripe_ptr = stripe.as_ptr() as usize;
             let stripe_len = stripe.len();
-            let tail_fill_hook = make_commit_tail_fill_hook(
-                &*challenger,
-                r1cs,
-                &padding,
-                &stripe_ready,
-                stripe_ptr,
-                stripe_len,
-            );
             // One shared chunk queue for the stripe. The E-workers own it
             // (helper-only broadcast, as before); main-pool workers that
             // finish the AB precompute queue help drain what is left, so a
@@ -3328,7 +3505,26 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 && std::env::var_os("FLOCK_NO_STRIPE_IN_AB").is_none();
             let pre = if stripe_in_ab {
                 let base = ab_producer.expect("checked above");
-                let emitter = AbStripeEmitter::new(
+                let n_groups = stripe_len / (1usize << k_log);
+                let prefix_groups =
+                    flock_core::gpu_commit::zc_fold_gpu_prefix_stripes(m, k_log).min(n_groups);
+                let tail_gate = if prefix_groups > 0 {
+                    make_commit_tail_fill_gate(&*challenger, r1cs, &padding, stripe_ptr, stripe_len)
+                } else {
+                    None
+                };
+                let on_prefix_ready = || {
+                    if let Some(gate) = &tail_gate {
+                        gate.on_prefix_ready();
+                    }
+                };
+                let tail_fill_hook: Option<CommitTailFillHook<'_>> =
+                    tail_gate.as_ref().map(|gate| {
+                        Box::new(move |commitment: &Commitment| {
+                            gate.on_commit(commitment);
+                        }) as CommitTailFillHook<'_>
+                    });
+                let mut emitter = AbStripeEmitter::new(
                     flock_core::epool::SyncPtr(stripe_ptr as *mut u8),
                     stripe_len,
                     1usize << k_log,
@@ -3336,6 +3532,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     fixed_root_rows.is_some(),
                     &input_mismatch,
                 );
+                if tail_gate.is_some() {
+                    emitter = emitter.with_prefix_ready(prefix_groups, &on_prefix_ready);
+                }
                 // `primed`: the scratch pair has been filled before by this
                 // producer, which may then leave its per-block constants in
                 // place.  Either way the pair holds the unit's complete a and
@@ -3348,17 +3547,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     let t = std::time::Instant::now();
                     let missing = emitter.finish(&z_packed, &stripe_job_fn);
                     let mismatch = input_mismatch.load(std::sync::atomic::Ordering::Acquire);
-                    if mismatch {
-                        if let Some((n_jobs, job)) = &fallback_job {
-                            use rayon::prelude::*;
-                            (0..*n_jobs).into_par_iter().for_each(|j| job(j));
-                            let replaced = flock_core::lincheck::replace_root_stripe(
-                                stripe_ptr,
-                                stripe_len,
-                                crate::r1cs_hashes::blake3::root_stripe_descriptor(),
-                            );
-                            assert!(replaced, "root stripe registration vanished");
-                        }
+                    if !mismatch {
+                        // If any prefix group was missing and filled above,
+                        // release the gate now (no-op if prefix already fired).
+                        on_prefix_ready();
                     }
                     stripe_ready.store(true, std::sync::atomic::Ordering::Release);
                     if phase_timing {
@@ -3368,7 +3560,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                         );
                     }
                 };
-                run_commit(
+                let pre = run_commit(
                     tail_fill_hook,
                     None,
                     Some(zerocheck::univariate_skip_optimized::Round1AbProducer {
@@ -3376,8 +3568,34 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                         produce: &produce,
                     }),
                     Some(&finish),
-                )
+                );
+                // Fixed-input mismatch fallback (never taken on ranked inputs):
+                // run strictly after `run_commit` joins both arms, retiring any
+                // staged GPU prefix first so neither arm nor the GPU touches
+                // `stripe` while the 177-row fallback overwrites it.
+                if input_mismatch.load(std::sync::atomic::Ordering::Acquire) {
+                    flock_core::gpu_commit::abandon_staged_zc_fold();
+                    if let Some((n_jobs, job)) = &fallback_job {
+                        use rayon::prelude::*;
+                        (0..*n_jobs).into_par_iter().for_each(|j| job(j));
+                        let replaced = flock_core::lincheck::replace_root_stripe(
+                            stripe_ptr,
+                            stripe_len,
+                            crate::r1cs_hashes::blake3::root_stripe_descriptor(),
+                        );
+                        assert!(replaced, "root stripe registration vanished");
+                    }
+                }
+                pre
             } else {
+                let tail_fill_hook = make_commit_tail_fill_hook(
+                    &*challenger,
+                    r1cs,
+                    &padding,
+                    &stripe_ready,
+                    stripe_ptr,
+                    stripe_len,
+                );
                 std::thread::scope(|scope| {
                     let stripe_ready = &stripe_ready;
                     let stripe_queue = &stripe_queue;

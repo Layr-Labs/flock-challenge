@@ -461,10 +461,11 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<
 /// challenge vector, and abandons it otherwise (its output is then never
 /// read, so the fill is byte-inert by construction).
 ///
-/// Must be called on the thread that will later run zerocheck (the staged
-/// job pins the fold-state lock to this thread). The caller guarantees
-/// `c_lincheck` is fully written (release/acquire on the stripe-complete
-/// flag) and stable for the rest of the prove.
+/// May be called from either the commit arm or an AB worker once both the
+/// commitment is final and the GPU fold's stripe prefix `[0..stripe_hi)` is
+/// completely written (synchronized via release/acquire) and stable until
+/// either adoption or explicit abandonment. The staged job is parked with the
+/// fold-state lock released so zerocheck adopts it later on its own thread.
 pub fn stage_commit_tail_fill<C: Challenger>(
     forked: C,
     r1cs: &crate::r1cs::BlockR1cs,
@@ -504,7 +505,7 @@ pub fn stage_commit_tail_fill<C: Challenger>(
             padding.useful_bits_per_block,
             &r,
         );
-        if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+        if crate::zc_timing_env_on() {
             eprintln!(
                 "[commit-tail-fill] stage at graph completion: staged={staged} {:.2} ms",
                 t_stage.elapsed().as_secs_f64() * 1e3
@@ -591,7 +592,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    let zc_timing = crate::zc_timing_env_on();
     let cpu_r1 = crate::pcs::commit::commit_cpu_ms();
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");

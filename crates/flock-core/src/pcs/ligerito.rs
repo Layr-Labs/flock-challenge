@@ -8193,8 +8193,19 @@ fn direct_fold8_rest_claims_round0(
     {
         for (claim, table) in init_claims.iter().zip(init_tables.iter()) {
             super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
-            for (slot, out) in b_out.iter_mut().enumerate() {
-                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
+            let mut slot = 0usize;
+            while slot + 1 < b_out.len() {
+                let (d0, d1) = super::ring_switch::fold_two_slots(
+                    claim.eq_lo[slot],
+                    claim.eq_lo[slot + 1],
+                    scratch,
+                );
+                b_out[slot] += d0;
+                b_out[slot + 1] += d1;
+                slot += 2;
+            }
+            if slot < b_out.len() {
+                b_out[slot] += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
             }
         }
         super::ring_switch::compose_fold_byte_table_into(
@@ -8374,13 +8385,16 @@ fn materialize_direct_fold8(
                     f_out[slot + 3] = folded_f[3];
                 }
 
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
-                let direct2 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
-                let direct3 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
+                let (direct0, direct1) = super::ring_switch::fold_two_slots(
+                    first_claim.eq_lo[slot],
+                    first_claim.eq_lo[slot + 1],
+                    scratch,
+                );
+                let (direct2, direct3) = super::ring_switch::fold_two_slots(
+                    first_claim.eq_lo[slot + 2],
+                    first_claim.eq_lo[slot + 3],
+                    scratch,
+                );
                 if has_ordinary {
                     let folded_b = crate::field::f128_slice::fold_banked_slots4::<64>(
                         &fold_weight,
@@ -8506,13 +8520,16 @@ fn materialize_direct_fold8(
                     odd_slot_live,
                     odd_slot_lo_tail,
                 );
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
-                let direct2 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
-                let direct3 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
+                let (direct0, direct1) = super::ring_switch::fold_two_slots(
+                    first_claim.eq_lo[slot],
+                    first_claim.eq_lo[slot + 1],
+                    scratch,
+                );
+                let (direct2, direct3) = super::ring_switch::fold_two_slots(
+                    first_claim.eq_lo[slot + 2],
+                    first_claim.eq_lo[slot + 3],
+                    scratch,
+                );
                 b_out[slot] = direct0;
                 b_out[slot + 1] = direct1;
                 b_out[slot + 2] = direct2;
@@ -8563,8 +8580,19 @@ fn materialize_direct_fold8(
             first_table,
             scratch,
         );
-        for (slot, out) in b_out.iter_mut().enumerate() {
-            *out = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
+        let mut slot = 0usize;
+        while slot + 1 < b_out.len() {
+            let (d0, d1) = super::ring_switch::fold_two_slots(
+                first_claim.eq_lo[slot],
+                first_claim.eq_lo[slot + 1],
+                scratch,
+            );
+            b_out[slot] = d0;
+            b_out[slot + 1] = d1;
+            slot += 2;
+        }
+        if slot < b_out.len() {
+            b_out[slot] = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
         }
         direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
     };

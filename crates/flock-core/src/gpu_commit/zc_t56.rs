@@ -45,37 +45,53 @@ pub(crate) const SLOT: [u8; 32] = [
     14, 14, 14, 14, 15, 15, 15, 15,
 ];
 
-/// Per-launch constants: the `rho_a` then the `rho_b` nibble table
-/// (bank `k` for byte `k` of the 16: `[32 k + n] = rho * (n << 8k)` and
-/// `[32 k + 16 + n] = rho * ((n << 4) << 8k)`, the layout the kernel's
-/// `mul_rho16` reads), then `eq_odd[y] = eq_lo[4 y + 3]`. Each entry is the
-/// XOR of the `rho * x^p` of its set bits `p`, and `rho * x^p` is `rho`
-/// times `x` applied `p` times, so every entry is the exact product.
+/// Fill the first `banks` byte-bank nibble tables of `rho` into `out[..32 * banks]`
+/// (`[32 k + n] = rho * (n << 8k)` and `[32 k + 16 + n] = rho * ((n << 4) << 8k)`).
+/// Each entry is the exact GF(2^128) product via repeated `mul_by_x` and XOR.
+#[inline]
+pub(crate) fn nib_banks_into(out: &mut [F128], rho: F128, banks: usize) {
+    assert!(out.len() >= 32 * banks);
+    let mut cur = rho;
+    let mut i = 0;
+    for _ in 0..banks {
+        for _ in 0..2 {
+            let p0 = cur;
+            let p1 = crate::field::mul_by_x(p0);
+            let p2 = crate::field::mul_by_x(p1);
+            let p3 = crate::field::mul_by_x(p2);
+            cur = crate::field::mul_by_x(p3);
+            let p01 = p0 + p1;
+            let p32 = p3 + p2;
+            out[i] = F128::ZERO;
+            out[i + 1] = p0;
+            out[i + 2] = p1;
+            out[i + 3] = p01;
+            out[i + 4] = p2;
+            out[i + 5] = p2 + p0;
+            out[i + 6] = p2 + p1;
+            out[i + 7] = p2 + p01;
+            out[i + 8] = p3;
+            out[i + 9] = p3 + p0;
+            out[i + 10] = p3 + p1;
+            out[i + 11] = p3 + p01;
+            out[i + 12] = p32;
+            out[i + 13] = p32 + p0;
+            out[i + 14] = p32 + p1;
+            out[i + 15] = p32 + p01;
+            i += 16;
+        }
+    }
+}
+
+/// Per-launch constants for `zc_t56_fold`: only the banks actually read by the
+/// kernel — `rho_a` banks 0..4 (`out[0..128]` for `mul_rho32`), `rho_b` banks
+/// 0..2 (`out[512..576]` for `mul_rho16b`), and `eq_odd[y] = eq_lo[4 y + 3]`
+/// (`out[1024..1024 + GROUPS]`).
 pub(crate) fn consts_into(out: &mut [F128], rho_a: F128, rho_b: F128, eq_lo: &[F128]) {
     assert_eq!(out.len(), CONSTS);
     assert_eq!(eq_lo.len(), LO);
-    let mut i = 0;
-    for rho in [rho_a, rho_b] {
-        let mut pw = [F128::ZERO; 128];
-        pw[0] = rho;
-        for p in 1..128 {
-            pw[p] = crate::field::mul_by_x(pw[p - 1]);
-        }
-        for bank in 0..16 {
-            for half in 0..2 {
-                for n in 0..16usize {
-                    let mut v = F128::ZERO;
-                    for b in 0..4 {
-                        if (n >> b) & 1 == 1 {
-                            v += pw[8 * bank + 4 * half + b];
-                        }
-                    }
-                    out[i] = v;
-                    i += 1;
-                }
-            }
-        }
-    }
+    nib_banks_into(&mut out[0..128], rho_a, 4);
+    nib_banks_into(&mut out[512..576], rho_b, 2);
     for y in 0..GROUPS {
         out[1024 + y] = eq_lo[4 * y + 3];
     }
@@ -145,15 +161,45 @@ pub(crate) mod emu {
         F128 { lo: p.r0 ^ t0, hi: p.r1 ^ t1 }
     }
 
-    fn mul_rho16(x: F128, nib: &[F128]) -> F128 {
+    fn gf_shl16(a: F128) -> F128 {
+        let h = a.hi >> 48;
+        let red = (h << 7) ^ (h << 2) ^ (h << 1) ^ h;
+        F128 { lo: (a.lo << 16) ^ red, hi: (a.hi << 16) | (a.lo >> 48) }
+    }
+
+    fn gf_shl32(a: F128) -> F128 {
+        let h = a.hi >> 32;
+        let red = h ^ (h << 1) ^ (h << 2) ^ (h << 7);
+        F128 { lo: (a.lo << 32) ^ red, hi: (a.hi << 32) | (a.lo >> 32) }
+    }
+
+    fn mul_rho32(x: F128, nib4: &[F128]) -> F128 {
+        let words = [x.lo as u32, (x.lo >> 32) as u32, x.hi as u32, (x.hi >> 32) as u32];
         let mut acc = Z4;
-        let w = [x.lo as u32, (x.lo >> 32) as u32, x.hi as u32, (x.hi >> 32) as u32];
-        for word in 0..4 {
-            for j in 0..4 {
-                let b = ((w[word] >> (8 * j)) & 0xff) as usize;
-                let bank = word * 4 + j;
-                acc = x4(acc, x4(nib[bank * 32 + (b & 15)], nib[bank * 32 + 16 + (b >> 4)]));
+        for &w in words.iter().rev() {
+            acc = gf_shl32(acc);
+            for b in 0..4 {
+                let byte = ((w >> (8 * b)) & 0xff) as usize;
+                acc = x4(acc, x4(nib4[b * 32 + (byte & 15)], nib4[b * 32 + 16 + (byte >> 4)]));
             }
+        }
+        acc
+    }
+
+    fn mul_rho16b(x: F128, nib2: &[F128]) -> F128 {
+        let words = [x.lo as u32, (x.lo >> 32) as u32, x.hi as u32, (x.hi >> 32) as u32];
+        let mut acc = Z4;
+        for &w in words.iter().rev() {
+            let b3 = ((w >> 24) & 0xff) as usize;
+            let b2 = ((w >> 16) & 0xff) as usize;
+            acc = gf_shl16(acc);
+            acc = x4(acc, x4(nib2[b2 & 15], nib2[16 + (b2 >> 4)]));
+            acc = x4(acc, x4(nib2[32 + (b3 & 15)], nib2[48 + (b3 >> 4)]));
+            let b1 = ((w >> 8) & 0xff) as usize;
+            let b0 = (w & 0xff) as usize;
+            acc = gf_shl16(acc);
+            acc = x4(acc, x4(nib2[b0 & 15], nib2[16 + (b0 >> 4)]));
+            acc = x4(acc, x4(nib2[32 + (b1 & 15)], nib2[48 + (b1 >> 4)]));
         }
         acc
     }
@@ -222,12 +268,12 @@ pub(crate) mod emu {
                     let lid = 32 * sg + lane;
                     let o = (quarter << 11) + (j << 8) + lid;
                     let ([a0, a1, a2, a3], [b0, b1, b2, b3]) = load(ai, bi, o);
-                    let fa0 = x4(a0, mul_rho16(x4(a0, a1), &nib[..512]));
-                    let fa1 = x4(a2, mul_rho16(x4(a2, a3), &nib[..512]));
-                    let fa = x4(fa0, mul_rho16(x4(fa0, fa1), &nib[512..]));
-                    let fb0 = x4(b0, mul_rho16(x4(b0, b1), &nib[..512]));
-                    let fb1 = x4(b2, mul_rho16(x4(b2, b3), &nib[..512]));
-                    let fbv = x4(fb0, mul_rho16(x4(fb0, fb1), &nib[512..]));
+                    let fa0 = x4(a0, mul_rho32(x4(a0, a1), &nib[..128]));
+                    let fa1 = x4(a2, mul_rho32(x4(a2, a3), &nib[..128]));
+                    let fa = x4(fa0, mul_rho16b(x4(fa0, fa1), &nib[512..576]));
+                    let fb0 = x4(b0, mul_rho32(x4(b0, b1), &nib[..128]));
+                    let fb1 = x4(b2, mul_rho32(x4(b2, b3), &nib[..128]));
+                    let fbv = x4(fb0, mul_rho16b(x4(fb0, fb1), &nib[512..576]));
                     ao[o] = fa;
                     bo[o] = fbv;
                     wa[lane] = gf_reduce(clmul128(eq_odd[o >> 3], fa));

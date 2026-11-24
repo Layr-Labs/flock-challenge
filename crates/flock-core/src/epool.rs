@@ -1061,6 +1061,45 @@ where
     }
 }
 
+/// [`run_hetero_chunks_then`] plus one caller-thread tail job: each main worker
+/// runs `after` once `0..n_chunks` are exhausted (e.g. stealing GPU chunks), and
+/// the calling thread runs `tail` once its own `after` finishes.
+pub(crate) fn run_hetero_chunks_then_caller_tail<F, A, T, R>(
+    n_chunks: usize,
+    f: F,
+    after: A,
+    tail: T,
+) -> R
+where
+    F: Fn(usize) + Sync,
+    A: Fn() + Sync,
+    T: FnOnce() -> R,
+{
+    struct CallerOnly<X>(std::cell::UnsafeCell<Option<X>>);
+    // SAFETY: only touched on the thread whose id is `caller`.
+    unsafe impl<X> Sync for CallerOnly<X> {}
+    let caller = std::thread::current().id();
+    let tail_cell = CallerOnly(std::cell::UnsafeCell::new(Some(tail)));
+    let out_cell: CallerOnly<R> = CallerOnly(std::cell::UnsafeCell::new(None));
+    let (tail_ref, out_ref) = (&tail_cell, &out_cell);
+    let combined_after = || {
+        after();
+        if std::thread::current().id() != caller {
+            return;
+        }
+        let t = unsafe { (*tail_ref.0.get()).take() };
+        if let Some(t) = t {
+            let r = t();
+            unsafe { *out_ref.0.get() = Some(r) };
+        }
+    };
+    run_chunks_with_helper_arm_after(n_chunks, &f, epool(), detached_enabled(), &combined_after);
+    match tail_cell.0.into_inner() {
+        Some(t) => t(),
+        None => out_cell.0.into_inner().expect("caller tail ran"),
+    }
+}
+
 /// Try to process chunks exclusively on the efficiency-core helper pool.
 ///
 /// Unlike [`run_hetero_chunks`], the calling thread and the main Rayon pool do

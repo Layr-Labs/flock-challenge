@@ -4081,7 +4081,22 @@ fn fold2_compact_and_round45_into_packed_b(
             crate::field::f128_slice::scale_slice_into(&mut *partials_base.ptr().add(x_hi), &outv, eq_h);
         }
     };
-    crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
+    // Pre-park the next 5+6 GPU command buffer during the K pass's caller tail
+    // (before `zc_k_wait` joins K), so Metal encoding and commit happen
+    // completely off the 5+6 critical path (`FLOCK_NO_ZC_T56_PARK=1` disables).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let park_t56 = gpu_job.is_some() && !gpu_job.as_ref().is_some_and(crate::gpu_commit::ZcKJob::calibration);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3")))]
+    let park_t56 = false;
+    crate::epool::run_hetero_chunks_caller_tail(
+        hi_size - cpu_base,
+        |i| chunk_body(cpu_base + i),
+        || {
+            if park_t56 {
+                crate::gpu_commit::zc_t56_park();
+            }
+        },
+    );
 
     // Join the GPU prefix (it was submitted first and is normally done).
     #[allow(unused_mut)]
@@ -4130,6 +4145,10 @@ fn fold2_compact_and_round45_into_packed_b(
                 crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
             }
         }
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    if park_t56 && (gpu_prefix.is_none() || b_failed.load(std::sync::atomic::Ordering::Relaxed)) {
+        crate::gpu_commit::zc_t56_retire();
     }
     if b_failed.into_inner() {
         return None;
@@ -5310,89 +5329,78 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                     partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
                 }
             };
-            // The record's launch and queue: the GPU's share first, the CPU
-            // folds the chunks after it in ascending order.
+            // Fire the pre-parked (or direct fallback) multi-encoder GPU job, then
+            // run one race-free two-ended dynamic claim queue (mirroring
+            // `tri0_gpu_queue`): CPU claims from `hi_size - 1` down (lowering `cut`
+            // once inside the offer), and claims GPU chunks from `0` up only as
+            // each encoder signals completion. Zero CPU wait; automatic M1/M3
+            // load balancing up to the full K-prefix cap (`200` chunks).
             let job = crate::gpu_commit::launch_zc_t56_loop(pa, pb, share, rhos[0], rhos[1], eq_lo);
-            let cpu_base = job.as_ref().map_or(0, |j| j.chunks());
-            crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| fold(cpu_base + i));
             if let Some(job) = job {
-                let mut lo = cpu_base;
-                let mut gpu_done = job.done();
-                if !gpu_done {
-                    // The GPU is late: steal from the top of its share.
-                    let claims = std::sync::Mutex::new((cpu_base, false));
-                    crate::epool::run_hetero_chunks(cpu_base, |_| {
-                        let x_hi = {
-                            let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
-                            if g.1 || g.0 == 0 {
-                                return;
+                let hold = t56_loop_hold().min(job.offer());
+                // `(lo, hi, claimed_from_gpu, ready_end)`
+                let claims = std::sync::Mutex::new((0usize, hi_size, 0usize, 0usize));
+                crate::epool::run_hetero_chunks(hi_size, |_| {
+                    let (x_hi, from_gpu) = {
+                        let mut g = crate::lock_spin(&claims).unwrap_or_else(|e| e.into_inner());
+                        assert!(g.0 < g.1, "5+6 claim queue overrun");
+                        if g.0 < g.3 {
+                            let c = g.0;
+                            g.0 += 1;
+                            g.2 += 1;
+                            (c, true)
+                        } else if job.chunk_ready(g.0) {
+                            let c = g.0;
+                            g.3 = job.ready_end(c);
+                            g.0 += 1;
+                            g.2 += 1;
+                            (c, true)
+                        } else if g.1 <= hold {
+                            // Test builds only (`t56_loop_hold == 0` otherwise):
+                            // wait for the GPU's chunk instead of stealing it.
+                            let c = g.0;
+                            g.0 += 1;
+                            if job.wait_chunk(c) {
+                                g.3 = job.ready_end(c);
+                                g.2 += 1;
+                                (c, true)
+                            } else {
+                                (c, false)
                             }
-                            if job.done() {
-                                g.1 = true;
-                                return;
-                            }
-                            // Test builds only (see `t56_loop_hold`, the
-                            // constant 0 otherwise): do not steal below
-                            // chunk `n`; wait for the GPU instead, so a slow
-                            // GPU still keeps `min(n, share)` chunks and
-                            // that path can be checked.
-                            if g.0 <= t56_loop_hold() {
-                                while !job.done() {
-                                    std::hint::spin_loop();
-                                }
-                                g.1 = true;
-                                return;
-                            }
-                            job.set_cut(g.0 - 1);
-                            g.0 -= 1;
-                            g.0
-                        };
-                        fold(x_hi);
-                    });
-                    (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
-                    // Without the completion seen, the CPU folded every
-                    // chunk and nothing of the GPU's is read.
-                    assert!(gpu_done || lo == 0, "5+6 steal ended early");
-                }
-                // A buffer that signalled and still reports an error is not
-                // trusted (the record's join checks the status too): the CPU
-                // folds what it had left to the GPU; `finish` turns the arm
-                // off.
-                let gpu_ok = gpu_done && !job.failed();
-                if gpu_done && !gpu_ok {
-                    crate::epool::run_hetero_chunks(lo, &fold);
-                }
-                let taken = if gpu_ok { lo } else { 0 };
-                let t_rows = timing.then(std::time::Instant::now);
-                if ww && taken >= 64 {
-                    // Tri partials weighted on their producers: the GPU's
-                    // rows (each finished from its banks, then weighted) by
-                    // the pool, eight rows per claim, instead of the caller.
-                    let rows = |g: usize| {
-                        for c in 8 * g..(8 * g + 8).min(taken) {
-                            // SAFETY: row `c` belongs to claim `g` alone; the
-                            // run's join publishes it.
-                            unsafe {
-                                partials_base
-                                    .ptr()
-                                    .add(c)
-                                    .write(std::mem::MaybeUninit::new(tri_weigh(eq_hi[c], job.part(c))));
-                            }
+                        } else {
+                            g.1 -= 1;
+                            job.set_cut(g.1);
+                            (g.1, false)
                         }
                     };
-                    crate::epool::run_hetero_chunks_then(taken.div_ceil(8), &rows, &|| {});
-                } else {
-                    for c in 0..taken {
-                        let part = job.part(c);
-                        partials[c].write(if ww { tri_weigh(eq_hi[c], part) } else { part });
+                    if from_gpu {
+                        let part = job.part(x_hi);
+                        let outv = if ww { tri_weigh(eq_hi[x_hi], part) } else { part };
+                        // SAFETY: exclusive owner of row `x_hi` (claimed above);
+                        // the queue join publishes writes before `tri_combine`.
+                        unsafe {
+                            partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
+                        }
+                    } else {
+                        fold(x_hi);
                     }
+                });
+                let (g0, _, claimed, _) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+                // A buffer that reports an error (or a timed-out test wait) is not
+                // trusted: recompute the GPU-claimed prefix on the CPU; `finish`
+                // disables the arm for the rest of the process.
+                let gpu_ok = claimed == g0 && !job.failed();
+                if !gpu_ok && g0 > 0 {
+                    crate::epool::run_hetero_chunks(g0, &fold);
                 }
-                rows_us = t_rows.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1e6);
+                let taken = if gpu_ok { claimed } else { 0 };
                 if taken > 0 {
                     let (a, b) = job.outputs();
                     gpu_prefix = Some(KGpuPrefix { a, b, len_a: taken * chunk_out, len_b: taken * chunk_out });
                 }
                 job.finish(taken, hi_size);
+            } else {
+                crate::epool::run_hetero_chunks(hi_size, &fold);
             }
             return {
                 // SAFETY: the joined CPU suffix/steals and the copied GPU

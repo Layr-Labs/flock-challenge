@@ -688,37 +688,119 @@ unsafe fn fold_banked_slots4_schoolbook<const BANKS: usize>(
 }
 
 /// One whole 16-byte load of an input element that the optimizer may not
-/// narrow or split. With an ordinary load the compiler serves the
-/// matching-lane PMULL of [`tri_acc_two_banks`] from an 8-byte load of the
-/// low half and the PMULL2 from a second, broadcasting 8-byte load of the
-/// high half (`ld1r`, which also needs its own address instruction): two
-/// loads, one address add and one broadcast per element. A volatile load is
-/// kept as written, so each element is one `ldr q` feeding PMULL (low lanes)
-/// and PMULL2 (high lanes) directly.
+/// narrow or split, without the scheduling barrier of `ptr::read_volatile`.
 #[inline(always)]
 unsafe fn load_whole(p: *const F128) -> uint64x2_t {
+    let out: uint64x2_t;
     // SAFETY (caller): `p` is valid for a 16-byte read; `F128` is
     // `repr(C, align(16))`, the alignment of `uint64x2_t`.
-    unsafe { core::ptr::read_volatile(p.cast::<uint64x2_t>()) }
+    unsafe {
+        core::arch::asm!(
+            "ldr {out:q}, [{p}]",
+            p = in(reg) p,
+            out = lateout(vreg) out,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+    out
 }
 
-/// [`fold_banked_slots4`] for an even bank count with whole-element loads
-/// ([`load_whole`]), writing the four folded slots to `out[0..4]`.
+/// Two contiguous whole 16-byte loads via opaque `ldp q, q` (no volatile
+/// scheduling barrier, one decode slot for both banks).
+#[inline(always)]
+unsafe fn load_pair_whole(p: *const F128) -> (uint64x2_t, uint64x2_t) {
+    let x0: uint64x2_t;
+    let x1: uint64x2_t;
+    // SAFETY (caller): `p` is valid for a contiguous 32-byte read of two `F128`s.
+    unsafe {
+        core::arch::asm!(
+            "ldp {x0:q}, {x1:q}, [{p}]",
+            p = in(reg) p,
+            x0 = lateout(vreg) x0,
+            x1 = lateout(vreg) x1,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+    (x0, x1)
+}
+
+/// `acc ^ (a.lo * b.lo)` as one macro-fused `pmull` + `eor` SIMD issue slot.
+#[inline(always)]
+unsafe fn fused_pmull_lo_acc(acc: uint64x2_t, a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    let out: uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "pmull {o:v}.1q, {a:v}.1d, {b:v}.1d",
+            "eor {o:v}.16b, {o:v}.16b, {c:v}.16b",
+            a = in(vreg) a,
+            b = in(vreg) b,
+            c = in(vreg) acc,
+            o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// `acc ^= (a.lo * b.lo) ^ (a.hi * b.hi)` as two macro-fused `pmull/pmull2 + eor`
+/// SIMD issue slots.
+#[inline(always)]
+unsafe fn fused_pmull_pair_acc(acc: &mut uint64x2_t, a: uint64x2_t, b: uint64x2_t) {
+    unsafe {
+        core::arch::asm!(
+            "pmull {t:v}.1q, {a:v}.1d, {b:v}.1d",
+            "eor {t:v}.16b, {t:v}.16b, {acc:v}.16b",
+            "pmull2 {acc:v}.1q, {a:v}.2d, {b:v}.2d",
+            "eor {acc:v}.16b, {acc:v}.16b, {t:v}.16b",
+            a = in(vreg) a,
+            b = in(vreg) b,
+            acc = inout(vreg) *acc,
+            t = out(vreg) _,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Two-bank Karatsuba accumulate into raw `(ll, hh, mm)` accumulators using
+/// hoisted `(w_lo, w_hi, w_mid)` = `([w0.lo, w1.lo], [w0.hi, w1.hi],
+/// [w0.lo^w0.hi, w1.lo^w1.hi])`: 6 fused `pmull/pmull2+eor` pairs and 3 prep
+/// ops (9 SIMD issue slots, 6 PMULLs vs 12 slots / 8 PMULLs for schoolbook).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn kara_acc_two_banks(
+    ll: &mut uint64x2_t,
+    hh: &mut uint64x2_t,
+    mm: &mut uint64x2_t,
+    x0: uint64x2_t,
+    x1: uint64x2_t,
+    w_lo: uint64x2_t,
+    w_hi: uint64x2_t,
+    w_mid: uint64x2_t,
+) {
+    unsafe {
+        let x_lo = vuzp1q_u64(x0, x1);
+        let x_hi = vuzp2q_u64(x0, x1);
+        let x_mid = veorq_u64(x_lo, x_hi);
+        fused_pmull_pair_acc(ll, x_lo, w_lo);
+        fused_pmull_pair_acc(hh, x_hi, w_hi);
+        fused_pmull_pair_acc(mm, x_mid, w_mid);
+    }
+}
+
+/// [`fold_banked_slots4`] for an even bank count with opaque whole-element
+/// loads and fused 2-bank Karatsuba accumulation, writing the four folded
+/// slots to `out[0..4]`.
 ///
-/// `odd_live` is the number of leading banks that can be nonzero in the
-/// second and fourth slot (`BANKS` when nothing is known). Banks at and above
-/// it, rounded up to a bank pair, are neither loaded nor multiplied for those
-/// two slots: the caller promises they are zero, and a zero input adds
-/// nothing to any of the three product sums.
+/// `odd_live` is the caller's promise about the second and fourth slot:
+/// banks at and above it, rounded up to a bank pair, are neither loaded nor
+/// multiplied for those two slots.
 ///
 /// `odd_lo_tail` (used only with an odd `odd_live < BANKS`) adds the promise
-/// that bank `odd_live - 1` of those two slots has a zero high limb. Its
-/// pair partner is then zero too, so of that pair's eight limb products
-/// only `x.lo * w.lo` and `x.lo * w.hi` can be nonzero: just those two run.
+/// that bank `odd_live - 1` of those two slots has a zero high limb: only
+/// `ll ^= x.lo * w.lo` and `mm ^= x.lo * (w.lo ^ w.hi)` run (reconstructing
+/// `cross = mm ^ ll ^ hh` yields `x.lo * w.hi`).
 ///
-/// Same products (less the promised-zero ones), same accumulators and the
-/// same reduction as [`fold_banked_slots4_schoolbook`]: the four outputs are
-/// bit-identical whenever the promise holds.
+/// Bit-identical to [`fold_banked_slots4_schoolbook`] whenever the promise holds.
 ///
 /// # Safety
 /// Requires the `aes` target feature (PMULL). `BANKS` must be even, `input`
@@ -738,8 +820,8 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
         debug_assert!(out.len() >= 4);
         let zero = vdupq_n_u64(0);
         let mut ll = [zero; 4];
-        let mut cross = [zero; 4];
         let mut hh = [zero; 4];
+        let mut mm = [zero; 4];
 
         let w = weight.as_ptr();
         let x = input.as_ptr();
@@ -753,66 +835,65 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
         };
         let mut bank = 0usize;
         while bank < split {
-            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
-            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
-            let w0_sw = swap_halves(w0);
-            let w1_sw = swap_halves(w1);
+            let (w0, w1) = load_pair_whole(w.add(bank));
+            let w_lo = vuzp1q_u64(w0, w1);
+            let w_hi = vuzp2q_u64(w0, w1);
+            let w_mid = veorq_u64(w_lo, w_hi);
             for slot in 0..4 {
-                let row = x.add(slot * BANKS + bank);
-                let x0 = load_whole(row);
-                let x1 = load_whole(row.add(1));
-                tri_acc_two_banks(
+                let (x0, x1) = load_pair_whole(x.add(slot * BANKS + bank));
+                kara_acc_two_banks(
                     &mut ll[slot],
-                    &mut cross[slot],
                     &mut hh[slot],
+                    &mut mm[slot],
                     x0,
-                    w0,
-                    w0_sw,
                     x1,
-                    w1,
-                    w1_sw,
+                    w_lo,
+                    w_hi,
+                    w_mid,
                 );
             }
             bank += 2;
         }
         // Banks whose second- and fourth-slot inputs are promised zero.
         while bank < BANKS {
-            let w0 = vld1q_u64(w.add(bank).cast::<u64>());
-            let w1 = vld1q_u64(w.add(bank + 1).cast::<u64>());
-            let w0_sw = swap_halves(w0);
-            let w1_sw = swap_halves(w1);
+            let (w0, w1) = load_pair_whole(w.add(bank));
+            let w_lo = vuzp1q_u64(w0, w1);
+            let w_hi = vuzp2q_u64(w0, w1);
+            let w_mid = veorq_u64(w_lo, w_hi);
             for slot in [0usize, 2] {
-                let row = x.add(slot * BANKS + bank);
-                let x0 = load_whole(row);
-                let x1 = load_whole(row.add(1));
-                tri_acc_two_banks(
+                let (x0, x1) = load_pair_whole(x.add(slot * BANKS + bank));
+                kara_acc_two_banks(
                     &mut ll[slot],
-                    &mut cross[slot],
                     &mut hh[slot],
+                    &mut mm[slot],
                     x0,
-                    w0,
-                    w0_sw,
                     x1,
-                    w1,
-                    w1_sw,
+                    w_lo,
+                    w_hi,
+                    w_mid,
                 );
             }
             if lo_tail {
-                // Bank `bank` of the second and fourth slot: low limb only,
-                // and bank `bank + 1` is zero.
+                // Bank `bank` of the second and fourth slot: low limb only
+                // (`x0.hi == 0`), and bank `bank + 1` is zero.
+                // Accumulate `ll ^= x0.lo * w0.lo` and `mm ^= x0.lo * (w0.lo ^ w0.hi)`
+                // so `cross = mm ^ ll ^ hh` receives `x0.lo * w0.hi`.
                 for slot in [1usize, 3] {
-                    let xl = vgetq_lane_u64::<0>(load_whole(x.add(slot * BANKS + bank)));
-                    ll[slot] = veorq_u64(ll[slot], pmull(xl, vgetq_lane_u64::<0>(w0)));
-                    cross[slot] = veorq_u64(cross[slot], pmull(xl, vgetq_lane_u64::<0>(w0_sw)));
+                    let x0 = load_whole(x.add(slot * BANKS + bank));
+                    ll[slot] = fused_pmull_lo_acc(ll[slot], x0, w_lo);
+                    mm[slot] = fused_pmull_lo_acc(mm[slot], x0, w_mid);
                 }
                 lo_tail = false;
             }
             bank += 2;
         }
 
-        let wide = |slot: usize| WideNeon {
-            lo: veorq_u64(ll[slot], vextq_u64::<1>(zero, cross[slot])),
-            hi: veorq_u64(hh[slot], vextq_u64::<1>(cross[slot], zero)),
+        let wide = |slot: usize| {
+            let cross = xor3_u64(mm[slot], ll[slot], hh[slot]);
+            WideNeon {
+                lo: veorq_u64(ll[slot], vextq_u64::<1>(zero, cross)),
+                hi: veorq_u64(hh[slot], vextq_u64::<1>(cross, zero)),
+            }
         };
         let low = reduce_wide_pair(wide(0), wide(1));
         let high = reduce_wide_pair(wide(2), wide(3));

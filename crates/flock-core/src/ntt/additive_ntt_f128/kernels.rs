@@ -385,6 +385,112 @@ pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
     false
 }
 
+/// Deep even-suffix radix-8 block kernel with hoisted `three_coeffs`, `ABSORB`
+/// dispatch, zero-root specialization, and odd-row tail trimming.
+#[inline]
+pub(super) unsafe fn butterfly_fused_3layer_deep_rows_odd_tail(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    unsafe {
+        if vector_resident_rows() {
+            aarch64::butterfly_fused_3layer_deep_rows_odd_tail(
+                ptr, eighth, num_ntts, odd_tail, twiddles, zero_root,
+            );
+            return true;
+        }
+    }
+    let _ = (ptr, eighth, num_ntts, odd_tail, twiddles, zero_root);
+    false
+}
+
+/// Ranked top-tiled pass 1 with hoisted `three_coeffs` across `a in 0..8, r in r0..r0+rows`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn try_butterfly_fused_3layer_top_tile_pass1(
+    block_base: *mut F128,
+    eighth4: usize,
+    eighth7: usize,
+    num_ntts: usize,
+    odd_lanes: usize,
+    r0: usize,
+    rows: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+    prefetch: bool,
+    next_tile_ptr: *const F128,
+    use_neon: bool,
+) -> bool {
+    if use_neon {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        unsafe {
+            aarch64::butterfly_fused_3layer_top_tile_pass1(
+                block_base,
+                eighth4,
+                eighth7,
+                num_ntts,
+                odd_lanes,
+                r0,
+                rows,
+                twiddles,
+                zero_root,
+                prefetch,
+                next_tile_ptr,
+            );
+            return true;
+        }
+    }
+    let _ = (
+        block_base,
+        eighth4,
+        eighth7,
+        num_ntts,
+        odd_lanes,
+        r0,
+        rows,
+        twiddles,
+        zero_root,
+        prefetch,
+        next_tile_ptr,
+    );
+    false
+}
+
+/// Ranked top-tiled pass 2 (contiguous row range `row_start..row_end`) with
+/// hoisted `three_coeffs` across all rows of the tile.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn try_butterfly_fused_3layer_rows_range_odd_lanes(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    odd_lanes: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+    use_neon: bool,
+) -> bool {
+    if use_neon {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        unsafe {
+            aarch64::butterfly_fused_3layer_rows_range_odd_lanes(
+                ptr, eighth, num_ntts, odd_lanes, row_start, row_end, twiddles, zero_root,
+            );
+            return true;
+        }
+    }
+    let _ = (
+        ptr, eighth, num_ntts, odd_lanes, row_start, row_end, twiddles, zero_root,
+    );
+    false
+}
+
 /// Whether the AArch64 vector-resident radix-8 row kernels are used.
 ///
 /// `FLOCK_NO_NTT_NEON_ROWS=1` restores the portable `F128`-typed chain in the

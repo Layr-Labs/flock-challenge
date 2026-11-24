@@ -1939,22 +1939,8 @@ const FOLD_N_BYTES: usize = 16;
 const FOLD_TABLE_SIZE: usize = 256;
 
 // The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
-    unsafe {
-        core::mem::transmute::<core::arch::aarch64::uint64x2_t, F128>(
-            core::arch::aarch64::veor3q_u64(
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(a),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(b),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(c),
-            ),
-        )
-    }
-}
-
-#[cfg(not(target_feature = "sha3"))]
+// builds that do not take the unscaled AArch64+SHA3 assembly lookup.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
 #[inline(always)]
 fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
     a + (b + c)
@@ -1980,52 +1966,337 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     tables
 }
 
+/// Unscaled-byte-offset NEON+SHA3 16-table byte lookup for [`fold_one_slot`].
+/// Avoids scaled `ldr q, [base, idx, lsl #4]` uops on Apple Silicon via
+/// `ubfiz` + `and mask(0xff0), x, lsr #{4,12,20,28,36,44,52}` + `7× eor3` + `1× eor`.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn fold_one_slot_aarch64_sha3(elem: F128, tables_ptr: *const F128) -> F128 {
+    use core::arch::aarch64::uint64x2_t;
+    let out: uint64x2_t;
+    let mask: u64 = 0xff0;
+    // SAFETY: `tables_ptr` points to `16 * 256` `F128` elements (`16 * 4096` bytes).
+    // Byte offsets are `byte << 4` in `0..=4080`, added to `tables_ptr + k * 4096`
+    // for `k = 0..16`, all strictly in bounds.
+    unsafe {
+        core::arch::asm!(
+            "ubfiz {o0}, {lo}, #4, #8",
+            "ubfiz {o1}, {hi}, #4, #8",
+            "add {t1}, {base}, #8, lsl #12",
+            "ldr {v0:q}, [{base}, {o0}]",
+            "ldr {v1:q}, [{t1}, {o1}]",
+
+            "and {o0}, {mask}, {lo}, lsr #4",
+            "add {t0}, {base}, #1, lsl #12",
+            "ldr {v2:q}, [{t0}, {o0}]",
+            "eor3 {v0:v}.16b, {v0:v}.16b, {v1:v}.16b, {v2:v}.16b",
+
+            "and {o1}, {mask}, {hi}, lsr #4",
+            "add {t1}, {base}, #9, lsl #12",
+            "ldr {v1:q}, [{t1}, {o1}]",
+
+            "and {o0}, {mask}, {lo}, lsr #12",
+            "add {t0}, {base}, #2, lsl #12",
+            "ldr {v2:q}, [{t0}, {o0}]",
+
+            "and {o1}, {mask}, {hi}, lsr #12",
+            "add {t1}, {base}, #10, lsl #12",
+            "ldr {v3:q}, [{t1}, {o1}]",
+            "eor3 {v1:v}.16b, {v1:v}.16b, {v2:v}.16b, {v3:v}.16b",
+
+            "and {o0}, {mask}, {lo}, lsr #20",
+            "add {t0}, {base}, #3, lsl #12",
+            "ldr {v2:q}, [{t0}, {o0}]",
+
+            "and {o1}, {mask}, {hi}, lsr #20",
+            "add {t1}, {base}, #11, lsl #12",
+            "ldr {v3:q}, [{t1}, {o1}]",
+
+            "and {o0}, {mask}, {lo}, lsr #28",
+            "add {t0}, {base}, #4, lsl #12",
+            "ldr {v4:q}, [{t0}, {o0}]",
+            "eor3 {v2:v}.16b, {v2:v}.16b, {v3:v}.16b, {v4:v}.16b",
+
+            "and {o1}, {mask}, {hi}, lsr #28",
+            "add {t1}, {base}, #12, lsl #12",
+            "ldr {v3:q}, [{t1}, {o1}]",
+
+            "and {o0}, {mask}, {lo}, lsr #36",
+            "add {t0}, {base}, #5, lsl #12",
+            "ldr {v4:q}, [{t0}, {o0}]",
+
+            "and {o1}, {mask}, {hi}, lsr #36",
+            "add {t1}, {base}, #13, lsl #12",
+            "ldr {v5:q}, [{t1}, {o1}]",
+            "eor3 {v3:v}.16b, {v3:v}.16b, {v4:v}.16b, {v5:v}.16b",
+
+            "and {o0}, {mask}, {lo}, lsr #44",
+            "add {t0}, {base}, #6, lsl #12",
+            "ldr {v4:q}, [{t0}, {o0}]",
+
+            "and {o1}, {mask}, {hi}, lsr #44",
+            "add {t1}, {base}, #14, lsl #12",
+            "ldr {v5:q}, [{t1}, {o1}]",
+
+            "and {o0}, {mask}, {lo}, lsr #52",
+            "add {t0}, {base}, #7, lsl #12",
+            "ldr {v6:q}, [{t0}, {o0}]",
+            "eor3 {v4:v}.16b, {v4:v}.16b, {v5:v}.16b, {v6:v}.16b",
+
+            "and {o1}, {mask}, {hi}, lsr #52",
+            "add {t1}, {base}, #15, lsl #12",
+            "ldr {v5:q}, [{t1}, {o1}]",
+
+            "eor3 {v0:v}.16b, {v0:v}.16b, {v1:v}.16b, {v2:v}.16b",
+            "eor3 {v3:v}.16b, {v3:v}.16b, {v4:v}.16b, {v5:v}.16b",
+            "eor {v0:v}.16b, {v0:v}.16b, {v3:v}.16b",
+
+            base = in(reg) tables_ptr,
+            lo = in(reg) elem.lo,
+            hi = in(reg) elem.hi,
+            mask = in(reg) mask,
+            t0 = out(reg) _,
+            t1 = out(reg) _,
+            o0 = out(reg) _,
+            o1 = out(reg) _,
+            v0 = out(vreg) out,
+            v1 = out(vreg) _,
+            v2 = out(vreg) _,
+            v3 = out(vreg) _,
+            v4 = out(vreg) _,
+            v5 = out(vreg) _,
+            v6 = out(vreg) _,
+            options(readonly, nostack, preserves_flags),
+        );
+        core::mem::transmute::<uint64x2_t, F128>(out)
+    }
+}
+
+/// Two-slot paired unscaled-byte-offset NEON+SHA3 lookup: shares each table's
+/// `base + k*4096` address calculation across two elements (halving address
+/// arithmetic and widening load parallelism).
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn fold_two_slots_aarch64_sha3(e0: F128, e1: F128, tables_ptr: *const F128) -> (F128, F128) {
+    use core::arch::aarch64::uint64x2_t;
+    let out0: uint64x2_t;
+    let out1: uint64x2_t;
+    let mask: u64 = 0xff0;
+    // SAFETY: `tables_ptr` points to `16 * 256` `F128` elements (`16 * 4096` bytes).
+    unsafe {
+        core::arch::asm!(
+            // k = 0 (tables 0, 8)
+            "add {t1}, {base}, #8, lsl #12",
+            "ubfiz {o0}, {lo0}, #4, #8",
+            "ubfiz {o1}, {lo1}, #4, #8",
+            "ldr {a0:q}, [{base}, {o0}]",
+            "ldr {b0:q}, [{base}, {o1}]",
+            "ubfiz {o0}, {hi0}, #4, #8",
+            "ubfiz {o1}, {hi1}, #4, #8",
+            "ldr {a1:q}, [{t1}, {o0}]",
+            "ldr {b1:q}, [{t1}, {o1}]",
+
+            // k = 1 (tables 1, 9)
+            "add {t0}, {base}, #1, lsl #12",
+            "add {t1}, {base}, #9, lsl #12",
+            "and {o0}, {mask}, {lo0}, lsr #4",
+            "and {o1}, {mask}, {lo1}, lsr #4",
+            "ldr {u0:q}, [{t0}, {o0}]",
+            "ldr {w0:q}, [{t0}, {o1}]",
+            "eor3 {a0:v}.16b, {a0:v}.16b, {a1:v}.16b, {u0:v}.16b",
+            "eor3 {b0:v}.16b, {b0:v}.16b, {b1:v}.16b, {w0:v}.16b",
+            "and {o0}, {mask}, {hi0}, lsr #4",
+            "and {o1}, {mask}, {hi1}, lsr #4",
+            "ldr {a1:q}, [{t1}, {o0}]",
+            "ldr {b1:q}, [{t1}, {o1}]",
+
+            // k = 2 (tables 2, 10)
+            "add {t0}, {base}, #2, lsl #12",
+            "add {t1}, {base}, #10, lsl #12",
+            "and {o0}, {mask}, {lo0}, lsr #12",
+            "and {o1}, {mask}, {lo1}, lsr #12",
+            "ldr {u0:q}, [{t0}, {o0}]",
+            "ldr {w0:q}, [{t0}, {o1}]",
+            "and {o0}, {mask}, {hi0}, lsr #12",
+            "and {o1}, {mask}, {hi1}, lsr #12",
+            "ldr {u1:q}, [{t1}, {o0}]",
+            "ldr {w1:q}, [{t1}, {o1}]",
+            "eor3 {a1:v}.16b, {a1:v}.16b, {u0:v}.16b, {u1:v}.16b",
+            "eor3 {b1:v}.16b, {b1:v}.16b, {w0:v}.16b, {w1:v}.16b",
+
+            // k = 3 (tables 3, 11)
+            "add {t0}, {base}, #3, lsl #12",
+            "add {t1}, {base}, #11, lsl #12",
+            "and {o0}, {mask}, {lo0}, lsr #20",
+            "and {o1}, {mask}, {lo1}, lsr #20",
+            "ldr {a2:q}, [{t0}, {o0}]",
+            "ldr {b2:q}, [{t0}, {o1}]",
+            "and {o0}, {mask}, {hi0}, lsr #20",
+            "and {o1}, {mask}, {hi1}, lsr #20",
+            "ldr {a3:q}, [{t1}, {o0}]",
+            "ldr {b3:q}, [{t1}, {o1}]",
+
+            // k = 4 (tables 4, 12)
+            "add {t0}, {base}, #4, lsl #12",
+            "add {t1}, {base}, #12, lsl #12",
+            "and {o0}, {mask}, {lo0}, lsr #28",
+            "and {o1}, {mask}, {lo1}, lsr #28",
+            "ldr {u0:q}, [{t0}, {o0}]",
+            "ldr {w0:q}, [{t0}, {o1}]",
+            "eor3 {a2:v}.16b, {a2:v}.16b, {a3:v}.16b, {u0:v}.16b",
+            "eor3 {b2:v}.16b, {b2:v}.16b, {b3:v}.16b, {w0:v}.16b",
+            "eor3 {a0:v}.16b, {a0:v}.16b, {a1:v}.16b, {a2:v}.16b",
+            "eor3 {b0:v}.16b, {b0:v}.16b, {b1:v}.16b, {b2:v}.16b",
+            "and {o0}, {mask}, {hi0}, lsr #28",
+            "and {o1}, {mask}, {hi1}, lsr #28",
+            "ldr {a1:q}, [{t1}, {o0}]",
+            "ldr {b1:q}, [{t1}, {o1}]",
+
+            // k = 5 (tables 5, 13)
+            "add {t0}, {base}, #5, lsl #12",
+            "add {t1}, {base}, #13, lsl #12",
+            "and {o0}, {mask}, {lo0}, lsr #36",
+            "and {o1}, {mask}, {lo1}, lsr #36",
+            "ldr {u0:q}, [{t0}, {o0}]",
+            "ldr {w0:q}, [{t0}, {o1}]",
+            "and {o0}, {mask}, {hi0}, lsr #36",
+            "and {o1}, {mask}, {hi1}, lsr #36",
+            "ldr {u1:q}, [{t1}, {o0}]",
+            "ldr {w1:q}, [{t1}, {o1}]",
+            "eor3 {a1:v}.16b, {a1:v}.16b, {u0:v}.16b, {u1:v}.16b",
+            "eor3 {b1:v}.16b, {b1:v}.16b, {w0:v}.16b, {w1:v}.16b",
+
+            // k = 6 (tables 6, 14)
+            "add {t0}, {base}, #6, lsl #12",
+            "add {t1}, {base}, #14, lsl #12",
+            "and {o0}, {mask}, {lo0}, lsr #44",
+            "and {o1}, {mask}, {lo1}, lsr #44",
+            "ldr {a2:q}, [{t0}, {o0}]",
+            "ldr {b2:q}, [{t0}, {o1}]",
+            "and {o0}, {mask}, {hi0}, lsr #44",
+            "and {o1}, {mask}, {hi1}, lsr #44",
+            "ldr {a3:q}, [{t1}, {o0}]",
+            "ldr {b3:q}, [{t1}, {o1}]",
+
+            // k = 7 (tables 7, 15)
+            "add {t0}, {base}, #7, lsl #12",
+            "add {t1}, {base}, #15, lsl #12",
+            "and {o0}, {mask}, {lo0}, lsr #52",
+            "and {o1}, {mask}, {lo1}, lsr #52",
+            "ldr {u0:q}, [{t0}, {o0}]",
+            "ldr {w0:q}, [{t0}, {o1}]",
+            "eor3 {a2:v}.16b, {a2:v}.16b, {a3:v}.16b, {u0:v}.16b",
+            "eor3 {b2:v}.16b, {b2:v}.16b, {b3:v}.16b, {w0:v}.16b",
+            "and {o0}, {mask}, {hi0}, lsr #52",
+            "and {o1}, {mask}, {hi1}, lsr #52",
+            "ldr {a3:q}, [{t1}, {o0}]",
+            "ldr {b3:q}, [{t1}, {o1}]",
+            "eor3 {a1:v}.16b, {a1:v}.16b, {a2:v}.16b, {a3:v}.16b",
+            "eor3 {b1:v}.16b, {b1:v}.16b, {b2:v}.16b, {b3:v}.16b",
+            "eor {a0:v}.16b, {a0:v}.16b, {a1:v}.16b",
+            "eor {b0:v}.16b, {b0:v}.16b, {b1:v}.16b",
+
+            base = in(reg) tables_ptr,
+            lo0 = in(reg) e0.lo,
+            hi0 = in(reg) e0.hi,
+            lo1 = in(reg) e1.lo,
+            hi1 = in(reg) e1.hi,
+            mask = in(reg) mask,
+            t0 = out(reg) _,
+            t1 = out(reg) _,
+            o0 = out(reg) _,
+            o1 = out(reg) _,
+            a0 = out(vreg) out0,
+            a1 = out(vreg) _,
+            a2 = out(vreg) _,
+            a3 = out(vreg) _,
+            b0 = out(vreg) out1,
+            b1 = out(vreg) _,
+            b2 = out(vreg) _,
+            b3 = out(vreg) _,
+            u0 = out(vreg) _,
+            u1 = out(vreg) _,
+            w0 = out(vreg) _,
+            w1 = out(vreg) _,
+            options(readonly, nostack, preserves_flags),
+        );
+        (
+            core::mem::transmute::<uint64x2_t, F128>(out0),
+            core::mem::transmute::<uint64x2_t, F128>(out1),
+        )
+    }
+}
+
 /// One folded output slot: `Σ_{k=0..16} tables[k·256 + byte_k(elem)]`, where
 /// `byte_k` are the 16 little-endian bytes of `elem`. `tables` MUST be a
-/// `build_fold_byte_table` output (length `16·256`). Tree-reduced (depth 4)
+/// `build_fold_byte_table` output (length `16·256`). Tree-reduced (depth 3)
 /// rather than a length-15 XOR chain so the adds pipeline.
 #[inline(always)]
 pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
-    let lo_bytes = elem.lo.to_le_bytes();
-    let hi_bytes = elem.hi.to_le_bytes();
-    let tables_ptr = tables.as_ptr();
-    // SAFETY: byte values are u8 (0..256); the max offset is
-    // `15·256 + 255 = 4095 = 16·256 − 1`, in-bounds for the asserted length.
-    let (l0, l1, l2, l3, l4, l5, l6, l7, h0, h1, h2, h3, h4, h5, h6, h7) = unsafe {
-        (
-            *tables_ptr.add(lo_bytes[0] as usize),
-            *tables_ptr.add(FOLD_TABLE_SIZE + lo_bytes[1] as usize),
-            *tables_ptr.add(2 * FOLD_TABLE_SIZE + lo_bytes[2] as usize),
-            *tables_ptr.add(3 * FOLD_TABLE_SIZE + lo_bytes[3] as usize),
-            *tables_ptr.add(4 * FOLD_TABLE_SIZE + lo_bytes[4] as usize),
-            *tables_ptr.add(5 * FOLD_TABLE_SIZE + lo_bytes[5] as usize),
-            *tables_ptr.add(6 * FOLD_TABLE_SIZE + lo_bytes[6] as usize),
-            *tables_ptr.add(7 * FOLD_TABLE_SIZE + lo_bytes[7] as usize),
-            *tables_ptr.add(8 * FOLD_TABLE_SIZE + hi_bytes[0] as usize),
-            *tables_ptr.add(9 * FOLD_TABLE_SIZE + hi_bytes[1] as usize),
-            *tables_ptr.add(10 * FOLD_TABLE_SIZE + hi_bytes[2] as usize),
-            *tables_ptr.add(11 * FOLD_TABLE_SIZE + hi_bytes[3] as usize),
-            *tables_ptr.add(12 * FOLD_TABLE_SIZE + hi_bytes[4] as usize),
-            *tables_ptr.add(13 * FOLD_TABLE_SIZE + hi_bytes[5] as usize),
-            *tables_ptr.add(14 * FOLD_TABLE_SIZE + hi_bytes[6] as usize),
-            *tables_ptr.add(15 * FOLD_TABLE_SIZE + hi_bytes[7] as usize),
-        )
-    };
-    // Level 1: 8 pair sums.
-    let p0 = l0 + l1;
-    let p1 = l2 + l3;
-    let p2 = l4 + l5;
-    let p3 = l6 + l7;
-    let p4 = h0 + h1;
-    let p5 = h2 + h3;
-    let p6 = h4 + h5;
-    let p7 = h6 + h7;
-    // Levels 2–3: three-input nodes reduce the 16-load tree from depth 4 to 3.
-    let q0 = xor3_f128(p0, p1, p2);
-    let q1 = xor3_f128(p3, p4, p5);
-    let q2 = p6 + p7;
-    xor3_f128(q0, q1, q2)
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    {
+        // SAFETY: `tables.len() == 16 * 256` asserted above.
+        return unsafe { fold_one_slot_aarch64_sha3(elem, tables.as_ptr()) };
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+    {
+        let lo_bytes = elem.lo.to_le_bytes();
+        let hi_bytes = elem.hi.to_le_bytes();
+        let tables_ptr = tables.as_ptr();
+        // SAFETY: byte values are u8 (0..256); the max offset is
+        // `15·256 + 255 = 4095 = 16·256 − 1`, in-bounds for the asserted length.
+        let (l0, l1, l2, l3, l4, l5, l6, l7, h0, h1, h2, h3, h4, h5, h6, h7) = unsafe {
+            (
+                *tables_ptr.add(lo_bytes[0] as usize),
+                *tables_ptr.add(FOLD_TABLE_SIZE + lo_bytes[1] as usize),
+                *tables_ptr.add(2 * FOLD_TABLE_SIZE + lo_bytes[2] as usize),
+                *tables_ptr.add(3 * FOLD_TABLE_SIZE + lo_bytes[3] as usize),
+                *tables_ptr.add(4 * FOLD_TABLE_SIZE + lo_bytes[4] as usize),
+                *tables_ptr.add(5 * FOLD_TABLE_SIZE + lo_bytes[5] as usize),
+                *tables_ptr.add(6 * FOLD_TABLE_SIZE + lo_bytes[6] as usize),
+                *tables_ptr.add(7 * FOLD_TABLE_SIZE + lo_bytes[7] as usize),
+                *tables_ptr.add(8 * FOLD_TABLE_SIZE + hi_bytes[0] as usize),
+                *tables_ptr.add(9 * FOLD_TABLE_SIZE + hi_bytes[1] as usize),
+                *tables_ptr.add(10 * FOLD_TABLE_SIZE + hi_bytes[2] as usize),
+                *tables_ptr.add(11 * FOLD_TABLE_SIZE + hi_bytes[3] as usize),
+                *tables_ptr.add(12 * FOLD_TABLE_SIZE + hi_bytes[4] as usize),
+                *tables_ptr.add(13 * FOLD_TABLE_SIZE + hi_bytes[5] as usize),
+                *tables_ptr.add(14 * FOLD_TABLE_SIZE + hi_bytes[6] as usize),
+                *tables_ptr.add(15 * FOLD_TABLE_SIZE + hi_bytes[7] as usize),
+            )
+        };
+        // Level 1: 8 pair sums.
+        let p0 = l0 + l1;
+        let p1 = l2 + l3;
+        let p2 = l4 + l5;
+        let p3 = l6 + l7;
+        let p4 = h0 + h1;
+        let p5 = h2 + h3;
+        let p6 = h4 + h5;
+        let p7 = h6 + h7;
+        // Levels 2–3: three-input nodes reduce the 16-load tree from depth 4 to 3.
+        let q0 = xor3_f128(p0, p1, p2);
+        let q1 = xor3_f128(p3, p4, p5);
+        let q2 = p6 + p7;
+        xor3_f128(q0, q1, q2)
+    }
+}
+
+/// Paired two-slot form of [`fold_one_slot`], bit-identical to
+/// `(fold_one_slot(e0, tables), fold_one_slot(e1, tables))`.
+#[inline(always)]
+pub(crate) fn fold_two_slots(e0: F128, e1: F128, tables: &[F128]) -> (F128, F128) {
+    debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    {
+        // SAFETY: `tables.len() == 16 * 256` asserted above.
+        return unsafe { fold_two_slots_aarch64_sha3(e0, e1, tables.as_ptr()) };
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
+    {
+        (fold_one_slot(e0, tables), fold_one_slot(e1, tables))
+    }
 }
 
 /// Total length of a fold byte table (`build_fold_byte_table` output).
@@ -4107,6 +4378,22 @@ mod tests {
                     fold_one_slot(lo * e_hi, &base),
                     "trial={trial} lo={lo:?} e_hi={e_hi:?}"
                 );
+            }
+            for pair in los.chunks_exact(2) {
+                let (d0, d1) = fold_two_slots(pair[0], pair[1], &composed);
+                assert_eq!(d0, fold_one_slot(pair[0], &composed), "pair[0] trial={trial}");
+                assert_eq!(d1, fold_one_slot(pair[1], &composed), "pair[1] trial={trial}");
+                // Direct byte-by-byte scalar oracle.
+                for (got, elem) in [(d0, pair[0]), (d1, pair[1])] {
+                    let mut oracle = F128::ZERO;
+                    for (k, &b) in elem.lo.to_le_bytes().iter().enumerate() {
+                        oracle += composed[k * FOLD_TABLE_SIZE + b as usize];
+                    }
+                    for (k, &b) in elem.hi.to_le_bytes().iter().enumerate() {
+                        oracle += composed[(8 + k) * FOLD_TABLE_SIZE + b as usize];
+                    }
+                    assert_eq!(got, oracle, "oracle mismatch trial={trial} elem={elem:?}");
+                }
             }
         }
     }

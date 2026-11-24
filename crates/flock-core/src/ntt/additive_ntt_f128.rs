@@ -345,6 +345,26 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Even 10-layer L0 deep suffix radix-8 passes `(10,11,12)` + `(13,14,15)`
+/// before `(16,17)` + `(18,19)`; `FLOCK_NO_DEEP_RADIX8_EVEN` (any value)
+/// restores the five fused-pair passes.
+#[inline]
+fn deep_radix8_even_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = DEEP_RADIX8_EVEN_OVERRIDE.with(|o| o.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_DEEP_RADIX8_EVEN").is_none())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread switch override so tests can compare even radix-8 vs fused-pairs side by side.
+    static DEEP_RADIX8_EVEN_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Sub-transforms that took the radix-8 lead, counted only while the
 /// recursive NTT trace is on (`FLOCK_TRACE_RECURSIVE_L1_NTT_EPOOL=1`), which
 /// prints it per recursive L1/L2 transform.
@@ -1525,35 +1545,56 @@ impl AdditiveNttF128 {
             // touches only positions of its own tile.
             unsafe {
                 let block_base = (base as *mut F128).add(abs_b * BLOCK4_POS * NUM_NTTS);
-                for a in 0..8usize {
-                    for r in r0..r0 + ROWS {
-                        if prefetch {
-                            let ahead = if a + 1 < 8 {
-                                Some(abs_b * BLOCK4_POS + (a + 1) * EIGHTH7 + r)
+                let next_tile_ptr = match next_row0 {
+                    Some(p0) => (base as *const F128).add(p0 * NUM_NTTS),
+                    None => core::ptr::null(),
+                };
+                if !kernels::try_butterfly_fused_3layer_top_tile_pass1(
+                    block_base,
+                    EIGHTH4,
+                    EIGHTH7,
+                    NUM_NTTS,
+                    odd_lanes,
+                    r0,
+                    ROWS,
+                    &tw4[local],
+                    abs_b == 0,
+                    prefetch,
+                    next_tile_ptr,
+                    use_neon,
+                ) {
+                    for a in 0..8usize {
+                        for r in r0..r0 + ROWS {
+                            if prefetch {
+                                let ahead = if a + 1 < 8 {
+                                    Some(abs_b * BLOCK4_POS + (a + 1) * EIGHTH7 + r)
+                                } else {
+                                    next_row0.map(|p0| p0 + (r - r0))
+                                };
+                                if let Some(pos) = ahead {
+                                    // SAFETY: `pos` is a row-group start inside
+                                    // `data` (a valid tile row); prefetch hints
+                                    // never fault and never write.
+                                    prefetch_row_group_l2(
+                                        (base as *const F128).add(pos * NUM_NTTS),
+                                        EIGHTH4 * NUM_NTTS,
+                                        NUM_NTTS,
+                                    );
+                                }
+                            }
+                            let row = a * EIGHTH7 + r;
+                            let lanes = if row & 1 == 1 { odd_lanes } else { NUM_NTTS };
+                            if abs_b == 0 {
+                                kernels::butterfly_fused_3layer_zero_root_row_with_policy(
+                                    block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local],
+                                    use_neon,
+                                );
                             } else {
-                                next_row0.map(|p0| p0 + (r - r0))
-                            };
-                            if let Some(pos) = ahead {
-                                // SAFETY: `pos` is a row-group start inside
-                                // `data` (a valid tile row); prefetch hints
-                                // never fault and never write.
-                                prefetch_row_group_l2(
-                                    (base as *const F128).add(pos * NUM_NTTS),
-                                    EIGHTH4 * NUM_NTTS,
-                                    NUM_NTTS,
+                                kernels::butterfly_fused_3layer_row_with_policy(
+                                    block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local],
+                                    use_neon,
                                 );
                             }
-                        }
-                        let row = a * EIGHTH7 + r;
-                        let lanes = if row & 1 == 1 { odd_lanes } else { NUM_NTTS };
-                        if abs_b == 0 {
-                            kernels::butterfly_fused_3layer_zero_root_row_with_policy(
-                                block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local], use_neon,
-                            );
-                        } else {
-                            kernels::butterfly_fused_3layer_row_with_policy(
-                                block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local], use_neon,
-                            );
                         }
                     }
                 }
@@ -1561,16 +1602,28 @@ impl AdditiveNttF128 {
                     let abs_c = 8 * abs_b + b;
                     let sub_base = block_base.add(b * EIGHTH4 * NUM_NTTS);
                     let tw = &tw7[8 * local + b];
-                    for r in r0..r0 + ROWS {
-                        let lanes = if r & 1 == 1 { odd_lanes } else { NUM_NTTS };
-                        if abs_c == 0 {
-                            kernels::butterfly_fused_3layer_zero_root_row_with_policy(
-                                sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
-                            );
-                        } else {
-                            kernels::butterfly_fused_3layer_row_with_policy(
-                                sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
-                            );
+                    if !kernels::try_butterfly_fused_3layer_rows_range_odd_lanes(
+                        sub_base,
+                        EIGHTH7,
+                        NUM_NTTS,
+                        odd_lanes,
+                        r0,
+                        r0 + ROWS,
+                        tw,
+                        abs_c == 0,
+                        use_neon,
+                    ) {
+                        for r in r0..r0 + ROWS {
+                            let lanes = if r & 1 == 1 { odd_lanes } else { NUM_NTTS };
+                            if abs_c == 0 {
+                                kernels::butterfly_fused_3layer_zero_root_row_with_policy(
+                                    sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
+                                );
+                            } else {
+                                kernels::butterfly_fused_3layer_row_with_policy(
+                                    sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
+                                );
+                            }
                         }
                     }
                 }
@@ -2559,6 +2612,9 @@ impl AdditiveNttF128 {
         let range_start = sub_start * sub_elems;
         let range_end = sub_end * sub_elems;
         let group_layer = deep_l1_group_layer(log_d, num_ntts, n_top);
+        let use_deep_radix8_even = log_d - n_top == 10
+            && deep_radix8_even_enabled()
+            && kernels::vector_resident_rows();
 
         // One compiled body for both fan-outs (see `ranked_suffix_hetero_enabled`).
         let sub_job: &(dyn Fn(usize, &mut [F128]) + Sync) = &|local_sub_idx: usize, sub_data: &mut [F128]| {
@@ -2638,6 +2694,72 @@ impl AdditiveNttF128 {
                         }
                     }
                 };
+
+                if use_deep_radix8_even {
+                    // Even 10-layer deep suffix (layers n_top..n_top+10, e.g. 10..20):
+                    // Pass 1: radix-8 over layers (n_top, n_top+1, n_top+2), eighth=128 (even).
+                    // Per 128-position (128 KiB at 64 lanes) sub-block b in 0..8:
+                    //   Pass 2: radix-8 over layers (n_top+3, n_top+4, n_top+5), eighth=16 (even).
+                    //   Per 16-position (16 KiB) sub-block g in 0..8:
+                    //     Pass 3: pair (n_top+6, n_top+7)
+                    //     Pass 4: pair (n_top+8, n_top+9) (low-twiddle zero-tail kernel untouched).
+                    let block_twiddles3 = |layer: usize, global_block: usize| {
+                        [
+                            self.twiddle(layer, global_block),
+                            self.twiddle(layer + 1, 2 * global_block),
+                            self.twiddle(layer + 1, 2 * global_block + 1),
+                            self.twiddle(layer + 2, 4 * global_block),
+                            self.twiddle(layer + 2, 4 * global_block + 1),
+                            self.twiddle(layer + 2, 4 * global_block + 2),
+                            self.twiddle(layer + 2, 4 * global_block + 3),
+                        ]
+                    };
+                    let tw1 = block_twiddles3(n_top, sub_idx);
+                    let zero_root1 =
+                        tw1[0] == F128::ZERO && tw1[1] == F128::ZERO && tw1[3] == F128::ZERO;
+                    // SAFETY: `sub_data` holds `1024 * num_ntts` elements exclusively;
+                    // `eighth = 128` is even, preserving row parity for `zero_tail`.
+                    let ran1 = unsafe {
+                        kernels::butterfly_fused_3layer_deep_rows_odd_tail(
+                            sub_data.as_mut_ptr(),
+                            128,
+                            num_ntts,
+                            zero_tail,
+                            &tw1,
+                            zero_root1,
+                        )
+                    };
+                    debug_assert!(ran1, "vector_resident_rows was checked above");
+
+                    let sub128_elems = 128 * num_ntts;
+                    for b in 0..8usize {
+                        let gb = 8 * sub_idx + b;
+                        let tw2 = block_twiddles3(n_top + 3, gb);
+                        let zero_root2 =
+                            tw2[0] == F128::ZERO && tw2[1] == F128::ZERO && tw2[3] == F128::ZERO;
+                        // SAFETY: sub-block `b` is a valid `128 * num_ntts` run inside
+                        // `sub_data`; `eighth = 16` is even, preserving row parity.
+                        let ran2 = unsafe {
+                            kernels::butterfly_fused_3layer_deep_rows_odd_tail(
+                                sub_data.as_mut_ptr().add(b * sub128_elems),
+                                16,
+                                num_ntts,
+                                zero_tail,
+                                &tw2,
+                                zero_root2,
+                            )
+                        };
+                        debug_assert!(ran2, "vector_resident_rows was checked above");
+
+                        for g in 0..8usize {
+                            let block16 = 8 * b + g;
+                            pair_blocks(sub_data, n_top + 6, block16, block16 + 1);
+                            pair_blocks(sub_data, n_top + 8, 4 * block16, 4 * block16 + 4);
+                        }
+                    }
+                    finish_chunk(sub_idx * sub_elems, sub_data);
+                    return;
+                }
 
                 // Layer-major sweeps down to the group layer, then every
                 // L1-sized block finishes its remaining pairs in one visit
@@ -5540,5 +5662,123 @@ mod zero_lane_skip {
             );
         }
         assert_eq!(ranked_zero_odd_tail_lanes(ZERO_TAIL_LOG_D, NUM_NTTS), 0);
+    }
+}
+
+#[cfg(test)]
+mod deep_radix8_even_tests {
+    use super::*;
+
+    fn fill_structured_sub(buf: &mut [F128], num_ntts: usize, zero_tail: usize, seed: u64) {
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for (i, slot) in buf.iter_mut().enumerate() {
+            let odd_pos = (i / num_ntts) & 1 == 1;
+            if odd_pos && i % num_ntts >= num_ntts - zero_tail {
+                *slot = F128::ZERO;
+            } else {
+                *slot = F128::new(next(), next());
+            }
+        }
+    }
+
+    #[test]
+    fn deep_radix8_even_log20_matches_fused_pairs() {
+        let log_d = 20usize;
+        let n_top = 10usize;
+        let num_ntts = 64usize;
+        let sub_elems = (1usize << (log_d - n_top)) * num_ntts;
+        let ntt = AdditiveNttF128::standard(log_d);
+
+        // Allocate once; demand-paging only faults the slices we write.
+        let mut data_r8 = vec![F128::ZERO; (1usize << log_d) * num_ntts];
+        let mut data_pairs = vec![F128::ZERO; (1usize << log_d) * num_ntts];
+
+        for &(sub_start, sub_end) in &[(0usize, 2usize), (700usize, 702usize)] {
+            for &zero_tail in &[0usize, 4usize, 7usize] {
+                let lo = sub_start * sub_elems;
+                let hi = sub_end * sub_elems;
+                fill_structured_sub(
+                    &mut data_r8[lo..hi],
+                    num_ntts,
+                    zero_tail,
+                    0x517c_c1b7_2722_0a95 ^ ((sub_start as u64) << 16) ^ (zero_tail as u64),
+                );
+                data_pairs[lo..hi].copy_from_slice(&data_r8[lo..hi]);
+
+                DEEP_RADIX8_EVEN_OVERRIDE.with(|o| o.set(Some(true)));
+                ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                    &mut data_r8,
+                    num_ntts,
+                    n_top,
+                    log_d,
+                    sub_start,
+                    sub_end,
+                    zero_tail,
+                    &|_, _| {},
+                );
+                DEEP_RADIX8_EVEN_OVERRIDE.with(|o| o.set(Some(false)));
+                ntt.forward_transform_interleaved_deep_fused_pairs_range_and_then(
+                    &mut data_pairs,
+                    num_ntts,
+                    n_top,
+                    log_d,
+                    sub_start,
+                    sub_end,
+                    zero_tail,
+                    &|_, _| {},
+                );
+                DEEP_RADIX8_EVEN_OVERRIDE.with(|o| o.set(None));
+
+                assert_eq!(
+                    data_r8[lo..hi],
+                    data_pairs[lo..hi],
+                    "deep radix-8 even diverges for range {sub_start}..{sub_end} zero_tail={zero_tail}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ranked_top_tiled_hoisted_three_coeffs_matches_block_range() {
+        let log_d = 20usize;
+        let num_ntts = 64usize;
+        let block4_elems = (1usize << (log_d - 4)) * num_ntts;
+        let ntt = AdditiveNttF128::standard(log_d);
+
+        let mut tiled = vec![F128::ZERO; (1usize << log_d) * num_ntts];
+        let mut plain = vec![F128::ZERO; (1usize << log_d) * num_ntts];
+
+        for &(b_start, b_end) in &[(0usize, 1usize), (11usize, 12usize)] {
+            for &odd_tail in &[0usize, 7usize] {
+                let lo = b_start * block4_elems;
+                let hi = b_end * block4_elems;
+                fill_structured_sub(
+                    &mut tiled[lo..hi],
+                    num_ntts,
+                    odd_tail,
+                    0x9e37_79b9_7f4a_7c15 ^ ((b_start as u64) << 8) ^ (odd_tail as u64),
+                );
+                plain[lo..hi].copy_from_slice(&tiled[lo..hi]);
+
+                let ran = ntt.forward_transform_interleaved_ranked_top_tiled(
+                    &mut tiled, num_ntts, b_start, b_end, odd_tail,
+                );
+                assert!(ran, "ranked top tiled should run");
+                ntt.forward_transform_interleaved_block_range(
+                    &mut plain, num_ntts, 4, 10, b_start, b_end, odd_tail,
+                );
+                assert_eq!(
+                    tiled[lo..hi],
+                    plain[lo..hi],
+                    "top-tiled diverges for blocks {b_start}..{b_end} odd_tail={odd_tail}"
+                );
+            }
+        }
     }
 }

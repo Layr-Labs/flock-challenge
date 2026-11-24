@@ -1161,15 +1161,54 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         if use_three_const_fold() {
             let prepared = core::array::from_fn(|i| three_coeffs(t[i]));
-            for r in row_start..row_end {
-                butterfly_fused_3layer_row_with_const_q::<false>(
-                    ptr, eighth, num_ntts, num_ntts, r, &prepared,
-                );
+            if use_ntt_absorb() {
+                for r in row_start..row_end {
+                    butterfly_fused_3layer_row_with_const_q::<true>(
+                        ptr, eighth, num_ntts, num_ntts, r, &prepared,
+                    );
+                }
+            } else {
+                for r in row_start..row_end {
+                    butterfly_fused_3layer_row_with_const_q::<false>(
+                        ptr, eighth, num_ntts, num_ntts, r, &prepared,
+                    );
+                }
             }
         } else {
             for r in row_start..row_end {
                 butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
             }
+        }
+    }
+}
+
+#[target_feature(enable = "aes")]
+unsafe fn butterfly_fused_3layer_zero_root_row_with_const_q(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    p2: Prep,
+    p4: Prep,
+    p5: Prep,
+    p6: Prep,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let step = eighth * num_ntts;
+        let ends: [*mut u8; 8] =
+            core::array::from_fn(|i| ptr.add(r * num_ntts + i * step + lanes).cast::<u8>());
+        let mut off = -((lanes * core::mem::size_of::<F128>()) as isize);
+        while off != 0 {
+            let mut v: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(ends[i].offset(off).cast::<u64>()));
+            fused3_zero_root_prepared_q(&mut v, p2, p4, p5, p6);
+            // v[0] is unchanged by all three layers; skip its store.
+            for (i, value) in v.into_iter().enumerate().skip(1) {
+                vst1q_u64(ends[i].offset(off).cast::<u64>(), value);
+            }
+            off = next_lane_off(off);
         }
     }
 }
@@ -1316,14 +1355,342 @@ pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
                     three_coeffs(t[5]),
                     three_coeffs(t[6]),
                 ];
-                for r in 0..eighth {
-                    butterfly_fused_3layer_row_with_const_q::<false>(
-                        ptr, eighth, num_ntts, num_ntts, r, &prepared,
-                    );
+                if use_ntt_absorb() {
+                    for r in 0..eighth {
+                        butterfly_fused_3layer_row_with_const_q::<true>(
+                            ptr, eighth, num_ntts, num_ntts, r, &prepared,
+                        );
+                    }
+                } else {
+                    for r in 0..eighth {
+                        butterfly_fused_3layer_row_with_const_q::<false>(
+                            ptr, eighth, num_ntts, num_ntts, r, &prepared,
+                        );
+                    }
                 }
             } else {
                 for r in 0..eighth {
                     butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
+                }
+            }
+        }
+    }
+}
+
+/// All `eighth` row groups of one radix-8 block in the deep even suffix
+/// (`log_d - n_top == 10`), with hoisted `three_coeffs`, `ABSORB` dispatch,
+/// zero-root specialization, and per-row parity `odd_tail` trim.
+///
+/// # Safety
+/// `ptr` must cover `8 * eighth * num_ntts` elements with exclusive access.
+/// When `odd_tail > 0`, `eighth` must be even and `odd_tail < num_ntts`.
+/// With `zero_root`, `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
+#[target_feature(enable = "aes")]
+#[inline(never)]
+pub(super) unsafe fn butterfly_fused_3layer_deep_rows_odd_tail(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    odd_tail: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        debug_assert!(odd_tail < num_ntts);
+        debug_assert!(odd_tail == 0 || eighth.is_multiple_of(2));
+        let odd_lanes = num_ntts - odd_tail;
+        let ld = |i: usize| vld1q_u64((&raw const twiddles[i]).cast::<u64>());
+        if zero_root {
+            debug_assert_eq!(twiddles[0], F128::ZERO);
+            debug_assert_eq!(twiddles[1], F128::ZERO);
+            debug_assert_eq!(twiddles[3], F128::ZERO);
+            let (t2, t4, t5, t6) = (ld(2), ld(4), ld(5), ld(6));
+            if use_const_ext() {
+                let (p2, p4, p5, p6) = (
+                    three_coeffs(t2),
+                    three_coeffs(t4),
+                    three_coeffs(t5),
+                    three_coeffs(t6),
+                );
+                for r in 0..eighth {
+                    let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                    butterfly_fused_3layer_zero_root_row_with_const_q(
+                        ptr, eighth, num_ntts, lanes, r, p2, p4, p5, p6,
+                    );
+                }
+            } else {
+                for r in 0..eighth {
+                    let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                    butterfly_fused_3layer_zero_root_row_with_q(
+                        ptr, eighth, num_ntts, lanes, r, t2, t4, t5, t6,
+                    );
+                }
+            }
+        } else {
+            let t = [ld(0), ld(1), ld(2), ld(3), ld(4), ld(5), ld(6)];
+            if use_three_const_fold() {
+                let prepared = [
+                    three_coeffs(t[0]),
+                    three_coeffs(t[1]),
+                    three_coeffs(t[2]),
+                    three_coeffs(t[3]),
+                    three_coeffs(t[4]),
+                    three_coeffs(t[5]),
+                    three_coeffs(t[6]),
+                ];
+                if use_ntt_absorb() {
+                    for r in 0..eighth {
+                        let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                        butterfly_fused_3layer_row_with_const_q::<true>(
+                            ptr, eighth, num_ntts, lanes, r, &prepared,
+                        );
+                    }
+                } else {
+                    for r in 0..eighth {
+                        let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                        butterfly_fused_3layer_row_with_const_q::<false>(
+                            ptr, eighth, num_ntts, lanes, r, &prepared,
+                        );
+                    }
+                }
+            } else {
+                for r in 0..eighth {
+                    let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                    butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes, r, &t);
+                }
+            }
+        }
+    }
+}
+
+/// Hint the eight positions `p + i * step` (i < 8) of one radix-8 row group,
+/// `num_ntts` lanes each, into L2.
+#[inline(always)]
+unsafe fn prefetch_row_group_l2_aarch64(p: *const F128, step: usize, num_ntts: usize) {
+    unsafe {
+        const LINE: usize = 128;
+        let bytes = num_ntts * core::mem::size_of::<F128>();
+        for i in 0..8usize {
+            let row = p.add(i * step).cast::<u8>();
+            let mut off = 0usize;
+            while off < bytes {
+                core::arch::asm!(
+                    "prfm pldl2keep, [{a}]",
+                    a = in(reg) row.add(off),
+                    options(nostack, readonly, preserves_flags)
+                );
+                off += LINE;
+            }
+        }
+    }
+}
+
+/// Ranked top-tiled pass 1 (layers 4..7): runs all `8 * rows` row groups
+/// `a * eighth7 + r` (`a in 0..8, r in r0..r0 + rows`) while hoisting
+/// `three_coeffs` and twiddle loads once across the entire tile.
+///
+/// # Safety
+/// Same disjoint-tile contract as `forward_transform_interleaved_ranked_top_tiled`.
+/// When `prefetch` is true and `next_tile_ptr` is non-null, `next_tile_ptr`
+/// points to the first row group of the next tile (for prefetch hints only).
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_top_tile_pass1(
+    block_base: *mut F128,
+    eighth4: usize,
+    eighth7: usize,
+    num_ntts: usize,
+    odd_lanes: usize,
+    r0: usize,
+    rows: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+    prefetch: bool,
+    next_tile_ptr: *const F128,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let prefetch_step = eighth4 * num_ntts;
+        let maybe_prefetch = |a: usize, r: usize| {
+            if prefetch {
+                let ahead_ptr = if a + 1 < 8 {
+                    block_base.add(((a + 1) * eighth7 + r) * num_ntts) as *const F128
+                } else if !next_tile_ptr.is_null() {
+                    next_tile_ptr.add((r - r0) * num_ntts)
+                } else {
+                    core::ptr::null()
+                };
+                if !ahead_ptr.is_null() {
+                    prefetch_row_group_l2_aarch64(ahead_ptr, prefetch_step, num_ntts);
+                }
+            }
+        };
+        let ld = |i: usize| vld1q_u64((&raw const twiddles[i]).cast::<u64>());
+        if zero_root {
+            debug_assert_eq!(twiddles[0], F128::ZERO);
+            debug_assert_eq!(twiddles[1], F128::ZERO);
+            debug_assert_eq!(twiddles[3], F128::ZERO);
+            let (t2, t4, t5, t6) = (ld(2), ld(4), ld(5), ld(6));
+            if use_const_ext() {
+                let (p2, p4, p5, p6) = (
+                    three_coeffs(t2),
+                    three_coeffs(t4),
+                    three_coeffs(t5),
+                    three_coeffs(t6),
+                );
+                for a in 0..8usize {
+                    for r in r0..r0 + rows {
+                        maybe_prefetch(a, r);
+                        let row = a * eighth7 + r;
+                        let lanes = if row & 1 == 1 { odd_lanes } else { num_ntts };
+                        butterfly_fused_3layer_zero_root_row_with_const_q(
+                            block_base, eighth4, num_ntts, lanes, row, p2, p4, p5, p6,
+                        );
+                    }
+                }
+            } else {
+                for a in 0..8usize {
+                    for r in r0..r0 + rows {
+                        maybe_prefetch(a, r);
+                        let row = a * eighth7 + r;
+                        let lanes = if row & 1 == 1 { odd_lanes } else { num_ntts };
+                        butterfly_fused_3layer_zero_root_row_with_q(
+                            block_base, eighth4, num_ntts, lanes, row, t2, t4, t5, t6,
+                        );
+                    }
+                }
+            }
+        } else {
+            let t = [ld(0), ld(1), ld(2), ld(3), ld(4), ld(5), ld(6)];
+            if use_three_const_fold() {
+                let prepared = [
+                    three_coeffs(t[0]),
+                    three_coeffs(t[1]),
+                    three_coeffs(t[2]),
+                    three_coeffs(t[3]),
+                    three_coeffs(t[4]),
+                    three_coeffs(t[5]),
+                    three_coeffs(t[6]),
+                ];
+                if use_ntt_absorb() {
+                    for a in 0..8usize {
+                        for r in r0..r0 + rows {
+                            maybe_prefetch(a, r);
+                            let row = a * eighth7 + r;
+                            let lanes = if row & 1 == 1 { odd_lanes } else { num_ntts };
+                            butterfly_fused_3layer_row_with_const_q::<true>(
+                                block_base, eighth4, num_ntts, lanes, row, &prepared,
+                            );
+                        }
+                    }
+                } else {
+                    for a in 0..8usize {
+                        for r in r0..r0 + rows {
+                            maybe_prefetch(a, r);
+                            let row = a * eighth7 + r;
+                            let lanes = if row & 1 == 1 { odd_lanes } else { num_ntts };
+                            butterfly_fused_3layer_row_with_const_q::<false>(
+                                block_base, eighth4, num_ntts, lanes, row, &prepared,
+                            );
+                        }
+                    }
+                }
+            } else {
+                for a in 0..8usize {
+                    for r in r0..r0 + rows {
+                        maybe_prefetch(a, r);
+                        let row = a * eighth7 + r;
+                        let lanes = if row & 1 == 1 { odd_lanes } else { num_ntts };
+                        butterfly_fused_3layer_row_with_q(
+                            block_base, eighth4, num_ntts, lanes, row, &t,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Contiguous row range `row_start..row_end` of one radix-8 block with hoisted
+/// `three_coeffs`, `ABSORB` dispatch, zero-root specialization, and per-row
+/// parity `odd_lanes` trim.
+///
+/// # Safety
+/// Same disjoint-row contract as [`butterfly_fused_3layer_rows`]; with
+/// `zero_root`, `twiddles[0] == twiddles[1] == twiddles[3] == 0`.
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn butterfly_fused_3layer_rows_range_odd_lanes(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    odd_lanes: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[F128; 7],
+    zero_root: bool,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let ld = |i: usize| vld1q_u64((&raw const twiddles[i]).cast::<u64>());
+        if zero_root {
+            debug_assert_eq!(twiddles[0], F128::ZERO);
+            debug_assert_eq!(twiddles[1], F128::ZERO);
+            debug_assert_eq!(twiddles[3], F128::ZERO);
+            let (t2, t4, t5, t6) = (ld(2), ld(4), ld(5), ld(6));
+            if use_const_ext() {
+                let (p2, p4, p5, p6) = (
+                    three_coeffs(t2),
+                    three_coeffs(t4),
+                    three_coeffs(t5),
+                    three_coeffs(t6),
+                );
+                for r in row_start..row_end {
+                    let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                    butterfly_fused_3layer_zero_root_row_with_const_q(
+                        ptr, eighth, num_ntts, lanes, r, p2, p4, p5, p6,
+                    );
+                }
+            } else {
+                for r in row_start..row_end {
+                    let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                    butterfly_fused_3layer_zero_root_row_with_q(
+                        ptr, eighth, num_ntts, lanes, r, t2, t4, t5, t6,
+                    );
+                }
+            }
+        } else {
+            let t = [ld(0), ld(1), ld(2), ld(3), ld(4), ld(5), ld(6)];
+            if use_three_const_fold() {
+                let prepared = [
+                    three_coeffs(t[0]),
+                    three_coeffs(t[1]),
+                    three_coeffs(t[2]),
+                    three_coeffs(t[3]),
+                    three_coeffs(t[4]),
+                    three_coeffs(t[5]),
+                    three_coeffs(t[6]),
+                ];
+                if use_ntt_absorb() {
+                    for r in row_start..row_end {
+                        let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                        butterfly_fused_3layer_row_with_const_q::<true>(
+                            ptr, eighth, num_ntts, lanes, r, &prepared,
+                        );
+                    }
+                } else {
+                    for r in row_start..row_end {
+                        let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                        butterfly_fused_3layer_row_with_const_q::<false>(
+                            ptr, eighth, num_ntts, lanes, r, &prepared,
+                        );
+                    }
+                }
+            } else {
+                for r in row_start..row_end {
+                    let lanes = if r & 1 == 1 { odd_lanes } else { num_ntts };
+                    butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, lanes, r, &t);
                 }
             }
         }
