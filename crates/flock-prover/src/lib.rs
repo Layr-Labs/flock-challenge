@@ -366,3 +366,4 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // darthweenies-resample marker r59-108-1788755410
 // darthweenies-resample marker r60-109-1788756018
 // darthweenies-resample marker r61-110-1788756628
+// Re-measurement marker of the restored f70b35b8 delta (no functional change).
