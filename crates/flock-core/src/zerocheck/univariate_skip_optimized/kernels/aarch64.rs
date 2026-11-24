@@ -2476,6 +2476,9 @@ fn static_a_k1_partial(inv_table: &InvNttTableByteSingleGf8) -> &'static [u8; 64
     })
 }
 
+#[cfg(target_arch = "aarch64")]
+const ABV_OMIT_MIXED_ONES: u32 = 1 << 21;
+
 /// Horner / scaled-table twin of [`shift_reduce_inner_mixed_const_b`]. Rows
 /// selected by `ONE_MASK` have B = 1 and therefore widen the transformed A
 /// bytes directly; all other rows form the same raw PMULL products as the h4
@@ -2501,6 +2504,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
     use crate::field::gf2_8::neon::gf8_reduce_vec16;
     use core::arch::aarch64::*;
 
+    const { assert!(V & ABV_OMIT_MIXED_ONES == 0 || ONE_MASK == 0x03 || ONE_MASK == 0xf0) };
     let plain = inv_table.data_ptr();
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
@@ -2532,7 +2536,10 @@ fn shift_reduce_inner_mixed_const_b_h4<
         // The A image of K word `$k` (each form as described inline).
         macro_rules! a_img {
             ($at:expr, $at_sw:expr, $kara:expr, $k:literal) => {{
-                if STATIC_A && $k == 1 {
+                if V & ABV_OMIT_MIXED_ONES != 0 && ONE_MASK & (1 << $k) != 0 {
+                    let zero = vdupq_n_u8(0);
+                    (zero, zero, zero, zero)
+                } else if STATIC_A && $k == 1 {
                     let p = a_k1_partial.unwrap_unchecked().as_ptr();
                     (
                         vld1q_u8(p),
@@ -2635,18 +2642,48 @@ fn shift_reduce_inner_mixed_const_b_h4<
                     ([da0, da1, da2, da3], db)
                 }};
             }
+            let omit_high = V & ABV_OMIT_MIXED_ONES != 0 && ONE_MASK == 0xf0;
             let o3 = opnds!(plain, plain_sw, kplain, 3);
-            let o7 = opnds!(scaled, scaled_sw, kscaled, 7);
-            let mut acc = fuse_seed(&o3, &o7);
+            let mut acc = if omit_high {
+                fuse_products(&o3)
+            } else {
+                let o7 = opnds!(scaled, scaled_sw, kscaled, 7);
+                fuse_seed(&o3, &o7)
+            };
+            let zero = [vdupq_n_u16(0); 8];
             let o2 = opnds!(plain, plain_sw, kplain, 2);
-            let o6 = opnds!(scaled, scaled_sw, kscaled, 6);
-            fuse_absorb_first(&mut acc, &o2, &o6);
-            let o1 = opnds!(plain, plain_sw, kplain, 1);
-            let o5 = opnds!(scaled, scaled_sw, kscaled, 5);
-            fuse_absorb_k1(&mut acc, &o1, &o5);
-            let o0 = opnds!(plain, plain_sw, kplain, 0);
-            let o4 = opnds!(scaled, scaled_sw, kscaled, 4);
-            fuse_absorb_k0(&mut acc, &o0, &o4);
+            if omit_high {
+                horner_absorb_first(&mut acc, &fuse_products(&o2), &zero);
+            } else {
+                let o6 = opnds!(scaled, scaled_sw, kscaled, 6);
+                fuse_absorb_first(&mut acc, &o2, &o6);
+            }
+            if V & ABV_OMIT_MIXED_ONES != 0 {
+                let one = if omit_high {
+                    opnds!(plain, plain_sw, kplain, 1)
+                } else {
+                    opnds!(scaled, scaled_sw, kscaled, 5)
+                };
+                horner_absorb_k1::<V>(
+                    &mut acc,
+                    &fuse_products(&one),
+                    &zero,
+                    vreinterpretq_u8_u16(vdupq_n_u16(!HORNER_CARRY_X16)),
+                );
+                let base = if omit_high {
+                    opnds!(plain, plain_sw, kplain, 0)
+                } else {
+                    opnds!(scaled, scaled_sw, kscaled, 4)
+                };
+                acc = fuse_acc(&acc, &base);
+            } else {
+                let o1 = opnds!(plain, plain_sw, kplain, 1);
+                let o5 = opnds!(scaled, scaled_sw, kscaled, 5);
+                fuse_absorb_k1(&mut acc, &o1, &o5);
+                let o0 = opnds!(plain, plain_sw, kplain, 0);
+                let o4 = opnds!(scaled, scaled_sw, kscaled, 4);
+                fuse_absorb_k0(&mut acc, &o0, &o4);
+            }
             let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
             let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
             let r2 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[4]), vreinterpretq_u8_u16(acc[5]));
@@ -6042,6 +6079,54 @@ pub(crate) fn ab_mixed_row_direct(
     ab_kara_enabled()
         && ab_mixed_row_direct_route()
         && ab_mixed_row_guarded(a_packed, b_packed, inv_table, chunk_byte_base, b_med, w0, out, nt_store)
+}
+
+/// Keep the complete mixed-row path under its alternate process settings.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn ab_mixed_row_residual_enabled() -> bool {
+    ab_mixed_row_direct_route()
+        && ab_mixed_h2_enabled()
+        && ab_mixed_fuse_enabled()
+        && ab_kara_lanez_enabled()
+}
+
+/// Produce the remaining terms of a mixed row after its certified B=1
+/// terms are moved to C recovery. The caller owns that proof-wide receipt.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ab_mixed_row_residual(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    b_med: usize,
+    w0: bool,
+    out: &mut [u8; 64],
+    nt_store: bool,
+) {
+    const MAIN: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_KARA_LANEZ | ABV_OMIT_MIXED_ONES;
+    const HELPER: u32 = ABV_HZ | ABV_OMIT_MIXED_ONES;
+    let base = chunk_byte_base + b_med * N_CHUNKS * 8;
+    assert!(base + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
+    macro_rules! run {
+        ($variant:ident) => {
+            if w0 {
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0, $variant>(
+                    a_packed, b_packed, inv_table, base, None, out, nt_store,
+                );
+            } else {
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, $variant>(
+                    a_packed, b_packed, inv_table, base, None, out, nt_store,
+                );
+            }
+        };
+    }
+    if ab_kara_enabled() {
+        run!(MAIN);
+    } else {
+        run!(HELPER);
+    }
 }
 
 /// The guards and the kernel call of [`ab_mixed_row_direct`]: the

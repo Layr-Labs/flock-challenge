@@ -102,14 +102,23 @@ pub struct BlockR1cs {
 /// packed prefix has `A = C = Z` before identity-prefix omission is valid.
 /// The optional output-window extension additionally checks B's fixed mask
 /// and A/B padding; evaluated A=Z there also requires the producer guarantee.
+/// The mixed-ones extension checks the six complete B words separately and
+/// likewise requires the producer's evaluated A=Z guarantee for those words.
 #[derive(Clone, Copy, Debug)]
 pub struct Round1PinnedOnePrefixStatement {
     output_window: bool,
+    mixed_ones: bool,
 }
+
+pub(crate) const ROUND1_MIXED_ONE_ROWS: [usize; 6] = [16, 17, 236, 237, 238, 239];
 
 impl Round1PinnedOnePrefixStatement {
     pub fn includes_output_window(self) -> bool {
         self.output_window
+    }
+
+    pub(crate) fn includes_mixed_ones(self) -> bool {
+        self.mixed_ones
     }
 }
 
@@ -217,7 +226,10 @@ impl BlockR1cs {
                 .get(i)
                 .is_some_and(|row| row.as_slice() == [const_pin])
         });
-        prefix_matches.then_some(Round1PinnedOnePrefixStatement { output_window: false })
+        prefix_matches.then_some(Round1PinnedOnePrefixStatement {
+            output_window: false,
+            mixed_ones: false,
+        })
     }
 
     /// C1 plus C1b's fixed window-30 B mask and empty A/B padding rows.
@@ -244,6 +256,11 @@ impl BlockR1cs {
             return None;
         }
         statement.output_window = true;
+        statement.mixed_ones = ROUND1_MIXED_ONE_ROWS.iter().all(|&row| {
+            self.b_0.rows[64 * row..64 * (row + 1)]
+                .iter()
+                .all(|row| row.as_slice() == [512])
+        });
         Some(statement)
     }
 
@@ -944,6 +961,39 @@ mod tests {
         r1cs.c_0.rows[3] = vec![2];
         assert!(!r1cs.c0_is_identity());
         assert!(r1cs.digest_cache.get().is_none());
+    }
+
+    #[test]
+    fn mixed_ones_receipt_requires_each_public_b_word() {
+        const K: usize = 1 << 14;
+        let blank = || SparseBinaryMatrix { num_rows: K, num_cols: K, rows: vec![vec![]; K] };
+        let mut r1cs = test_r1cs(blank(), blank(), identity(K));
+        r1cs.m = 32;
+        r1cs.k_log = 14;
+        r1cs.k_skip = 6;
+        r1cs.useful_bits = 15_409;
+        r1cs.const_pin = Some(512);
+        for bit in (0..1024).chain(1024..1152).chain(15104..15409) {
+            r1cs.b_0.rows[bit] = vec![512];
+        }
+        let receipt = |r1cs: &BlockR1cs| {
+            let scanned = r1cs.round1_pinned_one_prefix_and_output_statement().unwrap();
+            let cached = r1cs.round1_pinned_one_prefix_and_output_statement_cached_identity().unwrap();
+            assert_eq!(scanned.includes_mixed_ones(), cached.includes_mixed_ones());
+            scanned
+        };
+        assert!(receipt(&r1cs).includes_mixed_ones());
+        for word in ROUND1_MIXED_ONE_ROWS {
+            for bit in [64 * word, 64 * word + 63] {
+                r1cs.b_0.rows[bit] = vec![513];
+                let rejected = receipt(&r1cs);
+                assert!(rejected.includes_output_window());
+                assert!(!rejected.includes_mixed_ones());
+                r1cs.b_0.rows[bit] = vec![512];
+            }
+        }
+        r1cs.layout = WitnessLayout::BatchMajor;
+        assert!(r1cs.round1_pinned_one_prefix_and_output_statement().is_none());
     }
 
     #[test]

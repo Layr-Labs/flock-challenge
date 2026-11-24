@@ -504,7 +504,7 @@ pub fn stage_commit_tail_fill<C: Challenger>(
             padding.useful_bits_per_block,
             &r,
         );
-        if crate::zc_timing_env_on() {
+        if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
             eprintln!(
                 "[commit-tail-fill] stage at graph completion: staged={staged} {:.2} ms",
                 t_stage.elapsed().as_secs_f64() * 1e3
@@ -591,7 +591,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = crate::zc_timing_env_on();
+    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
     let cpu_r1 = crate::pcs::commit::commit_cpu_ms();
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
@@ -646,6 +646,10 @@ fn prove_packed_padded_inner<C: Challenger>(
             };
             let recover_identity_prefix = ab_inner.identity_prefix_was_omitted();
             let recover_output_window = ab_inner.output_window_was_omitted();
+            let recover_mixed_ones = ab_inner.mixed_ones_were_omitted();
+            if zc_timing && recover_mixed_ones {
+                eprintln!("[zc-timing] round1 C recovery: six mixed-one terms");
+            }
             let r_ref: &[F128] = &r;
             // The C fold reads only the stripe, r and the C prelude — never
             // the AB completion — so it may run anywhere before z is sampled.
@@ -667,6 +671,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                             c_prelude,
                             recover_identity_prefix,
                             recover_output_window,
+                            recover_mixed_ones,
                         );
                     if zc_timing {
                         eprintln!(
@@ -698,6 +703,7 @@ fn prove_packed_padded_inner<C: Challenger>(
                             c_prelude,
                             recover_identity_prefix,
                             recover_output_window,
+                            recover_mixed_ones,
                         );
                     if zc_timing {
                         eprintln!(

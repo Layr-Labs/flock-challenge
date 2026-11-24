@@ -45,7 +45,7 @@ use std::sync::OnceLock;
 
 use crate::field::{F8, F128, PHI_8_TABLE, mul_by_x, phi8};
 use crate::ntt::InvNttTableByteSingleGf8;
-use crate::r1cs::Round1PinnedOnePrefixStatement;
+use crate::r1cs::{ROUND1_MIXED_ONE_ROWS, Round1PinnedOnePrefixStatement};
 
 use super::PaddingSpec;
 use super::univariate_skip::{
@@ -811,27 +811,37 @@ pub struct Round1AbInner {
 enum Round1AbRepresentation {
     Complete,
     Blake3IdentityPrefixOmitted { output_window: bool },
+    Blake3MixedOnesOmitted,
 }
 
 impl Round1AbRepresentation {
     #[inline]
     fn first_materialized_b_med(self, within_hash_outer: usize) -> usize {
         match self {
-            Self::Blake3IdentityPrefixOmitted { .. } if within_hash_outer == 0 => 2,
+            Self::Blake3IdentityPrefixOmitted { .. } | Self::Blake3MixedOnesOmitted
+                if within_hash_outer == 0 => 2,
             _ => 0,
         }
     }
 
     #[inline]
     fn materialized_b_med_end(self, within_hash_outer: usize, n_b_med: usize) -> usize {
-        if matches!(self, Self::Blake3IdentityPrefixOmitted { output_window: true })
-            && within_hash_outer == 1
-        {
+        if self.omits_output_window() && within_hash_outer == 1 {
             debug_assert_eq!(n_b_med, 15);
             14
         } else {
             n_b_med
         }
+    }
+
+    #[inline]
+    fn omits_mixed_ones(self) -> bool {
+        self == Self::Blake3MixedOnesOmitted
+    }
+
+    #[inline]
+    fn omits_output_window(self) -> bool {
+        matches!(self, Self::Blake3IdentityPrefixOmitted { output_window: true } | Self::Blake3MixedOnesOmitted)
     }
 }
 
@@ -862,12 +872,17 @@ impl Round1AbInner {
 
     #[inline]
     pub(crate) fn identity_prefix_was_omitted(&self) -> bool {
-        matches!(self.representation, Round1AbRepresentation::Blake3IdentityPrefixOmitted { .. })
+        self.representation != Round1AbRepresentation::Complete
     }
 
     #[inline]
     pub(crate) fn output_window_was_omitted(&self) -> bool {
-        matches!(self.representation, Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true })
+        self.representation.omits_output_window()
+    }
+
+    #[inline]
+    pub(crate) fn mixed_ones_were_omitted(&self) -> bool {
+        self.representation.omits_mixed_ones()
     }
 
     /// Donate the now-dead transform to a byte-oriented scratch consumer
@@ -1503,8 +1518,21 @@ fn precompute_round1_ab_inner_packed_padded_body(
         assert!(m >= padding.k_log, "C1 requires complete blocks");
         assert_eq!(padding.k_log, 14, "C1 requires 16,384-bit blocks");
         assert_eq!(padding.useful_bits_per_block, 15_409);
-        Round1AbRepresentation::Blake3IdentityPrefixOmitted {
-            output_window: statement.includes_output_window(),
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let mixed_residual_enabled = kernels::aarch64::ab_mixed_row_residual_enabled()
+            && std::env::var_os("FLOCK_NO_ZC_AB_C_MIXED_RECOVERY").is_none();
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let mixed_residual_enabled = false;
+        if mixed_residual_enabled
+            && (m == 32 || cfg!(test))
+            && statement.includes_output_window()
+            && statement.includes_mixed_ones()
+        {
+            Round1AbRepresentation::Blake3MixedOnesOmitted
+        } else {
+            Round1AbRepresentation::Blake3IdentityPrefixOmitted {
+                output_window: statement.includes_output_window(),
+            }
         }
     } else {
         Round1AbRepresentation::Complete
@@ -1552,7 +1580,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         // `total_bytes`; zero is a valid object representation for F128.
         unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
     }
-    if use_provenance && crate::zc_timing_env_on() {
+    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
         let (hits, misses) = ab_compact_backing_token_counts();
         eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
     }
@@ -2560,16 +2588,26 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
         } else {
             0
         };
-        // The two mixed const-one rows call the kernel the dispatcher picks
-        // for them directly when its guards hold (same kernel, same inputs);
-        // any other case, or `FLOCK_NO_ZC_AB_MIXED_ROW_DIRECT`, runs the
-        // dispatcher. A worker's `mixed_plan` (1, 2) is the route and kernel
-        // `ab_mixed_row_direct` resolves on its thread, resolved once
-        // (`FLOCK_NO_ZC_AB_MIXED_PLAN=1`: 0, the per-row route).
+        // A certified mixed omission leaves just the residual products.
+        // Otherwise keep the worker's planned kernel, per-row route and
+        // generic fallback.
         #[cfg(target_arch = "aarch64")]
         let done = const_one_mask != 0
-            && match mixed_plan {
-                kernels::aarch64::AB_MIXED_PLAN_VL => kernels::aarch64::ab_mixed_row_planned::<true>(
+            && match (representation.omits_mixed_ones(), mixed_plan) {
+                (true, _) => {
+                    kernels::aarch64::ab_mixed_row_residual(
+                        a_packed,
+                        b_packed,
+                        inv_table,
+                        chunk_byte_base,
+                        b_med,
+                        const_one_mask == 0x03,
+                        dst,
+                        direct,
+                    );
+                    true
+                }
+                (false, kernels::aarch64::AB_MIXED_PLAN_VL) => kernels::aarch64::ab_mixed_row_planned::<true>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -2579,7 +2617,7 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
                     dst,
                     direct,
                 ),
-                kernels::aarch64::AB_MIXED_PLAN_V0 => kernels::aarch64::ab_mixed_row_planned::<false>(
+                (false, kernels::aarch64::AB_MIXED_PLAN_V0) => kernels::aarch64::ab_mixed_row_planned::<false>(
                     a_packed,
                     b_packed,
                     inv_table,
@@ -4703,7 +4741,7 @@ pub(crate) fn round1_c_prelude(
             if let Some((eq_outer, job, submitted)) =
                 crate::gpu_commit::adopt_staged_zc_fold(c_lincheck, r)
             {
-                if crate::zc_timing_env_on() {
+                if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
                     eprintln!("[commit-tail-fill] staged C prelude adopted");
                 }
                 return Round1CPrelude {
@@ -4894,8 +4932,9 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     prelude: Round1CPrelude,
     recover_identity_prefix: bool,
     recover_output_window: bool,
+    recover_mixed_ones: bool,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Option<Vec<F128>>) {
-    assert!(!recover_output_window || recover_identity_prefix);
+    assert!(!(recover_output_window || recover_mixed_ones) || recover_identity_prefix);
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 5,
@@ -4909,7 +4948,7 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
     // been repaired on CPU. The same complete C inner fold feeds both the
     // incumbent C/capture derivation and the omitted AB-region recovery.
     let recovered_ab = recover_identity_prefix.then(|| {
-        let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table);
+        let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table, recover_mixed_ones);
         if recover_output_window {
             add_round1_output_window_ab_recovery(&mut ab, &c_inner, r, inv_table);
         }
@@ -5018,8 +5057,9 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
     prelude: Round1CPrelude,
     recover_identity_prefix: bool,
     recover_output_window: bool,
+    recover_mixed_ones: bool,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Option<Vec<F128>>) {
-    assert!(!recover_output_window || recover_identity_prefix);
+    assert!(!(recover_output_window || recover_mixed_ones) || recover_identity_prefix);
     assert_eq!(k_skip, K_SKIP);
     assert!(
         k_log >= k_skip + 7,
@@ -5035,7 +5075,7 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
         r2_c_capture_store(&c_inner);
     }
     let recovered_ab = recover_identity_prefix.then(|| {
-        let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table);
+        let mut ab = round1_identity_prefix_ab_recovery(&c_inner, r, k_log, inv_table, recover_mixed_ones);
         if recover_output_window {
             add_round1_output_window_ab_recovery(&mut ab, &c_inner, r, inv_table);
         }
@@ -5076,8 +5116,8 @@ pub(crate) fn round1_c_fold8_from_lincheck_stripe(
 }
 
 /// Recover the optimized-convention round-one AB contribution of the first
-/// 1,024 bits in every 16,384-bit block from identity C's already-completed
-/// inner fold.
+/// 1,024 bits in every 16,384-bit block and any certified mixed-row terms
+/// from identity C's already-completed inner fold.
 ///
 /// `t` is kept as the original eight-coordinate index: rows `0..16` have the
 /// four high coordinates equal to zero, so `eq(r[6..14], t)` is the exact
@@ -5088,13 +5128,15 @@ fn round1_identity_prefix_ab_recovery(
     r: &[F128],
     k_log: usize,
     inv_table: &InvNttTableByteSingleGf8,
+    mixed_ones: bool,
 ) -> Vec<F128> {
     assert_eq!(k_log, 14, "identity-prefix recovery fixes 16,384-bit blocks");
     assert!(c_inner.len() >= 1_024);
     assert!(r.len() >= k_log);
     let eq_inner = build_eq(&r[K_SKIP..k_log]);
     let mut recovered_s = [F128::ZERO; ELL];
-    for t in 0..16 {
+    let mixed_rows: &[usize] = if mixed_ones { &ROUND1_MIXED_ONE_ROWS } else { &[] };
+    for t in (0..16).chain(mixed_rows.iter().copied()) {
         let weight = eq_inner[t];
         for lane in 0..ELL {
             recovered_s[lane] += weight * c_inner[ELL * t + lane];
@@ -6231,7 +6273,7 @@ mod tests {
     /// view, at any shape the rebuild accepts.
     #[test]
     fn r2_offer_ceil_within_published_prefix() {
-        assert_eq!(crate::gpu_commit::zc_r2_offer_ceil_chunks(2048), 1024);
+        assert_eq!(crate::gpu_commit::zc_r2_offer_ceil_chunks(2048), 880);
         for log_hi in 3..=14usize {
             let hi = 1usize << log_hi;
             let offer = crate::gpu_commit::zc_r2_offer_ceil_chunks(hi);
@@ -6249,6 +6291,82 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mixed_one_c_recovery_matches_full_round1_terms() {
+        const K_LOG: usize = 14;
+        const M: usize = 17;
+        let table = InvNttTableByteSingleGf8::cached_standard_k6();
+        let mut state = 0xc7a1_1cd5_7814_31efu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..3 {
+            let mut r = [F128::ZERO; M];
+            r[6..9].copy_from_slice(&small_challenges_ghash());
+            r[9..13].copy_from_slice(&medium_challenges_ghash());
+            for weight in &mut r[13..] {
+                *weight = match case {
+                    0 => F128::ZERO,
+                    1 => F128::ONE,
+                    _ => F128 { lo: next(), hi: next() },
+                };
+            }
+            let instance_weights = build_eq(&r[K_LOG..]);
+            let outer_weights = build_eq(&r[13..]);
+            let mut c_inner = vec![F128::ZERO; 1 << K_LOG];
+            let mut full = [F128::ZERO; ELL];
+            let mut residual = [F128::ZERO; ELL];
+            for (instance, &instance_weight) in instance_weights.iter().enumerate() {
+                for (window, (b_med, ones)) in [(2, 0x03), (13, 0xf0)].into_iter().enumerate() {
+                    let mut a = [0u8; 64];
+                    let mut b = [0u8; 64];
+                    let mut direct = [F8::ZERO; ELL];
+                    for k in 0..8 {
+                        let a_word = next();
+                        let b_word = if ones & (1 << k) != 0 { u64::MAX } else { next() };
+                        let t = (window * 16 + b_med) * 8 + k;
+                        let start = 8 * k;
+                        a[start..start + 8].copy_from_slice(&a_word.to_le_bytes());
+                        b[start..start + 8].copy_from_slice(&b_word.to_le_bytes());
+                        if ROUND1_MIXED_ONE_ROWS.contains(&t) {
+                            for lane in 0..ELL {
+                                if (a_word & b_word) >> lane & 1 != 0 {
+                                    c_inner[ELL * t + lane] += instance_weight;
+                                }
+                            }
+                        }
+                        let mut ta = [F8::ZERO; ELL];
+                        let mut tb = [F8::ZERO; ELL];
+                        table.apply(&a_word.to_le_bytes(), &mut ta);
+                        table.apply(&b_word.to_le_bytes(), &mut tb);
+                        for lane in 0..ELL {
+                            direct[lane] += F8(1 << k) * ta[lane] * tb[lane];
+                        }
+                    }
+                    let mut out = [0u8; ELL];
+                    kernels::aarch64::ab_mixed_row_residual(
+                        &a, &b, table, 0, 0, window == 0, &mut out, false,
+                    );
+                    let weight = d_inv() * outer_weights[2 * instance + window];
+                    let row = &convert_table()[256 * b_med..256 * (b_med + 1)];
+                    for lane in 0..ELL {
+                        full[lane] += weight * row[direct[lane].0 as usize];
+                        residual[lane] += weight * row[out[lane] as usize];
+                    }
+                }
+            }
+            let recovered = round1_identity_prefix_ab_recovery(&c_inner, &r, K_LOG, table, true);
+            for (residual, recovered) in residual.iter_mut().zip(recovered) {
+                *residual += recovered;
+            }
+            assert_eq!(residual, full, "challenge case {case}");
+        }
+    }
     use crate::ntt::AdditiveNttGf8;
     use crate::zerocheck::univariate_skip::round1_naive;
 
@@ -11235,6 +11353,7 @@ mod tests {
                 round1_c_prelude(&c_lincheck, M, K_LOG, padding.useful_bits_per_block, &r),
                 false,
                 false,
+                false,
             );
             assert_eq!(got_c.0, incumbent.1, "round-one C mismatch in case {case}");
             assert_eq!(got_c.1, incumbent.2, "canonical C mismatch in case {case}");
@@ -11252,6 +11371,7 @@ mod tests {
                 &r,
                 &inv_table,
                 round1_c_prelude(&c_lincheck, M, K_LOG, padding.useful_bits_per_block, &r),
+                false,
                 false,
                 false,
             );
