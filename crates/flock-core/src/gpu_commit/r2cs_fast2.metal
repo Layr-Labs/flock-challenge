@@ -40,13 +40,28 @@ kernel void zc_r2_products_horner_cs(
     ushort simd_group [[simdgroup_index_in_threadgroup]],
     ushort simd_lane  [[thread_index_in_simdgroup]])
 {
-    threadgroup ulong4 red[256];
-    threadgroup uint4* nib = reinterpret_cast<threadgroup uint4*>(red);
+    threadgroup uint4 tab8[1824];
+    threadgroup ulong4* red = reinterpret_cast<threadgroup ulong4*>(tab8);
+    threadgroup uint4* nib = tab8;
     nib[lid] = nib_tab_dev[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        uint lo_n = lid & 15u;
+        uint hi_n = lid >> 4u;
+        uint4 b0 = nib[lo_n] ^ nib[16u + hi_n];
+        if (lid < 32u) {
+            tab8[1792u + lid] = nib[224u + lid];
+        }
+        for (uint b = 1u; b < 7u; b++) {
+            tab8[b * 256u + lid] = nib[b * 32u + lo_n] ^ nib[b * 32u + 16u + hi_n];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tab8[lid] = b0;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // Whether the all-ones row folds to exactly ONE (the table is a
     // partition of unity): the premise of the b == 1 step for live pairs.
-    bool c_one = all(zc_r2_fold<ZC_R2_PL>(0xffffffffu, 0xffffffffu, nib) == uint4(1u, 0u, 0u, 0u));
+    bool c_one = all(zc_r2_cs_fold7b_1n(0xffffffffu, 0xffffffffu, tab8) == uint4(1u, 0u, 0u, 0u));
 
     uint hi_chunk = tgid >> 2;
     // lid bits -> window bit 0 = bit 5, window bits 1..4 = bits 1..4,
@@ -55,10 +70,10 @@ kernel void zc_r2_products_horner_cs(
     uint window = ((tgid & 3u) << 6) | ((block >> 2) << 5) | (lid & 30u) | (block & 1u);
     uint small_class = (((block >> 1) & 1u) << 1) | (lid & 1u);
     bool odd_lane = (small_class & 1u) != 0u;
-    U256k h1 = {0ul, 0ul, 0ul, 0ul};
-    U256k hi = {0ul, 0ul, 0ul, 0ul};
-    U256k wa = {0ul, 0ul, 0ul, 0ul};
-    U256k wb = {0ul, 0ul, 0ul, 0ul};
+    U256u h1 = {uint4(0u), uint4(0u)};
+    U256u hi = {uint4(0u), uint4(0u)};
+    U256u wa = {uint4(0u), uint4(0u)};
+    U256u wb = {uint4(0u), uint4(0u)};
     bool head_bad = false;
     for (uint step = 0u; step < (p.xpt & 0x7fffffffu); step++) {
         uint medium = 15u - step;
@@ -90,18 +105,18 @@ kernel void zc_r2_products_horner_cs(
             uint pib = pair_idx & 127u;
             if (cl.pad0 != 0u && (pib < 8u || pib == 118u || pib == 119u)) {
                 if (!pad) {
-                    a0 = zc_r2_fold<ZC_R2_PL>(ar.x, ar.y, nib);
+                    a0 = zc_r2_cs_fold7b_1n(ar.x, ar.y, tab8);
                     zc_r2_cs_store(pair_idx, ar, br, a0, uint4(1u, 0u, 0u, 0u), cs_anchors, cs_deltas, cl);
                 }
-                zc_r2_cs_horner_shift(h1);
-                zc_r2_cs_horner_shift(hi);
-                zc_r2_cs_horner_shift(wa);
-                zc_r2_cs_horner_shift(wb);
+                zc_r2_cs_horner_shift_u8(h1);
+                zc_r2_cs_horner_shift_u8(hi);
+                zc_r2_cs_horner_shift_u8(wa);
+                zc_r2_cs_horner_shift_u8(wb);
                 continue;
             }
             if (!pad) {
-                a0 = zc_r2_fold<ZC_R2_PL>(ar.x, ar.y, nib);
-                a1 = zc_r2_fold<ZC_R2_PL>(ar.z, ar.w, nib);
+                a0 = zc_r2_cs_fold7b_1n(ar.x, ar.y, tab8);
+                a1 = zc_r2_cs_fold7b_1n(ar.z, ar.w, tab8);
                 zc_r2_cs_store(pair_idx, ar, br, a0, uint4(1u, 0u, 0u, 0u), cs_anchors, cs_deltas, cl);
             }
             // Group partners are lanes lid and lid ^ 1, pairs pair_idx and
@@ -111,23 +126,20 @@ kernel void zc_r2_products_horner_cs(
             bool lone = pad != (((pair_idx ^ 1u) & p.mask) >= p.useful);
             uint4 w0 = odd_lane ? a0 : (lone ? a0 ^ pa0 : uint4(0u));
             uint4 w1 = (!odd_lane && lone) ? a1 ^ pa1 : uint4(0u);
-            zc_r2_cs_horner_shift(h1);
-            h1.r0 ^= (ulong(a1.y) << 32) | a1.x;
-            h1.r1 ^= (ulong(a1.w) << 32) | a1.z;
-            zc_r2_cs_horner_shift(hi);
-            zc_r2_cs_horner_shift(wa);
-            wa.r0 ^= (ulong(w0.y) << 32) | w0.x;
-            wa.r1 ^= (ulong(w0.w) << 32) | w0.z;
-            zc_r2_cs_horner_shift(wb);
-            wb.r0 ^= (ulong(w1.y) << 32) | w1.x;
-            wb.r1 ^= (ulong(w1.w) << 32) | w1.z;
+            zc_r2_cs_horner_shift_u8(h1);
+            h1.lo ^= a1;
+            zc_r2_cs_horner_shift_u8(hi);
+            zc_r2_cs_horner_shift_u8(wa);
+            wa.lo ^= w0;
+            zc_r2_cs_horner_shift_u8(wb);
+            wb.lo ^= w1;
             continue;
         }
         if (!pad) {
-            a0 = zc_r2_fold<ZC_R2_PL>(ar.x, ar.y, nib);
-            a1 = zc_r2_fold<ZC_R2_PL>(ar.z, ar.w, nib);
-            b0 = zc_r2_fold<ZC_R2_PL>(br.x, br.y, nib);
-            b1 = zc_r2_fold<ZC_R2_PL>(br.z, br.w, nib);
+            a0 = zc_r2_cs_fold7b_1n(ar.x, ar.y, tab8);
+            a1 = zc_r2_cs_fold7b_1n(ar.z, ar.w, tab8);
+            b0 = zc_r2_cs_fold7b_1n(br.x, br.y, tab8);
+            b1 = zc_r2_cs_fold7b_1n(br.z, br.w, tab8);
             zc_r2_cs_store(pair_idx, ar, br, a0, b0, cs_anchors, cs_deltas, cl);
             // Head-compacted state: a head pair's b rows must be all ones.
             if (cl.hc != 0u && (pair_idx & 127u) < 8u) {
@@ -170,9 +182,11 @@ kernel void zc_r2_products_horner_cs(
                     y = odd_lane ? (b0 ^ b1) ^ rv : b1 ^ rv;
                 }
             }
-            zc_r2_cs_horner_shift(h1);
-            zc_r2_cs_horner_add(h1, zc_r2_cs_clmul128p(x, y));
-            U256k th = h1; h1 = hi; hi = wa; wa = wb; wb = th;
+            zc_r2_cs_horner_shift_u8(h1);
+            U256u pr = zc_r2_cs_clmul128_u16(x, y);
+            h1.lo ^= pr.lo;
+            h1.hi ^= pr.hi;
+            U256u th = h1; h1 = hi; hi = wa; wa = wb; wb = th;
         }
     }
     if (head_bad) {
@@ -189,13 +203,13 @@ kernel void zc_r2_products_horner_cs(
     // (group * 4 + accumulator) * 2 + parity; lanes 0..7 then sum and weigh
     // one output slot each.
     {
-        uint4 r0 = gf_reduce(h1);
-        uint4 r1 = gf_reduce(hi);
-        uint4 r2 = gf_reduce(wa);
-        uint4 r3 = gf_reduce(wb);
+        uint4 r0 = gf_reduce(zc_r2_cs_u8_to_k(h1));
+        uint4 r1 = gf_reduce(zc_r2_cs_u8_to_k(hi));
+        uint4 r2 = gf_reduce(zc_r2_cs_u8_to_k(wa));
+        uint4 r3 = gf_reduce(zc_r2_cs_u8_to_k(wb));
         #pragma clang loop unroll(disable)
         for (uint k = 0u; k < 4u; k++) {
-            U256k t = zc_r2_cs_simd_parity_xor(zc_r2_cs_clmul128(k < 2u ? e : lam, r0), simd_width);
+            U256k t = zc_r2_cs_simd_parity_xor(zc_r2_cs_u8_to_k(zc_r2_cs_clmul128_u16(k < 2u ? e : lam, r0)), simd_width);
             uint4 tr = r0; r0 = r1; r1 = r2; r2 = r3; r3 = tr;
             if (simd_lane < 2u) {
                 red[(uint(simd_group) * 4u + k) * 2u + uint(simd_lane)] = ulong4(t.r0, t.r1, t.r2, t.r3);

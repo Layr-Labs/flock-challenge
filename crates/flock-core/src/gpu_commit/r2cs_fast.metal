@@ -20,6 +20,89 @@
 //    the weighing pass reduces the four accumulators first and stores
 //    each SIMD sum as soon as it is formed.
 
+// Native 16x16->32 carry-less product via explicit ushort operands: on Apple
+// Silicon GPUs, uint(ushort) * uint(ushort) lowers to a single 16x16->32 imad
+// instead of a multi-instruction 32x32 multiply. Pure 32-bit Karatsuba avoids
+// 64-bit shifts/ORs in the hot inner loop.
+struct U256u { uint4 lo; uint4 hi; };
+
+static inline uint zc_r2_cs_leaf3_u16(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
+    return r0 | r1 | r2;
+}
+
+static inline uint2 zc_r2_cs_clmul32_u16(uint a, uint b) {
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = zc_r2_cs_leaf3_u16(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = zc_r2_cs_leaf3_u16(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = zc_r2_cs_leaf3_u16(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
+    return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
+}
+
+static inline uint4 zc_r2_cs_clmul64_u16(uint2 a, uint2 b) {
+    uint2 p0 = zc_r2_cs_clmul32_u16(a.x, b.x);
+    uint2 p2 = zc_r2_cs_clmul32_u16(a.y, b.y);
+    uint2 pm = zc_r2_cs_clmul32_u16(a.x ^ a.y, b.x ^ b.y) ^ p0 ^ p2;
+    return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
+}
+
+static inline U256u zc_r2_cs_clmul128_u16(uint4 a, uint4 b) {
+    uint4 p0 = zc_r2_cs_clmul64_u16(a.xy, b.xy);
+    uint4 p2 = zc_r2_cs_clmul64_u16(a.zw, b.zw);
+    uint4 pm = zc_r2_cs_clmul64_u16(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
+    return {
+        uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y),
+        uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w)
+    };
+}
+
+static inline void zc_r2_cs_horner_shift_u8(thread U256u& h) {
+    uint c = h.hi.w >> 31;
+    h.hi.w = (h.hi.w << 1) | (h.hi.z >> 31);
+    h.hi.z = (h.hi.z << 1) | (h.hi.y >> 31);
+    h.hi.y = (h.hi.y << 1) | (h.hi.x >> 31);
+    h.hi.x = (h.hi.x << 1) | (h.lo.w >> 31);
+    h.lo.w = (h.lo.w << 1) | (h.lo.z >> 31);
+    h.lo.z = (h.lo.z << 1) | (h.lo.y >> 31);
+    h.lo.y = (h.lo.y << 1) | (h.lo.x >> 31);
+    h.lo.x = (h.lo.x << 1) ^ (c * 0x4015u);
+}
+
+static inline U256k zc_r2_cs_u8_to_k(U256u u) {
+    U256k r;
+    r.r0 = (ulong(u.lo.y) << 32) | u.lo.x;
+    r.r1 = (ulong(u.lo.w) << 32) | u.lo.z;
+    r.r2 = (ulong(u.hi.y) << 32) | u.hi.x;
+    r.r3 = (ulong(u.hi.w) << 32) | u.hi.z;
+    return r;
+}
+
+// 7 full byte tables (bytes 0..6: 7 * 256 = 1792 uint4s) + byte 7's 32 nibble
+// entries (tab[1792..1824]): 29,184 B total, leaving headroom below Apple
+// Silicon's 32,768 B threadgroup memory cap for r2steal's claim word while
+// cutting SRAM loads per fold from 16 to 9 (-44%).
+static inline uint4 zc_r2_cs_fold7b_1n(uint lo, uint hi, threadgroup const uint4* tab) {
+    uchar4 a = as_type<uchar4>(lo);
+    uchar4 b = as_type<uchar4>(hi);
+    return tab[a.x]
+         ^ tab[256u  + a.y]
+         ^ tab[512u  + a.z]
+         ^ tab[768u  + a.w]
+         ^ tab[1024u + b.x]
+         ^ tab[1280u + b.y]
+         ^ tab[1536u + b.z]
+         ^ tab[1792u + (b.w & 15u)]
+         ^ tab[1808u + (b.w >> 4u)];
+}
+
 // Nine products of the bit-position-mod-3 planes of two 16-bit values
 // (the same products and masks as zc_r2_cs_clmul16).
 static inline uint zc_r2_cs_leaf3(uint a0, uint a1, uint a2, uint b0, uint b1, uint b2) {
