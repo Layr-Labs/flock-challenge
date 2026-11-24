@@ -1203,7 +1203,7 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 1024;
 
 pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
-const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
+const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 1024;
 
 /// Kill switch for the K arm's faster fold kernel (`FLOCK_NO_ZC_K_V2`, any
 /// value): the embedded `zc_k_fold` and the record's share
@@ -5765,54 +5765,50 @@ kernel void zc_k_finish(
 #include <metal_stdlib>
 using namespace metal;
 
-// 16x16 carry-less product from 9 native 32-bit integer products: each
-// factor split by bit position mod 3, so a product of two masked parts has at
-// most 6 overlapping terms per result bit (16 bits / spacing 3) and its sums
+// 16x16 carry-less product from 9 native 16x16->32 integer products: each
+// factor split by bit position mod 3 into ushort planes, so a product of two
+// masked parts has at most 6 overlapping terms per result bit and its sums
 // stay below the next same-residue bit (no carry crosses into a kept bit).
-static inline uint zck_clmul16(uint a, uint b) {
-    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
-    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
-    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
-    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
-    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+// The ushort operands let Apple Silicon GPUs use the native 16x16->32 multiply.
+static inline uint zck_clmul16_u16(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
-// 32x32 by one Karatsuba step over 16-bit halves (27 32-bit products instead
-// of the embedded kernel's 16 64-bit ones).
-static inline ulong zck_clmul32(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zck_clmul16(al, bl);
-    uint hi = zck_clmul16(ah, bh);
-    uint mid = zck_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
-    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
+// 32x32 by one Karatsuba step over 16-bit halves; result (lo32, hi32).
+static inline uint2 zck_clmul32_u16(uint a, uint b) {
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = zck_clmul16_u16(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = zck_clmul16_u16(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = zck_clmul16_u16(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
+    return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
 }
 
-struct ZckU128 { ulong lo; ulong hi; };
-
-static inline ZckU128 zck_clmul64(ulong a, ulong b) {
-    uint al = uint(a), ah = uint(a >> 32);
-    uint bl = uint(b), bh = uint(b >> 32);
-    ulong p_lo = zck_clmul32(al, bl);
-    ulong p_hi = zck_clmul32(ah, bh);
-    ulong p_mid = zck_clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
-    ZckU128 r;
-    r.lo = p_lo ^ (p_mid << 32);
-    r.hi = p_hi ^ (p_mid >> 32);
-    return r;
+// 64x64 over (lo32, hi32) halves; result as four 32-bit words, low first.
+static inline uint4 zck_clmul64_u16(uint2 a, uint2 b) {
+    uint2 p0 = zck_clmul32_u16(a.x, b.x);
+    uint2 p2 = zck_clmul32_u16(a.y, b.y);
+    uint2 pm = zck_clmul32_u16(a.x ^ a.y, b.x ^ b.y) ^ p0 ^ p2;
+    return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
 }
 
 // a * b mod x^128 + x^7 + x^2 + x + 1 (Karatsuba product, then reduction).
 static inline uint4 zck_mul(uint4 a, uint4 b) {
-    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
-    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
-    ZckU128 p0 = zck_clmul64(al, bl);
-    ZckU128 p2 = zck_clmul64(ah, bh);
-    ZckU128 pm = zck_clmul64(al ^ ah, bl ^ bh);
-    pm.lo ^= p0.lo ^ p2.lo;
-    pm.hi ^= p0.hi ^ p2.hi;
-    ulong r0 = p0.lo, r1 = p0.hi ^ pm.lo, h0 = p2.lo ^ pm.hi, h1 = p2.hi;
+    uint4 p0 = zck_clmul64_u16(a.xy, b.xy);
+    uint4 p2 = zck_clmul64_u16(a.zw, b.zw);
+    uint4 pm = zck_clmul64_u16(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
+    ulong r0 = (ulong(p0.y) << 32) | p0.x;
+    ulong r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
+    ulong h0 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
+    ulong h1 = (ulong(p2.w) << 32) | p2.z;
     ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
     ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
              ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
