@@ -4254,13 +4254,91 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     const GPU_COMMIT_DEFAULT: bool = true;
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+        && gpu_commit_env_clear()
 }
 
 /// True after untimed warmup permanently selected the ranked GPU path.
 /// The opt-out only restores speculative CPU buffers; it does not disable GPU.
 pub(crate) fn gpu_commit_latched_on() -> bool {
-    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none() && imp::gpu_commit_latched_on()
+    lazy_gpu_codeword_env_clear() && imp::gpu_commit_latched_on()
+}
+
+/// Kill switch for keeping the GPU commit's gate environment reads once per
+/// process (`FLOCK_NO_GPU_ENV_ONCE`, any value: every gate below reads its
+/// variable from the process environment on every call, as before). Read
+/// once per process.
+pub const ENV_NO_GPU_ENV_ONCE: &str = "FLOCK_NO_GPU_ENV_ONCE";
+
+pub(crate) fn gpu_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ENV_ONCE).is_none());
+    *ON
+}
+
+/// `FLOCK_NO_GPU_COMMIT` unset (the environment term of
+/// [`gpu_commit_enabled`]). The process environment does not change while a
+/// worker runs, so the first answer is kept; `FLOCK_NO_GPU_ENV_ONCE`
+/// restores the per-call lookup.
+#[inline]
+fn gpu_commit_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_COMMIT).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+}
+
+/// `FLOCK_NO_LAZY_GPU_CODEWORD` unset (the environment term of
+/// [`gpu_commit_latched_on`]), kept the same way.
+#[inline]
+fn lazy_gpu_codeword_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none()
+}
+
+/// `FLOCK_NO_GPU_TABLE_REUSE` unset (the shared-table term of the final
+/// leaf pass, the g4x2 dead-lane pass and the table share of the three NTT
+/// tile encoders), kept the same way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_table_reuse_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+}
+
+/// `FLOCK_COMMIT_TIMING` set (the commit's timing trace term), kept the same
+/// way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn commit_timing_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
+}
+
+/// `FLOCK_GPU_COMMIT_DEBUG` set (the GPU commit's debug trace term), kept
+/// the same way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_commit_debug_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
 }
 
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
@@ -7562,22 +7640,44 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     // The published 2633d97f anchors below were written as a literal
     // backslash-n and never matched, so the ranked leaf-fused final pass kept
     // the nibble Horner for sub-layer 3; real newlines let the splice apply.
+    // Once sub-layer 3 uses `tab3` (aliased onto `tabB`), `nibB`, its per-tile
+    // device preload, and the inter-tile barrier protecting `nibB` are dead
+    // (`gf_build_byte16` already begins with a threadgroup barrier retiring
+    // the previous tile's `tab3` reads), so splice them out atomically too.
     fn with_fused_bytetab3(src: &str) -> Option<String> {
         let indent = |t: &str| t.lines().map(|l| if l.is_empty() { String::new() } else { format!("    {l}") }).collect::<Vec<_>>().join("\n") + "\n";
         let pre = "        {\n            constexpr uint j = 3u;\n";
         let sub3 = indent(T3_SUB3_HORNER);
-        if src.matches(pre).count() != 1 || src.matches(sub3.as_str()).count() != 1 {
-            return None;
-        }
-        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(sub3.as_str(), T3_BYTETAB3_MUL, 1))
+        splice_exact(
+            src,
+            &[
+                (pre, T3_BYTETAB3_BUILD),
+                (sub3.as_str(), T3_BYTETAB3_MUL),
+                ("    constexpr uint NNIB = 5u;\n", ""),
+                ("    threadgroup uint  nibB[8u * NNIB];\n", ""),
+                (
+                    "        // The previous tile's sub-layer 3 still reads nibB.\n        if (tt != 0u) { threadgroup_barrier(mem_flags::mem_threadgroup); }\n        if (lid < 8u * NNIB) {\n            uint cB = lid / NNIB, qB = lid % NNIB;\n            uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];\n            nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;\n        }\n",
+                    "",
+                ),
+            ],
+        )
     }
 
     fn with_t3_bytetab3(src: &str) -> Option<String> {
         let pre = "    {\n        constexpr uint j = 3u;\n";
-        if src.matches(pre).count() != 1 || src.matches(T3_SUB3_HORNER).count() != 1 {
-            return None;
-        }
-        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(T3_SUB3_HORNER, T3_BYTETAB3_MUL, 1))
+        splice_exact(
+            src,
+            &[
+                (pre, T3_BYTETAB3_BUILD),
+                (T3_SUB3_HORNER, T3_BYTETAB3_MUL),
+                ("    constexpr uint NNIB = 5u;      // sub-layer 3: twiddle < 2^20\n", ""),
+                ("    threadgroup uint  nibB[8u * NNIB];\n", ""),
+                (
+                    "    if (lid < 8u * NNIB) {\n        uint cB = lid / NNIB, qB = lid % NNIB;\n        uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];\n        nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;\n    }\n    // nibB is published by the first table build's barriers.\n",
+                    "",
+                ),
+            ],
+        )
     }
 
     const T3_BYTETAB2: &str = "    threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -7728,6 +7828,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
             let out = with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).expect("incumbent sub-layer 3 not found");
             assert!(out.contains("tab3[cc * 256u + base + i] = v;"));
             assert!(!out.contains("acc = gf_shl4(acc);"));
+            assert!(!out.contains("nibB") && !out.contains("NNIB"));
             assert!(out.contains("kernel void ntt_final_t3("));
         }
 
@@ -7765,8 +7866,9 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                         .collect()
                 };
                 let data = gpu.new_buffer(len).unwrap();
-                let run = |src: &str| -> Vec<u8> {
+                let run = |src: &str| -> (Vec<u8>, u64) {
                     let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3").unwrap();
+                    let (tg, _, _) = gpu.pipeline_resources(pso);
                     std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
                     let cb = gpu.command_buffer().unwrap();
                     let enc = gpu.compute_encoder(cb).unwrap();
@@ -7780,12 +7882,15 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                     gpu.end_encoding(enc);
                     gpu.commit_and_wait(cb).unwrap();
                     gpu.release(pso);
-                    std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec()
+                    (std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec(), tg)
                 };
-                let inc = run(NTT_FINAL_T3_MSL_SOURCE);
-                let new = run(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                let (inc, tg0) = run(NTT_FINAL_T3_MSL_SOURCE);
+                let (new, tg1) = run(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap());
+                eprintln!("ntt_final_t3 staticThreadgroupMemoryLength: incumbent={tg0} B -> bytetab3={tg1} B");
                 assert!(inc != input, "the pass did not run");
                 assert!(inc == new, "byte-table sub-layer 3 changed the final pass's output");
+                assert_eq!(tg1, 8192, "ntt_final_t3 dead nibB not removed from TG SRAM (incumbent={tg0})");
+                assert!(tg1 < tg0, "expected TG SRAM shrink ({tg0} -> {tg1})");
                 gpu.release(tw);
                 gpu.release(data);
                 gpu.pool_pop(pool);
@@ -8671,12 +8776,18 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
             let plain = final_t3_msl_source();
             assert!(plain.contains("tab3[cc * 256u + base + i] = v;"), "plain sub-layer 3");
             assert!(plain.contains("tab64[cc * 256u + base + i] = v;"), "plain sub-layer 2");
+            assert!(!plain.contains("nibB") && !plain.contains("NNIB"), "plain dead nibB survived");
             let leaf = final_leaf_msl_source();
             assert_eq!(leaf.matches("tab64[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 2");
             // With real newlines in `with_fused_bytetab3`'s anchors the fused
             // leaf kernel gets sub-layer 3 as well.
             assert_eq!(leaf.matches("tab3[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 3");
-            assert!(with_fused_bytetab3(NTT_FINAL_LEAF_EXTRA_MSL).is_some());
+            assert!(
+                !leaf.contains("nibB") && !leaf.contains("NNIB") && !leaf.contains("if (tt != 0u)"),
+                "leaf dead nibB or inter-tile barrier survived"
+            );
+            let fused_only = with_fused_bytetab3(NTT_FINAL_LEAF_EXTRA_MSL).expect("fused sub-layer 3");
+            assert!(!fused_only.contains("nibB") && !fused_only.contains("NNIB") && !fused_only.contains("if (tt != 0u)"));
         }
 
         /// The ranked leaf-fused final pass with both byte-table sub-layers
@@ -8711,8 +8822,9 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 let data = gpu.new_buffer(len).unwrap();
                 let tree_len = 2 * n_leaves * 32;
                 let tree = gpu.new_buffer(tree_len).unwrap();
-                let run = |src: &str| -> (Vec<u8>, Vec<u8>) {
+                let run = |src: &str| -> (Vec<u8>, Vec<u8>, u64) {
                     let pso = compile_supplemental_pipeline(gpu, src, "ntt_final_t3_leaf").unwrap();
+                    let (tg, _, _) = gpu.pipeline_resources(pso);
                     std::ptr::copy_nonoverlapping(input.as_ptr(), gpu.buffer_contents(data), len);
                     std::ptr::write_bytes(gpu.buffer_contents(tree), 0, tree_len);
                     let cb = gpu.command_buffer().unwrap();
@@ -8737,14 +8849,20 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                     (
                         std::slice::from_raw_parts(gpu.buffer_contents(data), len).to_vec(),
                         std::slice::from_raw_parts(gpu.buffer_contents(tree), tree_len).to_vec(),
+                        tg,
                     )
                 };
-                let (d0, t0) = run(&format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}"));
-                let (d1, t1) = run(&final_leaf_msl_source());
+                let (d0, t0, tg0) = run(&format!("{NTT_FINAL_T3_MSL_SOURCE}{NTT_FINAL_LEAF_EXTRA_MSL}"));
+                let (d1, t1, tg1) = run(&final_leaf_msl_source());
+                eprintln!("ntt_final_t3_leaf staticThreadgroupMemoryLength: incumbent={tg0} B -> spliced={tg1} B");
                 assert!(d0 != input, "the pass did not run");
                 assert!(t0.iter().any(|&b| b != 0), "no hashes written");
                 assert!(d0 == d1, "byte tables changed the fused final pass's codeword");
                 assert!(t0 == t1, "byte tables changed the fused final pass's leaf/parent hashes");
+                if super::super::gpu_t3_bytetab_enabled() {
+                    assert_eq!(tg1, 8192, "ntt_final_t3_leaf dead nibB not removed from TG SRAM (incumbent={tg0})");
+                    assert!(tg1 < tg0, "expected TG SRAM shrink ({tg0} -> {tg1})");
+                }
                 gpu.release(tw);
                 gpu.release(data);
                 gpu.release(tree);
@@ -9638,7 +9756,7 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
             && super::pass_tune_enabled()
             && super::gpu_mixed_final_selected(log_d, log_d - 4, 4)
             && super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled())
-            && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+            && super::gpu_table_reuse_env_clear()
     }
 
     pub(crate) unsafe fn encode_ntt_and_merkle(
@@ -12965,7 +13083,7 @@ kernel void blake3_pow_seg_tail(
         let text = *TEXT.get_or_init(|| {
             super::gpu_dead_lane_enabled() && with_g4x2_dead_lanes(g4x2_msl_source()).is_some()
         });
-        text && !gpu.pso_ntt4g4x2.is_null() && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+        text && !gpu.pso_ntt4g4x2.is_null() && super::gpu_table_reuse_env_clear()
     }
 
     /// [`super::select_from_z_zero_store_from`] for this process and
@@ -13058,7 +13176,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13143,7 +13261,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13223,7 +13341,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -14574,8 +14692,7 @@ kernel void blake3_pow_seg_tail(
     }
 
     fn debug_enabled() -> bool {
-        std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
-            || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+        super::commit_timing_env_on() || super::gpu_commit_debug_env_on()
     }
 
     /// Observability for poisoned process-global locks. The poisoning panic
@@ -14583,7 +14700,7 @@ kernel void blake3_pow_seg_tail(
     /// `catch_unwind`); the score-relevant symptom — a GPU arm silently
     /// degraded or recovered — must be visible under FLOCK_GPU_COMMIT_DEBUG.
     fn note_poisoned_lock(tag: &str, recovered: bool) {
-        if std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some() {
+        if super::gpu_commit_debug_env_on() {
             eprintln!(
                 "[gpu-commit] {tag}: poisoned lock {}",
                 if recovered {
@@ -15578,7 +15695,7 @@ kernel void blake3_pow_seg_tail(
             ll /= 2;
             lo = wlo;
         }
-        if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if after_ab && crate::phase_timing_env_on() {
             eprintln!(
                 "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
                  suffix units in {tail_ms:.2} ms",
@@ -16988,7 +17105,7 @@ kernel void blake3_pow_seg_tail(
         {
             return;
         }
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         if super::ranked_exact_contention_tune_pending() {
             // The outer warmup join will replay its real A/B branch beside a
             // balanced broad sweep. Avoid double-tuning against a synthetic
@@ -17295,7 +17412,7 @@ kernel void blake3_pow_seg_tail(
             return;
         }
 
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         let latch = latch_lock();
         let LatchState::On(latched) = &*latch else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -17735,7 +17852,7 @@ kernel void blake3_pow_seg_tail(
                 if verified { chosen } else { 0 },
             );
         }
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let k = if verified { chosen } else { 0 };
             eprintln!(
                 "[phase-timing] hybrid split: cpu {} of 256 (ntt priority helpers {})",
@@ -18657,7 +18774,7 @@ kernel void blake3_pow_seg_tail(
         let tree = unsafe {
             super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
         }
         // The replicated input codeword was never read by the from-z graph;
@@ -18929,7 +19046,7 @@ kernel void blake3_pow_seg_tail(
                 total_nodes,
             )
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             let wall_ms = stream.started.elapsed().as_secs_f64() * 1e3;
             eprintln!(
                 "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"
@@ -23624,6 +23741,26 @@ static void b3_compress(thread uint* cv, thread const uint* m,
 #undef B3_ROT16
 #undef B3_ROTR
 
+static inline void b3_load_dev4(device const uint4* p, thread uint* block) {
+    for (uint q = 0u; q < 4u; q++) {
+        const uint4 w = p[q];
+        block[q * 4u + 0u] = w.x;
+        block[q * 4u + 1u] = w.y;
+        block[q * 4u + 2u] = w.z;
+        block[q * 4u + 3u] = w.w;
+    }
+}
+
+static inline void b3_load_tg4(threadgroup const uint4* p, thread uint* block) {
+    for (uint q = 0u; q < 4u; q++) {
+        const uint4 w = p[q];
+        block[q * 4u + 0u] = w.x;
+        block[q * 4u + 1u] = w.y;
+        block[q * 4u + 2u] = w.z;
+        block[q * 4u + 3u] = w.w;
+    }
+}
+
 kernel void leaf_hash128(device const uint4* codeword [[buffer(0)]],
                          device uint4* out            [[buffer(1)]],
                          uint id [[thread_position_in_grid]])
@@ -23632,21 +23769,9 @@ kernel void leaf_hash128(device const uint4* codeword [[buffer(0)]],
     uint cv[8];
     for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
     uint block[16];
-    for (uint q = 0u; q < 4u; q++) {
-        const uint4 w = leaf[q];
-        block[q * 4u + 0u] = w.x;
-        block[q * 4u + 1u] = w.y;
-        block[q * 4u + 2u] = w.z;
-        block[q * 4u + 3u] = w.w;
-    }
+    b3_load_dev4(leaf, block);
     b3_compress(cv, block, 64u, B3_CHUNK_START);
-    for (uint q = 0u; q < 4u; q++) {
-        const uint4 w = leaf[4u + q];
-        block[q * 4u + 0u] = w.x;
-        block[q * 4u + 1u] = w.y;
-        block[q * 4u + 2u] = w.z;
-        block[q * 4u + 3u] = w.w;
-    }
+    b3_load_dev4(leaf + 4u, block);
     b3_compress(cv, block, 64u, B3_CHUNK_END);
     out[id * 2u + 0u] = uint4(cv[0], cv[1], cv[2], cv[3]);
     out[id * 2u + 1u] = uint4(cv[4], cv[5], cv[6], cv[7]);
@@ -23657,18 +23782,142 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                             uint id [[thread_position_in_grid]])
 {
     uint block[16];
-    for (uint q = 0u; q < 4u; q++) {
-        const uint4 w = children[id * 4u + q];
-        block[q * 4u + 0u] = w.x;
-        block[q * 4u + 1u] = w.y;
-        block[q * 4u + 2u] = w.z;
-        block[q * 4u + 3u] = w.w;
-    }
+    b3_load_dev4(children + id * 4u, block);
     uint cv[8];
     for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
     b3_compress(cv, block, 64u, B3_PARENT);
     parents[id * 2u + 0u] = uint4(cv[0], cv[1], cv[2], cv[3]);
     parents[id * 2u + 1u] = uint4(cv[4], cv[5], cv[6], cv[7]);
+}
+
+// Straight-line fused 3-level parent pass: 128 threads/TG consume 256
+// children -> 128 parents1, 64 parents2, 32 parents3 in 4 KiB TG SRAM
+// (`stage[256]`). Level 2 reuses each SIMD group's own half of `stage`
+// (`[0..127]` for SIMD 0, `[128..255]` for SIMD 1) via a within-SIMD barrier,
+// staying at 4 KiB TG SRAM and two threadgroup barriers total.
+[[max_total_threads_per_threadgroup(128)]]
+kernel void rec_parent_hash3(device const uint4* children [[buffer(0)]],
+                             device uint4* parents1       [[buffer(1)]],
+                             device uint4* parents2       [[buffer(2)]],
+                             device uint4* parents3       [[buffer(3)]],
+                             uint tgid [[threadgroup_position_in_grid]],
+                             uint lid  [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 stage[256u]; // 4 KiB
+
+    // Level 1: all 128 threads consume 256 global children -> 128 parents1.
+    {
+        const uint id = tgid * 128u + lid;
+        uint block[16];
+        b3_load_dev4(children + id * 4u, block);
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
+        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
+        parents1[id * 2u + 0u] = lo;
+        parents1[id * 2u + 1u] = hi;
+        stage[lid * 2u + 0u] = lo;
+        stage[lid * 2u + 1u] = hi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Level 2: two complete 32-lane SIMD groups (0..31 and 32..63) read
+    // disjoint halves [0..127] and [128..255] of `stage`, then write back
+    // into [0..63] and [128..191] respectively after an intra-SIMD barrier.
+    if (lid < 64u) {
+        uint block[16];
+        b3_load_tg4(stage + lid * 4u, block);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 64u + lid;
+        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
+        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
+        parents2[id * 2u + 0u] = lo;
+        parents2[id * 2u + 1u] = hi;
+        const uint wbase = ((lid & 32u) << 2) + ((lid & 31u) << 1);
+        stage[wbase + 0u] = lo;
+        stage[wbase + 1u] = hi;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Level 3: SIMD 0 (0..31) reads [0..63] for lid < 16 and [128..191] for
+    // lid >= 16, producing 32 parents3.
+    if (lid < 32u) {
+        const uint sbase = ((lid & 16u) << 3) + ((lid & 15u) << 2);
+        uint block[16];
+        b3_load_tg4(stage + sbase, block);
+        uint cv[8];
+        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+        b3_compress(cv, block, 64u, B3_PARENT);
+        const uint id = tgid * 32u + lid;
+        parents3[id * 2u + 0u] = uint4(cv[0], cv[1], cv[2], cv[3]);
+        parents3[id * 2u + 1u] = uint4(cv[4], cv[5], cv[6], cv[7]);
+    }
+}
+
+struct RecTopParams {
+    uint read_level;
+    uint level_len;
+    uint cur_off;
+    uint cur_n;
+    uint steps;
+};
+
+// Single-TG top/subtree parent collapse: 1 TG of 32 threads, 2 KiB TG SRAM
+// (`stage[128]` = two 32-node ping-pong banks). Collapses up to 6 levels
+// (`cur_n <= 64`, e.g. 64->32->16->8->4->2->1) into 1 dispatch.
+[[max_total_threads_per_threadgroup(32)]]
+kernel void rec_parent_top(device uint4* tree          [[buffer(0)]],
+                           constant RecTopParams& P    [[buffer(1)]],
+                           uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 stage[128u]; // 2 KiB (two 32-node banks)
+    uint r_lvl = P.read_level;
+    uint l_len = P.level_len;
+    uint off   = P.cur_off;
+    uint n     = P.cur_n;
+    uint cur_base  = 0u;
+    uint next_base = 64u;
+    for (uint s = 0u; s < P.steps; s++) {
+        const uint w_lvl = r_lvl + l_len;
+        const uint w_off = off >> 1;
+        const uint out_n = n >> 1;
+        if (s != 0u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lid < out_n) {
+            uint block[16];
+            if (s == 0u) {
+                b3_load_dev4(tree + (r_lvl + off) * 2u + lid * 4u, block);
+            } else {
+                b3_load_tg4(stage + cur_base + lid * 4u, block);
+            }
+            uint cv[8];
+            for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
+            b3_compress(cv, block, 64u, B3_PARENT);
+            const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
+            const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
+            const uint w_node = w_lvl + w_off + lid;
+            tree[w_node * 2u + 0u] = lo;
+            tree[w_node * 2u + 1u] = hi;
+            if (s + 1u < P.steps) {
+                const uint dst_base = (s == 0u) ? 0u : next_base;
+                stage[dst_base + lid * 2u + 0u] = lo;
+                stage[dst_base + lid * 2u + 1u] = hi;
+            }
+        }
+        if (s != 0u) {
+            cur_base ^= 64u;
+            next_base ^= 64u;
+        }
+        r_lvl = w_lvl;
+        l_len >>= 1;
+        off   = w_off;
+        n     = out_n;
+    }
 }
 "#;
 
@@ -23682,6 +23931,8 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
     struct RecMerkle {
         pso_leaf128: Id,
         pso_parent: Id,
+        pso_parent3: Id,
+        pso_parent_top: Id,
         /// Persistent flat-tree output buffers, one per supported shape
         /// (`2 * n - 1` nodes each); allocated once, untimed.
         tree_bufs: [(usize, Id); REC_MERKLE_SHAPES.len()],
@@ -23779,6 +24030,25 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                         return Err(e);
                     }
                 };
+                let pso_parent3 = match build_pipeline("rec_parent_hash3") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        gpu.release(pso_parent);
+                        gpu.release(pso_leaf128);
+                        gpu.release(library);
+                        return Err(e);
+                    }
+                };
+                let pso_parent_top = match build_pipeline("rec_parent_top") {
+                    Ok(p) => p,
+                    Err(e) => {
+                        gpu.release(pso_parent3);
+                        gpu.release(pso_parent);
+                        gpu.release(pso_leaf128);
+                        gpu.release(library);
+                        return Err(e);
+                    }
+                };
                 gpu.release(library);
                 let mut tree_bufs = [(0usize, NIL); REC_MERKLE_SHAPES.len()];
                 for (slot, &n) in tree_bufs.iter_mut().zip(REC_MERKLE_SHAPES.iter()) {
@@ -23787,6 +24057,8 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                         Err(e) => {
                             gpu.release(pso_leaf128);
                             gpu.release(pso_parent);
+                            gpu.release(pso_parent3);
+                            gpu.release(pso_parent_top);
                             for &(_, b) in tree_bufs.iter() {
                                 if !b.is_null() {
                                     gpu.release(b);
@@ -23799,6 +24071,8 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                 let mut state = RecMerkle {
                     pso_leaf128,
                     pso_parent,
+                    pso_parent3,
+                    pso_parent_top,
                     tree_bufs,
                     wraps: Vec::new(),
                     hits: 0,
@@ -23954,19 +24228,17 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                 gpu.set_buffer(enc, tree_buf, 0, 1);
                 let tpg = 256u64.min(num_leaves as u64);
                 gpu.dispatch(enc, num_leaves as u64 / tpg, tpg);
-                gpu.set_pipeline(enc, state.pso_parent);
-                let mut read_start = 0usize;
-                let mut read_len = num_leaves;
-                while read_len > 1 {
-                    let write_start = read_start + read_len;
-                    let n_out = read_len / 2;
-                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
-                    gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
-                    let tpg = 256u64.min(n_out as u64);
-                    gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                    read_start = write_start;
-                    read_len = n_out;
-                }
+                encode_l1_parent_chain(
+                    gpu,
+                    enc,
+                    tree_buf,
+                    state.pso_parent,
+                    state.pso_parent3,
+                    state.pso_parent_top,
+                    0,
+                    num_leaves,
+                    l1_tail_enabled(),
+                );
                 gpu.end_encoding(enc);
                 // This dispatch sits on the opening's FS-serial spine with
                 // every CPU thread otherwise idle, the exact shape
@@ -24043,6 +24315,8 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
         gpu: &'static Gpu,
         pso_leaf128: Id,
         pso_parent: Id,
+        pso_parent3: Id,
+        pso_parent_top: Id,
         data_buf: Id,
         tree_buf: Id,
         num_leaves: usize,
@@ -24077,13 +24351,16 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
         local_levels: Option<usize>,
     }
 
-    /// Off by default (incumbent shape: leaves only per batch, every parent
-    /// level behind the cover-completing batch). `FLOCK_L1_LOCAL_PARENTS=1`
-    /// (exact) opts in to per-batch local parent levels; it measured faster
-    /// on an M4 GPU but has no grader measurement yet.
+    /// Opt-in toggle for per-batch L1 local parent hashing
+    /// (`FLOCK_L1_LOCAL_PARENTS=1`). Off by default because the fused
+    /// straight-line `rec_parent_hash3` + single-TG `rec_parent_top` tail
+    /// avoids per-chunk GPU dispatch contention during CPU NTT while still
+    /// collapsing the full parent chain into five dispatches.
+    pub const ENV_L1_LOCAL_PARENTS: &str = "FLOCK_L1_LOCAL_PARENTS";
+
     fn l1_local_parents_enabled() -> bool {
         static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            std::env::var("FLOCK_L1_LOCAL_PARENTS").is_ok_and(|v| v == "1")
+            std::env::var(ENV_L1_LOCAL_PARENTS).is_ok_and(|v| v == "1")
         });
         *ON
     }
@@ -24128,51 +24405,148 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
         *ON.get_or_init(|| !std::env::var(ENV_NO_L1_WINDOW_HOLD).is_ok_and(|v| v == "1"))
     }
 
+    #[repr(C)]
+    struct RecTopParams {
+        read_level: u32,
+        level_len: u32,
+        cur_off: u32,
+        cur_n: u32,
+        steps: u32,
+    }
+
+    /// Encode `steps` parent levels starting at `(read_level, level_len)` for
+    /// the aligned slice `[cur_off, cur_off + cur_n)` inside `tree_buf` (both
+    /// `cur_off` and `cur_n` must be multiples of `1 << steps`). When `fused`,
+    /// uses straight-line `rec_parent_hash3` (4 KiB TG SRAM) for 3-level hops
+    /// whose width is a multiple of 256, single-level `rec_parent_hash` for
+    /// any remaining level with `cur_n > 64`, and single-TG `rec_parent_top`
+    /// (2 KiB TG SRAM) once `cur_n <= 64`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_rec_parent_range(
+        gpu: &Gpu,
+        enc: Id,
+        tree_buf: Id,
+        pso_parent: Id,
+        pso_parent3: Id,
+        pso_parent_top: Id,
+        mut read_level: usize,
+        mut level_len: usize,
+        mut cur_off: usize,
+        mut cur_n: usize,
+        mut steps: usize,
+        fused: bool,
+    ) {
+        if steps == 0 {
+            return;
+        }
+        unsafe {
+            if fused {
+                if steps >= 3 && cur_n >= 256 && cur_n.is_multiple_of(256) {
+                    gpu.set_pipeline(enc, pso_parent3);
+                    while steps >= 3 && cur_n >= 256 && cur_n.is_multiple_of(256) {
+                        let l1_level = read_level + level_len;
+                        let l2_level = l1_level + (level_len >> 1);
+                        let l3_level = l2_level + (level_len >> 2);
+                        gpu.set_buffer(enc, tree_buf, (read_level + cur_off) * 32, 0);
+                        gpu.set_buffer(enc, tree_buf, (l1_level + (cur_off >> 1)) * 32, 1);
+                        gpu.set_buffer(enc, tree_buf, (l2_level + (cur_off >> 2)) * 32, 2);
+                        gpu.set_buffer(enc, tree_buf, (l3_level + (cur_off >> 3)) * 32, 3);
+                        gpu.dispatch(enc, (cur_n / 256) as u64, 128);
+                        read_level = l3_level;
+                        level_len >>= 3;
+                        cur_off >>= 3;
+                        cur_n >>= 3;
+                        steps -= 3;
+                    }
+                }
+                if steps > 0 && cur_n > 64 {
+                    gpu.set_pipeline(enc, pso_parent);
+                    while steps > 0 && cur_n > 64 {
+                        let write_level = read_level + level_len;
+                        let n_out = (cur_n >> 1) as u64;
+                        gpu.set_buffer(enc, tree_buf, (read_level + cur_off) * 32, 0);
+                        gpu.set_buffer(enc, tree_buf, (write_level + (cur_off >> 1)) * 32, 1);
+                        let tpg = (n_out & n_out.wrapping_neg()).min(256);
+                        gpu.dispatch(enc, n_out / tpg, tpg);
+                        read_level = write_level;
+                        level_len >>= 1;
+                        cur_off >>= 1;
+                        cur_n >>= 1;
+                        steps -= 1;
+                    }
+                }
+                if steps > 0 {
+                    debug_assert!(cur_n <= 64 && steps <= 6);
+                    gpu.set_pipeline(enc, pso_parent_top);
+                    gpu.set_buffer(enc, tree_buf, 0, 0);
+                    let params = RecTopParams {
+                        read_level: read_level as u32,
+                        level_len: level_len as u32,
+                        cur_off: cur_off as u32,
+                        cur_n: cur_n as u32,
+                        steps: steps as u32,
+                    };
+                    let bytes = core::slice::from_raw_parts(
+                        (&params as *const RecTopParams).cast::<u8>(),
+                        core::mem::size_of::<RecTopParams>(),
+                    );
+                    gpu.set_bytes(enc, bytes, 1);
+                    gpu.dispatch(enc, 1, 32);
+                }
+                return;
+            }
+            gpu.set_pipeline(enc, pso_parent);
+            for _ in 0..steps {
+                let write_level = read_level + level_len;
+                let n_out = (cur_n >> 1) as u64;
+                gpu.set_buffer(enc, tree_buf, (read_level + cur_off) * 32, 0);
+                gpu.set_buffer(enc, tree_buf, (write_level + (cur_off >> 1)) * 32, 1);
+                let tpg = (n_out & n_out.wrapping_neg()).min(256);
+                gpu.dispatch(enc, n_out / tpg, tpg);
+                read_level = write_level;
+                level_len >>= 1;
+                cur_off >>= 1;
+                cur_n >>= 1;
+            }
+        }
+    }
+
     /// Encode the flat tree's internal levels from the level that starts at
-    /// node `read_start` and holds `read_len` nodes up to the root: fused
-    /// three-level dispatches while a level has at least 256 nodes (when
-    /// `fused` and the main tree's pipeline exists), single levels after.
+    /// node `read_start` and holds `read_len` nodes up to the root: straight-
+    /// line `rec_parent_hash3` (4 KiB TG SRAM) while `read_len >= 256`,
+    /// single-level `rec_parent_hash` if `read_len == 128`, and single-TG
+    /// `rec_parent_top` (2 KiB TG SRAM) for `read_len <= 64`.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn encode_l1_parent_chain(
         gpu: &Gpu,
         enc: Id,
         tree_buf: Id,
         pso_parent: Id,
-        mut read_start: usize,
-        mut read_len: usize,
+        pso_parent3: Id,
+        pso_parent_top: Id,
+        read_start: usize,
+        read_len: usize,
         fused: bool,
     ) {
+        if read_len <= 1 {
+            return;
+        }
+        debug_assert!(read_len.is_power_of_two());
         unsafe {
-            let pso3 = if gpu.pso_parent3_v4.is_null() {
-                gpu.pso_parent3
-            } else {
-                gpu.pso_parent3_v4
-            };
-            if fused && !pso3.is_null() && read_len >= 256 {
-                gpu.set_pipeline(enc, pso3);
-                while read_len >= 256 {
-                    let l1 = read_start + read_len;
-                    let l2 = l1 + read_len / 2;
-                    let l3 = l2 + read_len / 4;
-                    gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
-                    gpu.set_buffer(enc, tree_buf, l1 * 32, 1);
-                    gpu.set_buffer(enc, tree_buf, l2 * 32, 2);
-                    gpu.set_buffer(enc, tree_buf, l3 * 32, 3);
-                    gpu.dispatch(enc, (read_len / 256) as u64, 128);
-                    read_start = l3;
-                    read_len /= 8;
-                }
-            }
-            gpu.set_pipeline(enc, pso_parent);
-            while read_len > 1 {
-                let write_start = read_start + read_len;
-                let n_out = read_len / 2;
-                gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
-                gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
-                let tpg = 256u64.min(n_out as u64);
-                gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                read_start = write_start;
-                read_len = n_out;
-            }
+            encode_rec_parent_range(
+                gpu,
+                enc,
+                tree_buf,
+                pso_parent,
+                pso_parent3,
+                pso_parent_top,
+                read_start,
+                read_len,
+                0,
+                read_len,
+                read_len.trailing_zeros() as usize,
+                fused,
+            );
         }
     }
 
@@ -24217,7 +24591,8 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
         if guard.is_none() {
             *guard = Some(rec_merkle_init(gpu));
         }
-        let (pso_leaf128, pso_parent, data_buf, tree_buf) = match guard.as_mut() {
+        let (pso_leaf128, pso_parent, pso_parent3, pso_parent_top, data_buf, tree_buf) =
+            match guard.as_mut() {
             Some(Ok(state)) => {
                 let data_addr = data_ptr as usize;
                 let cached = state
@@ -24251,7 +24626,14 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                     .iter()
                     .find(|(n, _)| *n == num_leaves)
                     .expect("shape checked above");
-                (state.pso_leaf128, state.pso_parent, data_buf, tree_buf)
+                (
+                    state.pso_leaf128,
+                    state.pso_parent,
+                    state.pso_parent3,
+                    state.pso_parent_top,
+                    data_buf,
+                    tree_buf,
+                )
             }
             Some(Err(e)) => {
                 if super::gpu_zc_r2_debug() {
@@ -24266,6 +24648,8 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
             gpu,
             pso_leaf128,
             pso_parent,
+            pso_parent3,
+            pso_parent_top,
             data_buf,
             tree_buf,
             num_leaves,
@@ -24409,27 +24793,25 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                         self.gpu.set_buffer(enc, self.tree_buf, leaf_start * 32, 1);
                         self.gpu.dispatch(enc, (n / 256) as u64, 256);
                         // This range's own subtree levels, encoded behind its
-                        // leaves (same kernel, same flat-tree slots as the
-                        // whole-tree parent chain; the serial encoder orders
-                        // each level after the one it reads).
+                        // leaves via `rec_parent_hash3` + `rec_parent_top`
+                        // (same flat-tree slots as the whole-tree parent chain;
+                        // the serial encoder orders each level after the one
+                        // it reads).
                         let depth = range_levels(leaf_start, n);
-                        if depth > 0 {
-                            self.gpu.set_pipeline(enc, self.pso_parent);
-                        }
-                        let mut read_level = 0usize;
-                        let mut level_len = self.num_leaves;
-                        for l in 1..=depth {
-                            let write_level = read_level + level_len;
-                            let read_off = read_level + (leaf_start >> (l - 1));
-                            let write_off = write_level + (leaf_start >> l);
-                            let n_out = (n >> l) as u64;
-                            self.gpu.set_buffer(enc, self.tree_buf, read_off * 32, 0);
-                            self.gpu.set_buffer(enc, self.tree_buf, write_off * 32, 1);
-                            let tpg = (n_out & n_out.wrapping_neg()).min(256);
-                            self.gpu.dispatch(enc, n_out / tpg, tpg);
-                            read_level = write_level;
-                            level_len >>= 1;
-                        }
+                        encode_rec_parent_range(
+                            self.gpu,
+                            enc,
+                            self.tree_buf,
+                            self.pso_parent,
+                            self.pso_parent3,
+                            self.pso_parent_top,
+                            0,
+                            self.num_leaves,
+                            leaf_start,
+                            n,
+                            depth,
+                            l1_tail_enabled(),
+                        );
                     }
                     if encode_parents {
                         let mut read_start = 0usize;
@@ -24443,6 +24825,8 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                             enc,
                             self.tree_buf,
                             self.pso_parent,
+                            self.pso_parent3,
+                            self.pso_parent_top,
                             read_start,
                             read_len,
                             l1_tail_enabled(),
@@ -24548,19 +24932,17 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                     let run = (|| -> Result<(), String> {
                         let cb = self.gpu.command_buffer()?;
                         let enc = self.gpu.compute_encoder(cb)?;
-                        self.gpu.set_pipeline(enc, self.pso_parent);
-                        let mut read_start = 0usize;
-                        let mut read_len = self.num_leaves;
-                        while read_len > 1 {
-                            let write_start = read_start + read_len;
-                            let n_out = read_len / 2;
-                            self.gpu.set_buffer(enc, self.tree_buf, read_start * 32, 0);
-                            self.gpu.set_buffer(enc, self.tree_buf, write_start * 32, 1);
-                            let tpg = 256u64.min(n_out as u64);
-                            self.gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                            read_start = write_start;
-                            read_len = n_out;
-                        }
+                        encode_l1_parent_chain(
+                            self.gpu,
+                            enc,
+                            self.tree_buf,
+                            self.pso_parent,
+                            self.pso_parent3,
+                            self.pso_parent_top,
+                            0,
+                            self.num_leaves,
+                            l1_tail_enabled(),
+                        );
                         self.gpu.end_encoding(enc);
                         if rec_merkle_spin_enabled() {
                             self.gpu.commit_and_spin(cb, 4.0)
@@ -26388,7 +26770,7 @@ kernel void zc_r2_horner_oracle(
             0.0
         };
         unsafe { gpu.release(cb) };
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let fold_gpu = f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
             let window = f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
             eprintln!(
@@ -30699,6 +31081,16 @@ static inline uint4 gf_mulx(uint4 v) {
     return r;
 }
 
+static inline uint4 gf_shl4(uint4 a) {
+    uint h = a.w >> 28;
+    uint4 r;
+    r.w = (a.w << 4) | (a.z >> 28);
+    r.z = (a.z << 4) | (a.y >> 28);
+    r.y = (a.y << 4) | (a.x >> 28);
+    r.x = (a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h);
+    return r;
+}
+
 static inline uint4 gf_shl16(uint4 a) {
     uint h = a.w >> 16;
     uint4 r;
@@ -30709,40 +31101,33 @@ static inline uint4 gf_shl16(uint4 a) {
     return r;
 }
 
-// The commit NTT's 64-thread byte-table build (gf_build_byte16) for one
-// constant `c`: tab[b] = b * c, tab[256 + b] = b * (c x^8). `c8` is the
-// host-computed `c x^8` (consts[6 + i] for consts[i]), so the upper half no
-// longer runs an 8-step gf_mulx chain inside every group's barrier pair.
+// 64-thread byte-table build for one constant `c`: tab[b] = b * c,
+// tab[256 + b] = b * (c x^8). `c8` is the host-computed `c x^8`.
+// Entry bits 0..4 are the thread's lane `u`, bits 5..7 the store index,
+// yielding branchless mask-XORs and 32-lane linear stores. Caller supplies
+// the prior-reader barrier when reusing `tabB` (skipped on level 0).
 static inline void zf_build(threadgroup uint4* tabB, uint4 c, uint4 c8, uint lid)
 {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint t  = lid >> 5;
-    const uint u  = lid & 31u;
-    const uint aa = u & 3u;
-    const uint cc = u >> 2;
-    uint4 e0 = (t != 0u) ? c8 : c;
-    uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
-    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
-    uint4 A = uint4(0u);
-    if (aa & 1u) { A ^= e2; }
-    if (aa & 2u) { A ^= e3; }
-    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
-    uint4 C = uint4(0u);
-    if (cc & 1u) { C ^= f1; }
-    if (cc & 2u) { C ^= f2; }
-    if (cc & 4u) { C ^= f3; }
-    const uint4 H0 = C, H1 = C ^ f0;
-    threadgroup uint4* dst = &tabB[t << 8];
-    const uint o0 = (cc << 5) + (aa << 2);
-    const uint o1 = o0 + 16u;
-    dst[o0 + 0u] = L0 ^ H0;
-    dst[o0 + 1u] = L1 ^ H0;
-    dst[o0 + 2u] = L2 ^ H0;
-    dst[o0 + 3u] = L3 ^ H0;
-    dst[o1 + 0u] = L0 ^ H1;
-    dst[o1 + 1u] = L1 ^ H1;
-    dst[o1 + 2u] = L2 ^ H1;
-    dst[o1 + 3u] = L3 ^ H1;
+    const uint t = lid >> 5;
+    const uint u = lid & 31u;
+    const uint4 e0 = (t != 0u) ? c8 : c;
+    const uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    const uint4 f0 = gf_shl4(e0), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    const uint4 A = (e0 & uint4(0u - (u & 1u)))
+                  ^ (e1 & uint4(0u - ((u >> 1) & 1u)))
+                  ^ (e2 & uint4(0u - ((u >> 2) & 1u)))
+                  ^ (e3 & uint4(0u - ((u >> 3) & 1u)))
+                  ^ (f0 & uint4(0u - ((u >> 4) & 1u)));
+    const uint4 A1 = A ^ f1, A2 = A ^ f2, A3 = A1 ^ f2;
+    threadgroup uint4* dst = &tabB[(t << 8) + u];
+    dst[0u]   = A;
+    dst[32u]  = A1;
+    dst[64u]  = A2;
+    dst[96u]  = A3;
+    dst[128u] = A  ^ f3;
+    dst[160u] = A1 ^ f3;
+    dst[192u] = A2 ^ f3;
+    dst[224u] = A3 ^ f3;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
@@ -30750,32 +31135,43 @@ static inline void zf_mul_x2(uint4 va, uint4 vb,
                              threadgroup const uint4* tab,
                              thread uint4& ra, thread uint4& rb)
 {
-    uint4 a = uint4(0u);
-    uint4 b = uint4(0u);
-    for (int i = 7; i >= 0; i--) {
-        a = gf_shl16(a);
-        b = gf_shl16(b);
-        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
-        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
-    }
+    const uchar4 a3 = as_type<uchar4>(va.w), b3 = as_type<uchar4>(vb.w);
+    uint4 a = tab[a3.z] ^ tab[256u + a3.w];
+    uint4 b = tab[b3.z] ^ tab[256u + b3.w];
+    a = gf_shl16(a) ^ tab[a3.x] ^ tab[256u + a3.y];
+    b = gf_shl16(b) ^ tab[b3.x] ^ tab[256u + b3.y];
+    const uchar4 a2 = as_type<uchar4>(va.z), b2 = as_type<uchar4>(vb.z);
+    a = gf_shl16(a) ^ tab[a2.z] ^ tab[256u + a2.w];
+    b = gf_shl16(b) ^ tab[b2.z] ^ tab[256u + b2.w];
+    a = gf_shl16(a) ^ tab[a2.x] ^ tab[256u + a2.y];
+    b = gf_shl16(b) ^ tab[b2.x] ^ tab[256u + b2.y];
+    const uchar4 a1 = as_type<uchar4>(va.y), b1 = as_type<uchar4>(vb.y);
+    a = gf_shl16(a) ^ tab[a1.z] ^ tab[256u + a1.w];
+    b = gf_shl16(b) ^ tab[b1.z] ^ tab[256u + b1.w];
+    a = gf_shl16(a) ^ tab[a1.x] ^ tab[256u + a1.y];
+    b = gf_shl16(b) ^ tab[b1.x] ^ tab[256u + b1.y];
+    const uchar4 a0 = as_type<uchar4>(va.x), b0 = as_type<uchar4>(vb.x);
+    a = gf_shl16(a) ^ tab[a0.z] ^ tab[256u + a0.w];
+    b = gf_shl16(b) ^ tab[b0.z] ^ tab[256u + b0.w];
+    a = gf_shl16(a) ^ tab[a0.x] ^ tab[256u + a0.y];
+    b = gf_shl16(b) ^ tab[b0.x] ^ tab[256u + b0.y];
     ra = a;
     rb = b;
 }
 
-#define ZF_LEVEL(J)                                                    \
-    {                                                                  \
-        constexpr uint st = 1u << (J);                                 \
-        zf_build(tabB, consts[2u + (J)], consts[8u + (J)], lid);       \
-        for (uint e = 0u; e < 16u; e += 2u * st) {                     \
-            uint4 pa;                                                  \
-            uint4 pb;                                                  \
-            zf_mul_x2(ea[e] ^ ea[e + st], eb[e] ^ eb[e + st],          \
-                      &tabB[0], pa, pb);                               \
-            ea[e] ^= pa;                                               \
-            eb[e] ^= pb;                                               \
-        }                                                              \
+#define ZF_LEVEL(J)                                                        \
+    {                                                                      \
+        constexpr uint st = 1u << (J);                                     \
+        if ((J) != 0u) { threadgroup_barrier(mem_flags::mem_threadgroup); }\
+        zf_build(tabB, consts[2u + (J)], consts[8u + (J)], lid);           \
+        for (uint e = 0u; e < 16u; e += 2u * st) {                         \
+            uint4 pa;                                                      \
+            uint4 pb;                                                      \
+            zf_mul_x2(ea[e] ^ ea[e + st], eb[e] ^ eb[e + st],              \
+                      &tabB[0], pa, pb);                                   \
+            ea[e] ^= pa;                                                   \
+            eb[e] ^= pb;                                                   \
+        }                                                                  \
     }
 
 [[max_total_threads_per_threadgroup(64)]]
@@ -30810,6 +31206,7 @@ kernel void zf_fold8(device const uint4* z      [[buffer(0)]],
     ZF_LEVEL(3u)
     uint4 ra = ea[0];
     uint4 rb = eb[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     zf_build(tabB, consts[0], consts[6], lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(1));
@@ -30822,6 +31219,7 @@ kernel void zf_fold8(device const uint4* z      [[buffer(0)]],
         ra = la ^ pa;
         rb = lb ^ pb;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     zf_build(tabB, consts[1], consts[7], lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(2));
@@ -33458,6 +33856,9 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_recursive_merkle_matches_cpu_tree() {
+        let _guard = L1_OVERLAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut rng = Rng::new(0x51AB);
         for log_leaves in [18usize] {
             let n_leaves = 1usize << log_leaves;
@@ -35064,10 +35465,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
     /// with the fused3 transform's per-chunk callback) with the admission
     /// latch forced to each arm; the latch is process-global, hence the
     /// serial lock and the reset at the end.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    static L1_OVERLAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn gpu_l1_merkle_overlap_matches_sync() {
-        static L1_OVERLAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = L1_OVERLAP_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -35129,6 +35532,86 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
             "L1 overlap tree diverges from the sync path"
         );
         assert_eq!(w_overlap.root(), w_sync.root());
+    }
+
+    /// Direct GPU-vs-CPU bit-exactness test for `rec_parent_hash3` (4 KiB TG
+    /// SRAM), single-TG `rec_parent_top` (2 KiB TG SRAM), and
+    /// `L1MerkleOverlapSession` with local parents enabled across:
+    /// - 4096-leaf NTT chunks (2^18 / 4096 = 64 chunks -> `local_levels = 12`,
+    ///   top 63 hashes via 1 `rec_parent_top` dispatch)
+    /// - out-of-order arrival + non-power-of-2 coalesced ranges (e.g. 12288)
+    /// - 256-leaf fine chunks (`local_levels = 8`)
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_rec_merkle_parent3_top_and_local_overlap_match_cpu() {
+        let _guard = L1_OVERLAP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = imp::gpu() {
+            eprintln!("skipping GPU test: {e}");
+            return;
+        }
+        let n_leaves = 1usize << 18;
+        let mut rng = Rng::new(0x52E3);
+        let data_f128 = rng.vec(n_leaves * 8); // 128 B per leaf
+        let data: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                data_f128.as_ptr().cast::<u8>(),
+                data_f128.len() * core::mem::size_of::<F128>(),
+            )
+        };
+        let cpu_tree =
+            crate::merkle::merkle_tree(data, n_leaves, crate::merkle::HashKind::Blake3);
+
+        // 1. Sync GPU recursive Merkle (exercises 4x rec_parent_hash3 + 1x rec_parent_top).
+        let sync_tree = super::gpu_recursive_merkle_blake3(data, n_leaves)
+            .expect("sync recursive merkle must succeed");
+        assert!(
+            sync_tree == cpu_tree,
+            "sync rec_parent_hash3 + rec_parent_top diverges from CPU"
+        );
+
+        // 2. Overlap session with 4096-leaf chunks in interleaved order (local_levels = 12).
+        {
+            let sess = imp::l1_merkle_overlap_begin(data.as_ptr(), data.len(), n_leaves)
+                .expect("overlap begin must succeed");
+            let chunk_leaves = 4096usize;
+            let n_chunks = n_leaves / chunk_leaves;
+            for i in 0..n_chunks {
+                // Stride-17 permutation hits out-of-order + coalesced ranges (incl. 12288).
+                let c = (i * 17) % n_chunks;
+                sess.chunk_ready(c * chunk_leaves * 8, chunk_leaves * 8);
+            }
+            let got = sess.finish().expect("4096-leaf overlap must succeed");
+            assert!(
+                got == cpu_tree,
+                "4096-leaf local-parents overlap diverges from CPU"
+            );
+        }
+
+        // 3. Overlap session with non-power-of-2 coalesced chunks (e.g. 3*4096=12288)
+        //    and a smaller aligned chunk (1024) so `local_levels = 10` (read_len = 256).
+        {
+            let sess = imp::l1_merkle_overlap_begin(data.as_ptr(), data.len(), n_leaves)
+                .expect("overlap begin must succeed");
+            // Feed first 4096 leaves as four 1024-leaf chunks -> local_levels = 10.
+            for k in 0..4 {
+                sess.chunk_ready(k * 1024 * 8, 1024 * 8);
+            }
+            // Feed remaining leaves in alternating 12288 (3*4096) and 4096 chunks.
+            let mut pos = 4096usize;
+            while pos < n_leaves {
+                let rem = n_leaves - pos;
+                let step = if rem >= 12288 { 12288 } else { rem };
+                sess.chunk_ready(pos * 8, step * 8);
+                pos += step;
+            }
+            let got = sess.finish().expect("mixed-chunk overlap must succeed");
+            assert!(
+                got == cpu_tree,
+                "mixed-chunk local-parents overlap diverges from CPU"
+            );
+        }
     }
 
     /// T3 products arm oracle: the GPU's per-chunk reduced partials must

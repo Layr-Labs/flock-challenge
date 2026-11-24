@@ -451,16 +451,34 @@ fn is_recursive_l2_ntt_epool_shape(log_d: usize, num_ntts: usize, start_layer: u
         && start_layer == 3
 }
 
+/// The third recursive Ligerito commitment (L3: 2 MiB, `log_msg_cols=10`,
+/// `log_inv_rate=4`) shares the same eight-lane direct-from-message geometry
+/// at `log_d = 14`. Its 64 × 32 KiB deep-tail claims (and 64 × 32-row top
+/// tiles) ride the P+E queue where the helper pool is otherwise idle, keeping
+/// chunks small enough that an E-core claim never stretches the tail. L4
+/// (`log_d = 12`, 512 KiB) stays off the helper pool to avoid over-syncing.
+#[inline]
+fn is_recursive_l3_ntt_epool_shape(log_d: usize, num_ntts: usize, start_layer: usize) -> bool {
+    cfg!(all(
+        target_os = "macos",
+        target_arch = "aarch64",
+        target_feature = "aes"
+    )) && log_d == 14
+        && num_ntts == 8
+        && start_layer == 4
+}
+
 // r1020 resample marker: AB redraw of 4912aee after the r1019 frontier control
 // landed in-band (−0.47%); comment-only delta versus the r1018 archive.
-/// The union gate for both recursive-commit epool shapes. Keep it separate
-/// from the ranked L0 selectors above: this changes scheduling only, and the
-/// recursive tail continues to use its independently tuned single-layer
-/// arithmetic on either shape.
+/// The union gate for all recursive-commit epool shapes (L1..L3). Keep it
+/// separate from the ranked L0 selectors above: this changes scheduling only,
+/// and the recursive tail continues to use its independently tuned arithmetic
+/// on every shape.
 #[inline]
 fn is_recursive_ntt_epool_shape(log_d: usize, num_ntts: usize, start_layer: usize) -> bool {
     is_recursive_l1_ntt_epool_shape(log_d, num_ntts, start_layer)
         || is_recursive_l2_ntt_epool_shape(log_d, num_ntts, start_layer)
+        || is_recursive_l3_ntt_epool_shape(log_d, num_ntts, start_layer)
 }
 
 /// Exact rollback rule for the recursive-L1 heterogeneous NTT schedule.
@@ -476,6 +494,14 @@ fn recursive_ntt_epool_killed_by(value: Option<&str>) -> bool {
 /// rollback) untouched. Values other than `1` cannot silently disable the path.
 #[inline]
 fn l2_recursive_ntt_epool_killed_by(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Exact rollback rule for the L3 extension: `FLOCK_NO_RECURSIVE_L3_NTT_EPOOL=1`
+/// disables only the third recursive commitment's helper schedule, leaving L1/L2
+/// untouched. Values other than `1` cannot silently disable the path.
+#[inline]
+fn l3_recursive_ntt_epool_killed_by(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
@@ -495,10 +521,19 @@ fn use_recursive_ntt_epool(log_d: usize, num_ntts: usize, start_layer: usize) ->
                 .as_deref(),
         )
     });
+    static L3_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        !l3_recursive_ntt_epool_killed_by(
+            std::env::var("FLOCK_NO_RECURSIVE_L3_NTT_EPOOL")
+                .ok()
+                .as_deref(),
+        )
+    });
     if is_recursive_l1_ntt_epool_shape(log_d, num_ntts, start_layer) {
         *L1_ENABLED && crate::epool::helper_pool_available()
     } else if is_recursive_l2_ntt_epool_shape(log_d, num_ntts, start_layer) {
         *L2_ENABLED && crate::epool::helper_pool_available()
+    } else if is_recursive_l3_ntt_epool_shape(log_d, num_ntts, start_layer) {
+        *L3_ENABLED && crate::epool::helper_pool_available()
     } else {
         false
     }
@@ -1093,15 +1128,23 @@ impl AdditiveNttF128 {
         debug_assert_eq!(twiddles[0][1], F128::ZERO);
         debug_assert_eq!(twiddles[0][3], F128::ZERO);
 
-        const ROWS_PER_TILE: usize = 128;
-        let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
+        // Keep 128-row tiles for large blocks (L1: 256 jobs, L2: 64 jobs), and
+        // split smaller blocks down to 32 rows when needed so L3 (16 blocks ×
+        // 128 rows) exposes 64 tiles to the 10P+4E queue instead of 16 coarse
+        // blocks. L4 (32 blocks × 16 rows) stays 1 tile/block = 32 jobs.
+        let rows_per_tile = if num_blocks * eighth.div_ceil(128) >= 64 {
+            128
+        } else {
+            32
+        };
+        let tiles_per_block = eighth.div_ceil(rows_per_tile);
         let src = msg.as_ptr() as usize;
         let dst = data.as_mut_ptr() as usize;
         let top = |job: usize| {
             let block = job / tiles_per_block;
             let tile = job % tiles_per_block;
-            let row_start = tile * ROWS_PER_TILE;
-            let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+            let row_start = tile * rows_per_tile;
+            let row_end = (row_start + rows_per_tile).min(eighth);
             // SAFETY: each `(block, tile)` job owns all eight destination
             // rows for one disjoint row interval. `msg` is immutable and
             // has one complete layer-start block; every derived address
@@ -2077,10 +2120,11 @@ impl AdditiveNttF128 {
     /// queue. Each job still executes the ordinary single-layer tail below.
     #[inline]
     /// Deep tail of a recursive-commit transform on the P+E helper queue.
-    /// Both ranked recursive shapes — L1 (32 x 1 MiB at log_d 18) and L2
-    /// (32 x 256 KiB at log_d 16) — partition into 32 independent
-    /// cache-resident sub-transforms; each sub runs the identical
-    /// single-layer subtree loop, so this changes ownership/scheduling only.
+    /// L1 (32 × 1 MiB at `log_d = 18`) and L2 (32 × 256 KiB at `log_d = 16`)
+    /// partition at `n_top = 5`; L3 (64 × 32 KiB at `log_d = 14`) partitions
+    /// at `n_top = 6` so each L1D-resident claim is fine enough for 10P+4E
+    /// without an E-core tail straggler. Every sub runs the identical subtree
+    /// loop, so this changes ownership/scheduling only.
     fn forward_transform_interleaved_recursive_deep_with_helper_and_then<F>(
         &self,
         data: &mut [F128],
@@ -2091,16 +2135,15 @@ impl AdditiveNttF128 {
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
-        const N_TOP: usize = 5;
-
         let log_d = log2_pow2(data.len() / num_ntts);
         debug_assert!(
-            matches!((log_d, num_ntts, start_layer), (18, 8, 5) | (16, 8, 6)),
-            "recursive deep helper only serves the L1/L2 ranked shapes"
+            matches!((log_d, num_ntts, start_layer), (18, 8, 5) | (16, 8, 6) | (14, 8, 7)),
+            "recursive deep helper only serves the L1/L2/L3 ranked shapes"
         );
-        let sub_size_positions = 1usize << (log_d - N_TOP);
+        let n_top: usize = if log_d == 14 { 6 } else { 5 };
+        let sub_size_positions = 1usize << (log_d - n_top);
         let sub_bytes = sub_size_positions * num_ntts;
-        let num_subs = 1usize << N_TOP;
+        let num_subs = 1usize << n_top;
         debug_assert_eq!(data.len(), num_subs * sub_bytes);
 
         let base = crate::epool::SyncPtr(data.as_mut_ptr());
@@ -2129,7 +2172,7 @@ impl AdditiveNttF128 {
                         std::slice::from_raw_parts_mut(base.ptr().add(job * sub_bytes), sub_bytes)
                     };
                     self.forward_transform_interleaved_deep_subtree(
-                        sub_data, num_ntts, start_layer, N_TOP, log_d, job,
+                        sub_data, num_ntts, start_layer, n_top, log_d, job,
                     );
                     finish_chunk(job * sub_bytes, sub_data);
                     return;
@@ -2152,7 +2195,7 @@ impl AdditiveNttF128 {
                         lo,
                         num_ntts,
                         start_layer + 1,
-                        N_TOP + 1,
+                        n_top + 1,
                         log_d,
                         2 * sub_idx,
                     );
@@ -2179,7 +2222,7 @@ impl AdditiveNttF128 {
                         hi,
                         num_ntts,
                         start_layer + 1,
-                        N_TOP + 1,
+                        n_top + 1,
                         log_d,
                         2 * sub_idx + 1,
                     );
@@ -2200,7 +2243,7 @@ impl AdditiveNttF128 {
                 sub_data,
                 num_ntts,
                 start_layer,
-                N_TOP,
+                n_top,
                 log_d,
                 sub_idx,
             );
@@ -4242,7 +4285,7 @@ mod tests {
     fn recursive_from_message_fused3_matches_replicated_transform() {
         const NUM_NTTS: usize = 8;
         let mut rng = Rng::new(0x5241_5445_384D_5347);
-        for (log_d, start_layer) in [(12usize, 2usize), (12, 3)] {
+        for (log_d, start_layer) in [(12usize, 2usize), (12, 3), (14, 4), (12, 5)] {
             let ntt = AdditiveNttF128::standard(log_d);
             let msg_len = (1usize << (log_d - start_layer)) * NUM_NTTS;
             let msg = rand_vec(&mut rng, msg_len);
@@ -4266,8 +4309,8 @@ mod tests {
     }
 
     /// The fused-pair deep subtree (odd-layer lead + low-twiddle pairs) at the
-    /// exact recursive L1 (log_d 18) and L2 (log_d 16) geometries, with and
-    /// without the P+E helper queue, against the scalar interleaved oracle.
+    /// exact recursive L1..L4 geometries, with and without the P+E helper
+    /// queue, against the scalar interleaved oracle.
     #[test]
     fn recursive_deep_subtree_pairs_match_scalar_oracle() {
         const NUM_NTTS: usize = 8;
@@ -4277,7 +4320,14 @@ mod tests {
             .build()
             .unwrap();
         let mut rng = Rng::new(0xDEE9_9A12_5EED_0001);
-        for (log_d, start_layer) in [(18usize, 2usize), (16, 3), (13, 2), (12, 3)] {
+        for (log_d, start_layer) in [
+            (18usize, 2usize),
+            (16, 3),
+            (14, 4),
+            (12, 5),
+            (13, 2),
+            (12, 3),
+        ] {
             let ntt = AdditiveNttF128::standard(log_d);
             let msg_len = (1usize << (log_d - start_layer)) * NUM_NTTS;
             let msg = rand_vec(&mut rng, msg_len);
@@ -4286,9 +4336,9 @@ mod tests {
                 replica.copy_from_slice(&msg);
             }
             ntt.forward_transform_interleaved_scalar_from_layer(&mut want, NUM_NTTS, start_layer);
-            // The P+E helper route is gated (and debug-asserted) to the two
-            // production shapes; the smaller shapes take the Rayon route.
-            let exact_shape = matches!((log_d, start_layer), (18, 2) | (16, 3));
+            // The P+E helper route is gated (and debug-asserted) to the L1..L3
+            // production shapes; L4 and smaller shapes take the Rayon route.
+            let exact_shape = matches!((log_d, start_layer), (18, 2) | (16, 3) | (14, 4));
             let helpers: &[Option<&rayon::ThreadPool>] =
                 if exact_shape { &[None, Some(&helper)] } else { &[None] };
             for &helper in helpers {
@@ -4353,6 +4403,12 @@ mod tests {
         assert!(!is_recursive_l2_ntt_epool_shape(16, 4, 3));
         assert!(!is_recursive_l2_ntt_epool_shape(16, 8, 2));
 
+        // L3 shares the eight-lane direct-from-message geometry at log_d 14.
+        assert_eq!(is_recursive_l3_ntt_epool_shape(14, 8, 4), enabled_here);
+        assert!(!is_recursive_l3_ntt_epool_shape(13, 8, 4));
+        assert!(!is_recursive_l3_ntt_epool_shape(14, 4, 4));
+        assert!(!is_recursive_l3_ntt_epool_shape(14, 8, 3));
+
         assert!(!recursive_ntt_epool_killed_by(None));
         assert!(!recursive_ntt_epool_killed_by(Some("")));
         assert!(!recursive_ntt_epool_killed_by(Some("0")));
@@ -4363,7 +4419,11 @@ mod tests {
         assert!(!l2_recursive_ntt_epool_killed_by(Some("0")));
         assert!(l2_recursive_ntt_epool_killed_by(Some("1")));
 
-        // The union gate matches each shape exactly, independent of env.
+        assert!(!l3_recursive_ntt_epool_killed_by(None));
+        assert!(!l3_recursive_ntt_epool_killed_by(Some("0")));
+        assert!(l3_recursive_ntt_epool_killed_by(Some("1")));
+
+        // The union gate matches L1..L3 exactly and keeps tiny L4 off epool.
         assert_eq!(
             is_recursive_ntt_epool_shape(18, 8, 2),
             enabled_here
@@ -4372,6 +4432,11 @@ mod tests {
             is_recursive_ntt_epool_shape(16, 8, 3),
             enabled_here
         );
+        assert_eq!(
+            is_recursive_ntt_epool_shape(14, 8, 4),
+            enabled_here
+        );
+        assert!(!is_recursive_ntt_epool_shape(12, 8, 5));
         assert!(!is_recursive_ntt_epool_shape(17, 8, 2));
         assert!(!is_recursive_ntt_epool_shape(16, 8, 2));
     }
@@ -4551,6 +4616,74 @@ mod tests {
             "injected helper never claimed an exact L2-shape deep subtree"
         );
         assert_eq!(candidate, incumbent);
+    }
+
+    /// Exercise the exact L3 production geometry (log_d 14, 8 lanes, rate
+    /// entry at layer 4) through an injected helper pool. The control keeps
+    /// the Rayon tail; the candidate routes 64 × 32 KiB sub-transforms over
+    /// the P+E queue. Outputs must be byte-identical and callbacks must cover
+    /// every element disjointly.
+    #[test]
+    fn recursive_l3_ntt_epool_exact_shape_matches_incumbent() {
+        const LOG_D: usize = 14;
+        const NUM_NTTS: usize = 8;
+        const START_LAYER: usize = 4;
+
+        let main = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("recursive-l3-main-test-{i}"))
+            .build()
+            .unwrap();
+        let helper = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("recursive-l3-helper-test-{i}"))
+            .build()
+            .unwrap();
+
+        let mut rng = Rng::new(0x13C3_9E41_0D71_8B34);
+        let msg_len = (1usize << (LOG_D - START_LAYER)) * NUM_NTTS;
+        let msg = rand_vec(&mut rng, msg_len);
+        let poison = F128::new(0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A);
+        let mut incumbent = vec![poison; msg_len << START_LAYER];
+        let mut candidate = incumbent.clone();
+        let covered = std::sync::Mutex::new(Vec::<(usize, usize)>::new());
+
+        let claimed_before = crate::epool::helper_chunks_claimed();
+        main.install(|| {
+            let ntt = AdditiveNttF128::standard(LOG_D);
+            ntt.forward_transform_interleaved_from_message_fused3_with_helper(
+                &msg,
+                &mut incumbent,
+                NUM_NTTS,
+                START_LAYER,
+                LOG_D,
+                None,
+            );
+            ntt.forward_transform_interleaved_from_message_fused3_with_helper_and_then(
+                &msg,
+                &mut candidate,
+                NUM_NTTS,
+                START_LAYER,
+                LOG_D,
+                Some(&helper),
+                |off, chunk| covered.lock().unwrap().push((off, chunk.len())),
+            );
+        });
+
+        assert!(
+            crate::epool::helper_chunks_claimed() > claimed_before,
+            "injected helper never claimed an exact L3-shape deep subtree"
+        );
+        assert_eq!(candidate, incumbent);
+        let mut c = covered.into_inner().unwrap();
+        c.sort_unstable();
+        let mut next = 0usize;
+        for (off, len) in &c {
+            assert_eq!(*off, next, "gap/overlap in L3 finished chunks");
+            next += len;
+        }
+        assert_eq!(next, incumbent.len(), "L3 finished chunks do not cover codeword");
+        assert_eq!(c.len(), 64, "L3 deep epool should emit 64 × 32 KiB chunks");
     }
 
     /// The ranked split extension must produce three consecutive radix-8

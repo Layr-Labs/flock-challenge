@@ -59,30 +59,25 @@ static inline uint4 clmul64_u16(uint2 a, uint2 b) {
     return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
 }
 
-struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+struct U256u { uint4 lo; uint4 hi; };
 
-static inline U256k clmul128(uint4 a, uint4 b) {
+static inline U256u clmul128(uint4 a, uint4 b) {
     uint4 p0 = clmul64_u16(a.xy, b.xy);
     uint4 p2 = clmul64_u16(a.zw, b.zw);
     uint4 pm = clmul64_u16(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
-    U256k r;
-    r.r0 = (ulong(p0.y) << 32) | p0.x;
-    r.r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
-    r.r2 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
-    r.r3 = (ulong(p2.w) << 32) | p2.z;
-    return r;
+    return { uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y),
+             uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w) };
 }
 
-// Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
-static inline uint4 gf_reduce(U256k p) {
-    ulong h0 = p.r2, h1 = p.r3;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+// Reduce a 256-bit product mod x^128 + x^7 + x^2 + x + 1 (pure 32-bit uint4).
+static inline uint4 gf_reduce(U256u p) {
+    const uint4 h = p.hi;
+    uint4 t = h ^ (h << 1) ^ (h << 2) ^ (h << 7);
+    const uint4 c = uint4(0u, h.x, h.y, h.z);
+    t ^= (c >> 31) ^ (c >> 30) ^ (c >> 25);
+    const uint ov = (h.w >> 31) ^ (h.w >> 30) ^ (h.w >> 25);
+    t.x ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    return p.lo ^ t;
 }
 
 // Multiply a 16-byte value by a challenge through its 16 byte-bank nibble
@@ -129,9 +124,9 @@ static inline uint4 mul_rho16b(uint4 x, threadgroup const uint4* tab) {
     return a;
 }
 
-static inline ulong4 acc_mul(ulong4 acc, uint4 x, uint4 y) {
-    U256k p = clmul128(x, y);
-    return acc ^ ulong4(p.r0, p.r1, p.r2, p.r3);
+static inline U256u acc_mul(U256u acc, uint4 x, uint4 y) {
+    U256u p = clmul128(x, y);
+    return { acc.lo ^ p.lo, acc.hi ^ p.hi };
 }
 
 // v ^ v of lane (lane ^ m) of the simdgroup.
@@ -139,13 +134,8 @@ static inline uint4 xor_lanes(uint4 v, ushort m) {
     return v ^ simd_shuffle_xor(v, m);
 }
 
-static inline ulong4 xor_lanes4(ulong4 v, ushort m) {
-    uint4 lo = uint4(uint(v.x), uint(v.y), uint(v.z), uint(v.w));
-    uint4 hi = uint4(uint(v.x >> 32), uint(v.y >> 32), uint(v.z >> 32), uint(v.w >> 32));
-    lo = simd_shuffle_xor(lo, m);
-    hi = simd_shuffle_xor(hi, m);
-    return v ^ ulong4(ulong(lo.x) | (ulong(hi.x) << 32), ulong(lo.y) | (ulong(hi.y) << 32),
-                      ulong(lo.z) | (ulong(hi.z) << 32), ulong(lo.w) | (ulong(hi.w) << 32));
+static inline U256u xor_lanes4(U256u v, ushort m) {
+    return { v.lo ^ simd_shuffle_xor(v.lo, m), v.hi ^ simd_shuffle_xor(v.hi, m) };
 }
 
 // Ranked chunk geometry: 128 packed superblocks of 244 a entries and 512
@@ -200,7 +190,8 @@ kernel void zc_t56_fold(
     device uint4* ao = a_out + ulong(chunk) * T56_OUT;
     device uint4* bo = b_out + ulong(chunk) * T56_OUT;
     device const uint4* eq_odd = consts + 1024u;
-    ulong4 acc_a = ulong4(0ul), acc_b = ulong4(0ul), acc_c = ulong4(0ul), acc_d = ulong4(0ul);
+    U256u acc_a = { uint4(0u), uint4(0u) }, acc_b = { uint4(0u), uint4(0u) };
+    U256u acc_c = { uint4(0u), uint4(0u) }, acc_d = { uint4(0u), uint4(0u) };
     uint4 qa = uint4(0u), qb = uint4(0u);
     for (uint j = 0u; j < 8u; j++) {
         const uint o = (quarter << 11) + (j << 8) + lid;
@@ -265,19 +256,26 @@ kernel void zc_t56_fold(
     acc_d = xor_lanes4(acc_d, ushort(16));
     // Retire every table reader before reusing `tab` as the 8 KiB reduction buffer.
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    threadgroup ulong4* red = reinterpret_cast<threadgroup ulong4*>(tab);
+    threadgroup uint4* red = tab;
     if ((lid & 31u) < 8u) {
-        const uint base = (lid >> 5) * 32u + l;
-        red[base] = acc_a;
-        red[base + 8u] = acc_b;
-        red[base + 16u] = acc_c;
-        red[base + 24u] = acc_d;
+        const uint base = ((lid >> 5) * 32u + l) * 2u;
+        red[base + 0u]  = acc_a.lo; red[base + 1u]  = acc_a.hi;
+        red[base + 16u] = acc_b.lo; red[base + 17u] = acc_b.hi;
+        red[base + 32u] = acc_c.lo; red[base + 33u] = acc_c.hi;
+        red[base + 48u] = acc_d.lo; red[base + 49u] = acc_d.hi;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid < 32u) {
-        ulong4 s = red[lid];
-        for (uint k = 1u; k < 8u; k++) { s ^= red[(k << 5) + lid]; }
-        banks[(ulong(tg) << 5) + lid] = s;
+        uint4 slo = red[lid * 2u], shi = red[lid * 2u + 1u];
+        for (uint k = 1u; k < 8u; k++) {
+            const uint idx = ((k << 5) + lid) * 2u;
+            slo ^= red[idx];
+            shi ^= red[idx + 1u];
+        }
+        device uint4* banks4 = reinterpret_cast<device uint4*>(banks);
+        const ulong dst = ((ulong(tg) << 5) + lid) * 2u;
+        banks4[dst] = slo;
+        banks4[dst + 1u] = shi;
     }
 }
 "#;
@@ -892,5 +890,103 @@ pub(super) fn zc_t56_out_bufs() -> Option<(Id, Id, *const F128, *const F128, usi
             gpu.buffer_contents(st.out_b).cast::<F128>().cast_const(),
             st.cap,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real-Metal `zc_t56_fold` (with pure 32-bit `uint4` `gf_reduce`) matches
+    /// the portable `zc_t56::emu::emulate_chunk` oracle bit-for-bit on `a_out`,
+    /// `b_out`, and all 26 finished slots, and keeps TG SRAM at 24 KiB + cut word.
+    #[test]
+    fn zc_t56_fold_matches_emulator_and_keeps_tg_sram() {
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        const CHUNKS: usize = 2;
+        let mut s = 0x5435_364D_4554_414Cu64;
+        let mut next = || -> F128 {
+            let mut step = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            F128::new(step(), step())
+        };
+        let a_in: Vec<F128> = (0..CHUNKS * IN_A).map(|_| next()).collect();
+        let b_in: Vec<F128> = (0..CHUNKS * IN_B).map(|_| next()).collect();
+        let rho_a = next();
+        let rho_b = next();
+        let eq_lo: Vec<F128> = (0..zc_t56::LO).map(|_| next()).collect();
+        let mut consts = vec![F128::ZERO; CONSTS];
+        zc_t56::consts_into(&mut consts, rho_a, rho_b, &eq_lo);
+
+        unsafe {
+            let pso = zc_t56_build_pso(gpu).expect("zc_t56_fold pipeline compile failed");
+            let (tg_bytes, simd_w, max_t) = gpu.pipeline_resources(pso);
+            eprintln!("zc_t56_fold staticThreadgroupMemoryLength = {tg_bytes} B");
+            assert!(tg_bytes <= 24_608, "zc_t56_fold TG SRAM grew unexpectedly: {tg_bytes} B");
+            assert_eq!(simd_w, 32);
+            assert!(max_t >= 256);
+
+            let pool = gpu.pool_push();
+            let in_a_buf = gpu.new_buffer(CHUNKS * IN_A * 16).unwrap();
+            let in_b_buf = gpu.new_buffer(CHUNKS * IN_B * 16).unwrap();
+            let out_a_buf = gpu.new_buffer(CHUNKS * OUT * 16).unwrap();
+            let out_b_buf = gpu.new_buffer(CHUNKS * OUT * 16).unwrap();
+            let consts_buf = gpu.new_buffer(CONSTS * 16).unwrap();
+            let banks_buf = gpu.new_buffer(CHUNKS * BANKS * 32).unwrap();
+            let cut_buf = gpu.new_buffer(16).unwrap();
+
+            std::ptr::copy_nonoverlapping(a_in.as_ptr().cast::<u8>(), gpu.buffer_contents(in_a_buf), CHUNKS * IN_A * 16);
+            std::ptr::copy_nonoverlapping(b_in.as_ptr().cast::<u8>(), gpu.buffer_contents(in_b_buf), CHUNKS * IN_B * 16);
+            std::ptr::copy_nonoverlapping(consts.as_ptr().cast::<u8>(), gpu.buffer_contents(consts_buf), CONSTS * 16);
+            *gpu.buffer_contents(cut_buf).cast::<u32>() = CHUNKS as u32;
+
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            gpu.set_pipeline(enc, pso);
+            gpu.set_buffer(enc, in_a_buf, 0, 0);
+            gpu.set_buffer(enc, in_b_buf, 0, 1);
+            gpu.set_buffer(enc, out_a_buf, 0, 2);
+            gpu.set_buffer(enc, out_b_buf, 0, 3);
+            gpu.set_buffer(enc, consts_buf, 0, 4);
+            gpu.set_buffer(enc, banks_buf, 0, 5);
+            let params: [u32; 4] = [0, 0, 0, 0];
+            gpu.set_bytes(enc, std::slice::from_raw_parts(params.as_ptr().cast::<u8>(), 16), 6);
+            gpu.set_buffer(enc, cut_buf, 0, 7);
+            gpu.dispatch(enc, (CHUNKS * 4) as u64, 256);
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+
+            let gpu_a = std::slice::from_raw_parts(gpu.buffer_contents(out_a_buf).cast::<F128>(), CHUNKS * OUT);
+            let gpu_b = std::slice::from_raw_parts(gpu.buffer_contents(out_b_buf).cast::<F128>(), CHUNKS * OUT);
+            let gpu_banks = std::slice::from_raw_parts(gpu.buffer_contents(banks_buf).cast::<[u64; 4]>(), CHUNKS * BANKS);
+
+            for c in 0..CHUNKS {
+                let mut ref_a = vec![F128::ZERO; OUT];
+                let mut ref_b = vec![F128::ZERO; OUT];
+                let ref_slots = zc_t56::emu::emulate_chunk(
+                    &a_in[c * IN_A..(c + 1) * IN_A],
+                    &b_in[c * IN_B..(c + 1) * IN_B],
+                    &mut ref_a,
+                    &mut ref_b,
+                    &consts,
+                );
+                let got_slots = zc_t56::finish_banks(&gpu_banks[c * BANKS..(c + 1) * BANKS]);
+                assert_eq!(&gpu_a[c * OUT..(c + 1) * OUT], ref_a.as_slice(), "a_out mismatch chunk {c}");
+                assert_eq!(&gpu_b[c * OUT..(c + 1) * OUT], ref_b.as_slice(), "b_out mismatch chunk {c}");
+                assert_eq!(got_slots, ref_slots, "slots mismatch chunk {c}");
+            }
+
+            for b in [in_a_buf, in_b_buf, out_a_buf, out_b_buf, consts_buf, banks_buf, cut_buf, pso] {
+                gpu.release(b);
+            }
+            gpu.pool_pop(pool);
+        }
     }
 }

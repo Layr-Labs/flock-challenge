@@ -173,6 +173,9 @@ mod r2cs_fast {
                     assert_eq!(width, gpu.pipeline_resources(pso).1, "SIMD width");
                     assert!(gpu.pipeline_resources(pso).2 >= 256, "threadgroup capacity");
                 }
+                let fast2_tg = gpu.pipeline_resources(psos[2]).0;
+                eprintln!("r2cs_fast2 staticThreadgroupMemoryLength = {fast2_tg} B");
+                assert_eq!(fast2_tg, 29_184, "r2cs_fast2 TG SRAM must stay 29,184 B (got {fast2_tg})");
                 let a_buf = upload(&a_in);
                 let eq_lo_buf = upload(&eq_lo);
                 let eq_hi_buf = upload(&eq_hi);

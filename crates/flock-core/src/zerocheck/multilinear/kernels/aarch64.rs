@@ -3048,7 +3048,7 @@ pub(crate) fn r2_full_xb_rho_prep(eq_lo: &[F128]) -> Option<Vec<F128>> {
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
+unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool, const OPT: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -3130,8 +3130,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 let mut w3 = tri_zero;
                 let mut w4 = tri_zero;
                 let mut w5 = tri_zero;
-                // `x^b` in both lanes, and the prepared pair of `rho x^b`.
-                let mut xb = vdupq_n_u64(1);
+                // Prepared pair pointer for `rho x^b`.
                 let mut pr = rho_prep;
                 // One group's eight products from its two folded pairs, its
                 // a rows scaled by `$scale`; `$pad1`: the second pair is
@@ -3208,8 +3207,41 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                     }};
                 }
                 // The walk's own order, two groups (`t = 0`, `t = 1` of one
-                // `b`) per trip.
-                for trip in 0..trips {
+                // `b`) per trip. When `OPT`, peel `trip == 0` (`b == 0`,
+                // `x^0 = 1`) so its even group skips `mul_xb_q` and the loop
+                // `1..trips` starts at `xb = 2` (ending at `x^14` for group 60
+                // in `win == 1`).
+                const { assert!(HC_HEAD_PAIRS >= 4); }
+                let (mut xb, start_trip) = if OPT {
+                    if skip_pure && win == 0 {
+                        for i in 0..2usize {
+                            head_ok &= r2_head_group_store_even::<F7>(
+                                table_data,
+                                pa.wrapping_add(32 * i),
+                                pb.wrapping_add(32 * i),
+                                anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * i),
+                                deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * i),
+                                nt_deltas,
+                            );
+                        }
+                    } else {
+                        let (rows0, rows1) = fold_group!(0usize, 0, 0, 16, 0, 32);
+                        products!(rows0, rows1, false, |v| v);
+                        let (rows0, rows1) = fold_group!(0usize, 1, 32, 48, 64, 96);
+                        let p0 = vld1q_u64(pr.cast::<u64>());
+                        let p1 = vld1q_u64(pr.add(1).cast::<u64>());
+                        products!(rows0, rows1, false, |v| mul_prep86_seeded_q(p0, p1, v, k86));
+                    }
+                    pr = pr.wrapping_add(2);
+                    pa = pa.wrapping_add(64);
+                    pb = pb.wrapping_add(64);
+                    pn = pn.wrapping_add(8);
+                    pd = pd.wrapping_add(64);
+                    (vdupq_n_u64(2), 1usize)
+                } else {
+                    (vdupq_n_u64(1), 0usize)
+                };
+                for trip in start_trip..trips {
                     // R2 C capture (`skip_pure`): the head groups 0..4
                     // (window 0, trips 0 and 1) and group 59 (window 1, trip
                     // 13, second group) make their stores from the even rows
@@ -3266,7 +3298,13 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                         inout(reg) pr,
                         options(pure, nomem, nostack, preserves_flags),
                     );
-                    products!(rows0, rows1, false, |v| mul_prep86_q(p0, p1, v, k86));
+                    products!(rows0, rows1, false, |v| {
+                        if OPT {
+                            mul_prep86_seeded_q(p0, p1, v, k86)
+                        } else {
+                            mul_prep86_q(p0, p1, v, k86)
+                        }
+                    });
                 }
                 if win == 1 {
                     // Group 60 (`t = 0`, `b = 14`): pair 120 live, pair 121
@@ -3299,6 +3337,19 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
     }
 }
 
+/// Zero-spill optimizations in
+/// [`fold_round2_compact_chunk_neon_lookahead_8_xb_impl`]: seeded prepared
+/// products ([`mul_prep86_seeded_q`]) for odd groups and peeling `trip == 0`
+/// (`b == 0`, `x^0 = 1`) so its even group skips [`mul_xb_q`]. On by default;
+/// `FLOCK_NO_R2_NOSPILL` (any value, read once per process) keeps the parent
+/// loop. Same anchors, deltas and slots either way.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn r2_nospill_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_R2_NOSPILL").is_none());
+    *ON
+}
+
 /// [`fold_round2_compact_chunk_neon_lookahead_8_xb_impl`] through the
 /// seven-piece table at `table7` when it is non-null, else through the byte
 /// banks at `table_data`.
@@ -3326,16 +3377,23 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb(
     out: *mut F128,
 ) {
     unsafe {
-        if table7.is_null() {
-            fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false>(
+        match (table7.is_null(), r2_nospill_enabled()) {
+            (true, true) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false, true>(
                 table_data, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
                 head_fail, skip_pure, out,
-            )
-        } else {
-            fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true>(
+            ),
+            (true, false) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false, false>(
+                table_data, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
+                head_fail, skip_pure, out,
+            ),
+            (false, true) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true, true>(
                 table7, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
                 head_fail, skip_pure, out,
-            )
+            ),
+            (false, false) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true, false>(
+                table7, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
+                head_fail, skip_pure, out,
+            ),
         }
     }
 }
@@ -5849,21 +5907,26 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         let mut win_first = 0usize;
         let mut in_window = 0usize;
         let k87 = vdupq_n_u64(0x87);
+        macro_rules! k_xb_flush {
+            () => {{
+                let lambda = vld1q_u64(eq_prep.add(2 * win_first + 1).cast::<u64>());
+                let lambda_sw = swap_halves_q(lambda);
+                for (sum, w) in sums.0.iter_mut().zip(wacc.0.iter()) {
+                    let v = reduce_tri_binius_xor_q(w.ll, w.cross, w.hh, zero);
+                    tri_acc_sw(sum, lambda, lambda_sw, v);
+                }
+                wacc = LookaheadTriAcc::zero();
+                win_first += 8;
+            }};
+        }
         macro_rules! k_xb_step {
             () => {{
                 xb_q = vshlq_n_u64::<2>(xb_q);
                 in_window += 1;
                 if in_window == 8 {
-                    let lambda = vld1q_u64(eq_prep.add(2 * win_first + 1).cast::<u64>());
-                    let lambda_sw = swap_halves_q(lambda);
-                    for (sum, w) in sums.0.iter_mut().zip(wacc.0.iter()) {
-                        let v = reduce_tri_binius_xor_q(w.ll, w.cross, w.hh, zero);
-                        tri_acc_sw(sum, lambda, lambda_sw, v);
-                    }
-                    wacc = LookaheadTriAcc::zero();
+                    k_xb_flush!();
                     xb_q = vdupq_n_u64(1);
                     in_window = 0;
-                    win_first += 8;
                 }
             }};
         }
@@ -5950,11 +6013,17 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         }
 
         // `$o`: the index of the group's first output in `a_out` / `b_out`.
+        // `$xb_one`: group starts an 8-group window (`b == 0`, `xb_q == 1`),
+        // skipping `mul_xb_q`. `$check_flush`: check `in_window == 8` in
+        // `k_xb_step!`; `DEAD_TAIL` flushes explicitly at `t0 + 7` and `t0 + 15`.
         macro_rules! k_group {
             ($t:expr, $o:expr) => {
-                k_group!(@ $t, $o, false)
+                k_group!(@ $t, $o, false, false, true)
             };
-            (@ $t:expr, $o:expr, $fused:literal) => {{
+            (@ $t:expr, $o:expr, $fused:literal) => {
+                k_group!(@ $t, $o, $fused, false, true)
+            };
+            (@ $t:expr, $o:expr, $fused:literal, $xb_one:literal, $check_flush:literal) => {{
                 macro_rules! kacc {
                     ($acc:expr, $x:expr, $y:expr) => {
                         if $fused {
@@ -6005,9 +6074,15 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     ))
                 {
                     if XB {
-                        acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb_q, k87));
-                        acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb_q, k87));
-                        acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb_q, k87));
+                        if $xb_one {
+                            acc[0].ll = veorq_u64(acc[0].ll, a1);
+                            acc[2].ll = veorq_u64(acc[2].ll, a3);
+                            acc[4].ll = veorq_u64(acc[4].ll, a2);
+                        } else {
+                            acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb_q, k87));
+                            acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb_q, k87));
+                            acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb_q, k87));
+                        }
                     } else {
                         // `w` = (p0.lo, p1.lo).
                         let wp = eq_prep.add(2 * t).cast::<u64>();
@@ -6019,12 +6094,16 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     }
                 } else {
                     let (a0w, a1w, a2w, a3w) = if XB {
-                        (
-                            mul_xb_q(a0, xb_q, k87),
-                            mul_xb_q(a1, xb_q, k87),
-                            mul_xb_q(a2, xb_q, k87),
-                            mul_xb_q(a3, xb_q, k87),
-                        )
+                        if $xb_one {
+                            (a0, a1, a2, a3)
+                        } else {
+                            (
+                                mul_xb_q(a0, xb_q, k87),
+                                mul_xb_q(a1, xb_q, k87),
+                                mul_xb_q(a2, xb_q, k87),
+                                mul_xb_q(a3, xb_q, k87),
+                            )
+                        }
                     } else {
                         let wp = eq_prep.add(2 * t).cast::<u64>();
                         let (w_p0, w_p1) = (vld1q_u64(wp), vld1q_u64(wp.add(2)));
@@ -6047,7 +6126,13 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     kacc!(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
                 }
                 if XB {
-                    k_xb_step!();
+                    if $check_flush {
+                        k_xb_step!();
+                    } else if $xb_one {
+                        xb_q = vdupq_n_u64(4);
+                    } else {
+                        xb_q = vshlq_n_u64::<2>(xb_q);
+                    }
                 }
             }};
         }
@@ -6082,18 +6167,42 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     deltas = deltas0.wrapping_sub(TC_DELTA_GAP * blk);
                 }
                 if allfused {
-                    // Two groups per trip (seven pairs and one more): the
-                    // fused results alternate registers.
-                    let mut t = t0;
-                    while t + 2 <= t0 + 15 {
-                        k_group!(@ t, o0 + 4 * (t - t0), true);
-                        k_group!(@ t + 1, o0 + 4 * (t + 1 - t0), true);
-                        t += 2;
+                    // Two 8-group windows per block: peel `b == 0` (`t0` and
+                    // `t0 + 8`, where `xb_q == 1`, skipping `mul_xb_q`), run
+                    // the 3 interior pairs (`b = 1..6`), and close `win == 0`
+                    // with `t0 + 7` + window flush (`win == 1` closes at the
+                    // dead-tail group `t0 + 15` below).
+                    for win in 0..2usize {
+                        let wt = t0 + 8 * win;
+                        let wo = o0 + 32 * win;
+                        k_group!(@ wt, wo, true, true, false);
+                        let mut t = wt + 1;
+                        while t + 2 <= wt + 7 {
+                            k_group!(@ t, o0 + 4 * (t - t0), true, false, false);
+                            k_group!(@ t + 1, o0 + 4 * (t + 1 - t0), true, false, false);
+                            t += 2;
+                        }
+                        if win == 0 {
+                            k_group!(@ wt + 7, wo + 28, true, false, false);
+                            if XB {
+                                k_xb_flush!();
+                            }
+                        }
                     }
-                    k_group!(@ t, o0 + 4 * (t - t0), true);
                 } else {
-                    for t in t0..t0 + 15 {
-                        k_group!(t, o0 + 4 * (t - t0));
+                    for win in 0..2usize {
+                        let wt = t0 + 8 * win;
+                        let wo = o0 + 32 * win;
+                        k_group!(@ wt, wo, false, true, false);
+                        for t in wt + 1..wt + 7 {
+                            k_group!(@ t, o0 + 4 * (t - t0), false, false, false);
+                        }
+                        if win == 0 {
+                            k_group!(@ wt + 7, wo + 28, false, false, false);
+                            if XB {
+                                k_xb_flush!();
+                            }
+                        }
                     }
                 }
                 let t = t0 + 15;
@@ -6150,7 +6259,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     t.hh = veorq_u64(t.hh, hh);
                 }
                 if XB {
-                    k_xb_step!();
+                    k_xb_flush!();
                 }
             }
         } else {
@@ -10404,6 +10513,138 @@ mod tests {
         }
     }
 
+    /// The zero-spill `OPT = true` path of
+    /// [`fold_round2_compact_chunk_neon_lookahead_8_xb_impl`] (`mul_prep86_seeded_q`
+    /// plus peeled `trip == 0`) produces the exact same anchors, deltas, eight
+    /// slots and `head_fail` flag as `OPT = false`, across both byte banks and
+    /// seven-piece tables, `ones_is_one`, `skip_pure`, and clean/bad head and
+    /// group-59 rows.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn round2_full_xb_nospill_matches_parent() {
+        const LO_SIZE: usize = 512;
+        let mut state = 0x5232_4e4f_5350_494c;
+        let mut a_packed = vec![0u8; 16 * LO_SIZE];
+        let mut b_packed = vec![0u8; 16 * LO_SIZE];
+        for byte in a_packed.iter_mut().chain(b_packed.iter_mut()) {
+            *byte = splitmix64(&mut state) as u8;
+        }
+        let n_groups = LO_SIZE / 2;
+        let n_blocks = LO_SIZE / 128;
+        for block in 0..n_blocks {
+            // Head groups 0..4 and group 59 all ones (valid for `skip_pure`).
+            b_packed[block * 64 * 32..(block * 64 + 4) * 32].fill(0xff);
+            b_packed[(block * 64 + 59) * 32..(block * 64 + 60) * 32].fill(0xff);
+            for trip in 2..29 {
+                let g = 64 * block + 2 * trip + (trip + block) % 2;
+                match (trip + block) % 4 {
+                    0 => b_packed[g * 32..(g + 1) * 32].fill(0xff),
+                    1 => b_packed[g * 32..g * 32 + 16].fill(0xff),
+                    2 => b_packed[g * 32 + 16..(g + 1) * 32].fill(0xff),
+                    _ => {}
+                }
+            }
+        }
+        let mut eq_lo: Vec<F128> = (0..LO_SIZE)
+            .map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state)))
+            .collect();
+        let rho = F128::new(splitmix64(&mut state), splitmix64(&mut state));
+        for first in (0..n_groups).step_by(32) {
+            eq_lo[2 * first + 3] = rho * eq_lo[2 * first + 1];
+            for t in 0..2 {
+                for b in 1..16 {
+                    eq_lo[2 * (first + 2 * b + t) + 1] =
+                        eq_lo[2 * (first + t) + 1] * F128::new(1u64 << b, 0);
+                }
+            }
+        }
+        let rho_prep = r2_full_xb_rho_prep(&eq_lo).expect("structured weights");
+        let mut singles: Vec<F128> =
+            (0..64).map(|_| F128::new(splitmix64(&mut state), splitmix64(&mut state))).collect();
+        let poison = F128::new(0xbbbb_bbbb_bbbb_bbbb, 0x4444_4444_4444_4444);
+        for ones_is_one in [false, true] {
+            if ones_is_one {
+                let rest = singles[..63].iter().fold(F128::ZERO, |acc, s| acc + *s);
+                singles[63] = F128::ONE + rest;
+            }
+            let table = linear_byte_banks(&singles);
+            let t7 = r2_fold7_table(&table).expect("linear banks");
+            for bad_case in [0u8, 1, 2] {
+                let mut b_packed = b_packed.clone();
+                if bad_case == 1 {
+                    // Bad b row inside peeled trip 0 (block 2, group 1).
+                    b_packed[(2 * 64 + 1) * 32 + 16..(2 * 64 + 1) * 32 + 24].fill(0x7f);
+                } else if bad_case == 2 {
+                    // Bad b row inside win 1, trip 13 (block 3, group 59).
+                    b_packed[(3 * 64 + 59) * 32..((3 * 64 + 59) * 32 + 8)].fill(0x3e);
+                }
+                for (head, tail, degen, skip_pure) in [
+                    (false, false, false, false),
+                    (false, false, true, false),
+                    (false, true, true, false),
+                    (true, true, false, false),
+                    (true, true, true, false),
+                    (true, true, true, true),
+                ] {
+                    for pieces in [false, true] {
+                        let run = |opt: bool| {
+                            let a_off = n_blocks * HC_ANCHOR_GAP + HC_ANCHOR_SHIFT;
+                            let d_off = n_blocks * HC_DELTA_GAP + HC_DELTA_SHIFT;
+                            let mut anchors = vec![poison; 2 * LO_SIZE + a_off];
+                            let mut deltas = vec![0x5au8; 16 * LO_SIZE + d_off];
+                            let mut out = [poison; 8];
+                            let flag = core::sync::atomic::AtomicBool::new(false);
+                            unsafe {
+                                let (anc, del) = if tail {
+                                    (anchors.as_mut_ptr().add(a_off), deltas.as_mut_ptr().add(d_off))
+                                } else {
+                                    (anchors.as_mut_ptr(), deltas.as_mut_ptr())
+                                };
+                                let hf = if head {
+                                    &flag as *const core::sync::atomic::AtomicBool
+                                } else {
+                                    core::ptr::null()
+                                };
+                                let tp = if pieces {
+                                    t7.as_ptr().cast::<u8>()
+                                } else {
+                                    table.as_ptr().cast::<u8>()
+                                };
+                                match (pieces, opt) {
+                                    (false, false) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false, false>(
+                                        tp, a_packed.as_ptr(), b_packed.as_ptr(), anc, del, eq_lo.as_ptr(),
+                                        rho_prep.as_ptr(), LO_SIZE, degen, tail, hf, skip_pure, out.as_mut_ptr(),
+                                    ),
+                                    (false, true) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false, true>(
+                                        tp, a_packed.as_ptr(), b_packed.as_ptr(), anc, del, eq_lo.as_ptr(),
+                                        rho_prep.as_ptr(), LO_SIZE, degen, tail, hf, skip_pure, out.as_mut_ptr(),
+                                    ),
+                                    (true, false) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true, false>(
+                                        tp, a_packed.as_ptr(), b_packed.as_ptr(), anc, del, eq_lo.as_ptr(),
+                                        rho_prep.as_ptr(), LO_SIZE, degen, tail, hf, skip_pure, out.as_mut_ptr(),
+                                    ),
+                                    (true, true) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true, true>(
+                                        tp, a_packed.as_ptr(), b_packed.as_ptr(), anc, del, eq_lo.as_ptr(),
+                                        rho_prep.as_ptr(), LO_SIZE, degen, tail, hf, skip_pure, out.as_mut_ptr(),
+                                    ),
+                                }
+                            }
+                            (anchors, deltas, out, flag.into_inner())
+                        };
+                        let (want, got) = (run(false), run(true));
+                        let at = format!(
+                            "ones {ones_is_one} bad {bad_case} head {head} tail {tail} degen {degen} skip {skip_pure} pieces {pieces}"
+                        );
+                        assert_eq!(got.0, want.0, "anchors: {at}");
+                        assert_eq!(got.1, want.1, "deltas: {at}");
+                        assert_eq!(got.2, want.2, "slots: {at}");
+                        assert_eq!(got.3, want.3, "head flag: {at}");
+                    }
+                }
+            }
+        }
+    }
+
     /// The ranked pre-scaled loop with the reduction constant held in a
     /// register and one copy per `degen` and b == 1 flag writes the same
     /// anchors and deltas and returns the same slots as the parent loop:
@@ -11680,14 +11921,14 @@ mod tests {
                                 OUT_PAIRS, true, out.as_mut_ptr(),
                             ),
                             (false, false) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
                                 );
                             }
                             (false, true) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
@@ -11771,12 +12012,12 @@ mod tests {
                 let (mut ap, mut bp) = (vec![poison; n_out], vec![poison; n_out]);
                 let (mut o_full, mut o_pack) = ([F128::ZERO; 8], [F128::ZERO; 8]);
                 unsafe {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_full.as_mut_ptr(), false, false, false, F128::ONE,
                     );
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         ap.as_mut_ptr(), bp.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_pack.as_mut_ptr(), false, false, false, F128::ONE,
@@ -11860,7 +12101,7 @@ mod tests {
                     let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
                     let mut o = [F128::ZERO; 8];
                     let ok = unsafe {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
                             r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                             a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                             o.as_mut_ptr(), bpack, false, false, F128::ONE,
@@ -11933,13 +12174,13 @@ mod tests {
                     let mut o = [F128::ZERO; 8];
                     let ok = unsafe {
                         if pieces {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false>(
                                 t7.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                                 o.as_mut_ptr(), bpack, false, false, F128::ONE,
                             )
                         } else {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
                                 r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                                 o.as_mut_ptr(), bpack, false, false, F128::ONE,
@@ -11954,6 +12195,96 @@ mod tests {
                 assert_eq!(got.1, want.1, "b outputs, {at}");
                 assert_eq!(got.2, want.2, "slots, {at}");
                 assert_eq!(got.3, want.3, "b-one verdict, {at}");
+            }
+        }
+    }
+
+    /// `XB = true` (including the `b == 0` peel on `t == t0` and `t == t0 + 8`
+    /// in `DEAD_TAIL`) matches `XB = false` (prepared `eq_prep`) bit-for-bit
+    /// across dense, packed, b-one-packed, and pieces7 K walks.
+    #[cfg(target_feature = "sha3")]
+    #[test]
+    fn k_fused_xb_peel_matches_prepared() {
+        use crate::zerocheck::multilinear::UniSkipFoldTable;
+        let mut state = 0x4b58_4250_4545_4c31;
+        let rho = |state: &mut u64| F128::new(splitmix64(state), splitmix64(state));
+        let table = UniSkipFoldTable::new(6, rho(&mut state));
+        for case in 0..4 {
+            let out_pairs = if case % 2 == 0 { 2 * 16 * 8 } else { 2 * 16 * 4 };
+            let n_out = 2 * out_pairs;
+            let n5 = out_pairs / 2;
+            let (rho1, rho2) = (rho(&mut state), rho(&mut state));
+            let r1 = table.scaled_linear(rho1);
+            let t7 = r2_fold7_table(&r1).expect("scaled banks are linear");
+            let mut anchors: Vec<F128> = (0..8 * out_pairs).map(|_| rho(&mut state)).collect();
+            let mut deltas: Vec<u8> =
+                (0..64 * out_pairs).map(|_| splitmix64(&mut state) as u8).collect();
+            // Build `eq` obeying the 8-group `x^(2j)` window relation.
+            let mut eq = vec![F128::ZERO; out_pairs];
+            for win in 0..n5 / 8 {
+                let lam = rho(&mut state);
+                for j in 0..8 {
+                    eq[2 * (8 * win + j) + 1] = lam * F128::new(1u64 << (2 * j), 0);
+                }
+            }
+            let eq_prep = round2_eq_prep(&eq);
+            for g in 0..n_out {
+                if matches!(g % 64, 0..4 | 59) || (case >= 2 && splitmix64(&mut state) % 4 == 0) {
+                    anchors[4 * g + 1] = F128::ONE;
+                    anchors[4 * g + 3] = F128::ONE;
+                    deltas[32 * g + 8..32 * g + 16].fill(0);
+                    deltas[32 * g + 24..32 * g + 32].fill(0);
+                }
+            }
+            let poison = F128::new(0xdead, 0xbeef);
+            for (degen, bpack) in [(false, false), (true, false), (true, true)] {
+                for mode in 0..3usize {
+                    let run = |xb: bool| {
+                        let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
+                        let mut o = [F128::ZERO; 8];
+                        let prep = if xb { eq.as_ptr() } else { eq_prep.as_ptr() };
+                        let ok = unsafe {
+                            match (mode, xb) {
+                                (0, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
+                                    r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                    a.as_mut_ptr(), b.as_mut_ptr(), prep, out_pairs, degen,
+                                    o.as_mut_ptr(), false, false, false, F128::ONE,
+                                ),
+                                (0, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true>(
+                                    r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                    a.as_mut_ptr(), b.as_mut_ptr(), prep, out_pairs, degen,
+                                    o.as_mut_ptr(), false, false, false, F128::ONE,
+                                ),
+                                (1, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
+                                    r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                    a.as_mut_ptr(), b.as_mut_ptr(), prep, out_pairs, degen,
+                                    o.as_mut_ptr(), bpack, false, false, F128::ONE,
+                                ),
+                                (1, true) => fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true>(
+                                    r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                    a.as_mut_ptr(), b.as_mut_ptr(), prep, out_pairs, degen,
+                                    o.as_mut_ptr(), bpack, false, false, F128::ONE,
+                                ),
+                                (2, false) => fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false>(
+                                    t7.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                    a.as_mut_ptr(), b.as_mut_ptr(), prep, out_pairs, degen,
+                                    o.as_mut_ptr(), bpack, false, false, F128::ONE,
+                                ),
+                                _ => fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true>(
+                                    t7.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
+                                    a.as_mut_ptr(), b.as_mut_ptr(), prep, out_pairs, degen,
+                                    o.as_mut_ptr(), bpack, false, false, F128::ONE,
+                                ),
+                            }
+                        };
+                        (a, b, o, ok)
+                    };
+                    let (want, got) = (run(false), run(true));
+                    assert_eq!(got.0, want.0, "a mismatch case={case} mode={mode} degen={degen} bpack={bpack}");
+                    assert_eq!(got.1, want.1, "b mismatch case={case} mode={mode} degen={degen} bpack={bpack}");
+                    assert_eq!(got.2, want.2, "slots mismatch case={case} mode={mode} degen={degen} bpack={bpack}");
+                    assert_eq!(got.3, want.3, "ok mismatch case={case} mode={mode} degen={degen} bpack={bpack}");
+                }
             }
         }
     }
