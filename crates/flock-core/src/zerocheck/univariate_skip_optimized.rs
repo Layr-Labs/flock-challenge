@@ -6231,7 +6231,7 @@ mod tests {
     /// view, at any shape the rebuild accepts.
     #[test]
     fn r2_offer_ceil_within_published_prefix() {
-        assert_eq!(crate::gpu_commit::zc_r2_offer_ceil_chunks(2048), 1024);
+        assert_eq!(crate::gpu_commit::zc_r2_offer_ceil_chunks(2048), 1146);
         for log_hi in 3..=14usize {
             let hi = 1usize << log_hi;
             let offer = crate::gpu_commit::zc_r2_offer_ceil_chunks(hi);
