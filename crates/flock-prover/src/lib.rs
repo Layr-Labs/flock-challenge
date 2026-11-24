@@ -366,3 +366,4 @@ static RECYCLE_ALLOC: recycle_alloc::RecycleAlloc = recycle_alloc::RecycleAlloc;
 // darthweenies-resample marker r59-108-1788755410
 // darthweenies-resample marker r60-109-1788756018
 // darthweenies-resample marker r61-110-1788756628
+// Re-measurement marker 2 of the restored e1dca094 piece (no functional change).
