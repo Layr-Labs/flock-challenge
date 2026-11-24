@@ -3030,6 +3030,74 @@ pub(crate) fn induce_sumcheck_poly(
     (basis_poly, enforced_sum)
 }
 
+/// One prepared multiplier of the fused three-layer transpose: the PMULL
+/// constant form on AES aarch64, the plain field element elsewhere.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+type Fused3Twiddle = crate::field::gf2_128::aarch64::ConstPrep;
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+type Fused3Twiddle = F128;
+
+/// The seven twiddles of block `block` of the three-layer group rooted at
+/// `layer` (`layer`, then its two and four children), prepared.
+#[inline]
+fn fused3_twiddle_row(ntt: &AdditiveNttF128, layer: usize, block: usize) -> [Fused3Twiddle; 7] {
+    let mut tw = [F128::ZERO; 7];
+    tw[0] = ntt.twiddle(layer, block);
+    for s in 0..2 {
+        tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
+    }
+    for s in 0..4 {
+        tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    {
+        use core::arch::aarch64::uint64x2_t;
+        use crate::field::gf2_128::aarch64::const_prep;
+        // Prepare each shared multiplier once per block, outside the rows.
+        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
+        // layout maps lo/hi to vector lanes 0/1 without padding.
+        unsafe { tw.map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t))) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+    {
+        tw
+    }
+}
+
+/// Every block's prepared row of the group rooted at `layer`, built afresh
+/// (the per-call path, and the fill of [`fused3_twiddles_cached`]).
+fn fused3_twiddles_uncached(ntt: &AdditiveNttF128, layer: usize) -> Vec<[Fused3Twiddle; 7]> {
+    (0..1usize << layer).map(|block| fused3_twiddle_row(ntt, layer, block)).collect()
+}
+
+/// Largest group root kept by [`fused3_twiddles_cached`]: at most 2^10
+/// blocks (224 KiB of prepared rows) per kept `(dim, layer)`.
+const FUSED3_TW_CACHE_MAX_LAYER: usize = 10;
+
+/// [`fused3_twiddles_uncached`] kept per `(dim, layer)` for the shared
+/// standard NTTs (see `AdditiveNttF128::shared_standard_dim`), whose
+/// twiddles never change, so the kept rows are the ones a fresh build
+/// returns. At most one table per `(dim <= 20, layer <= 10)` slot.
+/// `None` (build per call) for any other NTT, a larger root, or with
+/// `FLOCK_NO_RECOMPUTE_CACHE` set.
+fn fused3_twiddles_cached(ntt: &AdditiveNttF128, layer: usize) -> Option<&'static [[Fused3Twiddle; 7]]> {
+    const DIMS: usize = 21;
+    if !crate::recompute_cache_enabled() || layer > FUSED3_TW_CACHE_MAX_LAYER {
+        return None;
+    }
+    let dim = ntt.shared_standard_dim()?;
+    if dim >= DIMS || layer + 3 > dim {
+        return None;
+    }
+    static TABLES: std::sync::OnceLock<
+        [[std::sync::OnceLock<Box<[[Fused3Twiddle; 7]]>>; FUSED3_TW_CACHE_MAX_LAYER + 1]; DIMS],
+    > = std::sync::OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        std::array::from_fn(|_| std::array::from_fn(|_| std::sync::OnceLock::new()))
+    });
+    Some(&tables[dim][layer].get_or_init(|| fused3_twiddles_uncached(ntt, layer).into_boxed_slice()))
+}
+
 /// Apply three consecutive transpose layers in one read/write pass. `layer`
 /// is the lowest (root-most) of the three; the transpose executes forward
 /// layers `layer+2`, `layer+1`, then `layer`.
@@ -3046,10 +3114,7 @@ fn transpose_forward_ntt_fused_3layer(
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
     let pmull_fold = std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none();
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
-    type Twiddle = crate::field::gf2_128::aarch64::ConstPrep;
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
-    type Twiddle = F128;
+    type Twiddle = Fused3Twiddle;
 
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
     #[inline(always)]
@@ -3096,30 +3161,17 @@ fn transpose_forward_ntt_fused_3layer(
     let eighth = block_size >> 3;
     let eighth_log = log_d - layer - 3;
     let row_mask = eighth - 1;
-    let twiddles: Vec<[Twiddle; 7]> = (0..num_blocks)
-        .map(|block| {
-            let mut tw = [F128::ZERO; 7];
-            tw[0] = ntt.twiddle(layer, block);
-            for s in 0..2 {
-                tw[1 + s] = ntt.twiddle(layer + 1, 2 * block + s);
-            }
-            for s in 0..4 {
-                tw[3 + s] = ntt.twiddle(layer + 2, 4 * block + s);
-            }
-            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
-            {
-                use core::arch::aarch64::uint64x2_t;
-                use crate::field::gf2_128::aarch64::const_prep;
-                // Prepare each shared multiplier once per block, outside the rows.
-                // SAFETY: the same AES and limb-layout conditions apply above.
-                unsafe { tw.map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t))) }
-            }
-            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
-            {
-                tw
-            }
-        })
-        .collect();
+    // `FLOCK_NO_RECOMPUTE_CACHE`: the rows of a standard NTT are kept per
+    // `(dim, layer)`; any other NTT builds them here as before.
+    let built: Vec<[Twiddle; 7]>;
+    let twiddles: &[[Twiddle; 7]] = match fused3_twiddles_cached(ntt, layer) {
+        Some(kept) => kept,
+        None => {
+            built = fused3_twiddles_uncached(ntt, layer);
+            &built
+        }
+    };
+    debug_assert_eq!(twiddles.len(), num_blocks);
 
     // Flatten `(block, row)` into one Rayon range. This keeps all cores busy
     // even for the final few large blocks without opening nested parallel
@@ -4321,8 +4373,15 @@ fn densify_active_windows_fused_first_3layer(
     log_d: usize,
     prefix_k: usize,
 ) -> Vec<F128> {
+    // Off AES aarch64 the kept prepared rows are these plain rows.
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+    let kept = log_d
+        .checked_sub(prefix_k + 3)
+        .and_then(|first_layer| fused3_twiddles_cached(ntt, first_layer));
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    let kept: Option<&[[F128; 7]]> = None;
     densify_active_windows_fused_first_3layer_with(
-        ntt, arena, groups, log_d, prefix_k, |tw| tw,
+        ntt, arena, groups, log_d, prefix_k, kept, |tw| tw,
         |values, tw| {
             #[inline(always)]
             fn butterfly(values: &mut [F128; 8], top: usize, bottom: usize, twiddle: F128) {
@@ -4351,6 +4410,7 @@ fn densify_active_windows_fused_first_3layer_with<C: Copy + Send + Sync>(
     groups: &[ActiveWindow],
     log_d: usize,
     prefix_k: usize,
+    kept: Option<&[C]>,
     prepare: impl Fn([F128; 7]) -> C,
     row_op: impl Fn(&mut [F128; 8], &C) + Send + Sync,
 ) -> Vec<F128> {
@@ -4371,19 +4431,28 @@ fn densify_active_windows_fused_first_3layer_with<C: Copy + Send + Sync>(
     debug_assert_eq!(arena.len(), groups.len() * window_len);
 
     let window_to_arena = active_window_to_arena(groups, n_windows);
-    let twiddles: Vec<C> = (0..num_blocks)
-        .map(|block| {
-            let mut tw = [F128::ZERO; 7];
-            tw[0] = ntt.twiddle(first_layer, block);
-            for half in 0..2 {
-                tw[1 + half] = ntt.twiddle(first_layer + 1, 2 * block + half);
-            }
-            for quarter in 0..4 {
-                tw[3 + quarter] = ntt.twiddle(first_layer + 2, 4 * block + quarter);
-            }
-            prepare(tw)
-        })
-        .collect();
+    // `kept`: the same prepared rows, already made (`FLOCK_NO_RECOMPUTE_CACHE`).
+    let built: Vec<C>;
+    let twiddles: &[C] = match kept {
+        Some(kept) => kept,
+        None => {
+            built = (0..num_blocks)
+                .map(|block| {
+                    let mut tw = [F128::ZERO; 7];
+                    tw[0] = ntt.twiddle(first_layer, block);
+                    for half in 0..2 {
+                        tw[1 + half] = ntt.twiddle(first_layer + 1, 2 * block + half);
+                    }
+                    for quarter in 0..4 {
+                        tw[3 + quarter] = ntt.twiddle(first_layer + 2, 4 * block + quarter);
+                    }
+                    prepare(tw)
+                })
+                .collect();
+            &built
+        }
+    };
+    assert_eq!(twiddles.len(), num_blocks);
 
     // Keep the vector length at zero until every Rayon job has initialized its
     // disjoint block. This avoids ever constructing a safe reference to an
@@ -4515,8 +4584,13 @@ fn densify_c2_windows_prepared_first_3layer(
         values[b[1]] = products[1] + bottom[1];
     }
 
+    // The kept rows are the `const_prep` rows built below
+    // (`FLOCK_NO_RECOMPUTE_CACHE`).
+    let kept = log_d
+        .checked_sub(prefix_k + 3)
+        .and_then(|first_layer| fused3_twiddles_cached(ntt, first_layer));
     densify_active_windows_fused_first_3layer_with(
-        ntt, arena, groups, log_d, prefix_k,
+        ntt, arena, groups, log_d, prefix_k, kept,
         |tw| {
             // SAFETY: the same AES and limb-layout conditions apply above.
             unsafe { tw.map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t))) }
@@ -4658,6 +4732,20 @@ fn transpose_forward_ntt_dense_suffix_impl(
     intro_msg
 }
 
+/// `ntt.twiddle(layer, block)` for every block of `layer`. With a
+/// precomputed table this is the table's layer slice itself (layer `l`
+/// starts at `2^l - 1`, the index `twiddle` reads), borrowed instead of
+/// copied (`FLOCK_NO_RECOMPUTE_CACHE`: copied per call, as before).
+fn single_layer_twiddles(ntt: &AdditiveNttF128, layer: usize) -> std::borrow::Cow<'_, [F128]> {
+    let num_blocks = 1usize << layer;
+    if crate::recompute_cache_enabled() {
+        if let Some(table) = ntt.precomputed_twiddle_table() {
+            return std::borrow::Cow::Borrowed(&table[num_blocks - 1..][..num_blocks]);
+        }
+    }
+    std::borrow::Cow::Owned((0..num_blocks).map(|block| ntt.twiddle(layer, block)).collect())
+}
+
 /// One exact transpose layer with a flattened `(block, row)` schedule. This is
 /// used only by the ranked rate-eight pruned suffix when one or two layers sit
 /// between the existing fused-three groups and the top-only tail.
@@ -4676,9 +4764,8 @@ fn transpose_forward_ntt_single_layer_flat(
     let half = 1usize << half_log;
     let block_size = half << 1;
     let row_mask = half - 1;
-    let twiddles: Vec<F128> = (0..num_blocks)
-        .map(|block| ntt.twiddle(layer, block))
-        .collect();
+    let twiddles = single_layer_twiddles(ntt, layer);
+    let twiddles: &[F128] = &twiddles;
     let data_ptr = data.as_mut_ptr() as usize;
 
     (0..num_blocks * half)
@@ -22017,3 +22104,113 @@ mod tests {
 
 // r583 chewy hot-line nonce: 20260806T050013Z; semantics unchanged.
 // RealAdii next sample on eda4129 (marker 23601).
+
+/// `FLOCK_NO_RECOMPUTE_CACHE`: the kept rows and slices equal the per-call
+/// builds, and the kernels that read them give the same bytes as on an NTT
+/// that is never cached (same basis, own tables).
+#[cfg(test)]
+mod recompute_cache_tests {
+    use super::*;
+
+    fn rand_f128(state: &mut u64) -> F128 {
+        let mut next = || {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        F128::new(next(), next())
+    }
+
+    /// The same twiddles as `standard(dim)`, in tables of its own.
+    fn private_standard(dim: usize) -> AdditiveNttF128 {
+        let basis: Vec<F128> = (0..dim).map(|i| F128::new(1u64 << i, 0)).collect();
+        AdditiveNttF128::new(&basis)
+    }
+
+    fn row_bytes(rows: &[[Fused3Twiddle; 7]]) -> &[u8] {
+        // SAFETY: plain-data rows (field limbs or NEON lanes), no padding.
+        unsafe { core::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), core::mem::size_of_val(rows)) }
+    }
+
+    #[test]
+    fn fused3_kept_rows_equal_fresh_rows() {
+        for dim in [12usize, 14, 16, 18, 20] {
+            let ntt = AdditiveNttF128::standard(dim);
+            let private = private_standard(dim);
+            assert_eq!(ntt.shared_standard_dim(), Some(dim));
+            assert_eq!(private.shared_standard_dim(), None);
+            for layer in 0..=FUSED3_TW_CACHE_MAX_LAYER.min(dim - 3) {
+                let kept = fused3_twiddles_cached(&ntt, layer).expect("standard NTT rows are kept");
+                assert_eq!(row_bytes(kept), row_bytes(&fused3_twiddles_uncached(&ntt, layer)));
+                assert_eq!(row_bytes(kept), row_bytes(&fused3_twiddles_uncached(&private, layer)));
+                let again = fused3_twiddles_cached(&ntt, layer).unwrap();
+                assert!(core::ptr::eq(kept, again), "one table per (dim, layer)");
+                assert!(fused3_twiddles_cached(&private, layer).is_none());
+            }
+            assert!(fused3_twiddles_cached(&ntt, FUSED3_TW_CACHE_MAX_LAYER + 1).is_none());
+        }
+    }
+
+    #[test]
+    fn fused3_transpose_kept_matches_private() {
+        let mut state = 7u64;
+        for (log_d, layer) in [(11usize, 8usize), (11, 5), (17, 3), (15, 4), (17, 6), (13, 10)] {
+            let ntt = AdditiveNttF128::standard(log_d + 3);
+            let private = private_standard(log_d + 3);
+            let input: Vec<F128> = (0..1usize << log_d).map(|_| rand_f128(&mut state)).collect();
+            let mut kept = input.clone();
+            let mut fresh = input;
+            transpose_forward_ntt_fused_3layer(&ntt, &mut kept, log_d, layer);
+            transpose_forward_ntt_fused_3layer(&private, &mut fresh, log_d, layer);
+            assert_eq!(kept, fresh, "log_d={log_d} layer={layer}");
+        }
+    }
+
+    #[test]
+    fn densify_first_3layer_kept_matches_private() {
+        let mut state = 11u64;
+        for (log_d, prefix_k, dim) in [(17usize, 8usize, 20usize), (15, 8, 18), (11, 0, 14), (13, 6, 16)] {
+            let ntt = AdditiveNttF128::standard(dim);
+            let private = private_standard(dim);
+            let n = 1usize << log_d;
+            let mut positions: Vec<usize> =
+                (0..96).map(|_| (rand_f128(&mut state).lo as usize) & (n - 1)).collect();
+            positions.sort_unstable();
+            let groups = group_sorted_positions(&positions, prefix_k);
+            let arena: Vec<F128> =
+                (0..groups.len() << prefix_k).map(|_| rand_f128(&mut state)).collect();
+            let kept = densify_active_windows_fused_first_3layer(&ntt, &arena, &groups, log_d, prefix_k);
+            let fresh = densify_active_windows_fused_first_3layer(&private, &arena, &groups, log_d, prefix_k);
+            assert_eq!(kept, fresh, "log_d={log_d} prefix_k={prefix_k}");
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            {
+                let kept = densify_c2_windows_prepared_first_3layer(&ntt, &arena, &groups, log_d, prefix_k);
+                let fresh =
+                    densify_c2_windows_prepared_first_3layer(&private, &arena, &groups, log_d, prefix_k);
+                assert_eq!(kept, fresh, "prepared log_d={log_d} prefix_k={prefix_k}");
+            }
+        }
+    }
+
+    #[test]
+    fn single_layer_slice_equals_fresh_twiddles() {
+        let mut state = 13u64;
+        for dim in [14usize, 16, 18] {
+            let ntt = AdditiveNttF128::standard(dim);
+            for layer in 0..dim {
+                let fresh: Vec<F128> = (0..1usize << layer).map(|b| ntt.twiddle(layer, b)).collect();
+                assert_eq!(&*single_layer_twiddles(&ntt, layer), &fresh[..]);
+            }
+            for (log_d, layer) in [(dim - 3, 3usize), (dim - 3, 4), (dim - 4, 2)] {
+                let input: Vec<F128> = (0..1usize << log_d).map(|_| rand_f128(&mut state)).collect();
+                let mut borrowed = input.clone();
+                let mut copied = input;
+                transpose_forward_ntt_single_layer_flat(&ntt, &mut borrowed, log_d, layer);
+                transpose_forward_ntt_single_layer_flat(&private_standard(dim), &mut copied, log_d, layer);
+                assert_eq!(borrowed, copied);
+            }
+        }
+    }
+}
