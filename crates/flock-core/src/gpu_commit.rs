@@ -243,6 +243,7 @@
 
 use crate::field::F128;
 use crate::ntt::AdditiveNttF128;
+use crate::zerocheck::univariate_skip_optimized::Round1AbGpuBand;
 
 /// Env var that disables the GPU commit path entirely.
 pub const ENV_NO_GPU_COMMIT: &str = "FLOCK_NO_GPU_COMMIT";
@@ -1286,7 +1287,7 @@ pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
 
 /// The 5+6 arm's default share, in 5+6 chunks (of 512), when
 /// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
-pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 160;
+pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 128;
 
 /// Kill switch for the 5+6 arm's late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1`:
 /// the record's join, where the CPU queue, having folded the chunks after the
@@ -3825,6 +3826,19 @@ pub fn warm_gpu_spares() {
 }
 
 impl FromZFirstPassStream {
+    /// The matching hybrid prefix has already been committed on this stream's queue.
+    #[doc(hidden)]
+    pub fn has_matching_precommitted_cb2(&self) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inner.has_matching_precommitted_cb2()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+
     /// Publish `r_start..r_start+r_count` (in position tiles). Ranges must be
     /// contiguous, ordered, and multiples of four for the tuned g4 kernel.
     #[doc(hidden)]
@@ -3851,12 +3865,13 @@ pub(crate) fn finish_from_z_first_pass_or_fallback(
     z_packed: &[F128],
     codeword: Vec<F128>,
     params: &crate::pcs::commit::PcsParams,
+    ab_band: Option<&Round1AbGpuBand>,
     cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
 ) -> (
     crate::pcs::commit::CodewordBuf,
     crate::pcs::commit::MerkleTreeBuf,
 ) {
-    imp::finish_from_z_first_pass_or_fallback(stream.inner, z_packed, codeword, params, cpu)
+    imp::finish_from_z_first_pass_or_fallback(stream.inner, z_packed, codeword, params, ab_band, cpu)
 }
 
 /// A read-only view of the transformed L0 codeword living in the GPU's
@@ -8489,7 +8504,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 let codeword = || std::slice::from_raw_parts(gpu.buffer_contents(staging).cast::<u8>(), CW_BYTES);
                 let tree_bytes = || std::slice::from_raw_parts(gpu.buffer_contents(tree).cast::<u8>(), TREE_BYTES);
                 let graph = |k_split: usize| {
-                    run_commit_graph_from_z_hybrid_impl(gpu, z, staging, tw, tree, 20, N_LEAVES, k_split, true, None)
+                    run_commit_graph_from_z_hybrid_impl(gpu, z, staging, tw, tree, 20, N_LEAVES, k_split, true, None, None)
                         .unwrap()
                 };
                 let geometry = super::super::GpuZeroTailLanes::scope(64, 7);
@@ -13989,6 +14004,11 @@ kernel void blake3_pow_seg_tail(
     unsafe impl Send for FromZFirstPassStream {}
 
     impl FromZFirstPassStream {
+        pub(super) fn has_matching_precommitted_cb2(&self) -> bool {
+            self.failed.is_none()
+                && self.early_cb2.is_some_and(|(_, k)| k == hybrid_cpu_sixteenths())
+        }
+
         pub(crate) fn submit_ready_range(&mut self, r_start: usize, r_count: usize) {
             if self.failed.is_some() {
                 return;
@@ -14122,12 +14142,11 @@ kernel void blake3_pow_seg_tail(
                 Err(e) => self.failed = Some(e),
             }
 
-            // Final tile queued: encode the hybrid GPU prefix now and commit
-            // it directly behind that tile on the same (serial) queue. The
-            // GPU then flows from the last first-pass tile straight into the
-            // prefix passes with no host round-trip, and `finish` skips the
-            // encode on the CPU-suffix critical path. Bit-identical: the
-            // encoded work is exactly what `finish` would have encoded.
+            // Final tile queued: commit the hybrid GPU prefix behind it on
+            // the same queue. Both commands bind the staging buffer, so its
+            // dependency orders the first-pass writes before the prefix reads.
+            // `finish` skips the encode on the CPU-suffix critical path and
+            // uses the same encoded work.
             // (Redraw marker: first draw of this tree scored 1,199,897.47 —
             // 0.12% below the 1,201,360 bar — on 2026-08-01; content change
             // required for a per-account resubmission.)
@@ -15299,6 +15318,7 @@ kernel void blake3_pow_seg_tail(
         suffix_start: usize,
         force: usize,
         after_ab: bool,
+        ab_band: Option<&super::Round1AbGpuBand>,
     ) -> Result<(), String> {
         let unit_levels = tail_unit_levels();
         let unit = 1usize << unit_levels;
@@ -15341,6 +15361,11 @@ kernel void blake3_pow_seg_tail(
             (cb3, per_unit, sig3)
         };
         crate::tmark::mark("cb3 committed (tail)");
+        // The band goes behind cb3 on the same queue. The AB lease owns its
+        // completion, and the commit arm still joins cb2 and cb3 only.
+        if after_ab && let Some(band) = ab_band {
+            band.after_cb3();
+        }
         let bytes_base = crate::epool::SyncPtr(unsafe { gpu.buffer_contents(staging).cast::<u8>() });
         let args_base = crate::epool::SyncPtr(args_ptr);
         let per_unit = &per_unit;
@@ -15534,6 +15559,7 @@ kernel void blake3_pow_seg_tail(
         if window_trace_enabled() {
             let (s3, e3) = cb_gpu_interval(gpu, cb3);
             let (s2, e2) = cb2_gpu_interval(gpu, cb2);
+            crate::tmark::mark_gpu("cb3 gpu start", "cb3 gpu end", s3, e3);
             eprintln!(
                 "[gpu-window] tail hash: CPU took {} of {total_units} suffix units in {tail_ms:.2} ms; \
                  cb3 start {:.3} ms after cb2's end, gpu dur {:.2} ms; cb2 gpu dur {:.2} ms",
@@ -15600,6 +15626,7 @@ kernel void blake3_pow_seg_tail(
         k_split: usize,
         first_pass_done: bool,
         pre_cb2: Option<Id>,
+        ab_band: Option<&super::Round1AbGpuBand>,
     ) -> Result<(), String> {
         use rayon::prelude::*;
         let (k_cpu16, fine_m) = decode_hybrid_split(k_split);
@@ -15763,6 +15790,7 @@ kernel void blake3_pow_seg_tail(
                             suffix_leaf_start,
                             tail_force,
                             late,
+                            ab_band,
                         )?;
                     } else {
                     let cb3 = gpu.command_buffer()?;
@@ -16088,7 +16116,7 @@ kernel void blake3_pow_seg_tail(
     ) -> Result<(), String> {
         unsafe {
             run_commit_graph_from_z_hybrid_impl(
-                gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16, false, None,
+                gpu, z_buf, staging, tw_buf, tree_buf, log_d, n_leaves, k_cpu16, false, None, None,
             )
         }
     }
@@ -17060,6 +17088,7 @@ kernel void blake3_pow_seg_tail(
                     run_commit_graph_from_z_hybrid_impl(
                         c.gpu, c.z_buf, c.staging, c.tw_buf, c.tree_buf, log_d, n_leaves, k, true,
                         None,
+                        None,
                     )
                 }
             }
@@ -17358,6 +17387,7 @@ kernel void blake3_pow_seg_tail(
                         k,
                         true,
                         (pre != 0).then_some(pre as Id),
+                        None,
                     )
                 }
             }
@@ -17671,6 +17701,7 @@ kernel void blake3_pow_seg_tail(
                         params.n_leaves(),
                         chosen,
                         true,
+                        None,
                         None,
                     )
                 });
@@ -18677,6 +18708,7 @@ kernel void blake3_pow_seg_tail(
         z_packed: &[F128],
         mut codeword: Vec<F128>,
         params: &crate::pcs::commit::PcsParams,
+        ab_band: Option<&super::Round1AbGpuBand>,
         cpu: impl FnOnce(&mut [F128]) -> Vec<Hash>,
     ) -> (
         crate::pcs::commit::CodewordBuf,
@@ -18781,7 +18813,7 @@ kernel void blake3_pow_seg_tail(
                             if k_cpu16 > 0 {
                                 run_commit_graph_from_z_hybrid_impl(
                                     stream.gpu, stream.z_buf, stream.staging, stream.tw_buf,
-                                    stream.tree_buf, stream.log_d, stream.n_leaves, k_cpu16, true, None,
+                                    stream.tree_buf, stream.log_d, stream.n_leaves, k_cpu16, true, None, None,
                                 )
                             } else {
                                 run_commit_graph_after_from_z(
@@ -18817,6 +18849,7 @@ kernel void blake3_pow_seg_tail(
                             k_cpu16,
                             true,
                             Some(cb2),
+                            ab_band,
                         );
                         stream.gpu.release(cb2);
                         r
@@ -18848,6 +18881,7 @@ kernel void blake3_pow_seg_tail(
                                     stream.n_leaves,
                                     k_cpu16,
                                     true,
+                                    None,
                                     None,
                                 )
                             } else {
@@ -18889,6 +18923,7 @@ kernel void blake3_pow_seg_tail(
                                     stream.n_leaves,
                                     k_cpu16,
                                     true,
+                                    None,
                                     None,
                                 )
                             } else {
@@ -29266,6 +29301,7 @@ kernel void zc_ab_finish(
     // the K arm's output buffers above.
     // Tri pass 0 GPU arm (see `ENV_NO_ZC_T0_GPU`): chained on the 5+6
     // arm's output buffers.
+    pub(crate) mod r1_ab_band;
     mod t0_metal;
     pub(crate) use t0_metal::{T0_HI, T0_IN, T0_OUT, ZcT0Job, zc_t0_fire, zc_t0_park, zc_t0_prewarm, zc_t0_verdict};
     mod t56_metal;
@@ -31419,6 +31455,9 @@ pub(crate) use imp::{
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm, zc_ab_wait};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::r1_ab_band;
+
 /// Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
@@ -31507,6 +31546,7 @@ mod imp {
         _z_packed: &[F128],
         mut codeword: Vec<F128>,
         _params: &crate::pcs::commit::PcsParams,
+        _ab_band: Option<&super::Round1AbGpuBand>,
         cpu: impl FnOnce(&mut [F128]) -> Vec<crate::merkle::Hash>,
     ) -> (
         crate::pcs::commit::CodewordBuf,

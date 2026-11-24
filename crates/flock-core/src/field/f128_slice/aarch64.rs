@@ -868,7 +868,8 @@ pub(super) unsafe fn fold_bank_major_128x64_rows2(
                 let second_x = vld1q_u64(row.add(1).cast::<u64>());
                 xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
                 bank += 1;
-                row = row.add(64);
+                // The last advance can pass the allocation end for a nonzero lane.
+                row = row.wrapping_add(64);
             }
 
             let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));
@@ -917,7 +918,8 @@ pub(super) unsafe fn fold_bank_major_64x128_rows2(
                 let second_x = vld1q_u64(row.add(1).cast::<u64>());
                 xor_karatsuba_const_pair(&mut first, &mut second, first_x, second_x, wk);
                 bank += 1;
-                row = row.add(128);
+                // The last advance can pass the allocation end for a nonzero lane.
+                row = row.wrapping_add(128);
             }
 
             let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));
