@@ -5765,56 +5765,26 @@ kernel void zc_k_finish(
 #include <metal_stdlib>
 using namespace metal;
 
-// 16x16 carry-less product from 9 native 32-bit integer products: each
-// factor split by bit position mod 3, so a product of two masked parts has at
-// most 6 overlapping terms per result bit (16 bits / spacing 3) and its sums
-// stay below the next same-residue bit (no carry crosses into a kept bit).
-static inline uint zck_clmul16(uint a, uint b) {
-    // 16-bit masks: the ushort parts hold the same values, and
-    // uint(ushort) products can lower to native 16x16->32 multiplies.
-    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
-    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+// 16x16 carry-less product via native ushort 16x16->32 imad on Apple Silicon GPUs.
+static inline uint zck_clmul16_m3(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
     uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
     uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
     uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
-// 32x32 by one Karatsuba step over 16-bit halves (27 32-bit products instead
-// of the embedded kernel's 16 64-bit ones).
-static inline ulong zck_clmul32(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zck_clmul16(al, bl);
-    uint hi = zck_clmul16(ah, bh);
-    uint mid = zck_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
-    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
-}
-
-struct ZckU128 { ulong lo; ulong hi; };
-
-static inline ZckU128 zck_clmul64(ulong a, ulong b) {
-    uint al = uint(a), ah = uint(a >> 32);
-    uint bl = uint(b), bh = uint(b >> 32);
-    ulong p_lo = zck_clmul32(al, bl);
-    ulong p_hi = zck_clmul32(ah, bh);
-    ulong p_mid = zck_clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
-    ZckU128 r;
-    r.lo = p_lo ^ (p_mid << 32);
-    r.hi = p_hi ^ (p_mid >> 32);
-    return r;
-}
-
-// a * b mod x^128 + x^7 + x^2 + x + 1 (Karatsuba product, then reduction).
-// The Karatsuba levels on 32-bit lanes (a 64-bit v is uint2(v, v >> 32)):
-// lo ^ (mid << 16) ^ (hi << 32) is uint2(lo ^ (mid << 16), hi ^ (mid >> 16)),
-// and p_lo ^ (p_mid << 32), p_hi ^ (p_mid >> 32) are the uint4 words below,
-// so r0, r1, h0, h1 are the same limbs and the reduction is unchanged.
+// Pure 32-bit Karatsuba + hoisted ushort masks and pure 32-bit GF reduction.
 static inline uint2 zck_clmul32_u(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zck_clmul16(al, bl);
-    uint hi = zck_clmul16(ah, bh);
-    uint mid = zck_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = zck_clmul16_m3(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = zck_clmul16_m3(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = zck_clmul16_m3(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
     return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
 }
 
@@ -5829,17 +5799,14 @@ static inline uint4 zck_mul(uint4 a, uint4 b) {
     uint4 p0 = zck_clmul64_u(a.xy, b.xy);
     uint4 p2 = zck_clmul64_u(a.zw, b.zw);
     uint4 pm = zck_clmul64_u(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
-    ulong r0 = (ulong(p0.y) << 32) | p0.x;
-    ulong r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
-    ulong h0 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
-    ulong h1 = (ulong(p2.w) << 32) | p2.z;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = r0 ^ t0, l1 = r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+    uint4 lo = uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y);
+    uint4 hi = uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w);
+    uint4 t = hi ^ (hi << 1u) ^ (hi << 2u) ^ (hi << 7u);
+    uint4 s = (hi >> 31u) ^ (hi >> 30u) ^ (hi >> 25u);
+    uint ov = s.w;
+    t.x ^= ov ^ (ov << 1u) ^ (ov << 2u) ^ (ov << 7u);
+    t.yzw ^= s.xyz;
+    return lo ^ t;
 }
 
 // T(code) for one 8-byte delta code (lo = bytes 0..3, hi = bytes 4..7).
@@ -5988,8 +5955,12 @@ kernel void zc_k_fold_v2(
         x0 = aw1 ^ aw3; y0 = b1 ^ b3;
         x1 = aw0 ^ aw1 ^ aw2 ^ aw3; y1 = b0 ^ b1 ^ b2 ^ b3;
     }
-    uint4 r0 = zck_mul(x0, y0);
-    uint4 r1 = zck_mul(x1, y1);
+    uint4 r0, r1;
+    #pragma clang loop unroll(disable)
+    for (uint pass = 0u; pass < 2u; pass++) {
+        uint4 pr = zck_mul(pass == 0u ? x0 : x1, pass == 0u ? y0 : y1);
+        if (pass == 0u) { r0 = pr; } else { r1 = pr; }
+    }
     for (ushort off = 4; off < 32; off <<= 1) {
         r0 ^= simd_shuffle_xor(r0, off);
         r1 ^= simd_shuffle_xor(r1, off);
@@ -24699,31 +24670,34 @@ static inline ulong clmul_plane_pair(uint a0, uint a1, uint b0, uint b1) {
     return p0 ^ ((pm ^ p0 ^ p2) << 1) ^ (p2 << 2);
 }
 
-// Two Karatsuba levels use nine integer products rather than sixteen.
-// The aligned inputs occupy bits 0,4,...,28; the final product ends at bit 62.
-// 16x16 carry-less product from 9 native 32-bit products of bit-position-
-// mod-3 parts (at most 6 terms per result bit: no carry reaches a kept bit).
-static inline uint clmul16_m3(uint a, uint b) {
-    // 16-bit masks: the ushort parts hold the same values, and
-    // uint(ushort) products can lower to native 16x16->32 multiplies.
-    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
-    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+// Native 16x16->32 carry-less product via hoisted ushort2 masks on Apple Silicon GPUs.
+static inline uint clmul16_m3_u16(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
     uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
     uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
     uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
+static inline uint2 clmul32_u(uint a, uint b) {
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = clmul16_m3_u16(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = clmul16_m3_u16(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = clmul16_m3_u16(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
+    return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
+}
+
 static inline ulong clmul32(uint a, uint b) {
 #ifdef FLOCK_ZC_R2_CLMUL_INCUMBENT
     return clmul32_incumbent(a, b);
 #elif defined(FLOCK_ZC_R2_CLMUL16)
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = clmul16_m3(al, bl);
-    uint hi = clmul16_m3(ah, bh);
-    uint mid = clmul16_m3(al ^ ah, bl ^ bh) ^ lo ^ hi;
-    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
+    uint2 p = clmul32_u(a, b);
+    return (ulong(p.y) << 32) | p.x;
 #else
     const uint MASK = 0x11111111u;
     uint a0 = a & MASK, a1 = (a >> 1) & MASK;
@@ -24753,18 +24727,6 @@ static inline U128k clmul64(ulong a, ulong b) {
 }
 
 #if defined(FLOCK_ZC_R2_CLMUL16) && !defined(FLOCK_ZC_R2_CLMUL_INCUMBENT)
-// The 16-bit form's two Karatsuba levels on 32-bit lanes (no 64-bit shifts or
-// ORs). A 64-bit value v is uint2(v, v >> 32): lo ^ (mid << 16) ^ (hi << 32)
-// is uint2(lo ^ (mid << 16), hi ^ (mid >> 16)), and p_lo ^ (p_mid << 32),
-// p_hi ^ (p_mid >> 32) are the uint4 words below, so every limb is unchanged.
-static inline uint2 clmul32_u(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = clmul16_m3(al, bl);
-    uint hi = clmul16_m3(ah, bh);
-    uint mid = clmul16_m3(al ^ ah, bl ^ bh) ^ lo ^ hi;
-    return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
-}
-
 static inline uint4 clmul64_u(uint2 a, uint2 b) {
     uint2 p0 = clmul32_u(a.x, b.x);
     uint2 p2 = clmul32_u(a.y, b.y);
@@ -24801,16 +24763,20 @@ static inline U256k clmul128(uint4 a, uint4 b) {
 }
 #endif
 
-// Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
+// Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1 in pure 32-bit ops.
+static inline uint4 gf_reduce_u(uint4 lo, uint4 hi) {
+    uint4 t = hi ^ (hi << 1u) ^ (hi << 2u) ^ (hi << 7u);
+    uint4 s = (hi >> 31u) ^ (hi >> 30u) ^ (hi >> 25u);
+    uint ov = s.w;
+    t.x ^= ov ^ (ov << 1u) ^ (ov << 2u) ^ (ov << 7u);
+    t.yzw ^= s.xyz;
+    return lo ^ t;
+}
+
 static inline uint4 gf_reduce(U256k p) {
-    ulong h0 = p.r2, h1 = p.r3;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+    uint4 lo = uint4(uint(p.r0), uint(p.r0 >> 32), uint(p.r1), uint(p.r1 >> 32));
+    uint4 hi = uint4(uint(p.r2), uint(p.r2 >> 32), uint(p.r3), uint(p.r3 >> 32));
+    return gf_reduce_u(lo, hi);
 }
 
 // Plane-sharing form of the same Karatsuba product (`ENV_NO_ZC_R2_PLANES`).
@@ -25198,53 +25164,25 @@ static inline void zc_r2_cs_store(
     deltas[d >> 4u] = uint4(ar.x ^ ar.z, ar.y ^ ar.w, br.x ^ br.z, br.y ^ br.w);
 }
 
-// 16x16 carry-less product from nine native 32-bit products of the
-// bit-position-mod-3 parts: a result bit sums at most six terms, so no carry
-// reaches the next bit of the same part.
-static inline uint zc_r2_cs_clmul16(uint a, uint b) {
-    // 16-bit masks: the ushort parts hold the same values, and
-    // uint(ushort) products can lower to native 16x16->32 multiplies.
-    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
-    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+// Native 16x16->32 carry-less product via hoisted ushort2 masks on Apple Silicon GPUs.
+static inline uint zc_r2_cs_clmul16_m3(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
     uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
     uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
     uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
-// 32x32 carry-less product: one Karatsuba step over the 16-bit halves.
-static inline ulong zc_r2_cs_clmul32(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zc_r2_cs_clmul16(al, bl);
-    uint hi = zc_r2_cs_clmul16(ah, bh);
-    uint mid = zc_r2_cs_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
-    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
-}
-
-// clmul64 / clmul128 (two Karatsuba levels) over zc_r2_cs_clmul32: the
-// same carry-less products as clmul128.
-static inline U128k zc_r2_cs_clmul64(ulong a, ulong b) {
-    uint al = uint(a), ah = uint(a >> 32);
-    uint bl = uint(b), bh = uint(b >> 32);
-    ulong p_lo = zc_r2_cs_clmul32(al, bl);
-    ulong p_hi = zc_r2_cs_clmul32(ah, bh);
-    ulong p_mid = zc_r2_cs_clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
-    U128k r;
-    r.lo = p_lo ^ (p_mid << 32);
-    r.hi = p_hi ^ (p_mid >> 32);
-    return r;
-}
-
-// The same two Karatsuba levels on 32-bit lanes (no 64-bit shifts or ORs
-// in the inner levels). Word for word: a 64-bit value v is uint2(v, v >> 32),
-// so lo ^ (mid << 16) ^ (hi << 32) is uint2(lo ^ (mid << 16), hi ^ (mid >> 16))
-// and p_lo ^ (p_mid << 32), p_hi ^ (p_mid >> 32) are the uint4 words below.
 static inline uint2 zc_r2_cs_clmul32_u(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zc_r2_cs_clmul16(al, bl);
-    uint hi = zc_r2_cs_clmul16(ah, bh);
-    uint mid = zc_r2_cs_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = zc_r2_cs_clmul16_m3(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = zc_r2_cs_clmul16_m3(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = zc_r2_cs_clmul16_m3(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
     return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
 }
 
@@ -27578,45 +27516,73 @@ static inline ulong clmul32(uint a, uint b) {
 
 struct U128k { ulong lo; ulong hi; };
 struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+struct U256u { uint4 lo; uint4 hi; };
 
-static inline U128k clmul64(ulong a, ulong b) {
-    uint al = uint(a), ah = uint(a >> 32);
-    uint bl = uint(b), bh = uint(b >> 32);
-    ulong p_lo = clmul32(al, bl);
-    ulong p_hi = clmul32(ah, bh);
-    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
-    U128k r;
-    r.lo = p_lo ^ (p_mid << 32);
-    r.hi = p_hi ^ (p_mid >> 32);
-    return r;
+static inline uint clmul16_m3_u16(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
+    return r0 | r1 | r2;
+}
+
+static inline uint2 clmul32_u16(uint a, uint b) {
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = clmul16_m3_u16(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = clmul16_m3_u16(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = clmul16_m3_u16(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
+    return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
+}
+
+static inline uint4 clmul64_u16(uint2 a, uint2 b) {
+    uint2 p0 = clmul32_u16(a.x, b.x);
+    uint2 p2 = clmul32_u16(a.y, b.y);
+    uint2 pm = clmul32_u16(a.x ^ a.y, b.x ^ b.y) ^ p0 ^ p2;
+    return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
+}
+
+static inline U256u clmul128_u(uint4 a, uint4 b) {
+    uint4 p0 = clmul64_u16(a.xy, b.xy);
+    uint4 p2 = clmul64_u16(a.zw, b.zw);
+    uint4 pm = clmul64_u16(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
+    return {
+        uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y),
+        uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w)
+    };
 }
 
 static inline U256k clmul128(uint4 a, uint4 b) {
-    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
-    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
-    U128k p0 = clmul64(al, bl);
-    U128k p2 = clmul64(ah, bh);
-    U128k pm = clmul64(al ^ ah, bl ^ bh);
-    pm.lo ^= p0.lo ^ p2.lo;
-    pm.hi ^= p0.hi ^ p2.hi;
+    U256u u = clmul128_u(a, b);
     U256k r;
-    r.r0 = p0.lo;
-    r.r1 = p0.hi ^ pm.lo;
-    r.r2 = p2.lo ^ pm.hi;
-    r.r3 = p2.hi;
+    r.r0 = (ulong(u.lo.y) << 32) | u.lo.x;
+    r.r1 = (ulong(u.lo.w) << 32) | u.lo.z;
+    r.r2 = (ulong(u.hi.y) << 32) | u.hi.x;
+    r.r3 = (ulong(u.hi.w) << 32) | u.hi.z;
     return r;
 }
 
-// Reduce a 255-bit product (or an XOR of such) mod x^128 + x^7 + x^2 + x + 1.
+// Reduce a 255-bit product (or an XOR of such) mod x^128 + x^7 + x^2 + x + 1 in pure 32-bit ops.
+static inline uint4 gf_reduce_u(U256u p) {
+    uint4 h = p.hi;
+    uint4 t = h ^ (h << 1u) ^ (h << 2u) ^ (h << 7u);
+    uint4 s = (h >> 31u) ^ (h >> 30u) ^ (h >> 25u);
+    uint ov = s.w;
+    t.x ^= ov ^ (ov << 1u) ^ (ov << 2u) ^ (ov << 7u);
+    t.yzw ^= s.xyz;
+    return p.lo ^ t;
+}
+
 static inline uint4 gf_reduce(U256k p) {
-    ulong h0 = p.r2, h1 = p.r3;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+    U256u u = {
+        uint4(uint(p.r0), uint(p.r0 >> 32), uint(p.r1), uint(p.r1 >> 32)),
+        uint4(uint(p.r2), uint(p.r2 >> 32), uint(p.r3), uint(p.r3 >> 32))
+    };
+    return gf_reduce_u(u);
 }
 
 struct ZcAbParams {
@@ -27644,24 +27610,21 @@ kernel void zc_ab_tables(
 {
     threadgroup uint4 scaled[8];
     if (lid < 8u) {
-        scaled[lid] = gf_reduce(clmul128(basis[lid], e_top[t]));
+        scaled[lid] = gf_reduce_u(clmul128_u(basis[lid], e_top[t]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint4 acc = uint4(0u);
     for (uint k = 0u; k < 8u; k++) {
         if (((lid >> k) & 1u) != 0u) { acc ^= scaled[k]; }
     }
-    ulong lo = (ulong(acc.y) << 32) | ulong(acc.x);
-    ulong hi = (ulong(acc.w) << 32) | ulong(acc.z);
     device uint4* row = tables + (ulong(t) << 12) + ulong(lid);
     for (uint b = 0u; b < 16u; b++) {
         if (b != 0u) {
-            // Multiply by x mod x^128 + x^7 + x^2 + x + 1.
-            ulong red = (hi >> 63) * 0x87ul;
-            hi = (hi << 1) | (lo >> 63);
-            lo = (lo << 1) ^ red;
+            uint red = (acc.w >> 31) * 0x87u;
+            acc = uint4((acc.x << 1) ^ red, (acc.y << 1) | (acc.x >> 31),
+                        (acc.z << 1) | (acc.y >> 31), (acc.w << 1) | (acc.z >> 31));
         }
-        row[b * 256u] = uint4(uint(lo), uint(lo >> 32), uint(hi), uint(hi >> 32));
+        row[b * 256u] = acc;
     }
 }
 
@@ -27755,18 +27718,17 @@ kernel void zc_ab_finish(
     uint chunk [[threadgroup_position_in_grid]],
     uint lam   [[thread_index_in_threadgroup]])
 {
-    U256k s;
-    s.r0 = 0ul; s.r1 = 0ul; s.r2 = 0ul; s.r3 = 0ul;
+    U256u s = {uint4(0u), uint4(0u)};
     for (uint bot = 0u; bot < 16u; bot++) {
         uint4 v = uint4(0u);
         for (uint g = 0u; g < p.groups_per_chunk; g++) {
             ulong group = ulong(chunk) * ulong(p.groups_per_chunk) + ulong(g);
             v ^= banks[(group * 16ul + ulong(bot)) * 64ul + ulong(lam)];
         }
-        U256k q = clmul128(eq_bot[bot], v);
-        s.r0 ^= q.r0; s.r1 ^= q.r1; s.r2 ^= q.r2; s.r3 ^= q.r3;
+        U256u q = clmul128_u(eq_bot[bot], v);
+        s.lo ^= q.lo; s.hi ^= q.hi;
     }
-    partials[chunk * 64u + lam] = gf_reduce(clmul128(eq_hi[chunk], gf_reduce(s)));
+    partials[chunk * 64u + lam] = gf_reduce_u(clmul128_u(eq_hi[chunk], gf_reduce_u(s)));
 }
 "#;
 
