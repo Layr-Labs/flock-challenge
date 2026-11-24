@@ -57,7 +57,7 @@
 //! The packed witness has `2^(m−7)` F_{2^128} elements indexed by the suffix.
 //! `s_hat_v` has 128 entries indexed by the 7-bit prefix.
 
-use crate::bits::{transpose_8_u64s_to_64_bytes, transpose_8x8_bits};
+use crate::bits::transpose_8x8_bits;
 use crate::challenger::Challenger;
 use crate::field::{F128, mul_by_x};
 use crate::zerocheck::PaddingSpec;
@@ -1743,11 +1743,8 @@ pub fn inner_product(a: &[F128], b: &[F128]) -> F128 {
 /// the "vertical" and "horizontal" dimensions swapped. The BaseFold target is
 /// `T = ⟨s_hat_u, eq_ind(r'')⟩`.
 ///
-/// Tiled as sixteen 8-row stripes. Each half-stripe delegates its 8×64 bit
-/// matrix to the shared architecture-optimized transpose, then the 64 output
-/// bytes are scattered into one byte column of the 128 output elements. This
-/// replaces 16,384 branchy bit tests/deposits with 32 fixed 64-byte
-/// transposes while preserving the exact polynomial-basis layout.
+/// Exchange each of the seven row-index bits with the corresponding
+/// column-index bit, operating directly on the output matrix.
 pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
     let mut out = [F128::ZERO; 1 << LOG_PACKING];
     tensor_algebra_transpose_into(s_hat_v, &mut out);
@@ -1756,31 +1753,39 @@ pub fn tensor_algebra_transpose(s_hat_v: &[F128]) -> Vec<F128> {
 
 #[inline]
 fn tensor_algebra_transpose_into(s_hat_v: &[F128], out: &mut [F128; 1 << LOG_PACKING]) {
-    assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
-    let mut out_bytes = [[0u8; 16]; 1 << LOG_PACKING];
-    for row_group in 0..16 {
-        let rows = &s_hat_v[row_group * 8..row_group * 8 + 8];
-        let lo: [u64; 8] = std::array::from_fn(|i| rows[i].lo);
-        let hi: [u64; 8] = std::array::from_fn(|i| rows[i].hi);
-        let mut lo_columns = [0u8; 64];
-        let mut hi_columns = [0u8; 64];
-        transpose_8_u64s_to_64_bytes(&lo, &mut lo_columns);
-        transpose_8_u64s_to_64_bytes(&hi, &mut hi_columns);
-        for bit in 0..64 {
-            out_bytes[bit][row_group] = lo_columns[bit];
-            out_bytes[64 + bit][row_group] = hi_columns[bit];
-        }
+    out.copy_from_slice(s_hat_v);
+    // Exchange halves of each paired row first. The remaining six exchanges
+    // act independently on the low and high u64 lanes.
+    let (top, bottom) = out.split_at_mut(64);
+    for (a, b) in top.iter_mut().zip(bottom) {
+        core::mem::swap(&mut a.hi, &mut b.lo);
     }
-    for (slot, bytes) in out.iter_mut().zip(out_bytes.iter()) {
-        *slot = F128::new(
-            u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-            u64::from_le_bytes(bytes[8..].try_into().unwrap()),
-        );
+    transpose_stage::<32>(out, 0x00000000_ffffffff);
+    transpose_stage::<16>(out, 0x0000ffff_0000ffff);
+    transpose_stage::<8>(out, 0x00ff00ff_00ff00ff);
+    transpose_stage::<4>(out, 0x0f0f0f0f_0f0f0f0f);
+    transpose_stage::<2>(out, 0x33333333_33333333);
+    transpose_stage::<1>(out, 0x55555555_55555555);
+}
+
+#[inline(always)]
+fn transpose_stage<const STEP: usize>(rows: &mut [F128; 128], mask: u64) {
+    for block in rows.chunks_exact_mut(2 * STEP) {
+        let (top, bottom) = block.split_at_mut(STEP);
+        for (a, b) in top.iter_mut().zip(bottom) {
+            // Only positions where the row and column index bits disagree move.
+            let lo = ((a.lo >> STEP) ^ b.lo) & mask;
+            let hi = ((a.hi >> STEP) ^ b.hi) & mask;
+            a.lo ^= lo << STEP;
+            a.hi ^= hi << STEP;
+            b.lo ^= lo;
+            b.hi ^= hi;
+        }
     }
 }
 
 /// Straight-line definition retained only as the independent oracle for the
-/// tiled implementation above.
+/// transpose above.
 #[cfg(test)]
 fn tensor_algebra_transpose_scalar(s_hat_v: &[F128]) -> Vec<F128> {
     assert_eq!(s_hat_v.len(), 1 << LOG_PACKING);
