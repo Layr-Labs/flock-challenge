@@ -166,7 +166,7 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// value-forced work). Read once per phase call, off the hot path.
 #[cfg(target_arch = "aarch64")]
 fn r2_degen_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1"))
 }
 
 /// Kill switch for the peeled first group of the round-two Horner kernel:
@@ -174,7 +174,7 @@ fn r2_degen_enabled() -> bool {
 /// zero accumulators in front of every window's first group. Same outputs.
 #[cfg(target_arch = "aarch64")]
 fn r2_first_shift_skip_enabled() -> bool {
-    std::env::var_os("FLOCK_OFF_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_OFF_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1"))
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -188,7 +188,7 @@ fn r2_prescale_enabled() -> bool {
 /// restores the one-body compact kernel. Same stores and slots either way.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 fn cascade_k_fused_enabled() -> bool {
-    std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1"))
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -203,7 +203,7 @@ fn zc_k_one_table_enabled() -> bool {
 /// and padded group executes the same arithmetic and stores as the oracle.
 #[cfg(target_arch = "aarch64")]
 fn r2_periodic_padding_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1"))
 }
 
 /// Kill switch for the round-two dead-pair skip: `FLOCK_NO_R2_DEADPAIR_SKIP=1`
@@ -212,7 +212,7 @@ fn r2_periodic_padding_enabled() -> bool {
 /// zeros the K pass substitutes exactly. Read once per phase call.
 #[cfg(target_arch = "aarch64")]
 fn r2_dead_pair_skip_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1"))
 }
 
 /// Kill switch for the tail-compacted round-two compact state
