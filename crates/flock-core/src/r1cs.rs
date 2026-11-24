@@ -117,7 +117,7 @@ impl Round1PinnedOnePrefixStatement {
         self.output_window
     }
 
-    pub(crate) fn includes_mixed_ones(self) -> bool {
+    pub fn includes_mixed_ones(self) -> bool {
         self.mixed_ones
     }
 }
@@ -456,21 +456,45 @@ impl BlockR1cs {
     /// to hash), subsequent calls are essentially free.
     pub fn statement_digest(&self) -> [u8; 32] {
         *self.digest_cache.get_or_init(|| {
-            let mut h = blake3::Hasher::new();
-            h.update(b"flock-r1cs-stmt-v1");
-            h.update(&(self.m as u64).to_le_bytes());
-            h.update(&(self.k_log as u64).to_le_bytes());
-            h.update(&(self.k_skip as u64).to_le_bytes());
-            // The layout determines which polynomial a given witness commits
-            // to — it is part of the statement.
-            h.update(&[match self.layout {
+            let mut header = [0u8; 43];
+            header[0..18].copy_from_slice(b"flock-r1cs-stmt-v1");
+            header[18..26].copy_from_slice(&(self.m as u64).to_le_bytes());
+            header[26..34].copy_from_slice(&(self.k_log as u64).to_le_bytes());
+            header[34..42].copy_from_slice(&(self.k_skip as u64).to_le_bytes());
+            header[42] = match self.layout {
                 WitnessLayout::RowMajor => 0u8,
                 WitnessLayout::BatchMajor => 1u8,
-            }]);
-            absorb_matrix(&mut h, &self.a_0);
-            absorb_matrix(&mut h, &self.b_0);
-            let c0_is_identity = absorb_c0_and_check_identity(&mut h, self.k(), &self.c_0);
-            let digest = *h.finalize().as_bytes();
+            };
+            #[cfg(all(target_endian = "little", target_pointer_width = "64"))]
+            let (digest, c0_is_identity) = {
+                // Only pay for row-offset indexing + Rayon subtree hashing on
+                // large matrices; tiny R1CS instances hash directly via the
+                // buffered little-endian absorber.
+                let approx_entries = self.a_0.rows.len()
+                    + self.b_0.rows.len()
+                    + self.c_0.rows.len()
+                    + self.a_0.rows.iter().map(Vec::len).sum::<usize>()
+                    + self.b_0.rows.iter().map(Vec::len).sum::<usize>();
+                if approx_entries >= 32 * 1024 {
+                    statement_digest_parallel(&header, self.k(), &self.a_0, &self.b_0, &self.c_0)
+                } else {
+                    let mut h = blake3::Hasher::new();
+                    h.update(&header);
+                    absorb_matrix(&mut h, &self.a_0);
+                    absorb_matrix(&mut h, &self.b_0);
+                    let c0_is_identity = absorb_c0_and_check_identity(&mut h, self.k(), &self.c_0);
+                    (*h.finalize().as_bytes(), c0_is_identity)
+                }
+            };
+            #[cfg(not(all(target_endian = "little", target_pointer_width = "64")))]
+            let (digest, c0_is_identity) = {
+                let mut h = blake3::Hasher::new();
+                h.update(&header);
+                absorb_matrix(&mut h, &self.a_0);
+                absorb_matrix(&mut h, &self.b_0);
+                let c0_is_identity = absorb_c0_and_check_identity(&mut h, self.k(), &self.c_0);
+                (*h.finalize().as_bytes(), c0_is_identity)
+            };
             cache_c0_identity(digest, c0_is_identity);
             digest
         })
@@ -543,12 +567,36 @@ fn c0_is_identity_scan(k: usize, c_0: &SparseBinaryMatrix) -> bool {
 /// little-endian u64, so two matrices with different shapes/contents always
 /// produce different states.
 fn absorb_matrix(h: &mut blake3::Hasher, m: &SparseBinaryMatrix) {
-    h.update(&(m.num_rows as u64).to_le_bytes());
-    h.update(&(m.num_cols as u64).to_le_bytes());
-    for row in &m.rows {
-        h.update(&(row.len() as u64).to_le_bytes());
-        for &col in row {
-            h.update(&(col as u64).to_le_bytes());
+    #[cfg(all(target_endian = "little", target_pointer_width = "64"))]
+    {
+        let mut buf = [0u8; 16 * 1024];
+        let mut buf_len = 0usize;
+        push_buffered(h, &mut buf, &mut buf_len, &(m.num_rows as u64).to_le_bytes());
+        push_buffered(h, &mut buf, &mut buf_len, &(m.num_cols as u64).to_le_bytes());
+        for row in &m.rows {
+            push_buffered(h, &mut buf, &mut buf_len, &(row.len() as u64).to_le_bytes());
+            if !row.is_empty() {
+                // SAFETY: on little-endian 64-bit targets, `[usize]` has the
+                // exact byte layout of little-endian `[u64]`.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(row.as_ptr().cast::<u8>(), row.len() * 8)
+                };
+                push_buffered(h, &mut buf, &mut buf_len, bytes);
+            }
+        }
+        if buf_len > 0 {
+            h.update(&buf[..buf_len]);
+        }
+    }
+    #[cfg(not(all(target_endian = "little", target_pointer_width = "64")))]
+    {
+        h.update(&(m.num_rows as u64).to_le_bytes());
+        h.update(&(m.num_cols as u64).to_le_bytes());
+        for row in &m.rows {
+            h.update(&(row.len() as u64).to_le_bytes());
+            for &col in row {
+                h.update(&(col as u64).to_le_bytes());
+            }
         }
     }
 }
@@ -559,17 +607,204 @@ fn absorb_c0_and_check_identity(
     k: usize,
     c_0: &SparseBinaryMatrix,
 ) -> bool {
-    h.update(&(c_0.num_rows as u64).to_le_bytes());
-    h.update(&(c_0.num_cols as u64).to_le_bytes());
-    let mut is_identity = c_0.num_rows == k && c_0.num_cols == k;
-    for (i, row) in c_0.rows.iter().enumerate() {
-        h.update(&(row.len() as u64).to_le_bytes());
-        for &col in row {
-            h.update(&(col as u64).to_le_bytes());
-        }
-        is_identity &= row.as_slice() == [i];
+    absorb_matrix(h, c_0);
+    c0_is_identity_scan(k, c_0)
+}
+
+#[cfg(all(target_endian = "little", target_pointer_width = "64"))]
+#[inline]
+fn push_buffered(h: &mut blake3::Hasher, buf: &mut [u8], buf_len: &mut usize, mut data: &[u8]) {
+    if *buf_len + data.len() <= buf.len() {
+        buf[*buf_len..*buf_len + data.len()].copy_from_slice(data);
+        *buf_len += data.len();
+        return;
     }
-    is_identity
+    if *buf_len > 0 {
+        let take = buf.len() - *buf_len;
+        buf[*buf_len..].copy_from_slice(&data[..take]);
+        h.update(buf);
+        *buf_len = 0;
+        data = &data[take..];
+    }
+    if data.len() >= buf.len() {
+        h.update(data);
+    } else if !data.is_empty() {
+        buf[..data.len()].copy_from_slice(data);
+        *buf_len = data.len();
+    }
+}
+
+/// Zero-allocation Rayon-parallel BLAKE3 tree hasher for `statement_digest()`.
+/// Produces a 100% bit-identical digest to feeding `(header, a_0, b_0, c_0)`
+/// sequentially into `blake3::Hasher::update`.
+#[cfg(all(target_endian = "little", target_pointer_width = "64"))]
+struct DigestMatrixSection<'a> {
+    mat: &'a SparseBinaryMatrix,
+    /// Cumulative byte offsets relative to the start of this matrix section.
+    /// `row_offsets[0] == 16`, `row_offsets[r + 1] == row_offsets[r] + 8 + rows[r].len() * 8`.
+    row_offsets: Vec<usize>,
+    /// Start byte offset of this matrix section in the global statement stream.
+    stream_start: usize,
+}
+
+#[cfg(all(target_endian = "little", target_pointer_width = "64"))]
+impl<'a> DigestMatrixSection<'a> {
+    fn new(mat: &'a SparseBinaryMatrix, stream_start: usize) -> (Self, usize) {
+        let mut row_offsets = Vec::with_capacity(mat.rows.len() + 1);
+        let mut off = 16usize;
+        row_offsets.push(off);
+        for row in &mat.rows {
+            off += 8 + row.len() * 8;
+            row_offsets.push(off);
+        }
+        let end = stream_start + off;
+        (
+            Self {
+                mat,
+                row_offsets,
+                stream_start,
+            },
+            end,
+        )
+    }
+
+    fn feed_range(
+        &self,
+        h: &mut blake3::Hasher,
+        buf: &mut [u8],
+        buf_len: &mut usize,
+        mut lo: usize,
+        hi: usize,
+    ) {
+        if lo >= hi {
+            return;
+        }
+        if lo < 16 {
+            let mut hdr = [0u8; 16];
+            hdr[0..8].copy_from_slice(&(self.mat.num_rows as u64).to_le_bytes());
+            hdr[8..16].copy_from_slice(&(self.mat.num_cols as u64).to_le_bytes());
+            let take_end = hi.min(16);
+            push_buffered(h, buf, buf_len, &hdr[lo..take_end]);
+            lo = take_end;
+        }
+        if lo >= hi {
+            return;
+        }
+        let mut r = self.row_offsets.partition_point(|&off| off <= lo) - 1;
+        while lo < hi {
+            let r_start = self.row_offsets[r];
+            let r_end = self.row_offsets[r + 1];
+            let row = &self.mat.rows[r];
+            if lo < r_start + 8 {
+                let len_bytes = (row.len() as u64).to_le_bytes();
+                let s = lo - r_start;
+                let e = hi.min(r_start + 8) - r_start;
+                push_buffered(h, buf, buf_len, &len_bytes[s..e]);
+                lo += e - s;
+            }
+            if lo < hi && lo < r_end {
+                let s = lo - (r_start + 8);
+                let e = hi.min(r_end) - (r_start + 8);
+                // SAFETY: on little-endian 64-bit targets, `[usize]` has the
+                // exact byte layout of little-endian `[u64]`.
+                let row_bytes = unsafe {
+                    std::slice::from_raw_parts(row.as_ptr().cast::<u8>(), row.len() * 8)
+                };
+                push_buffered(h, buf, buf_len, &row_bytes[s..e]);
+                lo += e - s;
+            }
+            r += 1;
+        }
+    }
+}
+
+#[cfg(all(target_endian = "little", target_pointer_width = "64"))]
+struct DigestStream<'a> {
+    header: &'a [u8; 43],
+    sections: [DigestMatrixSection<'a>; 3],
+    total_len: usize,
+}
+
+#[cfg(all(target_endian = "little", target_pointer_width = "64"))]
+impl<'a> DigestStream<'a> {
+    fn feed_range(&self, h: &mut blake3::Hasher, start: usize, end: usize) {
+        let mut buf = [0u8; 16 * 1024];
+        let mut buf_len = 0usize;
+        if start < self.header.len() {
+            let e = end.min(self.header.len());
+            push_buffered(h, &mut buf, &mut buf_len, &self.header[start..e]);
+        }
+        for (idx, sec) in self.sections.iter().enumerate() {
+            let sec_start = sec.stream_start;
+            let sec_end = if idx + 1 < self.sections.len() {
+                self.sections[idx + 1].stream_start
+            } else {
+                self.total_len
+            };
+            let lo = start.max(sec_start);
+            let hi = end.min(sec_end);
+            if lo < hi {
+                sec.feed_range(h, &mut buf, &mut buf_len, lo - sec_start, hi - sec_start);
+            }
+        }
+        if buf_len > 0 {
+            h.update(&buf[..buf_len]);
+        }
+    }
+}
+
+#[cfg(all(target_endian = "little", target_pointer_width = "64"))]
+fn hash_stream_subtree(
+    stream: &DigestStream<'_>,
+    offset: usize,
+    len: usize,
+    is_root: bool,
+) -> [u8; 32] {
+    use blake3::hazmat::{HasherExt, Mode, left_subtree_len, merge_subtrees_non_root, merge_subtrees_root};
+    const PAR_THRESHOLD: usize = 256 * 1024;
+    if len <= PAR_THRESHOLD {
+        let mut h = blake3::Hasher::new();
+        if !is_root {
+            h.set_input_offset(offset as u64);
+        }
+        stream.feed_range(&mut h, offset, offset + len);
+        return if is_root {
+            *h.finalize().as_bytes()
+        } else {
+            h.finalize_non_root()
+        };
+    }
+    let left_len = left_subtree_len(len as u64) as usize;
+    let (left_cv, right_cv) = rayon::join(
+        || hash_stream_subtree(stream, offset, left_len, false),
+        || hash_stream_subtree(stream, offset + left_len, len - left_len, false),
+    );
+    if is_root {
+        *merge_subtrees_root(&left_cv, &right_cv, Mode::Hash).as_bytes()
+    } else {
+        merge_subtrees_non_root(&left_cv, &right_cv, Mode::Hash)
+    }
+}
+
+#[cfg(all(target_endian = "little", target_pointer_width = "64"))]
+fn statement_digest_parallel(
+    header: &[u8; 43],
+    k: usize,
+    a_0: &SparseBinaryMatrix,
+    b_0: &SparseBinaryMatrix,
+    c_0: &SparseBinaryMatrix,
+) -> ([u8; 32], bool) {
+    let (sec_a, off_b) = DigestMatrixSection::new(a_0, header.len());
+    let (sec_b, off_c) = DigestMatrixSection::new(b_0, off_b);
+    let (sec_c, total_len) = DigestMatrixSection::new(c_0, off_c);
+    let stream = DigestStream {
+        header,
+        sections: [sec_a, sec_b, sec_c],
+        total_len,
+    };
+    let digest = hash_stream_subtree(&stream, 0, total_len, true);
+    let c0_is_identity = c0_is_identity_scan(k, c_0);
+    (digest, c0_is_identity)
 }
 
 /// Block-diagonal `(I_{2^n_log} ⊗ M_0) · z` over GF(2).
@@ -1151,5 +1386,60 @@ mod tests {
         let mut z_nonzero = vec![false; 1 << m];
         z_nonzero[5] = true;
         assert!(!r1cs.satisfies(&z_nonzero));
+    }
+
+    #[test]
+    fn parallel_statement_digest_matches_naive_byte_stream() {
+        fn naive_digest(r: &BlockR1cs) -> [u8; 32] {
+            let mut h = blake3::Hasher::new();
+            h.update(b"flock-r1cs-stmt-v1");
+            h.update(&(r.m as u64).to_le_bytes());
+            h.update(&(r.k_log as u64).to_le_bytes());
+            h.update(&(r.k_skip as u64).to_le_bytes());
+            h.update(&[match r.layout {
+                WitnessLayout::RowMajor => 0u8,
+                WitnessLayout::BatchMajor => 1u8,
+            }]);
+            for mat in [&r.a_0, &r.b_0, &r.c_0] {
+                h.update(&(mat.num_rows as u64).to_le_bytes());
+                h.update(&(mat.num_cols as u64).to_le_bytes());
+                for row in &mat.rows {
+                    h.update(&(row.len() as u64).to_le_bytes());
+                    for &col in row {
+                        h.update(&(col as u64).to_le_bytes());
+                    }
+                }
+            }
+            *h.finalize().as_bytes()
+        }
+
+        // Exercise small, medium, and multi-subtree (> 512 KiB) matrices with
+        // empty rows, uneven row lengths, and unaligned subtree cuts.
+        let mut rng = TestRng::new(0xD16E_5701);
+        for &(n_rows, max_row_len) in &[(8usize, 3usize), (64, 17), (1024, 97)] {
+            let make_mat = |rng: &mut TestRng| SparseBinaryMatrix {
+                num_rows: n_rows,
+                num_cols: n_rows,
+                rows: (0..n_rows)
+                    .map(|r| {
+                        let len = if r % 11 == 0 {
+                            0
+                        } else {
+                            (rng.next_u64() as usize) % (max_row_len + 1)
+                        };
+                        (0..len).map(|_| (rng.next_u64() as usize) % n_rows).collect()
+                    })
+                    .collect(),
+            };
+            let a_0 = make_mat(&mut rng);
+            let b_0 = make_mat(&mut rng);
+            let c_0 = identity(n_rows);
+            let r1cs = test_r1cs(a_0, b_0, c_0);
+            assert_eq!(
+                r1cs.statement_digest(),
+                naive_digest(&r1cs),
+                "digest mismatch for n_rows={n_rows} max_row_len={max_row_len}"
+            );
+        }
     }
 }

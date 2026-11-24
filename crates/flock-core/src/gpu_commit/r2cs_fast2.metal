@@ -96,17 +96,29 @@ kernel void zc_r2_products_horner_cs(
         // W5 = 0, and W3, W4 are the group sums of a0 and a1 when exactly one
         // pair of the group is live, else 0: no products. A group with only
         // padded pairs adds nothing (only the four Horner shifts run).
-        if (simd_all(pad || (c_one && ((br.x & br.z) & (br.y & br.w)) == 0xffffffffu))) {
+        // Group 60 (pairs 120, 121) under R2 C capture (`cl.pad0 != 0u`): pair
+        // 120 has constant b0 = 0x0001_ffff_ffff_ffff, high 15 bits of a0 zero,
+        // row 241 all zero, and pair 121 padded — fold only a0/b0 for the
+        // compact store and skip all four products.
+        uint pib = pair_idx & 127u;
+        bool g60 = cl.pad0 != 0u && (pib == 120u || pib == 121u);
+        bool g60_ok = pad
+            ? odd_lane
+            : (!odd_lane && (ar.y & 0xfffe0000u) == 0u && (ar.z | ar.w | br.z | br.w) == 0u
+               && br.x == 0xffffffffu && br.y == 0x0001ffffu);
+        bool b_one_ok = pad || (c_one && ((br.x & br.z) & (br.y & br.w)) == 0xffffffffu);
+        if (simd_all(g60 ? g60_ok : b_one_ok)) {
             // R2 C capture (`cl.pad0`, see ENV_NO_R2_C_CAPTURE): head pairs
-            // 0..8 and pairs 118, 119 of every block (whole SIMD groups:
-            // their pairs differ in bit 0 only) fold a0 for the compact store
-            // and add nothing to the sums; round two adds their terms once,
-            // from round one's C fold. Only the Horner shifts run.
-            uint pib = pair_idx & 127u;
-            if (cl.pad0 != 0u && (pib < 8u || pib == 118u || pib == 119u)) {
+            // 0..8, pairs 118, 119, and group 60 (pairs 120, 121) of every
+            // block (whole SIMD groups: their pairs differ in bit 0 only) make
+            // their compact store and add nothing to the sums; round two adds
+            // their terms once, from round one's C fold. Only the Horner shifts
+            // run.
+            if (cl.pad0 != 0u && (pib < 8u || pib == 118u || pib == 119u || g60)) {
                 if (!pad) {
                     a0 = zc_r2_cs_fold7b_1n(ar.x, ar.y, tab8);
-                    zc_r2_cs_store(pair_idx, ar, br, a0, uint4(1u, 0u, 0u, 0u), cs_anchors, cs_deltas, cl);
+                    b0 = g60 ? zc_r2_cs_fold7b_1n(0xffffffffu, 0x0001ffffu, tab8) : uint4(1u, 0u, 0u, 0u);
+                    zc_r2_cs_store(pair_idx, ar, br, a0, b0, cs_anchors, cs_deltas, cl);
                 }
                 zc_r2_cs_horner_shift_u8(h1);
                 zc_r2_cs_horner_shift_u8(hi);
@@ -142,15 +154,14 @@ kernel void zc_r2_products_horner_cs(
             b1 = zc_r2_cs_fold7b_1n(br.z, br.w, tab8);
             zc_r2_cs_store(pair_idx, ar, br, a0, b0, cs_anchors, cs_deltas, cl);
             // Head-compacted state: a head pair's b rows must be all ones.
-            if (cl.hc != 0u && (pair_idx & 127u) < 8u) {
+            if (cl.hc != 0u && pib < 8u) {
                 head_bad = head_bad || ((br.x & br.z) & (br.y & br.w)) != 0xffffffffu;
             }
-            // R2 C capture: a capture pair here (not a b == 1 step) would add
-            // its products; flag it so the caller redoes the round.
-            if (cl.pad0 != 0u) {
-                uint pib = pair_idx & 127u;
-                head_bad = head_bad || pib < 8u || pib == 118u || pib == 119u;
-            }
+        }
+        // R2 C capture: a capture pair here (not taking the capture skip above)
+        // would add its products; flag it so the caller redoes the round.
+        if (cl.pad0 != 0u) {
+            head_bad = head_bad || pib < 8u || pib == 118u || pib == 119u || g60;
         }
         // Four passes through one product body; pass k takes the
         // accumulator in h1 one Horner step, then the accumulators rotate.

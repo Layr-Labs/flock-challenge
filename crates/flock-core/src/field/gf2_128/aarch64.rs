@@ -450,6 +450,17 @@ pub(crate) unsafe fn mul_const_prep(p: ConstPrep, x: uint64x2_t) -> uint64x2_t {
     unsafe { fold_lm(pmull_pair_sum(x, p.0), pmull_pair_sum(x, p.1)) }
 }
 
+/// `acc ^ (x * t)` for the prepared constant `p = const_prep(t)`, absorbing
+/// `acc` into the macro-fused `pmull`+`eor` chain of `L`.
+#[inline(always)]
+pub(crate) unsafe fn mul_const_prep_xor(
+    acc: uint64x2_t,
+    p: ConstPrep,
+    x: uint64x2_t,
+) -> uint64x2_t {
+    unsafe { fold_lm(pmull_pair_acc(acc, x, p.0), pmull_pair_sum(x, p.1)) }
+}
+
 /// Two independent prepared products, folding each high limb with PMULL.
 /// This avoids the paired ZIP/shift network when that network limits throughput.
 #[inline(always)]
@@ -506,6 +517,22 @@ pub(crate) unsafe fn mul_two_const_sum_prep(
 ) -> uint64x2_t {
     unsafe {
         let l = pmull_pair_acc(pmull_pair_sum(x, pc.0), y, pd.0);
+        let m = pmull_pair_acc(pmull_pair_sum(x, pc.1), y, pd.1);
+        fold_lm(l, m)
+    }
+}
+
+/// `acc ^ (x * c + y * d)` for two prepared constants, absorbing `acc` into `L`.
+#[inline(always)]
+pub(crate) unsafe fn mul_two_const_sum_prep_xor(
+    acc: uint64x2_t,
+    pc: ConstPrep,
+    x: uint64x2_t,
+    pd: ConstPrep,
+    y: uint64x2_t,
+) -> uint64x2_t {
+    unsafe {
+        let l = pmull_pair_acc(pmull_pair_acc(acc, x, pc.0), y, pd.0);
         let m = pmull_pair_acc(pmull_pair_sum(x, pc.1), y, pd.1);
         fold_lm(l, m)
     }

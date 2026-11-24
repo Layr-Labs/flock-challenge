@@ -53,6 +53,32 @@ pub mod zerocheck;
 /// purely for screening/rollback — mirrors `FLOCK_NO_AB_COMPACT_STORE`.
 pub const ENV_NO_MICRO_STACK: &str = "FLOCK_NO_MICRO_STACK";
 
+pub const ENV_NO_TRACE_ENV_ONCE: &str = "FLOCK_NO_TRACE_ENV_ONCE";
+
+fn trace_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_TRACE_ENV_ONCE).is_none());
+    *ON
+}
+
+pub fn phase_timing_env_on() -> bool {
+    if trace_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_PHASE_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+}
+
+pub fn zc_timing_env_on() -> bool {
+    if trace_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_ZC_TIMING").is_some()
+}
+
 /// Publish-path warm-up hook (port of the x86 track's rename warm-up, e-man07
 /// fd1b67de item 20). The ranked worker's publisher installs it during the
 /// untimed gap; the PCS open fires it once, two recursive levels before the

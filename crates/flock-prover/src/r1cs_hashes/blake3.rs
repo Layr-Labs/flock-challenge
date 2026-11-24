@@ -88,7 +88,9 @@
 //!   are "free" witness bits. PCS-level openings at fixed indices will
 //!   eventually pin them to claimed public inputs.
 
-use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit, xor_dedup};
+use super::common::{BitRecord, add_carry_parts, or_bit_at, or_u32_at_bit};
+#[cfg(test)]
+use super::common::xor_dedup;
 use flock_core::challenger::Challenger;
 use flock_core::field::F128;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -298,6 +300,25 @@ impl DeferredAb<'_> {
         scratch_primed: bool,
         publish: bool,
     ) {
+        self.fill_quad_to_with_opts(q, a_scratch, b_scratch, scratch_primed, publish, false);
+    }
+
+    /// [`Self::fill_quad_to`] with an optional `skip_out` hint for unpublished
+    /// round-one quads whose `out_lo` (`u32` words `8..16`) and `out_hi` +
+    /// `g=55 lin1` (`u32` words `472..482`) are provably unread by both
+    /// round-one AB precompute (identity-prefix + output-window + mixed-ones
+    /// omission) and `AbStripeEmitter` (root-compacted stripe). Ignored when
+    /// publishing, when scratch is null/cold, or off the memory copy-drain form.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    pub(crate) fn fill_quad_to_with_opts(
+        &self,
+        q: usize,
+        a_scratch: *mut u8,
+        b_scratch: *mut u8,
+        scratch_primed: bool,
+        publish: bool,
+        skip_out: bool,
+    ) {
         assert!(q < self.n_quads);
         assert_eq!(a_scratch.is_null(), b_scratch.is_null());
         let publish = publish || a_scratch.is_null() || !self.copy_drain;
@@ -325,6 +346,9 @@ impl DeferredAb<'_> {
                     );
                 } else {
                     match (primed, self.copy_drain) {
+                        (true, true) if self.input_mem && skip_out && !publish => {
+                            witgen_simd::build_quad_split_neon_mem_skip_out(input, sa, sb)
+                        }
                         (true, true) if self.input_mem => {
                             witgen_simd::build_quad_split_neon_mem::<true>(input, a, b, sa, sb)
                         }
@@ -597,85 +621,116 @@ const fn build_per_round_msg_idx() -> [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] {
 const PER_ROUND_MSG_IDX: [[[usize; 2]; N_G_PER_ROUND]; N_ROUNDS] = build_per_round_msg_idx();
 
 // ---------------------------------------------------------------------------
-// Lin_func cascade — per-bit lists of slot indices XOR'd to evaluate one bit.
+// Lin_func cascade — compact per-bit bitsets of slot indices XOR'd to evaluate
+// one bit.
 //
 // In Option D, sum bits aren't materialized as slots; instead, the "value" of
-// any intermediate bit is a `LinBits[i] = Vec<usize>` whose XOR equals that
-// bit. The G-builder threads these lin_funcs forward through the state, so
-// each lane's value at any point in the protocol is represented as a `Word`.
+// any intermediate bit is a GF(2) linear combination of slot indices in
+// `[0, K)`. Representing each bit as a `[u64; K / 64]` bitset (bounded by
+// `active_words`) turns GF(2) XOR + deduplication into wordwise XOR and
+// materializes sorted square-free R1CS rows directly via `trailing_zeros()`.
 // ---------------------------------------------------------------------------
 
-/// A 32-bit symbolic word. `bits[i]` is a list of slot indices whose XOR
-/// equals bit `i` of the word.
+const BITSET_WORDS: usize = K / 64; // 256 u64s = 16,384 bits
+
+/// A 32-bit symbolic word. `bits[i]` is a bitset of slot indices `< K` whose
+/// XOR equals bit `i` of the word. Words at index `>= active_words` are zero.
+/// Stored on the heap (`Vec` of length `WORD_BITS`) so stack frames stay tiny.
 #[derive(Clone)]
 struct Word {
-    bits: [Vec<usize>; WORD_BITS],
+    bits: Vec<[u64; BITSET_WORDS]>,
+    active_words: usize,
 }
 
 impl Word {
     fn zero() -> Self {
         Self {
-            bits: std::array::from_fn(|_| Vec::new()),
+            bits: vec![[0u64; BITSET_WORDS]; WORD_BITS],
+            active_words: 0,
         }
     }
     /// Construct from a 32-bit witness or lin-id slot whose 32 bits live at
     /// `[base + 0, base + 1, …, base + 31]`.
     fn from_slot_base(base: usize) -> Self {
-        Self {
-            bits: std::array::from_fn(|i| vec![base + i]),
-        }
-    }
-    /// Construct from a 32-bit constant — bit `i` is `[Z_CONST]` if set,
-    /// `[]` otherwise.
-    fn from_const(val: u32) -> Self {
-        Self {
-            bits: std::array::from_fn(|i| {
-                if (val >> i) & 1 == 1 {
-                    vec![Z_CONST_POS]
-                } else {
-                    Vec::new()
-                }
-            }),
-        }
-    }
-    /// Bitwise XOR, no dedup. Caller calls `dedup()` after a chain if it
-    /// wants canonical rows.
-    fn xor(&self, other: &Word) -> Word {
-        let mut out = self.clone();
+        let mut out = Self::zero();
+        let mut max_w = 0usize;
         for i in 0..WORD_BITS {
-            out.bits[i].extend(&other.bits[i]);
+            let s = base + i;
+            let wi = s >> 6;
+            out.bits[i][wi] = 1u64 << (s & 63);
+            if wi + 1 > max_w {
+                max_w = wi + 1;
+            }
+        }
+        out.active_words = max_w;
+        out
+    }
+    /// Construct from a 32-bit constant — bit `i` is `{Z_CONST_POS}` if set,
+    /// empty otherwise.
+    fn from_const(val: u32) -> Self {
+        let mut out = Self::zero();
+        let wi = Z_CONST_POS >> 6;
+        let mask = 1u64 << (Z_CONST_POS & 63);
+        let mut any = false;
+        for i in 0..WORD_BITS {
+            if (val >> i) & 1 == 1 {
+                out.bits[i][wi] = mask;
+                any = true;
+            }
+        }
+        out.active_words = if any { wi + 1 } else { 0 };
+        out
+    }
+    /// Bitwise GF(2) XOR (automatically canonical / deduplicated).
+    fn xor(&self, other: &Word) -> Word {
+        let mut out = Word::zero();
+        let nw = self.active_words.max(other.active_words);
+        out.active_words = nw;
+        for i in 0..WORD_BITS {
+            let dst = &mut out.bits[i][..nw];
+            let a = &self.bits[i][..nw];
+            let b = &other.bits[i][..nw];
+            for w in 0..nw {
+                dst[w] = a[w] ^ b[w];
+            }
         }
         out
     }
-    /// `rotr(n)` — pure index permutation; doesn't touch slot lists.
-    fn rotr(&self, n: usize) -> Word {
-        Word {
-            bits: std::array::from_fn(|i| self.bits[(i + n) % WORD_BITS].clone()),
-        }
-    }
-    /// Sort + cancel duplicates per bit.
-    fn dedup(mut self) -> Word {
-        for i in 0..WORD_BITS {
-            self.bits[i] = xor_dedup(std::mem::take(&mut self.bits[i]));
-        }
+    /// In-place `rotr(n)` — pure bit-index permutation (`out[i] = self[(i + n) % 32]`).
+    fn rotr(mut self, n: usize) -> Word {
+        self.bits.rotate_left(n % WORD_BITS);
         self
     }
-    /// "Sum bit" lin_func of an ADD `x + y` whose carry_aux slots live at
-    /// `[carry_base, carry_base + 31)`.
-    ///
-    ///   sum[i] = x[i] ⊕ y[i] ⊕ ⊕_{j<i} carry_aux[j]
-    fn add_sum(x: &Word, y: &Word, carry_base: usize) -> Word {
-        let mut out = Word::zero();
-        for i in 0..WORD_BITS {
-            let mut v = x.bits[i].clone();
-            v.extend(&y.bits[i]);
-            for j in 0..i {
-                v.push(carry_base + j);
-            }
-            out.bits[i] = v;
-        }
-        out.dedup()
+}
+
+/// Materialize a bitset slice into a strictly ascending `Vec<usize>` of set bit
+/// positions — identical to `xor_dedup` over the contributing slot indices.
+#[inline]
+fn materialize_bitset(words: &[u64]) -> Vec<usize> {
+    let mut count = 0usize;
+    for &w in words {
+        count += w.count_ones() as usize;
     }
+    let mut out: Vec<usize> = Vec::with_capacity(count);
+    let mut dst: *mut usize = out.as_mut_ptr();
+    for (wi, &word) in words.iter().enumerate() {
+        let mut w = word;
+        let base = wi << 6;
+        while w != 0 {
+            let tz = w.trailing_zeros() as usize;
+            // SAFETY: `count` is the exact sum of set bits across `words`, so
+            // `dst` writes exactly `count` elements within `out`'s capacity.
+            unsafe {
+                dst.write(base + tz);
+                dst = dst.add(1);
+            }
+            w &= w - 1;
+        }
+    }
+    debug_assert_eq!(unsafe { dst.offset_from(out.as_ptr()) as usize }, count);
+    // SAFETY: all `count` elements were initialized above.
+    unsafe { out.set_len(count) };
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -694,19 +749,45 @@ fn write_add_carry_rows(
     y: &Word,
     carry_base: usize,
 ) -> Word {
-    for i in 0..CARRY_BITS_PER_ADD {
-        let mut a = x.bits[i].clone();
-        for j in 0..i {
-            a.push(carry_base + j);
+    let mut cin = [0u64; BITSET_WORDS];
+    let mut cin_words = 0usize;
+    let mut tmp = [0u64; BITSET_WORDS];
+    let mut sum = Word::zero();
+    let max_carry_word = ((carry_base + CARRY_BITS_PER_ADD - 1) >> 6) + 1;
+    let sum_words = x.active_words.max(y.active_words).max(max_carry_word);
+    sum.active_words = sum_words;
+
+    for i in 0..WORD_BITS {
+        let xb = &x.bits[i];
+        let yb = &y.bits[i];
+        let nw_xy = x.active_words.max(y.active_words).max(cin_words);
+        if i < CARRY_BITS_PER_ADD {
+            let nw_a = x.active_words.max(cin_words);
+            for w in 0..nw_a {
+                tmp[w] = xb[w] ^ cin[w];
+            }
+            a_rows[carry_base + i] = materialize_bitset(&tmp[..nw_a]);
+
+            let nw_b = y.active_words.max(cin_words);
+            for w in 0..nw_b {
+                tmp[w] = yb[w] ^ cin[w];
+            }
+            b_rows[carry_base + i] = materialize_bitset(&tmp[..nw_b]);
         }
-        let mut b = y.bits[i].clone();
-        for j in 0..i {
-            b.push(carry_base + j);
+        let sb = &mut sum.bits[i];
+        for w in 0..nw_xy {
+            sb[w] = xb[w] ^ yb[w] ^ cin[w];
         }
-        a_rows[carry_base + i] = xor_dedup(a);
-        b_rows[carry_base + i] = xor_dedup(b);
+        if i < CARRY_BITS_PER_ADD {
+            let bit = carry_base + i;
+            let wi = bit >> 6;
+            cin[wi] ^= 1u64 << (bit & 63);
+            if wi + 1 > cin_words {
+                cin_words = wi + 1;
+            }
+        }
     }
-    Word::add_sum(x, y, carry_base)
+    sum
 }
 
 // ---------------------------------------------------------------------------
@@ -766,12 +847,6 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             let [la, lb, lc, ld] = G_LANES[g_in_round];
             let [mx_idx, my_idx] = msg_idx[r][g_in_round];
 
-            // Snapshot inputs before any state mutation. Cloning is cheap
-            // (lane Words point at the same slot lists — we never alias).
-            let a = state[la].clone();
-            let b = state[lb].clone();
-            let c = state[lc].clone();
-            let d = state[ld].clone();
             let mx = Word::from_slot_base(m_bit(mx_idx, 0));
             let my = Word::from_slot_base(m_bit(my_idx, 0));
 
@@ -779,8 +854,8 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
             let tmp_0 = write_add_carry_rows(
                 &mut a_rows,
                 &mut b_rows,
-                &a,
-                &b,
+                &state[la],
+                &state[lb],
                 g_add_carry_bit(g, ADD_TMP0, 0),
             );
             // a_1 = tmp_0 + mx
@@ -792,17 +867,17 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
                 g_add_carry_bit(g, ADD_A1, 0),
             );
             // d_1 = rotr16(d ^ a_1)
-            let d_1 = d.xor(&a_1).dedup().rotr(16);
+            let d_1 = state[ld].xor(&a_1).rotr(16);
             // c_1 = c + d_1
             let c_1 = write_add_carry_rows(
                 &mut a_rows,
                 &mut b_rows,
-                &c,
+                &state[lc],
                 &d_1,
                 g_add_carry_bit(g, ADD_C1, 0),
             );
             // b_1 = rotr12(b ^ c_1)
-            let b_1 = b.xor(&c_1).dedup().rotr(12);
+            let b_1 = state[lb].xor(&c_1).rotr(12);
             // tmp_1 = a_1 + b_1
             let tmp_1 = write_add_carry_rows(
                 &mut a_rows,
@@ -820,7 +895,7 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
                 g_add_carry_bit(g, ADD_A2, 0),
             );
             // d_2 = rotr8(d_1 ^ a_2)
-            let d_2 = d_1.xor(&a_2).dedup().rotr(8);
+            let d_2 = d_1.xor(&a_2).rotr(8);
             // c_2 = c_1 + d_2    (= c_new — cascades)
             let c_2 = write_add_carry_rows(
                 &mut a_rows,
@@ -830,16 +905,16 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
                 g_add_carry_bit(g, ADD_C2, 0),
             );
             // b_new = rotr7(b_1 ^ c_2)    (materialized lin-id)
-            let b_new_word = b_1.xor(&c_2).dedup().rotr(7);
+            let b_new_word = b_1.xor(&c_2).rotr(7);
             for i in 0..WORD_BITS {
                 let s = g_lin_bit(g, LIN_B_NEW, i);
-                a_rows[s] = b_new_word.bits[i].clone();
+                a_rows[s] = materialize_bitset(&b_new_word.bits[i][..b_new_word.active_words]);
                 b_rows[s] = vec![Z_CONST_POS];
             }
             // d_new = d_2                  (materialized lin-id)
             for i in 0..WORD_BITS {
                 let s = g_lin_bit(g, LIN_D_NEW, i);
-                a_rows[s] = d_2.bits[i].clone();
+                a_rows[s] = materialize_bitset(&d_2.bits[i][..d_2.active_words]);
                 b_rows[s] = vec![Z_CONST_POS];
             }
 
@@ -856,17 +931,17 @@ pub fn build_matrices() -> (SparseBinaryMatrix, SparseBinaryMatrix) {
     //   out_lo[w] = state[w] ^ state[w+8]
     //   out_hi[w] = state[w+8] ^ cv[w]
     for w in 0..8 {
-        let lo = state[w].xor(&state[w + 8]).dedup();
+        let lo = state[w].xor(&state[w + 8]);
         for i in 0..WORD_BITS {
             let s = out_lo_bit(w, i);
-            a_rows[s] = lo.bits[i].clone();
+            a_rows[s] = materialize_bitset(&lo.bits[i][..lo.active_words]);
             b_rows[s] = vec![Z_CONST_POS];
         }
         let cv_w = Word::from_slot_base(cv_bit(w, 0));
-        let hi = state[w + 8].xor(&cv_w).dedup();
+        let hi = state[w + 8].xor(&cv_w);
         for i in 0..WORD_BITS {
             let s = out_hi_bit(w, i);
-            a_rows[s] = hi.bits[i].clone();
+            a_rows[s] = materialize_bitset(&hi.bits[i][..hi.active_words]);
             b_rows[s] = vec![Z_CONST_POS];
         }
     }
@@ -3480,7 +3555,7 @@ pub(crate) mod witgen_simd {
     /// only output words 8..16 need the stage here.
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn dump_dual_copy<const DIRECT: bool, const PRIMED: bool>(
+    unsafe fn dump_dual_copy<const DIRECT: bool, const PRIMED: bool, const SKIP_OUT: bool>(
         stage: *const V4,
         scratch: *mut u32,
         dst: *mut u32,
@@ -3495,7 +3570,7 @@ pub(crate) mod witgen_simd {
             if DIRECT && PRIMED {
                 // A's stable prefix was flushed before G. Only the output
                 // words 8..16 need the late stage; B needs no stage reads.
-                if sparse_tail {
+                if sparse_tail && !SKIP_OUT {
                     dump_range::<false>(stage, scratch, 1, 2);
                 }
             } else if DIRECT {
@@ -3624,9 +3699,9 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false, false, false, false>(inputs, z, a, b, sa, sb)
             } else {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false, false, false>(inputs, z, a, b, sa, sb)
             }
         }
     }
@@ -3666,6 +3741,14 @@ pub(crate) mod witgen_simd {
     /// # Safety
     /// As [`build_quad_split_neon`] for the `<false, true, PRIMED, true>`
     /// form.
+    /// Kill switch for skipping dead `out_lo` / `out_hi` writes on unpublished
+    /// round-one quads (`FLOCK_NO_WITGEN_SKIP_OUT`, any value restores the full
+    /// output writes). Read once per process.
+    fn skip_out_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_SKIP_OUT").is_none())
+    }
+
     pub(crate) unsafe fn build_quad_split_neon_mem<const PRIMED: bool>(
         inputs: QuadInput<'_>,
         a: *mut u32,
@@ -3675,7 +3758,7 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if PRIMED && ab_rebuild_enabled() && wide_stores_enabled() {
-                build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, true>(
+                build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, true, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3684,7 +3767,7 @@ pub(crate) mod witgen_simd {
                     sb,
                 )
             } else if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false, false>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false, false, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3693,7 +3776,7 @@ pub(crate) mod witgen_simd {
                     sb,
                 )
             } else {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false, false>(
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false, false, false>(
                     inputs,
                     core::ptr::null_mut(),
                     a,
@@ -3701,6 +3784,37 @@ pub(crate) mod witgen_simd {
                     sa,
                     sb,
                 )
+            }
+        }
+    }
+
+    /// Primed unpublished scratch-only form of [`build_quad_split_neon_mem`]
+    /// that skips computing and storing `out_lo` (`sa[8..16]`) and `out_hi` +
+    /// `g=55 lin1` (`sa[472..482]`). Sound only for round-one unpublished quads
+    /// when round-one AB precompute omits `identity_prefix`, `output_window`,
+    /// and `mixed_ones`, and the stripe emitter uses root-compacted rows.
+    pub(crate) unsafe fn build_quad_split_neon_mem_skip_out(
+        inputs: QuadInput<'_>,
+        sa: *mut u32,
+        sb: *mut u32,
+    ) {
+        #[inline(never)]
+        unsafe fn run<const WIDE: bool>(inputs: QuadInput<'_>, sa: *mut u32, sb: *mut u32) {
+            let none = core::ptr::null_mut();
+            unsafe {
+                build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, WIDE, true>(
+                    inputs, none, none, none, sa, sb,
+                )
+            }
+        }
+        unsafe {
+            if skip_out_enabled() && ab_rebuild_enabled() && wide_stores_enabled() {
+                run::<true>(inputs, sa, sb)
+            } else if skip_out_enabled() && ab_rebuild_enabled() {
+                run::<false>(inputs, sa, sb)
+            } else {
+                let none = core::ptr::null_mut();
+                build_quad_split_neon_mem::<true>(inputs, none, none, sa, sb)
             }
         }
     }
@@ -3717,7 +3831,7 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, WIDE>(
+            build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, WIDE, false>(
                 inputs, core::ptr::null_mut(), a, b, sa, sb,
             )
         }
@@ -3739,7 +3853,7 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false, false, false>(
+            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false, false, false, false>(
                 inputs, core::ptr::null_mut(), a, b, sa, sb,
             )
         }
@@ -3759,7 +3873,7 @@ pub(crate) mod witgen_simd {
     /// `zs` is valid for `4 * U32_PER_BLOCK` u32 writes.
     pub(crate) unsafe fn build_quad_z_rows_plain(inputs: QuadInput<'_>, zs: *mut u32) {
         unsafe {
-            build_quad_split_neon_impl::<true, false, false, false, false, false, false, false, true, false>(
+            build_quad_split_neon_impl::<true, false, false, false, false, false, false, false, true, false, false>(
                 inputs,
                 zs,
                 core::ptr::null_mut(),
@@ -3803,6 +3917,7 @@ pub(crate) mod witgen_simd {
         const DIRECT_SCRATCH: bool,
         const ZPLAIN: bool,
         const WIDE_STORES: bool,
+        const SKIP_OUT: bool,
     >(
         inputs: QuadInput<'_>,
         z: *mut u32,
@@ -3814,6 +3929,7 @@ pub(crate) mod witgen_simd {
         const {
             assert!(!ZPLAIN || WZ);
             assert!(!WIDE_STORES || (DIRECT_SCRATCH && PRIMED));
+            assert!(!SKIP_OUT || (DIRECT_SCRATCH && PRIMED && !WZ));
             assert!(!MEM || (!WZ && SCRATCH && COPY));
             assert!(!DIRECT_SCRATCH || (!WZ && SCRATCH && COPY));
             assert!(!(WZ && SCRATCH));
@@ -3823,6 +3939,7 @@ pub(crate) mod witgen_simd {
             assert!(ELIDE_B_PREFIX_CHUNKS.is_multiple_of(2));
             assert!(RANKED_SPARSE_TAIL_CHUNK + 1 == ELIDE_ZERO_CHUNK);
         }
+        debug_assert!(!SKIP_OUT || (a.is_null() && b.is_null()));
         let full_scratch = SCRATCH && !PRIMED;
         unsafe {
             // Memory form: where the 8 chaining words and the 16 message
@@ -4112,27 +4229,35 @@ pub(crate) mod witgen_simd {
             round!(48, 11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13);
 
             // ---- out_hi, stream-sequential (z = a, b = MAX) ----
-            const {
-                assert!(OUT_HI_BASE % 32 == 17);
-            }
-            macro_rules! oh {
-                ($w:literal) => {{
-                    let hv = veorq_u32(state[$w + 8], cvw!($w));
-                    lin!(OUT_HI_BASE + 32 * $w, hv);
-                }};
-            }
-            oh!(0);
-            oh!(1);
-            oh!(2);
-            oh!(3);
-            oh!(4);
-            oh!(5);
-            oh!(6);
-            oh!(7);
-            if WZ {
-                wz.finish();
-            } else {
-                wab.finish();
+            // When `SKIP_OUT` is set (unpublished round-1 quads where round-1
+            // AB omits identity_prefix, output_window, and mixed_ones, and the
+            // stripe is root-compacted), words 472..482 (`g=55 lin1` + `out_hi`)
+            // and words 8..16 (`out_lo`) are provably unread; word 471 (`g=55
+            // lin0` / `REC_C5`) already flushed group 468..472 directly to
+            // `sa`/`sb` above.
+            if !SKIP_OUT {
+                const {
+                    assert!(OUT_HI_BASE % 32 == 17);
+                }
+                macro_rules! oh {
+                    ($w:literal) => {{
+                        let hv = veorq_u32(state[$w + 8], cvw!($w));
+                        lin!(OUT_HI_BASE + 32 * $w, hv);
+                    }};
+                }
+                oh!(0);
+                oh!(1);
+                oh!(2);
+                oh!(3);
+                oh!(4);
+                oh!(5);
+                oh!(6);
+                oh!(7);
+                if WZ {
+                    wz.finish();
+                } else {
+                    wab.finish();
+                }
             }
 
             // ---- zero fill behind the last useful word ----
@@ -4159,9 +4284,11 @@ pub(crate) mod witgen_simd {
             }
 
             // ---- out_lo slot, words 8..16 (z = a) ----
-            for w in 0..8usize {
-                let lo = veorq_u32(state[w], state[w + 8]);
-                vst1q_u32(za.add(8 + w) as *mut u32, lo);
+            if !SKIP_OUT {
+                for w in 0..8usize {
+                    let lo = veorq_u32(state[w], state[w + 8]);
+                    vst1q_u32(za.add(8 + w) as *mut u32, lo);
+                }
             }
 
             // ---- drain ----
@@ -4186,8 +4313,17 @@ pub(crate) mod witgen_simd {
                 } else {
                     (DUMP_CHUNKS, 0, DUMP_CHUNKS)
                 };
-                dump_dual_copy::<DIRECT_SCRATCH, PRIMED>(za, sa, a, 0, a1, 0, RANKED_SPARSE_TAIL_CHUNK, true);
-                dump_dual_copy::<DIRECT_SCRATCH, PRIMED>(
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED, SKIP_OUT>(
+                    za,
+                    sa,
+                    a,
+                    0,
+                    a1,
+                    0,
+                    RANKED_SPARSE_TAIL_CHUNK,
+                    true,
+                );
+                dump_dual_copy::<DIRECT_SCRATCH, PRIMED, false>(
                     bs,
                     sb,
                     b,
@@ -5684,9 +5820,30 @@ impl Blake3Setup {
                     Some(deferred) => deferred.n_quads(),
                     None => 0,
                 };
+                // On unpublished round-1 quads, `out_lo` (`sa[8..16]`) and
+                // `out_hi` + `g=55 lin1` (`sa[472..482]`) are dead whenever
+                // round-1 AB omits identity_prefix, output_window, and
+                // mixed_ones (and `AbStripeEmitter` uses root-compacted rows).
+                // Round-2 rebuild reads full rows, so it MUST use a separate
+                // closure with `skip_out = false`.
+                let r1_skip_out = crate::prover::round1_ab_omits_out_words(&self.r1cs);
                 let ab_produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool| {
                     if let Some(deferred) = &deferred_ab {
-                        // A null scratch always publishes (see `fill_quad_to`).
+                        let publish = unit < r2_published_quads;
+                        // A null scratch always publishes (see `fill_quad_to_with_opts`).
+                        deferred.fill_quad_to_with_opts(
+                            unit,
+                            a_scratch,
+                            b_scratch,
+                            primed,
+                            publish,
+                            r1_skip_out && !publish,
+                        );
+                    }
+                };
+                let r2_ab_produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool| {
+                    if let Some(deferred) = &deferred_ab {
+                        // Round-2 rebuild needs complete rows (including out_lo / out_hi).
                         deferred.fill_quad_to(unit, a_scratch, b_scratch, primed, unit < r2_published_quads);
                     }
                 };
@@ -5715,7 +5872,7 @@ impl Blake3Setup {
                 // Round two takes this registration (matched by the buffers'
                 // addresses); it is withdrawn when the prove returns.
                 let _r2_ab_rebuild = match (&ab_producer, &deferred_ab, &r2_rebuild_only) {
-                    (Some(producer), Some(deferred), _) if r2_published_quads < deferred.n_quads() => {
+                    (Some(_), Some(deferred), _) if r2_published_quads < deferred.n_quads() => {
                         let published = r2_published_quads * DeferredAb::UNIT_BYTES;
                         // SAFETY: both buffers live until the prove below
                         // returns, before this scope drops, and only the
@@ -5723,7 +5880,8 @@ impl Blake3Setup {
                         // quads past the prefix unpublished exactly when it
                         // is handed a scratch pair, and the AB arm publishes
                         // the prefix before round two (the fused precompute
-                        // calls the producer once per unit).
+                        // calls the producer once per unit). Round two uses
+                        // `r2_ab_produce` (`skip_out = false`) for complete rows.
                         Some(unsafe {
                             flock_core::zerocheck::univariate_skip_optimized::round2_ab_rebuild_scope(
                                 a_packed_f128.as_ptr().cast::<u8>(),
@@ -5731,7 +5889,10 @@ impl Blake3Setup {
                                 ab_bytes,
                                 published,
                                 flock_core::zerocheck::univariate_skip_optimized::round2_ab_rebuild_cpu_from(published),
-                                *producer,
+                                flock_core::zerocheck::univariate_skip_optimized::Round1AbProducer {
+                                    unit_bytes: DeferredAb::UNIT_BYTES,
+                                    produce: &r2_ab_produce,
+                                },
                             )
                         })
                     }
@@ -7425,6 +7586,113 @@ mod tests {
         assert_eq!(checked, 24 * 2);
     }
 
+    /// `SKIP_OUT` (`build_quad_split_neon_mem_skip_out`) must match the full
+    /// primed scratch on EVERY live word (`sa[0..8]`, `sa[16..472]`,
+    /// `sa[482..512]`, and all of `sb[0..512]`), and neither root-stripe plan
+    /// nor fixed-input checks may ever read the skipped output words
+    /// (`sa[8..16]` = `u64` words `4..8`, `sa[472..482]` = `u64` words
+    /// `236..241`).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn skip_out_preserves_all_live_words_and_root_plans_ignore_out_words() {
+        for plan in [&*ROOT_PLAN, &*FIXED_INPUT_ROOT_PLAN] {
+            for &col in plan.cols.iter() {
+                let u32_word = col as usize / 32;
+                assert!(
+                    !(8..16).contains(&u32_word) && !(472..482).contains(&u32_word),
+                    "root plan reads skipped u32 word {u32_word} (col {col})"
+                );
+            }
+            for row in plan.rows.iter() {
+                let words = [
+                    row.lo_word,
+                    if row.hi_mask != 0 { row.lo_word + 1 } else { row.lo_word },
+                ];
+                for w64 in words {
+                    assert!(
+                        !(4..8).contains(&w64) && !(236..241).contains(&w64),
+                        "root row reads skipped u64 word {w64}"
+                    );
+                }
+            }
+        }
+        for &(w64, _, _) in FIXED_INPUT_CHECKS.iter() {
+            assert!(
+                !(4..8).contains(&w64) && !(236..241).contains(&w64),
+                "fixed-input check reads skipped u64 word {w64}"
+            );
+        }
+
+        use witgen_simd::QuadInput;
+        const BLK: usize = K / 32;
+        let mut rng = Rng::new(0x5eed_5419_0001);
+        let init: u64 = 0x9e37_79b9_7f4a_7c15;
+        for case in 0..8usize {
+            let blocks: [[Compression; 4]; 2] = std::array::from_fn(|phase| {
+                std::array::from_fn(|j| {
+                    let mut cv = [0u32; 8];
+                    let mut msg = [0u32; 16];
+                    for w in &mut cv {
+                        *w = rng.next_u32();
+                    }
+                    for w in &mut msg {
+                        *w = rng.next_u32();
+                    }
+                    (cv, msg, ((case * 8 + phase * 4 + j) as u64), 64, 11)
+                })
+            });
+            let seeded = [
+                crate::seed_pipe::gen_quad_soa(init, case * 8),
+                crate::seed_pipe::gen_quad_soa(init, case * 8 + 4),
+            ];
+            for seeded_path in [false, true] {
+                let input = |phase: usize| {
+                    if seeded_path {
+                        QuadInput::Seeded(&seeded[phase])
+                    } else {
+                        QuadInput::Blocks(std::array::from_fn(|j| &blocks[phase][j]))
+                    }
+                };
+                let (mut sa_full, mut sb_full) = (vec![0xdead_beefu32; 4 * BLK], vec![0xdead_beefu32; 4 * BLK]);
+                let (mut sa_skip, mut sb_skip) = (vec![0xdead_beefu32; 4 * BLK], vec![0xdead_beefu32; 4 * BLK]);
+                let none = core::ptr::null_mut();
+                unsafe {
+                    witgen_simd::build_quad_split_neon_mem::<false>(
+                        input(0), none, none, sa_full.as_mut_ptr(), sb_full.as_mut_ptr(),
+                    );
+                    witgen_simd::build_quad_split_neon_mem::<false>(
+                        input(0), none, none, sa_skip.as_mut_ptr(), sb_skip.as_mut_ptr(),
+                    );
+                    witgen_simd::build_quad_split_neon_mem_primed_stores::<true>(
+                        input(1), none, none, sa_full.as_mut_ptr(), sb_full.as_mut_ptr(),
+                    );
+                    witgen_simd::build_quad_split_neon_mem_skip_out(
+                        input(1), sa_skip.as_mut_ptr(), sb_skip.as_mut_ptr(),
+                    );
+                }
+                assert_eq!(sb_skip, sb_full, "sb mismatch case={case} seeded={seeded_path}");
+                for blk in 0..4 {
+                    let base = blk * BLK;
+                    assert_eq!(
+                        &sa_skip[base..base + 8],
+                        &sa_full[base..base + 8],
+                        "cv mismatch blk={blk}"
+                    );
+                    assert_eq!(
+                        &sa_skip[base + 16..base + 472],
+                        &sa_full[base + 16..base + 472],
+                        "live body mismatch blk={blk}"
+                    );
+                    assert_eq!(
+                        &sa_skip[base + 482..base + BLK],
+                        &sa_full[base + 482..base + BLK],
+                        "tail zeros mismatch blk={blk}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The immediate-offset copy-out writes exactly the words the per-chunk
     /// addressed loop wrote, for the a and b ranges of the copy drain and
     /// edge ranges, and nothing else; zero, one and all-ones words included.
@@ -8804,6 +9072,172 @@ mod chain_e2e_tests {
             setup
                 .verify_chain(&comm, &proof, &cv0, &cv_last, &mut chv)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn blake3_build_matrices_and_statement_digest_reference() {
+        // Reference Vec+xor_dedup implementation matching the original algorithm.
+        #[derive(Clone)]
+        struct RefWord {
+            bits: [Vec<usize>; WORD_BITS],
+        }
+        impl RefWord {
+            fn zero() -> Self {
+                Self { bits: std::array::from_fn(|_| Vec::new()) }
+            }
+            fn from_slot_base(base: usize) -> Self {
+                Self { bits: std::array::from_fn(|i| vec![base + i]) }
+            }
+            fn from_const(val: u32) -> Self {
+                Self {
+                    bits: std::array::from_fn(|i| {
+                        if (val >> i) & 1 == 1 { vec![Z_CONST_POS] } else { Vec::new() }
+                    }),
+                }
+            }
+            fn xor(&self, other: &RefWord) -> RefWord {
+                let mut out = self.clone();
+                for i in 0..WORD_BITS {
+                    out.bits[i].extend(&other.bits[i]);
+                }
+                out
+            }
+            fn rotr(&self, n: usize) -> RefWord {
+                RefWord { bits: std::array::from_fn(|i| self.bits[(i + n) % WORD_BITS].clone()) }
+            }
+            fn dedup(mut self) -> RefWord {
+                for i in 0..WORD_BITS {
+                    self.bits[i] = xor_dedup(std::mem::take(&mut self.bits[i]));
+                }
+                self
+            }
+            fn add_sum(x: &RefWord, y: &RefWord, carry_base: usize) -> RefWord {
+                let mut out = RefWord::zero();
+                for i in 0..WORD_BITS {
+                    let mut v = x.bits[i].clone();
+                    v.extend(&y.bits[i]);
+                    for j in 0..i {
+                        v.push(carry_base + j);
+                    }
+                    out.bits[i] = v;
+                }
+                out.dedup()
+            }
+        }
+        fn ref_add(
+            a_rows: &mut [Vec<usize>],
+            b_rows: &mut [Vec<usize>],
+            x: &RefWord,
+            y: &RefWord,
+            carry_base: usize,
+        ) -> RefWord {
+            for i in 0..CARRY_BITS_PER_ADD {
+                let mut a = x.bits[i].clone();
+                for j in 0..i { a.push(carry_base + j); }
+                let mut b = y.bits[i].clone();
+                for j in 0..i { b.push(carry_base + j); }
+                a_rows[carry_base + i] = xor_dedup(a);
+                b_rows[carry_base + i] = xor_dedup(b);
+            }
+            RefWord::add_sum(x, y, carry_base)
+        }
+        let mut ref_a = vec![Vec::new(); K];
+        let mut ref_b = vec![Vec::new(); K];
+        ref_a[Z_CONST_POS] = vec![Z_CONST_POS];
+        ref_b[Z_CONST_POS] = vec![Z_CONST_POS];
+        for (base, len) in [
+            (CV_BASE, 8 * WORD_BITS),
+            (M_BASE, 16 * WORD_BITS),
+            (T_LO_BASE, WORD_BITS),
+            (T_HI_BASE, WORD_BITS),
+            (BLEN_BASE, WORD_BITS),
+            (FLAGS_BASE, WORD_BITS),
+        ] {
+            for j in 0..len {
+                let s = base + j;
+                ref_a[s] = vec![s];
+                ref_b[s] = vec![Z_CONST_POS];
+            }
+        }
+        let mut state: [RefWord; 16] = std::array::from_fn(|_| RefWord::zero());
+        for w in 0..8 { state[w] = RefWord::from_slot_base(cv_bit(w, 0)); }
+        for i in 0..4 { state[8 + i] = RefWord::from_const(BLAKE3_IV[i]); }
+        state[12] = RefWord::from_slot_base(T_LO_BASE);
+        state[13] = RefWord::from_slot_base(T_HI_BASE);
+        state[14] = RefWord::from_slot_base(BLEN_BASE);
+        state[15] = RefWord::from_slot_base(FLAGS_BASE);
+        for r in 0..N_ROUNDS {
+            for g_in_round in 0..N_G_PER_ROUND {
+                let g = r * N_G_PER_ROUND + g_in_round;
+                let [la, lb, lc, ld] = G_LANES[g_in_round];
+                let [mx_idx, my_idx] = PER_ROUND_MSG_IDX[r][g_in_round];
+                let a = state[la].clone();
+                let b = state[lb].clone();
+                let c = state[lc].clone();
+                let d = state[ld].clone();
+                let mx = RefWord::from_slot_base(m_bit(mx_idx, 0));
+                let my = RefWord::from_slot_base(m_bit(my_idx, 0));
+                let tmp_0 = ref_add(&mut ref_a, &mut ref_b, &a, &b, g_add_carry_bit(g, ADD_TMP0, 0));
+                let a_1 = ref_add(&mut ref_a, &mut ref_b, &tmp_0, &mx, g_add_carry_bit(g, ADD_A1, 0));
+                let d_1 = d.xor(&a_1).dedup().rotr(16);
+                let c_1 = ref_add(&mut ref_a, &mut ref_b, &c, &d_1, g_add_carry_bit(g, ADD_C1, 0));
+                let b_1 = b.xor(&c_1).dedup().rotr(12);
+                let tmp_1 = ref_add(&mut ref_a, &mut ref_b, &a_1, &b_1, g_add_carry_bit(g, ADD_TMP1, 0));
+                let a_2 = ref_add(&mut ref_a, &mut ref_b, &tmp_1, &my, g_add_carry_bit(g, ADD_A2, 0));
+                let d_2 = d_1.xor(&a_2).dedup().rotr(8);
+                let c_2 = ref_add(&mut ref_a, &mut ref_b, &c_1, &d_2, g_add_carry_bit(g, ADD_C2, 0));
+                let b_new = b_1.xor(&c_2).dedup().rotr(7);
+                for i in 0..WORD_BITS {
+                    let s = g_lin_bit(g, LIN_B_NEW, i);
+                    ref_a[s] = b_new.bits[i].clone();
+                    ref_b[s] = vec![Z_CONST_POS];
+                }
+                for i in 0..WORD_BITS {
+                    let s = g_lin_bit(g, LIN_D_NEW, i);
+                    ref_a[s] = d_2.bits[i].clone();
+                    ref_b[s] = vec![Z_CONST_POS];
+                }
+                state[la] = a_2;
+                state[lb] = RefWord::from_slot_base(g_lin_bit(g, LIN_B_NEW, 0));
+                state[lc] = c_2;
+                state[ld] = RefWord::from_slot_base(g_lin_bit(g, LIN_D_NEW, 0));
+            }
+        }
+        for w in 0..8 {
+            let lo = state[w].xor(&state[w + 8]).dedup();
+            for i in 0..WORD_BITS {
+                let s = out_lo_bit(w, i);
+                ref_a[s] = lo.bits[i].clone();
+                ref_b[s] = vec![Z_CONST_POS];
+            }
+            let cv_w = RefWord::from_slot_base(cv_bit(w, 0));
+            let hi = state[w + 8].xor(&cv_w).dedup();
+            for i in 0..WORD_BITS {
+                let s = out_hi_bit(w, i);
+                ref_a[s] = hi.bits[i].clone();
+                ref_b[s] = vec![Z_CONST_POS];
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        let r1cs = build_block_r1cs(18);
+        let t_build = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let digest = r1cs.statement_digest();
+        let t_digest = t1.elapsed();
+        assert_eq!(r1cs.a_0.rows, ref_a, "bitset build_matrices A_0 differs from reference");
+        assert_eq!(r1cs.b_0.rows, ref_b, "bitset build_matrices B_0 differs from reference");
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "5011976dc4f3f65b5769f7dbe88e0369d612876986d5f652ea061070a0919481",
+            "statement_digest(1<<18) must remain bit-identical to pre-Wave7 reference"
+        );
+        eprintln!(
+            "OPT build_block_r1cs(18)={:.2}ms statement_digest={:.2}ms digest={hex}",
+            t_build.as_secs_f64() * 1e3,
+            t_digest.as_secs_f64() * 1e3,
         );
     }
 }

@@ -765,6 +765,7 @@ mod streamed_first_pass_tests {
 
 /// Sort `v` and remove pairs of duplicates (GF(2) cancellation). Keeps R1CS
 /// rows in canonical (sorted, square-free) form.
+#[cfg(test)]
 pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
     v.sort();
     let mut out = Vec::with_capacity(v.len());

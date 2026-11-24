@@ -81,29 +81,24 @@ static inline uint4 clmul64_u16(uint2 a, uint2 b) {
     return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
 }
 
-struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+struct U256u { uint4 lo; uint4 hi; };
 
-static inline U256k clmul128(uint4 a, uint4 b) {
+static inline U256u clmul128(uint4 a, uint4 b) {
     uint4 p0 = clmul64_u16(a.xy, b.xy);
     uint4 p2 = clmul64_u16(a.zw, b.zw);
     uint4 pm = clmul64_u16(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
-    U256k r;
-    r.r0 = (ulong(p0.y) << 32) | p0.x;
-    r.r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
-    r.r2 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
-    r.r3 = (ulong(p2.w) << 32) | p2.z;
-    return r;
+    return { uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y),
+             uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w) };
 }
 
-static inline uint4 gf_reduce(U256k p) {
-    ulong h0 = p.r2, h1 = p.r3;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+static inline uint4 gf_reduce(U256u p) {
+    const uint4 h = p.hi;
+    uint4 t = h ^ (h << 1) ^ (h << 2) ^ (h << 7);
+    const uint4 c = uint4(0u, h.x, h.y, h.z);
+    t ^= (c >> 31) ^ (c >> 30) ^ (c >> 25);
+    const uint ov = (h.w >> 31) ^ (h.w >> 30) ^ (h.w >> 25);
+    t.x ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    return p.lo ^ t;
 }
 
 static inline uint4 gf_shl16(uint4 a) {
@@ -124,42 +119,44 @@ static inline uint4 gf_shl32(uint4 a) {
 }
 
 static inline uint4 mul_b16(uint4 v, threadgroup const uint4* tab) {
-    uint4 a = tab[extract_bits(v.w, 16u, 8u)] ^ tab[256u + extract_bits(v.w, 24u, 8u)];
-    a = gf_shl16(a) ^ tab[extract_bits(v.w, 0u, 8u)]  ^ tab[256u + extract_bits(v.w, 8u, 8u)];
-    a = gf_shl16(a) ^ tab[extract_bits(v.z, 16u, 8u)] ^ tab[256u + extract_bits(v.z, 24u, 8u)];
-    a = gf_shl16(a) ^ tab[extract_bits(v.z, 0u, 8u)]  ^ tab[256u + extract_bits(v.z, 8u, 8u)];
-    a = gf_shl16(a) ^ tab[extract_bits(v.y, 16u, 8u)] ^ tab[256u + extract_bits(v.y, 24u, 8u)];
-    a = gf_shl16(a) ^ tab[extract_bits(v.y, 0u, 8u)]  ^ tab[256u + extract_bits(v.y, 8u, 8u)];
-    a = gf_shl16(a) ^ tab[extract_bits(v.x, 16u, 8u)] ^ tab[256u + extract_bits(v.x, 24u, 8u)];
-    a = gf_shl16(a) ^ tab[extract_bits(v.x, 0u, 8u)]  ^ tab[256u + extract_bits(v.x, 8u, 8u)];
+    const uchar4 b3 = as_type<uchar4>(v.w);
+    uint4 a = tab[b3.z] ^ tab[256u + b3.w];
+    a = gf_shl16(a) ^ tab[b3.x] ^ tab[256u + b3.y];
+    const uchar4 b2 = as_type<uchar4>(v.z);
+    a = gf_shl16(a) ^ tab[b2.z] ^ tab[256u + b2.w];
+    a = gf_shl16(a) ^ tab[b2.x] ^ tab[256u + b2.y];
+    const uchar4 b1 = as_type<uchar4>(v.y);
+    a = gf_shl16(a) ^ tab[b1.z] ^ tab[256u + b1.w];
+    a = gf_shl16(a) ^ tab[b1.x] ^ tab[256u + b1.y];
+    const uchar4 b0 = as_type<uchar4>(v.x);
+    a = gf_shl16(a) ^ tab[b0.z] ^ tab[256u + b0.w];
+    a = gf_shl16(a) ^ tab[b0.x] ^ tab[256u + b0.y];
     return a;
 }
 
 static inline uint4 mul_w32(uint4 v, threadgroup const uint4* tab) {
-    uint w = v.w;
-    uint4 a = tab[w & 255u] ^ tab[256u + extract_bits(w, 8u, 8u)] ^ tab[512u + extract_bits(w, 16u, 8u)] ^ tab[768u + (w >> 24u)];
-    w = v.z; a = gf_shl32(a) ^ tab[w & 255u] ^ tab[256u + extract_bits(w, 8u, 8u)] ^ tab[512u + extract_bits(w, 16u, 8u)] ^ tab[768u + (w >> 24u)];
-    w = v.y; a = gf_shl32(a) ^ tab[w & 255u] ^ tab[256u + extract_bits(w, 8u, 8u)] ^ tab[512u + extract_bits(w, 16u, 8u)] ^ tab[768u + (w >> 24u)];
-    w = v.x; a = gf_shl32(a) ^ tab[w & 255u] ^ tab[256u + extract_bits(w, 8u, 8u)] ^ tab[512u + extract_bits(w, 16u, 8u)] ^ tab[768u + (w >> 24u)];
+    const uchar4 b3 = as_type<uchar4>(v.w);
+    uint4 a = tab[b3.x] ^ tab[256u + b3.y] ^ tab[512u + b3.z] ^ tab[768u + b3.w];
+    const uchar4 b2 = as_type<uchar4>(v.z);
+    a = gf_shl32(a) ^ tab[b2.x] ^ tab[256u + b2.y] ^ tab[512u + b2.z] ^ tab[768u + b2.w];
+    const uchar4 b1 = as_type<uchar4>(v.y);
+    a = gf_shl32(a) ^ tab[b1.x] ^ tab[256u + b1.y] ^ tab[512u + b1.z] ^ tab[768u + b1.w];
+    const uchar4 b0 = as_type<uchar4>(v.x);
+    a = gf_shl32(a) ^ tab[b0.x] ^ tab[256u + b0.y] ^ tab[512u + b0.z] ^ tab[768u + b0.w];
     return a;
 }
 
-static inline ulong4 acc_mul(ulong4 acc, uint4 x, uint4 y) {
-    U256k p = clmul128(x, y);
-    return acc ^ ulong4(p.r0, p.r1, p.r2, p.r3);
+static inline U256u acc_mul(U256u acc, uint4 x, uint4 y) {
+    U256u p = clmul128(x, y);
+    return { acc.lo ^ p.lo, acc.hi ^ p.hi };
 }
 
 static inline uint4 xor_lanes(uint4 v, ushort m) {
     return v ^ simd_shuffle_xor(v, m);
 }
 
-static inline ulong4 xor_lanes4(ulong4 v, ushort m) {
-    uint4 lo = uint4(uint(v.x), uint(v.y), uint(v.z), uint(v.w));
-    uint4 hi = uint4(uint(v.x >> 32), uint(v.y >> 32), uint(v.z >> 32), uint(v.w >> 32));
-    lo = simd_shuffle_xor(lo, m);
-    hi = simd_shuffle_xor(hi, m);
-    return v ^ ulong4(ulong(lo.x) | (ulong(hi.x) << 32), ulong(lo.y) | (ulong(hi.y) << 32),
-                      ulong(lo.z) | (ulong(hi.z) << 32), ulong(lo.w) | (ulong(hi.w) << 32));
+static inline U256u xor_lanes4(U256u v, ushort m) {
+    return { v.lo ^ simd_shuffle_xor(v.lo, m), v.hi ^ simd_shuffle_xor(v.hi, m) };
 }
 
 // Three-level fold of eight consecutive inputs: word32 (4x256) for rho0,
@@ -191,14 +188,13 @@ kernel void zc_t0_fold(
     uint lid [[thread_index_in_threadgroup]])
 {
     threadgroup uint4 nib[2048];
-    threadgroup ulong4* red = reinterpret_cast<threadgroup ulong4*>(nib);
     const uint chunk = tg_base + tg_rel;
     if (lid == 0u) {
         const uint lim = min(ctl[0], ctl[1]);
-        red[0] = ulong4(chunk >= lim ? 1ul : 0ul, 0ul, 0ul, 0ul);
+        nib[0].x = chunk >= lim ? 1u : 0u;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const bool skip = red[0].x != 0ul;
+    const bool skip = nib[0].x != 0u;
     if (skip) { return; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
@@ -220,7 +216,8 @@ kernel void zc_t0_fold(
     device uint4* ao = a_out + ulong(chunk) * T0_OUT;
     device uint4* bo = b_out + ulong(chunk) * T0_OUT;
     device const uint4* eq_odd = consts + 1536u;
-    ulong4 acc_a = ulong4(0ul), acc_b = ulong4(0ul), acc_c = ulong4(0ul), acc_d = ulong4(0ul);
+    U256u acc_a = { uint4(0u), uint4(0u) }, acc_b = { uint4(0u), uint4(0u) };
+    U256u acc_c = { uint4(0u), uint4(0u) }, acc_d = { uint4(0u), uint4(0u) };
     uint4 qa = uint4(0u), qb = uint4(0u);
     for (uint j = 0u; j < 4u; j++) {
         const uint o = (j << 8) + lid;
@@ -254,18 +251,26 @@ kernel void zc_t0_fold(
     acc_c = xor_lanes4(acc_c, ushort(16));
     acc_d = xor_lanes4(acc_d, ushort(16));
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup uint4* red = nib;
     if ((lid & 31u) < 8u) {
-        const uint base = (lid >> 5) * 32u + l;
-        red[base] = acc_a;
-        red[base + 8u] = acc_b;
-        red[base + 16u] = acc_c;
-        red[base + 24u] = acc_d;
+        const uint base = ((lid >> 5) * 32u + l) * 2u;
+        red[base + 0u]  = acc_a.lo; red[base + 1u]  = acc_a.hi;
+        red[base + 16u] = acc_b.lo; red[base + 17u] = acc_b.hi;
+        red[base + 32u] = acc_c.lo; red[base + 33u] = acc_c.hi;
+        red[base + 48u] = acc_d.lo; red[base + 49u] = acc_d.hi;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid < 32u) {
-        ulong4 s = red[lid];
-        for (uint k = 1u; k < 8u; k++) { s ^= red[(k << 5) + lid]; }
-        banks[(ulong(chunk) << 5) + lid] = s;
+        uint4 slo = red[lid * 2u], shi = red[lid * 2u + 1u];
+        for (uint k = 1u; k < 8u; k++) {
+            const uint idx = ((k << 5) + lid) * 2u;
+            slo ^= red[idx];
+            shi ^= red[idx + 1u];
+        }
+        device uint4* banks4 = reinterpret_cast<device uint4*>(banks);
+        const ulong dst = ((ulong(chunk) << 5) + lid) * 2u;
+        banks4[dst] = slo;
+        banks4[dst + 1u] = shi;
     }
 }
 "#;
@@ -790,6 +795,155 @@ fn nib_into(out: &mut [F128], rho: F128) {
                 out[i] = v;
                 i += 1;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zc_t0_fold_matches_cpu_and_keeps_tg_sram_at_32kib() {
+        let gpu = match gpu() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let chunks = 2usize;
+        let mut s = 0x70C0_FFEE_1234_5678u64;
+        let mut next = || -> F128 {
+            let mut step = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            F128::new(step(), step())
+        };
+        let a_in: Vec<F128> = (0..chunks * T0_IN).map(|_| next()).collect();
+        let b_in: Vec<F128> = (0..chunks * T0_IN).map(|_| next()).collect();
+        let rhos = [next(), next(), next()];
+        let eq_lo: Vec<F128> = (0..4 * T0_GROUPS).map(|_| next()).collect();
+
+        let fold8_cpu = |v: &[F128]| -> F128 {
+            let c0 = v[0] + rhos[0] * (v[0] + v[1]);
+            let c1 = v[2] + rhos[0] * (v[2] + v[3]);
+            let c2 = v[4] + rhos[0] * (v[4] + v[5]);
+            let c3 = v[6] + rhos[0] * (v[6] + v[7]);
+            let d0 = c0 + rhos[1] * (c0 + c1);
+            let d1 = c2 + rhos[1] * (c2 + c3);
+            d0 + rhos[2] * (d0 + d1)
+        };
+
+        unsafe {
+            let pso = zc_t0_build_pso(gpu).expect("zc_t0_fold pipeline compile failed");
+            let (tg_bytes, simd_w, max_t) = gpu.pipeline_resources(pso);
+            assert_eq!(tg_bytes, 32_768, "zc_t0_fold TG SRAM must remain 32768 B (got {tg_bytes})");
+            assert_eq!(simd_w, 32);
+            assert!(max_t >= 256);
+
+            let pool = gpu.pool_push();
+            let in_a_buf = gpu.new_buffer(chunks * T0_IN * 16).unwrap();
+            let in_b_buf = gpu.new_buffer(chunks * T0_IN * 16).unwrap();
+            let out_a_buf = gpu.new_buffer(chunks * T0_OUT * 16).unwrap();
+            let out_b_buf = gpu.new_buffer(chunks * T0_OUT * 16).unwrap();
+            let consts_buf = gpu.new_buffer(T0_CONSTS * 16).unwrap();
+            let banks_buf = gpu.new_buffer(chunks * T0_BANKS * 32).unwrap();
+            let ctl_buf = gpu.new_buffer(16).unwrap();
+
+            std::ptr::copy_nonoverlapping(a_in.as_ptr().cast::<u8>(), gpu.buffer_contents(in_a_buf), chunks * T0_IN * 16);
+            std::ptr::copy_nonoverlapping(b_in.as_ptr().cast::<u8>(), gpu.buffer_contents(in_b_buf), chunks * T0_IN * 16);
+            let consts = std::slice::from_raw_parts_mut(gpu.buffer_contents(consts_buf).cast::<F128>(), T0_CONSTS);
+            for (k, rho) in rhos.into_iter().enumerate() {
+                nib_into(&mut consts[512 * k..512 * (k + 1)], rho);
+            }
+            for y in 0..T0_GROUPS {
+                consts[1536 + y] = eq_lo[4 * y + 3];
+            }
+            let ctl = gpu.buffer_contents(ctl_buf).cast::<u32>();
+            ctl.write(chunks as u32);
+            ctl.add(1).write(chunks as u32);
+
+            let cb = gpu.command_buffer().unwrap();
+            let enc = gpu.compute_encoder(cb).unwrap();
+            gpu.set_pipeline(enc, pso);
+            gpu.set_buffer(enc, in_a_buf, 0, 0);
+            gpu.set_buffer(enc, in_b_buf, 0, 1);
+            gpu.set_buffer(enc, out_a_buf, 0, 2);
+            gpu.set_buffer(enc, out_b_buf, 0, 3);
+            gpu.set_buffer(enc, consts_buf, 0, 4);
+            gpu.set_buffer(enc, banks_buf, 0, 5);
+            gpu.set_buffer(enc, ctl_buf, 0, 6);
+            let base = 0u32;
+            gpu.set_bytes(enc, std::slice::from_raw_parts((&raw const base).cast::<u8>(), 4), 7);
+            gpu.dispatch(enc, chunks as u64, 256);
+            gpu.end_encoding(enc);
+            gpu.commit_and_wait(cb).unwrap();
+
+            let gpu_a = std::slice::from_raw_parts(gpu.buffer_contents(out_a_buf).cast::<F128>(), chunks * T0_OUT);
+            let gpu_b = std::slice::from_raw_parts(gpu.buffer_contents(out_b_buf).cast::<F128>(), chunks * T0_OUT);
+            let gpu_banks = std::slice::from_raw_parts(gpu.buffer_contents(banks_buf).cast::<[u64; 4]>(), chunks * T0_BANKS);
+
+            for c in 0..chunks {
+                let mut ref_a = vec![F128::ZERO; T0_OUT];
+                let mut ref_b = vec![F128::ZERO; T0_OUT];
+                for o in 0..T0_OUT {
+                    let idx = c * T0_IN + 8 * o;
+                    ref_a[o] = fold8_cpu(&a_in[idx..idx + 8]);
+                    ref_b[o] = fold8_cpu(&b_in[idx..idx + 8]);
+                }
+                assert_eq!(&gpu_a[c * T0_OUT..(c + 1) * T0_OUT], ref_a.as_slice(), "a_out mismatch chunk {c}");
+                assert_eq!(&gpu_b[c * T0_OUT..(c + 1) * T0_OUT], ref_b.as_slice(), "b_out mismatch chunk {c}");
+
+                let mut ref_slots = [F128::ZERO; 26];
+                for y in 0..T0_GROUPS {
+                    let eq = eq_lo[4 * y + 3];
+                    let mut wa = [F128::ZERO; 8];
+                    let mut fb = [F128::ZERO; 8];
+                    for l in 0..8 {
+                        wa[l] = eq * ref_a[8 * y + l];
+                        fb[l] = ref_b[8 * y + l];
+                    }
+                    let mut acc = [F128::ZERO; 32];
+                    for l in 0..8 {
+                        let pa = wa[l] + wa[l ^ 1];
+                        let pb = fb[l] + fb[l ^ 1];
+                        let ea = wa[l] + wa[l ^ 2];
+                        let eb = fb[l] + fb[l ^ 2];
+                        let qsa = ea + (wa[l ^ 1] + wa[l ^ 3]);
+                        let qsb = eb + (fb[l ^ 1] + fb[l ^ 3]);
+                        let ha = wa[l] + wa[l ^ 4];
+                        let hb = fb[l] + fb[l ^ 4];
+                        let h1a = ha + (wa[l ^ 1] + wa[l ^ 5]);
+                        let h1b = hb + (fb[l ^ 1] + fb[l ^ 5]);
+                        let h2a = ha + (wa[l ^ 2] + wa[l ^ 6]);
+                        let h2b = hb + (fb[l ^ 2] + fb[l ^ 6]);
+                        let hha = h1a + (wa[l ^ 2] + wa[l ^ 6] + wa[l ^ 3] + wa[l ^ 7]);
+                        let hhb = h1b + (fb[l ^ 2] + fb[l ^ 6] + fb[l ^ 3] + fb[l ^ 7]);
+                        let sel_b = ((l ^ (l >> 1)) & 1) != 0;
+                        acc[l] += if l == 0 { hha * hhb } else { wa[l] * fb[l] };
+                        acc[8 + l] += if sel_b { pa * pb } else { ea * eb };
+                        acc[16 + l] += if l < 4 { ha * hb } else if sel_b { h1a * h1b } else { h2a * h2b };
+                        if (l & 3) == (y & 3) {
+                            acc[24 + l] += qsa * qsb;
+                        }
+                    }
+                    for e in 0..32 {
+                        ref_slots[SLOT[e] as usize] += acc[e];
+                    }
+                }
+                let mut got_acc = [F256Unreduced::ZERO; 26];
+                for (e, w) in gpu_banks[c * T0_BANKS..(c + 1) * T0_BANKS].iter().enumerate() {
+                    got_acc[SLOT[e & 31] as usize] ^= F256Unreduced { r0: w[0], r1: w[1], r2: w[2], r3: w[3] };
+                }
+                let got_slots = got_acc.map(F256Unreduced::reduce);
+                assert_eq!(got_slots, ref_slots, "slots mismatch chunk {c}");
+            }
+
+            for b in [in_a_buf, in_b_buf, out_a_buf, out_b_buf, consts_buf, banks_buf, ctl_buf, pso] {
+                gpu.release(b);
+            }
+            gpu.pool_pop(pool);
         }
     }
 }

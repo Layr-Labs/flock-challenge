@@ -1484,6 +1484,22 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
     )
 }
 
+/// Whether round-one AB precompute omits the six mixed-one words
+/// (`ROUND1_MIXED_ONE_ROWS`: u64 words 16, 17, 236..=239) and recovers them
+/// from C instead. Used both by `precompute_round1_ab_inner_packed_padded_body`
+/// and by the deferred BLAKE3 producer's `SKIP_OUT` gate so they never disagree.
+pub fn round1_ab_mixed_ones_omission_enabled() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        kernels::aarch64::ab_mixed_row_residual_enabled()
+            && std::env::var_os("FLOCK_NO_ZC_AB_C_MIXED_RECOVERY").is_none()
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn precompute_round1_ab_inner_packed_padded_body(
     a_packed: &[u8],
@@ -1518,11 +1534,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         assert!(m >= padding.k_log, "C1 requires complete blocks");
         assert_eq!(padding.k_log, 14, "C1 requires 16,384-bit blocks");
         assert_eq!(padding.useful_bits_per_block, 15_409);
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let mixed_residual_enabled = kernels::aarch64::ab_mixed_row_residual_enabled()
-            && std::env::var_os("FLOCK_NO_ZC_AB_C_MIXED_RECOVERY").is_none();
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let mixed_residual_enabled = false;
+        let mixed_residual_enabled = round1_ab_mixed_ones_omission_enabled();
         if mixed_residual_enabled
             && (m == 32 || cfg!(test))
             && statement.includes_output_window()
@@ -1580,7 +1592,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         // `total_bytes`; zero is a valid object representation for F128.
         unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
     }
-    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+    if use_provenance && crate::zc_timing_env_on() {
         let (hits, misses) = ab_compact_backing_token_counts();
         eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
     }
@@ -4741,7 +4753,7 @@ pub(crate) fn round1_c_prelude(
             if let Some((eq_outer, job, submitted)) =
                 crate::gpu_commit::adopt_staged_zc_fold(c_lincheck, r)
             {
-                if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                if crate::zc_timing_env_on() {
                     eprintln!("[commit-tail-fill] staged C prelude adopted");
                 }
                 return Round1CPrelude {
@@ -4994,15 +5006,17 @@ pub(crate) fn round1_c_fold4_from_lincheck_stripe(
 ///
 /// At the ranked shape, round two's groups 0..4 (rows 0..16 of every 256-row
 /// block, the identity prefix) and group 59 (rows 236..240, output words)
-/// have b rows that are all ones and a rows equal to the C rows (C = A AND B).
-/// Their round-two products are then the scaled a rows alone, and summed over
-/// the blocks with the instance weights they are the same linear forms of
-/// round one's completed C inner fold (`c_inner`, whose instance weights are
-/// the same challenges). With this on, round one keeps those fifteen rows of
-/// `c_inner` (odd and even rows 1..16 except rows 0, 4, 8, 12, and rows
-/// 237..240), and round two folds only the even rows of these groups (their
-/// anchors; the deltas are raw bytes), adds none of their products, and adds
-/// their exact contributions to `G(1)`, `W0` and `W1` once from the kept rows.
+/// have b rows that are all ones and a rows equal to the C rows (C = A AND B),
+/// and group 60 (pair 120 = rows 240..242, pair 121 padded) has constant
+/// `b_240 = 0x0001_ffff_ffff_ffff`, `a_240 = c_240` (top 15 bits zero), and
+/// `a_241 = b_241 = 0`. Their round-two products are linear in the `a` rows
+/// alone, so summed over the blocks with the instance weights they are exact
+/// linear forms of round one's completed C inner fold (`c_inner`, whose
+/// instance weights are the same challenges). With this on, round one keeps
+/// those sixteen rows of `c_inner` (rows 1..16 except 0, 4, 8, 12; rows
+/// 237..240; and row 240), and round two folds only the anchor rows of these
+/// groups, adds none of their products, and adds their exact contributions to
+/// `G(1)`, `G(inf)`, `W0`, `W1`, `W3`, and `W5` once from the kept rows.
 /// Same field values, same transcript.
 pub const ENV_NO_R2_C_CAPTURE: &str = "FLOCK_NO_R2_C_CAPTURE";
 
@@ -5013,7 +5027,8 @@ pub(crate) fn r2_c_capture_enabled() -> bool {
 }
 
 /// The `c_inner` rows round two takes (see [`ENV_NO_R2_C_CAPTURE`]), in order.
-pub(crate) const R2_C_CAPTURE_ROWS: [usize; 15] = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 237, 238, 239];
+pub(crate) const R2_C_CAPTURE_ROWS: [usize; 16] =
+    [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 237, 238, 239, 240];
 
 /// This prove's kept rows (`R2_C_CAPTURE_ROWS.len() * 64` lanes), set by
 /// round one's C fold and taken by round two of the same prove; cleared at
@@ -5029,7 +5044,7 @@ pub(crate) fn r2_c_capture_take() -> Option<Vec<F128>> {
 }
 
 fn r2_c_capture_store(c_inner: &[F128]) {
-    if c_inner.len() < 240 * ELL {
+    if c_inner.len() < 241 * ELL {
         return;
     }
     let mut rows = Vec::with_capacity(R2_C_CAPTURE_ROWS.len() * ELL);

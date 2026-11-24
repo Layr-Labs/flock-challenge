@@ -2018,17 +2018,28 @@ fn r2_ab_quad_enabled() -> bool {
 }
 
 /// R2 C capture (`univariate_skip_optimized::ENV_NO_R2_C_CAPTURE`): the
-/// round-two terms of the groups the walks left out, `(ΔG(1), ΔW0, ΔW1)`.
+/// round-two terms of the groups the walks left out,
+/// `(ΔG(1), ΔG(inf), ΔW0, ΔW1, ΔP60)`.
 ///
 /// `rows` holds round one's C inner fold rows `R2_C_CAPTURE_ROWS` (64 lanes
 /// each, instance weights `eq(r[14..32], ·)` = round two's instance weights).
-/// In those groups (0..4 and 59 of every 256-row block) b folds to ONE and
-/// a = C, so a row's folded a summed over the instances is
-/// `a(t) = Σ_s fold(e_s)·c(t, s)`, and with `h_g = eq(ρ[2..8], g)`, `d = ρ[1]`:
-/// `ΔG(1) = Σ_g h_g·((1+d)·a(4g+1) + d·a(4g+3))`, `ΔW0 = Σ_g h_g·a(4g+2)`,
-/// `ΔW1 = Σ_g h_g·a(4g+3)`; every other round-two and round-three term of
-/// these groups is zero (b is constant across them).
-fn r2_c_capture_terms(table: &UniSkipFoldTable, rows: &[F128], mlv_challenges: &[F128]) -> (F128, F128, F128) {
+/// - In groups 0..4 and 59 of every 256-row block b folds to ONE and a = C,
+///   so a row's folded a summed over the instances is
+///   `a(t) = Σ_s fold(e_s)·c(t, s)`, and with `h_g = eq(ρ[2..8], g)`, `d = ρ[1]`:
+///   `ΔG(1) = Σ_g h_g·((1+d)·a(4g+1) + d·a(4g+3))`, `ΔW0 = Σ_g h_g·a(4g+2)`,
+///   `ΔW1 = Σ_g h_g·a(4g+3)`; every other round-two and round-three term of
+///   these groups is zero (b is constant across them).
+/// - In group 60 (pair 120 = rows 240, 241; pair 121 padded), row 240 has
+///   constant `b_240 = 0x0001_ffff_ffff_ffff` and `a_240 = c_240` (top 15
+///   bits zero), and row 241 is all zero. With `B_240 = fold(b_240)` and
+///   `ΔP60 = h_60·a(240)·B_240`: `ΔG(inf) = (1+d)·ΔP60`, `ΔW3 = ΔP60`,
+///   `ΔW5 = ΔP60`; every other round-two and round-three term of group 60 is
+///   zero.
+fn r2_c_capture_terms(
+    table: &UniSkipFoldTable,
+    rows: &[F128],
+    mlv_challenges: &[F128],
+) -> (F128, F128, F128, F128, F128) {
     use crate::zerocheck::univariate_skip_optimized::R2_C_CAPTURE_ROWS;
     const GROUPS: [usize; 5] = [0, 1, 2, 3, 59];
     assert_eq!(rows.len(), R2_C_CAPTURE_ROWS.len() * 64);
@@ -2052,7 +2063,18 @@ fn r2_c_capture_terms(table: &UniSkipFoldTable, rows: &[F128], mlv_challenges: &
         t0 += h * a[1];
         t1 += h * a[2];
     }
-    (g1, t0, t1)
+    let idx60 = 3 * GROUPS.len();
+    debug_assert_eq!(R2_C_CAPTURE_ROWS[idx60], 240);
+    let h60 = (0..6).fold(F128::ONE, |h, bit| {
+        let c = mlv_challenges[2 + bit];
+        h * if (60usize >> bit) & 1 == 1 { c } else { F128::ONE + c }
+    });
+    let row240 = &rows[64 * idx60..64 * (idx60 + 1)];
+    let a240 = lane_fold.iter().zip(row240).fold(F128::ZERO, |acc, (l, c)| acc + *l * *c);
+    let b240 = table.fold_one_row(&0x0001_ffff_ffff_ffffu64.to_le_bytes());
+    let p60 = h60 * a240 * b240;
+    let ginf = (F128::ONE + d) * p60;
+    (g1, ginf, t0, t1, p60)
 }
 
 /// Interleave rebuilt ranked A/B quads and the existing full round-two walk.
@@ -3333,7 +3355,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     unsafe { compact.deltas.mark_fully_initialized() };
 
     #[allow(unused_mut)]
-    let (mut sum1, sum_inf) = partials
+    let (mut sum1, mut sum_inf) = partials
         .iter()
         .fold((F128::ZERO, F128::ZERO), |(s1, sinf), &(c1, cinf)| {
             (s1 + c1, sinf + cinf)
@@ -3352,17 +3374,22 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let w2 = r1_inv * agg[1];
     #[allow(unused_mut)]
     let mut w0 = r1_inv * agg[2];
+    #[allow(unused_mut)]
+    let mut w3 = r1_inv * agg[3];
+    let w4 = r1_inv * agg[4];
+    #[allow(unused_mut)]
+    let mut w5 = r1_inv * agg[5];
     // R2 C capture: the left-out groups' exact terms, from round one's kept
     // C rows (`r2_c_capture_terms`).
     if capture_sums && let Some(rows) = r2_capture.as_deref() {
-        let (g1, t0, t1) = r2_c_capture_terms(table, rows, mlv_challenges);
+        let (g1, ginf, t0, t1, p60) = r2_c_capture_terms(table, rows, mlv_challenges);
         sum1 += g1;
+        sum_inf += ginf;
         w0 += t0;
         w1 += t1;
+        w3 += p60;
+        w5 += p60;
     }
-    let w3 = r1_inv * agg[3];
-    let w4 = r1_inv * agg[4];
-    let w5 = r1_inv * agg[5];
     let la = Round3Lookahead {
         c: [w0, w0 + w1 + w2, w2, w3, w3 + w4 + w5, w5],
     };

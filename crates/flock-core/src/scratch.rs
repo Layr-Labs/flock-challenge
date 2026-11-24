@@ -641,12 +641,15 @@ pub fn give_f128(v: Vec<F128>) {
 /// work: a race between fault cost and the hiding window flips sign across
 /// machines; eliminated work doesn't.)
 ///
-/// A traced ranked warm proof at m = 32 requests two 1 GiB F128 buffers, with
-/// a six-buffer high-water at 512 MiB, then two simultaneous 256 MiB
-/// zerocheck ping-pongs. Park those exact F128 classes so smallest-fit does
-/// not hand the ping-pongs 512 MiB/1 GiB allocations. One 512 MiB byte buffer
-/// covers the lincheck stripe; compact round two reuses its dead 512 MiB
-/// F128 AB transform through [`ScratchBytes`] instead of needing another byte
+/// A traced ranked warm proof at m = 32 requests two 1 GiB F128 buffers
+/// simultaneously (1 GiB CPU `codeword` held through warmup PCS-open plus
+/// 1 GiB round-two `anchors` handed over to the timed prove), with a
+/// six-buffer high-water at 512 MiB, then two simultaneous 256 MiB zerocheck
+/// ping-pongs. Park those exact F128 classes so smallest-fit does not hand
+/// the ping-pongs 512 MiB/1 GiB allocations and warmup `anchors` never faults
+/// lazily inside `zc_k_premap` or timed prove. One 512 MiB byte buffer covers
+/// the lincheck stripe; compact round two reuses its dead 512 MiB F128 AB
+/// transform through [`ScratchBytes`] instead of needing another byte
 /// allocation. Total ranked retention remains ~6 GiB, but with the requested
 /// size classes rather than oversized substitutes. Release with [`clear`].
 pub fn prewarm_prover(m: usize) {
