@@ -454,9 +454,38 @@ pub(crate) fn perf_core_count_cached() -> usize {
 /// parallelism()` counts SMT siblings, so derive physical cores from `/sys`
 /// topology and clamp that host-wide count to the process's affinity/cgroup
 /// availability. Elsewhere, falls back to `available_parallelism()`.
+/// A positive 32-bit integer sysctl read with the `sysctlbyname` syscall
+/// (no process spawn). `None` on any error or non-positive value.
+#[cfg(target_os = "macos")]
+fn macos_sysctl_usize(name: &core::ffi::CStr) -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const core::ffi::c_char,
+            oldp: *mut core::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *mut core::ffi::c_void,
+            newlen: usize,
+        ) -> core::ffi::c_int;
+    }
+    let mut n: i32 = 0;
+    let mut len = core::mem::size_of::<i32>();
+    let rc = unsafe {
+        sysctlbyname(name.as_ptr(), (&raw mut n).cast(), &raw mut len, core::ptr::null_mut(), 0)
+    };
+    (rc == 0 && len == core::mem::size_of::<i32>() && n > 0).then_some(n as usize)
+}
+
 fn perf_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
+        // Through the `sysctlbyname` syscall, never a spawned `sysctl`
+        // process: the ranked Seatbelt profile denies `process-fork`, so the
+        // spawn failed there and the pool silently fell back to
+        // `available_parallelism()` (P + E cores) instead of the P-core count
+        // this function documents (same reasoning as `epool::ecore_count`).
+        if let Some(n) = macos_sysctl_usize(c"hw.perflevel0.physicalcpu") {
+            return n;
+        }
         if let Ok(out) = std::process::Command::new("sysctl")
             .args(["-n", "hw.perflevel0.physicalcpu"])
             .output()
