@@ -168,6 +168,40 @@ pub(crate) fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Fold two slots whose banks from `SHARED_START` onward are equal.
+/// Accumulate the shared products once before adding either slot's head.
+#[inline]
+pub(crate) fn fold_banked_slots2_shared_tail<const BANKS: usize, const SHARED_START: usize>(
+    weight: &[F128; BANKS],
+    first: &[F128; BANKS],
+    second: &[F128; BANKS],
+) -> [F128; 2] {
+    debug_assert_eq!(first[SHARED_START..], second[SHARED_START..]);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL and the arrays hold BANKS elements.
+        unsafe {
+            aarch64::fold_banked_slot_pair::<BANKS, SHARED_START>(
+                weight, first.as_ptr(), second.as_ptr(),
+            )
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut shared = super::F256Unreduced::ZERO;
+        for bank in SHARED_START..BANKS {
+            shared ^= weight[bank].mul_unreduced(first[bank]);
+        }
+        let mut a = shared;
+        let mut b = shared;
+        for bank in 0..SHARED_START {
+            a ^= weight[bank].mul_unreduced(first[bank]);
+            b ^= weight[bank].mul_unreduced(second[bank]);
+        }
+        [a.reduce(), b.reduce()]
+    }
+}
+
 /// once. Each output remains an independent deferred-reduction sum, so the
 #[inline]
 pub(crate) fn fold_banked_slots4<const BANKS: usize>(
