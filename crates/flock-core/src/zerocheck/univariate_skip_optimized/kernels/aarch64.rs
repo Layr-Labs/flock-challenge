@@ -5500,7 +5500,7 @@ pub(crate) fn prepare_static_b_context(
     inv_table: &InvNttTableByteSingleGf8,
     blake3_static_layout: bool,
 ) -> Option<StaticBContext> {
-    if std::env::var_os("FLOCK_ZC_BSTATIC_CONTEXT_LEGACY").is_some() {
+    if crate::gate_env_once!(std::env::var_os("FLOCK_ZC_BSTATIC_CONTEXT_LEGACY").is_some()) {
         return blake3_static_layout.then_some(StaticBContext::LegacyPerCall);
     }
     prepare_static_b_context_with_policy(

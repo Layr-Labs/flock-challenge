@@ -375,7 +375,7 @@ fn use_ranked_low_twiddle_final_pair(log_d: usize, num_ntts: usize, n_top: usize
     )) && log_d == 20
         && num_ntts == 64
         && n_top == 10
-        && std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none()
+        && crate::gate_env_once!(std::env::var_os("FLOCK_NO_NTT_LOW_TWIDDLE_FINAL").is_none())
 }
 
 /// The ranked low-twiddle final pair runs each sub-transform's blocks in one
@@ -563,7 +563,7 @@ fn l1_tail_split_count(log_d: usize, start_layer: usize, num_subs: usize) -> usi
 /// (block, tile) job writes disjoint destination rows.
 #[inline]
 fn recursive_top_hetero_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none()
+    crate::gate_env_once!(std::env::var_os("FLOCK_NO_RECURSIVE_TOP_HETERO").is_none())
 }
 
 /// Kill switch for the two-pool claim queue on the ranked L0 CPU suffix

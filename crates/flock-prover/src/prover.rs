@@ -3325,7 +3325,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             let stripe_in_ab = root_rows.is_some()
                 && ab_producer.is_some()
                 && zerocheck::univariate_skip_optimized::zc_ab_producer_fused_active()
-                && std::env::var_os("FLOCK_NO_STRIPE_IN_AB").is_none();
+                && flock_core::gate_env_once!(std::env::var_os("FLOCK_NO_STRIPE_IN_AB").is_none());
             let pre = if stripe_in_ab {
                 let base = ab_producer.expect("checked above");
                 let emitter = AbStripeEmitter::new(
@@ -3475,7 +3475,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // short serial steps. Zerocheck's long bandwidth-bound kernels measured
     // neutral-to-worse with it, so it stays off there unless
     // `FLOCK_EPOOL_LINGER_ZC=1`.
-    if std::env::var("FLOCK_EPOOL_LINGER_ZC").is_ok_and(|v| v == "1") {
+    if flock_core::gate_env_once!(std::env::var("FLOCK_EPOOL_LINGER_ZC").is_ok_and(|v| v == "1")) {
         flock_core::epool::set_linger_phase(true);
     }
     let cpu_zc0 = phase_timing.then(process_cpu_ms);

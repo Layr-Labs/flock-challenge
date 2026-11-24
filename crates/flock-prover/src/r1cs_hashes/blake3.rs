@@ -2294,7 +2294,7 @@ pub(crate) mod witgen_simd {
     /// Read per witgen call (uncached) so same-process A/B tests can
     /// toggle it.
     fn const_elide_killed() -> bool {
-        std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1")
+        flock_core::gate_env_once!(std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1"))
     }
 
     /// Bitmask of token hits (bit0 z, bit1 a, bit2 b) of the most recent
@@ -4264,7 +4264,7 @@ pub(crate) mod witgen_simd {
             n_total >= 8 && n_total.is_multiple_of(8),
             "lincheck stripe layout requires n_total ≥ 8 and divisible by 8"
         );
-        let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+        let stripe_useful_bits = if flock_core::gate_env_once!(std::env::var_os("FLOCK_FULL_STRIPE").is_some()) {
             K
         } else {
             USEFUL_BITS
@@ -4556,7 +4556,7 @@ pub(crate) mod witgen_simd {
             // worker-thread submission needs no extra pool handling.
             // `FLOCK_NO_WITGEN_CONT_QUEUE=1` restores the incumbent band
             // loop exactly.
-            let cont_queue = !std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE").is_ok_and(|v| v == "1");
+            let cont_queue = !flock_core::gate_env_once!(std::env::var("FLOCK_NO_WITGEN_CONT_QUEUE").is_ok_and(|v| v == "1"));
             if cont_queue {
                 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
                 const SLAB: usize = super::super::common::WITGEN_HETERO_SLAB;
@@ -5020,7 +5020,7 @@ fn generate_witness_with_ab_packed_and_lincheck_impl(
     // every block. (The chain forbids padding, so this only affects the
     // standalone batch setup.)
     let padding: Compression = ([0u32; 8], [0u32; 16], 0u64, 0u32, 0u32);
-    let stripe_useful_bits = if std::env::var_os("FLOCK_FULL_STRIPE").is_some() {
+    let stripe_useful_bits = if flock_core::gate_env_once!(std::env::var_os("FLOCK_FULL_STRIPE").is_some()) {
         K
     } else {
         USEFUL_BITS
@@ -5103,8 +5103,8 @@ fn use_deferred_ranked_lincheck_stripe(n_blocks_log: usize, pcs_params: &PcsPara
         pcs_params,
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
         flock_core::epool::helper_pool_available(),
-        std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some(),
-        std::env::var_os("FLOCK_FULL_STRIPE").is_some(),
+        flock_core::gate_env_once!(std::env::var_os("FLOCK_NO_DEFER_LINCHECK_STRIPE").is_some()),
+        flock_core::gate_env_once!(std::env::var_os("FLOCK_FULL_STRIPE").is_some()),
     )
 }
 
@@ -5278,7 +5278,7 @@ impl Blake3Setup {
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
-            && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+            && flock_core::gate_env_once!(std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none())
     }
 
     #[inline]
@@ -8511,7 +8511,7 @@ mod tests {
             // (Not applicable under the elision kill gate, where the mask
             // is structurally zero — the gate A/B matrix runs the canary
             // with FLOCK_NO_SCRATCH_CONST_ELIDE=1 for byte-identity only.)
-            if !std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1") {
+            if !flock_core::gate_env_once!(std::env::var("FLOCK_NO_SCRATCH_CONST_ELIDE").is_ok_and(|v| v == "1")) {
                 assert_eq!(
                     second_hits, 0b111,
                     "second ranked prove should token-hit z (pinned), a and b"

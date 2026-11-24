@@ -1614,7 +1614,7 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         // (`lincheck::RootStripe`; 11_249 also drops the fixed block_len/flags
         // input columns).
         && (useful_bits == 15_409 || useful_bits == 11_313 || useful_bits == 11_249)
-        && std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none();
+        && crate::gate_env_once!(std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none());
     oblock_padded_tiled_impl::<TILE_T>(
         z_packed,
         m,

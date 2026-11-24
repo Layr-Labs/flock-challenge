@@ -206,7 +206,7 @@ pub(crate) fn gen_block(init: u64, block: usize) -> Compression {
 /// eager parallel fill) resolve it once per prove/fill and pass the bool
 /// down via [`gen_block_with`]; only cold callers pay the per-call read.
 pub(crate) fn gen_block_ilp_killed() -> bool {
-    std::env::var("FLOCK_NO_GEN_BLOCK_SIMD").is_ok_and(|v| v == "1")
+    flock_core::gate_env_once!(std::env::var("FLOCK_NO_GEN_BLOCK_SIMD").is_ok_and(|v| v == "1"))
 }
 
 /// [`gen_block`] with the ILP/scalar choice resolved by the caller (hot
@@ -974,7 +974,7 @@ fn preopen_publish_enabled_for(kill: Option<&OsStr>) -> bool {
 /// Whether the pre-opened publish descriptor is closed after the rename
 /// rather than before it. Exact-`1` kill: `FLOCK_NO_LATE_CLOSE`.
 fn late_close_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_LATE_CLOSE").as_deref() != Some(OsStr::new("1"))
+    flock_core::gate_env_once!(std::env::var_os("FLOCK_NO_LATE_CLOSE").as_deref() != Some(OsStr::new("1")))
 }
 
 /// Whether a publication through the pre-opened file leaves the published
@@ -1575,7 +1575,7 @@ fn speculative_main(
     // that pure serial join time is off the timed window's first microseconds.
     // `FLOCK_NO_KEEPALIVE_DEFER=1` (exact '1') restores signal+join up front.
     let defer_join =
-        std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1"));
+        flock_core::gate_env_once!(std::env::var_os("FLOCK_NO_KEEPALIVE_DEFER").as_deref() != Some(std::ffi::OsStr::new("1")));
     if defer_join {
         flock_core::cpu_keepalive::keepalive_signal();
     } else {
@@ -1776,7 +1776,7 @@ pub(crate) fn try_adopt(blocks: &[Compression]) -> Option<ProveOut> {
 
     // The head start is exactly what this mechanism buys, and it is only
     // observable on a 10-P-core host, so make it printable there.
-    if std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some() {
+    if flock_core::gate_env_once!(std::env::var_os("FLOCK_SEED_PIPE_DEBUG").is_some()) {
         if let (Some(seed_at), Some(blocks_at)) = (seed_at, blocks_at) {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
             eprintln!(
