@@ -1122,6 +1122,10 @@ pub const ENV_NO_GPU_ZC_AB_COMPLETION: &str = "FLOCK_NO_GPU_ZC_AB_COMPLETION";
 /// Unset = [`ZC_AB_GPU_DEFAULT_CHUNKS`]. A non-integer value fails loudly.
 pub const ENV_ZC_AB_GPU_CHUNKS: &str = "FLOCK_ZC_AB_GPU_CHUNKS";
 const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 32;
+/// Default share with threadgroup-staged `zc_ab_gather_tg` (`gpu_zc_ab_tg_enabled()`):
+/// staging the 4 KiB `T_t[0]` table in threadgroup SRAM and advancing `b = 1..15` in
+/// place speeds up the GPU kernel 3.7x-4.7x, shifting the balance from 32/128 to 64/128.
+const ZC_AB_GPU_TG_DEFAULT_CHUNKS: usize = 64;
 
 /// Requested GPU chunk share of the round-one AB completion arm; `0` = off
 /// (kill switch, share 0, or GPU commit disabled).
@@ -1131,6 +1135,7 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
             return 0;
         }
         match std::env::var_os(ENV_ZC_AB_GPU_CHUNKS) {
+            None if gpu_zc_ab_tg_enabled() => ZC_AB_GPU_TG_DEFAULT_CHUNKS,
             None => ZC_AB_GPU_DEFAULT_CHUNKS,
             Some(value) => value
                 .to_str()
@@ -1146,6 +1151,18 @@ pub const ENV_NO_ZC_AB_SCHED: &str = "FLOCK_NO_ZC_AB_SCHED";
 pub(crate) fn gpu_zc_ab_one_cb_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ZC_AB_SCHED).is_none());
+    *ON
+}
+
+/// Kill switch for threadgroup-staged `T_t[0]` + in-place `x`-step in the
+/// round-one AB completion GPU kernels (`FLOCK_NO_ZC_AB_TG=1` restores the
+/// 16 MiB `tables` buffer and device-memory random gathers). Read once per process.
+pub const ENV_NO_ZC_AB_TG: &str = "FLOCK_NO_ZC_AB_TG";
+
+pub(crate) fn gpu_zc_ab_tg_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os(ENV_NO_ZC_AB_TG).as_deref() != Some(std::ffi::OsStr::new("1"))
+    });
     *ON
 }
 
@@ -5934,7 +5951,7 @@ kernel void zc_k_fold_v2(
             }
         }
         a = xa0 ^ zck_mulc(xa0 ^ xa1, rtab);
-        b = xb0 ^ zck_mulc(xb0 ^ xb1, rtab);
+        b = (p.hc != 0u && i < 4u) ? consts[1] : (xb0 ^ zck_mulc(xb0 ^ xb1, rtab));
         out_a[ulong(tg) * 244ul + ulong(i < 60u ? 60u * k + i : 240u + k)] = a;
         if (i < 4u || i == 59u) {
             if (any(b != uint4(1u, 0u, 0u, 0u))) {
@@ -27616,6 +27633,85 @@ kernel void zc_ab_finish(
     }
     partials[chunk * 64u + lam] = gf_reduce(clmul128(eq_hi[chunk], gf_reduce(s)));
 }
+
+// Row b = 0 only (1 MiB contiguous instead of 16 MiB): `zc_ab_gather_tg` stages
+// each top's 4 KiB b = 0 table into threadgroup SRAM and advances b = 1..15 in
+// place via multiply-by-x (exact, bit-identical to `zc_ab_tables` + `zc_ab_gather`).
+kernel void zc_ab_tables_tg(
+    device const uint4* basis  [[buffer(0)]],
+    device const uint4* e_top  [[buffer(1)]],
+    device uint4*       tables [[buffer(2)]],
+    uint t   [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+    threadgroup uint4 scaled[8];
+    if (lid < 8u) {
+        scaled[lid] = gf_reduce(clmul128(basis[lid], e_top[t]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint4 acc = uint4(0u);
+    for (uint k = 0u; k < 8u; k++) {
+        if (((lid >> k) & 1u) != 0u) { acc ^= scaled[k]; }
+    }
+    tables[(ulong(t) << 8) + ulong(lid)] = acc;
+}
+
+kernel void zc_ab_gather_tg(
+    device const uchar* ab       [[buffer(0)]],
+    device const uint4* tables   [[buffer(1)]],
+    device uint4*       banks    [[buffer(2)]],
+    constant ZcAbParams& p       [[buffer(3)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint lam [[thread_index_in_threadgroup]])
+{
+    uint chunk = tg / p.groups_per_chunk;
+    uint t0 = (tg % p.groups_per_chunk) * p.tops_per_group;
+    threadgroup uint4 tb_tg[256];
+    uint4 acc[16];
+    for (int i = 0; i < 16; i++) { acc[i] = uint4(0u); }
+    for (uint t = t0; t < t0 + p.tops_per_group; t++) {
+        device const uint4* tb0 = tables + (ulong(t) << 8);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tb_tg[lam]        = tb0[lam];
+        tb_tg[lam + 64u]  = tb0[lam + 64u];
+        tb_tg[lam + 128u] = tb0[lam + 128u];
+        tb_tg[lam + 192u] = tb0[lam + 192u];
+        ulong rbase = (ulong(chunk) << p.chunk_shift) + (ulong(t) << 14) + ulong(lam);
+        for (uint b = 0u; b < 16u; b++) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint m = p.bmask[b];
+            if (m != 0u) {
+                device const uchar* col = ab + (rbase + ulong(b) * 64ul);
+                if (m == 0xFFFFu) {
+                    for (int bot = 0; bot < 16; bot++) { uchar v = col[bot * 1024]; acc[bot] ^= tb_tg[v]; }
+                } else if (m == 0x5555u) {
+                    for (int bot = 0; bot < 16; bot += 2) { uchar v = col[bot * 1024]; acc[bot] ^= tb_tg[v]; }
+                } else if (m == 0xAAAAu) {
+                    for (int bot = 1; bot < 16; bot += 2) { uchar v = col[bot * 1024]; acc[bot] ^= tb_tg[v]; }
+                } else {
+                    for (int bot = 0; bot < 16; bot++) {
+                        if (((m >> uint(bot)) & 1u) != 0u) { uchar v = col[bot * 1024]; acc[bot] ^= tb_tg[v]; }
+                    }
+                }
+            }
+            if (b < 15u) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint k = 0u; k < 4u; k++) {
+                    uint4 v = tb_tg[lam + k * 64u];
+                    uint red = (v.w >> 31) * 0x87u;
+                    v.w = (v.w << 1) | (v.z >> 31);
+                    v.z = (v.z << 1) | (v.y >> 31);
+                    v.y = (v.y << 1) | (v.x >> 31);
+                    v.x = (v.x << 1) ^ red;
+                    tb_tg[lam + k * 64u] = v;
+                }
+            }
+        }
+    }
+    for (int bot = 0; bot < 16; bot++) {
+        banks[(ulong(tg) * 16ul + ulong(bot)) * 64ul + ulong(lam)] = acc[bot];
+    }
+}
 "#;
 
     include!("gpu_commit/ab_mul9.rs");
@@ -27641,7 +27737,12 @@ kernel void zc_ab_finish(
     /// threadgroup's serial 128 x 16 x 16 gather chain.
     fn zc_ab_tops_per_group(chunks: usize) -> usize {
         let pow2_floor = 1usize << (usize::BITS - 1 - chunks.max(1).leading_zeros());
-        pow2_floor.clamp(ZC_AB_MIN_TOPS_PER_GROUP, ZC_AB_MAX_TOPS_PER_GROUP)
+        let tb = pow2_floor.clamp(ZC_AB_MIN_TOPS_PER_GROUP, ZC_AB_MAX_TOPS_PER_GROUP);
+        if super::gpu_zc_ab_tg_enabled() && tb == 64 && chunks * 8 <= ZC_AB_MAX_GROUPS {
+            32
+        } else {
+            tb
+        }
     }
     /// F128 slot offsets inside the persistent constants buffer.
     const ZC_AB_BASIS_OFF: usize = 0;
@@ -27731,9 +27832,15 @@ kernel void zc_ab_finish(
                     }
                     Ok(pso)
                 };
+                let tg_mode = super::gpu_zc_ab_tg_enabled();
+                let kernel_names = if tg_mode {
+                    ["zc_ab_tables_tg", "zc_ab_gather_tg", "zc_ab_finish"]
+                } else {
+                    ["zc_ab_tables", "zc_ab_gather", "zc_ab_finish"]
+                };
                 let mut psos: Vec<Id> = Vec::with_capacity(3);
                 let mut failed = None;
-                for name in ["zc_ab_tables", "zc_ab_gather", "zc_ab_finish"] {
+                for name in kernel_names {
                     match make_pipeline(name) {
                         Ok(pso) => psos.push(pso),
                         Err(e) => {
@@ -27767,10 +27874,15 @@ kernel void zc_ab_finish(
                 gpu.release(finish_pso);
                 return Err("zc-ab PSOs cannot run their threadgroup widths".into());
             }
+            let tables_bytes = if super::gpu_zc_ab_tg_enabled() {
+                ZC_AB_TOPS * 256 * 16
+            } else {
+                ZC_AB_TOPS * 16 * 256 * 16
+            };
             let buffers = (|| -> Result<(Id, Id, Id, Id), String> {
                 let mut made: Vec<Id> = Vec::with_capacity(4);
                 for len in [
-                    ZC_AB_TOPS * 16 * 256 * 16,
+                    tables_bytes,
                     ZC_AB_CONSTS_LEN * 16,
                     ZC_AB_MAX_GROUPS * 16 * 64 * 16,
                     ZC_AB_MAX_CHUNKS * 64 * 16,
