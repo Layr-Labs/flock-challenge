@@ -5770,12 +5770,14 @@ using namespace metal;
 // most 6 overlapping terms per result bit (16 bits / spacing 3) and its sums
 // stay below the next same-residue bit (no carry crosses into a kept bit).
 static inline uint zck_clmul16(uint a, uint b) {
+    // Masks are 16-bit, so the ushort parts hold the same values; uint(ushort)
+    // products lower to native 16x16->32 multiplies (identical integers).
     const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
-    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
-    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
-    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
-    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
+    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
@@ -24633,12 +24635,14 @@ static inline ulong clmul_plane_pair(uint a0, uint a1, uint b0, uint b1) {
 // 16x16 carry-less product from 9 native 32-bit products of bit-position-
 // mod-3 parts (at most 6 terms per result bit: no carry reaches a kept bit).
 static inline uint clmul16_m3(uint a, uint b) {
+    // Masks are 16-bit, so the ushort parts hold the same values; uint(ushort)
+    // products lower to native 16x16->32 multiplies (identical integers).
     const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
-    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
-    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
-    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
-    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
+    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
@@ -25096,12 +25100,14 @@ static inline void zc_r2_cs_store(
 // bit-position-mod-3 parts: a result bit sums at most six terms, so no carry
 // reaches the next bit of the same part.
 static inline uint zc_r2_cs_clmul16(uint a, uint b) {
+    // Masks are 16-bit, so the ushort parts hold the same values; uint(ushort)
+    // products lower to native 16x16->32 multiplies (identical integers).
     const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
-    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
-    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
-    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
-    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
+    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
