@@ -166,7 +166,13 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// value-forced work). Read once per phase call, off the hot path.
 #[cfg(target_arch = "aarch64")]
 fn r2_degen_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+    // This crate's own tests toggle the variable in-process; they keep the
+    // per-call read. Every other build keeps the first answer (one read per
+    // phase, several phases per prove).
+    if cfg!(test) {
+        return std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1");
+    }
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1"))
 }
 
 /// Kill switch for the peeled first group of the round-two Horner kernel:
@@ -188,7 +194,7 @@ fn r2_prescale_enabled() -> bool {
 /// restores the one-body compact kernel. Same stores and slots either way.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 fn cascade_k_fused_enabled() -> bool {
-    std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1")
+    crate::env_once_sweep!(std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1"))
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -3867,6 +3873,10 @@ fn fold2_compact_and_round45_into_packed_b(
         one_table && kernels::aarch64::zc_k_xb_enabled() && kernels::aarch64::k_full_xb_weights(eq_lo, lo_size);
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let k_xb = false;
+    // `FLOCK_NO_ZC_K_XB_ONE_SKIP=1` (exactly): the packed walk scales its
+    // window-position-0 a rows by `x^0 = 1` again (the record's instance).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let k_one_skip = k_xb && kernels::aarch64::zc_k_xb_one_skip_enabled();
     if std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some() && one_table {
         let n_groups = lo_size / 2;
         let armed = k_xb;
@@ -3993,25 +4003,35 @@ fn fold2_compact_and_round45_into_packed_b(
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table && pack => {
                     let ok = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
-                        if k_xb {
-                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true>(
+                        if k_one_skip {
+                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true, true>(
+                                fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
+                                degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                        } else if k_xb {
+                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<true, false>(
                                 fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
                                 degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
                             )
                         } else {
-                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false>(
+                            kernels::aarch64::fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false, false>(
                                 fold7_addr as *const u8, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size,
                                 degen, out_ptr, bpack, compact.tail_compact, compact.head_compact, compact.head_b,
                             )
                         }
                     } else {
-                        if k_xb {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true>(
+                        if k_one_skip {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, true>(
+                                t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                                compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                        } else if k_xb {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, false>(
                                 t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
                                 compact.tail_compact, compact.head_compact, compact.head_b,
                             )
                         } else {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false, false>(
                                 t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
                                 compact.tail_compact, compact.head_compact, compact.head_b,
                             )
@@ -4024,12 +4044,12 @@ fn fold2_compact_and_round45_into_packed_b(
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
                     if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             compact.tail_compact, compact.head_compact, compact.head_b,
                         );
                     } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             compact.tail_compact, compact.head_compact, compact.head_b,
                         );
@@ -4038,12 +4058,12 @@ fn fold2_compact_and_round45_into_packed_b(
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => {
                     if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             false, false, F128::ZERO,
                         );
                     } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             false, false, F128::ZERO,
                         );
@@ -5181,7 +5201,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     let eq_hi = &eq.hi;
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
+    let nt_stores = out_n >= (1usize << 20) && crate::env_once_sweep!(std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none());
     let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
     // The group weights `eq_lo[4y + 3]` as prepared pairs, one table per
     // pass shared by every chunk.

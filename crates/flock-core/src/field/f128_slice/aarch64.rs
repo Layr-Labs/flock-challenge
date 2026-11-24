@@ -1,5 +1,8 @@
 use crate::field::F128;
-use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep, mul_two_const_sum_prep};
+use crate::field::gf2_128::aarch64::{
+    const_prep, mul_const_prep, mul_const_prep_xor, mul_two_const_sum_prep,
+    mul_two_const_sum_prep_xor,
+};
 use core::arch::aarch64::*;
 use core::mem::transmute;
 
@@ -1269,26 +1272,26 @@ unsafe fn fold_two_and_msg_impl<const PREP: bool>(
             let b_even1 = vld1q_u64(b.as_ptr().add(source + 2).cast::<u64>());
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
 
-            let folded_f = if PREP {
-                [
-                    mul_const_prep(r_prep, veorq_u64(f_even0, f_odd0)),
-                    mul_const_prep(r_prep, veorq_u64(f_even1, f_odd1)),
-                ]
+            let (f0, f1) = if PREP {
+                (
+                    mul_const_prep_xor(f_even0, r_prep, veorq_u64(f_even0, f_odd0)),
+                    mul_const_prep_xor(f_even1, r_prep, veorq_u64(f_even1, f_odd1)),
+                )
             } else {
-                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1))
+                let folded_f =
+                    mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+                (veorq_u64(f_even0, folded_f[0]), veorq_u64(f_even1, folded_f[1]))
             };
-            let f0 = veorq_u64(f_even0, folded_f[0]);
-            let f1 = veorq_u64(f_even1, folded_f[1]);
-            let folded_b = if PREP {
-                [
-                    mul_const_prep(r_prep, veorq_u64(b_even0, b_odd0)),
-                    mul_const_prep(r_prep, veorq_u64(b_even1, b_odd1)),
-                ]
+            let (b0, b1) = if PREP {
+                (
+                    mul_const_prep_xor(b_even0, r_prep, veorq_u64(b_even0, b_odd0)),
+                    mul_const_prep_xor(b_even1, r_prep, veorq_u64(b_even1, b_odd1)),
+                )
             } else {
-                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1))
+                let folded_b =
+                    mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
+                (veorq_u64(b_even0, folded_b[0]), veorq_u64(b_even1, folded_b[1]))
             };
-            let b0 = veorq_u64(b_even0, folded_b[0]);
-            let b1 = veorq_u64(b_even1, folded_b[1]);
 
             vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
             vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
@@ -1359,26 +1362,26 @@ unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool>(
             let b_even1 = vld1q_u64(b_ptr.add(source + 2).cast::<u64>());
             let b_odd1 = vld1q_u64(b_ptr.add(source + 3).cast::<u64>());
 
-            let folded_f = if PREP {
-                [
-                    mul_const_prep(r_prep, veorq_u64(f_even0, f_odd0)),
-                    mul_const_prep(r_prep, veorq_u64(f_even1, f_odd1)),
-                ]
+            let (f0, f1) = if PREP {
+                (
+                    mul_const_prep_xor(f_even0, r_prep, veorq_u64(f_even0, f_odd0)),
+                    mul_const_prep_xor(f_even1, r_prep, veorq_u64(f_even1, f_odd1)),
+                )
             } else {
-                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1))
+                let folded_f =
+                    mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+                (veorq_u64(f_even0, folded_f[0]), veorq_u64(f_even1, folded_f[1]))
             };
-            let f0 = veorq_u64(f_even0, folded_f[0]);
-            let f1 = veorq_u64(f_even1, folded_f[1]);
-            let folded_b = if PREP {
-                [
-                    mul_const_prep(r_prep, veorq_u64(b_even0, b_odd0)),
-                    mul_const_prep(r_prep, veorq_u64(b_even1, b_odd1)),
-                ]
+            let (b0, b1) = if PREP {
+                (
+                    mul_const_prep_xor(b_even0, r_prep, veorq_u64(b_even0, b_odd0)),
+                    mul_const_prep_xor(b_even1, r_prep, veorq_u64(b_even1, b_odd1)),
+                )
             } else {
-                mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1))
+                let folded_b =
+                    mul_const_vec2_pmred(r_q, veorq_u64(b_even0, b_odd0), veorq_u64(b_even1, b_odd1));
+                (veorq_u64(b_even0, folded_b[0]), veorq_u64(b_even1, folded_b[1]))
             };
-            let b0 = veorq_u64(b_even0, folded_b[0]);
-            let b1 = veorq_u64(b_even1, folded_b[1]);
 
             vst1q_u64(f_ptr.add(t).cast::<u64>(), f0);
             vst1q_u64(f_ptr.add(t + 1).cast::<u64>(), f1);
@@ -1459,16 +1462,16 @@ unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
             let f_odd0 = vld1q_u64(f.as_ptr().add(source + 1).cast::<u64>());
             let f_even1 = vld1q_u64(f.as_ptr().add(source + 2).cast::<u64>());
             let f_odd1 = vld1q_u64(f.as_ptr().add(source + 3).cast::<u64>());
-            let folded_f = if PREP {
-                [
-                    mul_const_prep(r_prep, veorq_u64(f_even0, f_odd0)),
-                    mul_const_prep(r_prep, veorq_u64(f_even1, f_odd1)),
-                ]
+            let (f0, f1) = if PREP {
+                (
+                    mul_const_prep_xor(f_even0, r_prep, veorq_u64(f_even0, f_odd0)),
+                    mul_const_prep_xor(f_even1, r_prep, veorq_u64(f_even1, f_odd1)),
+                )
             } else {
-                mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1))
+                let folded_f =
+                    mul_const_vec2_pmred(r_q, veorq_u64(f_even0, f_odd0), veorq_u64(f_even1, f_odd1));
+                (veorq_u64(f_even0, folded_f[0]), veorq_u64(f_even1, folded_f[1]))
             };
-            let f0 = veorq_u64(f_even0, folded_f[0]);
-            let f1 = veorq_u64(f_even1, folded_f[1]);
 
             let b_even0 = vld1q_u64(b.as_ptr().add(source).cast::<u64>());
             let b_odd0 = vld1q_u64(b.as_ptr().add(source + 1).cast::<u64>());
@@ -1476,33 +1479,37 @@ unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
             let b_odd1 = vld1q_u64(b.as_ptr().add(source + 3).cast::<u64>());
             let addend0 = vld1q_u64(basis_addend.as_ptr().add(t).cast::<u64>());
             let addend1 = vld1q_u64(basis_addend.as_ptr().add(t + 1).cast::<u64>());
-            let folded_b_with_addend = if PREP {
-                [
-                    mul_two_const_sum_prep(
+            let (b0, b1) = if PREP {
+                (
+                    mul_two_const_sum_prep_xor(
+                        b_even0,
                         r_prep,
                         veorq_u64(b_even0, b_odd0),
                         scale_prep,
                         addend0,
                     ),
-                    mul_two_const_sum_prep(
+                    mul_two_const_sum_prep_xor(
+                        b_even1,
                         r_prep,
                         veorq_u64(b_even1, b_odd1),
                         scale_prep,
                         addend1,
                     ),
-                ]
+                )
             } else {
-                mul_two_const_sum_vec2_pmred(
+                let folded_b_with_addend = mul_two_const_sum_vec2_pmred(
                     r_q,
                     veorq_u64(b_even0, b_odd0),
                     veorq_u64(b_even1, b_odd1),
                     scale_q,
                     addend0,
                     addend1,
+                );
+                (
+                    veorq_u64(b_even0, folded_b_with_addend[0]),
+                    veorq_u64(b_even1, folded_b_with_addend[1]),
                 )
             };
-            let b0 = veorq_u64(b_even0, folded_b_with_addend[0]);
-            let b1 = veorq_u64(b_even1, folded_b_with_addend[1]);
 
             vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
             vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
@@ -1714,17 +1721,27 @@ unsafe fn fold2_two_and_msgs_impl(
                 let bo1 = vld1q_u64(b.as_ptr().add(src + 3).cast::<u64>());
 
                 // First bind at r_a: v = even ^ r_a*(even^odd), two v per poly.
-                let pf = mul_const_pair_sel(prep_on, ra_q, ra_p, veorq_u64(fe0, fo0), veorq_u64(fe1, fo1));
-                let vf0 = veorq_u64(fe0, pf[0]);
-                let vf1 = veorq_u64(fe1, pf[1]);
-                let pb = mul_const_pair_sel(prep_on, ra_q, ra_p, veorq_u64(be0, bo0), veorq_u64(be1, bo1));
-                let vb0 = veorq_u64(be0, pb[0]);
-                let vb1 = veorq_u64(be1, pb[1]);
-
-                // Second bind at r_b, both polynomials in one paired multiply.
-                let pw = mul_const_pair_sel(prep_on, rb_q, rb_p, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
-                let wq_f = veorq_u64(vf0, pw[0]);
-                let wq_b = veorq_u64(vb0, pw[1]);
+                let (vf0, vf1, vb0, vb1, wq_f, wq_b) = if prep_on {
+                    let vf0 = mul_const_prep_xor(fe0, ra_p, veorq_u64(fe0, fo0));
+                    let vf1 = mul_const_prep_xor(fe1, ra_p, veorq_u64(fe1, fo1));
+                    let vb0 = mul_const_prep_xor(be0, ra_p, veorq_u64(be0, bo0));
+                    let vb1 = mul_const_prep_xor(be1, ra_p, veorq_u64(be1, bo1));
+                    let wq_f = mul_const_prep_xor(vf0, rb_p, veorq_u64(vf0, vf1));
+                    let wq_b = mul_const_prep_xor(vb0, rb_p, veorq_u64(vb0, vb1));
+                    (vf0, vf1, vb0, vb1, wq_f, wq_b)
+                } else {
+                    let pf = mul_const_pair_sel(false, ra_q, ra_p, veorq_u64(fe0, fo0), veorq_u64(fe1, fo1));
+                    let vf0 = veorq_u64(fe0, pf[0]);
+                    let vf1 = veorq_u64(fe1, pf[1]);
+                    let pb = mul_const_pair_sel(false, ra_q, ra_p, veorq_u64(be0, bo0), veorq_u64(be1, bo1));
+                    let vb0 = veorq_u64(be0, pb[0]);
+                    let vb1 = veorq_u64(be1, pb[1]);
+                    let pw = mul_const_pair_sel(false, rb_q, rb_p, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
+                    let wq_f = veorq_u64(vf0, pw[0]);
+                    let wq_b = veorq_u64(vb0, pw[1]);
+                    (vf0, vf1, vb0, vb1, wq_f, wq_b)
+                };
+                let _ = (vf0, vf1, vb0, vb1);
                 if !nt_stores {
                     vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
                     vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);

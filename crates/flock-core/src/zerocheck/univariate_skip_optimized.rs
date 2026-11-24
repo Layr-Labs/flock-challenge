@@ -4097,10 +4097,27 @@ impl AbGpuPrefix {
         }
     }
 
-    /// The GPU's chunk share once admitted (also during the probe).
+    /// The GPU's expected steady-state chunk share for C-fold warm-up tuning.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_chunks(&self) -> usize {
-        self.job.gpu_chunks()
+    fn gpu_chunks_for_tune(&self) -> usize {
+        self.job.gpu_chunks_for_tune()
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn steal(&self) -> Option<&crate::gpu_commit::ZcAbSteal> {
+        self.job.steal()
+    }
+
+    /// Number of leading chunks owned by the GPU (below the lowest stolen chunk).
+    fn gpu_taken(&self) -> usize {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.job.gpu_taken()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            0
+        }
     }
 
     /// Join the GPU. Admitted prove: writes the GPU's partials into
@@ -4494,14 +4511,26 @@ where
             // admitted prove's (the warm-up probe drains every chunk).
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             crate::gpu_commit::zc_fold_tune_note_ab_chunks(
-                hi_size - gpu_prefix.as_ref().map_or(0, AbGpuPrefix::gpu_chunks),
+                hi_size - gpu_prefix.as_ref().map_or(0, AbGpuPrefix::gpu_chunks_for_tune),
                 cpu_chunks,
             );
             // Tail split (`FLOCK_NO_ZC_AB_TAIL_SPLIT=1` kills): the last
             // `split` chunks of the queue are claimed as two half-ranges of
             // `x_outer_lo` each, halving the queue's ragged-tail grain. The
             // two half partials XOR to the whole chunk's partial exactly.
-            let split = ab_tail_split_chunks(cpu_chunks, big_lo_size, 1usize << bank_bits);
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let ab_steal = gpu_prefix.as_ref().and_then(AbGpuPrefix::steal);
+            let split = {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let use_split = ab_steal.is_none();
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                let use_split = true;
+                if use_split {
+                    ab_tail_split_chunks(cpu_chunks, big_lo_size, 1usize << bank_bits)
+                } else {
+                    0
+                }
+            };
             let whole = cpu_chunks - split;
             let half_lo = big_lo_size / 2;
             let mut half_partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(2 * split);
@@ -4534,31 +4563,47 @@ where
                 });
                 partial
             };
-            let out = crate::epool::run_hetero_chunks_caller_tail(
-                whole + 2 * split,
-                |i| {
-                    let (x_hi, range) = if i < whole {
-                        (cpu_base + i, 0..big_lo_size)
+            let run_task = |i: usize| {
+                let (x_hi, range) = if i < whole {
+                    (cpu_base + i, 0..big_lo_size)
+                } else {
+                    let j = i - whole;
+                    let h = j & 1;
+                    (cpu_base + whole + j / 2, h * half_lo..(h + 1) * half_lo)
+                };
+                let partial = fold_chunk(x_hi, range);
+                // SAFETY: each queue index owns one disjoint output slot
+                // (whole chunks in `partials`, halves in
+                // `half_partials`) and the synchronous queue join
+                // publishes all writes before reduction.
+                unsafe {
+                    if i < whole {
+                        *partials_base.ptr().add(x_hi) = partial;
                     } else {
-                        let j = i - whole;
-                        let h = j & 1;
-                        (cpu_base + whole + j / 2, h * half_lo..(h + 1) * half_lo)
-                    };
-                    let partial = fold_chunk(x_hi, range);
-                    // SAFETY: each queue index owns one disjoint output slot
-                    // (whole chunks in `partials`, halves in
-                    // `half_partials`) and the synchronous queue join
-                    // publishes all writes before reduction.
-                    unsafe {
-                        if i < whole {
-                            *partials_base.ptr().add(x_hi) = partial;
-                        } else {
-                            *half_base.ptr().add(i - whole) = partial;
-                        }
+                        *half_base.ptr().add(i - whole) = partial;
                     }
-                },
-                tail,
-            );
+                }
+            };
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            let out = if let Some(steal) = ab_steal {
+                crate::epool::run_hetero_chunks_then_caller_tail(
+                    whole + 2 * split,
+                    run_task,
+                    || {
+                        while let Some(x_hi) = steal.claim() {
+                            let partial = fold_chunk(x_hi, 0..big_lo_size);
+                            // SAFETY: `steal.claim()` hands out each chunk at most
+                            // once below `cpu_base`, disjoint from `cpu_base..hi_size`.
+                            unsafe { *partials_base.ptr().add(x_hi) = partial };
+                        }
+                    },
+                    tail,
+                )
+            } else {
+                crate::epool::run_hetero_chunks_caller_tail(whole + 2 * split, run_task, tail)
+            };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            let out = crate::epool::run_hetero_chunks_caller_tail(whole + 2 * split, run_task, tail);
             // Reassemble each split chunk's partial (XOR is exact).
             let reassemble = |partials: &mut [[F128; ELL]]| {
                 for k in 0..split {
@@ -4579,11 +4624,12 @@ where
                     // The oracle probe compares against the CPU's complete
                     // per-chunk partials, so reassemble before joining.
                     reassemble(&mut partials);
+                    let redo_chunks = prefix.gpu_taken();
                     if !prefix.finish(&mut partials) {
                         // GPU failed after admission: CPU computes its chunks
                         // with the same kernel (the arm is now disabled).
                         crate::epool::run_hetero_chunks_caller_tail(
-                            cpu_base,
+                            redo_chunks,
                             |x_hi| {
                                 let partial = fold_chunk(x_hi, 0..big_lo_size);
                                 // SAFETY: one disjoint slot per index; the

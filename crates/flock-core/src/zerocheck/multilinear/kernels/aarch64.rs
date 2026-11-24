@@ -1469,6 +1469,7 @@ pub(crate) fn zc_k_fold7_enabled() -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7<
     const XB: bool,
+    const ONE_SKIP: bool,
 >(
     table7: *const u8,
     rho2: F128,
@@ -1486,7 +1487,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7<
     head_b: F128,
 ) -> bool {
     unsafe {
-        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, true, XB>(
+        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, true, XB, ONE_SKIP>(
             table7, rho2, anchors, deltas, a_out, b_out, eq_prep, out_pairs, degen, out, bpack,
             tail_compact, head_compact, head_b,
         )
@@ -1497,6 +1498,18 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7<
 pub(crate) fn zc_k_xb_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_XB").is_none())
+}
+
+/// Kill switch for `ONE_SKIP` of [`fold2_compact_and_round45_chunk_neon_8_fused_r1`]
+/// (the K walk's window-position-0 a rows go unscaled, `x^0 = 1`): exactly
+/// `FLOCK_NO_ZC_K_XB_ONE_SKIP=1` runs the record's instance, which scales
+/// them by `xb_q = (1, 1)`. Read once per process. Same values, same bytes.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+pub(crate) fn zc_k_xb_one_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_ZC_K_XB_ONE_SKIP").as_deref() != Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -5789,6 +5802,14 @@ unsafe fn mul_prep_q(
 /// `F7`: `table_r1` is the seven-piece form of the byte banks
 /// ([`r2_fold7_table`] of them) and every lookup tree takes seven lookups
 /// ([`lookup7_acc_q`]); the same field elements, so the same stores and slots.
+///
+/// `ONE_SKIP` (with `XB` only; `FLOCK_NO_ZC_K_XB_ONE_SKIP`, see
+/// [`zc_k_xb_one_skip_enabled`]): a group at window position 0 takes its
+/// four a rows unscaled instead of through [`mul_xb_q`] by `xb_q`, which is
+/// `(1, 1)` there. Same values: with `xb = (1, 1)`, `u = pmull2(v, xb) =
+/// (v.hi, 0)`, `r = pmull2(u, k) = 0`, `zip1(r, u) = (0, v.hi)` and `o =
+/// pmull(v, xb) ^ (0, v.hi) = (v.lo, 0) ^ (0, v.hi) = v`, so `mul_xb_q(v, 1)
+/// == v` for every `v`.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
@@ -5799,6 +5820,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     const PACK: bool,
     const F7: bool,
     const XB: bool,
+    const ONE_SKIP: bool,
 >(
     table_r1: *const u8,
     rho2: F128,
@@ -5816,6 +5838,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     head_b: F128,
 ) -> bool {
     const { assert!(DEAD_TAIL || !PACK) };
+    const { assert!(XB || !ONE_SKIP) };
     use core::arch::aarch64::*;
 
     #[inline(always)]
@@ -5998,13 +6021,26 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     store_pair_nt_off::<32>(bo, b2, b3);
                 }
                 let acc = if XB { &mut wacc.0 } else { &mut acc.0 };
+                // `FLOCK_NO_ZC_K_XB_ONE_SKIP`: at window position 0 `xb_q`
+                // is `(1, 1)` (set with `in_window = 0`, see `k_xb_step!`)
+                // and `mul_xb_q(v, xb_q, k87) == v`: the rows go unscaled.
+                let one_xb = ONE_SKIP && in_window == 0;
+                macro_rules! xbs {
+                    ($v:expr) => {
+                        if one_xb { $v } else { mul_xb_q($v, xb_q, k87) }
+                    };
+                }
                 if b_flat
                     && is_zero_q(vorrq_u64(
                         vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
                         vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
                     ))
                 {
-                    if XB {
+                    if XB && ONE_SKIP {
+                        acc[0].ll = veorq_u64(acc[0].ll, xbs!(a1));
+                        acc[2].ll = veorq_u64(acc[2].ll, xbs!(a3));
+                        acc[4].ll = veorq_u64(acc[4].ll, xbs!(a2));
+                    } else if XB {
                         acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb_q, k87));
                         acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb_q, k87));
                         acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb_q, k87));
@@ -6018,7 +6054,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                         tri_acc_q_crossfused(&mut acc[4], w, a2);
                     }
                 } else {
-                    let (a0w, a1w, a2w, a3w) = if XB {
+                    let (a0w, a1w, a2w, a3w) = if XB && ONE_SKIP {
+                        (xbs!(a0), xbs!(a1), xbs!(a2), xbs!(a3))
+                    } else if XB {
                         (
                             mul_xb_q(a0, xb_q, k87),
                             mul_xb_q(a1, xb_q, k87),
@@ -11680,14 +11718,14 @@ mod tests {
                                 OUT_PAIRS, true, out.as_mut_ptr(),
                             ),
                             (false, false) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
                                 );
                             }
                             (false, true) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
@@ -11771,12 +11809,12 @@ mod tests {
                 let (mut ap, mut bp) = (vec![poison; n_out], vec![poison; n_out]);
                 let (mut o_full, mut o_pack) = ([F128::ZERO; 8], [F128::ZERO; 8]);
                 unsafe {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_full.as_mut_ptr(), false, false, false, F128::ONE,
                     );
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         ap.as_mut_ptr(), bp.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_pack.as_mut_ptr(), false, false, false, F128::ONE,
@@ -11860,7 +11898,7 @@ mod tests {
                     let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
                     let mut o = [F128::ZERO; 8];
                     let ok = unsafe {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false, false>(
                             r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                             a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                             o.as_mut_ptr(), bpack, false, false, F128::ONE,
@@ -11933,13 +11971,13 @@ mod tests {
                     let mut o = [F128::ZERO; 8];
                     let ok = unsafe {
                         if pieces {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false, false>(
                                 t7.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                                 o.as_mut_ptr(), bpack, false, false, F128::ONE,
                             )
                         } else {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false, false>(
                                 r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                                 o.as_mut_ptr(), bpack, false, false, F128::ONE,
