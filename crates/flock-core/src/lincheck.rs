@@ -1906,7 +1906,7 @@ fn prove_padded_inner<Ch: Challenger>(
     assert_eq!(x_ab.x_outer.len(), n_log);
 
     challenger.observe_label(b"flock-lincheck-v0");
-    let trace = std::env::var("LINCHECK_TRACE").is_ok();
+    let trace = crate::gate_env_once!(std::env::var("LINCHECK_TRACE").is_ok());
 
     // 1. Sample α (matches verifier's order). Used to batch the two scalar
     //    consistency checks v_a, v_b into a single sumcheck.
@@ -1986,7 +1986,7 @@ fn prove_padded_inner<Ch: Challenger>(
         z_vec
     };
     let ((mut comb_vec, eq_inner), mut z_vec) =
-        if std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some() {
+        if crate::gate_env_once!(std::env::var_os("FLOCK_NO_LINCHECK_JOIN").is_some()) {
             (comb_branch(), z_branch())
         } else {
             rayon::join(comb_branch, z_branch)

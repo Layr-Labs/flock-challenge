@@ -53,6 +53,73 @@ pub mod zerocheck;
 /// purely for screening/rollback — mirrors `FLOCK_NO_AB_COMPACT_STORE`.
 pub const ENV_NO_MICRO_STACK: &str = "FLOCK_NO_MICRO_STACK";
 
+/// Kill switch for keeping the timing-trace environment reads once per
+/// process (`FLOCK_NO_TRACE_ENV_ONCE`, any value: [`phase_timing_env_on`] and
+/// [`zc_timing_env_on`] read their variable from the process environment on
+/// every call, as before). Read once per process.
+pub const ENV_NO_TRACE_ENV_ONCE: &str = "FLOCK_NO_TRACE_ENV_ONCE";
+
+fn trace_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_TRACE_ENV_ONCE).is_none());
+    *ON
+}
+
+/// `FLOCK_PHASE_TIMING` set (the prover's phase-timing trace). The process
+/// environment does not change while a worker runs, so the first answer is
+/// kept; [`ENV_NO_TRACE_ENV_ONCE`] restores the per-call lookup.
+pub fn phase_timing_env_on() -> bool {
+    if trace_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_PHASE_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+}
+
+/// `FLOCK_ZC_TIMING` set (the zerocheck's timing trace), kept the same way.
+pub fn zc_timing_env_on() -> bool {
+    if trace_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_ZC_TIMING").is_some()
+}
+
+/// Kill switch for [`gate_env_once!`] (`FLOCK_NO_GATE_ENV_ONCE`, any value:
+/// every gate wrapped by the macro reads its variable from the process
+/// environment on each call, as before). Read once per process.
+pub const ENV_NO_GATE_ENV_ONCE: &str = "FLOCK_NO_GATE_ENV_ONCE";
+
+/// `true` when [`gate_env_once!`] must re-read the environment on each call:
+/// always in builds with debug assertions (unit tests toggle several of these
+/// variables inside one process), and in optimized builds when
+/// [`ENV_NO_GATE_ENV_ONCE`] is set.
+#[doc(hidden)]
+#[inline]
+pub fn gate_env_once_live() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    static LIVE: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GATE_ENV_ONCE).is_some());
+    *LIVE
+}
+
+/// Evaluate a boolean kill-switch expression once per process at this call
+/// site and keep the answer. A ranked worker never changes its environment,
+/// so the first answer is the answer of every later call; the timed prove
+/// then pays one atomic load here instead of an environment lookup (key
+/// allocation, environment lock, linear scan of `environ`).
+#[macro_export]
+macro_rules! gate_env_once {
+    ($e:expr) => {{
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if $crate::gate_env_once_live() { $e } else { *V.get_or_init(|| $e) }
+    }};
+}
+
 /// Publish-path warm-up hook (port of the x86 track's rename warm-up, e-man07
 /// fd1b67de item 20). The ranked worker's publisher installs it during the
 /// untimed gap; the PCS open fires it once, two recursive levels before the
@@ -107,7 +174,7 @@ pub(crate) fn recompute_cache_enabled() -> bool {
 /// per-call `var_os` read is noise, and re-reading keeps same-process A/B
 /// tests (set var → prove → unset → prove) possible.
 pub fn micro_stack_enabled() -> bool {
-    std::env::var_os(ENV_NO_MICRO_STACK).as_deref() != Some(std::ffi::OsStr::new("1"))
+    crate::gate_env_once!(std::env::var_os(ENV_NO_MICRO_STACK).as_deref() != Some(std::ffi::OsStr::new("1")))
 }
 
 /// Configure rayon's global thread pool to use only performance cores on
@@ -174,7 +241,7 @@ pub const ENV_NO_READY_PAUSE: &str = "FLOCK_NO_READY_PAUSE";
 /// proof through readiness to the timed proof runs exactly as it did, so the
 /// pause cannot reach the timed proof. It is a plain sleep, the same in every
 /// worker, and reads nothing but the executable name and the argument count.
-const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(2400);
+const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(2380);
 
 /// Pure selector: the pause a process takes at start-up, if any.
 fn ranked_start_pause_for(
