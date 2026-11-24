@@ -2904,6 +2904,13 @@ fn commit_with_round1_ab_precompute(
     let k_skip = zerocheck::K_SKIP;
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
+    use zerocheck::univariate_skip_optimized::Round1AbTail;
+    let gpu_tail = (ab_producer.is_some()
+        && after_ab.is_some()
+        && identity_prefix_contract.is_some()
+        && matches!(&commit_codeword, CommitCodeword::StreamedFirstPass(..))
+        && Round1AbTail::enabled())
+        .then(Round1AbTail::default);
 
     // `stripe_help` (deferred-stripe proves only): each main-pool worker of
     // the AB queue drains leftover stripe chunks once the AB queue is empty.
@@ -2918,7 +2925,7 @@ fn commit_with_round1_ab_precompute(
             // SAFETY: both buffers are live, `2^m / 8` bytes long, and
             // written only by the producer during this call.
             return unsafe {
-                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced(
+                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced_with_gpu_tail(
                     a_packed.as_ptr(),
                     b_packed.as_ptr(),
                     pcs_params.m,
@@ -2928,6 +2935,7 @@ fn commit_with_round1_ab_precompute(
                     identity_prefix_contract,
                     stripe_help,
                     producer,
+                    gpu_tail.as_ref(),
                 )
             };
         }
@@ -3026,6 +3034,16 @@ fn commit_with_round1_ab_precompute(
             flock_core::tmark::mark("commit arm root");
             if let Some(hook) = tail_fill {
                 hook(&pre.0);
+            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if let Some(tail) = &gpu_tail
+                && matches!(&pre.1.codeword, pcs::commit::CodewordBuf::Gpu(_))
+            {
+                // SAFETY: the identity receipt names this canonical
+                // witness. The streamed GPU commitment succeeded, and
+                // the AB lease retires before either join arm releases
+                // the backing borrowed from this frame.
+                unsafe { tail.at_root(z_packed) };
             }
             flock_core::tmark::mark("commit arm end");
             pre

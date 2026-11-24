@@ -53,6 +53,8 @@ use super::univariate_skip::{
 };
 
 mod kernels;
+mod gpu_ab_tail_only;
+pub use gpu_ab_tail_only::Round1AbTail;
 
 #[cfg(all(test, target_arch = "aarch64"))]
 use kernels::aarch64::{
@@ -1035,6 +1037,7 @@ pub fn precompute_round1_ab_inner_packed_padded_with_tail(
         tail,
         None,
         None,
+        None,
     )
 }
 
@@ -1314,6 +1317,34 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Round1AbProducer<'_>,
 ) -> Round1AbInner {
+    // SAFETY: this wrapper forwards the same producer contract.
+    unsafe {
+        precompute_round1_ab_inner_packed_padded_produced_with_gpu_tail(
+            a_packed, b_packed, m, k_skip, inv_table, padding, identity_prefix,
+            tail, producer, None,
+        )
+    }
+}
+
+/// The same deferred precompute with a proof-local GPU tail offer.
+///
+/// # Safety
+/// Both raw buffers and the producer have the contract of
+/// [`precompute_round1_ab_inner_packed_padded_produced`].
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn precompute_round1_ab_inner_packed_padded_produced_with_gpu_tail(
+    a_packed: *const u8,
+    b_packed: *const u8,
+    m: usize,
+    k_skip: usize,
+    inv_table: &InvNttTableByteSingleGf8,
+    padding: &PaddingSpec,
+    identity_prefix: Option<Round1PinnedOnePrefixStatement>,
+    tail: Option<&(dyn Fn() + Sync)>,
+    producer: Round1AbProducer<'_>,
+    gpu_tail: Option<&Round1AbTail>,
+) -> Round1AbInner {
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     let total_bytes = (1usize << m) / 8;
     assert!(producer.unit_bytes > 0 && producer.unit_bytes.is_multiple_of(OUTER_BYTES));
@@ -1345,6 +1376,7 @@ pub unsafe fn precompute_round1_ab_inner_packed_padded_produced(
         tail,
         fused.then_some(producer),
         None,
+        gpu_tail,
     )
 }
 
@@ -1388,6 +1420,7 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune(
         false,
         false,
         identity_prefix,
+        None,
         None,
         None,
         None,
@@ -1458,6 +1491,7 @@ pub fn precompute_round1_ab_inner_packed_padded_for_exact_tune_into(
         None,
         None,
         Some(backing),
+        None,
     );
     ExactTuneBacking(core::mem::take(&mut inner.storage))
 }
@@ -1480,7 +1514,7 @@ fn precompute_round1_ab_inner_packed_padded_with_flavor(
 ) -> Round1AbInner {
     precompute_round1_ab_inner_packed_padded_body(
         a_packed, b_packed, m, k_skip, inv_table, padding, nt, compact, true, identity_prefix,
-        None, None, None,
+        None, None, None, None,
     )
 }
 
@@ -1499,6 +1533,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Option<Round1AbProducer<'_>>,
     backing: Option<ExactTuneBacking>,
+    gpu_tail: Option<&Round1AbTail>,
 ) -> Round1AbInner {
     use rayon::prelude::*;
 
@@ -1585,8 +1620,9 @@ fn precompute_round1_ab_inner_packed_padded_body(
         eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
     }
     let compact = compact && token_hit;
-    let out_bytes: &mut [u8] =
-        unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+    // The fused drain borrows only CPU-owned output units. A tail command
+    // may write its disjoint packet while those units are live.
+    let output = crate::epool::SyncPtr(storage.as_mut_ptr().cast::<u8>());
 
     if zc_ab_pre_hetero_enabled() {
         // QS5 hetero drain: feed the precompute through the shared two-pool
@@ -1636,9 +1672,11 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     compact,
                     representation,
                     n_chunks,
-                    out_bytes,
+                    output,
+                    total_bytes,
                     tail,
                     producer,
+                    gpu_tail,
                 );
             } else {
                 precompute_ab_hetero::<{ kernels::AB_FAST_POLICY_FORCE_FAST }, false>(
@@ -1653,9 +1691,11 @@ fn precompute_round1_ab_inner_packed_padded_body(
                     compact,
                     representation,
                     n_chunks,
-                    out_bytes,
+                    output,
+                    total_bytes,
                     tail,
                     producer,
+                    gpu_tail,
                 );
             }
         } else {
@@ -1671,9 +1711,11 @@ fn precompute_round1_ab_inner_packed_padded_body(
                 compact,
                 representation,
                 n_chunks,
-                out_bytes,
+                output,
+                total_bytes,
                 tail,
                 producer,
+                gpu_tail,
             );
         }
         return Round1AbInner {
@@ -1687,6 +1729,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         producer.is_none(),
         "a deferred A/B producer requires the two-pool precompute queue"
     );
+    let out_bytes = unsafe { core::slice::from_raw_parts_mut(output.ptr(), total_bytes) };
     out_bytes
         .par_chunks_mut(OUTER_BYTES)
         .enumerate()
@@ -1799,9 +1842,11 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     compact: bool,
     representation: Round1AbRepresentation,
     n_chunks: usize,
-    out_bytes: &mut [u8],
+    out_base: crate::epool::SyncPtr<u8>,
+    output_len: usize,
     tail: Option<&(dyn Fn() + Sync)>,
     producer: Option<Round1AbProducer<'_>>,
+    gpu_tail: Option<&Round1AbTail>,
 ) {
     // This is a private specialization contract, but keep it checked in
     // release builds so a future caller cannot accidentally select
@@ -1818,7 +1863,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // generation and maximizes spatial locality; queue-level heterogeneity still
     // distributes independent slabs dynamically.
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
-    let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+    debug_assert_eq!(output_len, n_chunks * OUTER_BYTES);
     // Resolve the rollback once before worker/row dispatch; no table setup.
     let transform_trim = std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref()
         != Some(std::ffi::OsStr::new("1"));
@@ -1836,7 +1881,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         let n_units = n_chunks / unit_chunks;
         // Even, so unit pairs (2u, 2u + 1) always share a job and a thread
         // (the producer may pair them; see `zc_ab_producer_fused_active`).
-        // 42 at the ranked shape, unchanged.
+        // 32 at the ranked shape.
         let units_per_job = match chunks_per_job / unit_chunks {
             0 | 1 => 1,
             u => u & !1,
@@ -1853,58 +1898,99 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             nt,
             representation,
         );
-        crate::epool::run_hetero_chunks_stateful_with_tail(
-            n_jobs,
-            || {
-                #[cfg(target_arch = "aarch64")]
-                kernels::aarch64::ab_kara_note_worker();
-                let window_plan = ab_window_rows_worker_plan_with_trim(transform_trim);
-                (
-                    [F8::ZERO; ELL],
-                    [F8::ZERO; ELL],
-                    AbUnitScratch::new(unit_bytes),
-                    window_plan,
-                    ab_window_unit_worker_plan(window_plan).zip(window_runs),
-                    ab_mixed_row_worker_plan(),
-                )
-            },
-            |(a_col, b_col, scratch, window_plan, window_unit, mixed_plan), job| {
-                let window_plan = *window_plan;
-                let window_unit = *window_unit;
-                let mixed_plan = *mixed_plan;
-                let unit_start = job * units_per_job;
-                let unit_end = (unit_start + units_per_job).min(n_units);
-                for unit in unit_start..unit_end {
-                    let (a_unit, b_unit) =
-                        scratch.fill(unit, |a, b, primed| (producer.produce)(unit, a, b, primed));
-                    // SAFETY: this job owns the output of its units.
-                    unsafe {
-                        precompute_ab_unit::<FAST_POLICY, FORCE_DIRECT>(
-                            a_unit,
-                            b_unit,
-                            inv_table,
-                            within_outer_mask,
-                            b_med_counts,
-                            blake3_static_layout,
-                            static_b_context,
-                            nt,
-                            compact,
-                            representation,
-                            unit * unit_chunks,
-                            unit_chunks,
-                            0,
-                            out_base.ptr().add(unit * unit_chunks * OUTER_BYTES),
-                            a_col,
-                            b_col,
-                            window_plan,
-                            window_unit,
-                            mixed_plan,
-                        );
-                    }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let lease = gpu_tail.and_then(|gpu_tail| {
+            use crate::gpu_commit::r1_ab_tail_only::{FULL_BYTES, JOB_BYTES};
+            if !compact
+                || n_jobs != 2048
+                || output_len != FULL_BYTES
+                || unit_bytes * units_per_job != JOB_BYTES
+                || !representation.omits_output_window()
+                || !core::ptr::eq(inv_table, InvNttTableByteSingleGf8::cached_standard_k6())
+                || rayon::current_num_threads() <= 1
+            {
+                return None;
+            }
+            let registrations = R2_AB_REBUILDS.try_lock().ok()?;
+            let registered = registrations.iter().find(|r| {
+                r.a == a_packed.as_ptr() as usize
+                    && r.b == b_packed.as_ptr() as usize
+                    && r.len == output_len
+                    && r.published > 0 && r.published < r.len
+                    && r.rebuild_from == r.published
+                    && r.published.is_multiple_of(JOB_BYTES)
+            })?;
+            let published = registered.published / JOB_BYTES;
+            drop(registrations);
+            gpu_tail.arm(
+                out_base.ptr() as usize, output_len, published, n_jobs,
+                representation.omits_mixed_ones(),
+            )
+        });
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = gpu_tail;
+        type Worker = ([F8; ELL], [F8; ELL], AbUnitScratch, Option<AbWindowRows>, Option<AbWindowUnitRun>, u8);
+        let init = || {
+            #[cfg(target_arch = "aarch64")]
+            kernels::aarch64::ab_kara_note_worker();
+            let window_plan = ab_window_rows_worker_plan_with_trim(transform_trim);
+            (
+                [F8::ZERO; ELL],
+                [F8::ZERO; ELL],
+                AbUnitScratch::new(unit_bytes),
+                window_plan,
+                ab_window_unit_worker_plan(window_plan).zip(window_runs),
+                ab_mixed_row_worker_plan(),
+            )
+        };
+        let work = |(a_col, b_col, scratch, window_plan, window_unit, mixed_plan): &mut Worker, job: usize| {
+            let window_plan = *window_plan;
+            let window_unit = *window_unit;
+            let mixed_plan = *mixed_plan;
+            let unit_start = job * units_per_job;
+            let unit_end = (unit_start + units_per_job).min(n_units);
+            for unit in unit_start..unit_end {
+                let (a_unit, b_unit) =
+                    scratch.fill(unit, |a, b, primed| (producer.produce)(unit, a, b, primed));
+                // SAFETY: this job owns the output of its units.
+                unsafe {
+                    precompute_ab_unit::<FAST_POLICY, FORCE_DIRECT>(
+                        a_unit,
+                        b_unit,
+                        inv_table,
+                        within_outer_mask,
+                        b_med_counts,
+                        blake3_static_layout,
+                        static_b_context,
+                        nt,
+                        compact,
+                        representation,
+                        unit * unit_chunks,
+                        unit_chunks,
+                        0,
+                        out_base.ptr().add(unit * unit_chunks * OUTER_BYTES),
+                        a_col,
+                        b_col,
+                        window_plan,
+                        window_unit,
+                        mixed_plan,
+                    );
                 }
-            },
-            tail,
-        );
+            }
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(lease) = lease {
+            crate::epool::run_hetero_chunks_stateful_with_cursor(n_jobs, init, work, tail, lease.cursor());
+            if let Some(redo) = lease.finish() {
+                // No GPU writer remains. Replay the complete packet with
+                // the ordinary CPU transform and stripe emission.
+                crate::epool::run_hetero_chunks_stateful_with_tail(
+                    redo.len(), init, |state, job| work(state, redo.start + job), None,
+                );
+            }
+            return;
+        }
+        crate::epool::run_hetero_chunks_stateful_with_tail(n_jobs, init, work, tail);
         return;
     }
     let n_jobs = n_chunks.div_ceil(chunks_per_job);
@@ -4237,6 +4323,15 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 pub fn ab_completion_gpu_prewarm() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
+        if Round1AbTail::enabled() {
+            if crate::gpu_commit::pipe_fanout_enabled() {
+                spawn_counted_r1_tail();
+            } else {
+                let _ = std::thread::Builder::new()
+                    .name("flock-r1-tail-only".into())
+                    .spawn(crate::gpu_commit::r1_ab_tail_only::prewarm);
+            }
+        }
         let ab = std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1"))
             && crate::gpu_commit::gpu_zc_ab_completion_share() != 0;
         let k = crate::gpu_commit::zc_k_prewarm_wanted();
@@ -4284,6 +4379,41 @@ pub fn ab_completion_gpu_prewarm() {
             let _ = std::thread::Builder::new()
                 .name("flock-zcr2cs-prewarm".into())
                 .spawn(crate::gpu_commit::zc_r2_cs_prewarm);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn spawn_counted_r1_tail() -> bool {
+    static STARTED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut started = STARTED.lock().unwrap_or_else(|e| e.into_inner());
+    if *started {
+        return false;
+    }
+    // Record the start only after the helper is counted. On a spawn
+    // failure the normal prove-entry hook can try again.
+    *started = crate::gpu_commit::spawn_build("flock-r1-tail-only", || {
+        crate::gpu_commit::r1_ab_tail_only::prewarm();
+        if crate::gpu_commit::gpu_zc_ab_debug() || crate::tmark::on() {
+            eprintln!("[r1-tail-only] prewarm finished_ns={}", crate::tmark::now_ns());
+        }
+    });
+    *started
+}
+
+/// Start the same counted ranked R1 tail helper during setup.
+#[doc(hidden)]
+pub fn ranked_r1_tail_prewarm_early() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if Round1AbTail::enabled()
+        && crate::gpu_commit::pipe_fanout_enabled()
+        && std::env::var_os("FLOCK_NO_R1_GPU_AB_TAIL_EARLY_PREWARM").is_none()
+    {
+        let trace = crate::gpu_commit::gpu_zc_ab_debug() || crate::tmark::on();
+        let request = trace.then(crate::tmark::now_ns);
+        let started = spawn_counted_r1_tail();
+        if let Some(request) = request {
+            eprintln!("[r1-tail-only] setup spawn={started} request_ns={request}");
         }
     }
 }
@@ -7385,9 +7515,11 @@ mod tests {
                                     false,
                                     representation,
                                     n_chunks,
-                                    out,
+                                    crate::epool::SyncPtr(out.as_mut_ptr()),
+                                    out.len(),
                                     None,
                                     producer,
+                                    None,
                                 )
                             };
                         }
