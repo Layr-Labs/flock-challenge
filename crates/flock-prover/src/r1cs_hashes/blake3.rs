@@ -5278,7 +5278,7 @@ impl Blake3Setup {
             && self.pcs_params.log_inv_rate == 1
             && self.pcs_params.log_batch_size == 6
             && self.pcs_params.profile == flock_core::pcs::ligerito::LigeritoProfile::Fast
-            && std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none()
+            && flock_core::env_once_sweep!(std::env::var_os("FLOCK_NO_BLAKE3_REVERSE_LINCHECK").is_none())
     }
 
     #[inline]
