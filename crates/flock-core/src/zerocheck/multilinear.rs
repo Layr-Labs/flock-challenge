@@ -166,7 +166,7 @@ use kernels::x86_64::{fold_and_message_x86_avx512, fold_round2_pair_x86_unchecke
 /// value-forced work). Read once per phase call, off the hot path.
 #[cfg(target_arch = "aarch64")]
 fn r2_degen_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_NO_R2_DEGEN").is_none_or(|v| v != *"1"))
 }
 
 /// Kill switch for the peeled first group of the round-two Horner kernel:
@@ -174,7 +174,7 @@ fn r2_degen_enabled() -> bool {
 /// zero accumulators in front of every window's first group. Same outputs.
 #[cfg(target_arch = "aarch64")]
 fn r2_first_shift_skip_enabled() -> bool {
-    std::env::var_os("FLOCK_OFF_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_OFF_R2_FIRST_SHIFT_SKIP").is_none_or(|v| v != *"1"))
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -188,7 +188,7 @@ fn r2_prescale_enabled() -> bool {
 /// restores the one-body compact kernel. Same stores and slots either way.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 fn cascade_k_fused_enabled() -> bool {
-    std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_OFF_ZC_K_FUSED").is_none_or(|v| v != *"1"))
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -203,7 +203,7 @@ fn zc_k_one_table_enabled() -> bool {
 /// and padded group executes the same arithmetic and stores as the oracle.
 #[cfg(target_arch = "aarch64")]
 fn r2_periodic_padding_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_NO_ZC_R2_PERIODIC").is_none_or(|v| v != *"1"))
 }
 
 /// Kill switch for the round-two dead-pair skip: `FLOCK_NO_R2_DEADPAIR_SKIP=1`
@@ -212,7 +212,7 @@ fn r2_periodic_padding_enabled() -> bool {
 /// zeros the K pass substitutes exactly. Read once per phase call.
 #[cfg(target_arch = "aarch64")]
 fn r2_dead_pair_skip_enabled() -> bool {
-    std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1")
+    crate::gate_env_once!(std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none_or(|v| v != *"1"))
 }
 
 /// Kill switch for the tail-compacted round-two compact state
@@ -3867,7 +3867,7 @@ fn fold2_compact_and_round45_into_packed_b(
         one_table && kernels::aarch64::zc_k_xb_enabled() && kernels::aarch64::k_full_xb_weights(eq_lo, lo_size);
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let k_xb = false;
-    if std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some() && one_table {
+    if crate::gate_env_once!(std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some()) && one_table {
         let n_groups = lo_size / 2;
         let armed = k_xb;
         let first_window_ok = (0..n_groups.min(8)).all(|j| {
@@ -5181,7 +5181,7 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     let eq_hi = &eq.hi;
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
+    let nt_stores = out_n >= (1usize << 20) && crate::gate_env_once!(std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none());
     let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
     // The group weights `eq_lo[4y + 3]` as prepared pairs, one table per
     // pass shared by every chunk.
