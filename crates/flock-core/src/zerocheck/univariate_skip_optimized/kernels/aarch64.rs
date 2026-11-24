@@ -3750,7 +3750,8 @@ pub(crate) fn ab_kara_enabled() -> bool {
 }
 
 /// Second switch: exactly `FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN=1` lets the
-/// efficiency-core helper threads use the Karatsuba apply as well.
+/// helper threads use the Karatsuba apply as well. Set it to `0` to keep
+/// the plain apply. The ranked macOS worker defaults to Karatsuba.
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ENV_NO_ZC_AB_KARA_HELPER_PLAIN: &str = "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN";
 
@@ -3761,11 +3762,10 @@ thread_local! {
 }
 
 /// Called by every worker of an AB precompute queue before its first job.
-/// Threads of the efficiency-core helper pool (`flock-ecore-*`, see
-/// `epool`) keep the plain apply: the Karatsuba form trades loads for
-/// instructions, which pays on a core that is bound by its three load
-/// units and loses on a narrower core with two (measured: about 12% slower
-/// there). The choice is per thread and both forms write the same bytes.
+/// The helper pool names its threads `flock-ecore-*` (see `epool`). Those
+/// threads can also run on performance cores. The Karatsuba form saves load
+/// work, while the plain form can be faster on narrower cores. Both write
+/// the same bytes.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn ab_kara_note_worker() {
     static HELPER_PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3774,8 +3774,10 @@ pub(crate) fn ab_kara_note_worker() {
         .is_some_and(|name| name.starts_with("flock-ecore-"));
     let plain = helper
         && *HELPER_PLAIN.get_or_init(|| {
-            std::env::var_os(ENV_NO_ZC_AB_KARA_HELPER_PLAIN).as_deref()
-                != Some(std::ffi::OsStr::new("1"))
+            match std::env::var_os(ENV_NO_ZC_AB_KARA_HELPER_PLAIN).as_deref() {
+                Some(value) => value != std::ffi::OsStr::new("1"),
+                None => !(cfg!(target_os = "macos") && crate::is_ranked_worker_process()),
+            }
         });
     AB_KARA_THREAD_PLAIN.with(|cell| cell.set(plain));
 }
