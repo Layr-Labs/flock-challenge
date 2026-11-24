@@ -3112,7 +3112,7 @@ fn transpose_forward_ntt_fused_3layer(
     // Read once per group, not per product; an in-process diagnostic can ablate
     // this fold without changing the transpose schedule or prepared twiddles.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
-    let pmull_fold = std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none();
+    let pmull_fold = crate::gate_env_once!(std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none());
 
     type Twiddle = Fused3Twiddle;
 
