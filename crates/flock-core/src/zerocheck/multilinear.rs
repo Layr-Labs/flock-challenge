@@ -3867,6 +3867,10 @@ fn fold2_compact_and_round45_into_packed_b(
         one_table && kernels::aarch64::zc_k_xb_enabled() && kernels::aarch64::k_full_xb_weights(eq_lo, lo_size);
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
     let k_xb = false;
+    // `FLOCK_NO_ZC_K_XB_ONE_SKIP=1` (exactly): the packed walk scales its
+    // window-position-0 a rows by `x^0 = 1` again (the record's instance).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let k_one_skip = k_xb && kernels::aarch64::zc_k_xb_one_skip_enabled();
     if std::env::var_os("FLOCK_ZC_K_XB_DEBUG").is_some() && one_table {
         let n_groups = lo_size / 2;
         let armed = k_xb;
@@ -4005,13 +4009,18 @@ fn fold2_compact_and_round45_into_packed_b(
                             )
                         }
                     } else {
-                        if k_xb {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true>(
+                        if k_one_skip {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, true>(
+                                t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
+                                compact.tail_compact, compact.head_compact, compact.head_b,
+                            )
+                        } else if k_xb {
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, true, false>(
                                 t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
                                 compact.tail_compact, compact.head_compact, compact.head_b,
                             )
                         } else {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false, false>(
                                 t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, bpack,
                                 compact.tail_compact, compact.head_compact, compact.head_b,
                             )
@@ -4024,12 +4033,12 @@ fn fold2_compact_and_round45_into_packed_b(
                 #[cfg(target_feature = "sha3")]
                 (true, true) if one_table => {
                     if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, true, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             compact.tail_compact, compact.head_compact, compact.head_b,
                         );
                     } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             compact.tail_compact, compact.head_compact, compact.head_b,
                         );
@@ -4038,12 +4047,12 @@ fn fold2_compact_and_round45_into_packed_b(
                 #[cfg(target_feature = "sha3")]
                 (true, false) if one_table => {
                     if k_xb {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, true, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             false, false, F128::ZERO,
                         );
                     } else {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false, false>(
                             t1, rho2, anchors, deltas, a_ptr, b_ptr, prep_ptr, lo_size, degen, out_ptr, false,
                             false, false, F128::ZERO,
                         );
