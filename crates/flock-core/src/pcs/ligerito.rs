@@ -5906,6 +5906,8 @@ fn ligero_commit_select(
     let level_opt_out = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
         (16, 3, 2) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1"),
         (13, 3, 3) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2"),
+        (10, 3, 4) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L3"),
+        (7, 3, 5) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L4"),
         _ => None,
     };
     let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
@@ -6189,6 +6191,8 @@ fn ligero_commit_impl_view(
         let level = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
             (16, 3, 2) => Some("L1"),
             (13, 3, 3) => Some("L2"),
+            (10, 3, 4) => Some("L3"),
+            (7, 3, 5) => Some("L4"),
             _ => None,
         };
         if let Some(level) = level {
@@ -6753,6 +6757,29 @@ fn round_msg_and_eval_lsb_factorized_eq_split(
             s += s_chunk * hi_weight;
         }
         (a, s)
+    } else if eq_hi.len() >= 16 && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+        let chunk_len = 2 * eq_lo.len();
+        let n_chunks = eq_hi.len();
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n_chunks, |hi| {
+            let start = hi * chunk_len;
+            let (a_chunk, s_chunk) =
+                crate::field::f128_slice::round0_factorized_eq(&f[start..start + chunk_len], eq_lo);
+            let hi_weight = eq_hi[hi];
+            // SAFETY: each `hi` is claimed once and writes its disjoint partial slot.
+            unsafe {
+                partials_base
+                    .ptr()
+                    .add(hi)
+                    .write((a_chunk * hi_weight, s_chunk * hi_weight));
+            }
+        });
+        partials
+            .into_iter()
+            .fold((F128::ZERO, F128::ZERO), |(a_0, s_0), (a_1, s_1)| {
+                (a_0 + a_1, s_0 + s_1)
+            })
     } else {
         f.par_chunks(2 * eq_lo.len())
             .zip(eq_hi.par_iter())
@@ -13096,7 +13123,8 @@ mod tests {
     }
 
     /// The recursive from-message first pass preserves every encoded element
-    /// and every node of the ordinary Merkle tree for both production rates.
+    /// and every node of the ordinary Merkle tree for all ranked recursive
+    /// shapes (L1..L4).
     #[test]
     fn recursive_from_message_commit_matches_replica_oracle() {
         use crate::challenger::Challenger;
@@ -13104,6 +13132,8 @@ mod tests {
         for (log_msg_cols, log_inv_rate, seed) in [
             (16usize, 2usize, 0xF14C_0002_u64),
             (13usize, 3usize, 0xF14C_0003_u64),
+            (10usize, 4usize, 0xF14C_0004_u64),
+            (7usize, 5usize, 0xF14C_0005_u64),
         ] {
             let log_num_interleaved = 3usize;
             let mut rng = crate::challenger::RandomChallenger::new(seed);
@@ -13127,9 +13157,35 @@ mod tests {
                 HashKind::Blake3,
                 true,
             );
-            assert_eq!(fused.mat, ordinary.mat, "encoded matrix changed");
-            assert_eq!(fused.tree, ordinary.tree, "flat Merkle tree changed");
-            assert_eq!(fused.root(), ordinary.root(), "Merkle root changed");
+            let dispatched = ligero_commit(
+                &poly,
+                log_msg_cols,
+                log_num_interleaved,
+                log_inv_rate,
+                &ntt,
+                HashKind::Blake3,
+            );
+            assert_eq!(
+                fused.mat, ordinary.mat,
+                "encoded matrix changed at ({log_msg_cols}, {log_num_interleaved}, {log_inv_rate})"
+            );
+            assert_eq!(
+                fused.tree, ordinary.tree,
+                "flat Merkle tree changed at ({log_msg_cols}, {log_num_interleaved}, {log_inv_rate})"
+            );
+            assert_eq!(
+                fused.root(),
+                ordinary.root(),
+                "Merkle root changed at ({log_msg_cols}, {log_num_interleaved}, {log_inv_rate})"
+            );
+            assert_eq!(
+                dispatched.mat, ordinary.mat,
+                "dispatched matrix changed at ({log_msg_cols}, {log_num_interleaved}, {log_inv_rate})"
+            );
+            assert_eq!(
+                dispatched.tree, ordinary.tree,
+                "dispatched tree changed at ({log_msg_cols}, {log_num_interleaved}, {log_inv_rate})"
+            );
         }
     }
 

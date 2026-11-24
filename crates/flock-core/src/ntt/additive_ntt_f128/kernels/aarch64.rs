@@ -671,6 +671,7 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         let ext = use_const_ext();
+        let absorb = use_ntt_absorb();
         let prep: [Prep; 7] = core::array::from_fn(|i| three_coeffs(t[i]));
         let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
         let step = eighth * num_ntts;
@@ -685,6 +686,8 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
                 if ext {
                     if ZERO_ROOT {
                         fused3_zero_root_prepared_q(&mut v, prep[2], prep[4], prep[5], prep[6]);
+                    } else if absorb {
+                        fused3_prepared_absorb_q(&mut v, &prep);
                     } else {
                         fused3_prepared_q(&mut v, &prep);
                     }
@@ -911,7 +914,6 @@ unsafe fn fused3_prepared_q(
     ); 7],
 ) {
     unsafe {
-        use core::arch::aarch64::*;
         let (a, b, p0) = three_lazy_zero(v[0], v[4], t[0]);
         v[0] = a;
         v[4] = b;
@@ -1046,29 +1048,29 @@ unsafe fn fused3_zero_root_prepared_q(
     t6: Prep,
 ) {
     unsafe {
-        use core::arch::aarch64::*;
+        use core::arch::aarch64::veorq_u64;
         for i in 0..4 {
             v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
         }
         for i in 0..2 {
             v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
         }
-        let (a, b, p4) = three_lazy_zero(v[4], v[6], t2);
-        v[4] = a;
-        v[6] = b;
-        let (a, b) = three_fold_zero(v[5], v[7], t2);
-        v[5] = a;
-        v[7] = b;
+        let v6_old = v[6];
+        let a4 = fused_pmull_hi_acc(fused_pmull_lo_acc(v[4], v6_old, t2.0), v6_old, t2.0);
+        let p4 = cross_sum_q(v6_old, t2.1);
+        let (a5, b7) = three_fold_zero(v[5], v[7], t2);
         v[1] = butterfly_zero_q(v[0], v[1]);
-        let (a, b) = three_fold_zero(v[2], v[3], t4);
-        v[2] = a;
-        v[3] = b;
-        let (a, b) = three_fold(v[4], v[5], t5, p4);
-        v[4] = a;
-        v[5] = b;
-        let (a, b) = three_fold(v[6], v[7], t6, p4);
-        v[6] = a;
-        v[7] = b;
+        let (a2, b3) = three_fold_zero(v[2], v[3], t4);
+        v[2] = a2;
+        v[3] = b3;
+        let (o4, o5) = three_fold(a4, a5, t5, p4);
+        v[4] = o4;
+        v[5] = o5;
+        let l6 = fused_pmull_hi_acc(fused_pmull_lo_acc(a4, b7, t6.0), b7, t6.0);
+        let m6 = fused_pmull_hi_acc(fused_pmull_lo_acc(p4, b7, t6.1), b7, t6.1);
+        let o6 = fold_x64_plus_into(l6, m6, v6_old);
+        v[6] = o6;
+        v[7] = veorq_u64(b7, o6);
     }
 }
 
@@ -1174,6 +1176,40 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
     }
 }
 
+/// Prepared vector-resident zero-root row with hoisted twiddle coefficients and
+/// shared negative-offset addressing.
+#[target_feature(enable = "aes")]
+#[inline]
+unsafe fn butterfly_fused_3layer_zero_root_row_with_const_q(
+    ptr: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    lanes: usize,
+    r: usize,
+    p2: Prep,
+    p4: Prep,
+    p5: Prep,
+    p6: Prep,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let step = eighth * num_ntts;
+        let ends: [*mut u8; 8] =
+            core::array::from_fn(|i| ptr.add(r * num_ntts + i * step + lanes).cast::<u8>());
+        let mut off = -((lanes * core::mem::size_of::<F128>()) as isize);
+        while off != 0 {
+            let mut v: [uint64x2_t; 8] =
+                core::array::from_fn(|i| vld1q_u64(ends[i].offset(off).cast::<u64>()));
+            fused3_zero_root_prepared_q(&mut v, p2, p4, p5, p6);
+            // v[0] is unchanged by all three layers; skip its store.
+            for (i, value) in v.into_iter().enumerate().skip(1) {
+                vst1q_u64(ends[i].offset(off).cast::<u64>(), value);
+            }
+            off = next_lane_off(off);
+        }
+    }
+}
+
 /// Vector-resident twin of `portable::butterfly_fused_3layer_zero_root_row`.
 ///
 /// Twiddles 0, 1 and 3 are zero on the root spine, so those butterflies are
@@ -1196,24 +1232,14 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
+        let step = eighth * num_ntts;
         for lane in 0..lanes {
             let base = ptr.add(r * num_ntts + lane);
-            let step = eighth * num_ntts;
 
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
 
-            if use_const_ext() {
-                fused3_zero_root_prepared_q(
-                    &mut v,
-                    three_coeffs(t2),
-                    three_coeffs(t4),
-                    three_coeffs(t5),
-                    three_coeffs(t6),
-                );
-            } else {
-                fused3_zero_root_q(&mut v, t2, t4, t5, t6);
-            }
+            fused3_zero_root_q(&mut v, t2, t4, t5, t6);
 
             // v[0] is unchanged by all three layers; skip its store.
             for (i, value) in v.iter().enumerate().skip(1) {
@@ -1241,9 +1267,21 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_row(
         let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
         let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
         let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
-        butterfly_fused_3layer_zero_root_row_with_q(
-            ptr, eighth, num_ntts, lanes, r, t2, t4, t5, t6,
-        );
+        if use_const_ext() {
+            let (p2, p4, p5, p6) = (
+                three_coeffs(t2),
+                three_coeffs(t4),
+                three_coeffs(t5),
+                three_coeffs(t6),
+            );
+            butterfly_fused_3layer_zero_root_row_with_const_q(
+                ptr, eighth, num_ntts, lanes, r, p2, p4, p5, p6,
+            );
+        } else {
+            butterfly_fused_3layer_zero_root_row_with_q(
+                ptr, eighth, num_ntts, lanes, r, t2, t4, t5, t6,
+            );
+        }
     }
 }
 
@@ -1265,10 +1303,24 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
         let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
         let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
         let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
-        for r in row_start..row_end {
-            butterfly_fused_3layer_zero_root_row_with_q(
-                ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
+        if use_const_ext() {
+            let (p2, p4, p5, p6) = (
+                three_coeffs(t2),
+                three_coeffs(t4),
+                three_coeffs(t5),
+                three_coeffs(t6),
             );
+            for r in row_start..row_end {
+                butterfly_fused_3layer_zero_root_row_with_const_q(
+                    ptr, eighth, num_ntts, num_ntts, r, p2, p4, p5, p6,
+                );
+            }
+        } else {
+            for r in row_start..row_end {
+                butterfly_fused_3layer_zero_root_row_with_q(
+                    ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
+                );
+            }
         }
     }
 }
@@ -1299,10 +1351,24 @@ pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
             debug_assert_eq!(twiddles[1], F128::ZERO);
             debug_assert_eq!(twiddles[3], F128::ZERO);
             let (t2, t4, t5, t6) = (ld(2), ld(4), ld(5), ld(6));
-            for r in 0..eighth {
-                butterfly_fused_3layer_zero_root_row_with_q(
-                    ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
+            if use_const_ext() {
+                let (p2, p4, p5, p6) = (
+                    three_coeffs(t2),
+                    three_coeffs(t4),
+                    three_coeffs(t5),
+                    three_coeffs(t6),
                 );
+                for r in 0..eighth {
+                    butterfly_fused_3layer_zero_root_row_with_const_q(
+                        ptr, eighth, num_ntts, num_ntts, r, p2, p4, p5, p6,
+                    );
+                }
+            } else {
+                for r in 0..eighth {
+                    butterfly_fused_3layer_zero_root_row_with_q(
+                        ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
+                    );
+                }
             }
         } else {
             let t = [ld(0), ld(1), ld(2), ld(3), ld(4), ld(5), ld(6)];
@@ -1572,7 +1638,6 @@ unsafe fn butterfly_fused_2layer_low_lazy(
         let to = vdupq_n_u64(t_outer.lo);
         let ta = vdupq_n_u64(t_inner_a.lo);
         let tb = vdupq_n_u64(t_inner_b.lo);
-        let zero = vdupq_n_u64(0);
         let n = a.len();
         let [ea, eb, ec, ed] = row_ends([a, b, c, d]);
         let mut off = -((n * core::mem::size_of::<F128>()) as isize);
@@ -1581,10 +1646,26 @@ unsafe fn butterfly_fused_2layer_low_lazy(
             let xb = vld1q_u64(eb.offset(off).cast::<u64>());
             let xc = vld1q_u64(ec.offset(off).cast::<u64>());
             let xd = vld1q_u64(ed.offset(off).cast::<u64>());
-            let (na, nc, p) = butterfly_low_lazy_q(xa, xc, to, zero);
-            let (nb, nd) = butterfly_low_fold_q(xb, xd, to, zero);
+            let p = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(xc),
+                vreinterpretq_p64_u64(to),
+            ));
+            let na = fused_pmull_lo_acc(xa, xc, to);
+            let nb_lo = fused_pmull_lo_acc(xb, xd, to);
+            let nb_hi = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(xd),
+                vreinterpretq_p64_u64(to),
+            ));
+            let nb = fold_x64_into(nb_lo, nb_hi);
+            let nd = veorq_u64(xd, nb);
             let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
-            let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
+            let lc = fused_pmull_lo_acc(na, nd, tb);
+            let hc = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(nd),
+                vreinterpretq_p64_u64(tb),
+            ));
+            let fc = fold_x64_plus_into(lc, veorq_u64(hc, p), xc);
+            let fd = veorq_u64(nd, fc);
             vst1q_u64(ea.offset(off).cast::<u64>(), fa);
             vst1q_u64(eb.offset(off).cast::<u64>(), fb);
             vst1q_u64(ec.offset(off).cast::<u64>(), fc);
@@ -1723,25 +1804,29 @@ pub(super) unsafe fn butterfly_fused_2layer_low_inner_rows(
         let (top_half, bot_half) = block.split_at_mut(2 * stride);
         let (q1, q2) = top_half.split_at_mut(stride);
         let (q3, q4) = bot_half.split_at_mut(stride);
-        for (((a, b), c), d) in q1
-            .iter_mut()
-            .zip(q2.iter_mut())
-            .zip(q3.iter_mut())
-            .zip(q4.iter_mut())
-        {
-            let xa = vld1q_u64((&raw const *a).cast::<u64>());
-            let xb = vld1q_u64((&raw const *b).cast::<u64>());
-            let xc = vld1q_u64((&raw const *c).cast::<u64>());
-            let xd = vld1q_u64((&raw const *d).cast::<u64>());
-            let (na, nc, p) = const_lazy_zero(xa, xc, to);
+        let [ea, eb, ec, ed] = row_ends([q1, q2, q3, q4]);
+        let mut off = -((stride * core::mem::size_of::<F128>()) as isize);
+        while off != 0 {
+            let xa = vld1q_u64(ea.offset(off).cast::<u64>());
+            let xb = vld1q_u64(eb.offset(off).cast::<u64>());
+            let xc = vld1q_u64(ec.offset(off).cast::<u64>());
+            let xd = vld1q_u64(ed.offset(off).cast::<u64>());
+            let (na, _, p) = const_lazy_zero(xa, xc, to);
             let (nb, nd) = const_fold_zero(xb, xd, to);
-            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
+            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b; absorb xc into fc fold.
             let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
-            let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
-            vst1q_u64((&raw mut *a).cast::<u64>(), fa);
-            vst1q_u64((&raw mut *b).cast::<u64>(), fb);
-            vst1q_u64((&raw mut *c).cast::<u64>(), fc);
-            vst1q_u64((&raw mut *d).cast::<u64>(), fd);
+            let lc = fused_pmull_lo_acc(na, nd, tb);
+            let hc = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
+                vreinterpretq_p64_u64(nd),
+                vreinterpretq_p64_u64(tb),
+            ));
+            let fc = fold_x64_plus_into(lc, veorq_u64(hc, p), xc);
+            let fd = veorq_u64(nd, fc);
+            vst1q_u64(ea.offset(off).cast::<u64>(), fa);
+            vst1q_u64(eb.offset(off).cast::<u64>(), fb);
+            vst1q_u64(ec.offset(off).cast::<u64>(), fc);
+            vst1q_u64(ed.offset(off).cast::<u64>(), fd);
+            off = next_lane_off(off);
         }
     }
 }

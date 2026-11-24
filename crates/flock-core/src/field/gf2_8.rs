@@ -150,26 +150,41 @@ pub mod neon {
     use core::arch::aarch64::*;
     use core::mem::transmute;
 
+    /// Subset sums of x^8..x^11 mod p = 0x1b, 0x36, 0x6c, 0xd8.
+    const RED_LO: [u8; 16] = [
+        0x00, 0x1b, 0x36, 0x2d, 0x6c, 0x77, 0x5a, 0x41, 0xd8, 0xc3, 0xee, 0xf5, 0xb4, 0xaf, 0x82,
+        0x99,
+    ];
+    /// Subset sums of x^12..x^15 mod p = 0xab, 0x4d, 0x9a, 0x2f.
+    const RED_HI: [u8; 16] = [
+        0x00, 0xab, 0x4d, 0xe6, 0x9a, 0x31, 0xd7, 0x7c, 0x2f, 0x84, 0x62, 0xc9, 0xb5, 0x1e, 0xf8,
+        0x53,
+    ];
+    /// Subset sums of x^16..x^19 mod p = 0x5e, 0xbc, 0x63, 0xc6.
+    const RED_X16: [u8; 16] = [
+        0x00, 0x5e, 0xbc, 0xe2, 0x63, 0x3d, 0xdf, 0x81, 0xc6, 0x98, 0x7a, 0x24, 0xa5, 0xfb, 0x19,
+        0x47,
+    ];
+
+    #[cfg(target_feature = "sha3")]
+    #[inline(always)]
+    unsafe fn xor3_u8(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uint8x16_t {
+        unsafe { veor3q_u8(a, b, c) }
+    }
+
+    #[cfg(not(target_feature = "sha3"))]
+    #[inline(always)]
+    unsafe fn xor3_u8(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uint8x16_t {
+        unsafe { veorq_u8(a, veorq_u8(b, c)) }
+    }
+
     /// Fold the coefficients at degrees 8..15 below degree 8 modulo the AES
     /// polynomial, for 16 high bytes in parallel.
-    ///
-    /// The tables contain the subset sums of:
-    /// - x^8..x^11 mod p = 0x1b, 0x36, 0x6c, 0xd8
-    /// - x^12..x^15 mod p = 0xab, 0x4d, 0x9a, 0x2f
     ///
     /// # Safety
     /// Uses `core::arch::aarch64` NEON intrinsics; only call on `aarch64`.
     #[inline]
     pub(crate) unsafe fn gf8_fold_high_bytes_vec16(ch: uint8x16_t) -> uint8x16_t {
-        const RED_LO: [u8; 16] = [
-            0x00, 0x1b, 0x36, 0x2d, 0x6c, 0x77, 0x5a, 0x41, 0xd8, 0xc3, 0xee, 0xf5, 0xb4, 0xaf,
-            0x82, 0x99,
-        ];
-        const RED_HI: [u8; 16] = [
-            0x00, 0xab, 0x4d, 0xe6, 0x9a, 0x31, 0xd7, 0x7c, 0x2f, 0x84, 0x62, 0xc9, 0xb5, 0x1e,
-            0xf8, 0x53,
-        ];
-
         unsafe {
             let lo_nibble = vandq_u8(ch, vdupq_n_u8(0x0f));
             let hi_nibble = vshrq_n_u8::<4>(ch);
@@ -193,8 +208,58 @@ pub mod neon {
         unsafe {
             let cl = vuzp1q_u8(c0, c1); // low bytes of all 16 products
             let ch = vuzp2q_u8(c0, c1); // high bytes of all 16 products
+            let lo_nibble = vandq_u8(ch, vdupq_n_u8(0x0f));
+            let hi_nibble = vshrq_n_u8::<4>(ch);
+            let red_lo = vld1q_u8(RED_LO.as_ptr());
+            let red_hi = vld1q_u8(RED_HI.as_ptr());
+            xor3_u8(cl, vqtbl1q_u8(red_lo, lo_nibble), vqtbl1q_u8(red_hi, hi_nibble))
+        }
+    }
 
-            veorq_u8(cl, gf8_fold_high_bytes_vec16(ch))
+    /// Reduce 16 polynomial products multiplied by `x^4` modulo
+    /// `x^8 + x^4 + x^3 + x + 1`, returning 16 reduced GF(2^8) values
+    /// `x^4 * (cl + x^8 * ch) mod p`.
+    ///
+    /// # Safety
+    /// Uses `core::arch::aarch64` NEON intrinsics; only call on `aarch64`.
+    #[inline]
+    pub unsafe fn gf8_reduce_x4_vec16(c0: uint8x16_t, c1: uint8x16_t) -> uint8x16_t {
+        unsafe {
+            let cl = vuzp1q_u8(c0, c1);
+            let ch = vuzp2q_u8(c0, c1);
+            let cl_shl4 = vshlq_n_u8::<4>(cl);
+            let cl_hi = vshrq_n_u8::<4>(cl);
+            let ch_lo = vandq_u8(ch, vdupq_n_u8(0x0f));
+            let ch_hi = vshrq_n_u8::<4>(ch);
+            let red_lo = vld1q_u8(RED_LO.as_ptr());
+            let red_hi = vld1q_u8(RED_HI.as_ptr());
+            let red_x16 = vld1q_u8(RED_X16.as_ptr());
+            let t0 = vqtbl1q_u8(red_lo, cl_hi);
+            let t1 = vqtbl1q_u8(red_hi, ch_lo);
+            let t2 = vqtbl1q_u8(red_x16, ch_hi);
+            veorq_u8(xor3_u8(cl_shl4, t0, t1), t2)
+        }
+    }
+
+    /// Reduce 16 polynomials `x^4 * (cl + x^8 * ch)` modulo
+    /// `x^8 + x^4 + x^3 + x + 1` when every lane of `ch` has zero upper nibble
+    /// (`ch < 16`, e.g. degree <= 10 sums `a4 + x a5 + x^2 a6 + x^3 a7` where
+    /// `ch < 8`).
+    ///
+    /// # Safety
+    /// Uses `core::arch::aarch64` NEON intrinsics; only call on `aarch64`, and
+    /// every lane of `ch` must be `< 16`.
+    #[inline]
+    pub(crate) unsafe fn gf8_reduce_x4_split_low_ch_vec16(
+        cl: uint8x16_t,
+        ch: uint8x16_t,
+    ) -> uint8x16_t {
+        unsafe {
+            let cl_shl4 = vshlq_n_u8::<4>(cl);
+            let cl_hi = vshrq_n_u8::<4>(cl);
+            let red_lo = vld1q_u8(RED_LO.as_ptr());
+            let red_hi = vld1q_u8(RED_HI.as_ptr());
+            xor3_u8(cl_shl4, vqtbl1q_u8(red_lo, cl_hi), vqtbl1q_u8(red_hi, ch))
         }
     }
 
@@ -383,6 +448,66 @@ mod tests {
                 "high bytes {base:#04x}..={:#04x}",
                 base + 15
             );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_gf8_reduce_x4_vec16_matches_scalar_exhaustive() {
+        use core::arch::aarch64::*;
+        use core::mem::transmute;
+
+        for base in (0u32..65536).step_by(16) {
+            let mut c0_arr = [0u16; 8];
+            let mut c1_arr = [0u16; 8];
+            let mut expected = [0u8; 16];
+            for lane in 0..16 {
+                let c = (base + lane as u32) as u16;
+                if lane < 8 {
+                    c0_arr[lane] = c;
+                } else {
+                    c1_arr[lane - 8] = c;
+                }
+                expected[lane] = (F8(gf8_reduce(c)) * F8(0x10)).0;
+            }
+            let actual: [u8; 16] = unsafe {
+                let c0 = vreinterpretq_u8_u16(vld1q_u16(c0_arr.as_ptr()));
+                let c1 = vreinterpretq_u8_u16(vld1q_u16(c1_arr.as_ptr()));
+                transmute(neon::gf8_reduce_x4_vec16(c0, c1))
+            };
+            assert_eq!(
+                actual,
+                expected,
+                "inputs {base:#06x}..={:#06x}",
+                base + 15
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_gf8_reduce_x4_split_low_ch_matches_scalar_exhaustive() {
+        use core::arch::aarch64::*;
+        use core::mem::transmute;
+
+        for ch_val in 0u8..16 {
+            for cl_base in (0u16..256).step_by(16) {
+                let mut cl_arr = [0u8; 16];
+                let ch_arr = [ch_val; 16];
+                let mut expected = [0u8; 16];
+                for lane in 0..16 {
+                    let cl = (cl_base + lane as u16) as u8;
+                    cl_arr[lane] = cl;
+                    let c = (cl as u16) | ((ch_val as u16) << 8);
+                    expected[lane] = (F8(gf8_reduce(c)) * F8(0x10)).0;
+                }
+                let actual: [u8; 16] = unsafe {
+                    let cl = vld1q_u8(cl_arr.as_ptr());
+                    let ch = vld1q_u8(ch_arr.as_ptr());
+                    transmute(neon::gf8_reduce_x4_split_low_ch_vec16(cl, ch))
+                };
+                assert_eq!(actual, expected, "ch={ch_val} cl={cl_base}..={}", cl_base + 15);
+            }
         }
     }
 
