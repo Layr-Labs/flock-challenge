@@ -2347,6 +2347,130 @@ unsafe fn fuse_absorb_k0(
     }
 }
 
+/// Row-body variant bit (with [`ABV_FUSE`]): evaluate the high half
+/// (`k = 4..7`) and the low half (`k = 0..3`) as two independent 4-word
+/// Horner4 streams using ONLY the plain table images (`plain`, `plain_sw`,
+/// `kplain`), reducing the high accumulator through `gf8_reduce_x4_vec16`
+/// (which multiplies by `x^4 mod p` during reduction) and XORing it with the
+/// `gf8_reduce_vec16`-reduced low accumulator. Eliminates all accesses to
+/// `scaled`, `scaled_sw`, and `kscaled`, shrinking the L1D working set by
+/// 36 KiB on P-cores (128 KiB -> 92 KiB) and 24 KiB on E-cores (80 KiB ->
+/// 56 KiB). Output is bit-identical.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const ABV_SPLIT_H4: u32 = 1 << 21;
+
+/// Kill switch for [`ABV_SPLIT_H4`]: exactly `FLOCK_NO_AB_SPLIT_H4=1`
+/// disables plain-only split Horner4 in the window unit. Read once per
+/// process; kept free of generic code.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_split_h4_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0: not read yet, 1: on, 2: off.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("FLOCK_NO_AB_SPLIT_H4").as_deref()
+                != Some(std::ffi::OsStr::new("1"));
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Single-stream [`ABV_SPLIT_H4`] seed: `P_3` (or `P_7`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fuse_seed_one(o: &AbKOperands) -> [core::arch::aarch64::uint16x8_t; 8] {
+    unsafe { fuse_products(o) }
+}
+
+/// Single-stream [`ABV_SPLIT_H4`] first absorb: `(acc << 1) ^ P_2` (or `P_6`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fuse_absorb_first_one(
+    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
+    o: &AbKOperands,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let mut s = *acc;
+        for v in s.iter_mut() {
+            debug_assert_eq!(vmaxvq_u16(vshrq_n_u16::<15>(*v)), 0);
+            *v = vshlq_n_u16::<1>(*v);
+        }
+        *acc = fuse_acc(&s, o);
+    }
+}
+
+/// Single-stream [`ABV_SPLIT_H4`] K1 step:
+/// `acc = (acc << 2) ^ fold(acc >> 14) ^ (P_1 << 1)`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fuse_absorb_k1_one(
+    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
+    o: &AbKOperands,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let p = fuse_products(o);
+        let fold = vld1q_u8(HORNER2_FOLD.as_ptr());
+        for i in 0..8 {
+            let t = acc[i];
+            let s2 = vreinterpretq_u8_u16(vshlq_n_u16::<2>(t));
+            let f = vqtbl1q_u8(fold, vreinterpretq_u8_u16(vshrq_n_u16::<14>(t)));
+            let p1 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(p[i]));
+            acc[i] = vreinterpretq_u16_u8(xor3_u8(s2, f, p1));
+        }
+    }
+}
+
+/// Single-stream [`ABV_SPLIT_H4`] K0 step: `acc ^ P_0` (or `P_4`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fuse_absorb_k0_one(
+    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
+    o: &AbKOperands,
+) {
+    unsafe {
+        *acc = fuse_acc(acc, o);
+    }
+}
+
+/// Zero-instruction scheduling fence between the high and low Horner4 halves
+/// of [`ABV_SPLIT_H4`]: forces LLVM to finish reducing `acc_hi` to 4 vectors
+/// before starting loads for `o3..o0`, preventing cross-half interleaving from
+/// exploding q-register pressure and spilling the accumulator.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn split_fence4(
+    r: (
+        core::arch::aarch64::uint8x16_t,
+        core::arch::aarch64::uint8x16_t,
+        core::arch::aarch64::uint8x16_t,
+        core::arch::aarch64::uint8x16_t,
+    ),
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    let (mut r0, mut r1, mut r2, mut r3) = r;
+    unsafe {
+        core::arch::asm!(
+            "/* {0:v} {1:v} {2:v} {3:v} */",
+            inlateout(vreg) r0,
+            inlateout(vreg) r1,
+            inlateout(vreg) r2,
+            inlateout(vreg) r3,
+            options(nostack, preserves_flags),
+        );
+    }
+    (r0, r1, r2, r3)
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 #[test]
 fn horner2_fold_table_matches_field() {
@@ -4464,15 +4588,96 @@ pub(crate) fn ab_bstatic_z_enabled() -> bool {
 }
 
 /// [`apply_word_z`] (record form) of the word `w` restricted to its bytes
-/// `0..NB` (`2 <= NB <= 4`), the other bytes taken as zero. The apply is
-/// F2-linear in each lookup index and every table's row 0 is zero, so the
-/// lookups whose index involves only bytes `NB..8` are dropped: the plain
-/// row, the `{1,3,5,7}` record pair, and for `NB >= 3` the `{2,3,6,7}` pair,
-/// for `NB = 4` the `{3,7}` pair (8, 10 or 12 loads). `t0` is the plain
-/// image, `kara` its [`ab_kara_tables`] base.
+/// `0..NB` (`1 <= NB <= 4`), the other bytes taken as zero. When `XOR1` is
+/// true, absorbs `vdupq_n_u8(1)` (the `[1; 64]` seed of [`ABV_TRANSFORM_TRIM`])
+/// directly into the output XORs (`xor3_u8` for `NB = 2`, `m0`/`m2` for
+/// `NB >= 3`). `t0` is the plain image, `kara` its [`ab_kara_tables`] base.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_z_low<const NB: u32>(
+unsafe fn apply_word_z_low<const NB: u32, const XOR1: bool>(
+    t0: *const u8,
+    kara: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    const { assert!(NB >= 1 && NB <= 4) };
+    unsafe {
+        let ld = |base: *const u8, off: usize| vld1q_u8(base.add(off));
+        if NB == 1 {
+            let r0 = t0.add(ab_z_idx::<0, 6>(w));
+            let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
+            return if XOR1 {
+                let one = vdupq_n_u8(1);
+                (veorq_u8(l0, one), veorq_u8(l1, one), veorq_u8(l2, one), veorq_u8(l3, one))
+            } else {
+                (l0, l1, l2, l3)
+            };
+        }
+        let z = kara.add(2 * AB_KARA_IMAGE_BYTES);
+        let ys = w ^ (w >> 8);
+        let yall = if NB == 2 {
+            ys
+        } else if NB == 3 {
+            ys ^ (w >> 16)
+        } else {
+            ys ^ (ys >> 16)
+        };
+        let r0 = t0.add(ab_z_idx::<0, 6>(yall));
+        let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
+        let rec = |i: usize| -> *const u8 {
+            let a: usize;
+            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) z.add(AB_Z_REC), i = in(reg) i,
+                options(pure, nomem, nostack, preserves_flags));
+            a as *const u8
+        };
+        // {1,3,5,7}: byte 1 for NB <= 3, bytes 1 ^ 3 for NB == 4.
+        let y1 = if NB >= 4 { w ^ (w >> 16) } else { w };
+        let a = rec(ab_z_idx::<1, 7>(y1));
+        let (mut p, mut q) = (ld(a, 64), ld(a, 80));
+        if NB >= 4 {
+            // {3,7}: byte 3.
+            let a = rec(ab_z_idx::<3, 7>(w));
+            p = veorq_u8(p, ld(a, 96));
+            q = veorq_u8(q, ld(a, 112));
+        }
+        let p = vreinterpretq_u64_u8(p);
+        let q = vreinterpretq_u64_u8(q);
+        let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
+        let b1 = vreinterpretq_u8_u64(vzip2q_u64(p, p));
+        let b2 = vreinterpretq_u8_u64(vzip1q_u64(q, q));
+        let b3 = vreinterpretq_u8_u64(vzip2q_u64(q, q));
+        if NB >= 3 {
+            // {2,3,6,7}: byte 2 for NB == 3, bytes 2 ^ 3 for NB == 4.
+            let y2 = if NB >= 4 { ys } else { w };
+            let a = rec(ab_z_idx::<2, 7>(y2));
+            let (mut m0, mut m2) = (ld(a, 0), ld(a, 16));
+            if XOR1 {
+                let one = vdupq_n_u8(1);
+                m0 = veorq_u8(m0, one);
+                m2 = veorq_u8(m2, one);
+            }
+            (xor3_u8(l0, m0, b0), xor3_u8(l1, m0, b1), xor3_u8(l2, m2, b2), xor3_u8(l3, m2, b3))
+        } else if XOR1 {
+            let one = vdupq_n_u8(1);
+            (xor3_u8(l0, b0, one), xor3_u8(l1, b1, one), xor3_u8(l2, b2, one), xor3_u8(l3, b3, one))
+        } else {
+            (veorq_u8(l0, b0), veorq_u8(l1, b1), veorq_u8(l2, b2), veorq_u8(l3, b3))
+        }
+    }
+}
+
+/// [`apply_word_z_low`] for bytes `8-NB..8` (`1 <= NB <= 4`), using the
+/// `j -> 7 - j` symmetry of the table apply (`block n -> block n ^ 7`).
+/// `XOR1` commutes with `sw` and register reversal because `[1; 16]` is
+/// constant across lanes.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z_high<const NB: u32, const XOR1: bool>(
     t0: *const u8,
     kara: *const u8,
     w: u64,
@@ -4484,44 +4689,72 @@ unsafe fn apply_word_z_low<const NB: u32>(
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        let v = w & ((1u64 << (8 * NB)) - 1);
-        let z = kara.add(2 * AB_KARA_IMAGE_BYTES);
-        let ys = v ^ (v >> 8);
-        let yl1 = v ^ (v >> 16);
-        let yall = ys ^ (ys >> 16);
-        let ld = |base: *const u8, off: usize| vld1q_u8(base.add(off));
-        let r0 = t0.add(ab_z_idx::<0, 6>(yall));
-        let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
-        let rec = |i: usize| -> *const u8 {
-            let a: usize;
-            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) z.add(AB_Z_REC), i = in(reg) i,
-                options(pure, nomem, nostack, preserves_flags));
-            a as *const u8
-        };
-        // {1,3,5,7}: bytes 1 ^ 3.
-        let a = rec(ab_z_idx::<1, 7>(yl1));
-        let (mut p, mut q) = (ld(a, 64), ld(a, 80));
-        if NB >= 4 {
-            // {3,7}: byte 3.
-            let a = rec(ab_z_idx::<3, 7>(v));
-            p = veorq_u8(p, ld(a, 96));
-            q = veorq_u8(q, ld(a, 112));
-        }
-        let p = vreinterpretq_u64_u8(p);
-        let q = vreinterpretq_u64_u8(q);
-        let b0 = vreinterpretq_u8_u64(vzip1q_u64(p, p));
-        let b1 = vreinterpretq_u8_u64(vzip2q_u64(p, p));
-        let b2 = vreinterpretq_u8_u64(vzip1q_u64(q, q));
-        let b3 = vreinterpretq_u8_u64(vzip2q_u64(q, q));
-        if NB >= 3 {
-            // {2,3,6,7}: bytes 2 ^ 3.
-            let a = rec(ab_z_idx::<2, 7>(ys));
-            let (m0, m2) = (ld(a, 0), ld(a, 16));
-            (xor3_u8(l0, m0, b0), xor3_u8(l1, m0, b1), xor3_u8(l2, m2, b2), xor3_u8(l3, m2, b3))
-        } else {
-            (veorq_u8(l0, b0), veorq_u8(l1, b1), veorq_u8(l2, b2), veorq_u8(l3, b3))
-        }
+        let (r0, r1, r2, r3) = apply_word_z_low::<NB, XOR1>(t0, kara, w.swap_bytes());
+        let sw = |x: uint8x16_t| vextq_u8::<8>(x, x);
+        (sw(r3), sw(r2), sw(r1), sw(r0))
     }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[test]
+fn ab_z_low_high_xor1_matches_plain_apply() {
+    use crate::ntt::AdditiveNttGf8;
+    use core::arch::aarch64::*;
+    let table =
+        InvNttTableByteSingleGf8::new(&AdditiveNttGf8::new(6, F8::ZERO), &AdditiveNttGf8::new(6, F8(1 << 6)));
+    let kara = ab_kara_tables(&table);
+    let plain = table.data_ptr();
+    let plain_sw = table.half_swapped_data_ptr();
+    let bytes = |v: (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t)| {
+        let mut out = [0u8; 64];
+        unsafe {
+            vst1q_u8(out.as_mut_ptr(), v.0);
+            vst1q_u8(out.as_mut_ptr().add(16), v.1);
+            vst1q_u8(out.as_mut_ptr().add(32), v.2);
+            vst1q_u8(out.as_mut_ptr().add(48), v.3);
+        }
+        out
+    };
+    let mut x = 0x710B_A515_2041_0007u64;
+    let mut checked = 0usize;
+    macro_rules! case {
+        ($nb:literal, $high:literal) => {{
+            let vary: u64 = (1u64 << (8 * $nb)) - 1;
+            let vary = if $high { vary.swap_bytes() } else { vary };
+            for i in 0..(256 * $nb + 4000) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let v = if i < 256 * $nb {
+                    let pos = if $high { 7 - (i / 256) } else { i / 256 };
+                    ((i % 256) as u64) << (8 * pos)
+                } else {
+                    x & vary
+                };
+                // Guarded word: non-varying bytes are 0xff, so !b has 0x00 there.
+                let b = !v;
+                let (got, want) = unsafe {
+                    let z = if $high {
+                        apply_word_z_high::<$nb, true>(plain, kara, !b)
+                    } else {
+                        apply_word_z_low::<$nb, true>(plain, kara, !b)
+                    };
+                    (bytes(z), bytes(apply_word_into_4_regs(plain, plain_sw, b)))
+                };
+                assert_eq!(got, want, "nb={} high={} b={b:016x}", $nb, $high);
+                checked += 1;
+            }
+        }};
+    }
+    case!(1, false);
+    case!(1, true);
+    case!(2, false);
+    case!(2, true);
+    case!(3, false);
+    case!(3, true);
+    case!(4, false);
+    case!(4, true);
+    assert_eq!(checked, 256 * 20 + 8 * 4000);
 }
 
 /// Row-body variant bit (with [`ABV_TRANSFORM_TRIM`], [`ABV_FUSE`] and the
@@ -4740,7 +4973,7 @@ pub(crate) fn ab_bstatic_z_low_forms<const NB: u32>(
                 xor_vary_ext::<2, 3>(plain, w, [d0, d1, d2, d3]);
             }
         }
-        let z = apply_word_z_low::<NB>(plain, kara, w);
+        let z = apply_word_z_low::<NB, false>(plain, kara, w);
         let e = [veorq_u8(vld1q_u8(pp), z.0), veorq_u8(vld1q_u8(pp.add(16)), z.1), veorq_u8(vld1q_u8(pp.add(32)), z.2), veorq_u8(vld1q_u8(pp.add(48)), z.3)];
         for i in 0..4 {
             vst1q_u8(out.0.as_mut_ptr().add(16 * i), d[i]);

@@ -752,6 +752,32 @@ impl Drop for CloseOnDrop {
     }
 }
 
+/// Run `main_body` while broadcasting `helper` on the efficiency-core helper
+/// pool behind a detached [`Gate`]. Admitted helpers finish before this
+/// function returns; late helpers see the closed gate and exit immediately.
+pub(crate) fn with_helper_broadcast<H, R>(helper: &H, main_body: impl FnOnce() -> R) -> R
+where
+    H: Fn() + Sync,
+{
+    let Some(ep) = epool() else {
+        return main_body();
+    };
+    if rayon::current_num_threads() <= 1 || !detached_enabled() {
+        return main_body();
+    }
+    let gate = Arc::new(Gate {
+        state: AtomicUsize::new(0),
+        panicked: AtomicBool::new(false),
+        body: JobPtr::new(helper),
+    });
+    let close = CloseOnDrop(Arc::clone(&gate));
+    let gate_bg = Arc::clone(&gate);
+    ep.spawn_broadcast(move |_| gate_bg.run());
+    let out = main_body();
+    drop(close);
+    out
+}
+
 /// Drain one *engaged* hetero chunk queue: `main_threads` main-pool workers
 /// running `worker`, while every helper-pool thread runs `helper` once.
 /// Returns once every chunk has been executed exactly once and its writes are

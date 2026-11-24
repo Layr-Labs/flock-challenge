@@ -4254,13 +4254,91 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     const GPU_COMMIT_DEFAULT: bool = true;
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+        && gpu_commit_env_clear()
 }
 
 /// True after untimed warmup permanently selected the ranked GPU path.
 /// The opt-out only restores speculative CPU buffers; it does not disable GPU.
 pub(crate) fn gpu_commit_latched_on() -> bool {
-    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none() && imp::gpu_commit_latched_on()
+    lazy_gpu_codeword_env_clear() && imp::gpu_commit_latched_on()
+}
+
+/// Kill switch for keeping the GPU commit's gate environment reads once per
+/// process (`FLOCK_NO_GPU_ENV_ONCE`, any value: every gate below reads its
+/// variable from the process environment on every call, as before). Read
+/// once per process.
+pub const ENV_NO_GPU_ENV_ONCE: &str = "FLOCK_NO_GPU_ENV_ONCE";
+
+pub(crate) fn gpu_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ENV_ONCE).is_none());
+    *ON
+}
+
+/// `FLOCK_NO_GPU_COMMIT` unset (the environment term of
+/// [`gpu_commit_enabled`]). The process environment does not change while a
+/// worker runs, so the first answer is kept; `FLOCK_NO_GPU_ENV_ONCE`
+/// restores the per-call lookup.
+#[inline]
+fn gpu_commit_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_COMMIT).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+}
+
+/// `FLOCK_NO_LAZY_GPU_CODEWORD` unset (the environment term of
+/// [`gpu_commit_latched_on`]), kept the same way.
+#[inline]
+fn lazy_gpu_codeword_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none()
+}
+
+/// `FLOCK_NO_GPU_TABLE_REUSE` unset (the shared-table term of the final
+/// leaf pass, the g4x2 dead-lane pass and the table share of the three NTT
+/// tile encoders), kept the same way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_table_reuse_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+}
+
+/// `FLOCK_COMMIT_TIMING` set (the commit's timing trace term), kept the same
+/// way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn commit_timing_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
+}
+
+/// `FLOCK_GPU_COMMIT_DEBUG` set (the GPU commit's debug trace term), kept
+/// the same way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_commit_debug_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
 }
 
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
@@ -6102,9 +6180,13 @@ kernel void leaf_parent3(device const uint* codeword [[buffer(0)]],
                          uint tgid [[threadgroup_position_in_grid]],
                          uint lid  [[thread_index_in_threadgroup]])
 {
-    threadgroup uint level0[256u * 8u];
-    threadgroup uint level1[128u * 8u];
-    threadgroup uint level2[64u * 8u];
+    threadgroup uint4 level0[256u * 2u];
+    threadgroup uint4 level1[128u * 2u];
+    threadgroup uint4* level2 = level0;
+    device uint4* leaves4   = (device uint4*)leaves;
+    device uint4* parents14 = (device uint4*)parents1;
+    device uint4* parents24 = (device uint4*)parents2;
+    device uint4* parents34 = (device uint4*)parents3;
 
     {
         const uint id = tgid * 256u + lid;
@@ -6129,58 +6211,74 @@ kernel void leaf_parent3(device const uint* codeword [[buffer(0)]],
             uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
             b3_compress(cv, block, 64u, flags);
         }
-        for (uint i = 0u; i < 8u; i++) {
-            leaves[id * 8u + i] = cv[i];
-            level0[lid * 8u + i] = cv[i];
-        }
+        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
+        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
+        leaves4[id * 2u + 0u] = lo;
+        leaves4[id * 2u + 1u] = hi;
+        level0[lid * 2u + 0u] = lo;
+        level0[lid * 2u + 1u] = hi;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (lid < 128u) {
         uint block[16];
-        for (uint i = 0u; i < 8u; i++) {
-            block[i] = level0[(2u * lid) * 8u + i];
-            block[8u + i] = level0[(2u * lid + 1u) * 8u + i];
+        for (uint q = 0u; q < 4u; q++) {
+            const uint4 w = level0[(2u * lid) * 2u + q];
+            block[q * 4u + 0u] = w.x;
+            block[q * 4u + 1u] = w.y;
+            block[q * 4u + 2u] = w.z;
+            block[q * 4u + 3u] = w.w;
         }
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
         b3_compress(cv, block, 64u, B3_PARENT);
         const uint id = tgid * 128u + lid;
-        for (uint i = 0u; i < 8u; i++) {
-            parents1[id * 8u + i] = cv[i];
-            level1[lid * 8u + i] = cv[i];
-        }
+        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
+        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
+        parents14[id * 2u + 0u] = lo;
+        parents14[id * 2u + 1u] = hi;
+        level1[lid * 2u + 0u] = lo;
+        level1[lid * 2u + 1u] = hi;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (lid < 64u) {
         uint block[16];
-        for (uint i = 0u; i < 8u; i++) {
-            block[i] = level1[(2u * lid) * 8u + i];
-            block[8u + i] = level1[(2u * lid + 1u) * 8u + i];
+        for (uint q = 0u; q < 4u; q++) {
+            const uint4 w = level1[(2u * lid) * 2u + q];
+            block[q * 4u + 0u] = w.x;
+            block[q * 4u + 1u] = w.y;
+            block[q * 4u + 2u] = w.z;
+            block[q * 4u + 3u] = w.w;
         }
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
         b3_compress(cv, block, 64u, B3_PARENT);
         const uint id = tgid * 64u + lid;
-        for (uint i = 0u; i < 8u; i++) {
-            parents2[id * 8u + i] = cv[i];
-            level2[lid * 8u + i] = cv[i];
-        }
+        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
+        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
+        parents24[id * 2u + 0u] = lo;
+        parents24[id * 2u + 1u] = hi;
+        level2[lid * 2u + 0u] = lo;
+        level2[lid * 2u + 1u] = hi;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (lid < 32u) {
         uint block[16];
-        for (uint i = 0u; i < 8u; i++) {
-            block[i] = level2[(2u * lid) * 8u + i];
-            block[8u + i] = level2[(2u * lid + 1u) * 8u + i];
+        for (uint q = 0u; q < 4u; q++) {
+            const uint4 w = level2[(2u * lid) * 2u + q];
+            block[q * 4u + 0u] = w.x;
+            block[q * 4u + 1u] = w.y;
+            block[q * 4u + 2u] = w.z;
+            block[q * 4u + 3u] = w.w;
         }
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
         b3_compress(cv, block, 64u, B3_PARENT);
         const uint id = tgid * 32u + lid;
-        for (uint i = 0u; i < 8u; i++) parents3[id * 8u + i] = cv[i];
+        parents34[id * 2u + 0u] = uint4(cv[0], cv[1], cv[2], cv[3]);
+        parents34[id * 2u + 1u] = uint4(cv[4], cv[5], cv[6], cv[7]);
     }
 }
 "#;
@@ -6332,7 +6430,7 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
         b3_load_block4(children + id * 4u, block);
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
-        b3_compress(cv, block, 64u, B3_PARENT);
+        b3_compress_straight(cv, block, 64u, B3_PARENT);
         const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
         const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
         parents1[id * 2u + 0u] = lo;
@@ -6355,7 +6453,7 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
         }
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
-        b3_compress(cv, block, 64u, B3_PARENT);
+        b3_compress_straight(cv, block, 64u, B3_PARENT);
         const uint id = tgid * 64u + lid;
         const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
         const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
@@ -6379,7 +6477,7 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
         }
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
-        b3_compress(cv, block, 64u, B3_PARENT);
+        b3_compress_straight(cv, block, 64u, B3_PARENT);
         const uint id = tgid * 32u + lid;
         parents3[id * 2u + 0u] = uint4(cv[0], cv[1], cv[2], cv[3]);
         parents3[id * 2u + 1u] = uint4(cv[4], cv[5], cv[6], cv[7]);
@@ -6753,7 +6851,7 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     /// generator to its closing barrier, as in the record and lane-linear.
     const G4X2_BUILD_TAIL_RECORD: &str = "    uint4 e0 = twl[(t << 4) + k];
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
-    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 f0 = gf_shl4(e0), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
     uint4 A = uint4(0u);
     if (aa & 1u) { A ^= e2; }
     if (aa & 2u) { A ^= e3; }
@@ -6779,7 +6877,7 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
 ";
     const G4X2_BUILD_TAIL_LINEAR: &str = "    uint4 e0 = twl[(t << 4) + k];
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
-    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 f0 = gf_shl4(e0), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
     // Entry bits 0..4 are the thread's lane u, bits 5..7 the store index m:
     // the 32 lanes of a SIMD group store 32 consecutive entries at once.
     uint4 A = uint4(0u);
@@ -6824,7 +6922,7 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     const uint u  = lid & 63u;       // entry bits 0..5; bits 6..7 = store index
     uint4 e0 = twl[(t << 4) + k];
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
-    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 f0 = gf_shl4(e0), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
     uint4 A = uint4(0u);
     if (u & 1u) { A ^= e0; }
     if (u & 2u) { A ^= e1; }
@@ -7110,6 +7208,22 @@ static inline uint4 gf_mulx(uint4 v) {
     return r;
 }
 
+static inline uint4 gf_shl4(uint4 a) {
+    uint h = a.w >> 28;
+    return uint4((a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h),
+                 (a.y << 4) | (a.x >> 28),
+                 (a.z << 4) | (a.y >> 28),
+                 (a.w << 4) | (a.z >> 28));
+}
+
+static inline uint4 gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    return uint4((a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h),
+                 (a.y << 8) | (a.x >> 24),
+                 (a.z << 8) | (a.y >> 24),
+                 (a.w << 8) | (a.z >> 24));
+}
+
 static inline uint4 gf_shl16(uint4 a) {
     uint h = a.w >> 16;
     uint4 r;
@@ -7120,24 +7234,31 @@ static inline uint4 gf_shl16(uint4 a) {
     return r;
 }
 
-// gf_mul_byte16 of two values by the same table, the two Horner chains
-// interleaved step by step. Each chain is gf_mul_byte16's own sequence.
+// gf_mul_byte16 of two values by the same table, peeled over uchar4 lanes.
 static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
                                     threadgroup const uint4* tab,
                                     thread uint4& ra, thread uint4& rb)
 {
-    uint4 a = uint4(0u);
-    uint4 b = uint4(0u);
-    for (int i = 7; i >= 0; i--) {
-        a = gf_shl16(a);
-        b = gf_shl16(b);
-        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
-        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
-    }
-    ra = a;
-    rb = b;
+    const uchar4 aw = as_type<uchar4>(va.w), bw = as_type<uchar4>(vb.w);
+    uint4 a = tab[aw.z] ^ tab[256u + aw.w];
+    uint4 b = tab[bw.z] ^ tab[256u + bw.w];
+    a = gf_shl16(a) ^ tab[aw.x] ^ tab[256u + aw.y];
+    b = gf_shl16(b) ^ tab[bw.x] ^ tab[256u + bw.y];
+    const uchar4 az = as_type<uchar4>(va.z), bz = as_type<uchar4>(vb.z);
+    a = gf_shl16(a) ^ tab[az.z] ^ tab[256u + az.w];
+    b = gf_shl16(b) ^ tab[bz.z] ^ tab[256u + bz.w];
+    a = gf_shl16(a) ^ tab[az.x] ^ tab[256u + az.y];
+    b = gf_shl16(b) ^ tab[bz.x] ^ tab[256u + bz.y];
+    const uchar4 ay = as_type<uchar4>(va.y), by = as_type<uchar4>(vb.y);
+    a = gf_shl16(a) ^ tab[ay.z] ^ tab[256u + ay.w];
+    b = gf_shl16(b) ^ tab[by.z] ^ tab[256u + by.w];
+    a = gf_shl16(a) ^ tab[ay.x] ^ tab[256u + ay.y];
+    b = gf_shl16(b) ^ tab[by.x] ^ tab[256u + by.y];
+    const uchar4 ax = as_type<uchar4>(va.x), bx = as_type<uchar4>(vb.x);
+    a = gf_shl16(a) ^ tab[ax.z] ^ tab[256u + ax.w];
+    b = gf_shl16(b) ^ tab[bx.z] ^ tab[256u + bx.w];
+    ra = gf_shl16(a) ^ tab[ax.x] ^ tab[256u + ax.y];
+    rb = gf_shl16(b) ^ tab[bx.x] ^ tab[256u + bx.y];
 }
 
 // The 64-thread table build of ntt_fused_reg4g4 (gf_build_byte16), unchanged.
@@ -7293,6 +7414,22 @@ static inline uint4 gf_mulx(uint4 v) {
     return r;
 }
 
+static inline uint4 gf_shl4(uint4 a) {
+    uint h = a.w >> 28;
+    return uint4((a.x << 4) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h),
+                 (a.y << 4) | (a.x >> 28),
+                 (a.z << 4) | (a.y >> 28),
+                 (a.w << 4) | (a.z >> 28));
+}
+
+static inline uint4 gf_shl8(uint4 a) {
+    uint h = a.w >> 24;
+    return uint4((a.x << 8) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h),
+                 (a.y << 8) | (a.x >> 24),
+                 (a.z << 8) | (a.y >> 24),
+                 (a.w << 8) | (a.z >> 24));
+}
+
 static inline uint4 gf_shl16(uint4 a) {
     uint h = a.w >> 16;
     uint4 r;
@@ -7303,24 +7440,31 @@ static inline uint4 gf_shl16(uint4 a) {
     return r;
 }
 
-// gf_mul_byte16 of two values by the same table, the two Horner chains
-// interleaved step by step. Each chain is gf_mul_byte16's own sequence.
+// gf_mul_byte16 of two values by the same table, peeled over uchar4 lanes.
 static inline void gf_mul_byte16_x2(uint4 va, uint4 vb,
                                     threadgroup const uint4* tab,
                                     thread uint4& ra, thread uint4& rb)
 {
-    uint4 a = uint4(0u);
-    uint4 b = uint4(0u);
-    for (int i = 7; i >= 0; i--) {
-        a = gf_shl16(a);
-        b = gf_shl16(b);
-        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
-        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
-    }
-    ra = a;
-    rb = b;
+    const uchar4 aw = as_type<uchar4>(va.w), bw = as_type<uchar4>(vb.w);
+    uint4 a = tab[aw.z] ^ tab[256u + aw.w];
+    uint4 b = tab[bw.z] ^ tab[256u + bw.w];
+    a = gf_shl16(a) ^ tab[aw.x] ^ tab[256u + aw.y];
+    b = gf_shl16(b) ^ tab[bw.x] ^ tab[256u + bw.y];
+    const uchar4 az = as_type<uchar4>(va.z), bz = as_type<uchar4>(vb.z);
+    a = gf_shl16(a) ^ tab[az.z] ^ tab[256u + az.w];
+    b = gf_shl16(b) ^ tab[bz.z] ^ tab[256u + bz.w];
+    a = gf_shl16(a) ^ tab[az.x] ^ tab[256u + az.y];
+    b = gf_shl16(b) ^ tab[bz.x] ^ tab[256u + bz.y];
+    const uchar4 ay = as_type<uchar4>(va.y), by = as_type<uchar4>(vb.y);
+    a = gf_shl16(a) ^ tab[ay.z] ^ tab[256u + ay.w];
+    b = gf_shl16(b) ^ tab[by.z] ^ tab[256u + by.w];
+    a = gf_shl16(a) ^ tab[ay.x] ^ tab[256u + ay.y];
+    b = gf_shl16(b) ^ tab[by.x] ^ tab[256u + by.y];
+    const uchar4 ax = as_type<uchar4>(va.x), bx = as_type<uchar4>(vb.x);
+    a = gf_shl16(a) ^ tab[ax.z] ^ tab[256u + ax.w];
+    b = gf_shl16(b) ^ tab[bx.z] ^ tab[256u + bx.w];
+    ra = gf_shl16(a) ^ tab[ax.x] ^ tab[256u + ax.y];
+    rb = gf_shl16(b) ^ tab[bx.x] ^ tab[256u + bx.y];
 }
 
 // The 64-thread table build of ntt_fused_reg4g4 (gf_build_byte16), unchanged.
@@ -7377,7 +7521,7 @@ static inline void gf_build_byte16_twl(
     const uint cc = u >> 2;          // owns entry bits 5..7
     uint4 e0 = twl[(t << 4) + k];
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
-    uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
+    uint4 f0 = gf_shl4(e0), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
     uint4 A = uint4(0u);
     if (aa & 1u) { A ^= e2; }
     if (aa & 2u) { A ^= e3; }
@@ -7470,8 +7614,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
         const uint cj = q - (1u << jj);
         uint4 g = twiddles[(1u << (P.l + jj)) - 1u + (B << jj) + cj];
         twl[lid] = g;
-        for (uint m = 0; m < 8u; m++) { g = gf_mulx(g); }
-        twl[16u + lid] = g;
+        twl[16u + lid] = gf_shl8(g);
     }
 
     for (uint it = 0; it < 2u; it++) {
@@ -9307,33 +9450,38 @@ constant uint B3_PERM[16] = {
 #define B3_CHUNK_END   2u
 #define B3_PARENT      4u
 
-static void b3_compress(thread uint* cv, thread const uint* m_in,
+#define B3_ROTR_FL(x, n) rotate((uint)(x), (uint)(32u - (n)))
+#define B3_ROT16_FL(x) as_type<uint>(as_type<ushort2>((uint)(x)).yx)
+#define B3_G_FL(a, b, c, d, x, y)                          \
+    a = a + b + (x); d = B3_ROT16_FL(d ^ a);               \
+    c = c + d;       b = B3_ROTR_FL(b ^ c, 12u);           \
+    a = a + b + (y); d = B3_ROTR_FL(d ^ a, 8u);            \
+    c = c + d;       b = B3_ROTR_FL(b ^ c, 7u);
+#define B3_ROUND_FL(s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15) \
+    B3_G_FL(v0, v4, v8,  v12, m[s0],  m[s1]);  B3_G_FL(v1, v5, v9,  v13, m[s2],  m[s3]);    \
+    B3_G_FL(v2, v6, v10, v14, m[s4],  m[s5]);  B3_G_FL(v3, v7, v11, v15, m[s6],  m[s7]);    \
+    B3_G_FL(v0, v5, v10, v15, m[s8],  m[s9]);  B3_G_FL(v1, v6, v11, v12, m[s10], m[s11]);   \
+    B3_G_FL(v2, v7, v8,  v13, m[s12], m[s13]); B3_G_FL(v3, v4, v9,  v14, m[s14], m[s15]);
+static void b3_compress(thread uint* cv, thread const uint* m,
                         uint block_len, uint flags) {
-    uint v[16];
-    uint m[16];
-    for (int i = 0; i < 8; i++) v[i] = cv[i];
-    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
-    v[12] = 0u; v[13] = 0u; v[14] = block_len; v[15] = flags;
-    for (int i = 0; i < 16; i++) m[i] = m_in[i];
-    for (int r = 0; r < 7; r++) {
-        #define G(a,b,c,d,x,y) \
-            v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
-            v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
-        G(0,4,8,12,  m[0], m[1]);  G(1,5,9,13,  m[2], m[3]);
-        G(2,6,10,14, m[4], m[5]);  G(3,7,11,15, m[6], m[7]);
-        G(0,5,10,15, m[8], m[9]);  G(1,6,11,12, m[10],m[11]);
-        G(2,7,8,13,  m[12],m[13]); G(3,4,9,14,  m[14],m[15]);
-        #undef G
-        if (r < 6) {
-            uint t[16];
-            for (int i = 0; i < 16; i++) t[i] = m[B3_PERM[i]];
-            for (int i = 0; i < 16; i++) m[i] = t[i];
-        }
-    }
-    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+    uint v0 = cv[0], v1 = cv[1], v2 = cv[2], v3 = cv[3];
+    uint v4 = cv[4], v5 = cv[5], v6 = cv[6], v7 = cv[7];
+    uint v8 = B3_IV[0], v9 = B3_IV[1], v10 = B3_IV[2], v11 = B3_IV[3];
+    uint v12 = 0u, v13 = 0u, v14 = block_len, v15 = flags;
+    B3_ROUND_FL(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+    B3_ROUND_FL(2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+    B3_ROUND_FL(3, 4, 10, 12, 13, 2, 7, 14, 6, 5, 9, 0, 11, 15, 8, 1)
+    B3_ROUND_FL(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6)
+    B3_ROUND_FL(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4)
+    B3_ROUND_FL(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7)
+    B3_ROUND_FL(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13)
+    cv[0] = v0 ^ v8;  cv[1] = v1 ^ v9;  cv[2] = v2 ^ v10; cv[3] = v3 ^ v11;
+    cv[4] = v4 ^ v12; cv[5] = v5 ^ v13; cv[6] = v6 ^ v14; cv[7] = v7 ^ v15;
 }
+#undef B3_ROUND_FL
+#undef B3_G_FL
+#undef B3_ROT16_FL
+#undef B3_ROTR_FL
 
 #ifndef LEAF_TILES
 #define LEAF_TILES 4u
@@ -9411,9 +9559,13 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
     constexpr uint NL = 16u * LEAF_TILES;           // leaves per group
-    threadgroup uint* level0 = (threadgroup uint*)tabB;  // NL * 8 words
-    threadgroup uint* level1 = level0 + NL * 8u;         // NL * 4 words
-    threadgroup uint* level2 = level1 + NL * 4u;         // NL * 2 words
+    threadgroup uint4* level0 = tabB;                // NL * 2 uint4s
+    threadgroup uint4* level1 = level0 + NL * 2u;    // NL uint4s
+    threadgroup uint4* level2 = level1 + NL;         // (NL / 2) uint4s
+    device uint4* leaves4   = (device uint4*)leaves;
+    device uint4* parents14 = (device uint4*)parents1;
+    device uint4* parents24 = (device uint4*)parents2;
+    device uint4* parents34 = (device uint4*)parents3;
     for (uint n = lid; n < NL; n += 64u) {
         const uint id = tgid * NL + n;
         device const uint4* leaf4 = data + id * 64u;
@@ -9431,32 +9583,41 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
             b3_compress(cv, block, 64u, flags);
         }
-        for (uint i = 0u; i < 8u; i++) {
-            leaves[id * 8u + i] = cv[i];
-            level0[n * 8u + i] = cv[i];
-        }
+        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
+        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
+        leaves4[id * 2u + 0u] = lo;
+        leaves4[id * 2u + 1u] = hi;
+        level0[n * 2u + 0u] = lo;
+        level0[n * 2u + 1u] = hi;
     }
-#define LEAF_PARENT_LEVEL(SRC, DST, OUT, CNT)                                  \
+#define LEAF_PARENT_LEVEL(SRC, DST, OUT4, CNT, WRITE_DST)                      \
     threadgroup_barrier(mem_flags::mem_threadgroup);                           \
     for (uint n = lid; n < (CNT); n += 64u) {                                  \
         uint block[16];                                                        \
-        for (uint i = 0u; i < 8u; i++) {                                       \
-            block[i] = SRC[(2u * n) * 8u + i];                                 \
-            block[8u + i] = SRC[(2u * n + 1u) * 8u + i];                       \
+        for (uint q = 0u; q < 4u; q++) {                                       \
+            const uint4 w = SRC[(2u * n) * 2u + q];                            \
+            block[q * 4u + 0u] = w.x;                                          \
+            block[q * 4u + 1u] = w.y;                                          \
+            block[q * 4u + 2u] = w.z;                                          \
+            block[q * 4u + 3u] = w.w;                                          \
         }                                                                      \
         uint cv[8];                                                            \
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \
         b3_compress(cv, block, 64u, B3_PARENT);                                \
         const uint id = tgid * (CNT) + n;                                      \
-        for (uint i = 0u; i < 8u; i++) {                                       \
-            OUT[id * 8u + i] = cv[i];                                          \
-            DST[n * 8u + i] = cv[i];                                           \
+        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);                    \
+        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);                    \
+        OUT4[id * 2u + 0u] = lo;                                               \
+        OUT4[id * 2u + 1u] = hi;                                               \
+        if (WRITE_DST) {                                                       \
+            DST[n * 2u + 0u] = lo;                                             \
+            DST[n * 2u + 1u] = hi;                                             \
         }                                                                      \
     }
-    LEAF_PARENT_LEVEL(level0, level1, parents1, NL / 2u)
-    LEAF_PARENT_LEVEL(level1, level2, parents2, NL / 4u)
+    LEAF_PARENT_LEVEL(level0, level1, parents14, NL / 2u, true)
+    LEAF_PARENT_LEVEL(level1, level2, parents24, NL / 4u, true)
     // Level 3 goes to device memory only (its threadgroup copy is unused).
-    LEAF_PARENT_LEVEL(level2, level0, parents3, NL / 8u)
+    LEAF_PARENT_LEVEL(level2, level0, parents34, NL / 8u, false)
 #undef LEAF_PARENT_LEVEL
 }
 "#;
@@ -9638,7 +9799,7 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
             && super::pass_tune_enabled()
             && super::gpu_mixed_final_selected(log_d, log_d - 4, 4)
             && super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled())
-            && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+            && super::gpu_table_reuse_env_clear()
     }
 
     pub(crate) unsafe fn encode_ntt_and_merkle(
@@ -10759,7 +10920,24 @@ static inline uint pow_compress0_pre(constant uint* pre, uint nonce_lo, uint non
     PW_ROUND(10, 7, 12, 9, 14, 3, 13, 15, 4, 0, 11, 2, 5, 8, 1, 6)
     PW_ROUND(12, 13, 9, 11, 15, 10, 14, 8, 7, 2, 5, 3, 0, 1, 6, 4)
     PW_ROUND(9, 14, 11, 5, 8, 12, 15, 1, 13, 3, 0, 10, 2, 6, 4, 7)
-    PW_ROUND(11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13)
+    // Round 6: only v0 ^ v8 is consumed; omit dead diagonals 1 & 3 and dead tail updates.
+    v0 = v0 + v4;        v12 = PW_ROT16(v12 ^ v0);
+    v8 = v8 + v12;       v4  = PW_ROTR(v4 ^ v8, 12u);
+    v0 = v0 + v4;        v12 = PW_ROTR(v12 ^ v0, 8u);
+    v8 = v8 + v12;
+    PW_G(v1, v5, v9,  v13, w[5], w[0]);
+    v2 = v2 + v6 + w[1]; v14 = PW_ROT16(v14 ^ v2);
+    v10 = v10 + v14;     v6  = PW_ROTR(v6 ^ v10, 12u);
+    v2 = v2 + v6 + w[9]; v14 = PW_ROTR(v14 ^ v2, 8u);
+    v10 = v10 + v14;
+    PW_G(v3, v7, v11, v15, w[8], w[6]);
+    v0 = v0 + v5;        v15 = PW_ROT16(v15 ^ v0);
+    v10 = v10 + v15;     v5  = PW_ROTR(v5 ^ v10, 12u);
+    v0 = v0 + v5;
+    v2 = v2 + v7 + w[3]; v13 = PW_ROT16(v13 ^ v2);
+    v8 = v8 + v13;       v7  = PW_ROTR(v7 ^ v8, 12u);
+    v2 = v2 + v7 + w[4]; v13 = PW_ROTR(v13 ^ v2, 8u);
+    v8 = v8 + v13;
     return v0 ^ v8;
 }
 #undef PW_ROUND
@@ -10946,13 +11124,19 @@ kernel void blake3_pow_scan_v2(
     uint t [[thread_position_in_grid]],
     uint grid [[threads_per_grid]])
 {
+    uint full_bytes = params.bits >> 3u;
+    uint extra = params.bits & 7u;
+    uint mask = (full_bytes == 4u) ? 0xffffffffu
+        : (((1u << (full_bytes << 3u)) - 1u)
+           | (((0xffu << (8u - extra)) & 0xffu) << (full_bytes << 3u)));
     for (uint id = t; id < params.len; id += grid) {
-        if (id >= atomic_load_explicit(best, memory_order_relaxed)) return;
+        uint b = simd_is_first() ? atomic_load_explicit(best, memory_order_relaxed) : 0u;
+        if (id >= simd_broadcast_first(b)) return;
         uint nonce_lo = params.start_lo + id;
         uint carry = nonce_lo < params.start_lo ? 1u : 0u;
         uint nonce_hi = params.start_hi + carry;
         uint cv0 = pow_compress0_pre(pre, nonce_lo, nonce_hi);
-        if (pow_has_leading_zero_bits(cv0, params.bits)) {
+        if ((cv0 & mask) == 0u) {
             atomic_fetch_min_explicit(best, id, memory_order_relaxed);
             return;
         }
@@ -12965,7 +13149,7 @@ kernel void blake3_pow_seg_tail(
         let text = *TEXT.get_or_init(|| {
             super::gpu_dead_lane_enabled() && with_g4x2_dead_lanes(g4x2_msl_source()).is_some()
         });
-        text && !gpu.pso_ntt4g4x2.is_null() && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+        text && !gpu.pso_ntt4g4x2.is_null() && super::gpu_table_reuse_env_clear()
     }
 
     /// [`super::select_from_z_zero_store_from`] for this process and
@@ -13058,7 +13242,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13143,7 +13327,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13223,7 +13407,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -14574,8 +14758,7 @@ kernel void blake3_pow_seg_tail(
     }
 
     fn debug_enabled() -> bool {
-        std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
-            || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+        super::commit_timing_env_on() || super::gpu_commit_debug_env_on()
     }
 
     /// Observability for poisoned process-global locks. The poisoning panic
@@ -14583,7 +14766,7 @@ kernel void blake3_pow_seg_tail(
     /// `catch_unwind`); the score-relevant symptom — a GPU arm silently
     /// degraded or recovered — must be visible under FLOCK_GPU_COMMIT_DEBUG.
     fn note_poisoned_lock(tag: &str, recovered: bool) {
-        if std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some() {
+        if super::gpu_commit_debug_env_on() {
             eprintln!(
                 "[gpu-commit] {tag}: poisoned lock {}",
                 if recovered {
@@ -15408,6 +15591,37 @@ kernel void blake3_pow_seg_tail(
         // present (`super::ENV_NO_CB2_DONE_SIGNAL`), else the status.
         let sig2_ref = sig2.as_ref();
         if run_claims {
+        let epool_tail_on = {
+            static ON: OnceLock<bool> = OnceLock::new();
+            *ON.get_or_init(|| std::env::var_os("FLOCK_NO_TAILHASH_EPOOL").is_none())
+        };
+        let helper_loop = || loop {
+            let start = {
+                let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                // E-cores help only while cb2 is still running and enough units
+                // remain above `reserve`, avoiding any late E-core straggler tail.
+                if g.1
+                    || g.2 != usize::MAX
+                    || g.0 <= suffix_start.saturating_add(reserve.saturating_add(4).saturating_mul(unit))
+                {
+                    break;
+                }
+                if coord_work
+                    && (n_leaves - g.0) / unit >= force_units
+                    && unsafe { gpu.cb_done(cb2_u as Id, sig2_ref) }
+                {
+                    if reserve == 0 {
+                        g.1 = true;
+                        break;
+                    }
+                    freeze(&mut g);
+                    break;
+                }
+                claim(&mut g)
+            };
+            hash_unit(start);
+        };
+        let mut run_scope = || {
         rayon::scope(|sc| {
             for _ in 0..rayon::current_num_threads() {
                 let claims = &claims;
@@ -15505,6 +15719,12 @@ kernel void blake3_pow_seg_tail(
                 }
             }
         });
+        };
+        if epool_tail_on {
+            crate::epool::with_helper_broadcast(&helper_loop, run_scope);
+        } else {
+            run_scope();
+        }
         } else {
             // cb2 completed before the AB arm returned: keep helping the AB
             // queue while cb3 runs, as the whole-suffix cb3 path does.
@@ -16988,7 +17208,7 @@ kernel void blake3_pow_seg_tail(
         {
             return;
         }
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         if super::ranked_exact_contention_tune_pending() {
             // The outer warmup join will replay its real A/B branch beside a
             // balanced broad sweep. Avoid double-tuning against a synthetic
@@ -17295,7 +17515,7 @@ kernel void blake3_pow_seg_tail(
             return;
         }
 
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         let latch = latch_lock();
         let LatchState::On(latched) = &*latch else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -18657,7 +18877,7 @@ kernel void blake3_pow_seg_tail(
         let tree = unsafe {
             super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
         }
         // The replicated input codeword was never read by the from-z graph;
@@ -18929,7 +19149,7 @@ kernel void blake3_pow_seg_tail(
                 total_nodes,
             )
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             let wall_ms = stream.started.elapsed().as_secs_f64() * 1e3;
             eprintln!(
                 "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"

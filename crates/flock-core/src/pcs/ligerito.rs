@@ -6753,6 +6753,29 @@ fn round_msg_and_eval_lsb_factorized_eq_split(
             s += s_chunk * hi_weight;
         }
         (a, s)
+    } else if eq_hi.len() >= 16 && lig_fold_hetero_enabled() && crate::epool::epool().is_some() {
+        let chunk_len = 2 * eq_lo.len();
+        let n_chunks = eq_hi.len();
+        let mut partials = vec![(F128::ZERO, F128::ZERO); n_chunks];
+        let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        crate::epool::run_hetero_chunks(n_chunks, |hi| {
+            let start = hi * chunk_len;
+            let (a_chunk, s_chunk) =
+                crate::field::f128_slice::round0_factorized_eq(&f[start..start + chunk_len], eq_lo);
+            let hi_weight = eq_hi[hi];
+            // SAFETY: each `hi` is claimed once and writes its disjoint partial slot.
+            unsafe {
+                partials_base
+                    .ptr()
+                    .add(hi)
+                    .write((a_chunk * hi_weight, s_chunk * hi_weight));
+            }
+        });
+        partials
+            .into_iter()
+            .fold((F128::ZERO, F128::ZERO), |(a_0, s_0), (a_1, s_1)| {
+                (a_0 + a_1, s_0 + s_1)
+            })
     } else {
         f.par_chunks(2 * eq_lo.len())
             .zip(eq_hi.par_iter())
