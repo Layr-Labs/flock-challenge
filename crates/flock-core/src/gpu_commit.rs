@@ -969,12 +969,11 @@ pub const ENV_NO_ZC_R2_CS: &str = "FLOCK_NO_ZC_R2_CS";
 /// their view; nothing else about the round changes. Read once per process.
 pub const ENV_NO_ZC_R2_CS_SHARE: &str = "FLOCK_NO_ZC_R2_CS_SHARE";
 
-/// Hard ceiling of the measured R2-CS share, percent of `hi` (1024 of 2048
-/// chunks). Raised from 43 percent once the compact-state kernel got faster
-/// (16-bit multiplies and the byte-table fold): at the old ceiling the GPU
-/// arm could end early and wait, which nothing corrects, while a prefix that
-/// is too long is cut by the late-GPU steal in the timed prove itself.
-pub(crate) const ZC_R2_CS_SHARE_CEIL_PCT: usize = 50;
+/// Hard ceiling of the measured R2-CS share, percent of `hi` (921 of 2048
+/// chunks). The record publishes the ceiling as the GPU's timed prefix and
+/// the late-GPU steal cuts a prefix that runs long; this ceiling sits between
+/// the 43 and 50 percent ceilings of the record chain.
+pub(crate) const ZC_R2_CS_SHARE_CEIL_PCT: usize = 45;
 
 /// Measured prices below this are taken as bad samples: a wall this small
 /// means the oracle dispatch did not run or its timestamps are broken.
