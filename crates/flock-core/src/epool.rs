@@ -1353,6 +1353,23 @@ pub(crate) fn run_hetero_chunks_stateful_with_tail<S, I, F>(
     );
 }
 
+/// An optional proof-local claimant reserves complete chunks on this cursor.
+/// It must complete every reserved chunk before the caller uses the outputs.
+pub(crate) fn run_hetero_chunks_stateful_with_cursor<S, I, F>(
+    n_chunks: usize,
+    init: I,
+    f: F,
+    tail: Option<&(dyn Fn() + Sync)>,
+    cursor: &AtomicUsize,
+) where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
+    run_chunks_with_helper_stateful_cursor(
+        n_chunks, &init, &f, epool(), detached_enabled(), tail, Some(cursor),
+    );
+}
+
 /// [`run_hetero_chunks`] with an explicit helper pool, so tests can exercise
 /// the two-pool queue on hosts without efficiency cores.
 pub fn run_chunks_with_helper<F>(n_chunks: usize, f: &F, helper: Option<&rayon::ThreadPool>)
@@ -1503,6 +1520,22 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
     I: Fn() -> S + Sync,
     F: Fn(&mut S, usize) + Sync,
 {
+    run_chunks_with_helper_stateful_cursor(n_chunks, init, f, helper, detached, tail, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_chunks_with_helper_stateful_cursor<S, I, F>(
+    n_chunks: usize,
+    init: &I,
+    f: &F,
+    helper: Option<&rayon::ThreadPool>,
+    detached: bool,
+    tail: Option<&(dyn Fn() + Sync)>,
+    cursor: Option<&AtomicUsize>,
+) where
+    I: Fn() -> S + Sync,
+    F: Fn(&mut S, usize) + Sync,
+{
     if n_chunks == 0 {
         if let Some(tail) = tail {
             tail();
@@ -1521,6 +1554,7 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
         return;
     }
     let next = AtomicUsize::new(0);
+    let next = cursor.unwrap_or(&next);
     let guard = TailGuard::new(main_threads, helper.is_some() && n_chunks >= EPOOL_MIN_CHUNKS);
     let caller = rayon::current_thread_index();
     let worker = || {

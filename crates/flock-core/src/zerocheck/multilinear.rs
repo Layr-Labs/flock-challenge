@@ -5259,11 +5259,10 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
         // which starts at `cpu_base`. During the arm's first launch (oracle)
         // `cpu_base == 0` and the queue is exactly the incumbent one.
         // Late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1` keeps the record's join
-        // below): in an admitted prove the launch, the share and the CPU
-        // queue are the record's. If the GPU's buffer is complete when the
-        // queue has drained, that is all. If not, the CPU does not wait: it
-        // folds the GPU's chunks itself from the top of the share downward
-        // and asks at every claim whether the buffer has completed.
+        // below): after claiming the CPU suffix, main-pool workers fold the
+        // GPU's chunks from the top of its share down until its signal.
+        // `FLOCK_NO_ZC_T56_DRAIN_OVERLAP` restores a separate steal drain
+        // after the last CPU suffix job finishes.
         //
         // The seam: the boundary `lo` and the completion flag change only
         // under the claim lock; once completion is seen the boundary never
@@ -5314,45 +5313,55 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
             // folds the chunks after it in ascending order.
             let job = crate::gpu_commit::launch_zc_t56_loop(pa, pb, share, rhos[0], rhos[1], eq_lo);
             let cpu_base = job.as_ref().map_or(0, |j| j.chunks());
-            crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| fold(cpu_base + i));
+            let suffix = |i| fold(cpu_base + i);
             if let Some(job) = job {
-                let mut lo = cpu_base;
-                let mut gpu_done = job.done();
-                if !gpu_done {
-                    // The GPU is late: steal from the top of its share.
-                    let claims = std::sync::Mutex::new((cpu_base, false));
-                    crate::epool::run_hetero_chunks(cpu_base, |_| {
-                        let x_hi = {
-                            let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
-                            if g.1 || g.0 == 0 {
-                                return;
-                            }
-                            if job.done() {
-                                g.1 = true;
-                                return;
-                            }
-                            // Test builds only (see `t56_loop_hold`, the
-                            // constant 0 otherwise): do not steal below
-                            // chunk `n`; wait for the GPU instead, so a slow
-                            // GPU still keeps `min(n, share)` chunks and
-                            // that path can be checked.
-                            if g.0 <= t56_loop_hold() {
-                                while !job.done() {
-                                    std::hint::spin_loop();
-                                }
-                                g.1 = true;
-                                return;
-                            }
-                            job.set_cut(g.0 - 1);
-                            g.0 -= 1;
-                            g.0
-                        };
-                        fold(x_hi);
+                let claims = std::sync::Mutex::new((cpu_base, false));
+                let claim = || {
+                    let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.1 || g.0 == 0 {
+                        return None;
+                    }
+                    // Test builds may hold a minimum GPU share. A failed
+                    // buffer does not signal; let the CPU take its chunks.
+                    if g.0 <= t56_loop_hold() {
+                        while !job.done() && !job.failed() {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    if job.done() {
+                        g.1 = true;
+                        return None;
+                    }
+                    g.0 -= 1;
+                    job.set_cut(g.0);
+                    Some(g.0)
+                };
+                let overlap = std::env::var_os("FLOCK_NO_ZC_T56_DRAIN_OVERLAP").is_none();
+                let (lo, gpu_done) = if overlap {
+                    crate::epool::run_hetero_chunks_then(hi_size - cpu_base, &suffix, &|| {
+                        while let Some(x_hi) = claim() {
+                            fold(x_hi);
+                        }
                     });
-                    (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
-                    // Without the completion seen, the CPU folded every
-                    // chunk and nothing of the GPU's is read.
-                    assert!(gpu_done || lo == 0, "5+6 steal ended early");
+                    claims.into_inner().unwrap_or_else(|e| e.into_inner())
+                } else {
+                    crate::epool::run_hetero_chunks(hi_size - cpu_base, suffix);
+                    if job.done() {
+                        (cpu_base, true)
+                    } else {
+                        crate::epool::run_hetero_chunks(cpu_base, |_| {
+                            if let Some(x_hi) = claim() {
+                                fold(x_hi);
+                            }
+                        });
+                        claims.into_inner().unwrap_or_else(|e| e.into_inner())
+                    }
+                };
+                // Both drains join the suffix and all steals before we
+                // inspect the boundary or retire shared GPU state.
+                assert!(gpu_done || lo == 0, "5+6 steal ended early");
+                if timing {
+                    eprintln!("[zc-tail-rounds] 5+6 drain overlap={overlap} stolen={}", cpu_base - lo);
                 }
                 // A buffer that signalled and still reports an error is not
                 // trusted (the record's join checks the status too): the CPU
@@ -5393,6 +5402,8 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                     gpu_prefix = Some(KGpuPrefix { a, b, len_a: taken * chunk_out, len_b: taken * chunk_out });
                 }
                 job.finish(taken, hi_size);
+            } else {
+                crate::epool::run_hetero_chunks(hi_size, suffix);
             }
             return {
                 // SAFETY: the joined CPU suffix/steals and the copied GPU

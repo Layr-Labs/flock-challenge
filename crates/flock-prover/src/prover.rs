@@ -2904,6 +2904,14 @@ fn commit_with_round1_ab_precompute(
     let k_skip = zerocheck::K_SKIP;
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
+    use zerocheck::univariate_skip_optimized::Round1AbGpuBand;
+    let precommitted_cb2 = matches!(
+        &commit_codeword,
+        CommitCodeword::StreamedFirstPass(_, stream) if stream.has_matching_precommitted_cb2()
+    );
+    // Only the ranked fused stripe producer supplies an after-AB callback.
+    let gpu_band = (after_ab.is_some() && Round1AbGpuBand::enabled())
+        .then(|| Round1AbGpuBand::with_precommitted_cb2(precommitted_cb2));
 
     // `stripe_help` (deferred-stripe proves only): each main-pool worker of
     // the AB queue drains leftover stripe chunks once the AB queue is empty.
@@ -2918,9 +2926,9 @@ fn commit_with_round1_ab_precompute(
             // SAFETY: both buffers are live, `2^m / 8` bytes long, and
             // written only by the producer during this call.
             return unsafe {
-                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced(
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
+                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced_with_gpu_band(
+                    a_packed_f128.as_ptr().cast::<u8>(),
+                    b_packed_f128.as_ptr().cast::<u8>(),
                     pcs_params.m,
                     k_skip,
                     inv_table,
@@ -2928,6 +2936,7 @@ fn commit_with_round1_ab_precompute(
                     identity_prefix_contract,
                     stripe_help,
                     producer,
+                    gpu_band.as_ref(),
                 )
             };
         }
@@ -3017,13 +3026,33 @@ fn commit_with_round1_ab_precompute(
                     pcs::commit_preinitialized(z_packed, buf, pcs_params)
                 }
                 CommitCodeword::StreamedFirstPass(buf, stream) => {
-                    pcs::commit_from_streamed_first_pass(z_packed, buf, pcs_params, stream)
+                    pcs::commit::commit_from_streamed_first_pass_with_ab_band(
+                        z_packed,
+                        buf,
+                        pcs_params,
+                        stream,
+                        gpu_band.as_ref(),
+                    )
                 }
             };
             // Graph complete, root final — the AB arm is (typically) still
             // running. Fire the tail-fill hook here so its staged GPU work
             // executes in the arm-tail idle.
             flock_core::tmark::mark("commit arm root");
+            if let Some(band) = &gpu_band {
+                band.at_root();
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                if precommitted_cb2
+                    && identity_prefix_contract.is_some()
+                    && matches!(&pre.1.codeword, pcs::commit::CodewordBuf::Gpu(_))
+                {
+                    // SAFETY: the proof's identity receipt matches these
+                    // canonical Z/A/B allocations. Both join arms borrow
+                    // from this frame, and the AB lease retires the command
+                    // before the join can return or propagate a panic.
+                    unsafe { band.offer_tail_at_root(z_packed) };
+                }
+            }
             if let Some(hook) = tail_fill {
                 hook(&pre.0);
             }
