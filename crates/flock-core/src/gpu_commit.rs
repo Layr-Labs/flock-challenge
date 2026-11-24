@@ -1253,6 +1253,20 @@ pub(crate) fn gpu_zc_k_share() -> usize {
     if gpu_commit_enabled() { *SHARE } else { 0 }
 }
 
+/// Late-GPU steal for the K pass arm (`FLOCK_NO_ZC_K_STEAL`, any value,
+/// keeps the record's join): once the CPU queue has drained, instead of
+/// waiting for the GPU prefix the workers take its chunks from the top (one
+/// claim at a time, descending) until the prefix command buffer completes,
+/// publishing each taken chunk to the cut word (`flag_buf` word 1, which
+/// `zc_k_fold_v2` and `zc_k_finish_steal` skip from); the join then reads the GPU's
+/// outputs and sums only below the lowest taken chunk. Every chunk is folded
+/// by the CPU or the GPU with the same proven kernel and the GPU's rows above
+/// the cut are never read, so proof bytes are unchanged. Read once.
+pub(crate) fn zc_k_steal_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_STEAL").is_none())
+}
+
 /// Diagnostic trace for the K pass arm (`FLOCK_ZC_K_GPU_DEBUG=1`, or any
 /// `FLOCK_PHASE_TIMING` run): the oracle verdict and one line per prove.
 pub(crate) fn gpu_zc_k_debug() -> bool {
@@ -2893,6 +2907,64 @@ pub(crate) fn gpu_leaf_vec4_enabled() -> bool {
 pub(crate) fn gpu_tw_prefetch_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_GPU_TW_PREFETCH").is_none())
+}
+
+/// Measured K pass share (`FLOCK_NO_ZC_K_MEASURED_SHARE`, any value, keeps
+/// the constant share). The K arm's GPU share is a constant set from runner
+/// evidence (800 of 2048 chunks); on a slower GPU the CPU finishes its chunks
+/// and then waits at the K join (12-17 ms per prove measured on an M4). The
+/// warm-up's first (oracle) K launch is cold on both sides, so once it is
+/// admitted the warm-up replays, untimed: 256 CPU chunks through the same
+/// pool, then the GPU prefix twice back to back (the second wall is the
+/// steady one). Later launches use `g = n·u_cpu / (u_gpu + u_cpu)`, rounded to
+/// 16 chunks and clamped to `[256, 1024]`, allowing the GPU prefix to grow
+/// above or shrink below the record's 800-chunk default. The replays rewrite the same chunks' outputs with
+/// the same bytes, and every chunk is folded by the CPU or the GPU with the
+/// oracle-proven identical kernel, so proof bytes are unchanged. Read once.
+pub(crate) fn zc_k_measured_share_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_MEASURED_SHARE").is_none())
+}
+
+/// Upper bound of the measured K share: the record's own share for the
+/// faster kernel without the runner constant ([`ZC_K_GPU_V2_DEFAULT_CHUNKS`]).
+/// The arm's buffers are created for this many chunks when the measured
+/// share is on, so a machine whose GPU is fast enough can take more than the
+/// constant as well as less.
+pub(crate) fn zc_k_measured_cap() -> usize {
+    ZC_K_GPU_V2_DEFAULT_CHUNKS.max(gpu_zc_k_share())
+}
+
+/// The measured K share (`zc_k_measured_share_enabled`); 0 until measured.
+pub(crate) static ZC_K_MEASURED_SHARE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// GPU wall (ms, f64 bits) of the last joined K launch.
+pub(crate) static ZC_K_LAST_GPU_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Publish the measured K share from steady per-chunk walls (see
+/// `zc_k_measured_share_enabled`).
+pub(crate) fn zc_k_publish_measured_share(u_gpu: f64, u_cpu: f64, hi_size: usize) {
+    use std::sync::atomic::Ordering;
+    if !(u_gpu > 0.0 && u_cpu > 0.0 && u_gpu.is_finite() && u_cpu.is_finite()) {
+        return;
+    }
+    let base = gpu_zc_k_share().min(hi_size);
+    let hi = zc_k_measured_cap().min(hi_size);
+    let lo = 256usize.min(base);
+    let g = hi_size as f64 * u_cpu / (u_gpu + u_cpu);
+    let g = ((g / 16.0).round() as usize * 16).clamp(lo, hi);
+    // Test hook: force the published share (`FLOCK_ZC_K_MEASURED_TEST=<n>`).
+    let g = std::env::var("FLOCK_ZC_K_MEASURED_TEST")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(g, |t| t.clamp(lo, hi));
+    ZC_K_MEASURED_SHARE.store(g, Ordering::Relaxed);
+    if gpu_zc_k_debug() {
+        eprintln!(
+        "[zc-k] measured share {g}/{hi_size} (constant {base}): steady u_gpu {:.4} ms/chunk, u_cpu {:.4} ms/chunk",
+            u_gpu, u_cpu
+        );
+    }
 }
 
 /// Kill switch for the four-bit-shift table bases in the zero-root from-z
@@ -5916,13 +5988,20 @@ kernel void zc_k_fold_v2(
     ushort sl [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]])
 {
+    // Late-GPU steal: `flag[1]` = cut + 1 (0 = no cut). Read it once per
+    // threadgroup: independent loads could straddle a CPU publication and
+    // let only some threads return before a barrier. Reuse the table-build
+    // barrier to publish one uniform decision before touching chunk outputs.
+    threadgroup uint cut_tg;
     threadgroup uint4 nib[256];
     threadgroup uint4 rtab[512];
     threadgroup uint4 sred[8][8];
+    if (lid == 0u) { cut_tg = atomic_load_explicit(flag + 1, memory_order_relaxed); }
     nib[lid] = nib_dev[lid];
     rtab[lid] = nib_dev[256u + lid];
     rtab[256u + lid] = nib_dev[512u + lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (cut_tg != 0u && tg / p.sb_per_chunk >= cut_tg - 1u) { return; }
 
     uint i = lid & 63u;
     uint k = lid >> 6u;
@@ -6006,6 +6085,31 @@ kernel void zc_k_fold_v2(
     }
 }
 
+
+// `zc_k_finish` for the late-GPU steal (`super::zc_k_steal_enabled`): the
+// same per-chunk sum, but a chunk at or above the cut word (`flag[1]` =
+// cut + 1, 0 = none) was taken by the CPU and is left unwritten. Built from
+// this source with the faster fold, so the embedded metallib (whose
+// `zc_k_finish` is unchanged) stays fresh.
+kernel void zc_k_finish_steal(
+    device const uint4* tg_part [[buffer(0)]],
+    device const uint4* consts  [[buffer(1)]],
+    device uint4*       part    [[buffer(2)]],
+    constant ZcKParams& p       [[buffer(3)]],
+    device atomic_uint* flag    [[buffer(4)]],
+    uint chunk [[threadgroup_position_in_grid]],
+    uint k     [[thread_index_in_threadgroup]])
+{
+    // Late-GPU steal: `flag[1]` = cut + 1 (0 = no cut). A chunk at or above the cut was stolen by the
+    // CPU, which owns its rows; the fold skipped it, so there is nothing to sum and nothing to write.
+    uint cw = atomic_load_explicit(flag + 1, memory_order_relaxed);
+    if (cw != 0u && chunk >= cw - 1u) { return; }
+    uint4 s = uint4(0u);
+    for (uint j = 0u; j < p.sb_per_chunk; j++) {
+        s ^= tg_part[(ulong(chunk) * ulong(p.sb_per_chunk) + ulong(j)) * 8ul + ulong(k)];
+    }
+    part[ulong(chunk) * 8ul + ulong(k)] = zck_mul(consts[p.eq_hi_off + chunk], s);
+}
 "#;
 
     /// The leaf + parent3 kernel's straight-line compression (see
@@ -28442,6 +28546,8 @@ kernel void zc_ab_finish(
     /// Whether the fold pipeline last built is `zc_k_fold_v2` (it then reads
     /// the rho2 nibble table after the byte-table nibbles in `nib_buf`).
     static ZC_K_V2_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// Whether the finish pipeline reads the late-steal cut word.
+    static ZC_K_STEAL_FINISH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Build the K arm's pipelines on `device` from the embedded metallib; the
     /// faster fold (`zc_k_fold_v2`, see [`super::zc_k_v2_enabled`]) from
@@ -28486,11 +28592,13 @@ kernel void zc_ab_finish(
                 Ok(pso)
             };
             let mut fold = make_pipeline("zc_k_fold");
-            let finish = make_pipeline("zc_k_finish");
+            let mut finish = make_pipeline("zc_k_finish");
+            let mut steal_finish: Id = NIL;
             // The faster fold (`FLOCK_NO_ZC_K_V2` kills): compiled
             // from source here (the prewarm thread); on any failure the
             // embedded kernel stays.
             ZC_K_V2_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+            ZC_K_STEAL_FINISH.store(false, std::sync::atomic::Ordering::Relaxed);
             if super::zc_k_v2_enabled() && fold.is_ok() {
                 let v2 = (|| -> Result<Id, String> {
                     let src = api.nsstring(ZC_K_V2_MSL_SOURCE)?;
@@ -28506,6 +28614,24 @@ kernel void zc_ab_finish(
                     );
                     if lib.is_null() {
                         return Err(format!("zc-k v2 compile: {}", api.error_string(err)));
+                    }
+                    // Compile the optional cut-aware finish from the same v2 library.
+                    if super::zc_k_steal_enabled()
+                        && let Ok(ns) = api.nsstring("zc_k_finish_steal")
+                    {
+                        let f: Id = send!(api, unsafe extern "C" fn(Id, Sel, Id) -> Id, lib, c"newFunctionWithName:", ns);
+                        if !f.is_null() {
+                            let mut perr: Id = NIL;
+                            steal_finish = send!(
+                                api,
+                                unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
+                                device,
+                                c"newComputePipelineStateWithFunction:error:",
+                                f,
+                                &mut perr
+                            );
+                            release(f);
+                        }
                     }
                     let ns = api.nsstring("zc_k_fold_v2")?;
                     let f: Id = send!(api, unsafe extern "C" fn(Id, Sel, Id) -> Id, lib, c"newFunctionWithName:", ns);
@@ -28536,8 +28662,15 @@ kernel void zc_ab_finish(
                         }
                         fold = Ok(pso);
                         ZC_K_V2_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if !steal_finish.is_null() {
+                            if let Ok(old) = std::mem::replace(&mut finish, Ok(steal_finish)) {
+                                release(old);
+                            }
+                            ZC_K_STEAL_FINISH.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     Err(e) => {
+                        release(steal_finish);
                         if super::gpu_zc_k_debug() {
                             eprintln!("[zc-k-gpu] v2 fold unavailable ({e}); embedded kernel kept");
                         }
@@ -28608,10 +28741,16 @@ kernel void zc_ab_finish(
             return share;
         }
         zc_k_prewarm();
-        if ZC_K_V2_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        let share = if ZC_K_V2_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
             share
         } else {
             super::ZC_K_GPU_DEFAULT_CHUNKS
+        };
+        let measured = super::ZC_K_MEASURED_SHARE.load(std::sync::atomic::Ordering::Relaxed);
+        if measured > 0 && super::zc_k_measured_share_enabled() {
+            if ZC_K_V2_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) { measured } else { share.min(measured) }
+        } else {
+            share
         }
     }
 
@@ -28694,12 +28833,26 @@ kernel void zc_ab_finish(
         /// Views released at the join (the deltas one may be the round-one
         /// arm's retained view).
         views: [Id; 2],
+        /// The late-steal cut word: `flag_buf` word 1 (`cut + 1`, 0 = none;
+        /// read by `zc_k_fold_v2` and `zc_k_finish_steal`).
+        cut: usize,
+        /// The launch ran `zc_k_fold_v2` (the only fold that reads the cut).
+        v2: bool,
+        /// Span of the deltas view when it is the round-one arm's view (the
+        /// measured-share replays re-publish it; see
+        /// `zc_k_measured_share_enabled`).
+        d_span: Option<(usize, usize)>,
         chunks: usize,
         per_chunk_a: usize,
         per_chunk_b: usize,
         calibration: bool,
         submitted: std::time::Instant,
     }
+
+    // SAFETY: the steal loop's workers only poll the buffer's completion
+    // (`cb_done`, a status/shared-event read) and store the cut word; waiting
+    // and releasing stay with the launching thread.
+    unsafe impl Sync for ZcKJob {}
 
     // SAFETY: the handles are only waited/released by the launching thread;
     // Metal objects are themselves thread-safe.
@@ -28719,6 +28872,37 @@ kernel void zc_ab_finish(
         /// GPU prefix length in chunks.
         pub(crate) fn chunks(&self) -> usize {
             self.chunks
+        }
+
+        /// Whether the CPU may take GPU chunks from the top after its own
+        /// queue (`super::zc_k_steal_enabled`; never in the oracle probe;
+        /// only with the fold that reads the cut).
+        pub(crate) fn steal_active(&self) -> bool {
+            !self.calibration && self.v2 && super::zc_k_steal_enabled()
+        }
+
+        /// Non-blocking: the prefix command buffer has completed.
+        pub(crate) fn poll_done(&self) -> bool {
+            match gpu() {
+                Ok(g) => unsafe { g.cb_done(self.cb, self.sig.as_ref()) },
+                Err(_) => true,
+            }
+        }
+
+        /// Publish a chunk the CPU has taken (every chunk at or above it is
+        /// the CPU's): the cut word only moves down.
+        pub(crate) fn publish_cut(&self, chunk: usize) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            let v = chunk as u32 + 1;
+            // SAFETY: a live shared-storage buffer word for the arm's lifetime.
+            let w = unsafe { &*(self.cut as *const AtomicU32) };
+            let mut cur = w.load(Ordering::Relaxed);
+            while cur == 0 || v < cur {
+                match w.compare_exchange_weak(cur, v, Ordering::Release, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(x) => cur = x,
+                }
+            }
         }
     }
 
@@ -28912,6 +29096,16 @@ kernel void zc_ab_finish(
                         gpu.set_buffer(enc, state.nib_buf, 0, 1);
                         gpu.set_buffer(enc, state.touch_buf, 0, 2);
                         gpu.set_bytes(enc, pb, 3);
+                        // The finish kernel reads the late-steal cut word from buffer 4: bind an always-zero
+                        // word (cut 0 = no cut) so this touch dispatch always reads the view.
+                        static ZERO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                        let zero = *ZERO.get_or_init(|| {
+                            gpu.new_buffer(256).map(|b| {
+                                std::ptr::write_bytes(gpu.buffer_contents(b), 0, 256);
+                                b as usize
+                            }).unwrap_or(0)
+                        }) as Id;
+                        gpu.set_buffer(enc, zero, 0, 4);
                         gpu.dispatch(enc, 1, 1);
                         gpu.end_encoding(enc);
                         gpu.commit_async(cb);
@@ -29049,7 +29243,18 @@ kernel void zc_ab_finish(
             return None;
         };
         let state_mutex = ZC_K_STATE
-            .get_or_init(|| match zc_k_init(gpu, chunks, per_chunk_a, per_chunk_b, sb_per_chunk, n_weights) {
+            .get_or_init(|| match zc_k_init(
+                gpu,
+                if super::zc_k_measured_share_enabled() && super::zc_k_share_is_v2_default() {
+                    chunks.max(super::zc_k_measured_cap())
+                } else {
+                    chunks
+                },
+                per_chunk_a,
+                per_chunk_b,
+                sb_per_chunk,
+                n_weights,
+            ) {
                 Ok(s) => Some(std::sync::Mutex::new(s)),
                 Err(e) => {
                     if debug {
@@ -29071,7 +29276,11 @@ kernel void zc_ab_finish(
                 return None;
             }
         };
-        if state.chunks != chunks
+        // A measured share (`super::zc_k_measured_share_enabled`) launches at
+        // most the chunks the buffers were sized for; every buffer is indexed
+        // per chunk from zero.
+        if chunks > state.chunks
+            || (state.chunks != chunks && !super::zc_k_measured_share_enabled())
             || state.per_chunk_a != per_chunk_a
             || state.per_chunk_b != per_chunk_b
             || state.sb_per_chunk != sb_per_chunk
@@ -29117,6 +29326,10 @@ kernel void zc_ab_finish(
             // its join handed one over in this prove; a fresh view only when
             // no view of the allocation exists.
             let d_ptr = deltas.as_ptr() as usize;
+            let d_span = match ab_view {
+                Some((p, l, _)) if p == d_ptr && l >= d_bytes => Some((p, l)),
+                _ => None,
+            };
             let d_view = match ab_view {
                 Some((p, l, b)) if p == d_ptr && l >= d_bytes => Some(b),
                 other => {
@@ -29172,6 +29385,8 @@ kernel void zc_ab_finish(
             }
             std::ptr::copy_nonoverlapping(eq_hi.as_ptr(), consts.add(2 + n_weights), chunks);
             *gpu.buffer_contents(state.flag_buf).cast::<u32>() = 0;
+            // Cut word (late-GPU steal): 0 = no cut.
+            *gpu.buffer_contents(state.flag_buf).cast::<u32>().add(1) = 0;
             #[repr(C)]
             struct P {
                 sb_per_chunk: u32,
@@ -29220,6 +29435,7 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.consts_buf, 0, 1);
                 gpu.set_buffer(enc, state.part_buf, 0, 2);
                 gpu.set_bytes(enc, pb, 3);
+                gpu.set_buffer(enc, state.flag_buf, 0, 4);
                 gpu.dispatch(enc, chunks as u64, 8);
                 gpu.end_encoding(enc);
                 // Armed in the warm-up's oracle launch too, so the timed
@@ -29235,6 +29451,9 @@ kernel void zc_ab_finish(
                     cb,
                     sig,
                     views: [a_view, d_view],
+                    cut: gpu.buffer_contents(state.flag_buf).cast::<u32>().add(1) as usize,
+                    v2: ZC_K_V2_ACTIVE.load(Ordering::Relaxed) && ZC_K_STEAL_FINISH.load(Ordering::Relaxed),
+                    d_span,
                     chunks,
                     per_chunk_a,
                     per_chunk_b,
@@ -29278,6 +29497,17 @@ kernel void zc_ab_finish(
             }
             let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
             let gpu_ms = if ok.is_ok() { zc_fold_gpu_wall_ms(gpu, job.cb) } else { 0.0 };
+            super::ZC_K_LAST_GPU_MS.store(gpu_ms.to_bits(), Ordering::Relaxed);
+            // Measured share: keep the round-one deltas view for the warm-up
+            // replays (publish retains it; the next round-one launch clears it).
+            if ok.is_ok()
+                && super::zc_k_measured_share_enabled()
+                && super::zc_k_share_is_v2_default()
+                && super::ZC_K_MEASURED_SHARE.load(Ordering::Relaxed) == 0
+                && let Some((p, l)) = job.d_span
+            {
+                zc_k_view_publish(gpu, p, l, job.views[1]);
+            }
             gpu.release(job.cb);
             for v in job.views {
                 gpu.release(v);
