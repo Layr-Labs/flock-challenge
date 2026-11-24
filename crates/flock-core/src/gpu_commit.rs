@@ -1131,6 +1131,7 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
             return 0;
         }
         match std::env::var_os(ENV_ZC_AB_GPU_CHUNKS) {
+            None if zc_ab_steal_enabled() => ZC_AB_GPU_STEAL_DEFAULT_CHUNKS,
             None => ZC_AB_GPU_DEFAULT_CHUNKS,
             Some(value) => value
                 .to_str()
@@ -1139,6 +1140,32 @@ pub(crate) fn gpu_zc_ab_completion_share() -> usize {
         }
     });
     if gpu_commit_enabled() { *SHARE } else { 0 }
+}
+
+/// Kill switch for the round-one AB completion arm's CPU steal
+/// (`FLOCK_NO_ZC_AB_STEAL=1`: the record's kernels, share
+/// [`ZC_AB_GPU_DEFAULT_CHUNKS`] and join, where the CPU queue, having drained
+/// the chunks after the GPU's prefix, waits for the GPU). With it on, the GPU
+/// gets the larger default prefix [`ZC_AB_GPU_STEAL_DEFAULT_CHUNKS`] and runs
+/// boundary-aware kernels; once its own queue is claimed, the CPU claims the
+/// GPU's chunks from the top of the prefix downward (in half-chunk ranges,
+/// as the tail split does) for as long as the command buffer has not
+/// finished, publishing a boundary above which GPU threadgroups not yet
+/// started skip. The GPU reports per chunk whether it folded it completely;
+/// each chunk's partial is taken from whichever side folded all of it (a
+/// chunk neither side finished is folded by the CPU after the join). Same
+/// kernel arithmetic and the same per-chunk partials (the warm-up oracle
+/// still byte-compares the boundary-aware kernels against the CPU), so the
+/// XOR-folded message is bit-identical whoever folds a chunk; the split
+/// balances itself to the machine's GPU/CPU speed ratio. Read once per
+/// process.
+pub const ENV_NO_ZC_AB_STEAL: &str = "FLOCK_NO_ZC_AB_STEAL";
+const ZC_AB_GPU_STEAL_DEFAULT_CHUNKS: usize = 64;
+
+pub(crate) fn zc_ab_steal_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| !env_is_one(ENV_NO_ZC_AB_STEAL));
+    *ON
 }
 
 pub const ENV_NO_ZC_AB_SCHED: &str = "FLOCK_NO_ZC_AB_SCHED";
@@ -4134,6 +4161,37 @@ pub(crate) fn hybrid_tail_hash_force() -> usize {
             .unwrap_or_else(|| built.trim().parse().unwrap_or(0))
     })
 }
+
+/// Kill switch for the segmented suffix hash (`FLOCK_NO_SEG_CB3=1`, exact
+/// `1`: cb3 is encoded and committed once the whole CPU suffix NTT is done,
+/// with the CPU and late tail hash forms, as before). With the NTT's AB
+/// priority on, the CPU suffix NTT ends near the AB arm's end, so cb3 (the
+/// GPU hash of the whole suffix) ran after both, alone, on a GPU idle since
+/// cb2's end. With this on, before the CPU NTT starts the suffix is split
+/// into [`SEG_CB3_PARTS`] contiguous 1,024-leaf-aligned ranges and one
+/// command buffer per range is committed behind cb2. Each first waits on a
+/// shared event, then hashes its range's 512-leaf units (leaves and nine
+/// parent levels, the CPU tail hash's indirect unit kernels with a fixed
+/// count). The NTT's deep phase reports each finished 1,024-position
+/// sub-transform; once every sub of the lowest unsignalled ranges is
+/// finished the event is raised past them, so the GPU hashes the suffix
+/// while the CPU completes it, and only the last range's hash follows the
+/// NTT. After the join the suffix levels above the units and the top levels
+/// are recomputed exactly as after the tail hash. Same leaf bytes (each
+/// range is hashed after its last write), same BLAKE3 nodes in the same
+/// slots, so the root is unchanged. Not during the split tuner's sweep or
+/// a forced tail-hash test build. Read once per process.
+pub const ENV_NO_SEG_CB3: &str = "FLOCK_NO_SEG_CB3";
+
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn seg_cb3_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| !env_is_one(ENV_NO_SEG_CB3));
+    *ON
+}
+
+/// Ranges of the segmented suffix hash (see [`ENV_NO_SEG_CB3`]).
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) const SEG_CB3_PARTS: usize = 8;
 
 /// Process-local lifecycle of the broad exact-contention calibration. The
 /// ranked prover requests it before entering the call-zero warmup join. A
@@ -12426,6 +12484,64 @@ kernel void blake3_pow_seg_tail(
             }
         }
 
+        /// Process-wide MTLSharedEvent of the segmented suffix hash
+        /// (`super::ENV_NO_SEG_CB3`), created on first use and never
+        /// released. Only the CPU raises it, monotonically.
+        pub(crate) unsafe fn seg_cb3_event(&self) -> Id {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static EV: AtomicUsize = AtomicUsize::new(0);
+            let p = EV.load(Ordering::Acquire);
+            if p != 0 {
+                return p as Id;
+            }
+            let ev: Id = unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel) -> Id,
+                    self.device,
+                    c"newSharedEvent"
+                )
+            };
+            if ev.is_null() {
+                return ev;
+            }
+            match EV.compare_exchange(0, ev as usize, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => ev,
+                Err(other) => {
+                    unsafe { self.release(ev) };
+                    other as Id
+                }
+            }
+        }
+
+        /// Encode a command-buffer-level wait for `ev` to reach `value`
+        /// before the next encoder of `cb`.
+        pub(crate) unsafe fn encode_wait_event(&self, cb: Id, ev: Id, value: u64) {
+            unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel, Id, u64),
+                    cb,
+                    c"encodeWaitForEvent:value:",
+                    ev,
+                    value
+                );
+            }
+        }
+
+        /// Raise a shared event's `signaledValue` from the CPU.
+        pub(crate) unsafe fn set_event_value(&self, ev: Id, value: u64) {
+            unsafe {
+                send!(
+                    self.api,
+                    unsafe extern "C" fn(Id, Sel, u64),
+                    ev,
+                    c"setSignaledValue:",
+                    value
+                );
+            }
+        }
+
         /// Encode a command-buffer-level signal of `ev` to `value` between
         /// two encoders of `cb`.
         pub(crate) unsafe fn encode_signal_event(&self, cb: Id, ev: Id, value: u64) {
@@ -15203,6 +15319,246 @@ kernel void blake3_pow_seg_tail(
         if super::tail_half_units_enabled() { 9 } else { 10 }
     }
 
+    /// Process-lifetime indirect-count buffers of the segmented suffix
+    /// hash's command buffers (see `super::ENV_NO_SEG_CB3`), one per range.
+    static SEG_ARGS: std::sync::OnceLock<[usize; super::SEG_CB3_PARTS]> = std::sync::OnceLock::new();
+
+    /// The segmented suffix hash of one hybrid commit (see
+    /// `super::ENV_NO_SEG_CB3`): one committed command buffer per suffix
+    /// range, each gated on `ev` reaching `base + i + 1`.
+    struct SegCb3 {
+        ev: usize,
+        base: u64,
+        /// Retained, committed command buffers, in queue order.
+        cbs: Vec<usize>,
+        /// Completion signal of each buffer (status alone lags the
+        /// signal, so every buffer carries one when the pool allows).
+        sigs: Vec<Option<DoneSig>>,
+        /// Range `i` covers 1,024-leaf chunks `bounds[i]..bounds[i + 1]`
+        /// counted from `suffix_start`.
+        bounds: Vec<usize>,
+        /// Unfinished chunks of each range.
+        remaining: Vec<std::sync::atomic::AtomicUsize>,
+        /// Ranges released to the GPU so far (a prefix).
+        released: std::sync::Mutex<usize>,
+        suffix_start: usize,
+        n_leaves: usize,
+        unit_levels: usize,
+    }
+
+    impl SegCb3 {
+        const CHUNK_LEAVES: usize = 1024;
+
+        /// Encode one gated buffer per range and commit them all behind cb2,
+        /// or none (any encode failure returns `None` with nothing
+        /// committed).
+        unsafe fn start(
+            gpu: &Gpu,
+            staging: Id,
+            tree_buf: Id,
+            n_leaves: usize,
+            suffix_start: usize,
+        ) -> Option<Self> {
+            let unit_levels = tail_unit_levels();
+            let unit = 1usize << unit_levels;
+            if unit > Self::CHUNK_LEAVES
+                || !suffix_start.is_multiple_of(Self::CHUNK_LEAVES)
+                || suffix_start >= n_leaves
+                || !n_leaves.is_power_of_two()
+                || n_leaves < 1 << 16
+            {
+                return None;
+            }
+            let total = (n_leaves - suffix_start) / Self::CHUNK_LEAVES;
+            let parts = super::SEG_CB3_PARTS.min(total);
+            let bounds: Vec<usize> = (0..=parts).map(|i| i * total / parts).collect();
+            unsafe {
+                let ev = gpu.seg_cb3_event();
+                if ev.is_null() {
+                    return None;
+                }
+                let args = match SEG_ARGS.get() {
+                    Some(a) => *a,
+                    None => {
+                        let mut a = [0usize; super::SEG_CB3_PARTS];
+                        for slot in a.iter_mut() {
+                            *slot = gpu.new_buffer(16 * 12).ok()? as usize;
+                        }
+                        *SEG_ARGS.get_or_init(|| a)
+                    }
+                };
+                let base = gpu.event_signaled_value(ev);
+                let mut cbs: Vec<usize> = Vec::with_capacity(parts);
+                let release_all = |cbs: &[usize]| {
+                    for &cb in cbs {
+                        gpu.release(cb as Id);
+                    }
+                };
+                let mut sigs = Vec::with_capacity(parts);
+                for i in 0..parts {
+                    let lo = suffix_start + bounds[i] * Self::CHUNK_LEAVES;
+                    let units = (bounds[i + 1] - bounds[i]) * Self::CHUNK_LEAVES / unit;
+                    let Ok(cb) = gpu.command_buffer() else {
+                        release_all(&cbs);
+                        return None;
+                    };
+                    let cb = gpu.retain(cb);
+                    cbs.push(cb as usize);
+                    gpu.encode_wait_event(cb, ev, base + i as u64 + 1);
+                    let Ok(enc) = gpu.compute_encoder(cb) else {
+                        release_all(&cbs);
+                        return None;
+                    };
+                    let args_buf = args[i] as Id;
+                    let per_unit = encode_merkle_suffix_units_indirect(
+                        gpu, enc, staging, tree_buf, n_leaves, lo, args_buf, unit_levels,
+                    );
+                    gpu.end_encoding(enc);
+                    write_tail_counts(gpu.buffer_contents(args_buf).cast::<u32>(), &per_unit, units);
+                    sigs.push(gpu.arm_done(cb));
+                }
+                for &cb in &cbs {
+                    gpu.commit_async(cb as Id);
+                }
+                Some(Self {
+                    ev: ev as usize,
+                    base,
+                    cbs,
+                    sigs,
+                    remaining: (0..parts)
+                        .map(|i| std::sync::atomic::AtomicUsize::new(bounds[i + 1] - bounds[i]))
+                        .collect(),
+                    bounds,
+                    released: std::sync::Mutex::new(0),
+                    suffix_start,
+                    n_leaves,
+                    unit_levels,
+                })
+            }
+        }
+
+        /// Raise the event past every leading range whose chunks are all
+        /// finished (at least `at_least` ranges when given).
+        unsafe fn release_ready(&self, gpu: &Gpu, at_least: usize) {
+            use std::sync::atomic::Ordering;
+            let parts = self.remaining.len();
+            let mut g = self.released.lock().unwrap_or_else(|e| e.into_inner());
+            let mut r = (*g).max(at_least.min(parts));
+            while r < parts && self.remaining[r].load(Ordering::Acquire) == 0 {
+                r += 1;
+            }
+            if r > *g {
+                *g = r;
+                // Every write of the released ranges happens before this
+                // (the finishing threads' release decrements, read above).
+                std::sync::atomic::fence(Ordering::SeqCst);
+                unsafe { gpu.set_event_value(self.ev as Id, self.base + r as u64) };
+            }
+        }
+
+        /// The NTT's deep phase finished positions `elem_offset / 64 ..` of
+        /// `len` elements (64 lanes per position); every write is done.
+        unsafe fn note(&self, gpu: &Gpu, elem_offset: usize, len: usize) {
+            use std::sync::atomic::Ordering;
+            let leaf = elem_offset / 64;
+            let n = len / 64;
+            if leaf < self.suffix_start || leaf + n > self.n_leaves {
+                return;
+            }
+            let mut any = false;
+            let c0 = (leaf - self.suffix_start) / Self::CHUNK_LEAVES;
+            let c1 = (leaf + n - self.suffix_start).div_ceil(Self::CHUNK_LEAVES);
+            for c in c0..c1 {
+                // The range holding chunk `c`.
+                let i = self.bounds.partition_point(|&b| b <= c) - 1;
+                if self.remaining[i].fetch_sub(1, Ordering::AcqRel) == 1 {
+                    any = true;
+                }
+            }
+            if any {
+                unsafe { self.release_ready(gpu, 0) };
+            }
+        }
+
+        /// The NTT is complete: release every range, join cb2 and the ranges
+        /// (helping the AB queue meanwhile), then rebuild the suffix's levels
+        /// above the units exactly as the tail hash's join does.
+        unsafe fn join(
+            mut self,
+            gpu: &Gpu,
+            cb2: Id,
+            sig2: Option<DoneSig>,
+            tree_base: crate::epool::SyncPtr<Hash>,
+        ) -> Result<(), String> {
+            unsafe {
+                self.release_ready(gpu, self.remaining.len());
+                let last = *self.cbs.last().expect("at least one range") as Id;
+                let last_sig = self.sigs.last().and_then(|s| s.as_ref());
+                super::help_pool_until(|| gpu.cb_done(last, last_sig));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4);
+                let r2 = gpu.yield_wait_cb_until(cb2, deadline);
+                Gpu::recycle_done(sig2);
+                r2?;
+                // Each range on its own signal (or status): a failed buffer
+                // never signals, and reports its error through the status.
+                for (i, &cb) in self.cbs.iter().enumerate() {
+                    gpu.yield_wait_cb_until_sig(cb as Id, self.sigs[i].as_ref(), deadline)?;
+                }
+                for s in self.sigs.drain(..) {
+                    Gpu::recycle_done(s);
+                }
+                fine_head_status(gpu, cb2)?;
+                crate::tmark::mark("seg cb3 joined");
+                let n_leaves = self.n_leaves;
+                let mut ls = 0usize;
+                let mut ll = n_leaves;
+                for _ in 0..self.unit_levels {
+                    ls += ll;
+                    ll /= 2;
+                }
+                let mut lo = self.suffix_start >> self.unit_levels;
+                while ll > 16 {
+                    let ws = ls + ll;
+                    let wlo = lo / 2;
+                    let mut o = wlo;
+                    while o < ll / 2 {
+                        let len = 1024.min(ll / 2 - o);
+                        let read = core::slice::from_raw_parts(tree_base.ptr().add(ls + 2 * o), 2 * len);
+                        let write = core::slice::from_raw_parts_mut(tree_base.ptr().add(ws + o), len);
+                        crate::merkle::hash_ranked_blake3_parent_chunk(read, write);
+                        o += len;
+                    }
+                    ls = ws;
+                    ll /= 2;
+                    lo = wlo;
+                }
+                // Every range completed: nothing left for `Drop` to wait on.
+                for cb in self.cbs.drain(..) {
+                    gpu.release(cb as Id);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for SegCb3 {
+        fn drop(&mut self) {
+            // Never leave a gated buffer waiting (an early exit): release
+            // every range, wait them out, then drop the references.
+            if let Ok(gpu) = gpu() {
+                unsafe {
+                    gpu.set_event_value(self.ev as Id, self.base + self.remaining.len() as u64);
+                    for &cb in &self.cbs {
+                        let _ = gpu.wait_cb(cb as Id);
+                        gpu.release(cb as Id);
+                    }
+                }
+            }
+            // Signals of buffers not known complete are not recycled.
+            self.sigs.clear();
+        }
+    }
+
     /// Process-lifetime indirect-count buffer of the CPU tail hash's cb3.
     static TAIL_ARGS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
@@ -15628,6 +15984,26 @@ kernel void blake3_pow_seg_tail(
                     // See `super::ENV_NO_NTT_AB_PRIORITY`.
                     let helpers = super::ntt_ab_priority_helpers();
                     let ntt_first = helpers > 0;
+                    // Segmented suffix hash (see `super::ENV_NO_SEG_CB3`):
+                    // gated range buffers committed behind cb2 now, released
+                    // as the NTT's deep phase finishes their sub-transforms.
+                    let seg = if ntt_first
+                        && super::seg_cb3_enabled()
+                        && super::hybrid_tail_hash_force() == 0
+                        && !hybrid_arm_recording()
+                    {
+                        SegCb3::start(gpu, staging, tree_buf, n_leaves, suffix_leaf_start)
+                    } else {
+                        None
+                    };
+                    let seg_ref = seg.as_ref();
+                    let finish_seg = |elem_offset: usize, chunk: &[F128]| {
+                        if let Some(s) = seg_ref {
+                            // SAFETY: `chunk` is final (the deep phase's
+                            // callback runs after its last write).
+                            unsafe { s.note(gpu, elem_offset, chunk.len()) };
+                        }
+                    };
                     let prio = crate::epool::PriorityScope::new(helpers);
                     if fine_m == 0 {
                         ntt.forward_transform_interleaved_ranked_block_range_and_then(
@@ -15637,7 +16013,7 @@ kernel void blake3_pow_seg_tail(
                             log_d,
                             16 - k_cpu16,
                             16,
-                            |_elem_offset: usize, _chunk: &[F128]| {},
+                            finish_seg,
                         );
                     } else {
                         // The boundary sixteenth's layers 4..8 are the GPU's
@@ -15685,7 +16061,7 @@ kernel void blake3_pow_seg_tail(
                                 }
                                 Ok(())
                             },
-                            |_elem_offset: usize, _chunk: &[F128]| {},
+                            finish_seg,
                         )?;
                     }
                     drop(prio);
@@ -15718,7 +16094,10 @@ kernel void blake3_pow_seg_tail(
                         && super::hybrid_cpu_tail_hash_enabled()
                         && super::late_tail_hash_enabled()
                         && !gpu.cb_done(cb2, sig2.as_ref());
-                    if tail || late {
+                    if let Some(seg) = seg {
+                        let sig2 = sig2;
+                        seg.join(gpu, cb2, sig2, tree_base)?;
+                    } else if tail || late {
                         hybrid_cpu_tail_hash_join(
                             gpu,
                             cb2,
@@ -27616,6 +27995,92 @@ kernel void zc_ab_finish(
     }
     partials[chunk * 64u + lam] = gf_reduce(clmul128(eq_hi[chunk], gf_reduce(s)));
 }
+
+// Steal variants (`FLOCK_NO_ZC_AB_STEAL`): the same gather and finish, except
+// that a threadgroup whose chunk is at or above the CPU's steal boundary
+// `cut[0]` (read once per threadgroup, so the decision is uniform) does
+// nothing. `ran[tg]` records whether a gather threadgroup ran; the finish of
+// a chunk runs (and sets `done[chunk]`) only if every one of its gather
+// threadgroups ran, so a set `done` flag always names a complete partial.
+kernel void zc_ab_gather_cut(
+    device const uchar* ab       [[buffer(0)]],
+    device const uint4* tables   [[buffer(1)]],
+    device uint4*       banks    [[buffer(2)]],
+    constant ZcAbParams& p       [[buffer(3)]],
+    volatile device const uint* cut [[buffer(4)]],
+    device uint*        ran      [[buffer(5)]],
+    uint tg  [[threadgroup_position_in_grid]],
+    uint lam [[thread_index_in_threadgroup]])
+{
+    uint chunk = tg / p.groups_per_chunk;
+    threadgroup uint go;
+    if (lam == 0u) { go = (chunk < cut[0]) ? 1u : 0u; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (go == 0u) {
+        if (lam == 0u) { ran[tg] = 0u; }
+        return;
+    }
+    uint t0 = (tg % p.groups_per_chunk) * p.tops_per_group;
+    uint4 acc[16];
+    for (int i = 0; i < 16; i++) { acc[i] = uint4(0u); }
+    for (uint t = t0; t < t0 + p.tops_per_group; t++) {
+        ulong rbase = (ulong(chunk) << p.chunk_shift) + (ulong(t) << 14) + ulong(lam);
+        for (uint b = 0u; b < 16u; b++) {
+            device const uint4* tb = tables + ((t * 16u + b) << 8);
+            device const uchar* col = ab + (rbase + ulong(b) * 64ul);
+            uint m = p.bmask[b];
+            if (m == 0xFFFFu) {
+                for (int bot = 0; bot < 16; bot++) { uchar v = col[bot * 1024]; acc[bot] ^= tb[v]; }
+            } else if (m == 0x5555u) {
+                for (int bot = 0; bot < 16; bot += 2) { uchar v = col[bot * 1024]; acc[bot] ^= tb[v]; }
+            } else if (m == 0xAAAAu) {
+                for (int bot = 1; bot < 16; bot += 2) { uchar v = col[bot * 1024]; acc[bot] ^= tb[v]; }
+            } else if (m != 0u) {
+                for (int bot = 0; bot < 16; bot++) {
+                    if (((m >> uint(bot)) & 1u) != 0u) { uchar v = col[bot * 1024]; acc[bot] ^= tb[v]; }
+                }
+            }
+        }
+    }
+    for (int bot = 0; bot < 16; bot++) {
+        banks[(ulong(tg) * 16ul + ulong(bot)) * 64ul + ulong(lam)] = acc[bot];
+    }
+    if (lam == 0u) { ran[tg] = 1u; }
+}
+
+kernel void zc_ab_finish_cut(
+    device const uint4* banks    [[buffer(0)]],
+    device const uint4* eq_bot   [[buffer(1)]],
+    device const uint4* eq_hi    [[buffer(2)]],
+    device uint4*       partials [[buffer(3)]],
+    constant ZcAbParams& p       [[buffer(4)]],
+    device const uint*  ran      [[buffer(5)]],
+    device uint*        done     [[buffer(6)]],
+    uint chunk [[threadgroup_position_in_grid]],
+    uint lam   [[thread_index_in_threadgroup]])
+{
+    uint ok = 1u;
+    for (uint g = 0u; g < p.groups_per_chunk; g++) {
+        ok &= ran[chunk * p.groups_per_chunk + g];
+    }
+    if (ok == 0u) {
+        if (lam == 0u) { done[chunk] = 0u; }
+        return;
+    }
+    U256k s;
+    s.r0 = 0ul; s.r1 = 0ul; s.r2 = 0ul; s.r3 = 0ul;
+    for (uint bot = 0u; bot < 16u; bot++) {
+        uint4 v = uint4(0u);
+        for (uint g = 0u; g < p.groups_per_chunk; g++) {
+            ulong group = ulong(chunk) * ulong(p.groups_per_chunk) + ulong(g);
+            v ^= banks[(group * 16ul + ulong(bot)) * 64ul + ulong(lam)];
+        }
+        U256k q = clmul128(eq_bot[bot], v);
+        s.r0 ^= q.r0; s.r1 ^= q.r1; s.r2 ^= q.r2; s.r3 ^= q.r3;
+    }
+    partials[chunk * 64u + lam] = gf_reduce(clmul128(eq_hi[chunk], gf_reduce(s)));
+    if (lam == 0u) { done[chunk] = 1u; }
+}
 "#;
 
     include!("gpu_commit/ab_mul9.rs");
@@ -27665,6 +28130,18 @@ kernel void zc_ab_finish(
         part_buf: Id,
         /// Cached no-copy view of the `ab_inner` allocation `(ptr, len, buf)`.
         wrap: Option<(usize, usize, Id)>,
+        /// Steal arm (`super::ENV_NO_ZC_AB_STEAL`): the boundary-aware
+        /// gather and finish pipelines, the 16-byte steal-boundary word and
+        /// the flags buffer (`ran[ZC_AB_MAX_GROUPS] | done[ZC_AB_MAX_CHUNKS]`,
+        /// u32 each). `None` with the arm off.
+        steal: Option<ZcAbSteal>,
+    }
+
+    struct ZcAbSteal {
+        gather_pso: Id,
+        finish_pso: Id,
+        cut_buf: Id,
+        flags_buf: Id,
     }
 
     // SAFETY: the Metal handles are only touched under the state mutex;
@@ -27685,7 +28162,7 @@ kernel void zc_ab_finish(
     fn zc_ab_init(gpu: &'static Gpu, basis: &[F128; 128]) -> Result<ZcAb, String> {
         unsafe {
             let pool = gpu.pool_push();
-            let built = (|| -> Result<(Id, Id, Id), String> {
+            let built = (|| -> Result<(Id, Id, Id, Option<(Id, Id)>), String> {
                 let source = ab_mul9::source(ZC_AB_MSL_SOURCE);
                 let src = gpu.api.nsstring(&source)?;
                 let mut err: Id = NIL;
@@ -27731,9 +28208,14 @@ kernel void zc_ab_finish(
                     }
                     Ok(pso)
                 };
-                let mut psos: Vec<Id> = Vec::with_capacity(3);
+                let mut psos: Vec<Id> = Vec::with_capacity(5);
                 let mut failed = None;
-                for name in ["zc_ab_tables", "zc_ab_gather", "zc_ab_finish"] {
+                let names: &[&str] = if super::zc_ab_steal_enabled() {
+                    &["zc_ab_tables", "zc_ab_gather", "zc_ab_finish", "zc_ab_gather_cut", "zc_ab_finish_cut"]
+                } else {
+                    &["zc_ab_tables", "zc_ab_gather", "zc_ab_finish"]
+                };
+                for &name in names {
                     match make_pipeline(name) {
                         Ok(pso) => psos.push(pso),
                         Err(e) => {
@@ -27749,10 +28231,11 @@ kernel void zc_ab_finish(
                     }
                     return Err(e);
                 }
-                Ok((psos[0], psos[1], psos[2]))
+                let cut_psos = if psos.len() == 5 { Some((psos[3], psos[4])) } else { None };
+                Ok((psos[0], psos[1], psos[2], cut_psos))
             })();
             gpu.pool_pop(pool);
-            let (tables_pso, gather_pso, finish_pso) = built?;
+            let (tables_pso, gather_pso, finish_pso, cut_psos) = built?;
             let max_threads = |pso: Id| -> u64 {
                 send!(
                     gpu.api,
@@ -27802,6 +28285,40 @@ kernel void zc_ab_finish(
                 gpu.buffer_contents(consts_buf).cast::<F128>().add(ZC_AB_BASIS_OFF),
                 128,
             );
+            // Steal arm: its pipelines must run 64-wide and its two small
+            // buffers must allocate, else the arm stays off (incumbent join).
+            let steal = cut_psos.and_then(|(g, f)| {
+                let fits = max_threads(g) >= 64 && max_threads(f) >= 64;
+                let bufs = if fits {
+                    match (gpu.new_buffer(16), gpu.new_buffer((ZC_AB_MAX_GROUPS + ZC_AB_MAX_CHUNKS) * 4)) {
+                        (Ok(c), Ok(fl)) => Some((c, fl)),
+                        (c, fl) => {
+                            if let Ok(c) = c {
+                                gpu.release(c);
+                            }
+                            if let Ok(fl) = fl {
+                                gpu.release(fl);
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                match bufs {
+                    Some((cut_buf, flags_buf)) => Some(ZcAbSteal {
+                        gather_pso: g,
+                        finish_pso: f,
+                        cut_buf,
+                        flags_buf,
+                    }),
+                    None => {
+                        gpu.release(g);
+                        gpu.release(f);
+                        None
+                    }
+                }
+            });
             Ok(ZcAb {
                 tables_pso,
                 gather_pso,
@@ -27811,6 +28328,7 @@ kernel void zc_ab_finish(
                 banks_buf,
                 part_buf,
                 wrap: None,
+                steal,
             })
         }
     }
@@ -27851,11 +28369,19 @@ kernel void zc_ab_finish(
         groups_per_chunk: usize,
         calibration: bool,
         submitted: std::time::Instant,
+        /// Steal arm (`super::ENV_NO_ZC_AB_STEAL`): the steal-boundary word
+        /// and the per-chunk `done` flags (process-lifetime shared buffer
+        /// contents). Null with the arm off.
+        cut: *mut u32,
+        done: *const u32,
     }
 
     // SAFETY: the command buffer handle is only waited/released by the
     // launching thread; Metal command buffers are themselves thread-safe.
+    // `cut` / `done` name process-lifetime shared buffers, written by the
+    // CPU only through volatile stores (cut) or read after the join (done).
     unsafe impl Send for ZcAbJob {}
+    unsafe impl Sync for ZcAbJob {}
 
     impl ZcAbJob {
         /// First chunk the CPU drains. Zero for the warm-up oracle probe (the
@@ -27868,13 +28394,36 @@ kernel void zc_ab_finish(
         pub(crate) fn gpu_chunks(&self) -> usize {
             self.chunks
         }
+
+        /// Whether the CPU may steal this job's chunks: an admitted (not
+        /// oracle) launch of the steal kernels.
+        pub(crate) fn stealable(&self) -> bool {
+            !self.cut.is_null() && !self.calibration
+        }
+
+        /// Whether the command buffer has finished (completed or failed).
+        pub(crate) fn gpu_finished(&self) -> bool {
+            match gpu() {
+                Ok(g) => unsafe { g.cb_status(self.cb) >= 4 },
+                Err(_) => true,
+            }
+        }
+
+        /// Publish the CPU steal boundary: GPU threadgroups not yet started
+        /// skip chunks `>= hi`. Only a hint; the `done` flags are the truth.
+        pub(crate) fn set_cut(&self, hi: usize) {
+            if !self.cut.is_null() {
+                unsafe { self.cut.write_volatile(hi as u32) };
+            }
+        }
     }
 
     /// Result of joining the round-one AB completion GPU prefix.
     pub(crate) enum ZcAbResult {
         /// Admitted prove: the GPU's per-chunk 64-lane partials of chunks
-        /// `0..chunks`, eq_hi-weighted exactly like the CPU's.
-        Prefix(Vec<[F128; 64]>),
+        /// `0..chunks`, eq_hi-weighted exactly like the CPU's, and (steal
+        /// launch only) which of them the GPU completed; `None` = all.
+        Prefix(Vec<[F128; 64]>, Option<Vec<bool>>),
         /// Warm-up oracle probe compared (verdict recorded for the process);
         /// the caller's CPU partials are authoritative.
         Calibrated,
@@ -27990,6 +28539,13 @@ kernel void zc_ab_finish(
                 bmask: *bmask,
             };
             let pb = std::slice::from_raw_parts((&raw const params).cast::<u8>(), core::mem::size_of::<P>());
+            // Steal arm: reset the boundary to "GPU owns every chunk" before
+            // the submit (the previous prove's job has been joined).
+            let steal = state.steal.as_ref().map(|st| {
+                let cut = gpu.buffer_contents(st.cut_buf).cast::<u32>();
+                cut.write_volatile(u32::MAX);
+                (st.gather_pso, st.finish_pso, st.cut_buf, st.flags_buf, cut)
+            });
             let pool = gpu.pool_push();
             let one_cb = super::gpu_zc_ab_one_cb_enabled();
             let submitted = (|| -> Result<(Id, Id, Option<DoneSig>), String> {
@@ -28004,18 +28560,26 @@ kernel void zc_ab_finish(
                 gpu.end_encoding(enc);
                 let cb = if one_cb { cb_tables } else { gpu.command_buffer()? };
                 let enc = gpu.compute_encoder(cb)?;
-                gpu.set_pipeline(enc, state.gather_pso);
+                gpu.set_pipeline(enc, steal.map_or(state.gather_pso, |s| s.0));
                 gpu.set_buffer(enc, ab_buf, 0, 0);
                 gpu.set_buffer(enc, state.tables_buf, 0, 1);
                 gpu.set_buffer(enc, state.banks_buf, 0, 2);
                 gpu.set_bytes(enc, pb, 3);
+                if let Some((_, _, cut_buf, flags_buf, _)) = steal {
+                    gpu.set_buffer(enc, cut_buf, 0, 4);
+                    gpu.set_buffer(enc, flags_buf, 0, 5);
+                }
                 gpu.dispatch(enc, (chunks * groups_per_chunk) as u64, 64);
-                gpu.set_pipeline(enc, state.finish_pso);
+                gpu.set_pipeline(enc, steal.map_or(state.finish_pso, |s| s.1));
                 gpu.set_buffer(enc, state.banks_buf, 0, 0);
                 gpu.set_buffer(enc, state.consts_buf, ZC_AB_EQBOT_OFF * 16, 1);
                 gpu.set_buffer(enc, state.consts_buf, ZC_AB_EQHI_OFF * 16, 2);
                 gpu.set_buffer(enc, state.part_buf, 0, 3);
                 gpu.set_bytes(enc, pb, 4);
+                if let Some((_, _, _, flags_buf, _)) = steal {
+                    gpu.set_buffer(enc, flags_buf, 0, 5);
+                    gpu.set_buffer(enc, flags_buf, ZC_AB_MAX_GROUPS * 4, 6);
+                }
                 gpu.dispatch(enc, chunks as u64, 64);
                 gpu.end_encoding(enc);
                 // Armed in the warm-up's oracle launch too, so the timed
@@ -28043,6 +28607,10 @@ kernel void zc_ab_finish(
                     groups_per_chunk,
                     calibration: mode == ZC_AB_UNCALIBRATED,
                     submitted: std::time::Instant::now(),
+                    cut: steal.map_or(std::ptr::null_mut(), |s| s.4),
+                    done: steal.map_or(std::ptr::null(), |s| {
+                        gpu.buffer_contents(s.3).cast::<u32>().add(ZC_AB_MAX_GROUPS).cast_const()
+                    }),
                 }),
                 Err(e) => {
                     if debug {
@@ -28120,6 +28688,9 @@ kernel void zc_ab_finish(
             };
             let parts = gpu.buffer_contents(state.part_buf).cast::<[F128; 64]>();
             let out: Vec<[F128; 64]> = std::slice::from_raw_parts(parts, job.chunks).to_vec();
+            let done_flags: Option<Vec<bool>> = (!job.done.is_null()).then(|| {
+                (0..job.chunks).map(|c| job.done.add(c).read_volatile() == 1).collect()
+            });
             // This prove's launch validated (or created) the cached view of
             // `ab_inner`, which the cascade donates as the compact deltas:
             // hand it to the K pass arm of the same prove.
@@ -28142,7 +28713,7 @@ kernel void zc_ab_finish(
                         job.submitted.elapsed().as_secs_f64() * 1e3,
                     );
                 }
-                return ZcAbResult::Prefix(out);
+                return ZcAbResult::Prefix(out, done_flags);
             }
             // ---- Warm-up oracle: GPU partials must equal the CPU's own ----
             let mismatch = if cpu_partials.len() < job.chunks {

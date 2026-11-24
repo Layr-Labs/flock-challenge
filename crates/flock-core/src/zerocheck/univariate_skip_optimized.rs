@@ -4074,6 +4074,56 @@ fn ab_tail_split_chunks(hi_size: usize, big_lo_size: usize, n_banks: usize) -> u
     (*N).min(hi_size)
 }
 
+/// The round-one AB completion's caller-only tail (the C fold, which must run
+/// on the calling thread) held for the AB steal tickets
+/// (`gpu_commit::ENV_NO_ZC_AB_STEAL`): run at most once, on the caller only.
+struct CallerTail<T, R> {
+    caller: std::thread::ThreadId,
+    tail: std::cell::UnsafeCell<Option<T>>,
+    out: std::cell::UnsafeCell<Option<R>>,
+}
+
+// SAFETY: both cells are touched only on the thread whose id is `caller`
+// (`run` checks it; `into_output` consumes the value on that thread).
+unsafe impl<T, R> Sync for CallerTail<T, R> {}
+
+impl<T: FnOnce() -> R, R> CallerTail<T, R> {
+    fn new(tail: T) -> Self {
+        Self {
+            caller: std::thread::current().id(),
+            tail: std::cell::UnsafeCell::new(Some(tail)),
+            out: std::cell::UnsafeCell::new(None),
+        }
+    }
+
+    fn is_caller(&self) -> bool {
+        std::thread::current().id() == self.caller
+    }
+
+    /// Run the tail now if this is the caller and it has not run yet.
+    fn run(&self) {
+        if !self.is_caller() {
+            return;
+        }
+        // SAFETY: caller thread only (above); `take` ends the borrow before
+        // the tail runs, so a re-entrant call sees `None`.
+        let t = unsafe { (*self.tail.get()).take() };
+        if let Some(t) = t {
+            let r = t();
+            unsafe { *self.out.get() = Some(r) };
+        }
+    }
+
+    /// The tail's output, running it here if no ticket ran it.
+    fn into_output(self) -> R {
+        assert!(self.is_caller(), "caller tail consumed off its thread");
+        match self.out.into_inner() {
+            Some(r) => r,
+            None => (self.tail.into_inner().expect("tail neither ran nor kept"))(),
+        }
+    }
+}
+
 /// Round-one AB completion GPU prefix arm in flight (see
 /// `gpu_commit::ENV_NO_GPU_ZC_AB_COMPLETION`). The GPU computes the per-chunk
 /// 64-lane partials of chunks `0..cpu_base()`; the CPU drains the rest with
@@ -4109,23 +4159,81 @@ impl AbGpuPrefix {
     /// the process) and returns `true`. `false` = the GPU failed after
     /// admission: the caller must CPU-compute `partials[..cpu_base()]`.
     fn finish(self, partials: &mut [[F128; ELL]]) -> bool {
+        match self.finish_keep(partials, &|_| false) {
+            Some(missing) => {
+                debug_assert!(missing.is_empty(), "a non-steal launch completes every chunk");
+                missing.is_empty()
+            }
+            None => false,
+        }
+    }
+
+    /// [`Self::finish`] for a steal launch (`gpu_commit::ENV_NO_ZC_AB_STEAL`):
+    /// chunks with `keep(c)` are the CPU's (left untouched); every other
+    /// prefix chunk the GPU completed is copied in. `Some(missing)` lists the
+    /// prefix chunks neither side completed (the caller folds them);
+    /// `None` = the GPU failed after admission (the caller folds every
+    /// prefix chunk it does not keep).
+    fn finish_keep(self, partials: &mut [[F128; ELL]], keep: &dyn Fn(usize) -> bool) -> Option<Vec<usize>> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let hi_size = partials.len();
             match crate::gpu_commit::zc_ab_wait(self.job, partials, hi_size) {
-                crate::gpu_commit::ZcAbResult::Prefix(gpu) => {
-                    partials[..gpu.len()].copy_from_slice(&gpu);
-                    true
+                crate::gpu_commit::ZcAbResult::Prefix(gpu, done) => {
+                    let mut missing = Vec::new();
+                    for (c, part) in gpu.iter().enumerate() {
+                        if keep(c) {
+                            continue;
+                        }
+                        if done.as_ref().is_none_or(|d| d[c]) {
+                            partials[c] = *part;
+                        } else {
+                            missing.push(c);
+                        }
+                    }
+                    Some(missing)
                 }
-                crate::gpu_commit::ZcAbResult::Calibrated => true,
-                crate::gpu_commit::ZcAbResult::Failed => false,
+                crate::gpu_commit::ZcAbResult::Calibrated => Some(Vec::new()),
+                crate::gpu_commit::ZcAbResult::Failed => None,
             }
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
-            let _ = partials;
+            let _ = (partials, keep);
+            Some(Vec::new())
+        }
+    }
+
+    /// Whether the CPU may steal this launch's prefix chunks.
+    fn stealable(&self) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.job.stealable()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            false
+        }
+    }
+
+    /// Whether the GPU command buffer has finished.
+    fn gpu_finished(&self) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.job.gpu_finished()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
             true
         }
+    }
+
+    /// Publish the CPU steal boundary (GPU skips chunks `>= hi`).
+    fn set_cut(&self, hi: usize) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.job.set_cut(hi);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = hi;
     }
 }
 
@@ -4506,6 +4614,21 @@ where
             let half_lo = big_lo_size / 2;
             let mut half_partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(2 * split);
             let half_base = crate::epool::SyncPtr(half_partials.as_mut_ptr());
+            // CPU steal (`gpu_commit::ENV_NO_ZC_AB_STEAL`): after the CPU
+            // queue, `steal_units` more indices claim the GPU prefix's chunks
+            // from the top down, `steal_per` units (halves when the tail
+            // split's halving applies) per chunk, each only while the GPU
+            // command buffer is unfinished. Zero without a stealable launch:
+            // the queue below is then exactly the incumbent one.
+            let steal_on = gpu_prefix.as_ref().is_some_and(AbGpuPrefix::stealable);
+            let steal_per = if big_lo_size % 2 == 0 && half_lo >= (1usize << bank_bits) { 2 } else { 1 };
+            let steal_units = if steal_on { cpu_base * steal_per } else { 0 };
+            let stolen: Vec<std::sync::atomic::AtomicBool> =
+                (0..steal_units).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+            let mut steal_partials: Vec<[F128; ELL]> = crate::alloc_uninit_vec(steal_units);
+            let steal_base = crate::epool::SyncPtr(steal_partials.as_mut_ptr());
+            let cut_min = std::sync::atomic::AtomicUsize::new(cpu_base);
+            let cpu_units = whole + 2 * split;
             let fold_chunk = |x_hi: usize, range: std::ops::Range<usize>| -> [F128; ELL] {
                 let mut partial = [F128::ZERO; ELL];
                 AB_EQ_FOLD_BANKS.with(|cell| {
@@ -4534,31 +4657,85 @@ where
                 });
                 partial
             };
-            let out = crate::epool::run_hetero_chunks_caller_tail(
-                whole + 2 * split,
-                |i| {
-                    let (x_hi, range) = if i < whole {
-                        (cpu_base + i, 0..big_lo_size)
+            let cpu_unit = |i: usize| {
+                let (x_hi, range) = if i < whole {
+                    (cpu_base + i, 0..big_lo_size)
+                } else {
+                    let j = i - whole;
+                    let h = j & 1;
+                    (cpu_base + whole + j / 2, h * half_lo..(h + 1) * half_lo)
+                };
+                let partial = fold_chunk(x_hi, range);
+                // SAFETY: each queue index owns one disjoint output slot
+                // (whole chunks in `partials`, halves in
+                // `half_partials`) and the synchronous queue join
+                // publishes all writes before reduction.
+                unsafe {
+                    if i < whole {
+                        *partials_base.ptr().add(x_hi) = partial;
                     } else {
-                        let j = i - whole;
-                        let h = j & 1;
-                        (cpu_base + whole + j / 2, h * half_lo..(h + 1) * half_lo)
-                    };
-                    let partial = fold_chunk(x_hi, range);
-                    // SAFETY: each queue index owns one disjoint output slot
-                    // (whole chunks in `partials`, halves in
-                    // `half_partials`) and the synchronous queue join
-                    // publishes all writes before reduction.
-                    unsafe {
-                        if i < whole {
-                            *partials_base.ptr().add(x_hi) = partial;
-                        } else {
-                            *half_base.ptr().add(i - whole) = partial;
-                        }
+                        *half_base.ptr().add(i - whole) = partial;
                     }
-                },
-                tail,
-            );
+                }
+            };
+            let out = if steal_units > 0 {
+                use std::sync::atomic::Ordering;
+                let prefix = gpu_prefix.as_ref().expect("steal units need a GPU prefix");
+                let steal_next = std::sync::atomic::AtomicUsize::new(0);
+                // Steal loop: claim units (top chunk first) while the GPU
+                // command buffer is unfinished.
+                let steal_loop = || loop {
+                    if prefix.gpu_finished() {
+                        break;
+                    }
+                    let j = steal_next.fetch_add(1, Ordering::Relaxed);
+                    if j >= steal_units {
+                        break;
+                    }
+                    let c = cpu_base - 1 - j / steal_per;
+                    if cut_min.fetch_min(c, Ordering::Relaxed) > c {
+                        // Re-read so a racing larger store is corrected.
+                        prefix.set_cut(cut_min.load(Ordering::Relaxed));
+                    }
+                    let range = if steal_per == 2 {
+                        let h = j & 1;
+                        h * half_lo..(h + 1) * half_lo
+                    } else {
+                        0..big_lo_size
+                    };
+                    let partial = fold_chunk(c, range);
+                    // SAFETY: one disjoint slot per steal unit; the
+                    // synchronous queue join publishes the writes.
+                    unsafe { *steal_base.ptr().add(j) = partial };
+                    stolen[j].store(true, Ordering::Relaxed);
+                };
+                // Tickets past the CPU units: a main-pool worker that draws
+                // one runs the steal loop; the caller first runs the C fold
+                // tail (which must run on it) and then steals; efficiency-core
+                // helpers return at once (a slow core must not own a unit on
+                // the critical path).
+                let tail_cell = CallerTail::new(tail);
+                let n_tickets = 2 * rayon::current_num_threads() + 8;
+                crate::epool::run_hetero_chunks_caller_tail(
+                    cpu_units + n_tickets,
+                    |i| {
+                        if i < cpu_units {
+                            cpu_unit(i);
+                            return;
+                        }
+                        if tail_cell.is_caller() {
+                            tail_cell.run();
+                        } else if crate::epool::epool().is_some_and(|p| p.current_thread_index().is_some()) {
+                            return;
+                        }
+                        steal_loop();
+                    },
+                    || {},
+                );
+                tail_cell.into_output()
+            } else {
+                crate::epool::run_hetero_chunks_caller_tail(cpu_units, cpu_unit, tail)
+            };
             // Reassemble each split chunk's partial (XOR is exact).
             let reassemble = |partials: &mut [[F128; ELL]]| {
                 for k in 0..split {
@@ -4574,6 +4751,44 @@ where
                 None => {
                     crate::scratch::give_f128(tables);
                     reassemble(&mut partials);
+                }
+                Some(prefix) if steal_on => {
+                    use std::sync::atomic::Ordering;
+                    reassemble(&mut partials);
+                    // Chunk `c` of the prefix: unit `j` of its `u`-th part.
+                    let unit = |c: usize, u: usize| (cpu_base - 1 - c) * steal_per + u;
+                    let cpu_whole = |c: usize| (0..steal_per).all(|u| stolen[unit(c, u)].load(Ordering::Relaxed));
+                    let missing = match prefix.finish_keep(&mut partials, &cpu_whole) {
+                        Some(missing) => missing,
+                        None => (0..cpu_base).filter(|&c| !cpu_whole(c)).collect(),
+                    };
+                    for c in 0..cpu_base {
+                        if cpu_whole(c) {
+                            let mut p = steal_partials[unit(c, 0)];
+                            for u in 1..steal_per {
+                                let q = steal_partials[unit(c, u)];
+                                for lane in 0..ELL {
+                                    p[lane] += q[lane];
+                                }
+                            }
+                            partials[c] = p;
+                        }
+                    }
+                    if !missing.is_empty() {
+                        let missing_ref = &missing;
+                        crate::epool::run_hetero_chunks_caller_tail(
+                            missing.len(),
+                            |k| {
+                                let x_hi = missing_ref[k];
+                                let partial = fold_chunk(x_hi, 0..big_lo_size);
+                                // SAFETY: distinct chunks per index; the
+                                // synchronous join publishes the writes.
+                                unsafe { *partials_base.ptr().add(x_hi) = partial };
+                            },
+                            || {},
+                        );
+                    }
+                    crate::scratch::give_f128(tables);
                 }
                 Some(prefix) => {
                     // The oracle probe compares against the CPU's complete
