@@ -20200,24 +20200,35 @@ struct LcFactoredB4Params {
     uint i_groups;
 };
 
-#define LC_FACTORED_B4_STEP(TT, W) {            \
-    a0 ^= (TT)[(W) & 255u];                     \
-    a1 ^= (TT)[((W) >> 8) & 255u];              \
-    a2 ^= (TT)[((W) >> 16) & 255u];             \
-    a3 ^= (TT)[(W) >> 24];                      \
+#define LC_PLANAR_STEP4(OFF, W, A0, A1, A2, A3) {                                   \
+    uchar4 b = as_type<uchar4>(W);                                                  \
+    uint i0 = (OFF) + b.x, i1 = (OFF) + b.y, i2 = (OFF) + b.z, i3 = (OFF) + b.w;    \
+    A0.x ^= t0[i0]; A1.x ^= t0[i1]; A2.x ^= t0[i2]; A3.x ^= t0[i3];                 \
+    A0.y ^= t1[i0]; A1.y ^= t1[i1]; A2.y ^= t1[i2]; A3.y ^= t1[i3];                 \
+    A0.z ^= t2[i0]; A1.z ^= t2[i1]; A2.z ^= t2[i2]; A3.z ^= t2[i3];                 \
+    A0.w ^= t3[i0]; A1.w ^= t3[i1]; A2.w ^= t3[i2]; A3.w ^= t3[i3];                 \
 }
 
+// 128 threads x 8 contiguous columns = 1024 columns/TG.
+// Eliminates tg_eq (32x16 B) via simd_shuffle (1 simdgroup per stripe, 5+3-bit
+// branchless table build, 2 barriers instead of 3), shrinking threadgroup SRAM
+// from 16.5 KiB to exactly 16.0 KiB (2 resident TGs/core), and stores the four
+// 256-entry byte tables word-planar (4 x 1024 uint) to eliminate 16-byte uint4
+// threadgroup bank conflicts on Apple Silicon GPUs.
 kernel void lc_fold_stripes_factored_b4(
     device const uint*               z32      [[buffer(0)]],
     device const uint4*              eq       [[buffer(1)]],
     device uint4*                    partials [[buffer(2)]],
     constant LcFactoredB4Params&     p        [[buffer(3)]],
     uint tgid [[threadgroup_position_in_grid]],
-    uint lid  [[thread_position_in_threadgroup]])
+    uint lid  [[thread_position_in_threadgroup]],
+    ushort sl [[thread_index_in_simdgroup]])
 {
     constexpr uint B = 4u;
-    threadgroup uint4 tg_eq[B * 8u];
-    threadgroup uint4 tab[B * 256u];
+    threadgroup uint t0[B * 256u];
+    threadgroup uint t1[B * 256u];
+    threadgroup uint t2[B * 256u];
+    threadgroup uint t3[B * 256u];
 
     uint chunk  = tgid / p.i_groups;
     uint ig     = tgid - chunk * p.i_groups;
@@ -20226,60 +20237,87 @@ kernel void lc_fold_stripes_factored_b4(
     uint s_hi = min(s_lo + p.stripes_per_chunk, p.stripe_hi);
 
     uint4 a0 = uint4(0u), a1 = uint4(0u), a2 = uint4(0u), a3 = uint4(0u);
-    uint c0 = i_base + 4u * lid;
+    uint4 b0 = uint4(0u), b1 = uint4(0u), b2 = uint4(0u), b3 = uint4(0u);
+    uint c0 = i_base + 8u * lid;
     bool live = c0 < p.useful;
-    uint kw = p.k >> 2;
+    uint kw = p.k >> 3;
+    device const uint2* z64 = reinterpret_cast<device const uint2*>(z32);
+
+    uint s = lid >> 5;
+    uint h = lid & 31u;
+    uint4 m0 = uint4(-(h & 1u));
+    uint4 m1 = uint4(-((h >> 1) & 1u));
+    uint4 m2 = uint4(-((h >> 2) & 1u));
+    uint4 m3 = uint4(-((h >> 3) & 1u));
+    uint4 m4 = uint4(-((h >> 4) & 1u));
 
     for (uint sb = s_lo; sb < s_hi; sb += B) {
         uint ns = min(B, s_hi - sb);
-        uint w[B];
-        for (uint t = 0u; t < B; ++t) { w[t] = 0u; }
+        uint2 w0 = uint2(0u), w1 = uint2(0u), w2 = uint2(0u), w3 = uint2(0u);
         if (live && ns == B) {
-            uint q = (sb * p.k + c0) >> 2;
-            for (uint t = 0u; t < B; ++t) { w[t] = z32[q + t * kw]; }
+            uint q = (sb * p.k + c0) >> 3;
+            w0 = z64[q];
+            w1 = z64[q + kw];
+            w2 = z64[q + 2u * kw];
+            w3 = z64[q + 3u * kw];
         }
+        uint4 my_eq = (s < ns && sl < 8) ? eq[(sb + s) * 8u + uint(sl)] : uint4(0u);
+        uint4 e0 = simd_shuffle(my_eq, 0);
+        uint4 e1 = simd_shuffle(my_eq, 1);
+        uint4 e2 = simd_shuffle(my_eq, 2);
+        uint4 e3 = simd_shuffle(my_eq, 3);
+        uint4 e4 = simd_shuffle(my_eq, 4);
+        uint4 e5 = simd_shuffle(my_eq, 5);
+        uint4 e6 = simd_shuffle(my_eq, 6);
+        uint4 e7 = simd_shuffle(my_eq, 7);
+        uint4 v0 = (e0 & m0) ^ (e1 & m1) ^ (e2 & m2) ^ (e3 & m3) ^ (e4 & m4);
+        uint4 v1 = v0 ^ e5;
+        uint4 v2 = v0 ^ e6;
+        uint4 v3 = v1 ^ e6;
+        uint4 v4 = v0 ^ e7;
+        uint4 v5 = v1 ^ e7;
+        uint4 v6 = v2 ^ e7;
+        uint4 v7 = v3 ^ e7;
 
-        // All lanes rendezvous before the next block reuses tables that the
-        // previous block's lookups may still be reading.
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lid < ns * 8u) {
-            tg_eq[lid] = eq[sb * 8u + lid];
+        if (s < ns) {
+            uint tb = s * 256u + h;
+            t0[tb]=v0.x; t0[tb+32]=v1.x; t0[tb+64]=v2.x; t0[tb+96]=v3.x;
+            t0[tb+128]=v4.x; t0[tb+160]=v5.x; t0[tb+192]=v6.x; t0[tb+224]=v7.x;
+            t1[tb]=v0.y; t1[tb+32]=v1.y; t1[tb+64]=v2.y; t1[tb+96]=v3.y;
+            t1[tb+128]=v4.y; t1[tb+160]=v5.y; t1[tb+192]=v6.y; t1[tb+224]=v7.y;
+            t2[tb]=v0.z; t2[tb+32]=v1.z; t2[tb+64]=v2.z; t2[tb+96]=v3.z;
+            t2[tb+128]=v4.z; t2[tb+160]=v5.z; t2[tb+192]=v6.z; t2[tb+224]=v7.z;
+            t3[tb]=v0.w; t3[tb+32]=v1.w; t3[tb+64]=v2.w; t3[tb+96]=v3.w;
+            t3[tb+128]=v4.w; t3[tb+160]=v5.w; t3[tb+192]=v6.w; t3[tb+224]=v7.w;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Four stripes x 64 builders exactly occupy the 256-lane group.
-        // For a short final block, stale tables for s >= ns are never read.
-        if (lid < ns * 64u) {
-            uint s = lid >> 6;
-            uint h = lid & 63u;
-            uint eq_base = s * 8u;
-            uint4 l6 = uint4(0u);
-            uint hm = h;
-            while (hm != 0u) {
-                l6 ^= tg_eq[eq_base + ctz(hm)];
-                hm &= hm - 1u;
-            }
-            uint4 e6 = tg_eq[eq_base + 6u];
-            uint4 e7 = tg_eq[eq_base + 7u];
-            uint4 l6e6 = l6 ^ e6;
-            uint4 l6e7 = l6 ^ e7;
-            uint tab_base = s * 256u + h;
-            tab[tab_base]        = l6;
-            tab[tab_base + 64u]  = l6e6;
-            tab[tab_base + 128u] = l6e7;
-            tab[tab_base + 192u] = l6e6 ^ e7;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         if (live) {
             if (ns == B) {
-                for (uint t = 0u; t < B; ++t) {
-                    LC_FACTORED_B4_STEP(&tab[t * 256u], w[t]);
+                uchar4 c0a = as_type<uchar4>(w0.x), c0b = as_type<uchar4>(w0.y);
+                uchar4 c1a = as_type<uchar4>(w1.x), c1b = as_type<uchar4>(w1.y);
+                uchar4 c2a = as_type<uchar4>(w2.x), c2b = as_type<uchar4>(w2.y);
+                uchar4 c3a = as_type<uchar4>(w3.x), c3b = as_type<uchar4>(w3.y);
+                #define LC_DO_PLANE(T, F) { \
+                    a0.F ^= T[c0a.x] ^ T[256u+c1a.x] ^ T[512u+c2a.x] ^ T[768u+c3a.x]; \
+                    a1.F ^= T[c0a.y] ^ T[256u+c1a.y] ^ T[512u+c2a.y] ^ T[768u+c3a.y]; \
+                    a2.F ^= T[c0a.z] ^ T[256u+c1a.z] ^ T[512u+c2a.z] ^ T[768u+c3a.z]; \
+                    a3.F ^= T[c0a.w] ^ T[256u+c1a.w] ^ T[512u+c2a.w] ^ T[768u+c3a.w]; \
+                    b0.F ^= T[c0b.x] ^ T[256u+c1b.x] ^ T[512u+c2b.x] ^ T[768u+c3b.x]; \
+                    b1.F ^= T[c0b.y] ^ T[256u+c1b.y] ^ T[512u+c2b.y] ^ T[768u+c3b.y]; \
+                    b2.F ^= T[c0b.z] ^ T[256u+c1b.z] ^ T[512u+c2b.z] ^ T[768u+c3b.z]; \
+                    b3.F ^= T[c0b.w] ^ T[256u+c1b.w] ^ T[512u+c2b.w] ^ T[768u+c3b.w]; \
                 }
+                LC_DO_PLANE(t0, x);
+                LC_DO_PLANE(t1, y);
+                LC_DO_PLANE(t2, z);
+                LC_DO_PLANE(t3, w);
+                #undef LC_DO_PLANE
             } else {
                 for (uint t = 0u; t < ns; ++t) {
-                    uint wt = z32[((sb + t) * p.k + c0) >> 2];
-                    LC_FACTORED_B4_STEP(&tab[t * 256u], wt);
+                    uint2 wt = z64[((sb + t) * p.k + c0) >> 3];
+                    LC_PLANAR_STEP4(t * 256u, wt.x, a0, a1, a2, a3);
+                    LC_PLANAR_STEP4(t * 256u, wt.y, b0, b1, b2, b3);
                 }
             }
         }
@@ -20290,6 +20328,10 @@ kernel void lc_fold_stripes_factored_b4(
     out[1u] = a1;
     out[2u] = a2;
     out[3u] = a3;
+    out[4u] = b0;
+    out[5u] = b1;
+    out[6u] = b2;
+    out[7u] = b3;
 }
 "#;
 
@@ -22212,7 +22254,7 @@ kernel void zc_eq_rows(
             gpu.dispatch(
                 enc,
                 (ZC_FOLD_CHUNKS * plan.i_groups) as u64,
-                ZC_FOLD_TG as u64,
+                if plan.factored_b4 { 128 } else { ZC_FOLD_TG as u64 },
             );
             gpu.set_pipeline(enc, state.pso_reduce);
             gpu.set_buffer(enc, state.part_buf, 0, 0);
