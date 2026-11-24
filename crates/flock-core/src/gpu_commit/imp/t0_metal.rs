@@ -106,21 +106,42 @@ static inline uint4 gf_reduce(U256k p) {
     return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
 }
 
-static inline uint4 mul_rho16(uint4 x, threadgroup const uint4* nib) {
-    uint4 acc = uint4(0u);
-    for (uint k = 0u; k < 8u; k++) {
-        acc ^= nib[k * 16u + extract_bits(x.x, 4u * k, 4u)];
-    }
-    for (uint k = 0u; k < 8u; k++) {
-        acc ^= nib[128u + k * 16u + extract_bits(x.y, 4u * k, 4u)];
-    }
-    for (uint k = 0u; k < 8u; k++) {
-        acc ^= nib[256u + k * 16u + extract_bits(x.z, 4u * k, 4u)];
-    }
-    for (uint k = 0u; k < 8u; k++) {
-        acc ^= nib[384u + k * 16u + extract_bits(x.w, 4u * k, 4u)];
-    }
-    return acc;
+static inline uint4 gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    return uint4(
+        (a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h),
+        (a.y << 16) | (a.x >> 16),
+        (a.z << 16) | (a.y >> 16),
+        (a.w << 16) | (a.z >> 16));
+}
+
+static inline uint4 gf_shl32(uint4 a) {
+    uint h = a.w;
+    return uint4(
+        h ^ (h << 1) ^ (h << 2) ^ (h << 7),
+        a.x ^ (h >> 31) ^ (h >> 30) ^ (h >> 25),
+        a.y, a.z);
+}
+
+static inline uint4 mul_b16(uint4 v, threadgroup const uint4* tab) {
+    uint4 a = tab[extract_bits(v.w, 16u, 8u)] ^ tab[256u + extract_bits(v.w, 24u, 8u)];
+    a = gf_shl16(a) ^ tab[extract_bits(v.w, 0u, 8u)]  ^ tab[256u + extract_bits(v.w, 8u, 8u)];
+    a = gf_shl16(a) ^ tab[extract_bits(v.z, 16u, 8u)] ^ tab[256u + extract_bits(v.z, 24u, 8u)];
+    a = gf_shl16(a) ^ tab[extract_bits(v.z, 0u, 8u)]  ^ tab[256u + extract_bits(v.z, 8u, 8u)];
+    a = gf_shl16(a) ^ tab[extract_bits(v.y, 16u, 8u)] ^ tab[256u + extract_bits(v.y, 24u, 8u)];
+    a = gf_shl16(a) ^ tab[extract_bits(v.y, 0u, 8u)]  ^ tab[256u + extract_bits(v.y, 8u, 8u)];
+    a = gf_shl16(a) ^ tab[extract_bits(v.x, 16u, 8u)] ^ tab[256u + extract_bits(v.x, 24u, 8u)];
+    a = gf_shl16(a) ^ tab[extract_bits(v.x, 0u, 8u)]  ^ tab[256u + extract_bits(v.x, 8u, 8u)];
+    return a;
+}
+
+static inline uint4 mul_w32(uint4 v, threadgroup const uint4* tab) {
+    uint w = v.w;
+    uint4 a = tab[w & 255u] ^ tab[256u + extract_bits(w, 8u, 8u)] ^ tab[512u + extract_bits(w, 16u, 8u)] ^ tab[768u + (w >> 24u)];
+    w = v.z; a = gf_shl32(a) ^ tab[w & 255u] ^ tab[256u + extract_bits(w, 8u, 8u)] ^ tab[512u + extract_bits(w, 16u, 8u)] ^ tab[768u + (w >> 24u)];
+    w = v.y; a = gf_shl32(a) ^ tab[w & 255u] ^ tab[256u + extract_bits(w, 8u, 8u)] ^ tab[512u + extract_bits(w, 16u, 8u)] ^ tab[768u + (w >> 24u)];
+    w = v.x; a = gf_shl32(a) ^ tab[w & 255u] ^ tab[256u + extract_bits(w, 8u, 8u)] ^ tab[512u + extract_bits(w, 16u, 8u)] ^ tab[768u + (w >> 24u)];
+    return a;
 }
 
 static inline ulong4 acc_mul(ulong4 acc, uint4 x, uint4 y) {
@@ -141,15 +162,16 @@ static inline ulong4 xor_lanes4(ulong4 v, ushort m) {
                       ulong(lo.z) | (ulong(hi.z) << 32), ulong(lo.w) | (ulong(hi.w) << 32));
 }
 
-// Three-level fold of eight consecutive inputs.
-static inline uint4 fold8(device const uint4* v, threadgroup const uint4* nib) {
-    const uint4 c0 = v[0] ^ mul_rho16(v[0] ^ v[1], nib);
-    const uint4 c1 = v[2] ^ mul_rho16(v[2] ^ v[3], nib);
-    const uint4 c2 = v[4] ^ mul_rho16(v[4] ^ v[5], nib);
-    const uint4 c3 = v[6] ^ mul_rho16(v[6] ^ v[7], nib);
-    const uint4 d0 = c0 ^ mul_rho16(c0 ^ c1, nib + 512);
-    const uint4 d1 = c2 ^ mul_rho16(c2 ^ c3, nib + 512);
-    return d0 ^ mul_rho16(d0 ^ d1, nib + 1024);
+// Three-level fold of eight consecutive inputs: word32 (4x256) for rho0,
+// byte16 (2x256) for rho1 and rho2 (32 KiB total, aliased with reduction).
+static inline uint4 fold8(device const uint4* v, threadgroup const uint4* tab) {
+    const uint4 c0 = v[0] ^ mul_w32(v[0] ^ v[1], tab);
+    const uint4 c1 = v[2] ^ mul_w32(v[2] ^ v[3], tab);
+    const uint4 c2 = v[4] ^ mul_w32(v[4] ^ v[5], tab);
+    const uint4 c3 = v[6] ^ mul_w32(v[6] ^ v[7], tab);
+    const uint4 d0 = c0 ^ mul_b16(c0 ^ c1, tab + 1024);
+    const uint4 d1 = c2 ^ mul_b16(c2 ^ c3, tab + 1024);
+    return d0 ^ mul_b16(d0 ^ d1, tab + 1536);
 }
 
 constant uint T0_IN = 8192u;
@@ -168,8 +190,8 @@ kernel void zc_t0_fold(
     uint tg_rel [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]])
 {
-    threadgroup uint4 nib[1536];
-    threadgroup ulong4 red[256];
+    threadgroup uint4 nib[2048];
+    threadgroup ulong4* red = reinterpret_cast<threadgroup ulong4*>(nib);
     const uint chunk = tg_base + tg_rel;
     if (lid == 0u) {
         const uint lim = min(ctl[0], ctl[1]);
@@ -178,7 +200,17 @@ kernel void zc_t0_fold(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const bool skip = red[0].x != 0ul;
     if (skip) { return; }
-    for (uint i = lid; i < 1536u; i += 256u) { nib[i] = consts[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        const uint lo = lid & 15u, hi = lid >> 4u;
+        for (uint b = 0u; b < 4u; b++) {
+            nib[b * 256u + lid] = consts[b * 32u + lo] ^ consts[b * 32u + 16u + hi];
+        }
+        nib[1024u + lid] = consts[512u + lo] ^ consts[512u + 16u + hi];
+        nib[1280u + lid] = consts[544u + lo] ^ consts[544u + 16u + hi];
+        nib[1536u + lid] = consts[1024u + lo] ^ consts[1024u + 16u + hi];
+        nib[1792u + lid] = consts[1056u + lo] ^ consts[1056u + 16u + hi];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint l = lid & 7u;
@@ -221,6 +253,7 @@ kernel void zc_t0_fold(
     acc_b = xor_lanes4(acc_b, ushort(16));
     acc_c = xor_lanes4(acc_c, ushort(16));
     acc_d = xor_lanes4(acc_d, ushort(16));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if ((lid & 31u) < 8u) {
         const uint base = (lid >> 5) * 32u + l;
         red[base] = acc_a;
