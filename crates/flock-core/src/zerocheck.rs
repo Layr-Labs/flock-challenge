@@ -75,7 +75,7 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some())
 }
 
 /// Test-only forced-off latch for the second-level cascade (rounds 5+6),
@@ -96,7 +96,7 @@ fn cascade2_off() -> bool {
     if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1"))
 }
 
 /// Test-only forced-off latch for the third-level cascade (rounds 7+8),
@@ -504,7 +504,7 @@ pub fn stage_commit_tail_fill<C: Challenger>(
             padding.useful_bits_per_block,
             &r,
         );
-        if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+        if crate::zc_timing_env_on() {
             eprintln!(
                 "[commit-tail-fill] stage at graph completion: staged={staged} {:.2} ms",
                 t_stage.elapsed().as_secs_f64() * 1e3
@@ -591,7 +591,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    let zc_timing = crate::zc_timing_env_on();
     let cpu_r1 = crate::pcs::commit::commit_cpu_ms();
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
@@ -970,7 +970,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // table removes the two field multiplications per output that the generic
     // pair fold would require, while materializing exactly the ordinary
     // post-fold tables expected by all subsequent rounds.
-    let tail_round_timing = std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some();
+    let tail_round_timing = crate::env_once_sweep!(std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some());
 
     // Cascade the lookahead one level deeper (rounds 5+6, see
     // `fold2_compact_and_round45_into`): the K pass materializes each round-4
@@ -1580,7 +1580,7 @@ fn prove_packed_padded_inner<C: Challenger>(
 
     // H2 engagement evidence: E-core chunks claimed across the loop rounds
     // (T3's hetero drain is already behind us, so the delta is loop-only).
-    let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
+    let hetero_trace = crate::env_once_sweep!(std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some());
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
     // The serial rounds' equality tables: each round's suffix is the previous
     // round's minus its first challenge, so after the first serial round the
