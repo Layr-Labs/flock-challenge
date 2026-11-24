@@ -2028,6 +2028,38 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     xor3_f128(q0, q1, q2)
 }
 
+#[inline]
+fn fold8_seed_at_row(seed: F128, row: usize) -> F128 {
+    // Tile starts are 0, 16, ..., 112. Reducing the shifted-out coefficients
+    // by x^128 = x^7 + x^2 + x + 1 fits in one word of 128 bits.
+    debug_assert!(row <= 112);
+    if row == 0 {
+        return seed;
+    }
+    let x = u128::from(seed.lo) | (u128::from(seed.hi) << 64);
+    let carry = x >> (128 - row);
+    let value = (x << row) ^ carry ^ (carry << 1) ^ (carry << 2) ^ (carry << 7);
+    F128 { lo: value as u64, hi: (value >> 64) as u64 }
+}
+
+fn fold8_weight_rows(low_eq: &[F128; 64], table: &[F128], w_state: &mut [F128]) {
+    use rayon::prelude::*;
+
+    const ROWS: usize = 16;
+    assert_eq!(w_state.len(), 128 * 64);
+    // Give each task whole output rows. The closed-form shift starts its
+    // polynomial ladders at the correct bit without reading another tile.
+    w_state.par_chunks_exact_mut(ROWS * 64).enumerate().for_each(|(tile, rows)| {
+        for (column, &seed) in low_eq.iter().enumerate() {
+            let mut product = fold8_seed_at_row(seed, tile * ROWS);
+            for row in rows.chunks_exact_mut(64) {
+                row[column] = fold_one_slot(product, table);
+                product = mul_by_x(product);
+            }
+        }
+    });
+}
+
 /// Total length of a fold byte table (`build_fold_byte_table` output).
 pub(crate) const FOLD_TABLE_LEN: usize = FOLD_N_BYTES * FOLD_TABLE_SIZE;
 
@@ -3484,7 +3516,6 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
                             // pass over both states. Values are identical.
                             use rayon::prelude::*;
                             let a_base = crate::epool::SyncPtr(a_state.as_mut_ptr());
-                            let w_base = crate::epool::SyncPtr(w_state.as_mut_ptr());
                             let (fold8, table) = (&fold8, &table);
                             rayon::join(
                                 || {
@@ -3504,27 +3535,7 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
                                     })
                                 },
                                 || {
-                                    (0..64usize).into_par_iter().with_min_len(8).for_each(
-                                        |d_low| {
-                                            let mut basis_product = low_eq[d_low];
-                                            // SAFETY: as above, with `d_low`
-                                            // owned by exactly one task.
-                                            unsafe {
-                                                w_base
-                                                    .ptr()
-                                                    .add(d_low)
-                                                    .write(fold_one_slot(basis_product, table));
-                                            }
-                                            for bit in 1..n_packed {
-                                                basis_product = mul_by_x(basis_product);
-                                                unsafe {
-                                                    w_base.ptr().add(bit * 64 + d_low).write(
-                                                        fold_one_slot(basis_product, table),
-                                                    );
-                                                }
-                                            }
-                                        },
-                                    )
+                                    fold8_weight_rows(&low_eq, table, &mut w_state);
                                 },
                             );
                         } else if rs_fold8_par_enabled() {
