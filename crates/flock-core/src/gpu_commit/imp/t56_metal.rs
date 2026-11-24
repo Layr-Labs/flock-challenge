@@ -87,21 +87,46 @@ static inline uint4 gf_reduce(U256k p) {
 
 // Multiply a 16-byte value by a challenge through its 16 byte-bank nibble
 // tables using extract_bits (same 32 entries XORed together).
-static inline uint4 mul_rho16(uint4 x, threadgroup const uint4* nib) {
-    uint4 acc = uint4(0u);
-    for (uint k = 0u; k < 8u; k++) {
-        acc ^= nib[k * 16u + extract_bits(x.x, 4u * k, 4u)];
-    }
-    for (uint k = 0u; k < 8u; k++) {
-        acc ^= nib[128u + k * 16u + extract_bits(x.y, 4u * k, 4u)];
-    }
-    for (uint k = 0u; k < 8u; k++) {
-        acc ^= nib[256u + k * 16u + extract_bits(x.z, 4u * k, 4u)];
-    }
-    for (uint k = 0u; k < 8u; k++) {
-        acc ^= nib[384u + k * 16u + extract_bits(x.w, 4u * k, 4u)];
-    }
-    return acc;
+static inline uint4 gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    return uint4((a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h),
+                 (a.y << 16) | (a.x >> 16), (a.z << 16) | (a.y >> 16), (a.w << 16) | (a.z >> 16));
+}
+
+static inline uint4 gf_shl32(uint4 a) {
+    uint h = a.w;
+    return uint4(h ^ (h << 1) ^ (h << 2) ^ (h << 7),
+                 a.x ^ (h >> 31) ^ (h >> 30) ^ (h >> 25), a.y, a.z);
+}
+
+// Multiply by rho_a via 4 byte tables (word-32 Horner, 16 SRAM loads vs 32).
+static inline uint4 mul_rho32(uint4 x, threadgroup const uint4* tab) {
+    uchar4 b3 = as_type<uchar4>(x.w);
+    uint4 a = tab[b3.x] ^ tab[256u + b3.y] ^ tab[512u + b3.z] ^ tab[768u + b3.w];
+    uchar4 b2 = as_type<uchar4>(x.z);
+    a = gf_shl32(a) ^ tab[b2.x] ^ tab[256u + b2.y] ^ tab[512u + b2.z] ^ tab[768u + b2.w];
+    uchar4 b1 = as_type<uchar4>(x.y);
+    a = gf_shl32(a) ^ tab[b1.x] ^ tab[256u + b1.y] ^ tab[512u + b1.z] ^ tab[768u + b1.w];
+    uchar4 b0 = as_type<uchar4>(x.x);
+    a = gf_shl32(a) ^ tab[b0.x] ^ tab[256u + b0.y] ^ tab[512u + b0.z] ^ tab[768u + b0.w];
+    return a;
+}
+
+// Multiply by rho_b via 2 byte tables (byte-16 Horner, 16 SRAM loads vs 32).
+static inline uint4 mul_rho16b(uint4 x, threadgroup const uint4* tab) {
+    uchar4 b3 = as_type<uchar4>(x.w);
+    uint4 a = tab[b3.z] ^ tab[256u + b3.w];
+    a = gf_shl16(a) ^ tab[b3.x] ^ tab[256u + b3.y];
+    uchar4 b2 = as_type<uchar4>(x.z);
+    a = gf_shl16(a) ^ tab[b2.z] ^ tab[256u + b2.w];
+    a = gf_shl16(a) ^ tab[b2.x] ^ tab[256u + b2.y];
+    uchar4 b1 = as_type<uchar4>(x.y);
+    a = gf_shl16(a) ^ tab[b1.z] ^ tab[256u + b1.w];
+    a = gf_shl16(a) ^ tab[b1.x] ^ tab[256u + b1.y];
+    uchar4 b0 = as_type<uchar4>(x.x);
+    a = gf_shl16(a) ^ tab[b0.z] ^ tab[256u + b0.w];
+    a = gf_shl16(a) ^ tab[b0.x] ^ tab[256u + b0.y];
+    return a;
 }
 
 static inline ulong4 acc_mul(ulong4 acc, uint4 x, uint4 y) {
@@ -143,20 +168,24 @@ kernel void zc_t56_fold(
     uint tg_rel [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]])
 {
-    threadgroup uint4 nib[1024];
-    threadgroup ulong4 red[256];
-    // `tg_base`: first threadgroup of this dispatch in the pass's grid.
-    // `cut[0]`: the lowest chunk the CPU has taken (late-GPU steal); a group
-    // of a chunk at or above it returns at once. One thread reads the word
-    // into threadgroup memory, so every thread of the group takes the same
-    // branch whatever the CPU writes meanwhile (threads of one group must
-    // not part ways before the barriers and SIMD shuffles below).
+    // 24 KiB total: 1024 uint4s for rho_a word-32 Horner + 512 uint4s for rho_b
+    // byte-16 Horner; aliased as red[256] (8 KiB) after the fold loop finishes.
+    threadgroup uint4 tab[1536];
     threadgroup uint cut_tg;
     const uint tg = p.tg_base + tg_rel;
     if (lid == 0u) { cut_tg = cut[0]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if ((tg >> 2) >= cut_tg) { return; }
-    for (uint i = lid; i < 1024u; i += 256u) { nib[i] = consts[i]; }
+    {
+        const uint lo = lid & 15u;
+        const uint hi = lid >> 4u;
+        tab[lid]         = consts[lo] ^ consts[16u + hi];
+        tab[256u + lid]  = consts[32u + lo] ^ consts[48u + hi];
+        tab[512u + lid]  = consts[64u + lo] ^ consts[80u + hi];
+        tab[768u + lid]  = consts[96u + lo] ^ consts[112u + hi];
+        tab[1024u + lid] = consts[512u + lo] ^ consts[528u + hi];
+        tab[1280u + lid] = consts[544u + lo] ^ consts[560u + hi];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint chunk = tg >> 2;
@@ -202,12 +231,12 @@ kernel void zc_t56_fold(
             b0 = bi[q]; b1 = bi[q + 1u]; b2 = bi[q + 2u];
             if (hsel != 0u && l == 6u) { b3 = one; } else { b3 = bi[q + 3u]; }
         }
-        const uint4 fa0 = a0 ^ mul_rho16(a0 ^ a1, nib);
-        const uint4 fa1 = a2 ^ mul_rho16(a2 ^ a3, nib);
-        const uint4 fa = fa0 ^ mul_rho16(fa0 ^ fa1, nib + 512);
-        const uint4 fb0 = b0 ^ mul_rho16(b0 ^ b1, nib);
-        const uint4 fb1 = b2 ^ mul_rho16(b2 ^ b3, nib);
-        const uint4 fb = fb0 ^ mul_rho16(fb0 ^ fb1, nib + 512);
+        const uint4 fa0 = a0 ^ mul_rho32(a0 ^ a1, tab);
+        const uint4 fa1 = a2 ^ mul_rho32(a2 ^ a3, tab);
+        const uint4 fa = fa0 ^ mul_rho16b(fa0 ^ fa1, tab + 1024);
+        const uint4 fb0 = b0 ^ mul_rho32(b0 ^ b1, tab);
+        const uint4 fb1 = b2 ^ mul_rho32(b2 ^ b3, tab);
+        const uint4 fb = fb0 ^ mul_rho16b(fb0 ^ fb1, tab + 1024);
         ao[o] = fa;
         bo[o] = fb;
         const uint4 wa = gf_reduce(clmul128(eq_odd[y], fa));
@@ -234,6 +263,9 @@ kernel void zc_t56_fold(
     acc_b = xor_lanes4(acc_b, ushort(16));
     acc_c = xor_lanes4(acc_c, ushort(16));
     acc_d = xor_lanes4(acc_d, ushort(16));
+    // Retire every table reader before reusing `tab` as the 8 KiB reduction buffer.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup ulong4* red = reinterpret_cast<threadgroup ulong4*>(tab);
     if ((lid & 31u) < 8u) {
         const uint base = (lid >> 5) * 32u + l;
         red[base] = acc_a;

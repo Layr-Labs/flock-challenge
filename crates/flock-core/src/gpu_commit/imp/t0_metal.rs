@@ -52,52 +52,46 @@ const ZC_T0_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-static inline uint clmul16_m3(uint a, uint b) {
-    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    uint a0 = a & m0, a1 = a & m1, a2 = a & m2;
-    uint b0 = b & m0, b1 = b & m1, b2 = b & m2;
-    uint r0 = (a0 * b0 ^ a1 * b2 ^ a2 * b1) & 0x49249249u;
-    uint r1 = (a0 * b1 ^ a1 * b0 ^ a2 * b2) & 0x92492492u;
-    uint r2 = (a0 * b2 ^ a1 * b1 ^ a2 * b0) & 0x24924924u;
+// Native 16x16->32 carry-less product via explicit ushort operands on Apple Silicon GPUs.
+static inline uint clmul16_m3_u16(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
-static inline ulong clmul32(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = clmul16_m3(al, bl);
-    uint hi = clmul16_m3(ah, bh);
-    uint mid = clmul16_m3(al ^ ah, bl ^ bh) ^ lo ^ hi;
-    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
+static inline uint2 clmul32_u16(uint a, uint b) {
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = clmul16_m3_u16(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = clmul16_m3_u16(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = clmul16_m3_u16(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
+    return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
 }
 
-struct U128k { ulong lo; ulong hi; };
+static inline uint4 clmul64_u16(uint2 a, uint2 b) {
+    uint2 p0 = clmul32_u16(a.x, b.x);
+    uint2 p2 = clmul32_u16(a.y, b.y);
+    uint2 pm = clmul32_u16(a.x ^ a.y, b.x ^ b.y) ^ p0 ^ p2;
+    return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
+}
+
 struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
 
-static inline U128k clmul64(ulong a, ulong b) {
-    uint al = uint(a), ah = uint(a >> 32);
-    uint bl = uint(b), bh = uint(b >> 32);
-    ulong p_lo = clmul32(al, bl);
-    ulong p_hi = clmul32(ah, bh);
-    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
-    U128k r;
-    r.lo = p_lo ^ (p_mid << 32);
-    r.hi = p_hi ^ (p_mid >> 32);
-    return r;
-}
-
 static inline U256k clmul128(uint4 a, uint4 b) {
-    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
-    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
-    U128k p0 = clmul64(al, bl);
-    U128k p2 = clmul64(ah, bh);
-    U128k pm = clmul64(al ^ ah, bl ^ bh);
-    pm.lo ^= p0.lo ^ p2.lo;
-    pm.hi ^= p0.hi ^ p2.hi;
+    uint4 p0 = clmul64_u16(a.xy, b.xy);
+    uint4 p2 = clmul64_u16(a.zw, b.zw);
+    uint4 pm = clmul64_u16(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
     U256k r;
-    r.r0 = p0.lo;
-    r.r1 = p0.hi ^ pm.lo;
-    r.r2 = p2.lo ^ pm.hi;
-    r.r3 = p2.hi;
+    r.r0 = (ulong(p0.y) << 32) | p0.x;
+    r.r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
+    r.r2 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
+    r.r3 = (ulong(p2.w) << 32) | p2.z;
     return r;
 }
 
@@ -114,13 +108,17 @@ static inline uint4 gf_reduce(U256k p) {
 
 static inline uint4 mul_rho16(uint4 x, threadgroup const uint4* nib) {
     uint4 acc = uint4(0u);
-    uint w[4] = { x.x, x.y, x.z, x.w };
-    for (uint word = 0u; word < 4u; word++) {
-        for (uint j = 0u; j < 4u; j++) {
-            uint b = (w[word] >> (8u * j)) & 0xffu;
-            uint bank = word * 4u + j;
-            acc ^= nib[bank * 32u + (b & 15u)] ^ nib[bank * 32u + 16u + (b >> 4u)];
-        }
+    for (uint k = 0u; k < 8u; k++) {
+        acc ^= nib[k * 16u + extract_bits(x.x, 4u * k, 4u)];
+    }
+    for (uint k = 0u; k < 8u; k++) {
+        acc ^= nib[128u + k * 16u + extract_bits(x.y, 4u * k, 4u)];
+    }
+    for (uint k = 0u; k < 8u; k++) {
+        acc ^= nib[256u + k * 16u + extract_bits(x.z, 4u * k, 4u)];
+    }
+    for (uint k = 0u; k < 8u; k++) {
+        acc ^= nib[384u + k * 16u + extract_bits(x.w, 4u * k, 4u)];
     }
     return acc;
 }
@@ -177,11 +175,11 @@ kernel void zc_t0_fold(
         const uint lim = min(ctl[0], ctl[1]);
         red[0] = ulong4(chunk >= lim ? 1ul : 0ul, 0ul, 0ul, 0ul);
     }
-    for (uint i = lid; i < 1536u; i += 256u) { nib[i] = consts[i]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const bool skip = red[0].x != 0ul;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (skip) { return; }
+    for (uint i = lid; i < 1536u; i += 256u) { nib[i] = consts[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint l = lid & 7u;
     const bool sel_b = ((l ^ (l >> 1u)) & 1u) != 0u;
