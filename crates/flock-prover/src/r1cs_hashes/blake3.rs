@@ -2555,47 +2555,12 @@ pub(crate) mod witgen_simd {
     struct W32 {
         pending: V4,
         stage: *mut V4, // 512 block-lane words for this buffer's quad
-        paired: bool,
-        even: V4,
     }
 
     impl W32 {
         #[inline(always)]
         fn at(stage: *mut V4, pending: V4) -> Self {
-            Self::at_paired(stage, pending, false)
-        }
-
-        #[inline(always)]
-        fn at_paired(stage: *mut V4, pending: V4, paired: bool) -> Self {
-            Self {
-                pending,
-                stage,
-                paired,
-                even: unsafe { vdupq_n_u32(0) },
-            }
-        }
-
-        #[inline(always)]
-        unsafe fn emit<const WORD: usize>(&mut self, v: V4) {
-            unsafe {
-                if self.paired {
-                    if WORD % 2 == 0 {
-                        self.even = v;
-                    } else {
-                        // STP offsets address one 64-vector window. The window
-                        // base is shared across adjacent pairs; no per-pair ADD.
-                        core::arch::asm!(
-                            "stp {x:q}, {y:q}, [{p}, #{off}]",
-                            x = in(vreg) self.even, y = in(vreg) v,
-                            p = in(reg) self.stage.add((WORD / 64) * 64),
-                            off = const (WORD & 62) * 16,
-                            options(nostack, preserves_flags),
-                        );
-                    }
-                } else {
-                    vst1q_u32(self.stage.add(WORD) as *mut u32, v);
-                }
-            }
+            Self { pending, stage }
         }
 
         /// Push the low WIDTH bits of `v` at stream offset ≡ USED (mod 32).
@@ -2629,7 +2594,7 @@ pub(crate) mod witgen_simd {
                 // the next `vsli #31` overwrites it exactly.
                 if USED == 0 {
                     if WIDTH == 32 {
-                        self.emit::<WORD>(v);
+                        vst1q_u32(self.stage.add(WORD) as *mut u32, v);
                         self.pending = vdupq_n_u32(0);
                     } else {
                         self.pending = v;
@@ -2638,7 +2603,7 @@ pub(crate) mod witgen_simd {
                     self.pending = vsliq_n_u32::<USED>(self.pending, v);
                 } else {
                     let out = vsliq_n_u32::<USED>(self.pending, v);
-                    self.emit::<WORD>(out);
+                    vst1q_u32(self.stage.add(WORD) as *mut u32, out);
                     if USED + WIDTH == 32 {
                         self.pending = vdupq_n_u32(0);
                     } else {
@@ -2653,8 +2618,7 @@ pub(crate) mod witgen_simd {
         #[inline(always)]
         unsafe fn finish(&mut self) {
             unsafe {
-                const { assert!(LAST_WORD % 2 == 1); assert!((GS_BASE / 32) % 2 == 0); }
-                self.emit::<LAST_WORD>(self.pending);
+                vst1q_u32(self.stage.add(LAST_WORD) as *mut u32, self.pending);
             }
         }
     }
@@ -3660,7 +3624,7 @@ pub(crate) mod witgen_simd {
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, WZ, true, true, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, true, true, false, false, false>(inputs, z, a, b, sa, sb)
             } else {
                 build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false, false>(inputs, z, a, b, sa, sb)
             }
@@ -3795,7 +3759,7 @@ pub(crate) mod witgen_simd {
     /// `zs` is valid for `4 * U32_PER_BLOCK` u32 writes.
     pub(crate) unsafe fn build_quad_z_rows_plain(inputs: QuadInput<'_>, zs: *mut u32) {
         unsafe {
-            build_quad_split_neon_impl::<true, false, false, false, true, false, true, false, true, false>(
+            build_quad_split_neon_impl::<true, false, false, false, false, false, false, false, true, false>(
                 inputs,
                 zs,
                 core::ptr::null_mut(),
@@ -3850,7 +3814,7 @@ pub(crate) mod witgen_simd {
         const {
             assert!(!ZPLAIN || WZ);
             assert!(!WIDE_STORES || (DIRECT_SCRATCH && PRIMED));
-            assert!(!MEM || WZ || (SCRATCH && COPY));
+            assert!(!MEM || (!WZ && SCRATCH && COPY));
             assert!(!DIRECT_SCRATCH || (!WZ && SCRATCH && COPY));
             assert!(!(WZ && SCRATCH));
             assert!(SCRATCH || !PRIMED);
@@ -4052,7 +4016,7 @@ pub(crate) mod witgen_simd {
 
             // ---- G stream ----
             let pending_bit = vshrq_n_u32::<31>(flags);
-            let mut wz = W32::at_paired(za, pending_bit, PAIR_STAGE_STORES);
+            let mut wz = W32::at(za, pending_bit);
             let mut wab = W32Pair {
                 pa: pending_bit,
                 pb: one,

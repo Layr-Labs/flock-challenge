@@ -2523,6 +2523,15 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let mut partials: Vec<(F128, F128)> = crate::alloc_uninit_vec(hi_size);
     // [p1_odd, pinf_odd, W0, W3, W4, W5], eq_hi-weighted, one slot per chunk.
     let mut la_partials: Vec<[F128; 6]> = crate::alloc_uninit_vec(hi_size);
+    // The full-sweep group weights `eq_lo[2u + 1]` in prepared form, shared
+    // by every chunk's ranked loop (passed as an address; null without SHA3,
+    // which keeps the full sweep on its parent loop).
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let eq_prep = kernels::aarch64::round2_eq_prep(eq_lo);
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let eq_prep_addr = eq_prep.as_ptr() as usize;
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
+    let eq_prep_addr = 0usize;
     // The fold table in seven pieces (`FLOCK_NO_R2_FOLD7`), for the full
     // chunks' ranked walks on the performance-core workers: one lookup fewer
     // per row, the same folded rows (none when a byte bank is not linear).
@@ -2566,16 +2575,6 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let full_xb = xb_rho_addr != 0;
     #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
     let full_xb = false;
-    // The full-sweep group weights `eq_lo[2u + 1]` in prepared form, shared
-    // by every chunk's ranked loop (skipped when `full_xb` uses window-scaled
-    // weights; null without SHA3 or under `full_xb`, keeping fallbacks on the
-    // parent loop).
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let eq_prep = if full_xb { Vec::new() } else { kernels::aarch64::round2_eq_prep(eq_lo) };
-    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
-    let eq_prep_addr = if full_xb { 0usize } else { eq_prep.as_ptr() as usize };
-    #[cfg(all(target_arch = "aarch64", not(target_feature = "sha3")))]
-    let eq_prep_addr = 0usize;
     // Head-compacted layout on top: every chunk's producer must be one of the
     // two ranked walks that write it (the full lookahead walk, or the
     // prescaled ranked-invariant walk on GPU-offloaded chunks).
@@ -2725,7 +2724,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         && r.unit_bytes == 8192 && chunk_ab_bytes.is_multiple_of(r.unit_bytes)
                         && periodic_padding && pair_in_block_mask == 127
                         && useful_pairs_inclusive == 121 && pair_idx_base.is_multiple_of(128)
-                        && degen && skip_dead && (full_xb || eq_prep_addr != 0)
+                        && degen && skip_dead && eq_prep_addr != 0
                 });
                 #[cfg(not(target_feature = "sha3"))]
                 let quad: Option<&crate::zerocheck::univariate_skip_optimized::Round2AbRebuild> = None;
