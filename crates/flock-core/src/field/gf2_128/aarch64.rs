@@ -450,6 +450,19 @@ pub(crate) unsafe fn mul_const_prep(p: ConstPrep, x: uint64x2_t) -> uint64x2_t {
     unsafe { fold_lm(pmull_pair_sum(x, p.0), pmull_pair_sum(x, p.1)) }
 }
 
+/// `acc ^ (x * t)` for the prepared constant `p = const_prep(t)`, fully reduced.
+/// Absorbing `acc` into the low-lane `pmull_pair_acc` uses the same two
+/// macro-fused `pmull+eor` / `pmull2+eor` issue slots as `pmull_pair_sum` and
+/// eliminates the post-reduction `veorq_u64`.
+#[inline(always)]
+pub(crate) unsafe fn mul_const_prep_xor(
+    p: ConstPrep,
+    x: uint64x2_t,
+    acc: uint64x2_t,
+) -> uint64x2_t {
+    unsafe { fold_lm(pmull_pair_acc(acc, x, p.0), pmull_pair_sum(x, p.1)) }
+}
+
 /// Two independent prepared products, folding each high limb with PMULL.
 /// This avoids the paired ZIP/shift network when that network limits throughput.
 #[inline(always)]
@@ -497,6 +510,7 @@ pub(crate) unsafe fn mul_const_pair_prep(
 }
 
 /// `x * c + y * d` for two prepared constants, with one shared fold.
+#[cfg(test)]
 #[inline(always)]
 pub(crate) unsafe fn mul_two_const_sum_prep(
     pc: ConstPrep,
@@ -507,6 +521,87 @@ pub(crate) unsafe fn mul_two_const_sum_prep(
     unsafe {
         let l = pmull_pair_acc(pmull_pair_sum(x, pc.0), y, pd.0);
         let m = pmull_pair_acc(pmull_pair_sum(x, pc.1), y, pd.1);
+        fold_lm(l, m)
+    }
+}
+
+/// `acc ^ (x * c) ^ (y * d)` for two prepared constants, sharing one fold and
+/// absorbing `acc` into the first `pmull_pair_acc` at zero extra issue cost.
+#[inline(always)]
+pub(crate) unsafe fn mul_two_const_sum_prep_xor(
+    pc: ConstPrep,
+    x: uint64x2_t,
+    pd: ConstPrep,
+    y: uint64x2_t,
+    acc: uint64x2_t,
+) -> uint64x2_t {
+    unsafe {
+        let l = pmull_pair_acc(pmull_pair_acc(acc, x, pc.0), y, pd.0);
+        let m = pmull_pair_acc(pmull_pair_sum(x, pc.1), y, pd.1);
+        fold_lm(l, m)
+    }
+}
+
+/// `acc ^ (x0 * c0) ^ (x1 * c1) ^ (x2 * c2)` for three prepared constants with
+/// a single shared `fold_lm`. Used by the two-round bilinear sumcheck fold to
+/// collapse three dependent folds (15 PMULLs, 3 reductions) into one
+/// independent 13-PMULL single-reduction step.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn mul_three_const_sum_prep_xor(
+    p0: ConstPrep,
+    x0: uint64x2_t,
+    p1: ConstPrep,
+    x1: uint64x2_t,
+    p2: ConstPrep,
+    x2: uint64x2_t,
+    acc: uint64x2_t,
+) -> uint64x2_t {
+    unsafe {
+        let l = pmull_pair_acc(
+            pmull_pair_acc(pmull_pair_acc(acc, x0, p0.0), x1, p1.0),
+            x2,
+            p2.0,
+        );
+        let m = pmull_pair_acc(pmull_pair_acc(pmull_pair_sum(x0, p0.1), x1, p1.1), x2, p2.1);
+        fold_lm(l, m)
+    }
+}
+
+/// `acc ^ (x0 * c0) ^ (x1 * c1) ^ (x2 * c2) ^ (x3 * c3)` for four prepared
+/// constants with a single shared `fold_lm`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn mul_four_const_sum_prep_xor(
+    p0: ConstPrep,
+    x0: uint64x2_t,
+    p1: ConstPrep,
+    x1: uint64x2_t,
+    p2: ConstPrep,
+    x2: uint64x2_t,
+    p3: ConstPrep,
+    x3: uint64x2_t,
+    acc: uint64x2_t,
+) -> uint64x2_t {
+    unsafe {
+        let l = pmull_pair_acc(
+            pmull_pair_acc(
+                pmull_pair_acc(pmull_pair_acc(acc, x0, p0.0), x1, p1.0),
+                x2,
+                p2.0,
+            ),
+            x3,
+            p3.0,
+        );
+        let m = pmull_pair_acc(
+            pmull_pair_acc(
+                pmull_pair_acc(pmull_pair_sum(x0, p0.1), x1, p1.1),
+                x2,
+                p2.1,
+            ),
+            x3,
+            p3.1,
+        );
         fold_lm(l, m)
     }
 }
