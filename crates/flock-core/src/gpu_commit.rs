@@ -20253,24 +20253,45 @@ struct LcFactoredB4Params {
     uint i_groups;
 };
 
-#define LC_FACTORED_B4_STEP(TT, W) {            \
-    uchar4 wb = as_type<uchar4>(W);             \
-    a0 ^= (TT)[wb.x];                           \
-    a1 ^= (TT)[wb.y];                           \
-    a2 ^= (TT)[wb.z];                           \
-    a3 ^= (TT)[wb.w];                           \
+// Self-inverse bijection on 0..255: b ^ ((b >> 5) * 3) maps all powers of two
+// and all multiples of 16/32 to distinct 32-bank SRAM lanes (zero conflicts).
+static inline uint2 lc_swiz3x(uint2 v) {
+    uint2 t = (v >> 5) & 0x07070707u;
+    return v ^ (t + (t << 1));
+}
+
+#define LC_FACTORED_B4_STEP(OFF, W) {                                   \
+    uchar4 b0 = as_type<uchar4>((W).x), b1 = as_type<uchar4>((W).y);    \
+    threadgroup const uint* p0 = t0 + (OFF);                            \
+    threadgroup const uint* p1 = t1 + (OFF);                            \
+    threadgroup const uint* p2 = t2 + (OFF);                            \
+    threadgroup const uint* p3 = t3 + (OFF);                            \
+    a0.x ^= p0[b0.x]; a1.x ^= p0[b0.y]; a2.x ^= p0[b0.z]; a3.x ^= p0[b0.w]; \
+    a4.x ^= p0[b1.x]; a5.x ^= p0[b1.y]; a6.x ^= p0[b1.z]; a7.x ^= p0[b1.w]; \
+    a0.y ^= p1[b0.x]; a1.y ^= p1[b0.y]; a2.y ^= p1[b0.z]; a3.y ^= p1[b0.w]; \
+    a4.y ^= p1[b1.x]; a5.y ^= p1[b1.y]; a6.y ^= p1[b1.z]; a7.y ^= p1[b1.w]; \
+    a0.z ^= p2[b0.x]; a1.z ^= p2[b0.y]; a2.z ^= p2[b0.z]; a3.z ^= p2[b0.w]; \
+    a4.z ^= p2[b1.x]; a5.z ^= p2[b1.y]; a6.z ^= p2[b1.z]; a7.z ^= p2[b1.w]; \
+    a0.w ^= p3[b0.x]; a1.w ^= p3[b0.y]; a2.w ^= p3[b0.z]; a3.w ^= p3[b0.w]; \
+    a4.w ^= p3[b1.x]; a5.w ^= p3[b1.y]; a6.w ^= p3[b1.z]; a7.w ^= p3[b1.w]; \
+}
+
+#define LC_PUT3X(SOFF, K, V) {                                          \
+    uint idx = (SOFF) + ((K) << 5) + (h ^ ((K) * 3u));                  \
+    t0[idx] = (V).x; t1[idx] = (V).y; t2[idx] = (V).z; t3[idx] = (V).w; \
 }
 
 kernel void lc_fold_stripes_factored_b4(
-    device const uint*               z32      [[buffer(0)]],
+    device const uint2*              z64      [[buffer(0)]],
     device const uint4*              eq       [[buffer(1)]],
     device uint4*                    partials [[buffer(2)]],
     constant LcFactoredB4Params&     p        [[buffer(3)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]])
 {
-    constexpr uint B = 8u;
-    threadgroup uint4 tab[B * 256u];
+    constexpr uint B = 4u;
+    // Word-planar 4x256x4x4 B = 16 KiB (2x TG occupancy vs 32 KiB B=8 AoS).
+    threadgroup uint t0[B * 256u], t1[B * 256u], t2[B * 256u], t3[B * 256u];
 
     uint chunk  = tgid / p.i_groups;
     uint ig     = tgid - chunk * p.i_groups;
@@ -20279,24 +20300,23 @@ kernel void lc_fold_stripes_factored_b4(
     uint s_hi = min(s_lo + p.stripes_per_chunk, p.stripe_hi);
 
     uint4 a0 = uint4(0u), a1 = uint4(0u), a2 = uint4(0u), a3 = uint4(0u);
-    uint c0 = i_base + 4u * lid;
+    uint4 a4 = uint4(0u), a5 = uint4(0u), a6 = uint4(0u), a7 = uint4(0u);
+    uint c0 = i_base + 8u * lid;
     bool live = c0 < p.useful;
-    uint kw = p.k >> 2;
-    // Eight stripes x 32 builders (one SIMD group per stripe) occupy the
-    // 256-lane group and read each stripe's 8 eq weights uniformly from L1.
+    uint kq = p.k >> 3;
+    // Four stripes x 32 builders (128 threads = 4 SIMD groups, 1 per stripe).
     uint s = lid >> 5;
     uint h = lid & 31u;
-    uint tab_base = s * 256u + h;
+    uint soff = s * 256u;
 
     for (uint sb = s_lo; sb < s_hi; sb += B) {
         uint ns = min(B, s_hi - sb);
-        uint w[8];
+        uint2 w[4];
         if (live && ns == B) {
-            uint q = (sb * p.k + c0) >> 2;
-            for (uint t = 0u; t < B; ++t) { w[t] = z32[q + t * kw]; }
+            uint q = sb * kq + (c0 >> 3);
+            for (uint t = 0u; t < B; ++t) { w[t] = lc_swiz3x(z64[q + t * kq]); }
         }
 
-        // Retire previous block's table readers before rebuilding 8 tables.
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (s < ns) {
             device const uint4* ep = eq + (sb + s) * 8u;
@@ -20308,39 +20328,32 @@ kernel void lc_fold_stripes_factored_b4(
             if (h & 4u)  l5 ^= e2;
             if (h & 8u)  l5 ^= e3;
             if (h & 16u) l5 ^= e4;
-            uint4 l5e5  = l5 ^ e5;
-            uint4 l5e6  = l5 ^ e6;
-            uint4 l5e56 = l5e5 ^ e6;
-            tab[tab_base]        = l5;
-            tab[tab_base + 32u]  = l5e5;
-            tab[tab_base + 64u]  = l5e6;
-            tab[tab_base + 96u]  = l5e56;
-            tab[tab_base + 128u] = l5 ^ e7;
-            tab[tab_base + 160u] = l5e5 ^ e7;
-            tab[tab_base + 192u] = l5e6 ^ e7;
-            tab[tab_base + 224u] = l5e56 ^ e7;
+            uint4 v1 = l5 ^ e5, v2 = l5 ^ e6, v3 = v1 ^ e6;
+            LC_PUT3X(soff, 0u, l5); LC_PUT3X(soff, 1u, v1);
+            LC_PUT3X(soff, 2u, v2); LC_PUT3X(soff, 3u, v3);
+            l5 ^= e7; v1 ^= e7; v2 ^= e7; v3 ^= e7;
+            LC_PUT3X(soff, 4u, l5); LC_PUT3X(soff, 5u, v1);
+            LC_PUT3X(soff, 6u, v2); LC_PUT3X(soff, 7u, v3);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (live) {
             if (ns == B) {
                 for (uint t = 0u; t < B; ++t) {
-                    LC_FACTORED_B4_STEP(&tab[t * 256u], w[t]);
+                    LC_FACTORED_B4_STEP(t * 256u, w[t]);
                 }
             } else {
                 for (uint t = 0u; t < ns; ++t) {
-                    uint wt = z32[((sb + t) * p.k + c0) >> 2];
-                    LC_FACTORED_B4_STEP(&tab[t * 256u], wt);
+                    uint2 wt = lc_swiz3x(z64[(sb + t) * kq + (c0 >> 3)]);
+                    LC_FACTORED_B4_STEP(t * 256u, wt);
                 }
             }
         }
     }
 
     device uint4* out = partials + chunk * p.k + c0;
-    out[0u] = a0;
-    out[1u] = a1;
-    out[2u] = a2;
-    out[3u] = a3;
+    out[0u] = a0; out[1u] = a1; out[2u] = a2; out[3u] = a3;
+    out[4u] = a4; out[5u] = a5; out[6u] = a6; out[7u] = a7;
 }
 "#;
 
@@ -21863,7 +21876,7 @@ kernel void zc_eq_rows(
         }
         let share = (n_claims as f64 / (1.0 + ratio)).round();
         let cap = if factored_b4 {
-            n_claims * 3 / 4
+            n_claims * 7 / 8
         } else {
             n_claims * 5 / 8
         };
@@ -21892,7 +21905,7 @@ kernel void zc_eq_rows(
         if g == 0 {
             return 0;
         }
-        let cap = if factored_b4 { n_claims * 3 / 4 } else { n_claims * 5 / 8 };
+        let cap = if factored_b4 { n_claims * 7 / 8 } else { n_claims * 5 / 8 };
         (g + *BIAS).min(cap.max(g))
     }
 
@@ -22260,10 +22273,11 @@ kernel void zc_eq_rows(
             gpu.set_buffer(enc, state.eq_buf, 0, 1);
             gpu.set_buffer(enc, state.part_buf, 0, 2);
             gpu.set_bytes(enc, params_bytes, 3);
+            let fold_tg = if plan.factored_b4 { 128u64 } else { ZC_FOLD_TG as u64 };
             gpu.dispatch(
                 enc,
                 (ZC_FOLD_CHUNKS * plan.i_groups) as u64,
-                ZC_FOLD_TG as u64,
+                fold_tg,
             );
             gpu.set_pipeline(enc, state.pso_reduce);
             gpu.set_buffer(enc, state.part_buf, 0, 0);
@@ -34307,7 +34321,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Fast GPU: actual factored-PSO selection widens only the cap. The
         // ratio math is unchanged (round(64 / 1.1) = 58 before clamping).
         assert_eq!(lincheck_gate_share_balanced(0.1, 64, false), 40);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 48);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 56);
         // At an observed factored ratio the natural share, not the cap,
         // remains authoritative.
         assert_eq!(lincheck_gate_share_balanced(0.33, 64, false), 40);
@@ -34328,7 +34342,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(lincheck_gate_share_balanced(1.0, 16, true), 8);
         // Fallback retains the old proportional ceiling on small shapes too.
         assert_eq!(lincheck_gate_share_balanced(0.1, 16, false), 10);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 16, true), 12);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 16, true), 14);
         // The legacy policy is preserved exactly for causal comparison.
         assert_eq!(lincheck_gate_share_legacy(1.0, 64), 28);
         assert_eq!(lincheck_gate_share_legacy(1.52, 64), 22);
