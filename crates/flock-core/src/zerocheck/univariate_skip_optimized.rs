@@ -3566,85 +3566,100 @@ fn build_ab_eq_fold_tables(eq_top_scaled: &[F128], convert: &[F128]) -> Vec<F128
         .zip(eq_top_scaled.par_iter())
         .for_each(|(slot, scale)| {
             if derive_rows {
-                // Scaled images of the eight binary carry masks.
-                let deltas = [
+                // Bank-0 scaled images of the 8 single-bit basis elements (convert[1] == 1).
+                let basis = [
                     *scale,
-                    convert[3] * *scale,
-                    convert[7] * *scale,
-                    convert[15] * *scale,
-                    convert[31] * *scale,
-                    convert[63] * *scale,
-                    convert[127] * *scale,
-                    convert[255] * *scale,
+                    convert[2] * *scale,
+                    convert[4] * *scale,
+                    convert[8] * *scale,
+                    convert[16] * *scale,
+                    convert[32] * *scale,
+                    convert[64] * *scale,
+                    convert[128] * *scale,
                 ];
                 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-                // SAFETY: each ST2 writes two adjacent F128 entries. The largest
-                // start is 15 * 256 + 254 = 4094 in the complete 4096-entry image.
-                // F128 has initialized lo/hi u64 lanes; no pointer escapes.
+                // SAFETY: `output` has length CONVERT_TABLE_SIZE == 16 * 256 F128s
+                // (8192 u64 lanes, 16-byte aligned). Each bank writes 256 contiguous
+                // F128s (512 u64 lanes = 8 iterations * 64 u64 lanes); the last store
+                // ends at lane 16 * 512 = 8192. F128 is repr(C, align(16)) {lo, hi}.
                 unsafe {
                     use core::arch::aarch64::*;
 
                     let output: &mut [F128; CONVERT_TABLE_SIZE] =
                         slot.try_into().expect("complete canonical convert image");
-                    let scale_vec = core::mem::transmute::<F128, uint64x2_t>(*scale);
-                    let reduction = vdupq_n_u64(0x87);
-                    let mut base = vdupq_n_u64(0);
-                    for byte in (0usize..256).step_by(2) {
-                        if byte != 0 {
-                            let delta = core::mem::transmute::<F128, uint64x2_t>(
-                                deltas[byte.trailing_zeros() as usize],
-                            );
-                            // Clear the carry mask's bit zero for the even-byte step.
-                            base = veorq_u64(veorq_u64(base, delta), scale_vec);
-                        }
-                        let odd = veorq_u64(base, scale_vec);
-                        let mut lo = vzip1q_u64(base, odd);
-                        let mut hi = vzip2q_u64(base, odd);
-                        let dst = output.as_mut_ptr().add(byte);
-                        vst2q_u64(dst.cast(), uint64x2x2_t(lo, hi));
-                        macro_rules! next_bank {
-                            ($bank:literal) => {{
-                                let top = vandq_u64(
-                                    vreinterpretq_u64_s64(vshrq_n_s64::<63>(
-                                        vreinterpretq_s64_u64(hi),
-                                    )),
-                                    reduction,
-                                );
-                                let carry = vshrq_n_u64::<63>(lo);
-                                hi = vsliq_n_u64::<1>(carry, hi);
-                                lo = veorq_u64(vshlq_n_u64::<1>(lo), top);
-                                vst2q_u64(dst.add($bank * 256).cast(), uint64x2x2_t(lo, hi));
+                    let mut g = basis.map(|x| core::mem::transmute::<F128, uint64x2_t>(x));
+                    let zero = vdupq_n_u64(0);
+                    let poly_carry = core::mem::transmute::<F128, uint64x2_t>(F128::new(0x87, 1));
+                    let mut dst = output.as_mut_ptr().cast::<u64>();
+                    for bank in 0..16 {
+                        let [g0, g1, g2, g3, g4, g5, g6, g7] = g;
+                        let lo3 = veorq_u64(g0, g1);
+                        let lo5 = veorq_u64(g0, g2);
+                        let lo6 = veorq_u64(g1, g2);
+                        let lo7 = veorq_u64(lo3, g2);
+                        let g34 = veorq_u64(g3, g4);
+                        let g56 = veorq_u64(g5, g6);
+                        let tops = [
+                            zero,
+                            g5,
+                            g6,
+                            g56,
+                            g7,
+                            veorq_u64(g5, g7),
+                            veorq_u64(g6, g7),
+                            veorq_u64(g56, g7),
+                        ];
+                        macro_rules! emit8 {
+                            ($p:expr, $h:expr) => {{
+                                let p = $p;
+                                let h = $h;
+                                vst1q_u64(p, h);
+                                vst1q_u64(p.add(2), veorq_u64(h, g0));
+                                vst1q_u64(p.add(4), veorq_u64(h, g1));
+                                vst1q_u64(p.add(6), veorq_u64(h, lo3));
+                                vst1q_u64(p.add(8), veorq_u64(h, g2));
+                                vst1q_u64(p.add(10), veorq_u64(h, lo5));
+                                vst1q_u64(p.add(12), veorq_u64(h, lo6));
+                                vst1q_u64(p.add(14), veorq_u64(h, lo7));
                             }};
                         }
-                        next_bank!(1);
-                        next_bank!(2);
-                        next_bank!(3);
-                        next_bank!(4);
-                        next_bank!(5);
-                        next_bank!(6);
-                        next_bank!(7);
-                        next_bank!(8);
-                        next_bank!(9);
-                        next_bank!(10);
-                        next_bank!(11);
-                        next_bank!(12);
-                        next_bank!(13);
-                        next_bank!(14);
-                        next_bank!(15);
+                        for base in tops {
+                            emit8!(dst, base);
+                            emit8!(dst.add(16), veorq_u64(base, g3));
+                            emit8!(dst.add(32), veorq_u64(base, g4));
+                            emit8!(dst.add(48), veorq_u64(base, g34));
+                            dst = dst.add(64);
+                        }
+                        if bank < 15 {
+                            for v in &mut g {
+                                let shl = vshlq_n_u64::<1>(*v);
+                                let sign = vreinterpretq_u64_s64(vshrq_n_s64::<63>(
+                                    vreinterpretq_s64_u64(*v),
+                                ));
+                                let fix = vandq_u64(vextq_u64::<1>(sign, sign), poly_carry);
+                                *v = veorq_u64(shl, fix);
+                            }
+                        }
                     }
                 }
                 #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
                 {
-                    let mut base = F128::ZERO;
-                    for byte in 0usize..256 {
-                        if byte != 0 {
-                            base += deltas[byte.trailing_zeros() as usize];
+                    let mut basis = basis;
+                    for bank in 0..16 {
+                        let out = &mut slot[bank * 256..(bank + 1) * 256];
+                        out[0] = F128::ZERO;
+                        for bit in 0..8 {
+                            let step = 1usize << bit;
+                            let add = basis[bit];
+                            let (done, rest) = out.split_at_mut(step);
+                            for (dst, src) in rest[..step].iter_mut().zip(done.iter()) {
+                                *dst = *src + add;
+                            }
                         }
-                        let mut value = base;
-                        slot[byte] = value;
-                        for bank in 1..16 {
-                            value = mul_by_x(value);
-                            slot[bank * 256 + byte] = value;
+                        if bank < 15 {
+                            for b in &mut basis {
+                                *b = mul_by_x(*b);
+                            }
                         }
                     }
                 }

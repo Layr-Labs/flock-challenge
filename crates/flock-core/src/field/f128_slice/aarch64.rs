@@ -826,20 +826,125 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
 
 
 /// Fixed 128-bank by 64-lane bank-major fold for the ranked zerocheck AB
-/// completion. Adjacent lanes share a weight load; six raw Karatsuba
-/// components stay live across the complete bank scan, followed by one
-/// paired reduction and two write-only output stores.
+/// completion. On SHA3-capable AArch64 targets, eight adjacent lanes (one full
+/// 128-byte cache line) share each two-bank weight pair across eight passes:
+/// all 24 raw Karatsuba accumulators stay pinned in `v0..v23` with zero loop
+/// spills, `ld2` + `eor` hoist `(w_lo, w_hi, w_mid)` once per bank pair, and
+/// `pmull`/`pmull2` + `eor3` fuse two banks per accumulator update. Non-SHA3
+/// builds retain the two-lane Karatsuba loop.
 ///
 /// # Safety
 /// Requires the `aes` target feature (PMULL). `input` must contain exactly
 /// 128 consecutive rows of 64 [`F128`] values.
 #[inline(never)]
 #[target_feature(enable = "aes")]
+#[cfg_attr(target_feature = "sha3", target_feature(enable = "sha3"))]
 pub(super) unsafe fn fold_bank_major_128x64_rows2(
     weight: &[F128; 128],
     input: &[F128],
     output: &mut [F128; 64],
 ) {
+    #[cfg(target_feature = "sha3")]
+    unsafe {
+        debug_assert_eq!(input.len(), 128 * 64);
+        macro_rules! rows8_lane {
+            ($off:literal, $ll:literal, $hh:literal, $mm:literal) => {
+                concat!(
+                    "ldr q27, [{r0}, #", $off, "]\n",
+                    "ldr q28, [{r1}, #", $off, "]\n",
+                    "trn1 v29.2d, v27.2d, v28.2d\n",
+                    "trn2 v30.2d, v27.2d, v28.2d\n",
+                    "eor v31.16b, v29.16b, v30.16b\n",
+                    "pmull v27.1q, v29.1d, v24.1d\n",
+                    "pmull2 v28.1q, v29.2d, v24.2d\n",
+                    "eor3 ", $ll, ".16b, ", $ll, ".16b, v27.16b, v28.16b\n",
+                    "pmull v27.1q, v30.1d, v25.1d\n",
+                    "pmull2 v28.1q, v30.2d, v25.2d\n",
+                    "eor3 ", $hh, ".16b, ", $hh, ".16b, v27.16b, v28.16b\n",
+                    "pmull v27.1q, v31.1d, v26.1d\n",
+                    "pmull2 v28.1q, v31.2d, v26.2d\n",
+                    "eor3 ", $mm, ".16b, ", $mm, ".16b, v27.16b, v28.16b\n",
+                )
+            };
+        }
+
+        let wp_base = weight.as_ptr();
+        let xp_base = input.as_ptr();
+        let out = output.as_mut_ptr();
+        let mut lane = 0usize;
+        while lane < 64 {
+            let mut raw = core::mem::MaybeUninit::<[[uint64x2_t; 3]; 8]>::uninit();
+            let r0 = xp_base.add(lane);
+            let r1 = r0.add(64);
+            let acc_ptr = raw.as_mut_ptr().cast::<uint64x2_t>();
+            core::arch::asm!(
+                "movi v0.2d, #0",  "movi v1.2d, #0",  "movi v2.2d, #0",
+                "movi v3.2d, #0",  "movi v4.2d, #0",  "movi v5.2d, #0",
+                "movi v6.2d, #0",  "movi v7.2d, #0",  "movi v8.2d, #0",
+                "movi v9.2d, #0",  "movi v10.2d, #0", "movi v11.2d, #0",
+                "movi v12.2d, #0", "movi v13.2d, #0", "movi v14.2d, #0",
+                "movi v15.2d, #0", "movi v16.2d, #0", "movi v17.2d, #0",
+                "movi v18.2d, #0", "movi v19.2d, #0", "movi v20.2d, #0",
+                "movi v21.2d, #0", "movi v22.2d, #0", "movi v23.2d, #0",
+                "2:",
+                "prfm pldl1keep, [{r0}, #8192]",
+                "prfm pldl1keep, [{r1}, #8192]",
+                "ld2 {{v24.2d, v25.2d}}, [{wp}], #32",
+                "eor v26.16b, v24.16b, v25.16b",
+                rows8_lane!(0,   "v0",  "v1",  "v2"),
+                rows8_lane!(16,  "v3",  "v4",  "v5"),
+                rows8_lane!(32,  "v6",  "v7",  "v8"),
+                rows8_lane!(48,  "v9",  "v10", "v11"),
+                rows8_lane!(64,  "v12", "v13", "v14"),
+                rows8_lane!(80,  "v15", "v16", "v17"),
+                rows8_lane!(96,  "v18", "v19", "v20"),
+                rows8_lane!(112, "v21", "v22", "v23"),
+                "add {r0}, {r0}, #2048",
+                "add {r1}, {r1}, #2048",
+                "subs {cnt}, {cnt}, #1",
+                "b.ne 2b",
+                "stp q0, q1, [{acc}, #0]",     "stp q2, q3, [{acc}, #32]",
+                "stp q4, q5, [{acc}, #64]",    "stp q6, q7, [{acc}, #96]",
+                "stp q8, q9, [{acc}, #128]",   "stp q10, q11, [{acc}, #160]",
+                "stp q12, q13, [{acc}, #192]", "stp q14, q15, [{acc}, #224]",
+                "stp q16, q17, [{acc}, #256]", "stp q18, q19, [{acc}, #288]",
+                "stp q20, q21, [{acc}, #320]", "stp q22, q23, [{acc}, #352]",
+                wp = inout(reg) wp_base => _,
+                r0 = inout(reg) r0 => _,
+                r1 = inout(reg) r1 => _,
+                cnt = inout(reg) 64usize => _,
+                acc = in(reg) acc_ptr,
+                out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+                out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+                out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+                out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+                out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+                out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+                out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+                options(nostack),
+            );
+            let acc = raw.assume_init();
+            for p in 0..4 {
+                let first = KaratsubaNeon {
+                    ll: acc[p * 2][0],
+                    hh: acc[p * 2][1],
+                    mm: acc[p * 2][2],
+                };
+                let second = KaratsubaNeon {
+                    ll: acc[p * 2 + 1][0],
+                    hh: acc[p * 2 + 1][1],
+                    mm: acc[p * 2 + 1][2],
+                };
+                let reduced = reduce_wide_pair(karatsuba_to_wide(first), karatsuba_to_wide(second));
+                vst1q_u64(out.add(lane + p * 2).cast::<u64>(), reduced[0]);
+                vst1q_u64(out.add(lane + p * 2 + 1).cast::<u64>(), reduced[1]);
+            }
+            lane += 8;
+        }
+    }
+
+    #[cfg(not(target_feature = "sha3"))]
     unsafe {
         debug_assert_eq!(input.len(), 128 * 64);
         let zero = vdupq_n_u64(0);
