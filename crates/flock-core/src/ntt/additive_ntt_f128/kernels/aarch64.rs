@@ -672,47 +672,97 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         let ext = use_const_ext();
         let prep: [Prep; 7] = core::array::from_fn(|i| three_coeffs(t[i]));
-        let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
+        let prep_ptr = core::hint::black_box(prep.as_ptr());
         let step = eighth * num_ntts;
 
         for r in row_start..row_end {
             let off = r * num_ntts;
-            for lane in 0..num_ntts {
-                let src_base = src.add(off + lane);
-                let mut v: [uint64x2_t; 8] =
-                    core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
-
+            for pair in 0..4 {
+                let col = off + 2 * pair;
+                let mut v0 = [vdupq_n_u64(0); 8];
+                let mut v1 = [vdupq_n_u64(0); 8];
+                for i in 0..8 {
+                    let p = src.add(col + i * step).cast::<u64>();
+                    v0[i] = vld1q_u64(p);
+                    v1[i] = vld1q_u64(p.add(2));
+                }
                 if ext {
                     if ZERO_ROOT {
-                        fused3_zero_root_prepared_q(&mut v, prep[2], prep[4], prep[5], prep[6]);
+                        for i in 0..4 {
+                            v0[i + 4] = butterfly_zero_q(v0[i], v0[i + 4]);
+                            v1[i + 4] = butterfly_zero_q(v1[i], v1[i + 4]);
+                        }
+                        for i in 0..2 {
+                            v0[i + 2] = butterfly_zero_q(v0[i], v0[i + 2]);
+                            v1[i + 2] = butterfly_zero_q(v1[i], v1[i + 2]);
+                        }
+                        let (t2, t4, t5, t6, p4_0, p4_1);
+                        t2 = *prep_ptr.add(2);
+                        (v0[5], v0[7]) = three_fold_zero(v0[5], v0[7], t2);
+                        (v1[5], v1[7]) = three_fold_zero(v1[5], v1[7], t2);
+                        (v0[4], v0[6], p4_0) = three_lazy_zero(v0[4], v0[6], t2);
+                        (v1[4], v1[6], p4_1) = three_lazy_zero(v1[4], v1[6], t2);
+                        v0[1] = butterfly_zero_q(v0[0], v0[1]);
+                        v1[1] = butterfly_zero_q(v1[0], v1[1]);
+                        t4 = *prep_ptr.add(4);
+                        (v0[2], v0[3]) = three_fold_zero(v0[2], v0[3], t4);
+                        (v1[2], v1[3]) = three_fold_zero(v1[2], v1[3], t4);
+                        t5 = *prep_ptr.add(5);
+                        (v0[4], v0[5]) = three_fold(v0[4], v0[5], t5, p4_0);
+                        (v1[4], v1[5]) = three_fold(v1[4], v1[5], t5, p4_1);
+                        t6 = *prep_ptr.add(6);
+                        (v0[6], v0[7]) = three_fold(v0[6], v0[7], t6, p4_0);
+                        (v1[6], v1[7]) = three_fold(v1[6], v1[7], t6, p4_1);
+                        for i in 0..8 {
+                            store_pair_nt(dst.add(col + i * step), v0[i], v1[i]);
+                        }
                     } else {
-                        fused3_prepared_q(&mut v, &prep);
+                        let t0 = *prep_ptr;
+                        for i in 2..4 {
+                            (v0[i], v0[i + 4]) = three_fold_zero(v0[i], v0[i + 4], t0);
+                            (v1[i], v1[i + 4]) = three_fold_zero(v1[i], v1[i + 4], t0);
+                        }
+                        let (p0_0, p0_1, p1_0, p1_1, q4_0, q4_1, q0_0, q0_1);
+                        (v0[0], v0[4], p0_0) = three_lazy_zero(v0[0], v0[4], t0);
+                        (v1[0], v1[4], p0_1) = three_lazy_zero(v1[0], v1[4], t0);
+                        (v0[1], v0[5], p1_0) = three_lazy_zero(v0[1], v0[5], t0);
+                        (v1[1], v1[5], p1_1) = three_lazy_zero(v1[1], v1[5], t0);
+                        let t2 = *prep_ptr.add(2);
+                        (v0[5], v0[7]) = three_fold(v0[5], v0[7], t2, p1_0);
+                        (v1[5], v1[7]) = three_fold(v1[5], v1[7], t2, p1_1);
+                        (v0[4], v0[6], q4_0) = three_lazy(v0[4], v0[6], t2, p0_0);
+                        (v1[4], v1[6], q4_1) = three_lazy(v1[4], v1[6], t2, p0_1);
+                        for (s, idx) in [(2usize, 5usize), (3, 6)] {
+                            let ts = *prep_ptr.add(idx);
+                            let (a0, b0) = three_fold(v0[2 * s], v0[2 * s + 1], ts, q4_0);
+                            let (a1, b1) = three_fold(v1[2 * s], v1[2 * s + 1], ts, q4_1);
+                            store_pair_nt(dst.add(col + (2 * s) * step), a0, a1);
+                            store_pair_nt(dst.add(col + (2 * s + 1) * step), b0, b1);
+                        }
+                        let t1 = *prep_ptr.add(1);
+                        (v0[1], v0[3]) = three_fold(v0[1], v0[3], t1, p1_0);
+                        (v1[1], v1[3]) = three_fold(v1[1], v1[3], t1, p1_1);
+                        (v0[0], v0[2], q0_0) = three_lazy(v0[0], v0[2], t1, p0_0);
+                        (v1[0], v1[2], q0_1) = three_lazy(v1[0], v1[2], t1, p0_1);
+                        for (s, idx) in [(0usize, 3usize), (1, 4)] {
+                            let ts = *prep_ptr.add(idx);
+                            let (a0, b0) = three_fold(v0[2 * s], v0[2 * s + 1], ts, q0_0);
+                            let (a1, b1) = three_fold(v1[2 * s], v1[2 * s + 1], ts, q0_1);
+                            store_pair_nt(dst.add(col + (2 * s) * step), a0, a1);
+                            store_pair_nt(dst.add(col + (2 * s + 1) * step), b0, b1);
+                        }
                     }
-                } else if ZERO_ROOT {
-                    fused3_zero_root_q(&mut v, t[2], t[4], t[5], t[6]);
                 } else {
-                    fused3_general_q(&mut v, &t);
-                }
-
-                for (i, value) in v.iter().enumerate() {
-                    vst1q_u64(
-                        stage.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
-                        *value,
-                    );
-                }
-            }
-
-            // All 64 stage values are initialized above before this drain.
-            // Drain each 128 B row before the next group reuses the stage.
-            for i in 0..8 {
-                let src_row = stage.as_ptr().add(i * num_ntts);
-                let dst_row = dst.add(off + i * step);
-                let mut lane = 0;
-                while lane < num_ntts {
-                    let x = vld1q_u64(src_row.add(lane).cast::<u64>());
-                    let y = vld1q_u64(src_row.add(lane + 1).cast::<u64>());
-                    store_pair_nt(dst_row.add(lane), x, y);
-                    lane += 2;
+                    if ZERO_ROOT {
+                        fused3_zero_root_q(&mut v0, t[2], t[4], t[5], t[6]);
+                        fused3_zero_root_q(&mut v1, t[2], t[4], t[5], t[6]);
+                    } else {
+                        fused3_general_q(&mut v0, &t);
+                        fused3_general_q(&mut v1, &t);
+                    }
+                    for i in 0..8 {
+                        store_pair_nt(dst.add(col + i * step), v0[i], v1[i]);
+                    }
                 }
             }
         }
@@ -1265,10 +1315,31 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_rows(
         let t4 = vld1q_u64((&raw const twiddles[4]).cast::<u64>());
         let t5 = vld1q_u64((&raw const twiddles[5]).cast::<u64>());
         let t6 = vld1q_u64((&raw const twiddles[6]).cast::<u64>());
-        for r in row_start..row_end {
-            butterfly_fused_3layer_zero_root_row_with_q(
-                ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
+        if use_const_ext() {
+            let (p2, p4, p5, p6) = (
+                three_coeffs(t2),
+                three_coeffs(t4),
+                three_coeffs(t5),
+                three_coeffs(t6),
             );
+            let step = eighth * num_ntts;
+            for r in row_start..row_end {
+                for lane in 0..num_ntts {
+                    let base = ptr.add(r * num_ntts + lane);
+                    let mut v: [uint64x2_t; 8] =
+                        core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
+                    fused3_zero_root_prepared_q(&mut v, p2, p4, p5, p6);
+                    for (i, value) in v.iter().enumerate().skip(1) {
+                        vst1q_u64(base.add(i * step).cast::<u64>(), *value);
+                    }
+                }
+            }
+        } else {
+            for r in row_start..row_end {
+                butterfly_fused_3layer_zero_root_row_with_q(
+                    ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
+                );
+            }
         }
     }
 }
@@ -1295,15 +1366,7 @@ pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
     unsafe {
         let ld = |i: usize| vld1q_u64((&raw const twiddles[i]).cast::<u64>());
         if zero_root {
-            debug_assert_eq!(twiddles[0], F128::ZERO);
-            debug_assert_eq!(twiddles[1], F128::ZERO);
-            debug_assert_eq!(twiddles[3], F128::ZERO);
-            let (t2, t4, t5, t6) = (ld(2), ld(4), ld(5), ld(6));
-            for r in 0..eighth {
-                butterfly_fused_3layer_zero_root_row_with_q(
-                    ptr, eighth, num_ntts, num_ntts, r, t2, t4, t5, t6,
-                );
-            }
+            butterfly_fused_3layer_zero_root_rows(ptr, eighth, num_ntts, 0, eighth, twiddles);
         } else {
             let t = [ld(0), ld(1), ld(2), ld(3), ld(4), ld(5), ld(6)];
             if use_three_const_fold() {
