@@ -850,8 +850,8 @@ pub fn uni_skip_fold_and_round_pair_naive(
 ///
 ///   `data[j * 256 + v] = Σ_{b : bit b of v set} weights[8j + b]`
 ///
-/// where `weights = lagrange_weights_naive(k_skip, z)`. Built incrementally by
-/// XOR-composition over the set bits of `v` (one XOR per non-power-of-2 entry).
+/// where `weights = lagrange_weights_naive(k_skip, z)`. Built in rows of eight
+/// using separate subset sums for the high and low bits of `v`.
 ///
 /// Per-row fold then becomes one table lookup + XOR per byte (n_chunks lookups
 /// total instead of `ell` Lagrange multiplications).
@@ -861,6 +861,26 @@ pub struct UniSkipFoldTable {
     pub data: Vec<F128>,
 }
 
+/// Append the XOR-subset sums of eight field elements in byte-index order.
+fn append_fold_byte_bank(out: &mut Vec<F128>, basis: [F128; 8], zero_entry: F128) {
+    let [a, b, c, d, e, f, g, h] = basis;
+    let ab = a + b;
+    let low = [F128::ZERO, a, b, ab, c, a + c, b + c, ab + c];
+    let de = d + e;
+    let def = de + f;
+    let defg = def + g;
+    let carry = [d, de, def, defg, defg + h];
+
+    // Scaling preserves slot zero even for a caller-supplied noncanonical bank.
+    out.extend([zero_entry, a, b, ab, c, a + c, b + c, ab + c]);
+    let mut high = F128::ZERO;
+    for row in 1usize..32 {
+        // Incrementing the five-bit index toggles bits 0..=trailing_zeros(row).
+        high += carry[row.trailing_zeros() as usize];
+        out.extend(low.map(|value| high + value));
+    }
+}
+
 impl UniSkipFoldTable {
     pub fn new(k_skip: usize, z: F128) -> Self {
         let ell = 1usize << k_skip;
@@ -868,22 +888,9 @@ impl UniSkipFoldTable {
         let n_chunks = ell / 8;
         let weights = lagrange_weights_naive(k_skip, z);
 
-        let mut data = vec![F128::ZERO; n_chunks * 256];
-        for j in 0..n_chunks {
-            let basis = &weights[8 * j..8 * j + 8];
-            // v = 0: zero (already initialized).
-            for b in 0..8 {
-                data[j * 256 + (1 << b)] = basis[b];
-            }
-            // Non-powers-of-2: composed by XOR of (v ^ lo_bit) and lo_bit entries.
-            for v in 3usize..256 {
-                if (v & (v - 1)) == 0 {
-                    continue; // skip powers of 2 (already written)
-                }
-                let lo_bit = v & v.wrapping_neg();
-                let parent = v ^ lo_bit;
-                data[j * 256 + v] = data[j * 256 + parent] + data[j * 256 + lo_bit];
-            }
+        let mut data = Vec::with_capacity(n_chunks * 256);
+        for &basis in weights.as_chunks::<8>().0 {
+            append_fold_byte_bank(&mut data, basis, F128::ZERO);
         }
         Self { n_chunks, data }
     }
@@ -912,21 +919,10 @@ impl UniSkipFoldTable {
     /// would write, at the cost of 64 field multiplications.
     pub(crate) fn scaled_linear(&self, rho: F128) -> Vec<F128> {
         assert_eq!(self.data.len(), self.n_chunks * 256);
-        // Every bank writes its base and basis before rebuilding all other slots.
-        let mut scaled = crate::alloc_uninit_f128_vec(self.data.len());
-        for chunk in 0..self.n_chunks {
-            let base = chunk * 256;
-            scaled[base] = self.data[base];
-            for bit in 0..8 {
-                scaled[base + (1 << bit)] = rho * self.data[base + (1 << bit)];
-            }
-            for value in 3usize..256 {
-                if value.is_power_of_two() {
-                    continue;
-                }
-                let low_bit = value & value.wrapping_neg();
-                scaled[base + value] = scaled[base + (value ^ low_bit)] + scaled[base + low_bit];
-            }
+        let mut scaled = Vec::with_capacity(self.data.len());
+        for bank in self.data.as_chunks::<256>().0 {
+            let basis = std::array::from_fn(|bit| rho * bank[1 << bit]);
+            append_fold_byte_bank(&mut scaled, basis, bank[0]);
         }
         scaled
     }
