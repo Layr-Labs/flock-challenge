@@ -7536,31 +7536,38 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
     const T3_BYTETAB3_BUILD: &str = "    threadgroup uint* tab3 = (threadgroup uint*)tabB;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
-    const uint cc = lid >> 3;
-    const uint base = (lid & 7u) * 32u;
-    const uint tw3 = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cc].x;
+    const uint tw3 = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3)].x;
     uint hb = 0u;
-    for (uint k = 5u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= tw3 << k; } }
-    for (uint i = 0u; i < 32u; i++) {
+    for (uint k = 0u; k < 6u; k++) { if ((lid >> k) & 1u) { hb ^= tw3 << k; } }
+    for (uint m = 0u; m < 32u; m++) {
         uint v = hb;
-        for (uint k = 0u; k < 5u; k++) { if ((i >> k) & 1u) { v ^= tw3 << k; } }
-        tab3[cc * 256u + base + i] = v;
+        for (uint k = 0u; k < 5u; k++) { if ((m >> k) & 1u) { v ^= tw3 << (6u + k); } }
+        tab3[(m << 6) + lid] = v;
     }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
     constexpr uint j = 3u;
 ";
-    const T3_BYTETAB3_MUL: &str = "            const uint cb = c * 256u;
-        const uint4 V = elems[ev];
-        uint q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u, q4 = 0u;
-        #define T3B(W, LO, HI) { \\
-            const uint t0 = tab3[cb + ((W) & 255u)]; LO ^= t0; \\
-            const uint t1 = tab3[cb + extract_bits((W), 8, 8)]; LO ^= t1 << 8; HI ^= t1 >> 24; \\
-            const uint t2 = tab3[cb + extract_bits((W), 16, 8)]; LO ^= t2 << 16; HI ^= t2 >> 16; \\
-            const uint t4 = tab3[cb + ((W) >> 24)]; LO ^= t4 << 24; HI ^= t4 >> 8; }
-        T3B(V.x, q0, q1) T3B(V.y, q1, q2) T3B(V.z, q2, q3) T3B(V.w, q3, q4)
-        #undef T3B
+    const T3_BYTETAB3_MUL: &str = "        const uint4 V = elems[ev];
+        uint t = tab3[V.x & 2047u];
+        uint q0 = t, q1 = 0u, q2 = 0u, q3 = 0u, q4 = 0u;
+        t = tab3[extract_bits(V.x, 11, 11)]; q0 ^= t << 11; q1 ^= t >> 21;
+        t = tab3[(V.x >> 22) | ((V.y & 1u) << 10)]; q0 ^= t << 22; q1 ^= t >> 10;
+        t = tab3[extract_bits(V.y, 1, 11)];  q1 ^= t << 1;
+        t = tab3[extract_bits(V.y, 12, 11)]; q1 ^= t << 12; q2 ^= t >> 20;
+        t = tab3[(V.y >> 23) | ((V.z & 3u) << 9)]; q1 ^= t << 23; q2 ^= t >> 9;
+        t = tab3[extract_bits(V.z, 2, 11)];  q2 ^= t << 2;
+        t = tab3[extract_bits(V.z, 13, 11)]; q2 ^= t << 13; q3 ^= t >> 19;
+        t = tab3[(V.z >> 24) | ((V.w & 7u) << 8)]; q2 ^= t << 24; q3 ^= t >> 8;
+        t = tab3[extract_bits(V.w, 3, 11)];  q3 ^= t << 3;  q4 ^= t >> 29;
+        t = tab3[extract_bits(V.w, 14, 11)]; q3 ^= t << 14; q4 ^= t >> 18;
+        t = tab3[V.w >> 25];                 q3 ^= t << 25; q4 ^= t >> 7;
+        #define S3_SH(K) { q0 ^= V.x << (K); q1 ^= (V.y << (K)) | (V.x >> (32u - (K))); q2 ^= (V.z << (K)) | (V.y >> (32u - (K))); q3 ^= (V.w << (K)) | (V.z >> (32u - (K))); q4 ^= V.w >> (32u - (K)); }
+        if (c & 1u) S3_SH(1u)
+        if (c & 2u) S3_SH(2u)
+        if (c & 4u) S3_SH(3u)
+        #undef S3_SH
         q0 ^= q4 ^ (q4 << 1) ^ (q4 << 2) ^ (q4 << 7);
         uint4 acc = uint4(q0, q1, q2, q3);
 ";
@@ -7586,10 +7593,16 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
         let indent = |t: &str| t.lines().map(|l| if l.is_empty() { String::new() } else { format!("    {l}") }).collect::<Vec<_>>().join("\n") + "\n";
         let pre = "        {\n            constexpr uint j = 3u;\n";
         let sub3 = indent(T3_SUB3_HORNER);
+        let nib_decl = "    threadgroup uint  nibB[8u * NNIB];\n";
+        let nib_load = "        // The previous tile's sub-layer 3 still reads nibB.\n        if (tt != 0u) { threadgroup_barrier(mem_flags::mem_threadgroup); }\n        if (lid < 8u * NNIB) {\n            uint cB = lid / NNIB, qB = lid % NNIB;\n            uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];\n            nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;\n        }\n";
         if src.matches(pre).count() != 1 || src.matches(sub3.as_str()).count() != 1 {
             return None;
         }
-        Some(src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(sub3.as_str(), T3_BYTETAB3_MUL, 1))
+        let mut out = src.replacen(pre, T3_BYTETAB3_BUILD, 1).replacen(sub3.as_str(), T3_BYTETAB3_MUL, 1);
+        if out.matches(nib_decl).count() == 1 && out.matches(nib_load).count() == 1 {
+            out = out.replacen(nib_decl, "", 1).replacen(nib_load, "", 1);
+        }
+        Some(out)
     }
 
     fn with_t3_bytetab3(src: &str) -> Option<String> {
@@ -7602,39 +7615,53 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
 
     const T3_BYTETAB2: &str = "    threadgroup_barrier(mem_flags::mem_threadgroup);
     {
-        threadgroup ulong* tab64 = (threadgroup ulong*)tabB;
-        const uint cc = lid >> 4;
-        const uint base = (lid & 15u) * 16u;
-        const uint4 tw4 = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2) + cc];
-        const ulong t = ulong(tw4.x) | (ulong(tw4.y) << 32);
-        ulong hb = 0ul;
-        for (uint k = 4u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= t << k; } }
-        for (uint i = 0u; i < 16u; i++) {
-            ulong v = hb;
-            for (uint k = 0u; k < 4u; k++) { if ((i >> k) & 1u) { v ^= t << k; } }
+        threadgroup uint2* tab64 = (threadgroup uint2*)tabB;
+        const uint cc = lid >> 5;
+        const uint base = (lid & 31u) * 8u;
+        const uint4 tw4 = twiddles[(1u << (P.l + 2u)) - 1u + (B << 2)];
+        uint tx = tw4.x, ty = tw4.y;
+        if (cc != 0u) { ty = (ty << 8) | (tx >> 24); tx <<= 8; }
+        uint2 hb = uint2(0u);
+        for (uint k = 3u; k < 8u; k++) {
+            if ((base >> k) & 1u) { hb ^= uint2(tx << k, (ty << k) | (tx >> (32u - k))); }
+        }
+        const uint2 g0 = uint2(tx, ty);
+        const uint2 g1 = uint2(tx << 1, (ty << 1) | (tx >> 31));
+        const uint2 g2 = uint2(tx << 2, (ty << 2) | (tx >> 30));
+        for (uint i = 0u; i < 8u; i++) {
+            uint2 v = hb;
+            if (i & 1u) v ^= g0;
+            if (i & 2u) v ^= g1;
+            if (i & 4u) v ^= g2;
             tab64[cc * 256u + base + i] = v;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
-        threadgroup const ulong* tab64 = (threadgroup const ulong*)tabB;
+        threadgroup const uint2* T0 = (threadgroup const uint2*)tabB;
+        threadgroup const uint2* T1 = T0 + 256u;
         for (uint b = 0; b < 8u; b++) {
-            const uint eu = ((b >> 1) << 2) | (b & 1u);
+            const uint c = b >> 1;
+            const uint eu = (c << 2) | (b & 1u);
             const uint ev = eu | 2u;
-            threadgroup const ulong* T = tab64 + (b >> 1) * 256u;
             const uint4 V = elems[ev];
-            ulong a0 = 0ul, a1 = 0ul, a2 = 0ul;
-            #define BT2(W, SH, LO, HI) { \\
-                const ulong e = T[extract_bits((W), (SH) & 31u, 8)]; \\
-                LO ^= e << (SH); if ((SH) != 0u) { HI ^= e >> (64u - (SH)); } }
-            BT2(V.x, 0u, a0, a1) BT2(V.x, 8u, a0, a1) BT2(V.x, 16u, a0, a1) BT2(V.x, 24u, a0, a1)
-            BT2(V.y, 32u, a0, a1) BT2(V.y, 40u, a0, a1) BT2(V.y, 48u, a0, a1) BT2(V.y, 56u, a0, a1)
-            BT2(V.z, 0u, a1, a2) BT2(V.z, 8u, a1, a2) BT2(V.z, 16u, a1, a2) BT2(V.z, 24u, a1, a2)
-            BT2(V.w, 32u, a1, a2) BT2(V.w, 40u, a1, a2) BT2(V.w, 48u, a1, a2) BT2(V.w, 56u, a1, a2)
-            #undef BT2
-            a0 ^= a2 ^ (a2 << 1) ^ (a2 << 2) ^ (a2 << 7);
-            const uint4 pr = uint4(uint(a0), uint(a0 >> 32), uint(a1), uint(a1 >> 32));
-            const uint4 nu = elems[eu] ^ pr;
+            uint q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u, q4 = 0u, q5 = 0u;
+            #define S2W(W, Q0, Q1, Q2) { \\
+                const uint2 lo = T0[(W) & 255u] ^ T1[extract_bits((W), 8, 8)]; \\
+                const uint2 hi = T0[extract_bits((W), 16, 8)] ^ T1[(W) >> 24]; \\
+                Q0 ^= lo.x ^ (hi.x << 16); \\
+                Q1 ^= lo.y ^ ((hi.y << 16) | (hi.x >> 16)); \\
+                Q2 ^= hi.y >> 16; }
+            S2W(V.x, q0, q1, q2) S2W(V.y, q1, q2, q3) S2W(V.z, q2, q3, q4) S2W(V.w, q3, q4, q5)
+            #undef S2W
+            #define S2_SH(K) { q0 ^= V.x << (K); q1 ^= (V.y << (K)) | (V.x >> (32u - (K))); q2 ^= (V.z << (K)) | (V.y >> (32u - (K))); q3 ^= (V.w << (K)) | (V.z >> (32u - (K))); q4 ^= V.w >> (32u - (K)); }
+            if (c & 1u) S2_SH(1u)
+            if ((c ^ (c >> 1)) & 1u) S2_SH(2u)
+            if (c & 2u) { S2_SH(3u) S2_SH(4u) }
+            #undef S2_SH
+            q0 ^= q4 ^ (q4 << 1) ^ (q4 << 2) ^ (q4 << 7);
+            q1 ^= q5 ^ ((q5 << 1) | (q4 >> 31)) ^ ((q5 << 2) | (q4 >> 30)) ^ ((q5 << 7) | (q4 >> 25));
+            const uint4 nu = elems[eu] ^ uint4(q0, q1, q2, q3);
             elems[eu] = nu;
             elems[ev] ^= nu;
         }
@@ -7673,7 +7700,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
             let a = with_t3_bytetab2(NTT_FINAL_T3_MSL_SOURCE).expect("sub-layer 2 not found");
             assert!(a.contains("tab64[cc * 256u + base + i] = v;") && !a.contains("NTT_T3_SHORT_PAIR(2u, 0u)"));
             let b = with_t3_bytetab2(&with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).unwrap()).expect("not after sub-layer 3");
-            assert!(b.contains("tab64[cc * 256u + base + i] = v;") && b.contains("tab3[cc * 256u + base + i] = v;"));
+            assert!(b.contains("tab64[cc * 256u + base + i] = v;") && b.contains("tab3[(m << 6) + lid] = v;"));
         }
 
         #[test]
@@ -7746,7 +7773,7 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
         #[test]
         fn t3_bytetab_splice_applies() {
             let out = with_t3_bytetab3(NTT_FINAL_T3_MSL_SOURCE).expect("incumbent sub-layer 3 not found");
-            assert!(out.contains("tab3[cc * 256u + base + i] = v;"));
+            assert!(out.contains("tab3[(m << 6) + lid] = v;"));
             assert!(!out.contains("acc = gf_shl4(acc);"));
             assert!(out.contains("kernel void ntt_final_t3("));
         }
@@ -8689,13 +8716,13 @@ kernel void ntt_fused_reg4g4x2(device uint4* data                [[buffer(0)]],
                 return;
             }
             let plain = final_t3_msl_source();
-            assert!(plain.contains("tab3[cc * 256u + base + i] = v;"), "plain sub-layer 3");
+            assert!(plain.contains("tab3[(m << 6) + lid] = v;"), "plain sub-layer 3");
             assert!(plain.contains("tab64[cc * 256u + base + i] = v;"), "plain sub-layer 2");
             let leaf = final_leaf_msl_source();
             assert_eq!(leaf.matches("tab64[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 2");
             // With real newlines in `with_fused_bytetab3`'s anchors the fused
             // leaf kernel gets sub-layer 3 as well.
-            assert_eq!(leaf.matches("tab3[cc * 256u + base + i] = v;").count(), 2, "leaf sub-layer 3");
+            assert_eq!(leaf.matches("tab3[(m << 6) + lid] = v;").count(), 2, "leaf sub-layer 3");
             assert!(with_fused_bytetab3(NTT_FINAL_LEAF_EXTRA_MSL).is_some());
         }
 
@@ -9320,39 +9347,40 @@ constant uint B3_IV[8] = {
     0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
     0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u
 };
-constant uint B3_PERM[16] = {
-    2u,6u,3u,10u,7u,0u,4u,13u,1u,11u,12u,5u,9u,14u,15u,8u
-};
 #define B3_CHUNK_START 1u
 #define B3_CHUNK_END   2u
 #define B3_PARENT      4u
 
 static void b3_compress(thread uint* cv, thread const uint* m_in,
                         uint block_len, uint flags) {
-    uint v[16];
-    uint m[16];
-    for (int i = 0; i < 8; i++) v[i] = cv[i];
-    for (int i = 0; i < 4; i++) v[8 + i] = B3_IV[i];
-    v[12] = 0u; v[13] = 0u; v[14] = block_len; v[15] = flags;
-    for (int i = 0; i < 16; i++) m[i] = m_in[i];
+    uint v0 = cv[0], v1 = cv[1], v2 = cv[2], v3 = cv[3];
+    uint v4 = cv[4], v5 = cv[5], v6 = cv[6], v7 = cv[7];
+    uint v8 = B3_IV[0], v9 = B3_IV[1], v10 = B3_IV[2], v11 = B3_IV[3];
+    uint v12 = 0u, v13 = 0u, v14 = block_len, v15 = flags;
+    uint m0 = m_in[0], m1 = m_in[1], m2 = m_in[2], m3 = m_in[3];
+    uint m4 = m_in[4], m5 = m_in[5], m6 = m_in[6], m7 = m_in[7];
+    uint m8 = m_in[8], m9 = m_in[9], m10 = m_in[10], m11 = m_in[11];
+    uint m12 = m_in[12], m13 = m_in[13], m14 = m_in[14], m15 = m_in[15];
     for (int r = 0; r < 7; r++) {
         #define G(a,b,c,d,x,y) \
-            v[a] = v[a] + v[b] + x; v[d] = ((v[d]^v[a])>>16)|((v[d]^v[a])<<16); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>12)|((v[b]^v[c])<<20); \
-            v[a] = v[a] + v[b] + y; v[d] = ((v[d]^v[a])>>8) |((v[d]^v[a])<<24); \
-            v[c] = v[c] + v[d];     v[b] = ((v[b]^v[c])>>7) |((v[b]^v[c])<<25);
-        G(0,4,8,12,  m[0], m[1]);  G(1,5,9,13,  m[2], m[3]);
-        G(2,6,10,14, m[4], m[5]);  G(3,7,11,15, m[6], m[7]);
-        G(0,5,10,15, m[8], m[9]);  G(1,6,11,12, m[10],m[11]);
-        G(2,7,8,13,  m[12],m[13]); G(3,4,9,14,  m[14],m[15]);
+            a = a + b + (x); d = as_type<uint>(as_type<ushort2>(d ^ a).yx); \
+            c = c + d;       b = rotate(b ^ c, 20u); \
+            a = a + b + (y); d = rotate(d ^ a, 24u); \
+            c = c + d;       b = rotate(b ^ c, 25u);
+        G(v0,v4,v8, v12, m0, m1);  G(v1,v5,v9, v13, m2, m3);
+        G(v2,v6,v10,v14, m4, m5);  G(v3,v7,v11,v15, m6, m7);
+        G(v0,v5,v10,v15, m8, m9);  G(v1,v6,v11,v12, m10,m11);
+        G(v2,v7,v8, v13, m12,m13); G(v3,v4,v9, v14, m14,m15);
         #undef G
         if (r < 6) {
-            uint t[16];
-            for (int i = 0; i < 16; i++) t[i] = m[B3_PERM[i]];
-            for (int i = 0; i < 16; i++) m[i] = t[i];
+            uint t0=m2, t1=m6, t2=m3, t3=m10, t4=m7, t5=m0, t6=m4, t7=m13;
+            uint t8=m1, t9=m11, t10=m12, t11=m5, t12=m9, t13=m14, t14=m15, t15=m8;
+            m0=t0; m1=t1; m2=t2; m3=t3; m4=t4; m5=t5; m6=t6; m7=t7;
+            m8=t8; m9=t9; m10=t10; m11=t11; m12=t12; m13=t13; m14=t14; m15=t15;
         }
     }
-    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];
+    cv[0] = v0 ^ v8;  cv[1] = v1 ^ v9;  cv[2] = v2 ^ v10; cv[3] = v3 ^ v11;
+    cv[4] = v4 ^ v12; cv[5] = v5 ^ v13; cv[6] = v6 ^ v14; cv[7] = v7 ^ v15;
 }
 
 #ifndef LEAF_TILES
@@ -9451,27 +9479,33 @@ kernel void ntt_final_t3_leaf(device uint4* data                [[buffer(0)]],
             uint flags = (b == 0u ? B3_CHUNK_START : 0u) | (b == 15u ? B3_CHUNK_END : 0u);
             b3_compress(cv, block, 64u, flags);
         }
-        for (uint i = 0u; i < 8u; i++) {
-            leaves[id * 8u + i] = cv[i];
-            level0[n * 8u + i] = cv[i];
-        }
+        const uint4 c0 = uint4(cv[0], cv[1], cv[2], cv[3]);
+        const uint4 c1 = uint4(cv[4], cv[5], cv[6], cv[7]);
+        ((device uint4*)leaves)[id * 2u] = c0;
+        ((device uint4*)leaves)[id * 2u + 1u] = c1;
+        ((threadgroup uint4*)level0)[n * 2u] = c0;
+        ((threadgroup uint4*)level0)[n * 2u + 1u] = c1;
     }
 #define LEAF_PARENT_LEVEL(SRC, DST, OUT, CNT)                                  \
     threadgroup_barrier(mem_flags::mem_threadgroup);                           \
     for (uint n = lid; n < (CNT); n += 64u) {                                  \
+        threadgroup const uint4* s4 = (threadgroup const uint4*)SRC + n * 4u;  \
         uint block[16];                                                        \
-        for (uint i = 0u; i < 8u; i++) {                                       \
-            block[i] = SRC[(2u * n) * 8u + i];                                 \
-            block[8u + i] = SRC[(2u * n + 1u) * 8u + i];                       \
+        for (uint q = 0u; q < 4u; q++) {                                       \
+            const uint4 w = s4[q];                                             \
+            block[q * 4u] = w.x; block[q * 4u + 1u] = w.y;                     \
+            block[q * 4u + 2u] = w.z; block[q * 4u + 3u] = w.w;                \
         }                                                                      \
         uint cv[8];                                                            \
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \
         b3_compress(cv, block, 64u, B3_PARENT);                                \
         const uint id = tgid * (CNT) + n;                                      \
-        for (uint i = 0u; i < 8u; i++) {                                       \
-            OUT[id * 8u + i] = cv[i];                                          \
-            DST[n * 8u + i] = cv[i];                                           \
-        }                                                                      \
+        const uint4 c0 = uint4(cv[0], cv[1], cv[2], cv[3]);                    \
+        const uint4 c1 = uint4(cv[4], cv[5], cv[6], cv[7]);                    \
+        ((device uint4*)OUT)[id * 2u] = c0;                                    \
+        ((device uint4*)OUT)[id * 2u + 1u] = c1;                               \
+        ((threadgroup uint4*)DST)[n * 2u] = c0;                                \
+        ((threadgroup uint4*)DST)[n * 2u + 1u] = c1;                           \
     }
     LEAF_PARENT_LEVEL(level0, level1, parents1, NL / 2u)
     LEAF_PARENT_LEVEL(level1, level2, parents2, NL / 4u)
@@ -24182,6 +24216,16 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                     read_len /= 8;
                 }
             }
+            if fused && read_len > 1 && read_len <= 128 && read_len.is_power_of_two() {
+                encode_merkle_tops(
+                    gpu,
+                    enc,
+                    tree_buf,
+                    pso_parent,
+                    &[(read_start, read_len, 0, read_len)],
+                );
+                return;
+            }
             gpu.set_pipeline(enc, pso_parent);
             while read_len > 1 {
                 let write_start = read_start + read_len;
@@ -30801,76 +30845,52 @@ static inline uint4 gf_shl16(uint4 a) {
     return r;
 }
 
-// The commit NTT's 64-thread byte-table build (gf_build_byte16) for one
-// constant `c`: tab[b] = b * c, tab[256 + b] = b * (c x^8). `c8` is the
-// host-computed `c x^8` (consts[6 + i] for consts[i]), so the upper half no
-// longer runs an 8-step gf_mulx chain inside every group's barrier pair.
-static inline void zf_build(threadgroup uint4* tabB, uint4 c, uint4 c8, uint lid)
+// 256 threads build two 512-entry byte tables (`tabB[0..512]` for `cA`,
+// `tabB[512..1024]` for `cB`, 16 KiB total) in parallel: half 0 builds `cA`,
+// half 1 builds `cB`, 4 contiguous stores per thread, one trailing barrier.
+static inline void zf_build_pair256(threadgroup uint4* tabB,
+                                    uint4 cA, uint4 cA8,
+                                    uint4 cB, uint4 cB8,
+                                    uint lid)
 {
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint t  = lid >> 5;
-    const uint u  = lid & 31u;
+    const uint half_id = lid >> 7;
+    const uint l128 = lid & 127u;
+    const uint t = l128 >> 6;
+    const uint u = l128 & 63u;
     const uint aa = u & 3u;
     const uint cc = u >> 2;
+    uint4 c  = half_id ? cB  : cA;
+    uint4 c8 = half_id ? cB8 : cA8;
     uint4 e0 = (t != 0u) ? c8 : c;
     uint4 e1 = gf_mulx(e0), e2 = gf_mulx(e1), e3 = gf_mulx(e2);
+    uint4 A = (e2 & -uint(aa & 1u)) ^ (e3 & -uint((aa >> 1) & 1u));
     uint4 f0 = gf_mulx(e3), f1 = gf_mulx(f0), f2 = gf_mulx(f1), f3 = gf_mulx(f2);
-    uint4 A = uint4(0u);
-    if (aa & 1u) { A ^= e2; }
-    if (aa & 2u) { A ^= e3; }
-    const uint4 L0 = A, L1 = A ^ e0, L2 = A ^ e1, L3 = A ^ e0 ^ e1;
-    uint4 C = uint4(0u);
-    if (cc & 1u) { C ^= f1; }
-    if (cc & 2u) { C ^= f2; }
-    if (cc & 4u) { C ^= f3; }
-    const uint4 H0 = C, H1 = C ^ f0;
-    threadgroup uint4* dst = &tabB[t << 8];
-    const uint o0 = (cc << 5) + (aa << 2);
-    const uint o1 = o0 + 16u;
-    dst[o0 + 0u] = L0 ^ H0;
-    dst[o0 + 1u] = L1 ^ H0;
-    dst[o0 + 2u] = L2 ^ H0;
-    dst[o0 + 3u] = L3 ^ H0;
-    dst[o1 + 0u] = L0 ^ H1;
-    dst[o1 + 1u] = L1 ^ H1;
-    dst[o1 + 2u] = L2 ^ H1;
-    dst[o1 + 3u] = L3 ^ H1;
+    uint4 H = (f0 & -uint(cc & 1u)) ^ (f1 & -uint((cc >> 1) & 1u))
+            ^ (f2 & -uint((cc >> 2) & 1u)) ^ (f3 & -uint((cc >> 3) & 1u));
+    uint4 B = A ^ H;
+    threadgroup uint4* dst = &tabB[(half_id << 9) + (t << 8) + (cc << 4) + (aa << 2)];
+    dst[0u] = B;
+    dst[1u] = B ^ e0;
+    dst[2u] = B ^ e1;
+    dst[3u] = B ^ e0 ^ e1;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-static inline void zf_mul_x2(uint4 va, uint4 vb,
-                             threadgroup const uint4* tab,
-                             thread uint4& ra, thread uint4& rb)
+static inline uint4 zf_mul1(uint4 va, threadgroup const uint4* tab)
 {
     uint4 a = uint4(0u);
-    uint4 b = uint4(0u);
-    for (int i = 7; i >= 0; i--) {
-        a = gf_shl16(a);
-        b = gf_shl16(b);
-        uint ha = (va[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        uint hb = (vb[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
-        a ^= tab[ha & 255u] ^ tab[256u + (ha >> 8)];
-        b ^= tab[hb & 255u] ^ tab[256u + (hb >> 8)];
+    for (int i = 3; i >= 0; i--) {
+        uchar4 b = as_type<uchar4>(va[i]);
+        a = gf_shl16(a) ^ tab[b.z] ^ tab[256u + b.w];
+        a = gf_shl16(a) ^ tab[b.x] ^ tab[256u + b.y];
     }
-    ra = a;
-    rb = b;
+    return a;
 }
 
-#define ZF_LEVEL(J)                                                    \
-    {                                                                  \
-        constexpr uint st = 1u << (J);                                 \
-        zf_build(tabB, consts[2u + (J)], consts[8u + (J)], lid);       \
-        for (uint e = 0u; e < 16u; e += 2u * st) {                     \
-            uint4 pa;                                                  \
-            uint4 pb;                                                  \
-            zf_mul_x2(ea[e] ^ ea[e + st], eb[e] ^ eb[e + st],          \
-                      &tabB[0], pa, pb);                               \
-            ea[e] ^= pa;                                               \
-            eb[e] ^= pb;                                               \
-        }                                                              \
-    }
-
-[[max_total_threads_per_threadgroup(64)]]
+// 256 threads, 64 outputs/TG (4 lanes/output, 1 output/thread): streams levels
+// 0 and 1 through double-buffered 16 KiB `tabB[1024]` into 4 `uint4`s (16 regs),
+// then levels 2+3 and SIMD-shuffle levels 4+5 (skipping dead lanes) in 5 barriers.
+[[max_total_threads_per_threadgroup(256)]]
 kernel void zf_fold8(device const uint4* z      [[buffer(0)]],
                      device const uint4* consts [[buffer(1)]],
                      device uint4* out          [[buffer(2)]],
@@ -30879,61 +30899,50 @@ kernel void zf_fold8(device const uint4* z      [[buffer(0)]],
                      uint tgid [[threadgroup_position_in_grid]],
                      uint lid  [[thread_index_in_threadgroup]])
 {
-    threadgroup uint4 tabB[512u];
+    threadgroup uint4 tabB[1024u];
     // Blocks at or above the CPU's steal boundary are never read from this
     // arm's output: skip them (uniform per group, before any barrier). A
     // stale read only costs wasted work, never a wrong output.
-    if (((P.out_lo + (tgid << 5)) >> P.block_log) >= cut[0]) { return; }
+    if (((P.out_lo + (tgid << 6)) >> P.block_log) >= cut[0]) { return; }
     const uint q  = lid & 3u;
     const uint o  = lid >> 2;
-    const uint oa = P.out_lo + (tgid << 5) + o;
-    const uint ob = oa + 16u;
+    const uint oa = P.out_lo + (tgid << 6) + o;
     const uint ba = (oa << 6) + q;
-    const uint bb = (ob << 6) + q;
-    uint4 ea[16];
-    uint4 eb[16];
-    for (uint e = 0u; e < 16u; e++) {
-        ea[e] = z[ba + (e << 2)];
-        eb[e] = z[bb + (e << 2)];
+    zf_build_pair256(tabB, consts[2], consts[8], consts[3], consts[9], lid);
+    uint4 ea[4];
+    for (uint k = 0u; k < 4u; k++) {
+        uint off = k << 4;
+        uint4 a0 = z[ba + off];
+        uint4 a1 = z[ba + off + 4u];
+        uint4 a2 = z[ba + off + 8u];
+        uint4 a3 = z[ba + off + 12u];
+        a0 ^= zf_mul1(a0 ^ a1, &tabB[0]);
+        a2 ^= zf_mul1(a2 ^ a3, &tabB[0]);
+        ea[k] = a0 ^ zf_mul1(a0 ^ a2, &tabB[512]);
     }
-    ZF_LEVEL(0u)
-    ZF_LEVEL(1u)
-    ZF_LEVEL(2u)
-    ZF_LEVEL(3u)
-    uint4 ra = ea[0];
-    uint4 rb = eb[0];
-    zf_build(tabB, consts[0], consts[6], lid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    zf_build_pair256(tabB, consts[4], consts[10], consts[5], consts[11], lid);
+    ea[0] ^= zf_mul1(ea[0] ^ ea[1], &tabB[0]);
+    ea[2] ^= zf_mul1(ea[2] ^ ea[3], &tabB[0]);
+    uint4 ra = ea[0] ^ zf_mul1(ea[0] ^ ea[2], &tabB[512]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    zf_build_pair256(tabB, consts[0], consts[6], consts[1], consts[7], lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(1));
-        uint4 sb = simd_shuffle_xor(rb, ushort(1));
-        uint4 la = (q & 1u) ? sa : ra;
-        uint4 lb = (q & 1u) ? sb : rb;
-        uint4 pa;
-        uint4 pb;
-        zf_mul_x2(ra ^ sa, rb ^ sb, &tabB[0], pa, pb);
-        ra = la ^ pa;
-        rb = lb ^ pb;
+        if ((q & 1u) == 0u) {
+            ra ^= zf_mul1(ra ^ sa, &tabB[0]);
+        }
     }
-    zf_build(tabB, consts[1], consts[7], lid);
     {
         uint4 sa = simd_shuffle_xor(ra, ushort(2));
-        uint4 sb = simd_shuffle_xor(rb, ushort(2));
-        uint4 la = (q & 2u) ? sa : ra;
-        uint4 lb = (q & 2u) ? sb : rb;
-        uint4 pa;
-        uint4 pb;
-        zf_mul_x2(ra ^ sa, rb ^ sb, &tabB[0], pa, pb);
-        ra = la ^ pa;
-        rb = lb ^ pb;
-    }
-    if (q == 0u) {
-        out[oa] = ra;
-        out[ob] = rb;
+        if (q == 0u) {
+            out[oa] = ra ^ zf_mul1(ra ^ sa, &tabB[512]);
+        }
     }
 }
 
 // Memory floor of the same access pattern: loads, XOR, one store per output.
-[[max_total_threads_per_threadgroup(64)]]
+[[max_total_threads_per_threadgroup(256)]]
 kernel void zf_read_floor(device const uint4* z      [[buffer(0)]],
                           device const uint4* consts [[buffer(1)]],
                           device uint4* out          [[buffer(2)]],
@@ -30943,19 +30952,14 @@ kernel void zf_read_floor(device const uint4* z      [[buffer(0)]],
 {
     const uint q  = lid & 3u;
     const uint o  = lid >> 2;
-    const uint oa = P.out_lo + (tgid << 5) + o;
-    const uint ob = oa + 16u;
+    const uint oa = P.out_lo + (tgid << 6) + o;
     const uint ba = (oa << 6) + q;
-    const uint bb = (ob << 6) + q;
     uint4 ra = uint4(0u);
-    uint4 rb = uint4(0u);
     for (uint e = 0u; e < 16u; e++) {
         ra ^= z[ba + (e << 2)];
-        rb ^= z[bb + (e << 2)];
     }
     if (q == 0u) {
         out[oa] = ra ^ consts[0];
-        out[ob] = rb;
     }
 }
 "#;
@@ -31117,8 +31121,8 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
 }
 "#;
 
-        /// Outputs folded by one 64-thread group.
-        pub(crate) const ZF_OUTS_PER_TG: usize = 32;
+        /// Outputs folded by one 256-thread group.
+        pub(crate) const ZF_OUTS_PER_TG: usize = 64;
 
         pub(crate) const ZF_CONSTS_BYTES: usize = 12 * 16;
 
@@ -31173,7 +31177,7 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
                     core::mem::size_of::<ZfParams>(),
                 );
                 gpu.set_bytes(enc, bytes, 3);
-                gpu.dispatch(enc, (out_n / ZF_OUTS_PER_TG) as u64, 64);
+                gpu.dispatch(enc, (out_n / ZF_OUTS_PER_TG) as u64, 256);
             }
         }
 
