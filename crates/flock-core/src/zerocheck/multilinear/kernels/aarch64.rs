@@ -3114,7 +3114,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
     anchors: *mut F128,
     deltas: *mut u8,
     eq_lo: *const F128,
-    rho_prep: *const F128,
+    _rho_prep: *const F128,
     lo_size: usize,
     degen: bool,
     tail_compact: bool,
@@ -3123,6 +3123,25 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
     out: *mut F128,
 ) {
     use core::arch::aarch64::*;
+
+    #[inline(always)]
+    unsafe fn fold_stage_off<const F7: bool, const CODE: usize, const IDX: usize>(
+        table_data: *const u8, a_row: *const u8, b_row: *const u8,
+        sa: *mut uint64x2_t, sd: *mut u64, degen: bool, b_ones: uint64x2_t,
+    ) -> (uint64x2_t, uint64x2_t, uint64x2_t, uint64x2_t, bool) {
+        unsafe {
+            let rd = |p: *const u8, o: usize| u64::from_le(core::ptr::read_unaligned(p.add(o).cast::<u64>()));
+            let (a0_c, a1_c, b0_c, b1_c) = (rd(a_row, CODE), rd(a_row, CODE + 8), rd(b_row, CODE), rd(b_row, CODE + 8));
+            if degen && (b0_c & b1_c) == u64::MAX {
+                let (a0, a1) = fold_two_rows_g::<F7>(table_data, a0_c, a1_c);
+                (*sa.add(IDX), *sa.add(IDX + 1), *sd.add(IDX), *sd.add(IDX + 1)) = (a0, b_ones, a0_c ^ a1_c, 0);
+                return (a0, a1, b_ones, b_ones, true);
+            }
+            let (a0, a1, b0, b1) = fold_four_rows_g::<F7>(table_data, a0_c, a1_c, b0_c, b1_c);
+            (*sa.add(IDX), *sa.add(IDX + 1), *sd.add(IDX), *sd.add(IDX + 1)) = (a0, b0, a0_c ^ a1_c, b0_c ^ b1_c);
+            (a0, a1, b0, b1, false)
+        }
+    }
 
     unsafe {
         let (anchors0, deltas0) = (anchors, deltas);
@@ -3150,9 +3169,10 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
             b_ones,
             core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
         ));
-        // The chunk sums, in slot order.
+        // The chunk sums, in slot order, and L1D staging for even-group stores.
         let mut sums = [tri_zero; 8];
-        let k86 = vdupq_n_u64(0x86);
+        let mut stage_anc = [zero; 64];
+        let mut stage_del = [0u64; 64];
 
         for block in 0..lo_size / 128 {
             // The block's rebased state pointers, as the prepared-weight walk
@@ -3170,16 +3190,26 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
             } else {
                 (anchors0, deltas0)
             };
-            // One pointer per stream, stepped once per two groups.
-            let mut pa = a_packed.add(32 * 64 * block);
-            let mut pb = b_packed.add(32 * 64 * block);
-            let mut pn = anchors.add(4 * 64 * block);
-            let mut pd = deltas.add(32 * 64 * block);
+            let (ba, bb, bn, bd) = (
+                a_packed.add(32 * 64 * block), b_packed.add(32 * 64 * block),
+                anchors.add(4 * 64 * block), deltas.add(32 * 64 * block),
+            );
             for win in 0..2usize {
                 let first = 64 * block + 32 * win;
-                // Window 0 has sixteen live groups per parity; window 1 has
-                // fourteen, then group 60 (even, `b = 14`) with its second
-                // pair padded; groups 61..64 are dead.
+                let (wa, wb, wn, wd) = (
+                    ba.add(32 * 32 * win), bb.add(32 * 32 * win),
+                    bn.add(4 * 32 * win), bd.add(32 * 32 * win),
+                );
+                if win == 0 && skip_pure {
+                    for g in 0..HC_HEAD_PAIRS / 2 {
+                        head_ok &= r2_head_group_store_even::<F7>(
+                            table_data, wa.wrapping_add(32 * g), wb.wrapping_add(32 * g),
+                            anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * g),
+                            deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * g), nt_deltas,
+                        );
+                    }
+                }
+                macro_rules! run_parity { ($t:literal) => {{
                 let mut p1_even = tri_zero;
                 let mut pinf_even = tri_zero;
                 let mut p1_odd = tri_zero;
@@ -3188,9 +3218,8 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 let mut w3 = tri_zero;
                 let mut w4 = tri_zero;
                 let mut w5 = tri_zero;
-                // `x^b` in both lanes, and the prepared pair of `rho x^b`.
-                let mut xb = vdupq_n_u64(1);
-                let mut pr = rho_prep;
+                let (mut pa, mut pb, mut pn, mut pd) = (wa, wb, wn, wd);
+                let (mut sa, mut sd) = (stage_anc.as_mut_ptr(), stage_del.as_mut_ptr());
                 // One group's eight products from its two folded pairs, its
                 // a rows scaled by `$scale`; `$pad1`: the second pair is
                 // padded (its rows are zero); `$first`: accumulators are zero.
@@ -3260,87 +3289,74 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                         r2_pair_fold_and_store_off::<F7, $c, $n>(table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas)
                     };
                 }
+                macro_rules! flush_even {
+                    () => {{
+                        store_anchor_pair_nt_off::<0>(pn, *sa, *sa.add(1));
+                        store_anchor_pair_nt_off::<32>(pn, *sa.add(2), *sa.add(3));
+                        let (d0, d1, d2, d3) = (*sd, *sd.add(1), *sd.add(2), *sd.add(3));
+                        if nt_deltas {
+                            core::arch::asm!("stnp {0}, {1}, [{4}]\nstnp {2}, {3}, [{4}, #16]",
+                                in(reg) d0, in(reg) d1, in(reg) d2, in(reg) d3, in(reg) pd, options(nostack, preserves_flags));
+                        } else {
+                            core::arch::asm!("stp {0}, {1}, [{4}]\nstp {2}, {3}, [{4}, #16]",
+                                in(reg) d0, in(reg) d1, in(reg) d2, in(reg) d3, in(reg) pd, options(nostack, preserves_flags));
+                        }
+                    }};
+                }
                 macro_rules! step_ptrs {
                     () => {{
-                        xb = vshlq_n_u64::<1>(xb);
-                        (pr, pa, pb, pn, pd) = (
-                            pr.wrapping_add(2), pa.wrapping_add(64), pb.wrapping_add(64),
-                            pn.wrapping_add(8), pd.wrapping_add(64),
-                        );
-                        core::arch::asm!(
-                            "// {0} {1} {2} {3} {4}",
-                            inout(reg) pa, inout(reg) pb, inout(reg) pn, inout(reg) pd, inout(reg) pr,
-                            options(pure, nomem, nostack, preserves_flags),
-                        );
+                        (pa, pb, sa, sd) = (pa.wrapping_add(64), pb.wrapping_add(64), sa.wrapping_add(4), sd.wrapping_add(4));
+                        if $t == 0 {
+                            core::arch::asm!("// {0} {1} {2} {3}", inout(reg) pa, inout(reg) pb, inout(reg) sa, inout(reg) sd, options(pure, nomem, nostack, preserves_flags));
+                        } else {
+                            (pn, pd) = (pn.wrapping_add(8), pd.wrapping_add(64));
+                            core::arch::asm!("// {0} {1} {2} {3} {4} {5}", inout(reg) pa, inout(reg) pb, inout(reg) pn, inout(reg) pd, inout(reg) sa, inout(reg) sd, options(pure, nomem, nostack, preserves_flags));
+                        }
                     }};
                 }
-                macro_rules! body_trip {
-                    ($first:literal, $xb1:literal) => {{
-                        let (r0, r1) = (pair_off!(0, 0), pair_off!(16, 32));
-                        if $xb1 { products!(r0, r1, false, $first, |v| v); }
-                        else { products!(r0, r1, false, $first, |v| mul_xb_q(v, xb, k87)); }
-                        let (r0, r1) = (pair_off!(32, 64), pair_off!(48, 96));
-                        let (p0, p1) = (vld1q_u64(pr.cast::<u64>()), vld1q_u64(pr.add(1).cast::<u64>()));
+                macro_rules! body_group {
+                    ($first:literal, $b:expr, $xb1:literal) => {{
+                        let (r0, r1) = if $t == 0 {
+                            (fold_stage_off::<F7, 0, 0>(table_data, pa, pb, sa, sd, degen, b_ones),
+                             fold_stage_off::<F7, 16, 2>(table_data, pa, pb, sa, sd, degen, b_ones))
+                        } else { flush_even!(); (pair_off!(32, 64), pair_off!(48, 96)) };
                         step_ptrs!();
-                        products!(r0, r1, false, false, |v| mul_prep86_seeded_q(p0, p1, v, k86));
+                        if $xb1 { products!(r0, r1, false, $first, |v| v); }
+                        else {
+                            let (sh, shr) = (vdupq_n_s64($b), vdupq_n_s64(($b) - 64));
+                            products!(r0, r1, false, $first, |v| mul_xb_shift_q(v, sh, shr, k87, zero));
+                        }
                     }};
                 }
-                // Peeled head / first-live trips: body loop has no `skip_pure` or `head`
-                // branches, skips `mul_xb_q` when `xb == 1`, and initializes with `tri_set_q`.
                 let (body_start, body_end) = if win == 0 {
                     if skip_pure {
-                        for g in 0..HC_HEAD_PAIRS / 2 {
-                            head_ok &= r2_head_group_store_even::<F7>(
-                                table_data, pa.wrapping_add(32 * g), pb.wrapping_add(32 * g),
-                                anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * g),
-                                deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * g), nt_deltas,
-                            );
-                        }
-                        xb = vdupq_n_u64(4);
-                        (pr, pa, pb, pn, pd) = (pr.wrapping_add(4), pa.wrapping_add(128), pb.wrapping_add(128), pn.wrapping_add(16), pd.wrapping_add(128));
-                        body_trip!(true, false);
-                        (3, 16)
+                        (pa, pb, sa, sd) = (pa.wrapping_add(128), pb.wrapping_add(128), sa.wrapping_add(8), sd.wrapping_add(8));
+                        if $t == 1 { (pn, pd) = (pn.wrapping_add(16), pd.wrapping_add(128)); }
+                        body_group!(true, 2i64, false);
+                        (3i64, 16i64)
                     } else if head {
-                        for trip in 0..HC_HEAD_PAIRS / 4 {
-                            let (r0, r1) = fold_head!(trip, 0);
-                            if trip == 0 { products!(r0, r1, false, true, |v| v); }
-                            else { products!(r0, r1, false, false, |v| mul_xb_q(v, xb, k87)); }
-                            let (r0, r1) = fold_head!(trip, 1);
-                            let (p0, p1) = (vld1q_u64(pr.cast::<u64>()), vld1q_u64(pr.add(1).cast::<u64>()));
-                            step_ptrs!();
-                            products!(r0, r1, false, false, |v| mul_prep86_seeded_q(p0, p1, v, k86));
-                        }
-                        (HC_HEAD_PAIRS / 4, 16)
-                    } else {
-                        body_trip!(true, true);
-                        (1, 16)
-                    }
+                        let (r0, r1) = fold_head!(0, $t); step_ptrs!(); products!(r0, r1, false, true, |v| v);
+                        let (r0, r1) = fold_head!(1, $t); step_ptrs!(); products!(r0, r1, false, false, |v| mul_xb_const_q::<1, 63>(v, k87, zero));
+                        (2i64, 16i64)
+                    } else { body_group!(true, 0i64, true); (1i64, 16i64) }
                 } else {
-                    body_trip!(true, true);
-                    (1, if skip_pure { 13 } else { 14 })
+                    body_group!(true, 0i64, true);
+                    (1i64, if $t == 1 && skip_pure { 13i64 } else { 14i64 })
                 };
-                for _ in body_start..body_end {
-                    body_trip!(false, false);
+                let mut b = body_start;
+                while b + 2 <= body_end { body_group!(false, b, false); body_group!(false, b + 1, false); b += 2; }
+                if b < body_end { body_group!(false, b, false); }
+                if $t == 1 && win == 1 && skip_pure {
+                    flush_even!();
+                    head_ok &= r2_group_store_even_off::<F7, 32, 48, 64, 96>(table_data, pa, pb, pn, pd, b_ones, nt_deltas);
                 }
-                if win == 1 && skip_pure {
-                    products!(pair_off!(0, 0), pair_off!(16, 32), false, false, |v| mul_xb_q(v, xb, k87));
-                    head_ok &= r2_group_store_even_off::<F7, 32, 48, 64, 96>(
-                        table_data, pa, pb, pn, pd, b_ones, nt_deltas,
-                    );
-                    step_ptrs!();
-                }
-                if win == 1 {
-                    // Group 60 (`t = 0`, `b = 14`): pair 120 live, pair 121
-                    // padded and, with the dead pairs skipped, not written.
-                    let x_lo0 = 2 * (64 * block + 60);
+                if $t == 0 && win == 1 {
                     let rows0 = r2_pair_fold_and_store::<F7>(
-                        table_data, a_packed, b_packed, anchors, deltas, x_lo0, false, degen, b_ones,
-                        true, nt_deltas,
+                        table_data, a_packed, b_packed, anchors, deltas, 2 * (64 * block + 60), false, degen, b_ones, true, nt_deltas,
                     );
-                    products!(rows0, (zero, zero, zero, zero, false), true, false, |v| mul_xb_q(v, xb, k87));
+                    products!(rows0, (zero, zero, zero, zero, false), true, false, |v| mul_xb_const_q::<14, 50>(v, k87, zero));
                 }
-                // The window's sums, reduced, times its weight.
-                let lambda = vld1q_u64(eq_lo.add(2 * first + 1).cast::<u64>());
+                let lambda = vld1q_u64(eq_lo.add(2 * first + 2 * $t + 1).cast::<u64>());
                 let lambda_sw = swap_halves_q(lambda);
                 for (sum, acc) in sums
                     .iter_mut()
@@ -3349,6 +3365,9 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                     let v = reduce_tri_binius_xor_q(acc.ll, acc.cross, acc.hh, zero);
                     tri_acc_sw(sum, lambda, lambda_sw, v);
                 }
+                }}; }
+                run_parity!(0);
+                run_parity!(1);
             }
         }
         if head && !head_ok {
@@ -4100,6 +4119,44 @@ unsafe fn mul_xb_q(
             u = out(vreg) _,
             r = out(vreg) _,
             o = lateout(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// Shift-reduced `v * x^b` (`0 <= b <= 56`, 1 `PMULL2`): `sh = dup(b)`, `shr = dup(b - 64)`.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn mul_xb_shift_q(
+    v: core::arch::aarch64::uint64x2_t, sh: core::arch::aarch64::int64x2_t,
+    shr: core::arch::aarch64::int64x2_t, k: core::arch::aarch64::uint64x2_t, zero: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    let out: core::arch::aarch64::uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "ushl {h:v}.2d, {v:v}.2d, {shr:v}.2d\nushl {v:v}.2d, {v:v}.2d, {sh:v}.2d\npmull2 {r:v}.1q, {h:v}.2d, {k:v}.2d\next {h:v}.16b, {z:v}.16b, {h:v}.16b, #8\neor3 {v:v}.16b, {v:v}.16b, {h:v}.16b, {r:v}.16b",
+            v = inout(vreg) v => out, sh = in(vreg) sh, shr = in(vreg) shr,
+            k = in(vreg) k, z = in(vreg) zero, h = out(vreg) _, r = out(vreg) _,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+    }
+    out
+}
+
+/// Immediate-shift `v * x^B` (`1 <= B <= 56`, `R = 64 - B`, 1 `PMULL2`, 0 shift regs).
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn mul_xb_const_q<const B: i32, const R: i32>(
+    v: core::arch::aarch64::uint64x2_t, k: core::arch::aarch64::uint64x2_t, zero: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    const { assert!(B >= 1 && B <= 56 && R == 64 - B) };
+    let out: core::arch::aarch64::uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "ushr {h:v}.2d, {v:v}.2d, #{rs}\nshl {v:v}.2d, {v:v}.2d, #{ls}\npmull2 {r:v}.1q, {h:v}.2d, {k:v}.2d\next {h:v}.16b, {z:v}.16b, {h:v}.16b, #8\neor3 {v:v}.16b, {v:v}.16b, {h:v}.16b, {r:v}.16b",
+            ls = const B, rs = const R,
+            v = inout(vreg) v => out, k = in(vreg) k, z = in(vreg) zero, h = out(vreg) _, r = out(vreg) _,
             options(pure, nomem, nostack, preserves_flags),
         );
     }
@@ -5906,7 +5963,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         let mut acc = LookaheadTriAcc::zero();
         let mut wacc = LookaheadTriAcc::zero();
         let mut sums = LookaheadTriAcc::zero();
-        let mut xb_q = vdupq_n_u64(1);
+        let mut xb_b: i64 = 0;
         let mut win_first = 0usize;
         let mut in_window = 0usize;
         let k87 = vdupq_n_u64(0x87);
@@ -5918,12 +5975,12 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     let v = reduce_tri_binius_xor_q(w.ll, w.cross, w.hh, zero);
                     tri_acc_sw(sum, lambda, lambda_sw, v);
                 }
-                xb_q = vdupq_n_u64(1);
+                xb_b = 0;
             }};
         }
         macro_rules! k_xb_step {
             () => {{
-                xb_q = vshlq_n_u64::<2>(xb_q);
+                xb_b += 2;
                 in_window += 1;
                 if in_window == 8 {
                     k_xb_flush!(win_first);
@@ -6014,11 +6071,15 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         }
 
         // `$o`: the index of the group's first output in `a_out` / `b_out`.
+        macro_rules! k_xb {
+            ($v:expr, 0, 0) => { mul_xb_shift_q($v, vdupq_n_s64(xb_b), vdupq_n_s64(xb_b - 64), k87, zero) };
+            ($v:expr, $b:literal, $r:literal) => { mul_xb_const_q::<$b, $r>($v, k87, zero) };
+        }
         macro_rules! k_group {
             ($t:expr, $o:expr) => {
-                k_group!(@ $t, $o, false, ($t) == bt0, false, true)
+                k_group!(@ $t, $o, false, ($t) == bt0, false, true, 0, 0)
             };
-            (@ $t:expr, $o:expr, $fused:literal, $is_bt0:expr, $first:literal, $step_flush:literal) => {{
+            (@ $t:expr, $o:expr, $fused:literal, $is_bt0:expr, $first:literal, $step_flush:literal, $b:tt, $r:tt) => {{
                 macro_rules! kacc {
                     ($acc:expr, $x:expr, $y:expr) => {
                         if XB && $first { tri_set_q($acc, $x, $y) }
@@ -6071,9 +6132,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                         *acc = LookaheadTriAcc::zero().0;
                         (acc[0].ll, acc[2].ll, acc[4].ll) = (a1, a3, a2);
                     } else if XB {
-                        acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb_q, k87));
-                        acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb_q, k87));
-                        acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb_q, k87));
+                        acc[0].ll = veorq_u64(acc[0].ll, k_xb!(a1, $b, $r));
+                        acc[2].ll = veorq_u64(acc[2].ll, k_xb!(a3, $b, $r));
+                        acc[4].ll = veorq_u64(acc[4].ll, k_xb!(a2, $b, $r));
                     } else {
                         // `w` = (p0.lo, p1.lo).
                         let wp = eq_prep.add(2 * t).cast::<u64>();
@@ -6087,12 +6148,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     let (a0, a1, a2, a3) = if XB && $first {
                         (a0, a1, a2, a3)
                     } else if XB {
-                        (
-                            mul_xb_q(a0, xb_q, k87),
-                            mul_xb_q(a1, xb_q, k87),
-                            mul_xb_q(a2, xb_q, k87),
-                            mul_xb_q(a3, xb_q, k87),
-                        )
+                        (k_xb!(a0, $b, $r), k_xb!(a1, $b, $r), k_xb!(a2, $b, $r), k_xb!(a3, $b, $r))
                     } else {
                         let wp = eq_prep.add(2 * t).cast::<u64>();
                         let (w_p0, w_p1) = (vld1q_u64(wp), vld1q_u64(wp.add(2)));
@@ -6114,9 +6170,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     kacc!(&mut acc[6], o_aw, o_b);
                     kacc!(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
                 }
-                if XB {
-                    if $step_flush { k_xb_step!(); }
-                    else { xb_q = if $first { vdupq_n_u64(4) } else { vshlq_n_u64::<2>(xb_q) }; }
+                if XB && $step_flush {
+                    k_xb_step!();
                 }
             }};
         }
@@ -6151,19 +6206,19 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     deltas = deltas0.wrapping_sub(TC_DELTA_GAP * blk);
                 }
                 if allfused {
-                    // Two 8-group XB windows: peel `t0` & `t0+8`, share 3-pair body, flush at `t0+7`/`t0+15`.
-                    k_group!(@ t0, o0, true, true, true, false);
+                    // Two 8-group XB windows: peel `t0` & `t0+8`, const shifts 2..14, flush at `t0+7`/`t0+15`.
+                    k_group!(@ t0, o0, true, true, true, false, 0, 0);
                     for win in 0..2usize {
-                        let base = t0 + 8 * win;
-                        if win == 1 { k_group!(@ base, o0 + 4 * (base - t0), true, false, true, false); }
-                        let mut t = base + 1;
-                        while t < base + 7 {
-                            k_group!(@ t, o0 + 4 * (t - t0), true, false, false, false);
-                            k_group!(@ t + 1, o0 + 4 * (t + 1 - t0), true, false, false, false);
-                            t += 2;
-                        }
+                        let (base, ob) = (t0 + 8 * win, o0 + 32 * win);
+                        if win == 1 { k_group!(@ base, ob, true, false, true, false, 0, 0); }
+                        k_group!(@ base + 1, ob + 4, true, false, false, false, 2, 62);
+                        k_group!(@ base + 2, ob + 8, true, false, false, false, 4, 60);
+                        k_group!(@ base + 3, ob + 12, true, false, false, false, 6, 58);
+                        k_group!(@ base + 4, ob + 16, true, false, false, false, 8, 56);
+                        k_group!(@ base + 5, ob + 20, true, false, false, false, 10, 54);
+                        k_group!(@ base + 6, ob + 24, true, false, false, false, 12, 52);
                         if win == 0 {
-                            k_group!(@ base + 7, o0 + 28, true, false, false, false);
+                            k_group!(@ base + 7, ob + 28, true, false, false, false, 14, 50);
                             if XB { k_xb_flush!(t0); }
                         }
                     }
@@ -6212,7 +6267,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     store_pair_nt_off::<32>(bo, zero, zero);
                 }
                 let a0w = if XB {
-                    mul_xb_q(av0, xb_q, k87)
+                    mul_xb_const_q::<14, 50>(av0, k87, zero)
                 } else {
                     let wp = eq_prep.add(2 * t).cast::<u64>();
                     mul_prep86_q(vld1q_u64(wp), vld1q_u64(wp.add(2)), av0, k86)
@@ -6238,12 +6293,12 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
             if allfused {
                 let mut t = 0;
                 while t + 2 <= n5 {
-                    k_group!(@ t, 4 * t, true, false, false, true);
-                    k_group!(@ t + 1, 4 * (t + 1), true, false, false, true);
+                    k_group!(@ t, 4 * t, true, false, false, true, 0, 0);
+                    k_group!(@ t + 1, 4 * (t + 1), true, false, false, true, 0, 0);
                     t += 2;
                 }
                 if t < n5 {
-                    k_group!(@ t, 4 * t, true, false, false, true);
+                    k_group!(@ t, 4 * t, true, false, false, true, 0, 0);
                 }
             } else {
                 for t in 0..n5 {
