@@ -1044,10 +1044,13 @@ fn partial_fold_packed_z_best_gpu_split(
     k_log: usize,
     useful_bits: usize,
     eq_outer: &[F128],
+    prelaunched: Option<crate::gpu_commit::ZcFoldJob>,
 ) -> Vec<F128> {
-    let gpu = ranked_lincheck_fold_gpu_shape(m, k_log)
-        .then(|| crate::gpu_commit::launch_lincheck_fold(z_packed, m, k_log, useful_bits, eq_outer))
-        .flatten();
+    let gpu = prelaunched.or_else(|| {
+        ranked_lincheck_fold_gpu_shape(m, k_log)
+            .then(|| crate::gpu_commit::launch_lincheck_fold(z_packed, m, k_log, useful_bits, eq_outer))
+            .flatten()
+    });
     if let Some(job) = gpu {
         let claim_lo = job.claim_lo();
         let t_suffix = std::time::Instant::now();
@@ -1061,12 +1064,10 @@ fn partial_fold_packed_z_best_gpu_split(
         );
         let mut suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
         if crate::gpu_commit::lincheck_fold_tune_take_replays() {
-            for _ in 0..2 {
-                let t = std::time::Instant::now();
-                let again = partial_fold_packed_z_neon_oblock_padded_suffix(z_packed, m, k_log, useful_bits, eq_outer, claim_lo);
-                suffix_ms = suffix_ms.min(t.elapsed().as_secs_f64() * 1e3);
-                std::hint::black_box(again);
-            }
+            let t = std::time::Instant::now();
+            let again = partial_fold_packed_z_neon_oblock_padded_suffix(z_packed, m, k_log, useful_bits, eq_outer, claim_lo);
+            suffix_ms = suffix_ms.min(t.elapsed().as_secs_f64() * 1e3);
+            std::hint::black_box(again);
         }
         // No head in this window: the CPU suffix starts at submission.
         match job.finish_xor_into(&mut out, 0.0, suffix_ms) {
@@ -1103,6 +1104,7 @@ fn partial_fold_packed_z_best_gpu_split(
     k_log: usize,
     useful_bits: usize,
     eq_outer: &[F128],
+    _prelaunched: (),
 ) -> Vec<F128> {
     partial_fold_packed_z_best(z_packed, m, k_log, useful_bits, eq_outer)
 }
@@ -1970,16 +1972,28 @@ fn prove_padded_inner<Ch: Challenger>(
         } else {
             None
         };
-        let eq_x_outer = build_z_fold_eq_table(m, k_log, k_skip, useful_bits, &x_ab.x_outer);
         // Root stripe: fold the compacted root columns only, then rebuild
         // the dependent columns exactly (see `RootStripe`).
         let (fold_useful, roots) = stripe_fold_useful(z_packed, useful_bits);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let (eq_x_outer, gpu_job) = if ranked_lincheck_fold_gpu_shape(m, k_log)
+            && let Some((eq, job)) = crate::gpu_commit::launch_lincheck_fold_gpu_eq(
+                z_packed, m, k_log, fold_useful, &x_ab.x_outer,
+            )
+        {
+            (eq, Some(job))
+        } else {
+            (build_z_fold_eq_table(m, k_log, k_skip, useful_bits, &x_ab.x_outer), None)
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let (eq_x_outer, gpu_job) = (build_z_fold_eq_table(m, k_log, k_skip, useful_bits, &x_ab.x_outer), ());
         let mut z_vec = partial_fold_packed_z_best_gpu_split(
             z_packed,
             m,
             k_log,
             fold_useful,
             eq_x_outer.as_slice(),
+            gpu_job,
         );
         if let Some(roots) = roots {
             (roots.expand)(&mut z_vec);

@@ -4779,6 +4779,14 @@ pub(crate) fn round1_c_prelude(
                 };
             }
         }
+        let (fold_useful, _) = crate::lincheck::stripe_fold_useful(c_lincheck, useful_bits);
+        if ranked_c_fold_shape(m, k_log)
+            && let Some((eq_outer, job)) = crate::gpu_commit::launch_zerocheck_c_fold_gpu_eq(
+                c_lincheck, m, k_log, fold_useful, &r[k_log..],
+            )
+        {
+            return Round1CPrelude { eq_outer, gpu: Some(job), submitted: std::time::Instant::now() };
+        }
         // Off the arm's shape no launch will consume a staged table, so keep
         // the incumbent owned build there (same gate as the launch below).
         let eq_outer = if ranked_c_fold_shape(m, k_log) {
@@ -4786,7 +4794,6 @@ pub(crate) fn round1_c_prelude(
         } else {
             crate::gpu_commit::FoldEqTable::Owned(crate::lincheck::build_eq_table(&r[k_log..]))
         };
-        let (fold_useful, _) = crate::lincheck::stripe_fold_useful(c_lincheck, useful_bits);
         let gpu = ranked_c_fold_shape(m, k_log)
             .then(|| {
                 crate::gpu_commit::launch_zerocheck_c_fold(

@@ -17400,7 +17400,7 @@ kernel void blake3_pow_seg_tail(
         let reprime = || {
             let c = &ctx;
             unsafe {
-                run_from_z_first_pass(c.gpu, c.z_buf, c.staging, c.tw_buf, params.k_code())
+                run_from_z_first_pass_then(c.gpu, c.z_buf, c.staging, c.tw_buf, params.k_code(), || Ok(()))
             }
         };
         // Queue each hybrid sample's cb2 directly behind its re-prime, as
@@ -17434,10 +17434,19 @@ kernel void blake3_pow_seg_tail(
         let (lead, extend, phi) = hybrid_tune_sampling();
         let mut fp_ms_fixed = f64::INFINITY;
         if lead {
-            for _ in 0..2 {
+            let _rec = ArmRecordScope::enter();
+            for i in 0..8 {
                 let tp = std::time::Instant::now();
                 if reprime().is_err() { finish_ranked_exact_contention_tune(params, cpu_tree, 0); return; }
-                fp_ms_fixed = fp_ms_fixed.min(tp.elapsed().as_secs_f64() * 1e3);
+                let ms = tp.elapsed().as_secs_f64() * 1e3;
+                let prev_min = fp_ms_fixed;
+                fp_ms_fixed = fp_ms_fixed.min(ms);
+                if dbg {
+                    eprintln!("[gpu-commit] exact-AB fp_ms_fixed iter {i}: {ms:.3} ms (min {fp_ms_fixed:.3} ms)");
+                }
+                if i + 1 >= 3 && ms > 0.95 * prev_min {
+                    break;
+                }
             }
         }
         let delay = lead.then(|| std::time::Duration::from_secs_f64(phi * fp_ms_fixed * 1e-3));
@@ -21431,9 +21440,7 @@ kernel void zc_eq_rows(
             // failed, the prefix may have folded rows that were never
             // written; its output is not consumed and the caller redoes the
             // prefix claims on the CPU over the rebuilt table.
-            if self.arm == FoldArm::Zc
-                && ZC_GPU_EQ_FAILED.swap(false, std::sync::atomic::Ordering::AcqRel)
-            {
+            if ZC_GPU_EQ_FAILED.swap(false, std::sync::atomic::Ordering::AcqRel) {
                 return Err("GPU eq rows failed".to_string());
             }
             assert_eq!(dst.len(), self.k);
@@ -21551,7 +21558,7 @@ kernel void zc_eq_rows(
                                 let Ok(cb2) = zc_fold_submit(gpu, state, &replay) else {
                                     break;
                                 };
-                                let ok = gpu.wait_cb(cb2).is_ok();
+                                let ok = gpu.spin_wait_cb(cb2, 10.0).is_ok();
                                 let w = if ok { t.elapsed().as_secs_f64() * 1e3 } else { 0.0 };
                                 gpu.release(cb2);
                                 if w <= 0.0 {
@@ -22458,6 +22465,50 @@ kernel void zc_eq_rows(
             return None;
         }
         launch_fold_prefix(FoldArm::Zc, z_packed, m, k_log, useful_bits, eq_outer)
+    }
+
+    fn launch_fold_prefix_gpu_eq(
+        arm: FoldArm, z_packed: &[u8], m: usize, k_log: usize, useful_bits: usize, point: &[F128],
+    ) -> Option<(FoldEqTable, ZcFoldJob)> {
+        if !zc_gpu_eq_enabled() || cfg!(test)
+            || ZC_GPU_EQ_ORACLE.load(std::sync::atomic::Ordering::Relaxed) == 2
+            || point.len() != m.saturating_sub(k_log)
+        {
+            return None;
+        }
+        ZC_GPU_EQ_FAILED.store(false, std::sync::atomic::Ordering::Release);
+        let (job, rows) = launch_fold_prefix_src(arm, z_packed, m, k_log, useful_bits, EqSrc::GpuRows(point))?;
+        let eq_len = 1usize << (m - k_log);
+        let stage = {
+            let state = job.guard.as_ref()?.as_ref().ok()?;
+            FoldEqStage { ptr: unsafe { state.gpu.buffer_contents(state.eq_buf).cast::<F128>() }, len: eq_len }
+        };
+        match rows {
+            Some(rows) => {
+                if ZC_GPU_EQ_ORACLE.load(std::sync::atomic::Ordering::Relaxed) == 0 && !gpu_eq_oracle(&job, &rows) {
+                    return None;
+                }
+                if arm.debug() { eprintln!("{} eq rows launched on GPU ({eq_len} lanes)", arm.tag()); }
+                Some((FoldEqTable::GpuBuilt(GpuEqTable { stage, rows, ready: std::sync::OnceLock::new() }), job))
+            }
+            None => Some((FoldEqTable::Staged(stage), job)),
+        }
+    }
+
+    pub(crate) fn launch_zerocheck_c_fold_gpu_eq(
+        z_packed: &[u8], m: usize, k_log: usize, useful_bits: usize, point: &[F128],
+    ) -> Option<(FoldEqTable, ZcFoldJob)> {
+        super::gpu_zerocheck_enabled()
+            .then(|| launch_fold_prefix_gpu_eq(FoldArm::Zc, z_packed, m, k_log, useful_bits, point))
+            .flatten()
+    }
+
+    pub(crate) fn launch_lincheck_fold_gpu_eq(
+        z_packed: &[u8], m: usize, k_log: usize, useful_bits: usize, point: &[F128],
+    ) -> Option<(FoldEqTable, ZcFoldJob)> {
+        super::gpu_lincheck_enabled()
+            .then(|| launch_fold_prefix_gpu_eq(FoldArm::Lincheck, z_packed, m, k_log, useful_bits, point))
+            .flatten()
     }
 
     /// Commit-tail fill, GPU half (see `ENV_NO_COMMIT_TAIL_FILL`): build the
@@ -31478,7 +31529,8 @@ pub(crate) use imp::{gpu_merkle_tree_blake3, gpu_ntt_interleaved_from_layer};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{
-    ZcFoldJob, launch_lincheck_fold, launch_zerocheck_c_fold, zerocheck_gpu_submits,
+    ZcFoldJob, launch_lincheck_fold, launch_lincheck_fold_gpu_eq, launch_zerocheck_c_fold,
+    launch_zerocheck_c_fold_gpu_eq, zerocheck_gpu_submits,
 };
 
 /// Opening z-fold GPU arm (see `ENV_NO_GPU_ZFOLD` in `pcs::ligerito`).
