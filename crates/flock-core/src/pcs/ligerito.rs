@@ -3134,26 +3134,31 @@ fn transpose_forward_ntt_fused_3layer(
         pmull_fold: bool,
     ) {
         use core::arch::aarch64::uint64x2_t;
-        use crate::field::gf2_128::aarch64::{mul_const_pair_prep, mul_const_pair_prep_pmull};
+        use crate::field::gf2_128::aarch64::{mul_const_pair_prep, mul_const_prep_xor};
 
         let bottom = [values[b[0]], values[b[1]]];
         let sums = [values[a[0]] + bottom[0], values[a[1]] + bottom[1]];
-        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
-        // layout maps lo/hi to vector lanes 0/1 without padding.
-        let products = unsafe {
-            let x0 = core::mem::transmute::<F128, uint64x2_t>(sums[0]);
-            let x1 = core::mem::transmute::<F128, uint64x2_t>(sums[1]);
-            let products = if pmull_fold {
-                mul_const_pair_prep_pmull(tw[0], x0, tw[1], x1)
-            } else {
-                mul_const_pair_prep(tw[0], x0, tw[1], x1)
-            };
-            products.map(|p| core::mem::transmute::<uint64x2_t, F128>(p))
-        };
         values[a[0]] = sums[0];
         values[a[1]] = sums[1];
-        values[b[0]] = products[0] + bottom[0];
-        values[b[1]] = products[1] + bottom[1];
+        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
+        // layout maps lo/hi to vector lanes 0/1 without padding.
+        unsafe {
+            let x0 = core::mem::transmute::<F128, uint64x2_t>(sums[0]);
+            let x1 = core::mem::transmute::<F128, uint64x2_t>(sums[1]);
+            if pmull_fold {
+                let b0 = core::mem::transmute::<F128, uint64x2_t>(bottom[0]);
+                let b1 = core::mem::transmute::<F128, uint64x2_t>(bottom[1]);
+                values[b[0]] =
+                    core::mem::transmute::<uint64x2_t, F128>(mul_const_prep_xor(tw[0], x0, b0));
+                values[b[1]] =
+                    core::mem::transmute::<uint64x2_t, F128>(mul_const_prep_xor(tw[1], x1, b1));
+            } else {
+                let products = mul_const_pair_prep(tw[0], x0, tw[1], x1)
+                    .map(|p| core::mem::transmute::<uint64x2_t, F128>(p));
+                values[b[0]] = products[0] + bottom[0];
+                values[b[1]] = products[1] + bottom[1];
+            }
+        }
     }
 
     let num_blocks = 1usize << layer;
@@ -3429,6 +3434,7 @@ struct L0FactoredFinal3Constants {
 /// The ordinary butterfly control spends four layer-2 and four layer-1
 /// products. Standard additive-NTT identities eliminate the zero twiddles
 /// and share `A*p1`, `(A+D)*p3`, and `D*p2` across retained outputs.
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))))]
 #[inline(always)]
 fn l0_factored_final3_retained_row(
     values: [F128; 8],
@@ -3496,6 +3502,50 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
     };
 
     let data_ptr = data.as_mut_ptr() as usize;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    let (u_0, u_2) = {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64};
+        use crate::field::gf2_128::aarch64::{const_prep, TriNeon};
+        let to_q = |x: F128| unsafe { core::mem::transmute::<F128, uint64x2_t>(x) };
+        let prep = [constants.a, constants.d, constants.a_plus_d, constants.b]
+            .map(|t| unsafe { const_prep(to_q(t)) });
+        (0..eighth / 2)
+            .into_par_iter()
+            .with_min_len(small_ntt_min_jobs(16))
+            .fold(
+                || unsafe { (TriNeon::zero(), TriNeon::zero()) },
+                |(mut u0, mut u2), row_pair| {
+                    let even_row = 2 * row_pair;
+                    let odd_row = even_row + 1;
+                    // SAFETY: each `row_pair` owns 16 disjoint inputs and 8 retained outputs.
+                    unsafe {
+                        let ptr = data_ptr as *mut F128;
+                        let f_ptr = f.as_ptr();
+                        let even = l0_factored_final3_prepared_row(
+                            core::array::from_fn(|i| *ptr.add(even_row + i * eighth)),
+                            prep,
+                        );
+                        let odd = l0_factored_final3_prepared_row(
+                            core::array::from_fn(|i| *ptr.add(odd_row + i * eighth)),
+                            prep,
+                        );
+                        for segment in 0..4 {
+                            let idx = segment * eighth + even_row;
+                            *ptr.add(idx) = even[segment];
+                            *ptr.add(idx + 1) = odd[segment];
+                            let (f0, f1) = (to_q(*f_ptr.add(idx)), to_q(*f_ptr.add(idx + 1)));
+                            let (ev, od) = (to_q(even[segment]), to_q(odd[segment]));
+                            u0.acc_q(f0, ev);
+                            u2.acc_q(veorq_u64(f0, f1), veorq_u64(ev, od));
+                        }
+                    }
+                    (u0, u2)
+                },
+            )
+            .map(|(u0, u2)| unsafe { (u0.reduce(), u2.reduce()) })
+            .reduce(|| (F128::ZERO, F128::ZERO), |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2))
+    };
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
         .with_min_len(small_ntt_min_jobs(16))
@@ -4556,7 +4606,7 @@ fn densify_c2_windows_prepared_first_3layer(
     prefix_k: usize,
 ) -> Vec<F128> {
     use core::arch::aarch64::uint64x2_t;
-    use crate::field::gf2_128::aarch64::{const_prep, mul_const_pair_prep, ConstPrep};
+    use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep_xor, ConstPrep};
 
     #[inline(always)]
     fn butterfly_pair(
@@ -4567,21 +4617,22 @@ fn densify_c2_windows_prepared_first_3layer(
     ) {
         let bottom = [values[b[0]], values[b[1]]];
         let sums = [values[a[0]] + bottom[0], values[a[1]] + bottom[1]];
-        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
-        // layout maps lo/hi to vector lanes 0/1 without padding.
-        let products = unsafe {
-            let products = mul_const_pair_prep(
-                tw[0],
-                core::mem::transmute::<F128, uint64x2_t>(sums[0]),
-                tw[1],
-                core::mem::transmute::<F128, uint64x2_t>(sums[1]),
-            );
-            products.map(|p| core::mem::transmute::<uint64x2_t, F128>(p))
-        };
         values[a[0]] = sums[0];
         values[a[1]] = sums[1];
-        values[b[0]] = products[0] + bottom[0];
-        values[b[1]] = products[1] + bottom[1];
+        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
+        // layout maps lo/hi to vector lanes 0/1 without padding.
+        unsafe {
+            values[b[0]] = core::mem::transmute::<uint64x2_t, F128>(mul_const_prep_xor(
+                tw[0],
+                core::mem::transmute::<F128, uint64x2_t>(sums[0]),
+                core::mem::transmute::<F128, uint64x2_t>(bottom[0]),
+            ));
+            values[b[1]] = core::mem::transmute::<uint64x2_t, F128>(mul_const_prep_xor(
+                tw[1],
+                core::mem::transmute::<F128, uint64x2_t>(sums[1]),
+                core::mem::transmute::<F128, uint64x2_t>(bottom[1]),
+            ));
+        }
     }
 
     // The kept rows are the `const_prep` rows built below
@@ -5033,6 +5084,31 @@ const L2_FACTORED_FINAL5_COSETS: usize = 8;
 const L2_FACTORED_FINAL5_CHANNELS: usize = 4;
 const L2_FACTORED_FINAL5_ROW_TILE: usize = 8;
 
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn l2_factored_final5_eval_neon(
+    c: &[crate::field::gf2_128::aarch64::ConstPrep; 16],
+    p: F128, r: F128, d: F128, b1: F128,
+    p_i: [F128; 3], r_i: [F128; 3], d_i: [F128; 3], p_ij: [F128; 3],
+) -> [F128; 4] {
+    use core::arch::aarch64::{uint64x2_t, veorq_u64};
+    use crate::field::gf2_128::aarch64::{mul_const_prep, mul_three_const_sum_prep_xor};
+    unsafe {
+        let q = |x: F128| core::mem::transmute::<F128, uint64x2_t>(x);
+        let f = |x: uint64x2_t| core::mem::transmute::<uint64x2_t, F128>(x);
+        let (rq, dq, b1q) = (q(r), q(d), q(b1));
+        let (pi, ri, di, pij) = (p_i.map(q), r_i.map(q), d_i.map(q), p_ij.map(q));
+        let dr = mul_const_prep(c[0], rq);
+        let v1 = mul_three_const_sum_prep_xor(c[1], pi[0], c[2], pi[1], c[3], pi[2], veorq_u64(dq, dr));
+        let v2 = mul_three_const_sum_prep_xor(c[4], pi[0], c[5], pi[1], c[6], pi[2], rq);
+        let v3 = mul_three_const_sum_prep_xor(c[7], pi[0], c[8], pi[1], c[9], pi[2], veorq_u64(b1q, dr));
+        let v3 = mul_three_const_sum_prep_xor(c[10], ri[0], c[11], ri[1], c[12], ri[2], v3);
+        let v3 = mul_three_const_sum_prep_xor(c[4], di[0], c[5], di[1], c[6], di[2], v3);
+        let v3 = mul_three_const_sum_prep_xor(c[13], pij[0], c[14], pij[1], c[15], pij[2], v3);
+        [p, f(v1), f(v2), f(v3)]
+    }
+}
+
 /// One leaf tile of the factored direct tail. Keeping this helper out of line
 /// ensures Rayon recursion does not retain a 4 KiB stage array in every
 /// bridge frame; only a leaf tile owns the stage.
@@ -5043,6 +5119,9 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
     row_start: usize,
     eighth: usize,
     quarter: usize,
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    constants: &[crate::field::gf2_128::aarch64::ConstPrep; 16],
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
     constants: &L2FactoredFinal5Constants,
 ) {
     let mut staged = [[[core::mem::MaybeUninit::<F128>::uninit();
@@ -5089,6 +5168,10 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
         let (d, d_i) = l2_factored_first_moments(load_channel(2));
         let b1 = l2_factored_sum8(load_channel(3));
 
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+        let values = l2_factored_final5_eval_neon(constants, p, r, d, b1, p_i, r_i, d_i, p_ij);
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+        let values = {
         let delta_r = constants.delta * r;
 
         let ap = constants.a[0] * p_i[0]
@@ -5110,12 +5193,13 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
             + constants.h[1] * p_ij[1]
             + constants.h[2] * p_ij[2];
 
-        let values = [
+        [
             p,
             d + delta_r + ap,
             r + bp,
             b1 + delta_r + gp + er + bd + hp,
-        ];
+        ]
+        };
         let row = row_start + local_row;
         // SAFETY: the caller assigns one disjoint 8-row tile. Each tile
         // writes those rows exactly once in all four retained quarters.
@@ -5150,6 +5234,17 @@ fn transpose_forward_ntt_final_5layer_low_eighth_factored(
     assert!(quarter.is_multiple_of(L2_FACTORED_FINAL5_ROW_TILE));
 
     let constants = l2_factored_final5_constants(ntt);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    let constants = {
+        use core::arch::aarch64::uint64x2_t;
+        use crate::field::gf2_128::aarch64::const_prep;
+        let c = constants;
+        [
+            c.delta, c.a[0], c.a[1], c.a[2], c.b[0], c.b[1], c.b[2],
+            c.g[0], c.g[1], c.g[2], c.e[0], c.e[1], c.e[2], c.h[0], c.h[1], c.h[2],
+        ]
+        .map(|t| unsafe { const_prep(core::mem::transmute::<F128, uint64x2_t>(t)) })
+    };
     let data_ptr = data.as_ptr() as usize;
     let mut retained = Vec::<F128>::with_capacity(eighth);
     let retained_ptr = retained.as_mut_ptr() as usize;
