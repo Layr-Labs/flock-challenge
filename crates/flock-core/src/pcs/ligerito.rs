@@ -8233,6 +8233,27 @@ fn materialize_direct_fold8(
     challenges: [F128; 6],
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
+    thread_local! {
+        static DIRECT_FOLD8_TLS: std::cell::RefCell<(Vec<F128>, Vec<F128>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    struct DirectFold8TlsGuard(Vec<F128>, Vec<F128>);
+    impl DirectFold8TlsGuard {
+        fn take() -> Self {
+            let (mut tbl, zs) = DIRECT_FOLD8_TLS
+                .try_with(|c| c.try_borrow_mut().map(|mut b| std::mem::take(&mut *b)).ok())
+                .ok().flatten().unwrap_or_default();
+            if tbl.len() != super::ring_switch::FOLD_TABLE_LEN { tbl = crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN); }
+            Self(tbl, zs)
+        }
+    }
+    impl Drop for DirectFold8TlsGuard {
+        fn drop(&mut self) {
+            let _ = DIRECT_FOLD8_TLS.try_with(|c| if let Ok(mut b) = c.try_borrow_mut() {
+                if self.0.capacity() >= b.0.capacity() { b.0 = std::mem::take(&mut self.0); }
+                if self.1.capacity() >= b.1.capacity() { b.1 = std::mem::take(&mut self.1); }
+            });
+        }
+    }
 
     assert!(!claims.is_empty());
     let has_ordinary = !ordinary_basis.is_empty();
@@ -8527,7 +8548,7 @@ fn materialize_direct_fold8(
     };
     // A CPU-folded block: rebuilt rows when registered (and, under the
     // P-only knob, on a main-pool worker), else read from the buffer.
-    let fold8_cpu = |st: &mut (Vec<F128>, Vec<F128>),
+    let fold8_cpu = |st: &mut DirectFold8TlsGuard,
                      block: usize,
                      b_out: &mut [F128],
                      f_out: &mut [F128]|
@@ -8615,8 +8636,8 @@ fn materialize_direct_fold8(
         let zf_setup_ms = zf_t0.elapsed().as_secs_f64() * 1e3;
         crate::epool::run_hetero_chunks_stateful(
             n_blocks,
-            || (crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN), Vec::new()),
-            |st: &mut (Vec<F128>, Vec<F128>), block| {
+            DirectFold8TlsGuard::take,
+            |st: &mut DirectFold8TlsGuard, block| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 if zf_want {
                     if !zf_launch_claimed.load(std::sync::atomic::Ordering::Relaxed)
@@ -8759,7 +8780,7 @@ fn materialize_direct_fold8(
             .zip(folded_f.par_chunks_mut(block_len))
             .enumerate()
             .map_init(
-                || (crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN), Vec::new()),
+                DirectFold8TlsGuard::take,
                 |st, (block, (b_out, f_out))| fold8_cpu(st, block, b_out, f_out),
             )
             .reduce(

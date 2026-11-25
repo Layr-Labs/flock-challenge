@@ -3662,8 +3662,24 @@ pub(crate) mod witgen_simd {
             if ab_rebuild_enabled() {
                 build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, WZ, true, true, false, false, false>(inputs, z, a, b, sa, sb)
             } else {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_fallback::<WZ, SCRATCH, PRIMED, COPY>(inputs, z, a, b, sa, sb)
             }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build_quad_split_neon_fallback<const WZ: bool, const SCRATCH: bool, const PRIMED: bool, const COPY: bool>(
+        inputs: QuadInput<'_>,
+        z: *mut u32,
+        a: *mut u32,
+        b: *mut u32,
+        sa: *mut u32,
+        sb: *mut u32,
+    ) {
+        unsafe {
+            build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false, false>(inputs, z, a, b, sa, sb)
         }
     }
 
@@ -3710,32 +3726,41 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            if PRIMED && ab_rebuild_enabled() && wide_stores_enabled() {
-                build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, true>(
-                    inputs,
-                    core::ptr::null_mut(),
-                    a,
-                    b,
-                    sa,
-                    sb,
-                )
+            if PRIMED {
+                if ab_rebuild_enabled() && wide_stores_enabled() {
+                    build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, true>(
+                        inputs, core::ptr::null_mut(), a, b, sa, sb,
+                    )
+                } else {
+                    build_quad_split_neon_mem_fallback::<true>(inputs, a, b, sa, sb)
+                }
             } else if ab_rebuild_enabled() {
+                build_quad_split_neon_impl::<false, true, false, true, true, true, true, true, false, false>(
+                    inputs, core::ptr::null_mut(), a, b, sa, sb,
+                )
+            } else {
+                build_quad_split_neon_mem_fallback::<false>(inputs, a, b, sa, sb)
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn build_quad_split_neon_mem_fallback<const PRIMED: bool>(
+        inputs: QuadInput<'_>,
+        a: *mut u32,
+        b: *mut u32,
+        sa: *mut u32,
+        sb: *mut u32,
+    ) {
+        unsafe {
+            if PRIMED && ab_rebuild_enabled() {
                 build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false, false>(
-                    inputs,
-                    core::ptr::null_mut(),
-                    a,
-                    b,
-                    sa,
-                    sb,
+                    inputs, core::ptr::null_mut(), a, b, sa, sb,
                 )
             } else {
                 build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false, false>(
-                    inputs,
-                    core::ptr::null_mut(),
-                    a,
-                    b,
-                    sa,
-                    sb,
+                    inputs, core::ptr::null_mut(), a, b, sa, sb,
                 )
             }
         }
