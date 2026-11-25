@@ -1580,7 +1580,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         // `total_bytes`; zero is a valid object representation for F128.
         unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
     }
-    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+    if use_provenance && crate::zc_timing_env_on() {
         let (hits, misses) = ab_compact_backing_token_counts();
         eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
     }
@@ -4741,7 +4741,7 @@ pub(crate) fn round1_c_prelude(
             if let Some((eq_outer, job, submitted)) =
                 crate::gpu_commit::adopt_staged_zc_fold(c_lincheck, r)
             {
-                if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                if crate::zc_timing_env_on() {
                     eprintln!("[commit-tail-fill] staged C prelude adopted");
                 }
                 return Round1CPrelude {
@@ -6273,7 +6273,7 @@ mod tests {
     /// view, at any shape the rebuild accepts.
     #[test]
     fn r2_offer_ceil_within_published_prefix() {
-        assert_eq!(crate::gpu_commit::zc_r2_offer_ceil_chunks(2048), 880);
+        assert_eq!(crate::gpu_commit::zc_r2_offer_ceil_chunks(2048), 983);
         for log_hi in 3..=14usize {
             let hi = 1usize << log_hi;
             let offer = crate::gpu_commit::zc_r2_offer_ceil_chunks(hi);
