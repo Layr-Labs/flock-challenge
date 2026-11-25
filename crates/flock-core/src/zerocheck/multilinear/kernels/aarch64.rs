@@ -35,6 +35,115 @@ unsafe fn reduce_tri_q(value: TriNeon) -> core::arch::aarch64::uint64x2_t {
     }
 }
 
+/// Unreduced Karatsuba product sum `(ll, mm, hh)` in three NEON registers
+/// (`mm = sum mid(a) * mid(b)`, `mid(u) = u.lo ^ u.hi`); `cross = mm ^ ll ^ hh`.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct KaraNeon { ll: core::arch::aarch64::uint64x2_t, mm: core::arch::aarch64::uint64x2_t, hh: core::arch::aarch64::uint64x2_t }
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn kara_zero() -> KaraNeon { let z = unsafe { core::arch::aarch64::vdupq_n_u64(0) }; KaraNeon { ll: z, mm: z, hh: z } }
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn reduce_kara_q(v: KaraNeon) -> core::arch::aarch64::uint64x2_t {
+    unsafe { reduce_tri_q(TriNeon { ll: v.ll, cross: xor3_u64(v.mm, v.ll, v.hh), hh: v.hh }) }
+}
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn reduce_kara_binius_xor_q(v: KaraNeon, extra: core::arch::aarch64::uint64x2_t) -> core::arch::aarch64::uint64x2_t {
+    unsafe { reduce_tri_binius_xor_q(v.ll, xor3_u64(v.mm, v.ll, v.hh), v.hh, extra) }
+}
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mid_pair_q(u: core::arch::aarch64::uint64x2_t, v: core::arch::aarch64::uint64x2_t) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe { veorq_u64(vuzp1q_u64(u, v), vuzp2q_u64(u, v)) }
+}
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mid_one_q(u: core::arch::aarch64::uint64x2_t) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    unsafe { veorq_u64(u, vextq_u64::<1>(u, u)) }
+}
+/// `acc += x * y` in [`KaraNeon`] form: three macro-fused `PMULL+EOR` pairs
+/// rotating through `ll -> hh -> mm` with only two scratch registers.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn kara_one_q<const SET: bool>(acc: &mut KaraNeon, x: core::arch::aarch64::uint64x2_t, y: core::arch::aarch64::uint64x2_t) {
+    use core::arch::aarch64::*;
+    unsafe {
+        #[cfg(target_feature = "sha3")]
+        if !SET {
+            core::arch::asm!(
+                "pmull {t:v}.1q, {a:v}.1d, {b:v}.1d", "eor {t:v}.16b, {t:v}.16b, {ll:v}.16b",
+                "pmull2 {ll:v}.1q, {a:v}.2d, {b:v}.2d", "eor {ll:v}.16b, {ll:v}.16b, {hh:v}.16b",
+                "ext {hh:v}.16b, {a:v}.16b, {a:v}.16b, #8", "eor {hh:v}.16b, {hh:v}.16b, {a:v}.16b",
+                "ext {p:v}.16b, {b:v}.16b, {b:v}.16b, #8", "eor {p:v}.16b, {p:v}.16b, {b:v}.16b",
+                "pmull {hh:v}.1q, {hh:v}.1d, {p:v}.1d", "eor {hh:v}.16b, {hh:v}.16b, {mm:v}.16b",
+                "mov {mm:v}.16b, {hh:v}.16b", "mov {hh:v}.16b, {ll:v}.16b", "mov {ll:v}.16b, {t:v}.16b",
+                a = in(vreg) x, b = in(vreg) y,
+                ll = inout(vreg) acc.ll, hh = inout(vreg) acc.hh, mm = inout(vreg) acc.mm,
+                t = out(vreg) _, p = out(vreg) _,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            return;
+        }
+        let ll = pmull_lane(vgetq_lane_u64::<0>(x), vgetq_lane_u64::<0>(y));
+        let hh = pmull_lane(vgetq_lane_u64::<1>(x), vgetq_lane_u64::<1>(y));
+        let (xm, ym) = (mid_one_q(x), mid_one_q(y));
+        let mm = pmull_lane(vgetq_lane_u64::<0>(xm), vgetq_lane_u64::<0>(ym));
+        if SET { *acc = KaraNeon { ll, mm, hh }; }
+        else { acc.ll = veorq_u64(acc.ll, ll); acc.mm = veorq_u64(acc.mm, mm); acc.hh = veorq_u64(acc.hh, hh); }
+    }
+}
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+unsafe fn kara_pair_q(
+    acc0: &mut KaraNeon, acc1: &mut KaraNeon,
+    x0: core::arch::aarch64::uint64x2_t, y0: core::arch::aarch64::uint64x2_t,
+    x1: core::arch::aarch64::uint64x2_t, y1: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        #[cfg(target_feature = "sha3")]
+        {
+            acc0.ll = fused_pmull_lo_acc(acc0.ll, x0, y0);
+            acc0.hh = fused_pmull_hi_acc(acc0.hh, x0, y0);
+            acc1.ll = fused_pmull_lo_acc(acc1.ll, x1, y1);
+            acc1.hh = fused_pmull_hi_acc(acc1.hh, x1, y1);
+            let (am, bm) = (mid_pair_q(x0, x1), mid_pair_q(y0, y1));
+            acc0.mm = fused_pmull_lo_acc(acc0.mm, am, bm);
+            acc1.mm = fused_pmull_hi_acc(acc1.mm, am, bm);
+            return;
+        }
+        #[cfg(not(target_feature = "sha3"))]
+        { kara_one_q::<false>(acc0, x0, y0); kara_one_q::<false>(acc1, x1, y1); }
+    }
+}
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn kara_acc8_q<const SET: bool>(
+    acc: &mut [KaraNeon; 8],
+    a0: core::arch::aarch64::uint64x2_t, a1: core::arch::aarch64::uint64x2_t,
+    a2: core::arch::aarch64::uint64x2_t, a3: core::arch::aarch64::uint64x2_t,
+    b0: core::arch::aarch64::uint64x2_t, b1: core::arch::aarch64::uint64x2_t,
+    b2: core::arch::aarch64::uint64x2_t, b3: core::arch::aarch64::uint64x2_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        kara_one_q::<SET>(&mut acc[0], a1, b1);
+        kara_one_q::<SET>(&mut acc[1], veorq_u64(a0, a1), veorq_u64(b0, b1));
+        kara_one_q::<SET>(&mut acc[2], a3, b3);
+        kara_one_q::<SET>(&mut acc[3], veorq_u64(a2, a3), veorq_u64(b2, b3));
+        kara_one_q::<SET>(&mut acc[4], a2, b2);
+        let (e_a, e_b) = (veorq_u64(a0, a2), veorq_u64(b0, b2));
+        let (o_a, o_b) = (veorq_u64(a1, a3), veorq_u64(b1, b3));
+        kara_one_q::<SET>(&mut acc[5], e_a, e_b);
+        kara_one_q::<SET>(&mut acc[6], o_a, o_b);
+        kara_one_q::<SET>(&mut acc[7], veorq_u64(e_a, o_a), veorq_u64(e_b, o_b));
+    }
+}
+
 // The SHA3 extension includes EOR3; retain the two-EOR form for generic
 // AArch64 builds that do not enable it.
 #[cfg(target_feature = "sha3")]
@@ -3121,14 +3230,14 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 // Window 0 has sixteen live groups per parity; window 1 has
                 // fourteen, then group 60 (even, `b = 14`) with its second
                 // pair padded; groups 61..64 are dead.
-                let mut p1_even = tri_zero;
-                let mut pinf_even = tri_zero;
-                let mut p1_odd = tri_zero;
-                let mut pinf_odd = tri_zero;
-                let mut w0 = tri_zero;
-                let mut w3 = tri_zero;
-                let mut w4 = tri_zero;
-                let mut w5 = tri_zero;
+                let mut p1_even = kara_zero();
+                let mut pinf_even = kara_zero();
+                let mut p1_odd = kara_zero();
+                let mut pinf_odd = kara_zero();
+                let mut w0 = kara_zero();
+                let mut w3 = kara_zero();
+                let mut w4 = kara_zero();
+                let mut w5 = kara_zero();
                 // `x^b` in both lanes, and the prepared pair of `rho x^b`.
                 let mut xb = vdupq_n_u64(1);
                 let mut pr = rho_prep;
@@ -3142,38 +3251,37 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                         let scale = $scale;
                         if !$pad1 && deg0 & deg1 & ones_is_one {
                             // b == 1 across the group: W3, W4, W5 and both
-                            // G(inf) terms vanish and every other product is
-                            // the scaled `a_i`.
-                            p1_even.ll = if $first { scale(a1) } else { veorq_u64(p1_even.ll, scale(a1)) };
-                            p1_odd.ll = if $first { scale(a3) } else { veorq_u64(p1_odd.ll, scale(a3)) };
-                            w0.ll = if $first { scale(a2) } else { veorq_u64(w0.ll, scale(a2)) };
-                        } else {
-                            let a0w = scale(a0);
-                            let a1w = scale(a1);
-                            let (a2w, a3w) = if $pad1 { (zero, zero) } else { (scale(a2), scale(a3)) };
-                            macro_rules! pacc {
-                                ($acc:expr, $x:expr, $y:expr) => {
-                                    if $first { tri_set_q($acc, $x, $y) } else { tri_acc_q($acc, $x, $y) }
-                                };
+                            // G(inf) terms vanish; adding `s` with cross=0 sets
+                            // `ll ^= s, mm ^= s` so `mm ^ ll ^ hh == 0`.
+                            let (s1, s3, s2) = (scale(a1), scale(a3), scale(a2));
+                            if $first {
+                                (p1_even.ll, p1_even.mm) = (s1, s1);
+                                (p1_odd.ll, p1_odd.mm) = (s3, s3);
+                                (w0.ll, w0.mm) = (s2, s2);
+                            } else {
+                                (p1_even.ll, p1_even.mm) = (veorq_u64(p1_even.ll, s1), veorq_u64(p1_even.mm, s1));
+                                (p1_odd.ll, p1_odd.mm) = (veorq_u64(p1_odd.ll, s3), veorq_u64(p1_odd.mm, s3));
+                                (w0.ll, w0.mm) = (veorq_u64(w0.ll, s2), veorq_u64(w0.mm, s2));
                             }
-                            pacc!(&mut p1_even, a1w, b1);
+                        } else {
+                            let (a0w, a1w) = (scale(a0), scale(a1));
+                            let (a2w, a3w) = if $pad1 { (zero, zero) } else { (scale(a2), scale(a3)) };
+                            kara_one_q::<$first>(&mut p1_even, a1w, b1);
                             if !deg0 {
-                                pacc!(&mut pinf_even, veorq_u64(a0w, a1w), veorq_u64(b0, b1));
+                                kara_one_q::<$first>(&mut pinf_even, veorq_u64(a0w, a1w), veorq_u64(b0, b1));
                             }
                             if !$pad1 {
-                                pacc!(&mut p1_odd, a3w, b3);
+                                kara_one_q::<$first>(&mut p1_odd, a3w, b3);
                                 if !deg1 {
-                                    pacc!(&mut pinf_odd, veorq_u64(a2w, a3w), veorq_u64(b2, b3));
+                                    kara_one_q::<$first>(&mut pinf_odd, veorq_u64(a2w, a3w), veorq_u64(b2, b3));
                                 }
-                                pacc!(&mut w0, a2w, b2);
+                                kara_one_q::<$first>(&mut w0, a2w, b2);
                             }
-                            let e_aw = veorq_u64(a0w, a2w);
-                            let o_aw = veorq_u64(a1w, a3w);
-                            let e_b = veorq_u64(b0, b2);
-                            let o_b = veorq_u64(b1, b3);
-                            pacc!(&mut w3, e_aw, e_b);
-                            pacc!(&mut w4, o_aw, o_b);
-                            pacc!(&mut w5, veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                            let (e_aw, e_b) = (veorq_u64(a0w, a2w), veorq_u64(b0, b2));
+                            let (o_aw, o_b) = (veorq_u64(a1w, a3w), veorq_u64(b1, b3));
+                            kara_one_q::<$first>(&mut w3, e_aw, e_b);
+                            kara_one_q::<$first>(&mut w4, o_aw, o_b);
+                            kara_one_q::<$first>(&mut w5, veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
                         }
                     }};
                 }
@@ -3287,7 +3395,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                     .iter_mut()
                     .zip([p1_even, pinf_even, p1_odd, pinf_odd, w0, w3, w4, w5])
                 {
-                    let v = reduce_tri_binius_xor_q(acc.ll, acc.cross, acc.hh, zero);
+                    let v = reduce_kara_binius_xor_q(acc, zero);
                     tri_acc_sw(sum, lambda, lambda_sw, v);
                 }
             }
@@ -5844,8 +5952,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         let (rho2_p0, rho2_p1) = crate::field::gf2_128::aarch64::const_prep(rho2_q);
         let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
         // Slots: p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5'.
-        let mut acc = LookaheadTriAcc::zero();
-        let mut wacc = LookaheadTriAcc::zero();
+        let mut acc = [kara_zero(); 8];
+        let mut wacc = [kara_zero(); 8];
         let mut sums = LookaheadTriAcc::zero();
         let mut xb_q = vdupq_n_u64(1);
         let mut win_first = 0usize;
@@ -5855,8 +5963,8 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
             ($wf:expr) => {{
                 let lambda = vld1q_u64(eq_prep.add(2 * ($wf) + 1).cast::<u64>());
                 let lambda_sw = swap_halves_q(lambda);
-                for (sum, w) in sums.0.iter_mut().zip(wacc.0.iter()) {
-                    let v = reduce_tri_binius_xor_q(w.ll, w.cross, w.hh, zero);
+                for (sum, &w) in sums.0.iter_mut().zip(wacc.iter()) {
+                    let v = reduce_kara_binius_xor_q(w, zero);
                     tri_acc_sw(sum, lambda, lambda_sw, v);
                 }
                 xb_q = vdupq_n_u64(1);
@@ -5868,7 +5976,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 in_window += 1;
                 if in_window == 8 {
                     k_xb_flush!(win_first);
-                    wacc = LookaheadTriAcc::zero();
+                    wacc = [kara_zero(); 8];
                     in_window = 0;
                     win_first += 8;
                 }
@@ -5959,14 +6067,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
             ($t:expr, $o:expr) => {
                 k_group!(@ $t, $o, false, ($t) == bt0, false, true)
             };
-            (@ $t:expr, $o:expr, $fused:literal, $is_bt0:expr, $first:literal, $step_flush:literal) => {{
-                macro_rules! kacc {
-                    ($acc:expr, $x:expr, $y:expr) => {
-                        if XB && $first { tri_set_q($acc, $x, $y) }
-                        else if $fused { tri_acc_q($acc, $x, $y) }
-                        else { tri_acc_q_crossfused($acc, $x, $y) }
-                    };
-                }
+            (@ $t:expr, $o:expr, $_fused:literal, $is_bt0:expr, $first:literal, $step_flush:literal) => {{
                 let t = $t;
                 let is_bt0 = $is_bt0;
                 let is_head = head_compact && is_bt0;
@@ -6001,7 +6102,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 } else {
                     store_pair_nt_off::<32>(bo, b2, b3);
                 }
-                let acc = if XB { &mut wacc.0 } else { &mut acc.0 };
+                let acc = if XB { &mut wacc } else { &mut acc };
                 if b_flat
                     && is_zero_q(vorrq_u64(
                         vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
@@ -6009,20 +6110,22 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     ))
                 {
                     if XB && $first {
-                        *acc = LookaheadTriAcc::zero().0;
-                        (acc[0].ll, acc[2].ll, acc[4].ll) = (a1, a3, a2);
+                        *acc = [kara_zero(); 8];
+                        (acc[0].ll, acc[0].mm) = (a1, a1);
+                        (acc[2].ll, acc[2].mm) = (a3, a3);
+                        (acc[4].ll, acc[4].mm) = (a2, a2);
                     } else if XB {
-                        acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb_q, k87));
-                        acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb_q, k87));
-                        acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb_q, k87));
+                        let (s1, s3, s2) = (mul_xb_q(a1, xb_q, k87), mul_xb_q(a3, xb_q, k87), mul_xb_q(a2, xb_q, k87));
+                        (acc[0].ll, acc[0].mm) = (veorq_u64(acc[0].ll, s1), veorq_u64(acc[0].mm, s1));
+                        (acc[2].ll, acc[2].mm) = (veorq_u64(acc[2].ll, s3), veorq_u64(acc[2].mm, s3));
+                        (acc[4].ll, acc[4].mm) = (veorq_u64(acc[4].ll, s2), veorq_u64(acc[4].mm, s2));
                     } else {
                         // `w` = (p0.lo, p1.lo).
                         let wp = eq_prep.add(2 * t).cast::<u64>();
-                        let (w_p0, w_p1) = (vld1q_u64(wp), vld1q_u64(wp.add(2)));
-                        let w = vzip1q_u64(w_p0, w_p1);
-                        kacc!(&mut acc[0], w, a1);
-                        kacc!(&mut acc[2], w, a3);
-                        kacc!(&mut acc[4], w, a2);
+                        let w = vzip1q_u64(vld1q_u64(wp), vld1q_u64(wp.add(2)));
+                        kara_one_q::<false>(&mut acc[0], w, a1);
+                        kara_one_q::<false>(&mut acc[2], w, a3);
+                        kara_one_q::<false>(&mut acc[4], w, a2);
                     }
                 } else {
                     let (a0, a1, a2, a3) = if XB && $first {
@@ -6044,16 +6147,11 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                             mul_prep86_q(w_p0, w_p1, a3, k86),
                         )
                     };
-                    kacc!(&mut acc[0], a1, b1);
-                    kacc!(&mut acc[1], veorq_u64(a0, a1), veorq_u64(b0, b1));
-                    kacc!(&mut acc[2], a3, b3);
-                    kacc!(&mut acc[3], veorq_u64(a2, a3), veorq_u64(b2, b3));
-                    kacc!(&mut acc[4], a2, b2);
-                    let (e_aw, e_b) = (veorq_u64(a0, a2), veorq_u64(b0, b2));
-                    let (o_aw, o_b) = (veorq_u64(a1, a3), veorq_u64(b1, b3));
-                    kacc!(&mut acc[5], e_aw, e_b);
-                    kacc!(&mut acc[6], o_aw, o_b);
-                    kacc!(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                    if XB && $first {
+                        kara_acc8_q::<true>(acc, a0, a1, a2, a3, b0, b1, b2, b3);
+                    } else {
+                        kara_acc8_q::<false>(acc, a0, a1, a2, a3, b0, b1, b2, b3);
+                    }
                 }
                 if XB {
                     if $step_flush { k_xb_step!(); }
@@ -6158,18 +6256,21 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     let wp = eq_prep.add(2 * t).cast::<u64>();
                     mul_prep86_q(vld1q_u64(wp), vld1q_u64(wp.add(2)), av0, k86)
                 };
-                let (ll, cross, hh) = clmul_products_q(a0w, bv0);
-                let slots = if XB { &mut wacc.0 } else { &mut acc.0 };
+                let (am, bm) = (mid_one_q(a0w), mid_one_q(bv0));
+                let ll = pmull_lane(vgetq_lane_u64::<0>(a0w), vgetq_lane_u64::<0>(bv0));
+                let hh = pmull_lane(vgetq_lane_u64::<1>(a0w), vgetq_lane_u64::<1>(bv0));
+                let mm = pmull_lane(vgetq_lane_u64::<0>(am), vgetq_lane_u64::<0>(bm));
+                let slots = if XB { &mut wacc } else { &mut acc };
                 for slot in [1usize, 5, 7] {
                     let t = &mut slots[slot];
                     t.ll = veorq_u64(t.ll, ll);
-                    t.cross = veorq_u64(t.cross, cross);
+                    t.mm = veorq_u64(t.mm, mm);
                     t.hh = veorq_u64(t.hh, hh);
                 }
                 if XB {
                     k_xb_flush!(t0 + 8);
                     if !allfused {
-                        wacc = LookaheadTriAcc::zero();
+                        wacc = [kara_zero(); 8];
                         in_window = 0;
                         win_first += 8;
                     }
@@ -6193,7 +6294,11 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
             }
         }
 
-        let reduced = if XB { sums.reduce() } else { acc.reduce() };
+        let reduced = if XB {
+            sums.reduce()
+        } else {
+            acc.map(|k| core::mem::transmute::<uint64x2_t, F128>(reduce_kara_q(k)))
+        };
         for (k, v) in reduced.into_iter().enumerate() {
             *out.add(k) = v;
         }
@@ -8058,11 +8163,7 @@ fn fold_tri_and_message_core_with<
         } else {
             (zero, zero)
         };
-        let mut acc = [TriNeon {
-            ll: zero,
-            cross: zero,
-            hh: zero,
-        }; TRI_SLOTS];
+        let mut acc = [kara_zero(); TRI_SLOTS];
         let mut sink = zero;
         let a_ip = a_in.as_ptr();
         let b_ip = b_in.as_ptr();
@@ -8343,8 +8444,8 @@ fn fold_tri_and_message_core_with<
                 for t in 0..gn {
                     let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
                     for j in 0..4 {
-                        tri_acc_q(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
-                        tri_acc_q(
+                        kara_one_q::<false>(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
+                        kara_one_q::<false>(
                             &mut e[4 + j],
                             veorq_u64(aw[2 * j], aw[2 * j + 1]),
                             veorq_u64(b[2 * j], b[2 * j + 1]),
@@ -8361,13 +8462,13 @@ fn fold_tri_and_message_core_with<
                     let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
                     for k in 0..2 {
                         let o = 4 * k;
-                        tri_acc_q(&mut l[k], aw[o + 2], b[o + 2]);
+                        kara_one_q::<false>(&mut l[k], aw[o + 2], b[o + 2]);
                         let (ea, eb) = (veorq_u64(aw[o], aw[o + 2]), veorq_u64(b[o], b[o + 2]));
                         let (oa, ob) =
                             (veorq_u64(aw[o + 1], aw[o + 3]), veorq_u64(b[o + 1], b[o + 3]));
-                        tri_acc_q(&mut l[2 + k], ea, eb);
-                        tri_acc_q(&mut l[4 + k], oa, ob);
-                        tri_acc_q(&mut l[6 + k], veorq_u64(ea, oa), veorq_u64(eb, ob));
+                        kara_one_q::<false>(&mut l[2 + k], ea, eb);
+                        kara_one_q::<false>(&mut l[4 + k], oa, ob);
+                        kara_one_q::<false>(&mut l[6 + k], veorq_u64(ea, oa), veorq_u64(eb, ob));
                     }
                 }
                 acc[8..16].copy_from_slice(&l);
@@ -8376,17 +8477,17 @@ fn fold_tri_and_message_core_with<
                 let mut g = [acc[16], acc[17], acc[18], acc[20], acc[21]];
                 for t in 0..gn {
                     let (aw, b) = (ta[t].assume_init_mut(), tb[t].assume_init_mut());
-                    tri_acc_q(&mut g[0], aw[4], b[4]);
-                    let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
+                    let [g0, g1, g2, g3, g4] = &mut g;
+                    let (a4, b4) = (aw[4], b[4]);
+                    kara_one_q::<false>(g0, a4, b4);
+                    let (s0a, s0b) = (veorq_u64(aw[0], a4), veorq_u64(b[0], b4));
                     let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
                     let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
                     let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
                     aw[..4].copy_from_slice(&[s0a, s1a, s2a, s3a]);
                     b[..4].copy_from_slice(&[s0b, s1b, s2b, s3b]);
-                    tri_acc_q(&mut g[1], s0a, s0b);
-                    tri_acc_q(&mut g[2], s2a, s2b);
-                    tri_acc_q(&mut g[3], s1a, s1b);
-                    tri_acc_q(&mut g[4], s3a, s3b);
+                    kara_pair_q(g1, g2, s0a, s0b, s2a, s2b);
+                    kara_pair_q(g3, g4, s1a, s1b, s3a, s3b);
                 }
                 acc[16] = g[0];
                 acc[17] = g[1];
@@ -8398,17 +8499,14 @@ fn fold_tri_and_message_core_with<
                 let mut g = [acc[19], acc[22], acc[23], acc[24], acc[25]];
                 for t in 0..gn {
                     let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
+                    let [g0, g1, g2, g3, g4] = &mut g;
                     let (s0a, s1a, s2a, s3a) = (aw[0], aw[1], aw[2], aw[3]);
                     let (s0b, s1b, s2b, s3b) = (b[0], b[1], b[2], b[3]);
-                    let (s02a, s02b) = (veorq_u64(s0a, s2a), veorq_u64(s0b, s2b));
-                    let (s13a, s13b) = (veorq_u64(s1a, s3a), veorq_u64(s1b, s3b));
+                    kara_pair_q(g0, g1, veorq_u64(s0a, s2a), veorq_u64(s0b, s2b), veorq_u64(s1a, s3a), veorq_u64(s1b, s3b));
                     let (s01a, s01b) = (veorq_u64(s0a, s1a), veorq_u64(s0b, s1b));
                     let (s23a, s23b) = (veorq_u64(s2a, s3a), veorq_u64(s2b, s3b));
-                    tri_acc_q(&mut g[0], s02a, s02b);
-                    tri_acc_q(&mut g[1], s13a, s13b);
-                    tri_acc_q(&mut g[2], s01a, s01b);
-                    tri_acc_q(&mut g[3], s23a, s23b);
-                    tri_acc_q(&mut g[4], veorq_u64(s01a, s23a), veorq_u64(s01b, s23b));
+                    kara_pair_q(g2, g3, s01a, s01b, s23a, s23b);
+                    kara_one_q::<false>(g4, veorq_u64(s01a, s23a), veorq_u64(s01b, s23b));
                 }
                 acc[19] = g[0];
                 acc[22] = g[1];
@@ -8420,7 +8518,7 @@ fn fold_tri_and_message_core_with<
         if ABL != 0 {
             core::hint::black_box(sink);
         }
-        acc.map(|t| core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(t)))
+        acc.map(|t| core::mem::transmute::<uint64x2_t, F128>(reduce_kara_q(t)))
     }
 }
 
