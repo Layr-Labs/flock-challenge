@@ -1509,7 +1509,7 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
             // Every slot in `out` is written before any read.
-            let mut out = crate::alloc_uninit_f128_vec(half);
+            let mut out = crate::scratch::take_fold8_f128(half);
             crate::field::f128_slice::fold_half_into(z0, z1, &mut out, r);
             return out;
         }
@@ -2802,6 +2802,7 @@ pub enum RsEqInd {
         len: usize,
         entries: Vec<(usize, F128)>,
     },
+    Elided { len: usize },
 }
 
 /// Whether a caller-proved dead deferred basis may skip its factor build.
@@ -2835,6 +2836,7 @@ impl RsEqInd {
             Self::Dense(v) => v.len(),
             Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
             Self::Sparse { len, .. } => *len,
+            Self::Elided { len } => *len,
         }
     }
 
@@ -2867,6 +2869,7 @@ impl RsEqInd {
                     out[idx] += gamma * val;
                 }
             }
+            Self::Elided { .. } => unreachable!("elided rs_eq_ind cannot be accumulated"),
         }
     }
 
@@ -2892,6 +2895,7 @@ impl RsEqInd {
                 }
                 out
             }
+            Self::Elided { .. } => unreachable!("elided rs_eq_ind cannot be materialized"),
         }
     }
 
@@ -2908,6 +2912,7 @@ impl RsEqInd {
                 }
                 out
             }
+            Self::Elided { .. } => unreachable!("elided rs_eq_ind cannot be materialized"),
         }
     }
 }
@@ -3716,23 +3721,11 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
                             // `build_eq_split`), and field elements have a unique
                             // bit representation.
                             let suffix = dense_suffixes[d];
-                            let n_lo = deferred_split_n_lo(suffix.len());
-                            let (eq_lo, eq_hi) = if elide_basis {
-                                // Only the logical length is observed on the
-                                // direct-fold8 route.  Preserve it exactly
-                                // without evaluating or zero-filling either
-                                // dead tensor factor.
-                                (
-                                    crate::alloc_uninit_f128_vec(1usize << n_lo),
-                                    crate::alloc_uninit_f128_vec(1usize << (suffix.len() - n_lo)),
-                                )
+                            if elide_basis {
+                                RsEqInd::Elided { len: 1usize << suffix.len() }
                             } else {
-                                build_eq_split(suffix, n_lo)
-                            };
-                            RsEqInd::DeferredDense {
-                                eq_lo,
-                                eq_hi,
-                                table,
+                                let (eq_lo, eq_hi) = build_eq_split(suffix, deferred_split_n_lo(suffix.len()));
+                                RsEqInd::DeferredDense { eq_lo, eq_hi, table }
                             }
                         } else {
                             RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
@@ -5186,28 +5179,7 @@ mod tests {
                 control[claim].1.rs_eq_ind.len()
             );
 
-            let (control_lo, control_hi, control_table) = match &control[claim].1.rs_eq_ind {
-                RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => (eq_lo, eq_hi, table),
-                _ => panic!("control claim must be deferred dense"),
-            };
-            let (candidate_lo, candidate_hi, candidate_table) = match &candidate[claim].1.rs_eq_ind
-            {
-                RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => (eq_lo, eq_hi, table),
-                _ => panic!("candidate claim must be deferred dense"),
-            };
-            assert_eq!(candidate_lo.len(), control_lo.len());
-            assert_eq!(candidate_hi.len(), control_hi.len());
-            assert!(candidate_lo.iter().all(|&value| value == F128::ZERO));
-            assert!(candidate_hi.iter().all(|&value| value == F128::ZERO));
-            assert_eq!(candidate_table, control_table);
+            assert!(matches!(candidate[claim].1.rs_eq_ind, RsEqInd::Elided { len } if len == control[claim].1.rs_eq_ind.len()));
 
             let control_direct = control[claim]
                 .1

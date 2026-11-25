@@ -284,6 +284,7 @@ struct PreEncodedPrefix {
 static PRE_ENCODED: Mutex<Option<PreEncodedPrefix>> = Mutex::new(None);
 static STASH_SCRATCH: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 static GATHER_ARENA_SCRATCH: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+static GATHER_SEGS_SCRATCH: Mutex<Option<Vec<GatherSeg<'static>>>> = Mutex::new(None);
 
 fn alloc_prefaulted_bytes(cap: usize) -> Vec<u8> {
     let mut v = vec![0u8; cap];
@@ -321,6 +322,23 @@ fn take_gather_arena_scratch(cap: usize) -> Vec<u8> {
         }
     }
     alloc_prefaulted_bytes(cap)
+}
+
+fn take_gather_segs_scratch<'a>(cap: usize) -> Vec<GatherSeg<'a>> {
+    if let Ok(mut guard) = GATHER_SEGS_SCRATCH.lock() && let Some(mut v) = guard.take() {
+        v.clear();
+        if v.capacity() < cap { v.reserve(cap - v.capacity()); }
+        let mut v = std::mem::ManuallyDrop::new(v);
+        return unsafe { Vec::from_raw_parts(v.as_mut_ptr().cast(), 0, v.capacity()) };
+    }
+    Vec::with_capacity(cap)
+}
+fn give_gather_segs_scratch(mut v: Vec<GatherSeg<'_>>) {
+    if v.capacity() < 4096 { return; }
+    v.clear();
+    let mut v = std::mem::ManuallyDrop::new(v);
+    let v: Vec<GatherSeg<'static>> = unsafe { Vec::from_raw_parts(v.as_mut_ptr().cast(), 0, v.capacity()) };
+    if let Ok(mut guard) = GATHER_SEGS_SCRATCH.lock() { *guard = Some(v); }
 }
 
 /// `FLOCK_NO_PRE_ENCODE=1` (exact string, matching the tree's kill-switch
@@ -719,6 +737,10 @@ enum GatherSeg<'a> {
     Ext(&'a [u8]),
 }
 
+impl Drop for GatherBundle<'_> {
+    fn drop(&mut self) { give_gather_segs_scratch(std::mem::take(&mut self.segs)); }
+}
+
 impl<'a> GatherBundle<'a> {
     fn u64(&mut self, v: u64) {
         let start = self.arena.len();
@@ -869,7 +891,7 @@ pub(crate) fn r1cs_parts_gather<'a>(
     let mut g = GatherBundle {
         prefix,
         arena: take_gather_arena_scratch(64 * 1024),
-        segs: Vec::with_capacity(4096),
+        segs: take_gather_segs_scratch(4096),
     };
     let BatchOpeningProofLigerito {
         ring_switches,
@@ -938,16 +960,13 @@ pub(crate) fn warm_gather_publish(
     commitment: &Commitment,
     proof: &flock_core::proof::R1csProofLigerito,
 ) {
-    if let Some(g) = r1cs_parts_gather(commitment, proof) {
+    if let Some(mut g) = r1cs_parts_gather(commitment, proof) {
         let slices = g.io_slices();
         std::hint::black_box((slices.len(), g.len()));
         drop(slices);
-        let GatherBundle {
-            mut prefix,
-            mut arena,
-            segs,
-        } = g;
-        drop(segs);
+        let mut prefix = std::mem::take(&mut g.prefix);
+        let mut arena = std::mem::take(&mut g.arena);
+        drop(g);
         prefix.clear();
         arena.clear();
         if let Ok(mut slot) = STASH_SCRATCH.lock() {
@@ -957,6 +976,7 @@ pub(crate) fn warm_gather_publish(
             *slot = Some(arena);
         }
     } else {
+        give_gather_segs_scratch(take_gather_segs_scratch(4096));
         let mut arena = take_gather_arena_scratch(64 * 1024);
         arena.clear();
         if let Ok(mut slot) = GATHER_ARENA_SCRATCH.lock() {
