@@ -75,7 +75,7 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some())
 }
 
 /// Test-only forced-off latch for the second-level cascade (rounds 5+6),

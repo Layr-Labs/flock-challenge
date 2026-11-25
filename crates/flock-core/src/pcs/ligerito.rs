@@ -2134,9 +2134,9 @@ fn ranked_dense_final_direct_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_dense_final_direct_disabled_value(
+        crate::env_once_sweep!(ranked_dense_final_direct_disabled_value(
             std::env::var_os(ENV_NO_LIG_DENSE_FINAL_DIRECT).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2204,9 +2204,9 @@ fn ranked_dense_low_domain_trunc_enabled(use_dense_final_direct: bool) -> bool {
 
     ranked_dense_low_domain_trunc_policy_selected(
         use_dense_final_direct,
-        ranked_dense_low_domain_trunc_disabled_value(
+        crate::env_once_sweep!(ranked_dense_low_domain_trunc_disabled_value(
             std::env::var_os(ENV_NO_LIG_DENSE_LOW_DOMAIN_TRUNC).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2298,9 +2298,9 @@ fn ranked_l2_pruned_sparse_ntt_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_pruned_sparse_ntt_disabled_value(
+        crate::env_once_sweep!(ranked_l2_pruned_sparse_ntt_disabled_value(
             std::env::var_os(ENV_NO_LIG_L2_PRUNED_SPARSE_NTT).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2416,9 +2416,9 @@ fn ranked_l2_fused_densify_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_fused_densify_disabled_value(
+        crate::env_once_sweep!(ranked_l2_fused_densify_disabled_value(
             std::env::var_os(ENV_NO_LIG_L2_FUSED_DENSIFY).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2507,9 +2507,9 @@ fn ranked_l2_fused_final5_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_fused_final5_disabled_value(
+        crate::env_once_sweep!(ranked_l2_fused_final5_disabled_value(
             std::env::var_os(ENV_NO_LIG_L2_FUSED_FINAL5).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2596,9 +2596,9 @@ fn ranked_l2_factored_final5_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_factored_final5_disabled_value(
+        crate::env_once_sweep!(ranked_l2_factored_final5_disabled_value(
             std::env::var_os(ENV_NO_LIG_L2_FACTORED_FINAL5).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -3112,7 +3112,7 @@ fn transpose_forward_ntt_fused_3layer(
     // Read once per group, not per product; an in-process diagnostic can ablate
     // this fold without changing the transpose schedule or prepared twiddles.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
-    let pmull_fold = std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none();
+    let pmull_fold = crate::env_once_sweep!(std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none());
 
     type Twiddle = Fused3Twiddle;
 
@@ -3667,7 +3667,7 @@ fn use_ranked_induce_truncated_final_ntt(
             n_queries,
             alpha_len,
         )
-        && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none()
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none())
 }
 
 /// Enable the fused final-transpose/ordinary-message pass only at the exact
@@ -5895,6 +5895,22 @@ pub(crate) fn ligero_commit(
 }
 
 /// Shared dispatch of [`ligero_commit`] / [`ligero_commit_with_tree_view`].
+/// The per-level `FLOCK_NO_RECURSIVE_FROM_MESSAGE_L{1,2}` term of
+/// [`ligero_commit_select`] (one commit per recursive level), kept once per
+/// process by name (`FLOCK_NO_ENV_ONCE_SWEEP` restores the per-call lookup).
+#[inline]
+fn recursive_from_message_level_clear(name: &str) -> bool {
+    match name {
+        "FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1" => crate::env_once_sweep!(
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1").is_none()
+        ),
+        "FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2" => crate::env_once_sweep!(
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2").is_none()
+        ),
+        _ => std::env::var_os(name).is_none(),
+    }
+}
+
 fn ligero_commit_select(
     poly: &[F128],
     log_msg_cols: usize,
@@ -5910,7 +5926,7 @@ fn ligero_commit_select(
         _ => None,
     };
     let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
-    let level_enabled = level_opt_out.is_some_and(|name| std::env::var_os(name).is_none());
+    let level_enabled = level_opt_out.is_some_and(recursive_from_message_level_clear);
     let fuse_from_message = cfg!(all(
         target_os = "macos",
         target_arch = "aarch64",
