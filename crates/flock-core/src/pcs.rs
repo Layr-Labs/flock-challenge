@@ -782,7 +782,7 @@ fn open_trace_env() -> bool {
         });
         return *ON;
     }
-    std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+    crate::env_once_sweep!(std::env::var("PCS_TRACE").is_ok()) || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
 }
 
 /// The environment term of [`use_ranked_hetero_open_combine`], kept the same
@@ -807,7 +807,7 @@ fn open_mat_hetero_env_on() -> bool {
         });
         return *ON;
     }
-    !std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1")
+    !crate::env_once_sweep!(std::env::var("FLOCK_NO_OPEN_MAT_HETERO").is_ok_and(|v| v == "1"))
 }
 
 /// The `FLOCK_NO_OPEN_DIRECT_AB` term of the opening's basis-elision and
