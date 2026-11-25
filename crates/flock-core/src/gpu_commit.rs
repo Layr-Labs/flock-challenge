@@ -1286,7 +1286,7 @@ pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
 
 /// The 5+6 arm's default share, in 5+6 chunks (of 512), when
 /// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
-pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 160;
+pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 200;
 
 /// Kill switch for the 5+6 arm's late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1`:
 /// the record's join, where the CPU queue, having folded the chunks after the
@@ -21863,7 +21863,7 @@ kernel void zc_eq_rows(
         }
         let share = (n_claims as f64 / (1.0 + ratio)).round();
         let cap = if factored_b4 {
-            n_claims * 3 / 4
+            n_claims * 7 / 8
         } else {
             n_claims * 5 / 8
         };
@@ -21892,7 +21892,7 @@ kernel void zc_eq_rows(
         if g == 0 {
             return 0;
         }
-        let cap = if factored_b4 { n_claims * 3 / 4 } else { n_claims * 5 / 8 };
+        let cap = if factored_b4 { n_claims * 7 / 8 } else { n_claims * 5 / 8 };
         (g + *BIAS).min(cap.max(g))
     }
 
@@ -26588,6 +26588,20 @@ kernel void zc_r2_horner_oracle(
             // gated off mid-process) must complete before its buffers are
             // rewritten below.
             zc_r2_drain_prefetch(gpu, &mut state);
+            // Once both witness buffers are already wrapped and wired in
+            // `state.wraps` (every timed prove after warmup), skip the
+            // redundant eq upload and throwaway primer dispatch so round-two
+            // entry never stalls on `prefetch_cb`.
+            let a_key = (a_packed.as_ptr() as usize, a_packed.len());
+            let b_key = (b_packed.as_ptr() as usize, b_packed.len());
+            let wraps_warm = state.wraps.iter().any(|&(p, l, _)| (p, l) == a_key)
+                && state.wraps.iter().any(|&(p, l, _)| (p, l) == b_key);
+            if wraps_warm {
+                if super::gpu_zc_r2_debug() {
+                    eprintln!("[zc-idle-fill] wraps warm, skipped dummy primer");
+                }
+                return;
+            }
             let ok = (|| -> Result<(), String> {
                 zc_r2_upload_eq_lo(gpu, &mut state, eq_lo, horner)?;
                 let need_hi = hi_size * 16;
@@ -34323,11 +34337,12 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         // Fast GPU: actual factored-PSO selection widens only the cap. The
         // ratio math is unchanged (round(64 / 1.1) = 58 before clamping).
         assert_eq!(lincheck_gate_share_balanced(0.1, 64, false), 40);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 48);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 64, true), 56);
         // At an observed factored ratio the natural share, not the cap,
         // remains authoritative.
         assert_eq!(lincheck_gate_share_balanced(0.33, 64, false), 40);
         assert_eq!(lincheck_gate_share_balanced(0.33, 64, true), 48);
+        assert_eq!(lincheck_gate_share_balanced(0.25, 64, true), 51);
         assert_eq!(lincheck_gate_share_balanced(0.5, 64, false), 40);
         assert_eq!(lincheck_gate_share_balanced(0.5, 64, true), 43);
         // Unusable samples disable rather than guess.
@@ -34344,7 +34359,7 @@ DEF_PROBE(probe_g4_t8_p0,    8u,  0u,   tsel & 7u)
         assert_eq!(lincheck_gate_share_balanced(1.0, 16, true), 8);
         // Fallback retains the old proportional ceiling on small shapes too.
         assert_eq!(lincheck_gate_share_balanced(0.1, 16, false), 10);
-        assert_eq!(lincheck_gate_share_balanced(0.1, 16, true), 12);
+        assert_eq!(lincheck_gate_share_balanced(0.1, 16, true), 14);
         // The legacy policy is preserved exactly for causal comparison.
         assert_eq!(lincheck_gate_share_legacy(1.0, 64), 28);
         assert_eq!(lincheck_gate_share_legacy(1.52, 64), 22);

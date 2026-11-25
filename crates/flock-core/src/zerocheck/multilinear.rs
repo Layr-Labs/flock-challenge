@@ -5311,50 +5311,48 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                     partials_base.ptr().add(x_hi).write(std::mem::MaybeUninit::new(outv));
                 }
             };
-            // The record's launch and queue: the GPU's share first, the CPU
-            // folds the chunks after it in ascending order.
+            // Single-queue drain + late-GPU steal: workers drain the fixed
+            // `cpu_base..hi_size` suffix first, then main-pool workers
+            // immediately roll into stealing `0..cpu_base` downward without
+            // a mid-pass barrier or second broadcast.
             let job = crate::gpu_commit::launch_zc_t56_loop(pa, pb, share, rhos[0], rhos[1], eq_lo);
-            let cpu_base = job.as_ref().map_or(0, |j| j.chunks());
-            crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| fold(cpu_base + i));
             if let Some(job) = job {
-                let mut lo = cpu_base;
-                let mut gpu_done = job.done();
-                if !gpu_done {
-                    // The GPU is late: steal from the top of its share.
-                    let claims = std::sync::Mutex::new((cpu_base, false));
-                    crate::epool::run_hetero_chunks(cpu_base, |_| {
-                        let x_hi = {
-                            let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
-                            if g.1 || g.0 == 0 {
-                                return;
+                let cpu_base = job.chunks();
+                let claims = std::sync::Mutex::new((cpu_base, false));
+                let fixed = |i: usize| fold(cpu_base + i);
+                let steal = || loop {
+                    let x_hi = {
+                        let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.1 || g.0 == 0 {
+                            return;
+                        }
+                        if job.done() {
+                            g.1 = true;
+                            return;
+                        }
+                        // Test builds only (see `t56_loop_hold`, the
+                        // constant 0 otherwise): do not steal below
+                        // chunk `n`; wait for the GPU instead, so a slow
+                        // GPU still keeps `min(n, share)` chunks and
+                        // that path can be checked.
+                        if g.0 <= t56_loop_hold() {
+                            while !job.done() {
+                                std::hint::spin_loop();
                             }
-                            if job.done() {
-                                g.1 = true;
-                                return;
-                            }
-                            // Test builds only (see `t56_loop_hold`, the
-                            // constant 0 otherwise): do not steal below
-                            // chunk `n`; wait for the GPU instead, so a slow
-                            // GPU still keeps `min(n, share)` chunks and
-                            // that path can be checked.
-                            if g.0 <= t56_loop_hold() {
-                                while !job.done() {
-                                    std::hint::spin_loop();
-                                }
-                                g.1 = true;
-                                return;
-                            }
-                            job.set_cut(g.0 - 1);
-                            g.0 -= 1;
-                            g.0
-                        };
-                        fold(x_hi);
-                    });
-                    (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
-                    // Without the completion seen, the CPU folded every
-                    // chunk and nothing of the GPU's is read.
-                    assert!(gpu_done || lo == 0, "5+6 steal ended early");
-                }
+                            g.1 = true;
+                            return;
+                        }
+                        job.set_cut(g.0 - 1);
+                        g.0 -= 1;
+                        g.0
+                    };
+                    fold(x_hi);
+                };
+                crate::epool::run_hetero_chunks_then(hi_size - cpu_base, &fixed, &steal);
+                let (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+                // Without the completion seen, the CPU folded every
+                // chunk and nothing of the GPU's is read.
+                assert!(gpu_done || lo == 0, "5+6 steal ended early");
                 // A buffer that signalled and still reports an error is not
                 // trusted (the record's join checks the status too): the CPU
                 // folds what it had left to the GPU; `finish` turns the arm
@@ -5394,6 +5392,8 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
                     gpu_prefix = Some(KGpuPrefix { a, b, len_a: taken * chunk_out, len_b: taken * chunk_out });
                 }
                 job.finish(taken, hi_size);
+            } else {
+                crate::epool::run_hetero_chunks(hi_size, &fold);
             }
             return {
                 // SAFETY: the joined CPU suffix/steals and the copied GPU
