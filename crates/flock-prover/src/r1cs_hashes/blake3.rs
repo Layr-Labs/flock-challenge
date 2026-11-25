@@ -2557,28 +2557,41 @@ pub(crate) mod witgen_simd {
         stage: *mut V4, // 512 block-lane words for this buffer's quad
         paired: bool,
         even: V4,
+        direct_z: bool,
+        dst: *mut u32,
+        qz: [V4; 3],
     }
 
     impl W32 {
         #[inline(always)]
         fn at(stage: *mut V4, pending: V4) -> Self {
-            Self::at_paired(stage, pending, false)
+            Self::at_paired(stage, core::ptr::null_mut(), pending, false, false)
         }
 
         #[inline(always)]
-        fn at_paired(stage: *mut V4, pending: V4, paired: bool) -> Self {
-            Self {
-                pending,
-                stage,
-                paired,
-                even: unsafe { vdupq_n_u32(0) },
-            }
+        fn at_paired(stage: *mut V4, dst: *mut u32, pending: V4, paired: bool, direct_z: bool) -> Self {
+            let zero = unsafe { vdupq_n_u32(0) };
+            Self { pending, stage, paired, even: zero, direct_z, dst, qz: [zero; 3] }
         }
 
         #[inline(always)]
         unsafe fn emit<const WORD: usize>(&mut self, v: V4) {
             unsafe {
-                if self.paired {
+                if self.direct_z {
+                    if WORD < 480 {
+                        if WORD % 4 < 3 {
+                            self.qz[WORD % 4] = v;
+                        } else {
+                            store_group_rows::<WORD>(self.dst, self.qz[0], self.qz[1], self.qz[2], v);
+                        }
+                    } else if WORD == 480 {
+                        self.qz[0] = v;
+                    } else {
+                        debug_assert_eq!(WORD, LAST_WORD);
+                        let z0 = vdupq_n_u32(0);
+                        store_group_rows::<480>(self.dst, self.qz[0], v, z0, z0);
+                    }
+                } else if self.paired {
                     if WORD % 2 == 0 {
                         self.even = v;
                     } else {
@@ -3425,6 +3438,32 @@ pub(crate) mod witgen_simd {
             }
         }
 
+        /// Specialized width-32 push for identity rows (`vb == u32::MAX`).
+        #[inline(always)]
+        unsafe fn push_lin<const USED: i32, const BACK: i32, const WORD: usize, const PREV_LIN: bool>(
+            &mut self,
+            va: V4,
+        ) {
+            const { assert!(USED >= 1 && USED < 32 && BACK == 32 - USED && WORD < U32_PER_BLOCK); }
+            unsafe {
+                let oa = vsliq_n_u32::<USED>(self.pa, va);
+                let ob = if WORD >= self.b_end {
+                    self.pb
+                } else if PREV_LIN {
+                    vdupq_n_u32(u32::MAX)
+                } else {
+                    vsliq_n_u32::<USED>(self.pb, vdupq_n_u32(u32::MAX))
+                };
+                self.emit::<WORD>(oa, ob);
+                self.pa = vshrq_n_u32::<BACK>(va);
+                if WORD + 1 == LAST_WORD {
+                    if LAST_WORD < self.b_end { self.pb = vdupq_n_u32(u32::MAX >> BACK); }
+                } else if PREV_LIN && WORD + 1 < self.b_end {
+                    self.pb = vdupq_n_u32(u32::MAX);
+                }
+            }
+        }
+
         #[inline(always)]
         unsafe fn finish(&mut self) {
             unsafe {
@@ -3529,11 +3568,8 @@ pub(crate) mod witgen_simd {
         debug_assert!(s0 <= nt0 && nt1 + usize::from(sparse_tail) <= s1);
         unsafe {
             if DIRECT && PRIMED {
-                // A's stable prefix was flushed before G. Only the output
-                // words 8..16 need the late stage; B needs no stage reads.
-                if sparse_tail {
-                    dump_range::<false>(stage, scratch, 1, 2);
-                }
+                // Every quad-dependent chunk of A (prefix, message, G stream,
+                // out_hi, out_lo) and B was emitted straight into `scratch`.
             } else if DIRECT {
                 // Complete chunks 5..59 were emitted directly while building G.
                 dump_range::<false>(stage, scratch, s0, s1.min(5));
@@ -3702,6 +3738,24 @@ pub(crate) mod witgen_simd {
     /// # Safety
     /// As [`build_quad_split_neon`] for the `<false, true, PRIMED, true>`
     /// form.
+    #[cold]
+    #[inline(never)]
+    unsafe fn build_quad_split_neon_mem_fallback<const PRIMED: bool>(
+        inputs: QuadInput<'_>, a: *mut u32, b: *mut u32, sa: *mut u32, sb: *mut u32,
+    ) {
+        unsafe {
+            if ab_rebuild_enabled() {
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false, false>(
+                    inputs, core::ptr::null_mut(), a, b, sa, sb,
+                )
+            } else {
+                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false, false>(
+                    inputs, core::ptr::null_mut(), a, b, sa, sb,
+                )
+            }
+        }
+    }
+
     pub(crate) unsafe fn build_quad_split_neon_mem<const PRIMED: bool>(
         inputs: QuadInput<'_>,
         a: *mut u32,
@@ -3719,24 +3773,8 @@ pub(crate) mod witgen_simd {
                     sa,
                     sb,
                 )
-            } else if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false, false>(
-                    inputs,
-                    core::ptr::null_mut(),
-                    a,
-                    b,
-                    sa,
-                    sb,
-                )
             } else {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false, false>(
-                    inputs,
-                    core::ptr::null_mut(),
-                    a,
-                    b,
-                    sa,
-                    sb,
-                )
+                build_quad_split_neon_mem_fallback::<PRIMED>(inputs, a, b, sa, sb)
             }
         }
     }
@@ -3860,17 +3898,13 @@ pub(crate) mod witgen_simd {
             assert!(RANKED_SPARSE_TAIL_CHUNK + 1 == ELIDE_ZERO_CHUNK);
         }
         let full_scratch = SCRATCH && !PRIMED;
+        let direct_all = (DIRECT_SCRATCH && PRIMED) || (WZ && ZPLAIN);
         unsafe {
             // Memory form: where the 8 chaining words and the 16 message
             // words can be re-read (word-major, 16 bytes per word).
             let mut local_words = core::mem::MaybeUninit::<[V4; 24]>::uninit();
-            let seeded_words: Option<(*const u32, *const u32)> = match &inputs {
-                QuadInput::Seeded(q) => {
-                    Some((q.cv.as_ptr().cast::<u32>(), q.message.as_ptr().cast::<u32>()))
-                }
-                QuadInput::Blocks(_) => None,
-            };
-            let (cv_v, m, tlo, thi, blen, flags) = match inputs {
+            let mut m_reg = core::mem::MaybeUninit::<[V4; 16]>::uninit();
+            let (cv_v, tlo, thi, blen, flags, cv_mem, m_mem) = match inputs {
                 QuadInput::Blocks(inputs) => {
                     let ptrs = [
                         inputs[0].0.as_ptr(),
@@ -3891,13 +3925,17 @@ pub(crate) mod witgen_simd {
                         vld1q_u32(ptrs[3].add(4)),
                     );
                     let cv_v = [cv0, cv1, cv2, cv3, cv4, cv5, cv6, cv7];
+                    let base = local_words.as_mut_ptr().cast::<V4>();
+                    if MEM {
+                        for w in 0..8usize { base.add(w).write(cv_v[w]); }
+                    }
                     let mptrs = [
                         inputs[0].1.as_ptr(),
                         inputs[1].1.as_ptr(),
                         inputs[2].1.as_ptr(),
                         inputs[3].1.as_ptr(),
                     ];
-                    let mut m: [V4; 16] = [cv0; 16];
+                    let m_dst = if MEM { base.add(8) } else { m_reg.as_mut_ptr().cast::<V4>() };
                     for wgrp in 0..4 {
                         let (m0, m1, m2, m3) = tr4(
                             vld1q_u32(mptrs[0].add(4 * wgrp)),
@@ -3905,10 +3943,10 @@ pub(crate) mod witgen_simd {
                             vld1q_u32(mptrs[2].add(4 * wgrp)),
                             vld1q_u32(mptrs[3].add(4 * wgrp)),
                         );
-                        m[4 * wgrp] = m0;
-                        m[4 * wgrp + 1] = m1;
-                        m[4 * wgrp + 2] = m2;
-                        m[4 * wgrp + 3] = m3;
+                        m_dst.add(4 * wgrp).write(m0);
+                        m_dst.add(4 * wgrp + 1).write(m1);
+                        m_dst.add(4 * wgrp + 2).write(m2);
+                        m_dst.add(4 * wgrp + 3).write(m3);
                     }
                     let mut tlo_a = [0u32; 4];
                     let mut thi_a = [0u32; 4];
@@ -3922,23 +3960,28 @@ pub(crate) mod witgen_simd {
                     }
                     (
                         cv_v,
-                        m,
                         vld1q_u32(tlo_a.as_ptr()),
                         vld1q_u32(thi_a.as_ptr()),
                         vld1q_u32(bl_a.as_ptr()),
                         vld1q_u32(fl_a.as_ptr()),
+                        if MEM { base as *const u32 } else { core::ptr::null() },
+                        if MEM { base.add(8) as *const u32 } else { core::ptr::null() },
                     )
                 }
                 QuadInput::Seeded(inputs) => {
                     let cv_v = std::array::from_fn(|w| vld1q_u32(inputs.cv[w].as_ptr()));
-                    let m = std::array::from_fn(|w| vld1q_u32(inputs.message[w].as_ptr()));
+                    if !MEM {
+                        let m_dst = m_reg.as_mut_ptr().cast::<V4>();
+                        for w in 0..16usize { m_dst.add(w).write(vld1q_u32(inputs.message[w].as_ptr())); }
+                    }
                     (
                         cv_v,
-                        m,
                         vld1q_u32(inputs.counter_lo.as_ptr()),
                         vld1q_u32(inputs.counter_hi.as_ptr()),
                         vld1q_u32(inputs.block_len.as_ptr()),
                         vld1q_u32(inputs.flags.as_ptr()),
+                        if MEM { inputs.cv.as_ptr().cast::<u32>() } else { core::ptr::null() },
+                        if MEM { inputs.message.as_ptr().cast::<u32>() } else { core::ptr::null() },
                     )
                 }
             };
@@ -3962,27 +4005,13 @@ pub(crate) mod witgen_simd {
                 flags,
             ];
 
-            let (cv_mem, m_mem): (*const u32, *const u32) = if !MEM {
-                (core::ptr::null(), core::ptr::null())
-            } else if let Some(pointers) = seeded_words {
-                pointers
-            } else {
-                let base = local_words.as_mut_ptr().cast::<V4>();
-                for w in 0..8usize {
-                    vst1q_u32(base.add(w) as *mut u32, cv_v[w]);
-                }
-                for w in 0..16usize {
-                    vst1q_u32(base.add(8 + w) as *mut u32, m[w]);
-                }
-                (base as *const u32, base.add(8) as *const u32)
-            };
             // Message word `$i` as an addend, chaining word `$w` at the end.
             macro_rules! msg {
                 ($i:literal) => {{
                     if MEM {
                         load_word_opaque::<{ 16 * $i }>(m_mem)
                     } else {
-                        m[$i]
+                        *m_reg.as_ptr().cast::<V4>().add($i)
                     }
                 }};
             }
@@ -3996,24 +4025,28 @@ pub(crate) mod witgen_simd {
                 }};
             }
 
-            // L1 stages.  `za` is the z stage in the z form and the a stage
-            // in the a/b form (prefix, message and output words of z and a
-            // are identical); `bs` is used by the a/b form only.  Every
-            // stage word a drain reads is written first.
+            // L1 stages (elided altogether when `direct_all` emits straight to
+            // the row-major destination).
             let zero = vdupq_n_u32(0);
-            let maxv = vdupq_n_u32(u32::MAX);
             let one = vdupq_n_u32(1);
             let mut za = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
             let mut bs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
-            let za = za.as_mut_ptr().cast::<V4>();
-            let bs = bs.as_mut_ptr().cast::<V4>();
+            let za = if direct_all { core::ptr::null_mut() } else { za.as_mut_ptr().cast::<V4>() };
+            let bs = if WZ || (DIRECT_SCRATCH && PRIMED) { core::ptr::null_mut() } else { bs.as_mut_ptr().cast::<V4>() };
+            let direct_dst = if WZ { z } else { sa };
 
             // ---- prefix: cv slot words 0..8 (z = a = cv) ----
-            for w in 0..8usize {
-                vst1q_u32(za.add(w) as *mut u32, cv_v[w]);
+            if direct_all {
+                store_group_rows::<0>(direct_dst, cv_v[0], cv_v[1], cv_v[2], cv_v[3]);
+                store_group_rows::<4>(direct_dst, cv_v[4], cv_v[5], cv_v[6], cv_v[7]);
+            } else {
+                for w in 0..8usize {
+                    vst1q_u32(za.add(w) as *mut u32, cv_v[w]);
+                }
             }
             // 32..36 are ever read (the drain starts at chunk 4).
             if !WZ && !(DIRECT_SCRATCH && PRIMED) {
+                let maxv = vdupq_n_u32(u32::MAX);
                 let b0 = if full_scratch {
                     0
                 } else {
@@ -4023,36 +4056,47 @@ pub(crate) mod witgen_simd {
                     vst1q_u32(bs.add(w) as *mut u32, maxv);
                 }
             }
-            // Message region words 16..36 (z = a).
-            let chain: [V4; 20] = [
-                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
-                m[13], m[14], m[15], tlo, thi, blen, flags,
-            ];
-            vst1q_u32(
-                za.add(16) as *mut u32,
-                vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
-            );
-            for k in 1..20usize {
-                let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
-                vst1q_u32(za.add(16 + k) as *mut u32, w);
+            // Message region words 16..36 (z = a), streamed without keeping m[0..16] live.
+            macro_rules! msg_init {
+                ($i:expr) => {{
+                    if MEM { vld1q_u32(m_mem.add(4 * ($i))) } else { *m_reg.as_ptr().cast::<V4>().add($i) }
+                }};
             }
-
-            if DIRECT_SCRATCH && PRIMED {
-                // Flush initialized input words before G so their original
-                // vectors need not stay live through the stream. Output
-                // words 8..16 are computed and flushed after G.
-                dump_range::<false>(za, sa, 0, 1);
-                dump_range::<false>(za, sa, 2, 4);
-                let x = vld4q_u32(za.add(32) as *const u32);
-                vst1q_u32(sa.add(32), x.0);
-                vst1q_u32(sa.add(U32_PER_BLOCK + 32), x.1);
-                vst1q_u32(sa.add(2 * U32_PER_BLOCK + 32), x.2);
-                vst1q_u32(sa.add(3 * U32_PER_BLOCK + 32), x.3);
-            }
+            let pending_bit = if direct_all {
+                macro_rules! emit_msg_group {
+                    ($word:literal, $p:expr, $c0:expr, $c1:expr, $c2:expr, $c3:expr) => {{
+                        let (c0, c1, c2, c3) = ($c0, $c1, $c2, $c3);
+                        store_group_rows::<$word>(
+                            direct_dst,
+                            vsliq_n_u32::<1>($p, c0),
+                            vsliq_n_u32::<1>(vshrq_n_u32::<31>(c0), c1),
+                            vsliq_n_u32::<1>(vshrq_n_u32::<31>(c1), c2),
+                            vsliq_n_u32::<1>(vshrq_n_u32::<31>(c2), c3),
+                        );
+                        vshrq_n_u32::<31>(c3)
+                    }};
+                }
+                let p = emit_msg_group!(16, one, msg_init!(0), msg_init!(1), msg_init!(2), msg_init!(3));
+                let p = emit_msg_group!(20, p, msg_init!(4), msg_init!(5), msg_init!(6), msg_init!(7));
+                let p = emit_msg_group!(24, p, msg_init!(8), msg_init!(9), msg_init!(10), msg_init!(11));
+                let p = emit_msg_group!(28, p, msg_init!(12), msg_init!(13), msg_init!(14), msg_init!(15));
+                emit_msg_group!(32, p, tlo, thi, blen, flags)
+            } else {
+                let mut prev = one;
+                for k in 0..16usize {
+                    let c = msg_init!(k);
+                    vst1q_u32(za.add(16 + k) as *mut u32, vsliq_n_u32::<1>(prev, c));
+                    prev = vshrq_n_u32::<31>(c);
+                }
+                for (k, c) in [tlo, thi, blen, flags].into_iter().enumerate() {
+                    vst1q_u32(za.add(32 + k) as *mut u32, vsliq_n_u32::<1>(prev, c));
+                    prev = vshrq_n_u32::<31>(c);
+                }
+                prev
+            };
 
             // ---- G stream ----
-            let pending_bit = vshrq_n_u32::<31>(flags);
-            let mut wz = W32::at_paired(za, pending_bit, PAIR_STAGE_STORES);
+            let mut wz = W32::at_paired(za, z, pending_bit, PAIR_STAGE_STORES, WZ && ZPLAIN);
             let mut wab = W32Pair {
                 pa: pending_bit,
                 pb: one,
@@ -4092,14 +4136,11 @@ pub(crate) mod witgen_simd {
             }
             // One full-width identity row: z = a = value, b = MAX.
             macro_rules! lin {
-                ($pos:expr, $v:expr) => {{
+                ($pos:expr, $v:expr, $prev_lin:literal) => {{
                     if WZ {
                         pushf!(wz, $pos, 32, $v);
                     } else {
-                        wab.push::<{ ($pos % 32) as i32 }, 32, {
-                            let u = ($pos % 32) as i32;
-                            if u == 0 { 1 } else { 32 - u }
-                        }, { $pos / 32 }>($v, maxv);
+                        wab.push_lin::<{ ($pos % 32) as i32 }, { 32 - ($pos % 32) as i32 }, { $pos / 32 }, $prev_lin>($v);
                     }
                 }};
             }
@@ -4116,8 +4157,8 @@ pub(crate) mod witgen_simd {
                     let d2 = xor_rotr::<8, 24>(d1, a2);
                     let c2s = add!(GS_BASE + G_STRIDE * $g + REC_C5, c1s, d2);
                     let bn = xor_rotr::<7, 25>(b1, c2s);
-                    lin!(GS_BASE + G_STRIDE * $g + REC_LIN0, bn);
-                    lin!(GS_BASE + G_STRIDE * $g + REC_LIN1, d2);
+                    lin!(GS_BASE + G_STRIDE * $g + REC_LIN0, bn, false);
+                    lin!(GS_BASE + G_STRIDE * $g + REC_LIN1, d2, true);
                     state[$la] = a2;
                     state[$lb] = bn;
                     state[$lc] = c2s;
@@ -4154,7 +4195,7 @@ pub(crate) mod witgen_simd {
             macro_rules! oh {
                 ($w:literal) => {{
                     let hv = veorq_u32(state[$w + 8], cvw!($w));
-                    lin!(OUT_HI_BASE + 32 * $w, hv);
+                    lin!(OUT_HI_BASE + 32 * $w, hv, true);
                 }};
             }
             oh!(0);
@@ -4188,27 +4229,30 @@ pub(crate) mod witgen_simd {
                         vst1q_u32(za.add(w) as *mut u32, zero);
                     }
                 }
-            } else {
+            } else if !(WZ && ZPLAIN) {
                 // The sparse tail publisher reads words 480..483 only.
                 vst1q_u32(za.add(ZERO_FILL_WORD) as *mut u32, zero);
                 vst1q_u32(za.add(ZERO_FILL_WORD + 1) as *mut u32, zero);
             }
 
             // ---- out_lo slot, words 8..16 (z = a) ----
-            for w in 0..8usize {
-                let lo = veorq_u32(state[w], state[w + 8]);
-                vst1q_u32(za.add(8 + w) as *mut u32, lo);
+            if direct_all {
+                store_group_rows::<8>(direct_dst, veorq_u32(state[0], state[8]), veorq_u32(state[1], state[9]), veorq_u32(state[2], state[10]), veorq_u32(state[3], state[11]));
+                store_group_rows::<12>(direct_dst, veorq_u32(state[4], state[12]), veorq_u32(state[5], state[13]), veorq_u32(state[6], state[14]), veorq_u32(state[7], state[15]));
+            } else {
+                for w in 0..8usize {
+                    let lo = veorq_u32(state[w], state[w + 8]);
+                    vst1q_u32(za.add(8 + w) as *mut u32, lo);
+                }
             }
 
             // ---- drain ----
             if WZ && ZPLAIN {
-                // Scratch rows: words 484..488 are the zeros the sparse tail
-                // publisher supplies (482/483 were zeroed above); chunks
-                // 0..61 then drain with plain stores.
-                for w in RANKED_SPARSE_TAIL_WORD + 4..8 * ELIDE_ZERO_CHUNK {
-                    vst1q_u32(za.add(w) as *mut u32, zero);
+                // Words 0..484 were emitted directly into `z`; zero words
+                // 484..488 of each row to match the sparse tail publisher.
+                for j in 0..4usize {
+                    vst1q_u32(z.add(j * U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD + 4), zero);
                 }
-                dump_range::<false>(za, z, 0, ELIDE_ZERO_CHUNK);
             } else if WZ {
                 dump_range_lines_nt(za, z, 0, RANKED_SPARSE_TAIL_CHUNK);
                 dump_ranked_sparse_tail_nt(za, z);
