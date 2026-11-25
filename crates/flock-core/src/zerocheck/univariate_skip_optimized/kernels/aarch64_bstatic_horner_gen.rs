@@ -109,28 +109,37 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
         }
         macro_rules! bimg_s {
             ($blk:literal, $k:literal, [$(($j0:literal, $j1:literal)),*], [$($js:literal),*]) => {{
-                let pp = pbase.add(($blk * 8 + $k) * 64);
-                #[allow(unused_mut)]
-                let (mut db0, mut db1, mut db2, mut db3) = transform_partial_seed::<V>(pp);
-                #[allow(unused_variables)]
-                let b_word = transform_partial_word::<V>(bw!($k));
-                if V & ABV_NOSW != 0 {
-                    $(xor_vary_ext::<$j0, $j1>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
-                    $(xor_vary_ext::<$js, 8>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
+                if V & (ABV_TRANSFORM_TRIM | ABV_Z | ABV_Z_REC) == (ABV_TRANSFORM_TRIM | ABV_Z | ABV_Z_REC) {
+                    const NB: u32 = 0u32 $(+ (2 + 0 * $j0))* $(+ (1 + 0 * $js))*;
+                    const MASK: u32 = 0u32 $(| (1u32 << $j0) | (1u32 << $j1))* $(| (1u32 << $js))*;
+                    const HIGH: bool = MASK == (((1u32 << NB) - 1) << (8 - NB));
+                    const { assert!(MASK == ((1u32 << NB) - 1) || HIGH) };
+                    apply_word_z_sparse::<NB, HIGH, 0x01>(plain, kplain.add(2 * AB_KARA_IMAGE_BYTES), !bw!($k))
                 } else {
-                    $(xor_vary_pair::<$j0, $j1>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
-                    $(xor_vary_single::<$js>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                    let pp = pbase.add(($blk * 8 + $k) * 64);
+                    #[allow(unused_mut)]
+                    let (mut db0, mut db1, mut db2, mut db3) = transform_partial_seed::<V>(pp);
+                    #[allow(unused_variables)]
+                    let b_word = transform_partial_word::<V>(bw!($k));
+                    if V & ABV_NOSW != 0 {
+                        $(xor_vary_ext::<$j0, $j1>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
+                        $(xor_vary_ext::<$js, 8>(plain, b_word, [&mut db0, &mut db1, &mut db2, &mut db3]);)*
+                    } else {
+                        $(xor_vary_pair::<$j0, $j1>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                        $(xor_vary_single::<$js>(plain, plain_sw, b_word, &mut db0, &mut db1, &mut db2, &mut db3);)*
+                    }
+                    (db0, db1, db2, db3)
                 }
-                (db0, db1, db2, db3)
             }};
         }
-        // A static b word with four or more varying bytes: 4 partial loads
-        // plus 4 per varying byte is at least 20, the whole-word Karatsuba
-        // apply is 18. The row's guard established the static bytes, so the
-        // whole-word image is the partial image plus the varying rows.
+        // A static b word with four or more varying bytes: under `ABV_TRANSFORM_TRIM`
+        // and the z-basis form it uses the unified sparse z apply (`NB = 4..=6`);
+        // otherwise whole-word Karatsuba (18 loads) or per-byte partial rows.
         macro_rules! bimg_sk {
             ($blk:literal, $k:literal, $pairs:tt, $singles:tt) => {{
-                if V & ABV_KARA != 0 {
+                if V & (ABV_TRANSFORM_TRIM | ABV_Z | ABV_Z_REC) == (ABV_TRANSFORM_TRIM | ABV_Z | ABV_Z_REC) {
+                    bimg_s!($blk, $k, $pairs, $singles)
+                } else if V & ABV_KARA != 0 {
                     apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw!($k))
                 } else {
                     bimg_s!($blk, $k, $pairs, $singles)
@@ -138,11 +147,14 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
             }};
         }
         // A static b word whose varying bytes are exactly bytes 0..NB: under
-        // `ABV_BSTATIC_Z` its partial image plus the varying bytes' z-form
-        // image; otherwise the incumbent form `$inc`.
+        // `ABV_BSTATIC_Z` without `ABV_TRANSFORM_TRIM` uses `apply_word_z_low`;
+        // with `ABV_TRANSFORM_TRIM` + z-basis delegates to `$inc` (`apply_word_z_sparse`
+        // with folded constant).
         macro_rules! bimg_lz {
             ($blk:literal, $k:literal, $nb:literal, $inc:expr) => {{
-                if V & ABV_BSTATIC_Z != 0 {
+                if V & ABV_BSTATIC_Z != 0
+                    && V & (ABV_TRANSFORM_TRIM | ABV_Z | ABV_Z_REC) != (ABV_TRANSFORM_TRIM | ABV_Z | ABV_Z_REC)
+                {
                     let pp = pbase.add(($blk * 8 + $k) * 64);
                     let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(
                         plain, kplain, transform_partial_word::<V>(bw!($k)),
@@ -177,9 +189,22 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                 ]
             }};
         }
-        // The operands of one K row (the A image of `$k`, then the B image),
-        // for the `ABV_FUSE` accumulation: the same applies as `prods!`.
-        macro_rules! opnds {
+        // Sequential `fuse_acc` streaming accumulator: absorbs `o3` before `o7`,
+        // `o2` before `o6`, and `o0` before `o4`.
+        let acc_s = core::cell::Cell::new([vdupq_n_u16(0); 8]);
+        let fuse_seed = |_: &(), hi: &AbKOperands| -> [uint16x8_t; 8] {
+            let a = fuse_acc(&acc_s.get(), hi); acc_s.set(a); a
+        };
+        let fuse_absorb_first = |acc: &mut [uint16x8_t; 8], _: &(), hi: &AbKOperands| {
+            *acc = fuse_acc(&acc_s.get(), hi); acc_s.set(*acc);
+        };
+        let fuse_absorb_k1 = |acc: &mut [uint16x8_t; 8], lo: &AbKOperands, hi: &AbKOperands| {
+            self::fuse_absorb_k1(acc, lo, hi); acc_s.set(*acc);
+        };
+        let fuse_absorb_k0 = |acc: &mut [uint16x8_t; 8], _: &(), hi: &AbKOperands| {
+            *acc = fuse_acc(&acc_s.get(), hi);
+        };
+        macro_rules! opnds_raw {
             ($at:expr, $at_sw:expr, $kara:expr, $k:literal, $bimg:expr) => {{
                 let aw = u64::from_le(core::ptr::read_unaligned(a_base.add($k * N_CHUNKS).cast::<u64>()));
                 let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw);
@@ -187,17 +212,25 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
                 ([da0, da1, da2, da3], [db0, db1, db2, db3])
             }};
         }
+        macro_rules! opnds {
+            ($at:expr, $at_sw:expr, $kara:expr, 3, $bimg:expr) => { acc_s.set(fuse_products(&opnds_raw!($at, $at_sw, $kara, 3, $bimg))) };
+            ($at:expr, $at_sw:expr, $kara:expr, 2, $bimg:expr) => {{ let mut a = acc_s.get(); fuse_absorb_first_one(&mut a, &opnds_raw!($at, $at_sw, $kara, 2, $bimg)); acc_s.set(a); }};
+            ($at:expr, $at_sw:expr, $kara:expr, 0, $bimg:expr) => { acc_s.set(fuse_acc(&acc_s.get(), &opnds_raw!($at, $at_sw, $kara, 0, $bimg))) };
+            ($at:expr, $at_sw:expr, $kara:expr, $k:literal, $bimg:expr) => { opnds_raw!($at, $at_sw, $kara, $k, $bimg) };
+        }
         // [`ABV_SPARSE_SCALE`]: the operands of the row's one `x^4` word whose
-        // B varies only in `$nb` bytes at one end (`$high`): the A word out
-        // of the plain image, the B word out of the `x^4` image restricted to
-        // its varying bytes. The products are congruent mod p to those of
-        // `opnds!` with the scaled A image.
+        // B varies only in `$nb` bytes at one end (`$high`): A out of the plain
+        // image, B out of the `x^4` z-basis image restricted to its varying bytes.
         #[allow(unused_macros)]
         macro_rules! opnds_ss {
             ($k:literal, $nb:literal, $high:literal) => {{
                 let aw = u64::from_le(core::ptr::read_unaligned(a_base.add($k * N_CHUNKS).cast::<u64>()));
                 let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, aw);
-                let (db0, db1, db2, db3) = apply_word_sparse_x4::<$nb, $high>(kscaled, !bw!($k));
+                let (db0, db1, db2, db3) = apply_word_z_sparse::<$nb, $high, 0x10>(
+                    scaled,
+                    kplain.add(2 * AB_KARA_IMAGE_BYTES + AB_Z_IMAGE_BYTES),
+                    !bw!($k),
+                );
                 ([da0, da1, da2, da3], [db0, db1, db2, db3])
             }};
         }
@@ -1476,9 +1509,9 @@ pub(crate) fn bstatic_horner_window_unit_impl<const V: u32, const HOIST: bool>(
                             // or `FLOCK_NO_ZC_AB_LANEZ=1` takes the per-chunk
                             // rows, which write the same bytes (build budget:
                             // no separate unit instance).
-                            if ab_sparse_scale_enabled() && ab_kara_lanez_enabled() {
+                            if ab_sparse_scale_enabled() {
                                 bstatic_horner_window_unit_nt::<
-                                    { BASE | AB_FUSE_FORM | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_KARA_LANEZ },
+                                    { BASE | AB_FUSE_FORM | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_Z_SCALED },
                                     true,
                                     true,
                                 >(
@@ -2102,7 +2135,7 @@ fn ab_window_unit_sparse_scale_matches_parent() {
                 assert_eq!(both!(AB_UNIT_MAIN | ABV_Z_OUT3).0, want.0, "parent {at}");
                 assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM), want, "TRIM {at}");
                 assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE), want, "TRIM SPARSE {at}");
-                assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_KARA_LANEZ), want, "TRIM SPARSE LANEZ {at}");
+                assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_Z_SCALED), want, "TRIM SPARSE ZSCALED {at}");
                 assert_eq!(
                     both!(AB_UNIT_HELPER | ABV_FUSE | ABV_TRANSFORM_TRIM),
                     want,
@@ -2182,7 +2215,7 @@ fn ab_window_unit_sparse_scale_adversarial() {
         assert_eq!(both!(AB_UNIT_MAIN | ABV_Z_OUT3).0, want.0, "parent {at}");
         assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM), want, "TRIM {at}");
         assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE), want, "TRIM SPARSE {at}");
-        assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_KARA_LANEZ), want, "TRIM SPARSE LANEZ {at}");
+        assert_eq!(both!(FUSED | ABV_TRANSFORM_TRIM | ABV_SPARSE_SCALE | ABV_Z_SCALED), want, "TRIM SPARSE ZSCALED {at}");
         assert_eq!(both!(AB_UNIT_HELPER | ABV_FUSE | ABV_TRANSFORM_TRIM), want, "helper TRIM {at}");
         let mut out = [0u8; 2 * OUTER_BYTES];
         out.copy_from_slice(&want.0);

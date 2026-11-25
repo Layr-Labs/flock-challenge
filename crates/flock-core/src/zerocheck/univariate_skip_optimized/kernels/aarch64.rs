@@ -2285,13 +2285,6 @@ unsafe fn fuse_acc(
     }
 }
 
-/// [`ABV_FUSE`] seed: `P3 ^ P7'`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fuse_seed(lo: &AbKOperands, hi: &AbKOperands) -> [core::arch::aarch64::uint16x8_t; 8] {
-    unsafe { fuse_acc(&fuse_products(lo), hi) }
-}
-
 /// [`ABV_FUSE`] single-product form of [`horner_absorb_first`]: `(acc << 1) ^ P2`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -2307,25 +2300,6 @@ unsafe fn fuse_absorb_first_one(
             *v = vshlq_n_u16::<1>(*v);
         }
         *acc = fuse_acc(&s, lo);
-    }
-}
-
-/// [`ABV_FUSE`] form of [`horner_absorb_first`]: `(acc << 1) ^ P2 ^ P6'`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fuse_absorb_first(
-    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
-    lo: &AbKOperands,
-    hi: &AbKOperands,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        let mut s = *acc;
-        for v in s.iter_mut() {
-            debug_assert_eq!(vmaxvq_u16(vshrq_n_u16::<15>(*v)), 0);
-            *v = vshlq_n_u16::<1>(*v);
-        }
-        *acc = fuse_acc(&fuse_acc(&s, lo), hi);
     }
 }
 
@@ -2349,19 +2323,6 @@ unsafe fn fuse_absorb_k1(
             let p1 = vreinterpretq_u8_u16(vshlq_n_u16::<1>(p[i]));
             acc[i] = vreinterpretq_u16_u8(xor3_u8(s2, f, p1));
         }
-    }
-}
-
-/// [`ABV_FUSE`] form of the [`ABV_HORNER2`] K0 step: `acc ^ P0 ^ P4'`.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn fuse_absorb_k0(
-    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
-    lo: &AbKOperands,
-    hi: &AbKOperands,
-) {
-    unsafe {
-        *acc = fuse_acc(&fuse_acc(acc, lo), hi);
     }
 }
 
@@ -2662,19 +2623,17 @@ fn shift_reduce_inner_mixed_const_b_h4<
             }
             let omit_high = V & ABV_OMIT_MIXED_ONES != 0 && ONE_MASK == 0xf0;
             let o3 = opnds!(plain, plain_sw, kplain, 3);
-            let mut acc = if omit_high {
-                fuse_products(&o3)
-            } else {
+            let mut acc = fuse_products(&o3);
+            if !omit_high {
                 let o7 = opnds!(scaled, scaled_sw, kscaled, 7);
-                fuse_seed(&o3, &o7)
-            };
+                acc = fuse_acc(&acc, &o7);
+            }
             let zero = [vdupq_n_u16(0); 8];
             let o2 = opnds!(plain, plain_sw, kplain, 2);
-            if omit_high {
-                fuse_absorb_first_one(&mut acc, &o2);
-            } else {
+            fuse_absorb_first_one(&mut acc, &o2);
+            if !omit_high {
                 let o6 = opnds!(scaled, scaled_sw, kscaled, 6);
-                fuse_absorb_first(&mut acc, &o2, &o6);
+                acc = fuse_acc(&acc, &o6);
             }
             if V & ABV_OMIT_MIXED_ONES != 0 {
                 let one = if omit_high {
@@ -2699,8 +2658,9 @@ fn shift_reduce_inner_mixed_const_b_h4<
                 let o5 = opnds!(scaled, scaled_sw, kscaled, 5);
                 fuse_absorb_k1(&mut acc, &o1, &o5);
                 let o0 = opnds!(plain, plain_sw, kplain, 0);
+                acc = fuse_acc(&acc, &o0);
                 let o4 = opnds!(scaled, scaled_sw, kscaled, 4);
-                fuse_absorb_k0(&mut acc, &o0, &o4);
+                acc = fuse_acc(&acc, &o4);
             }
             let r0 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[0]), vreinterpretq_u8_u16(acc[1]));
             let r1 = gf8_reduce_vec16(vreinterpretq_u8_u16(acc[2]), vreinterpretq_u8_u16(acc[3]));
@@ -4613,33 +4573,15 @@ pub(crate) fn ab_sparse_scale_enabled() -> bool {
     }
 }
 
-/// `x^4·T(b)` of a guarded static-B word `b` under [`ABV_TRANSFORM_TRIM`]
-/// whose varying bytes are the `NB` (1..=4) bytes `0..NB` (`HIGH = false`)
-/// or `8-NB..8` (`HIGH = true`); `nb` is `!b`, which the row guard makes
-/// zero at every other byte. `T` is GF(2)-linear and `T(all-ones)` is
-/// `[1; 64]`, so `x^4·T(b) = [x^4; 64] ^ x^4·T(nb)`.
-///
-/// `x^4·T(nb)` is read out of the `x^4` image's Karatsuba tables (`kscaled`,
-/// 128-byte entries `C0, C1, C2, C3, C0^C1, C2^C3, ...`), which the row's
-/// other `x^4` words read anyway: no table is added to the row's working
-/// set. In the lane z form of that apply (see `apply_word_kara_lanez` and
-/// [`apply_word_kara`]) every lookup indexed by a byte that is zero reads
-/// row 0, which is zero; with bytes 4..8 zero only four remain:
-/// `out_q = E_q ^ sw(O_q)` with `E_q = C_q(v0) ^ M_q(s2)` and
-/// `O_q = C_q(v1) ^ M_q(s3)`, where `v0 = b0^b2`, `v1 = b1^b3`, `s2 = b2`,
-/// `s3 = b3`, `M_0 = M_1` the `C0^C1` slot and `M_2 = M_3` the `C2^C3` slot,
-/// and `sw` the 8-byte half exchange. Lookups of bytes the width leaves zero
-/// are not made: 4, 8, 10 or 12 reads for one to four bytes.
-///
-/// High bytes: output block `n` receives `R_(n^j)(W_j)` from byte `j` (see
-/// [`xor_vary_single`]), so the byte-reversed word (byte `j` at
-/// `7 - j = j ^ 7`) gives the low form with output block `n` read from
-/// block `n ^ 7`: register `q` is register `3 - q` with its two halves
-/// exchanged, which moves `sw` from `O` to `E`.
+/// Unified z-basis apply of a guarded static-B word `b` under [`ABV_TRANSFORM_TRIM`]
+/// (`NB` = 1..=6 varying bytes at `0..NB` or `8-NB..8`, `nb = !b` zero elsewhere).
+/// `T(b) = [CONST_BYTE; 64] ^ T(nb)` (`0x01` plain, `0x10` `x^4`-scaled); high
+/// bytes apply `nb.swap_bytes()` and return `(sw(o3), sw(o2), sw(o1), sw(o0))`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_sparse_x4<const NB: u32, const HIGH: bool>(
-    kscaled: *const u8,
+unsafe fn apply_word_z_sparse<const NB: u32, const HIGH: bool, const CONST_BYTE: u8>(
+    t0: *const u8,
+    z: *const u8,
     nb: u64,
 ) -> (
     core::arch::aarch64::uint8x16_t,
@@ -4648,59 +4590,69 @@ unsafe fn apply_word_sparse_x4<const NB: u32, const HIGH: bool>(
     core::arch::aarch64::uint8x16_t,
 ) {
     use core::arch::aarch64::*;
-    const { assert!(NB >= 1 && NB <= 4) };
+    const { assert!(NB >= 1 && NB <= 6) };
     unsafe {
         let w = if HIGH { nb.swap_bytes() } else { nb };
-        // Bytes 0, 1 of `v`: b0 ^ b2, b1 ^ b3 (b2 = b3 = 0 below width 3).
-        let v = if NB >= 3 { w ^ (w >> 16) } else { w };
+        debug_assert_eq!(w >> (8 * NB), 0);
         let ld = |base: *const u8, off: usize| vld1q_u8(base.add(off));
-        // An opaque entry address, so the slots of one index load as `ldp` pairs.
-        let at = |i: usize| -> *const u8 {
+        let sw = |x: uint8x16_t| vextq_u8::<8>(x, x);
+        let c = vdupq_n_u8(CONST_BYTE);
+        if NB == 1 {
+            let r0 = t0.add(ab_z_idx::<0, 6>(w));
+            let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
+            let (o0, o1, o2, o3) = if CONST_BYTE != 0 {
+                (veorq_u8(l0, c), veorq_u8(l1, c), veorq_u8(l2, c), veorq_u8(l3, c))
+            } else { (l0, l1, l2, l3) };
+            return if HIGH { (sw(o3), sw(o2), sw(o1), sw(o0)) } else { (o0, o1, o2, o3) };
+        }
+        let ys = w ^ (w >> 8);
+        let yl1 = if NB >= 4 { w ^ (w >> 16) } else { w };
+        let ysl1 = if NB >= 3 { ys ^ (ys >> 16) } else { ys };
+        let yall = if NB >= 5 { ysl1 ^ (ysl1 >> 32) } else { ysl1 };
+        let r0 = t0.add(ab_z_idx::<0, 6>(yall));
+        let (l0, l1, l2, l3) = (ld(r0, 0), ld(r0, 16), ld(r0, 32), ld(r0, 48));
+        let rec = |i: usize| -> *const u8 {
             let a: usize;
-            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) kscaled, i = in(reg) i,
+            core::arch::asm!("add {a}, {b}, {i}", a = lateout(reg) a, b = in(reg) z.add(AB_Z_REC), i = in(reg) i,
                 options(pure, nomem, nostack, preserves_flags));
             a as *const u8
         };
-        let z = vdupq_n_u8(0);
-        let a = at(ab_z_idx::<0, 7>(v));
-        let (mut e0, mut e1, mut e2, mut e3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
-        let (mut o0, mut o1, mut o2, mut o3) = (z, z, z, z);
-        if NB >= 2 {
-            let a = at(ab_z_idx::<1, 7>(v));
-            (o0, o1, o2, o3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
-        }
-        if NB >= 3 {
-            let a = at(ab_z_idx::<2, 7>(w));
-            let (m01, m23) = (ld(a, 64), ld(a, 80));
-            (e0, e1, e2, e3) = (veorq_u8(e0, m01), veorq_u8(e1, m01), veorq_u8(e2, m23), veorq_u8(e3, m23));
-        }
-        if NB >= 4 {
-            let a = at(ab_z_idx::<3, 7>(w));
-            let (m01, m23) = (ld(a, 64), ld(a, 80));
-            (o0, o1, o2, o3) = (veorq_u8(o0, m01), veorq_u8(o1, m01), veorq_u8(o2, m23), veorq_u8(o3, m23));
-        }
-        // x^4 · 1 in GF(2^8).
-        let c = vdupq_n_u8(0x10);
-        let sw = |x: uint8x16_t| vextq_u8::<8>(x, x);
-        if NB == 1 {
-            return if HIGH {
-                (veorq_u8(c, sw(e3)), veorq_u8(c, sw(e2)), veorq_u8(c, sw(e1)), veorq_u8(c, sw(e0)))
-            } else {
-                (veorq_u8(c, e0), veorq_u8(c, e1), veorq_u8(c, e2), veorq_u8(c, e3))
-            };
-        }
-        if HIGH {
-            (xor3_u8(c, o3, sw(e3)), xor3_u8(c, o2, sw(e2)), xor3_u8(c, o1, sw(e1)), xor3_u8(c, o0, sw(e0)))
+        let a = rec(ab_z_idx::<1, 7>(if NB >= 6 { yl1 ^ (yl1 >> 32) } else { yl1 }));
+        let (d01, d23) = (ld(a, 64), ld(a, 80));
+        let (p, q) = if NB >= 6 {
+            let a = rec(ab_z_idx::<3, 7>(w));
+            let f = ld(z.add(AB_Z_SL2), ab_z_idx::<5, 4>(w));
+            let fc = if CONST_BYTE != 0 { veorq_u8(f, c) } else { f };
+            (xor3_u8(d01, ld(a, 96), fc), xor3_u8(d23, ld(a, 112), fc))
+        } else if NB >= 4 {
+            let a = rec(ab_z_idx::<3, 7>(w));
+            if CONST_BYTE != 0 { (xor3_u8(d01, ld(a, 96), c), xor3_u8(d23, ld(a, 112), c)) }
+            else { (veorq_u8(d01, ld(a, 96)), veorq_u8(d23, ld(a, 112))) }
+        } else if CONST_BYTE != 0 { (veorq_u8(d01, c), veorq_u8(d23, c)) } else { (d01, d23) };
+        let (p, q) = (vreinterpretq_u64_u8(p), vreinterpretq_u64_u8(q));
+        let (b0, b1) = (vreinterpretq_u8_u64(vzip1q_u64(p, p)), vreinterpretq_u8_u64(vzip2q_u64(p, p)));
+        let (b2, b3) = (vreinterpretq_u8_u64(vzip1q_u64(q, q)), vreinterpretq_u8_u64(vzip2q_u64(q, q)));
+        let (o0, o1, o2, o3) = if NB >= 5 {
+            let a = rec(ab_z_idx::<2, 7>(ys));
+            let (m0, m2) = (ld(a, 0), ld(a, 16));
+            let a = rec(ab_z_idx::<4, 7>(if NB == 5 { w } else { ys }));
+            let (n0, n1) = (ld(a, 32), ld(a, 48));
+            (veorq_u8(xor3_u8(l0, m0, n0), b0), veorq_u8(xor3_u8(l1, m0, n1), b1),
+             veorq_u8(xor3_u8(l2, m2, n0), b2), veorq_u8(xor3_u8(l3, m2, n1), b3))
+        } else if NB >= 3 {
+            let a = rec(ab_z_idx::<2, 7>(if NB == 3 { w } else { ys }));
+            let (m0, m2) = (ld(a, 0), ld(a, 16));
+            (xor3_u8(l0, m0, b0), xor3_u8(l1, m0, b1), xor3_u8(l2, m2, b2), xor3_u8(l3, m2, b3))
         } else {
-            (xor3_u8(c, e0, sw(o0)), xor3_u8(c, e1, sw(o1)), xor3_u8(c, e2, sw(o2)), xor3_u8(c, e3, sw(o3)))
-        }
+            (veorq_u8(l0, b0), veorq_u8(l1, b1), veorq_u8(l2, b2), veorq_u8(l3, b3))
+        };
+        if HIGH { (sw(o3), sw(o2), sw(o1), sw(o0)) } else { (o0, o1, o2, o3) }
     }
 }
 
-/// [`apply_word_sparse_x4`] equals the `x^4`-scaled apply of the whole word
-/// ([`apply_word_into_4_regs`] out of the scaled image) for every static-B
-/// word shape it serves (`NB` = 1..4 low or high varying bytes, all other
-/// bytes 0xff): every byte value at every varying position, and random
+/// [`apply_word_z_sparse`] equals the plain and `x^4`-scaled whole-word applies
+/// for every static-B word shape (`NB` = 1..=6 low or high varying bytes, all
+/// other bytes 0xff): every byte value at every varying position, and random
 /// varying bytes.
 #[cfg(all(test, target_arch = "aarch64"))]
 #[test]
@@ -4740,17 +4692,20 @@ fn ab_sparse_x4_apply_matches_scaled_apply() {
                 // The guarded word: every static byte 0xff, varying bytes `!v`.
                 let b = !v;
                 // SAFETY: the applies read inside the table images only.
-                let (got, want) = unsafe {
+                let (got, want, got_p, want_p) = unsafe {
                     (
-                        bytes(apply_word_sparse_x4::<$nb, $high>(kara.wrapping_add(AB_KARA_IMAGE_BYTES), !b)),
+                        bytes(apply_word_z_sparse::<$nb, $high, 0x10>(table.scaled_x4_data_ptr(), kara.wrapping_add(2 * AB_KARA_IMAGE_BYTES + AB_Z_IMAGE_BYTES), !b)),
                         bytes(apply_word_into_4_regs(
                             table.scaled_x4_data_ptr(),
                             table.scaled_x4_half_swapped_data_ptr(),
                             b,
                         )),
+                        bytes(apply_word_z_sparse::<$nb, $high, 0x01>(table.data_ptr(), kara.wrapping_add(2 * AB_KARA_IMAGE_BYTES), !b)),
+                        bytes(apply_word_into_4_regs(table.data_ptr(), table.half_swapped_data_ptr(), b)),
                     )
                 };
                 assert_eq!(got, want, "nb={} high={} b={b:016x}", $nb, $high);
+                assert_eq!(got_p, want_p, "plain nb={} high={} b={b:016x}", $nb, $high);
                 checked += 1;
             }
         }};
@@ -4763,7 +4718,11 @@ fn ab_sparse_x4_apply_matches_scaled_apply() {
     case!(3, true);
     case!(4, false);
     case!(4, true);
-    assert_eq!(checked, 256 * 20 + 8 * 4000);
+    case!(5, false);
+    case!(5, true);
+    case!(6, false);
+    case!(6, true);
+    assert_eq!(checked, 256 * 42 + 12 * 4000);
 }
 
 /// Test access: one static-B word `(blk, k)` of a plan whose varying bytes
@@ -6102,10 +6061,7 @@ pub(crate) fn ab_mixed_row_direct(
 /// Keep the complete mixed-row path under its alternate process settings.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn ab_mixed_row_residual_enabled() -> bool {
-    ab_mixed_row_direct_route()
-        && ab_mixed_h2_enabled()
-        && ab_mixed_fuse_enabled()
-        && ab_kara_lanez_enabled()
+    ab_mixed_row_direct_route() && ab_mixed_h2_enabled() && ab_mixed_fuse_enabled()
 }
 
 /// Produce the remaining terms of a mixed row after its certified B=1
@@ -6123,7 +6079,7 @@ pub(crate) fn ab_mixed_row_residual(
     out: &mut [u8; 64],
     nt_store: bool,
 ) {
-    const MAIN: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_KARA_LANEZ | ABV_OMIT_MIXED_ONES;
+    const MAIN: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_Z_SCALED | ABV_OMIT_MIXED_ONES;
     const HELPER: u32 = ABV_HZ | ABV_OMIT_MIXED_ONES;
     let base = chunk_byte_base + b_med * N_CHUNKS * 8;
     assert!(base + N_CHUNKS * 8 <= a_packed.len().min(b_packed.len()));
@@ -6162,7 +6118,7 @@ pub(crate) fn ab_mixed_rows_residual_unit(
     out_unit: &mut [u8],
     nt_store: bool,
 ) {
-    const MAIN: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_KARA_LANEZ | ABV_OMIT_MIXED_ONES;
+    const MAIN: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_Z_SCALED | ABV_OMIT_MIXED_ONES;
     const HELPER: u32 = ABV_HZ | ABV_OMIT_MIXED_ONES;
     const ROW_BYTES: usize = N_CHUNKS * 8;
     const OUTER_BYTES: usize = 16 * ROW_BYTES;
