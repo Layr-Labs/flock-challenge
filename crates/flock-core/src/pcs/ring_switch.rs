@@ -1944,14 +1944,19 @@ const FOLD_TABLE_SIZE: usize = 256;
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = crate::alloc_uninit_f128_vec(FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    let nibble_join = compose_nibble_join_enabled();
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         let table = &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE];
-        table[0] = F128::ZERO;
-        for (bit_in_byte, &generator) in eq_r_dprime[bit_base..bit_base + 8].iter().enumerate() {
-            let half = 1usize << bit_in_byte;
-            for value in 0..half {
-                table[value + half] = table[value] + generator;
+        if nibble_join {
+            fill_composed_byte_bank(&eq_r_dprime[bit_base..bit_base + 8], table);
+        } else {
+            table[0] = F128::ZERO;
+            for (bit_in_byte, &generator) in eq_r_dprime[bit_base..bit_base + 8].iter().enumerate() {
+                let half = 1usize << bit_in_byte;
+                for value in 0..half {
+                    table[value + half] = table[value] + generator;
+                }
             }
         }
     }
@@ -2052,6 +2057,42 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     q0 + (q1 + q2)
 }
 
+#[inline]
+pub(crate) fn fold_slots_assign(eq_lo: &[F128], tables: &[F128], out: &mut [F128]) {
+    debug_assert_eq!(eq_lo.len(), out.len());
+    debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    let n = out.len();
+    let mut i = 0usize;
+    while i + 1 < n {
+        let v0 = fold_one_slot(eq_lo[i], tables);
+        let v1 = fold_one_slot(eq_lo[i + 1], tables);
+        out[i] = v0;
+        out[i + 1] = v1;
+        i += 2;
+    }
+    if i < n {
+        out[i] = fold_one_slot(eq_lo[i], tables);
+    }
+}
+
+#[inline]
+pub(crate) fn fold_slots_add_assign(eq_lo: &[F128], tables: &[F128], out: &mut [F128]) {
+    debug_assert_eq!(eq_lo.len(), out.len());
+    debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    let n = out.len();
+    let mut i = 0usize;
+    while i + 1 < n {
+        let v0 = fold_one_slot(eq_lo[i], tables);
+        let v1 = fold_one_slot(eq_lo[i + 1], tables);
+        out[i] += v0;
+        out[i + 1] += v1;
+        i += 2;
+    }
+    if i < n {
+        out[i] += fold_one_slot(eq_lo[i], tables);
+    }
+}
+
 /// Total length of a fold byte table (`build_fold_byte_table` output).
 pub(crate) const FOLD_TABLE_LEN: usize = FOLD_N_BYTES * FOLD_TABLE_SIZE;
 
@@ -2075,7 +2116,7 @@ fn compose_nibble_join_enabled() -> bool {
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
-    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vld1q_u64, vst1q_u64};
+    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vld1q_u64};
     debug_assert_eq!(g.len(), 8);
     debug_assert_eq!(out.len(), 256);
     // SAFETY: `g` has 8 `F128` elements and `out` has 256 `F128` elements.
@@ -2109,25 +2150,123 @@ fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
         let h_lo: [uint64x2_t; 4] = [l0, g4, g5, veorq_u64(g4, g5)];
         let h_hi: [uint64x2_t; 4] = [l0, g6, g7, veorq_u64(g6, g7)];
         let mut dst = out.as_mut_ptr();
-        for &hi in &h_hi {
-            for &lo in &h_lo {
+        core::arch::asm!(
+            "stp {v0:q}, {v1:q}, [{p}, #0]",
+            "stp {v2:q}, {v3:q}, [{p}, #32]",
+            "stp {v4:q}, {v5:q}, [{p}, #64]",
+            "stp {v6:q}, {v7:q}, [{p}, #96]",
+            "stp {v8:q}, {v9:q}, [{p}, #128]",
+            "stp {v10:q}, {v11:q}, [{p}, #160]",
+            "stp {v12:q}, {v13:q}, [{p}, #192]",
+            "stp {v14:q}, {v15:q}, [{p}, #224]",
+            p = in(reg) dst,
+            v0 = in(vreg) l0,
+            v1 = in(vreg) l1,
+            v2 = in(vreg) l2,
+            v3 = in(vreg) l3,
+            v4 = in(vreg) l4,
+            v5 = in(vreg) l5,
+            v6 = in(vreg) l6,
+            v7 = in(vreg) l7,
+            v8 = in(vreg) l8,
+            v9 = in(vreg) l9,
+            v10 = in(vreg) l10,
+            v11 = in(vreg) l11,
+            v12 = in(vreg) l12,
+            v13 = in(vreg) l13,
+            v14 = in(vreg) l14,
+            v15 = in(vreg) l15,
+            options(nostack, preserves_flags),
+        );
+        dst = dst.add(16);
+        #[inline(always)]
+        unsafe fn emit_row(
+            dst: *mut F128,
+            h: uint64x2_t,
+            l1: uint64x2_t,
+            l2: uint64x2_t,
+            l3: uint64x2_t,
+            l4: uint64x2_t,
+            l5: uint64x2_t,
+            l6: uint64x2_t,
+            l7: uint64x2_t,
+            l8: uint64x2_t,
+            l9: uint64x2_t,
+            l10: uint64x2_t,
+            l11: uint64x2_t,
+            l12: uint64x2_t,
+            l13: uint64x2_t,
+            l14: uint64x2_t,
+            l15: uint64x2_t,
+        ) {
+            unsafe {
+                let r1 = veorq_u64(l1, h);
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}, #0]",
+                    p = in(reg) dst, a = in(vreg) h, b = in(vreg) r1,
+                    options(nostack, preserves_flags),
+                );
+                let r2 = veorq_u64(l2, h);
+                let r3 = veorq_u64(l3, h);
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}, #32]",
+                    p = in(reg) dst, a = in(vreg) r2, b = in(vreg) r3,
+                    options(nostack, preserves_flags),
+                );
+                let r4 = veorq_u64(l4, h);
+                let r5 = veorq_u64(l5, h);
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}, #64]",
+                    p = in(reg) dst, a = in(vreg) r4, b = in(vreg) r5,
+                    options(nostack, preserves_flags),
+                );
+                let r6 = veorq_u64(l6, h);
+                let r7 = veorq_u64(l7, h);
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}, #96]",
+                    p = in(reg) dst, a = in(vreg) r6, b = in(vreg) r7,
+                    options(nostack, preserves_flags),
+                );
+                let r8 = veorq_u64(l8, h);
+                let r9 = veorq_u64(l9, h);
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}, #128]",
+                    p = in(reg) dst, a = in(vreg) r8, b = in(vreg) r9,
+                    options(nostack, preserves_flags),
+                );
+                let r10 = veorq_u64(l10, h);
+                let r11 = veorq_u64(l11, h);
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}, #160]",
+                    p = in(reg) dst, a = in(vreg) r10, b = in(vreg) r11,
+                    options(nostack, preserves_flags),
+                );
+                let r12 = veorq_u64(l12, h);
+                let r13 = veorq_u64(l13, h);
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}, #192]",
+                    p = in(reg) dst, a = in(vreg) r12, b = in(vreg) r13,
+                    options(nostack, preserves_flags),
+                );
+                let r14 = veorq_u64(l14, h);
+                let r15 = veorq_u64(l15, h);
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}, #224]",
+                    p = in(reg) dst, a = in(vreg) r14, b = in(vreg) r15,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        for &lo in &h_lo[1..] {
+            emit_row(dst, lo, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15);
+            dst = dst.add(16);
+        }
+        for &hi in &h_hi[1..] {
+            emit_row(dst, hi, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15);
+            dst = dst.add(16);
+            for &lo in &h_lo[1..] {
                 let h = veorq_u64(lo, hi);
-                vst1q_u64(dst.cast::<u64>(), h);
-                vst1q_u64(dst.add(1).cast::<u64>(), veorq_u64(l1, h));
-                vst1q_u64(dst.add(2).cast::<u64>(), veorq_u64(l2, h));
-                vst1q_u64(dst.add(3).cast::<u64>(), veorq_u64(l3, h));
-                vst1q_u64(dst.add(4).cast::<u64>(), veorq_u64(l4, h));
-                vst1q_u64(dst.add(5).cast::<u64>(), veorq_u64(l5, h));
-                vst1q_u64(dst.add(6).cast::<u64>(), veorq_u64(l6, h));
-                vst1q_u64(dst.add(7).cast::<u64>(), veorq_u64(l7, h));
-                vst1q_u64(dst.add(8).cast::<u64>(), veorq_u64(l8, h));
-                vst1q_u64(dst.add(9).cast::<u64>(), veorq_u64(l9, h));
-                vst1q_u64(dst.add(10).cast::<u64>(), veorq_u64(l10, h));
-                vst1q_u64(dst.add(11).cast::<u64>(), veorq_u64(l11, h));
-                vst1q_u64(dst.add(12).cast::<u64>(), veorq_u64(l12, h));
-                vst1q_u64(dst.add(13).cast::<u64>(), veorq_u64(l13, h));
-                vst1q_u64(dst.add(14).cast::<u64>(), veorq_u64(l14, h));
-                vst1q_u64(dst.add(15).cast::<u64>(), veorq_u64(l15, h));
+                emit_row(dst, h, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15);
                 dst = dst.add(16);
             }
         }
@@ -2304,13 +2443,18 @@ pub(crate) fn build_direct_fold8_table_from_generators(generators: &[F128]) -> V
     assert_eq!(generators.len(), 1 << LOG_PACKING);
 
     let mut out = crate::alloc_uninit_f128_vec(FOLD_TABLE_LEN);
+    let nibble_join = compose_nibble_join_enabled();
     for byte in 0..FOLD_N_BYTES {
         let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
-        table[0] = F128::ZERO;
-        for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
-            let half = 1usize << bit;
-            for value in 0..half {
-                table[value + half] = table[value] + generator;
+        if nibble_join {
+            fill_composed_byte_bank(&generators[byte * 8..byte * 8 + 8], table);
+        } else {
+            table[0] = F128::ZERO;
+            for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
+                let half = 1usize << bit;
+                for value in 0..half {
+                    table[value + half] = table[value] + generator;
+                }
             }
         }
     }

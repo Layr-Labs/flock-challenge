@@ -8196,9 +8196,7 @@ fn direct_fold8_rest_claims_round0(
     {
         for (claim, table) in init_claims.iter().zip(init_tables.iter()) {
             super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
-            for (slot, out) in b_out.iter_mut().enumerate() {
-                *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-            }
+            super::ring_switch::fold_slots_add_assign(&claim.eq_lo, scratch, b_out);
         }
         super::ring_switch::compose_fold_byte_table_into(
             last_claim.eq_hi[block],
@@ -8213,9 +8211,7 @@ fn direct_fold8_rest_claims_round0(
     }
     for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
         super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
-        for (slot, out) in b_out.iter_mut().enumerate() {
-            *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
-        }
+        super::ring_switch::fold_slots_add_assign(&claim.eq_lo, scratch, b_out);
     }
     super::round0_deferred(f_out, b_out)
 }
@@ -8566,9 +8562,7 @@ fn materialize_direct_fold8(
             first_table,
             scratch,
         );
-        for (slot, out) in b_out.iter_mut().enumerate() {
-            *out = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-        }
+        super::ring_switch::fold_slots_assign(&first_claim.eq_lo, scratch, b_out);
         direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
     };
 
