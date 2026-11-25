@@ -437,14 +437,10 @@ pub(super) unsafe fn round0_and_round1_lookahead(
 
         let mut i = 0usize;
         while i < witness.len() {
-            let a0 = vld1q_u64(witness.as_ptr().add(i).cast::<u64>());
-            let a1 = vld1q_u64(witness.as_ptr().add(i + 1).cast::<u64>());
-            let a2 = vld1q_u64(witness.as_ptr().add(i + 2).cast::<u64>());
-            let a3 = vld1q_u64(witness.as_ptr().add(i + 3).cast::<u64>());
-            let b0 = vld1q_u64(basis.as_ptr().add(i).cast::<u64>());
-            let b1 = vld1q_u64(basis.as_ptr().add(i + 1).cast::<u64>());
-            let b2 = vld1q_u64(basis.as_ptr().add(i + 2).cast::<u64>());
-            let b3 = vld1q_u64(basis.as_ptr().add(i + 3).cast::<u64>());
+            let (a0, a1) = load_pair_whole(witness.as_ptr().add(i));
+            let (a2, a3) = load_pair_whole(witness.as_ptr().add(i + 2));
+            let (b0, b1) = load_pair_whole(basis.as_ptr().add(i));
+            let (b2, b3) = load_pair_whole(basis.as_ptr().add(i + 2));
 
             let sa0 = veorq_u64(a0, a1);
             let sb0 = veorq_u64(b0, b1);
@@ -844,11 +840,9 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
 
         let low = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
         let high = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
-        let o = out.as_mut_ptr().cast::<u64>();
-        vst1q_u64(o, low[0]);
-        vst1q_u64(o.add(2), low[1]);
-        vst1q_u64(o.add(4), high[0]);
-        vst1q_u64(o.add(6), high[1]);
+        let o = out.as_mut_ptr();
+        store_pair_whole(o, low[0], low[1]);
+        store_pair_whole(o.add(2), high[0], high[1]);
     }
 }
 
@@ -896,10 +890,8 @@ pub(super) unsafe fn fold_bank_major_128x64_rows2(
 
             let lo = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
             let hi = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
-            vst1q_u64(out.add(lane).cast::<u64>(), lo[0]);
-            vst1q_u64(out.add(lane + 1).cast::<u64>(), lo[1]);
-            vst1q_u64(out.add(lane + 2).cast::<u64>(), hi[0]);
-            vst1q_u64(out.add(lane + 3).cast::<u64>(), hi[1]);
+            store_pair_whole(out.add(lane), lo[0], lo[1]);
+            store_pair_whole(out.add(lane + 2), hi[0], hi[1]);
             lane += 4;
         }
     }
@@ -949,10 +941,8 @@ pub(super) unsafe fn fold_bank_major_64x128_rows2(
 
             let lo = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
             let hi = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
-            vst1q_u64(out.add(lane).cast::<u64>(), lo[0]);
-            vst1q_u64(out.add(lane + 1).cast::<u64>(), lo[1]);
-            vst1q_u64(out.add(lane + 2).cast::<u64>(), hi[0]);
-            vst1q_u64(out.add(lane + 3).cast::<u64>(), hi[1]);
+            store_pair_whole(out.add(lane), lo[0], lo[1]);
+            store_pair_whole(out.add(lane + 2), hi[0], hi[1]);
             lane += 4;
         }
     }
@@ -1351,10 +1341,8 @@ unsafe fn fold_two_and_msg_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+            store_pair_whole(nf.as_mut_ptr().add(t), f0, f1);
+            store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
 
             tri_acc_q(&mut u0, f0, b0);
             tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
@@ -1449,10 +1437,8 @@ unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(f_ptr.add(t).cast::<u64>(), f0);
-            vst1q_u64(f_ptr.add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(b_ptr.add(t).cast::<u64>(), b0);
-            vst1q_u64(b_ptr.add(t + 1).cast::<u64>(), b1);
+            store_pair_whole(f_ptr.add(t), f0, f1);
+            store_pair_whole(b_ptr.add(t), b0, b1);
 
             tri_acc_q(&mut u0, f0, b0);
             tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
@@ -1572,10 +1558,8 @@ unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+            store_pair_whole(nf.as_mut_ptr().add(t), f0, f1);
+            store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
 
             tri_acc_q(&mut u0, f0, b0);
             tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
@@ -1666,8 +1650,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                     veorq_u64(f_even1, folded_f[1]),
                 )
             };
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
+            store_pair_whole(nf.as_mut_ptr().add(t), f0, f1);
             t += 2;
         }
 
@@ -1708,8 +1691,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                     addend1,
                     b_even1,
                 );
-                vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-                vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+                store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
                 t += 2;
             }
         } else {
@@ -1749,8 +1731,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                 );
                 let b0 = veorq_u64(partial_b0, deferred_delta_and_addend[0]);
                 let b1 = veorq_u64(partial_b1, deferred_delta_and_addend[1]);
-                vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-                vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+                store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
                 t += 2;
             }
         }
@@ -1888,10 +1869,6 @@ unsafe fn fold2_two_and_msgs_impl(
                     let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                     (veorq_u64(vf0, pw[0]), veorq_u64(vb0, pw[1]))
                 };
-                if !nt_stores {
-                    vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
-                    vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
-                }
                 w_regs_f[q] = wq_f;
                 w_regs_b[q] = wq_b;
             }
@@ -1900,6 +1877,11 @@ unsafe fn fold2_two_and_msgs_impl(
                 store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
                 store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
                 store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
+            } else {
+                store_pair_whole(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
+                store_pair_whole(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
+                store_pair_whole(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
+                store_pair_whole(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
             }
             let s0f = veorq_u64(w_regs_f[0], w_regs_f[1]);
             let s0b = veorq_u64(w_regs_b[0], w_regs_b[1]);
@@ -2025,10 +2007,6 @@ unsafe fn fold2_two_and_msg_impl(
                     let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                     (veorq_u64(vf0, pw[0]), veorq_u64(vb0, pw[1]))
                 };
-                if !nt_stores {
-                    vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
-                    vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
-                }
                 w_regs_f[q] = wq_f;
                 w_regs_b[q] = wq_b;
             }
@@ -2037,6 +2015,11 @@ unsafe fn fold2_two_and_msg_impl(
                 store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
                 store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
                 store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
+            } else {
+                store_pair_whole(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
+                store_pair_whole(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
+                store_pair_whole(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
+                store_pair_whole(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
             }
 
             let s0f = veorq_u64(w_regs_f[0], w_regs_f[1]);

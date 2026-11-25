@@ -8023,6 +8023,35 @@ fn fold_tri_and_message_core_with<
     }
 
     #[inline(always)]
+    unsafe fn load_pair_q(src: *const uint64x2_t) -> (uint64x2_t, uint64x2_t) {
+        let x: uint64x2_t;
+        let y: uint64x2_t;
+        unsafe {
+            core::arch::asm!(
+                "ldp {x:q}, {y:q}, [{src}]",
+                src = in(reg) src,
+                x = lateout(vreg) x,
+                y = lateout(vreg) y,
+                options(nostack, readonly, preserves_flags),
+            );
+        }
+        (x, y)
+    }
+
+    #[inline(always)]
+    unsafe fn store_pair_q(dst: *mut uint64x2_t, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            core::arch::asm!(
+                "stp {x:q}, {y:q}, [{dst}]",
+                dst = in(reg) dst,
+                x = in(vreg) x,
+                y = in(vreg) y,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
     unsafe fn store_pair<const NT: bool>(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
         unsafe {
             if NT {
@@ -8034,8 +8063,13 @@ fn fold_tri_and_message_core_with<
                     options(nostack, preserves_flags),
                 );
             } else {
-                vst1q_u64(dst.cast::<u64>(), x);
-                vst1q_u64(dst.add(1).cast::<u64>(), y);
+                core::arch::asm!(
+                    "stp {x:q}, {y:q}, [{dst}]",
+                    dst = in(reg) dst,
+                    x = in(vreg) x,
+                    y = in(vreg) y,
+                    options(nostack, preserves_flags),
+                );
             }
         }
     }
@@ -8314,75 +8348,143 @@ fn fold_tri_and_message_core_with<
                     // `PMULL`s and 10 instructions per row; the same fully
                     // reduced products as the schoolbook and Karatsuba forms.
                     // `seeded`: six SIMD issue slots per row instead of seven.
-                    let p0 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 2).cast::<u64>());
-                    let p1 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 3).cast::<u64>());
+                    let (p0, p1) = load_pair_q(eq_prep.as_ptr().add(4 * y + 2).cast::<uint64x2_t>());
                     if seeded {
-                        for i in 0..8 {
-                            ta_p.add(i).write(mul_prep86_seeded_q(p0, p1, a[i], pp.k));
+                        for h in 0..4 {
+                            let v0 = mul_prep86_seeded_q(p0, p1, a[2 * h], pp.k);
+                            let v1 = mul_prep86_seeded_q(p0, p1, a[2 * h + 1], pp.k);
+                            store_pair_q(ta_p.add(2 * h), v0, v1);
                         }
                     } else {
-                        for i in 0..8 {
-                            ta_p.add(i).write(mul_prep86_q(p0, p1, a[i], pp.k));
+                        for h in 0..4 {
+                            let v0 = mul_prep86_q(p0, p1, a[2 * h], pp.k);
+                            let v1 = mul_prep86_q(p0, p1, a[2 * h + 1], pp.k);
+                            store_pair_q(ta_p.add(2 * h), v0, v1);
                         }
                     }
                 } else {
                     let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
                     let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
-                    for i in 0..8 {
-                        ta_p.add(i).write(mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]));
+                    for h in 0..4 {
+                        let v0 = mul_sw_tri_binius_karatsuba_q(w, w_sum, a[2 * h]);
+                        let v1 = mul_sw_tri_binius_karatsuba_q(w, w_sum, a[2 * h + 1]);
+                        store_pair_q(ta_p.add(2 * h), v0, v1);
                     }
                 }
-                tb[t].write(b);
+                let tb_p = tb[t].as_mut_ptr().cast::<uint64x2_t>();
+                for h in 0..4 {
+                    store_pair_q(tb_p.add(2 * h), b[2 * h], b[2 * h + 1]);
+                }
             }
             g0 += gn;
             if ABL & 1 != 0 {
                 continue;
             }
+            // Split the 8-accumulator passes into 4-accumulator (12 Q-reg) sub-passes
+            // with paired `ldp q, q` loads from the L1-hot `ta`/`tb` tile, keeping all
+            // live TriNeon accumulators well under the 32-VREG spill cliff.
             {
-                let mut e = [acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]];
+                let mut e = [acc[0], acc[1], acc[4], acc[5]];
                 for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
-                    for j in 0..4 {
-                        tri_acc_q(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
-                        tri_acc_q(
-                            &mut e[4 + j],
-                            veorq_u64(aw[2 * j], aw[2 * j + 1]),
-                            veorq_u64(b[2 * j], b[2 * j + 1]),
-                        );
-                    }
+                    let ap = ta[t].as_ptr().cast::<uint64x2_t>();
+                    let bp = tb[t].as_ptr().cast::<uint64x2_t>();
+                    let (a0, a1) = load_pair_q(ap);
+                    let (b0, b1) = load_pair_q(bp);
+                    tri_acc_q(&mut e[0], a1, b1);
+                    tri_acc_q(&mut e[2], veorq_u64(a0, a1), veorq_u64(b0, b1));
+                    let (a2, a3) = load_pair_q(ap.add(2));
+                    let (b2, b3) = load_pair_q(bp.add(2));
+                    tri_acc_q(&mut e[1], a3, b3);
+                    tri_acc_q(&mut e[3], veorq_u64(a2, a3), veorq_u64(b2, b3));
                 }
-                acc[..8].copy_from_slice(&e);
+                acc[0] = e[0];
+                acc[1] = e[1];
+                acc[4] = e[2];
+                acc[5] = e[3];
             }
             {
-                let mut l = [
-                    acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
-                ];
+                let mut e = [acc[2], acc[3], acc[6], acc[7]];
                 for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
-                    for k in 0..2 {
-                        let o = 4 * k;
-                        tri_acc_q(&mut l[k], aw[o + 2], b[o + 2]);
-                        let (ea, eb) = (veorq_u64(aw[o], aw[o + 2]), veorq_u64(b[o], b[o + 2]));
-                        let (oa, ob) =
-                            (veorq_u64(aw[o + 1], aw[o + 3]), veorq_u64(b[o + 1], b[o + 3]));
-                        tri_acc_q(&mut l[2 + k], ea, eb);
-                        tri_acc_q(&mut l[4 + k], oa, ob);
-                        tri_acc_q(&mut l[6 + k], veorq_u64(ea, oa), veorq_u64(eb, ob));
-                    }
+                    let ap = ta[t].as_ptr().cast::<uint64x2_t>();
+                    let bp = tb[t].as_ptr().cast::<uint64x2_t>();
+                    let (a4, a5) = load_pair_q(ap.add(4));
+                    let (b4, b5) = load_pair_q(bp.add(4));
+                    tri_acc_q(&mut e[0], a5, b5);
+                    tri_acc_q(&mut e[2], veorq_u64(a4, a5), veorq_u64(b4, b5));
+                    let (a6, a7) = load_pair_q(ap.add(6));
+                    let (b6, b7) = load_pair_q(bp.add(6));
+                    tri_acc_q(&mut e[1], a7, b7);
+                    tri_acc_q(&mut e[3], veorq_u64(a6, a7), veorq_u64(b6, b7));
                 }
-                acc[8..16].copy_from_slice(&l);
+                acc[2] = e[0];
+                acc[3] = e[1];
+                acc[6] = e[2];
+                acc[7] = e[3];
+            }
+            {
+                let mut l = [acc[8], acc[10], acc[12], acc[14]];
+                for t in 0..gn {
+                    let ap = ta[t].as_ptr().cast::<uint64x2_t>();
+                    let bp = tb[t].as_ptr().cast::<uint64x2_t>();
+                    let (a0, a1) = load_pair_q(ap);
+                    let (a2, a3) = load_pair_q(ap.add(2));
+                    let (b0, b1) = load_pair_q(bp);
+                    let (b2, b3) = load_pair_q(bp.add(2));
+                    tri_acc_q(&mut l[0], a2, b2);
+                    let (ea, eb) = (veorq_u64(a0, a2), veorq_u64(b0, b2));
+                    let (oa, ob) = (veorq_u64(a1, a3), veorq_u64(b1, b3));
+                    tri_acc_q(&mut l[1], ea, eb);
+                    tri_acc_q(&mut l[2], oa, ob);
+                    tri_acc_q(&mut l[3], veorq_u64(ea, oa), veorq_u64(eb, ob));
+                }
+                acc[8] = l[0];
+                acc[10] = l[1];
+                acc[12] = l[2];
+                acc[14] = l[3];
+            }
+            {
+                let mut l = [acc[9], acc[11], acc[13], acc[15]];
+                for t in 0..gn {
+                    let ap = ta[t].as_ptr().cast::<uint64x2_t>();
+                    let bp = tb[t].as_ptr().cast::<uint64x2_t>();
+                    let (a4, a5) = load_pair_q(ap.add(4));
+                    let (a6, a7) = load_pair_q(ap.add(6));
+                    let (b4, b5) = load_pair_q(bp.add(4));
+                    let (b6, b7) = load_pair_q(bp.add(6));
+                    tri_acc_q(&mut l[0], a6, b6);
+                    let (ea, eb) = (veorq_u64(a4, a6), veorq_u64(b4, b6));
+                    let (oa, ob) = (veorq_u64(a5, a7), veorq_u64(b5, b7));
+                    tri_acc_q(&mut l[1], ea, eb);
+                    tri_acc_q(&mut l[2], oa, ob);
+                    tri_acc_q(&mut l[3], veorq_u64(ea, oa), veorq_u64(eb, ob));
+                }
+                acc[9] = l[0];
+                acc[11] = l[1];
+                acc[13] = l[2];
+                acc[15] = l[3];
             }
             {
                 let mut g = [acc[16], acc[17], acc[18], acc[20], acc[21]];
                 for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_mut(), tb[t].assume_init_mut());
-                    tri_acc_q(&mut g[0], aw[4], b[4]);
-                    let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
-                    let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
-                    let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
-                    let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
-                    aw[..4].copy_from_slice(&[s0a, s1a, s2a, s3a]);
-                    b[..4].copy_from_slice(&[s0b, s1b, s2b, s3b]);
+                    let ap = ta[t].as_mut_ptr().cast::<uint64x2_t>();
+                    let bp = tb[t].as_mut_ptr().cast::<uint64x2_t>();
+                    let (a0, a1) = load_pair_q(ap);
+                    let (a2, a3) = load_pair_q(ap.add(2));
+                    let (a4, a5) = load_pair_q(ap.add(4));
+                    let (a6, a7) = load_pair_q(ap.add(6));
+                    let (b0, b1) = load_pair_q(bp);
+                    let (b2, b3) = load_pair_q(bp.add(2));
+                    let (b4, b5) = load_pair_q(bp.add(4));
+                    let (b6, b7) = load_pair_q(bp.add(6));
+                    tri_acc_q(&mut g[0], a4, b4);
+                    let (s0a, s0b) = (veorq_u64(a0, a4), veorq_u64(b0, b4));
+                    let (s1a, s1b) = (veorq_u64(a1, a5), veorq_u64(b1, b5));
+                    let (s2a, s2b) = (veorq_u64(a2, a6), veorq_u64(b2, b6));
+                    let (s3a, s3b) = (veorq_u64(a3, a7), veorq_u64(b3, b7));
+                    store_pair_q(ap, s0a, s1a);
+                    store_pair_q(ap.add(2), s2a, s3a);
+                    store_pair_q(bp, s0b, s1b);
+                    store_pair_q(bp.add(2), s2b, s3b);
                     tri_acc_q(&mut g[1], s0a, s0b);
                     tri_acc_q(&mut g[2], s2a, s2b);
                     tri_acc_q(&mut g[3], s1a, s1b);
@@ -8397,9 +8499,12 @@ fn fold_tri_and_message_core_with<
             {
                 let mut g = [acc[19], acc[22], acc[23], acc[24], acc[25]];
                 for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
-                    let (s0a, s1a, s2a, s3a) = (aw[0], aw[1], aw[2], aw[3]);
-                    let (s0b, s1b, s2b, s3b) = (b[0], b[1], b[2], b[3]);
+                    let ap = ta[t].as_ptr().cast::<uint64x2_t>();
+                    let bp = tb[t].as_ptr().cast::<uint64x2_t>();
+                    let (s0a, s1a) = load_pair_q(ap);
+                    let (s2a, s3a) = load_pair_q(ap.add(2));
+                    let (s0b, s1b) = load_pair_q(bp);
+                    let (s2b, s3b) = load_pair_q(bp.add(2));
                     let (s02a, s02b) = (veorq_u64(s0a, s2a), veorq_u64(s0b, s2b));
                     let (s13a, s13b) = (veorq_u64(s1a, s3a), veorq_u64(s1b, s3b));
                     let (s01a, s01b) = (veorq_u64(s0a, s1a), veorq_u64(s0b, s1b));
