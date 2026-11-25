@@ -1059,7 +1059,15 @@ fn partial_fold_packed_z_best_gpu_split(
             eq_outer,
             claim_lo,
         );
-        let suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
+        let mut suffix_ms = t_suffix.elapsed().as_secs_f64() * 1e3;
+        if crate::gpu_commit::lincheck_fold_tune_take_replays() {
+            for _ in 0..2 {
+                let t = std::time::Instant::now();
+                let again = partial_fold_packed_z_neon_oblock_padded_suffix(z_packed, m, k_log, useful_bits, eq_outer, claim_lo);
+                suffix_ms = suffix_ms.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(again);
+            }
+        }
         // No head in this window: the CPU suffix starts at submission.
         match job.finish_xor_into(&mut out, 0.0, suffix_ms) {
             Ok(()) => return out,

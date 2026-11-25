@@ -4256,91 +4256,13 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     const GPU_COMMIT_DEFAULT: bool = true;
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && gpu_commit_env_clear()
+        && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
 }
 
 /// True after untimed warmup permanently selected the ranked GPU path.
 /// The opt-out only restores speculative CPU buffers; it does not disable GPU.
 pub(crate) fn gpu_commit_latched_on() -> bool {
-    lazy_gpu_codeword_env_clear() && imp::gpu_commit_latched_on()
-}
-
-/// Kill switch for keeping the GPU commit's gate environment reads once per
-/// process (`FLOCK_NO_GPU_ENV_ONCE`, any value: every gate below reads its
-/// variable from the process environment on every call, as before). Read
-/// once per process.
-pub const ENV_NO_GPU_ENV_ONCE: &str = "FLOCK_NO_GPU_ENV_ONCE";
-
-pub(crate) fn gpu_env_once_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ENV_ONCE).is_none());
-    *ON
-}
-
-/// `FLOCK_NO_GPU_COMMIT` unset (the environment term of
-/// [`gpu_commit_enabled`]). The process environment does not change while a
-/// worker runs, so the first answer is kept; `FLOCK_NO_GPU_ENV_ONCE`
-/// restores the per-call lookup.
-#[inline]
-fn gpu_commit_env_clear() -> bool {
-    if gpu_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_COMMIT).is_none());
-        return *CLEAR;
-    }
-    std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
-}
-
-/// `FLOCK_NO_LAZY_GPU_CODEWORD` unset (the environment term of
-/// [`gpu_commit_latched_on`]), kept the same way.
-#[inline]
-fn lazy_gpu_codeword_env_clear() -> bool {
-    if gpu_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none());
-        return *CLEAR;
-    }
-    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none()
-}
-
-/// `FLOCK_NO_GPU_TABLE_REUSE` unset (the shared-table term of the final
-/// leaf pass, the g4x2 dead-lane pass and the table share of the three NTT
-/// tile encoders), kept the same way.
-#[inline]
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn gpu_table_reuse_env_clear() -> bool {
-    if gpu_env_once_enabled() {
-        static CLEAR: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none());
-        return *CLEAR;
-    }
-    std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
-}
-
-/// `FLOCK_COMMIT_TIMING` set (the commit's timing trace term), kept the same
-/// way.
-#[inline]
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn commit_timing_env_on() -> bool {
-    if gpu_env_once_enabled() {
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
-        return *ON;
-    }
-    std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
-}
-
-/// `FLOCK_GPU_COMMIT_DEBUG` set (the GPU commit's debug trace term), kept
-/// the same way.
-#[inline]
-#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
-pub(crate) fn gpu_commit_debug_env_on() -> bool {
-    if gpu_env_once_enabled() {
-        static ON: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some());
-        return *ON;
-    }
-    std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none() && imp::gpu_commit_latched_on()
 }
 
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
@@ -9738,7 +9660,7 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
             && super::pass_tune_enabled()
             && super::gpu_mixed_final_selected(log_d, log_d - 4, 4)
             && super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled())
-            && super::gpu_table_reuse_env_clear()
+            && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
     }
 
     pub(crate) unsafe fn encode_ntt_and_merkle(
@@ -13065,7 +12987,7 @@ kernel void blake3_pow_seg_tail(
         let text = *TEXT.get_or_init(|| {
             super::gpu_dead_lane_enabled() && with_g4x2_dead_lanes(g4x2_msl_source()).is_some()
         });
-        text && !gpu.pso_ntt4g4x2.is_null() && super::gpu_table_reuse_env_clear()
+        text && !gpu.pso_ntt4g4x2.is_null() && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
     }
 
     /// [`super::select_from_z_zero_store_from`] for this process and
@@ -13158,7 +13080,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if !super::gpu_table_reuse_env_clear() {
+            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
                 0usize
             } else {
                 2usize
@@ -13243,7 +13165,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if !super::gpu_table_reuse_env_clear() {
+            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
                 0usize
             } else {
                 2usize
@@ -13323,7 +13245,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if !super::gpu_table_reuse_env_clear() {
+            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
                 0usize
             } else {
                 2usize
@@ -14674,7 +14596,8 @@ kernel void blake3_pow_seg_tail(
     }
 
     fn debug_enabled() -> bool {
-        super::commit_timing_env_on() || super::gpu_commit_debug_env_on()
+        std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
+            || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
     }
 
     /// Observability for poisoned process-global locks. The poisoning panic
@@ -14682,7 +14605,7 @@ kernel void blake3_pow_seg_tail(
     /// `catch_unwind`); the score-relevant symptom — a GPU arm silently
     /// degraded or recovered — must be visible under FLOCK_GPU_COMMIT_DEBUG.
     fn note_poisoned_lock(tag: &str, recovered: bool) {
-        if super::gpu_commit_debug_env_on() {
+        if std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some() {
             eprintln!(
                 "[gpu-commit] {tag}: poisoned lock {}",
                 if recovered {
@@ -15085,10 +15008,10 @@ kernel void blake3_pow_seg_tail(
             gpu.end_encoding(enc);
             gpu.commit_async(cb1);
             let queued = next();
-            if super::gpu_wait_help_enabled() && rayon::current_thread_index().is_some() {
+            if !hybrid_arm_recording() && super::gpu_wait_help_enabled() && rayon::current_thread_index().is_some() {
                 super::help_pool_until(|| gpu.cb_status(cb1) >= 4);
             }
-            let waited = gpu.wait_cb(cb1);
+            let waited = if hybrid_arm_recording() { gpu.spin_wait_cb(cb1, 10.0) } else { gpu.wait_cb(cb1) };
             queued.and(waited)
         }
     }
@@ -17093,7 +17016,7 @@ kernel void blake3_pow_seg_tail(
         {
             return;
         }
-        let dbg = debug_enabled() || super::commit_timing_env_on();
+        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         if super::ranked_exact_contention_tune_pending() {
             // The outer warmup join will replay its real A/B branch beside a
             // balanced broad sweep. Avoid double-tuning against a synthetic
@@ -17400,7 +17323,7 @@ kernel void blake3_pow_seg_tail(
             return;
         }
 
-        let dbg = debug_enabled() || super::commit_timing_env_on();
+        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
         let latch = latch_lock();
         let LatchState::On(latched) = &*latch else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -17509,21 +17432,16 @@ kernel void blake3_pow_seg_tail(
             }
         };
         let (lead, extend, phi) = hybrid_tune_sampling();
-        let mut first_pass_ms = None;
+        let mut fp_ms_fixed = f64::INFINITY;
+        if lead {
+            for _ in 0..2 {
+                let tp = std::time::Instant::now();
+                if reprime().is_err() { finish_ranked_exact_contention_tune(params, cpu_tree, 0); return; }
+                fp_ms_fixed = fp_ms_fixed.min(tp.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let delay = lead.then(|| std::time::Duration::from_secs_f64(phi * fp_ms_fixed * 1e-3));
         let sample = |k: usize| -> Result<f64, String> {
-            let delay = if lead {
-                let fp_ms = match first_pass_ms {
-                    Some(ms) => ms,
-                    None => {
-                        let tp = std::time::Instant::now();
-                        reprime()?;
-                        tp.elapsed().as_secs_f64() * 1e3
-                    }
-                };
-                Some(std::time::Duration::from_secs_f64(phi * fp_ms * 1e-3))
-            } else {
-                None
-            };
             let ntt_first = super::ntt_ab_priority_enabled();
             let lens = arm_record_lens();
             let replay_end_ns = std::sync::atomic::AtomicU64::new(0);
@@ -17539,20 +17457,23 @@ kernel void blake3_pow_seg_tail(
                 delay,
                 std::env::var_os("FLOCK_HYBRID_SCORE_JOIN_WALL").is_some(),
             )?;
+            let cb2_s = f64::from_bits(ARM_CB2_START_BITS.load(Ordering::Relaxed));
+            let ab_dur_s = replay_end_ns.load(Ordering::Relaxed).saturating_sub(replay_start_ns.load(Ordering::Relaxed)) as f64 * 1e-9;
+            let lead_s = if lead { (1.0 - phi) * fp_ms_fixed * 1e-3 } else { 0.0 };
             if dbg {
-                let cb2_s = f64::from_bits(ARM_CB2_START_BITS.load(Ordering::Relaxed));
                 let raw = fine_arm_samples().lock().ok().and_then(|v| v.last().copied());
                 eprintln!(
-                    "[gpu-commit] exact-AB sample k={k}: replay start {:.2} end {:.2} ms after cb2 start, fine row {:?}",
+                    "[gpu-commit] exact-AB sample k={k}: replay start {:.2} end {:.2} dur {:.2} norm_ab {:.2} ms, fine row {:?}",
                     (replay_start_ns.load(Ordering::Relaxed) as f64 * 1e-9 - cb2_s) * 1e3,
                     (replay_end_ns.load(Ordering::Relaxed) as f64 * 1e-9 - cb2_s) * 1e3,
+                    ab_dur_s * 1e3,
+                    (ab_dur_s - lead_s) * 1e3,
                     raw,
                 );
             }
             if ntt_first {
-                price_ab_end_into_arms(lens, replay_end_ns.load(Ordering::Relaxed) as f64 * 1e-9);
+                price_ab_end_into_arms(lens, cb2_s + ab_dur_s - lead_s);
             }
-            first_pass_ms = Some(fp_ms);
             if dbg {
                 eprintln!(
                     "[gpu-commit] exact-AB lead k={k}: enabled={lead} phi={phi} first pass {fp_ms:.3} ms, delay {:.3} ms",
@@ -17909,6 +17830,16 @@ kernel void blake3_pow_seg_tail(
         keepwarm_spawn_paused();
     }
 
+    const KW_LEAVES: usize = 16_384;
+    fn keepwarm_scratch(gpu: &Gpu) -> Option<(usize, usize)> {
+        static S: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
+        *S.get_or_init(|| unsafe {
+            let (Ok(d), Ok(t)) = (gpu.new_buffer(KW_LEAVES * 1024), gpu.new_buffer(KW_LEAVES * 32)) else { return None };
+            std::ptr::write_bytes(gpu.buffer_contents(d), 0xA5, KW_LEAVES * 1024);
+            Some((d as usize, t as usize))
+        })
+    }
+
     fn keepwarm_thread() {
         use std::sync::atomic::Ordering;
         // Utility QoS: the bridge must never contend for P-cores.
@@ -17921,21 +17852,8 @@ kernel void blake3_pow_seg_tail(
         let Ok(gpu) = gpu() else { return };
         unsafe {
             let pool = gpu.pool_push();
-            // 16 MiB of leaf input + the matching tree slice: one dispatch is
-            // ~0.2 ms of real GPU work, small enough that at most one is ever
-            // in flight when a prove pauses the bridge (its drain hides under
-            // the prove's CPU-side witness start), large enough to hold DVFS.
-            const KW_LEAVES: usize = 16_384;
-            let (Ok(data), Ok(tree)) = (
-                gpu.new_buffer(KW_LEAVES * 1024),
-                gpu.new_buffer(KW_LEAVES * 32),
-            ) else {
-                gpu.pool_pop(pool);
-                return;
-            };
-            // Contents are irrelevant (private scratch, never read back), but
-            // fault the pages once so dispatches do real reads.
-            std::ptr::write_bytes(gpu.buffer_contents(data), 0xA5, KW_LEAVES * 1024);
+            let Some((d, t)) = keepwarm_scratch(gpu) else { gpu.pool_pop(pool); return; };
+            let (data, tree) = (d as Id, t as Id);
             let mut warmed_s = 0.0f64;
             // Hard cap: a worker's inter-prove windows total well under a
             // minute; anything longer means a non-worker context, stop.
@@ -17960,8 +17878,6 @@ kernel void blake3_pow_seg_tail(
                     break;
                 }
             }
-            gpu.release(data);
-            gpu.release(tree);
             gpu.pool_pop(pool);
         }
     }
@@ -18458,7 +18374,6 @@ kernel void blake3_pow_seg_tail(
                         }
                         let tree = run.gpu_tree;
                         *latch = LatchState::On(run.latched);
-                        keepwarm_spawn_paused();
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
                     // Mismatch or wall regression: discard and fall through
@@ -18524,7 +18439,6 @@ kernel void blake3_pow_seg_tail(
                     }
                     let tree = run.gpu_tree;
                     *latch = LatchState::On(run.latched);
-                    keepwarm_spawn_paused();
                     return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                 }
                 if dbg || !deterministic {
@@ -18636,7 +18550,6 @@ kernel void blake3_pow_seg_tail(
                 &cpu_tree,
             );
             *latch = LatchState::On(run.latched);
-            keepwarm_spawn_paused();
         } else {
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
@@ -18772,7 +18685,7 @@ kernel void blake3_pow_seg_tail(
         let tree = unsafe {
             super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
         };
-        if super::commit_timing_env_on() || debug_enabled() {
+        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
             eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
         }
         // The replicated input codeword was never read by the from-z graph;
@@ -19044,7 +18957,7 @@ kernel void blake3_pow_seg_tail(
                 total_nodes,
             )
         };
-        if super::commit_timing_env_on() || debug_enabled() {
+        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
             let wall_ms = stream.started.elapsed().as_secs_f64() * 1e3;
             eprintln!(
                 "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"
@@ -21634,14 +21547,12 @@ kernel void zc_eq_rows(
                             let mut n_walls = 0usize;
                             let mut w_min = f64::MAX;
                             for slot in &mut walls {
+                                let t = std::time::Instant::now();
                                 let Ok(cb2) = zc_fold_submit(gpu, state, &replay) else {
                                     break;
                                 };
-                                let w = if gpu.wait_cb(cb2).is_ok() {
-                                    zc_fold_gpu_wall_ms(gpu, cb2)
-                                } else {
-                                    0.0
-                                };
+                                let ok = gpu.wait_cb(cb2).is_ok();
+                                let w = if ok { t.elapsed().as_secs_f64() * 1e3 } else { 0.0 };
                                 gpu.release(cb2);
                                 if w <= 0.0 {
                                     break;
@@ -21650,13 +21561,7 @@ kernel void zc_eq_rows(
                                 n_walls += 1;
                                 let prev_min = w_min;
                                 w_min = w_min.min(w);
-                                // Converged: at least three back-to-back
-                                // replays (~100% duty ramps the governor in
-                                // 1-2) and this wall did not improve the
-                                // best seen by more than 5% — a genuine
-                                // plateau, not a first-pair coincidence on
-                                // the ramp.
-                                if n_walls >= 3 && w > 0.95 * prev_min {
+                                if n_walls >= 4 && w > 0.95 * prev_min {
                                     break;
                                 }
                             }
@@ -22086,6 +21991,13 @@ kernel void zc_eq_rows(
     pub(crate) fn zc_fold_tune_take_replays() -> bool {
         static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         zc_fold_tune_pending() && !TAKEN.swap(true, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn lincheck_fold_tune_take_replays() -> bool {
+        static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        FoldArm::Lincheck.claim_override().is_none()
+            && LINCHECK_FOLD_TUNED_CLAIMS.load(std::sync::atomic::Ordering::Relaxed) == usize::MAX
+            && !TAKEN.swap(true, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The window's measured head and warm suffix replay (warm-up only).
@@ -22746,6 +22658,10 @@ kernel void zc_eq_rows(
     /// fresh completion events in the done-event pool.
     pub(crate) fn warm_gpu_spares(events: usize) {
         let Ok(gpu) = gpu() else { return };
+        if super::gpu_keepwarm_enabled() && super::gpu_commit_latched_on() {
+            let _ = keepwarm_scratch(gpu);
+            keepwarm_spawn_paused();
+        }
         if super::gpu_lincheck_enabled() && super::lc_gpu_wake_enabled() {
             let _ = lc_wake_scratch(gpu);
         }
@@ -31585,6 +31501,7 @@ pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix};
 pub(crate) use imp::{
     zc_fold_tune_head_ab_ms, zc_fold_tune_note_ab_chunks, zc_fold_tune_note_ab_start,
     zc_fold_tune_note_suffix, zc_fold_tune_take_replays,
+    lincheck_fold_tune_take_replays,
 };
 
 /// eq-direct staging for the two fold arms (see `ENV_NO_EQ_DIRECT`): the

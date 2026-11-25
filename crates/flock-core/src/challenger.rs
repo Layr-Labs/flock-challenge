@@ -678,6 +678,10 @@ impl Challenger for FsChallenger {
                     let cpu_1_started = std::time::Instant::now();
                     let cpu_1 = cpu_gpu_grind_calibration(&state_digest);
                     let cpu_1_time = cpu_1_started.elapsed();
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    for _ in 0..2 {
+                        let _ = crate::gpu_commit::gpu_blake3_pow_scan(&state_digest, 0, 1 << 20, GPU_GRIND_CALIBRATION_PREDICATE_BITS);
+                    }
                     let gpu_1_started = std::time::Instant::now();
                     let gpu_1 = gpu_grind_calibration(&state_digest);
                     let gpu_1_time = gpu_1_started.elapsed();
@@ -723,15 +727,13 @@ impl Challenger for FsChallenger {
                             GPU_GRIND_BLOCK_OVERDRAW
                         };
                         let projected_gpu = gpu_est.mul_f64(overdraw);
-                        // Keep the gain on the two-sample scale the
-                        // GPU_GRIND_MIN_TWO_SAMPLE_GAIN constant was set for: the
-                        // two-pass total is estimated as twice the best pass, so
-                        // the literal 1.5 ms threshold keeps its meaning.
                         let protected_gain =
                             cpu_est.saturating_sub(projected_gpu).saturating_mul(2);
-                        exact
-                            && projected_gpu < cpu_est
-                            && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN
+                        if grind_wide_enabled() && grind_race_enabled() {
+                            exact && projected_gpu < cpu_est.mul_f64(1.5)
+                        } else {
+                            exact && projected_gpu < cpu_est && protected_gain >= GPU_GRIND_MIN_TWO_SAMPLE_GAIN
+                        }
                     } else {
                         let cpu_total = cpu_1_time + cpu_2_time;
                         let gpu_total = gpu_1_time + gpu_2_time;
@@ -900,10 +902,13 @@ fn cpu_blake3_pow_window_inner(
         .min()
 }
 
+fn gpu_grind_calibration_lengths() -> &'static [u32] {
+    if grind_wide_enabled() { &GPU_GRIND_CALIBRATION_LENGTHS[..3] } else { &GPU_GRIND_CALIBRATION_LENGTHS }
+}
+
 fn cpu_gpu_grind_calibration(state_digest: &[u8; 32]) -> Vec<Option<u64>> {
     let mut start = 0u64;
-    GPU_GRIND_CALIBRATION_LENGTHS
-        .into_iter()
+    gpu_grind_calibration_lengths().iter().copied()
         .map(|len| {
             let result = cpu_blake3_pow_window(
                 state_digest,
@@ -919,8 +924,7 @@ fn cpu_gpu_grind_calibration(state_digest: &[u8; 32]) -> Vec<Option<u64>> {
 
 fn gpu_grind_calibration(state_digest: &[u8; 32]) -> Result<Vec<Option<u64>>, String> {
     let mut start = 0u64;
-    GPU_GRIND_CALIBRATION_LENGTHS
-        .into_iter()
+    gpu_grind_calibration_lengths().iter().copied()
         .map(|len| {
             let result = crate::gpu_commit::gpu_blake3_pow_scan(
                 state_digest,
