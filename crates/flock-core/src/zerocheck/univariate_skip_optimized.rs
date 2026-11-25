@@ -1271,6 +1271,37 @@ pub(crate) fn round2_ab_rebuild_take(a_packed: &[u8], b_packed: &[u8]) -> Option
     Some(list.swap_remove(at))
 }
 
+/// Count full R1 jobs inside the registered A/B publication span. The
+/// registration stays available for R2 to take after this drain.
+#[cfg(target_arch = "aarch64")]
+fn ab_published_prefix_jobs(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    unit_bytes: usize,
+    units_per_job: usize,
+) -> usize {
+    let rebuilds = R2_AB_REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut matches = rebuilds.iter().filter(|r| {
+        r.a == a_packed.as_ptr() as usize
+            && r.b == b_packed.as_ptr() as usize
+            && r.len == a_packed.len()
+            && r.len == b_packed.len()
+    });
+    let Some(rebuild) = matches.next() else {
+        return 0;
+    };
+    if matches.next().is_some()
+        || rebuild.unit_bytes != unit_bytes
+        || rebuild.published != rebuild.rebuild_from
+        || rebuild.published >= rebuild.len
+    {
+        return 0;
+    }
+    // The fused producer covers these buffers in whole units. A job that
+    // crosses the publication boundary keeps the normal helper plan.
+    rebuild.published / (units_per_job * unit_bytes)
+}
+
 /// Same-binary control for the fused producer path: with exactly
 /// `FLOCK_NO_ZC_AB_PRODUCER_FUSED=1` every unit is produced up front (no
 /// scratch) and the incumbent precompute then reads the buffers.
@@ -1853,25 +1884,68 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             nt,
             representation,
         );
+        #[cfg(target_arch = "aarch64")]
+        let (helper_pool, published_jobs, prefix_enabled, trace) = {
+            static TRACE: OnceLock<bool> = OnceLock::new();
+            let trace = *TRACE.get_or_init(|| {
+                std::env::var_os("FLOCK_TRACE_R1_AB_PUBLISH_POLICY").as_deref()
+                    == Some(std::ffi::OsStr::new("1"))
+            });
+            let enabled = kernels::aarch64::ab_kara_published_prefix_enabled();
+            if enabled || trace {
+                let pool = crate::epool::helper_pool();
+                let jobs = pool.map_or(0, |_| {
+                    ab_published_prefix_jobs(a_packed, b_packed, unit_bytes, units_per_job)
+                });
+                (pool, jobs, enabled, trace)
+            } else {
+                (None, 0, false, false)
+            }
+        };
+        let job_plan = |karatsuba| {
+            let window_rows = ab_window_rows_worker_plan_with_trim(transform_trim, karatsuba);
+            AbJobPlan {
+                window_rows,
+                window_unit: ab_window_unit_worker_plan(window_rows).zip(window_runs),
+                mixed: ab_mixed_row_worker_plan(karatsuba),
+                karatsuba,
+            }
+        };
         crate::epool::run_hetero_chunks_stateful_with_tail(
             n_jobs,
             || {
                 #[cfg(target_arch = "aarch64")]
-                kernels::aarch64::ab_kara_note_worker();
-                let window_plan = ab_window_rows_worker_plan_with_trim(transform_trim);
+                let named_helper = kernels::aarch64::ab_kara_note_worker();
+                #[cfg(target_arch = "aarch64")]
+                let helper = named_helper
+                    && helper_pool.is_some_and(|pool| pool.current_thread_index().is_some());
+                #[cfg(target_arch = "aarch64")]
+                let prefix_plan = (prefix_enabled && published_jobs != 0 && helper)
+                    .then(|| (published_jobs, job_plan(true)));
+                #[cfg(target_arch = "aarch64")]
+                let trace_plan = trace.then(|| AbJobPolicyTrace {
+                    helper,
+                    published_jobs,
+                    counts: [[0; 2]; 2],
+                    unit_jobs: 0,
+                });
+                #[cfg(not(target_arch = "aarch64"))]
+                let (prefix_plan, trace_plan): (Option<(usize, AbJobPlan)>, Option<AbJobPolicyTrace>) =
+                    (None, None);
                 (
                     [F8::ZERO; ELL],
                     [F8::ZERO; ELL],
                     AbUnitScratch::new(unit_bytes),
-                    window_plan,
-                    ab_window_unit_worker_plan(window_plan).zip(window_runs),
-                    ab_mixed_row_worker_plan(),
+                    job_plan(ab_thread_karatsuba()),
+                    prefix_plan,
+                    trace_plan,
                 )
             },
-            |(a_col, b_col, scratch, window_plan, window_unit, mixed_plan), job| {
-                let window_plan = *window_plan;
-                let window_unit = *window_unit;
-                let mixed_plan = *mixed_plan;
+            |(a_col, b_col, scratch, plan, prefix_plan, trace_plan), job| {
+                let plan = match *prefix_plan {
+                    Some((prefix_jobs, prefix)) if job < prefix_jobs => prefix,
+                    _ => *plan,
+                };
                 let unit_start = job * units_per_job;
                 let unit_end = (unit_start + units_per_job).min(n_units);
                 for unit in unit_start..unit_end {
@@ -1896,11 +1970,12 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                             out_base.ptr().add(unit * unit_chunks * OUTER_BYTES),
                             a_col,
                             b_col,
-                            window_plan,
-                            window_unit,
-                            mixed_plan,
+                            plan,
                         );
                     }
+                }
+                if let Some(trace_plan) = trace_plan {
+                    trace_plan.record(job, plan);
                 }
             },
             tail,
@@ -1913,11 +1988,12 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         || {
             #[cfg(target_arch = "aarch64")]
             kernels::aarch64::ab_kara_note_worker();
+            let karatsuba = ab_thread_karatsuba();
             (
                 [F8::ZERO; ELL],
                 [F8::ZERO; ELL],
-                ab_window_rows_worker_plan_with_trim(transform_trim),
-                ab_mixed_row_worker_plan(),
+                ab_window_rows_worker_plan_with_trim(transform_trim, karatsuba),
+                ab_mixed_row_worker_plan(karatsuba),
             )
         },
         |(a_col, b_col, window_plan, mixed_plan), job| {
@@ -2113,6 +2189,51 @@ fn ab_window_plan_enabled() -> bool {
 type AbWindowRows =
     fn(usize, &[u8], &[u8], &InvNttTableByteSingleGf8, usize, &'static [[u8; 64]; 248], &mut [u8], bool);
 
+#[derive(Clone, Copy)]
+struct AbJobPlan {
+    window_rows: Option<AbWindowRows>,
+    window_unit: Option<AbWindowUnitRun>,
+    mixed: u8,
+    karatsuba: bool,
+}
+
+/// Counts resolved plans only when the route trace is on.
+struct AbJobPolicyTrace {
+    helper: bool,
+    published_jobs: usize,
+    counts: [[usize; 2]; 2],
+    unit_jobs: usize,
+}
+
+impl AbJobPolicyTrace {
+    fn record(&mut self, job: usize, plan: AbJobPlan) {
+        self.counts[usize::from(job >= self.published_jobs)][usize::from(plan.karatsuba)] += 1;
+        self.unit_jobs += usize::from(plan.window_unit.is_some());
+    }
+}
+
+impl Drop for AbJobPolicyTrace {
+    fn drop(&mut self) {
+        let [[prefix_plain, prefix_kara], [rest_plain, rest_kara]] = self.counts;
+        if prefix_plain + prefix_kara + rest_plain + rest_kara == 0 {
+            return;
+        }
+        let role = if self.helper { "helper" } else { "other" };
+        eprintln!(
+            "[r1-ab-publish-policy] role={role} published_jobs={} prefix_plain={prefix_plain} prefix_kara={prefix_kara} rest_plain={rest_plain} rest_kara={rest_kara} unit_jobs={}",
+            self.published_jobs, self.unit_jobs,
+        );
+    }
+}
+
+#[inline]
+fn ab_thread_karatsuba() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    return kernels::aarch64::ab_kara_enabled();
+    #[cfg(not(target_arch = "aarch64"))]
+    false
+}
+
 /// The window-rows instance the switch chain in [`precompute_ab_one_chunk`]
 /// calls on this thread: [`ab_window_rows_plan_with_trim`] with the
 /// process's `FLOCK_NO_TRANSFORM_TRIM` switch, so a worker's plan and the
@@ -2120,8 +2241,8 @@ type AbWindowRows =
 /// arm of the drain bodies, which keep one call there.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn ab_window_rows_plan() -> AbWindowRows {
-    ab_window_rows_plan_with_trim(ab_transform_trim_enabled())
+fn ab_window_rows_plan(karatsuba: bool) -> AbWindowRows {
+    ab_window_rows_plan_with_trim(ab_transform_trim_enabled(), karatsuba)
 }
 
 /// `FLOCK_NO_TRANSFORM_TRIM=1` (exactly "1", as [`precompute_ab_hetero`]
@@ -2135,17 +2256,14 @@ fn ab_transform_trim_enabled() -> bool {
     })
 }
 
-/// The window-rows instance for this thread: the same checks in the same
-/// order as the switch chain. Every input is a per-process switch except the
-/// per-thread plain flag of `ab_kara_enabled`, which `ab_kara_note_worker`
-/// sets before a worker's first job, so a worker resolves this right after
-/// that call. The chain's `bstatic_horner_window_rows_hoisted::<V>` and
+/// The window-rows instance for the selected arithmetic. The chain's
+/// `bstatic_horner_window_rows_hoisted::<V>` and
 /// `bstatic_horner_window_rows::<V>` call `rows::<V, true>` and
 /// `rows::<V, false>`. `trim` selects the complemented static-B basis
 /// ([`kernels::aarch64::ABV_TRANSFORM_TRIM`]) of the two default instances;
 /// without it they take the plain instance, which writes the same rows.
 #[cfg(target_arch = "aarch64")]
-fn ab_window_rows_plan_with_trim(trim: bool) -> AbWindowRows {
+fn ab_window_rows_plan_with_trim(trim: bool, karatsuba: bool) -> AbWindowRows {
     use kernels::aarch64 as k;
     use kernels::aarch64::bstatic_horner_window_rows_impl as rows;
     // The default instances: the main-pool Karatsuba rows and the helper
@@ -2161,7 +2279,7 @@ fn ab_window_rows_plan_with_trim(trim: bool) -> AbWindowRows {
         | k::ABV_HORNER2
         | k::ABV_TRANSFORM_TRIM;
     const HELPER: u32 = k::AB_HZ_VARIANT | k::ABV_HORNER2 | k::ABV_TRANSFORM_TRIM;
-    if k::ab_kara_enabled() {
+    if karatsuba {
         if trim
             && k::ab_kara_unscaled_enabled()
             && k::ab_z_enabled()
@@ -2176,7 +2294,7 @@ fn ab_window_rows_plan_with_trim(trim: bool) -> AbWindowRows {
         } else {
             rows::<0, false>
         }
-    } else if k::ab_hz_helper_enabled() && k::ab_horner2_enabled() {
+    } else if k::ab_hz_helper_enabled(karatsuba) && k::ab_horner2_enabled() {
         // Lean: only the hoisted helper instance exists; its kill switches
         // take the plain instance, which writes the same rows, as every other
         // AB kill switch does.
@@ -2194,13 +2312,13 @@ fn ab_window_rows_plan_with_trim(trim: bool) -> AbWindowRows {
 /// worker thread after `ab_kara_note_worker`; `None` (the per-chunk chain)
 /// with [`ENV_NO_ZC_AB_WINDOW_PLAN`] set. `trim` as in
 /// [`ab_window_rows_plan_with_trim`], resolved once per drain.
-fn ab_window_rows_worker_plan_with_trim(trim: bool) -> Option<AbWindowRows> {
+fn ab_window_rows_worker_plan_with_trim(trim: bool, karatsuba: bool) -> Option<AbWindowRows> {
     #[cfg(target_arch = "aarch64")]
     if ab_window_plan_enabled() {
-        return Some(ab_window_rows_plan_with_trim(trim));
+        return Some(ab_window_rows_plan_with_trim(trim, karatsuba));
     }
     #[cfg(not(target_arch = "aarch64"))]
-    let _ = trim;
+    let _ = (trim, karatsuba);
     None
 }
 
@@ -2223,11 +2341,13 @@ fn ab_mixed_plan_enabled() -> bool {
 /// worker thread after `ab_kara_note_worker` (see
 /// `kernels::aarch64::ab_mixed_row_plan`); 0 (the per-row route) with
 /// [`ENV_NO_ZC_AB_MIXED_PLAN`] set to 1 and off aarch64.
-fn ab_mixed_row_worker_plan() -> u8 {
+fn ab_mixed_row_worker_plan(karatsuba: bool) -> u8 {
     #[cfg(target_arch = "aarch64")]
     if ab_mixed_plan_enabled() {
-        return kernels::aarch64::ab_mixed_row_plan();
+        return kernels::aarch64::ab_mixed_row_plan(karatsuba);
     }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = karatsuba;
     0
 }
 
@@ -2343,7 +2463,7 @@ fn ab_window_unit_runs<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
 
 /// The chunks `x_outer..x_outer + unit_chunks` of one producer unit, read at
 /// `chunk_byte_base + local * OUTER_BYTES` and written to
-/// `out_unit + local * OUTER_BYTES`. With `window_unit` (from
+/// `out_unit + local * OUTER_BYTES`. With `plan.window_unit` (from
 /// [`ab_window_unit_worker_plan`] and [`ab_window_unit_runs`] for the same
 /// drain) one call of the unit form writes the static-B window rows of every
 /// chunk, then each chunk writes its other rows; the rows are disjoint and
@@ -2371,9 +2491,7 @@ unsafe fn precompute_ab_unit<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     out_unit: *mut u8,
     a_col: &mut [F8; ELL],
     b_col: &mut [F8; ELL],
-    window_plan: Option<AbWindowRows>,
-    window_unit: Option<AbWindowUnitRun>,
-    mixed_plan: u8,
+    plan: AbJobPlan,
 ) {
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
     let direct = if FORCE_DIRECT {
@@ -2381,7 +2499,7 @@ unsafe fn precompute_ab_unit<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     } else {
         nt && ab_pre_nt_direct_enabled()
     };
-    let window_run_done = if let Some((rows, partials)) = window_unit {
+    let window_run_done = if let Some((rows, partials)) = plan.window_unit {
         // SAFETY: the caller's contract.
         let out = unsafe { core::slice::from_raw_parts_mut(out_unit, unit_chunks * OUTER_BYTES) };
         rows(x_outer, within_outer_mask, a_unit, b_unit, inv_table, chunk_byte_base, partials, out, direct);
@@ -2414,6 +2532,7 @@ unsafe fn precompute_ab_unit<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             unit_chunks,
             out,
             true,
+            plan.karatsuba,
         );
         return;
     }
@@ -2437,9 +2556,8 @@ unsafe fn precompute_ab_unit<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             out_outer,
             a_col,
             b_col,
-            window_plan,
+            plan,
             window_run_done,
-            mixed_plan,
         );
     }
 }
@@ -2488,9 +2606,13 @@ fn precompute_ab_one_chunk<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
         out_outer,
         a_col,
         b_col,
-        window_plan,
+        AbJobPlan {
+            window_rows: window_plan,
+            window_unit: None,
+            mixed: mixed_plan,
+            karatsuba: ab_thread_karatsuba(),
+        },
         false,
-        mixed_plan,
     );
 }
 
@@ -2515,10 +2637,12 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
     out_outer: &mut [u8],
     a_col: &mut [F8; ELL],
     b_col: &mut [F8; ELL],
-    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] window_plan: Option<AbWindowRows>,
+    plan: AbJobPlan,
     #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] window_run_done: bool,
-    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] mixed_plan: u8,
 ) {
+    let AbJobPlan { window_rows, mixed, karatsuba, .. } = plan;
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = (window_rows, mixed);
     // `chunk_byte_base` is where this chunk's 1 KiB of rows starts inside
     // `a_packed` / `b_packed`: `x_outer * OUTER_BYTES` for the complete
     // buffers, a unit-local offset for a producer scratch.
@@ -2574,7 +2698,7 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
         // z form of static B words and one bounds check per window; any of
         // `FLOCK_NO_ZC_AB_KARA_XOR16`, `FLOCK_NO_ZC_AB_BSTATIC_Z` or
         // `FLOCK_NO_ZC_AB_ROW_SETUP_HOIST` (any value) takes the arms below.
-        if let Some(rows) = window_plan {
+        if let Some(rows) = window_rows {
             // The instance `ab_window_rows_plan` picks on this thread, picked
             // once per worker (`FLOCK_NO_ZC_AB_WINDOW_PLAN` picks it per chunk).
             rows(
@@ -2589,7 +2713,7 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
             );
         } else {
             // The instance `ab_window_rows_plan` picks on this thread.
-            (ab_window_rows_plan())(
+            (ab_window_rows_plan(karatsuba))(
                 within_hash_outer,
                 a_packed,
                 b_packed,
@@ -2621,7 +2745,7 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
         // generic fallback.
         #[cfg(target_arch = "aarch64")]
         let done = const_one_mask != 0
-            && match (representation.omits_mixed_ones(), mixed_plan) {
+            && match (representation.omits_mixed_ones(), mixed) {
                 (true, _) => {
                     kernels::aarch64::ab_mixed_row_residual(
                         a_packed,
@@ -2632,6 +2756,7 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
                         const_one_mask == 0x03,
                         dst,
                         direct,
+                        karatsuba,
                     );
                     true
                 }
@@ -2664,12 +2789,13 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
                     const_one_mask == 0x03,
                     dst,
                     direct,
+                    karatsuba,
                 ),
             };
         #[cfg(not(target_arch = "aarch64"))]
         let done = false;
         if !done {
-            shift_reduce_inner_ab::<FAST_POLICY>(
+            kernels::shift_reduce_inner_ab::<FAST_POLICY>(
                 a_packed,
                 b_packed,
                 inv_table,
@@ -2688,6 +2814,7 @@ fn precompute_ab_one_chunk_with<const FAST_POLICY: u8, const FORCE_DIRECT: bool>
                 },
                 static_b_context,
                 direct,
+                karatsuba,
             );
         }
         if nt && !direct {
@@ -2773,6 +2900,7 @@ fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
         bstatic_w,
         static_b_context,
         nt_store,
+        ab_thread_karatsuba(),
     );
 }
 
@@ -6378,7 +6506,7 @@ mod tests {
                     }
                     let mut out = [0u8; ELL];
                     kernels::aarch64::ab_mixed_row_residual(
-                        &a, &b, table, 0, 0, window == 0, &mut out, false,
+                        &a, &b, table, 0, 0, window == 0, &mut out, false, ab_thread_karatsuba(),
                     );
                     let weight = d_inv() * outer_weights[2 * instance + window];
                     let row = &convert_table()[256 * b_med..256 * (b_med + 1)];
@@ -6765,7 +6893,7 @@ mod tests {
         nt_store: bool,
     ) {
         WINDOW_ROWS_CALLS.with(|calls| calls.borrow_mut().push((w, chunk_byte_base, nt_store)));
-        ab_window_rows_plan()(w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store);
+        ab_window_rows_plan(ab_thread_karatsuba())(w, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_outer, nt_store);
     }
 
     /// The per-worker window-rows plan (`FLOCK_NO_ZC_AB_WINDOW_PLAN`). With
@@ -6797,14 +6925,14 @@ mod tests {
         let untrimmed: AbWindowRows = rows::<0, false>;
         for kara in [true, false] {
             k::ab_kara_force(kara);
-            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan_with_trim(false), untrimmed));
+            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan_with_trim(false, ab_thread_karatsuba()), untrimmed));
         }
         k::ab_kara_force(true);
         let helper_untrimmed = std::thread::Builder::new()
             .name("flock-ecore-x".into())
             .spawn(|| {
                 k::ab_kara_note_worker();
-                ab_window_rows_plan_with_trim(false)
+                ab_window_rows_plan_with_trim(false, ab_thread_karatsuba())
             })
             .unwrap()
             .join()
@@ -6830,12 +6958,12 @@ mod tests {
         if default_switches {
             k::ab_kara_force(true);
             k::ab_kara_note_worker();
-            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(), main));
+            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(ab_thread_karatsuba()), main));
             let (helper, helper_mixed) = std::thread::Builder::new()
                 .name("flock-ecore-x".into())
                 .spawn(|| {
                     k::ab_kara_note_worker();
-                    (ab_window_rows_plan(), ab_mixed_row_worker_plan())
+                    (ab_window_rows_plan(ab_thread_karatsuba()), ab_mixed_row_worker_plan(ab_thread_karatsuba()))
                 })
                 .unwrap()
                 .join()
@@ -6845,13 +6973,13 @@ mod tests {
             // (which returns `false` there, so the dispatcher runs).
             assert_eq!(helper_mixed, 0);
             k::ab_kara_force(false);
-            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(), plain));
+            assert!(core::ptr::fn_addr_eq(ab_window_rows_plan(ab_thread_karatsuba()), plain));
             k::ab_kara_force(true);
         }
-        let worker_plan = ab_window_rows_worker_plan_with_trim(ab_transform_trim_enabled());
+        let worker_plan = ab_window_rows_worker_plan_with_trim(ab_transform_trim_enabled(), ab_thread_karatsuba());
         assert_eq!(worker_plan.is_some(), std::env::var_os(ENV_NO_ZC_AB_WINDOW_PLAN).is_none());
         if let Some(plan) = worker_plan {
-            assert!(core::ptr::fn_addr_eq(plan, ab_window_rows_plan()));
+            assert!(core::ptr::fn_addr_eq(plan, ab_window_rows_plan(ab_thread_karatsuba())));
         }
         // The mixed-row plan (`FLOCK_NO_ZC_AB_MIXED_PLAN`): exactly "1" keeps
         // the per-row route (0); otherwise the thread's resolved route and
@@ -6862,12 +6990,12 @@ mod tests {
             .all(|(key, _)| !key.to_string_lossy().starts_with("FLOCK_") || key == ENV_NO_ZC_AB_MIXED_PLAN);
         for kara in [true, false] {
             k::ab_kara_force(kara);
-            let want = if mixed_route { 0 } else { k::ab_mixed_row_plan() };
-            assert_eq!(ab_mixed_row_worker_plan(), want);
+            let want = if mixed_route { 0 } else { k::ab_mixed_row_plan(ab_thread_karatsuba()) };
+            assert_eq!(ab_mixed_row_worker_plan(ab_thread_karatsuba()), want);
             if !kara {
-                assert_eq!(k::ab_mixed_row_plan(), k::AB_MIXED_PLAN_ROUTE);
+                assert_eq!(k::ab_mixed_row_plan(ab_thread_karatsuba()), k::AB_MIXED_PLAN_ROUTE);
             } else if no_flock_env {
-                assert_eq!(k::ab_mixed_row_plan(), k::AB_MIXED_PLAN_VL);
+                assert_eq!(k::ab_mixed_row_plan(ab_thread_karatsuba()), k::AB_MIXED_PLAN_VL);
             }
         }
         k::ab_kara_force(true);
@@ -6912,7 +7040,7 @@ mod tests {
                 k::ab_kara_force(kara);
                 // This thread's mixed-row plan in this state, then both
                 // planned kernels against the per-row route (plan 0).
-                let mixed_worker = ab_mixed_row_worker_plan();
+                let mixed_worker = ab_mixed_row_worker_plan(ab_thread_karatsuba());
                 for representation in [
                     Round1AbRepresentation::Complete,
                     Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false },
@@ -7630,7 +7758,7 @@ mod tests {
         WINDOW_UNIT_CALLS.with(|calls| {
             calls.borrow_mut().push((x_outer, window_mask, chunk_byte_base, chunks, nt_store))
         });
-        let unit = ab_window_unit_plan(ab_window_rows_plan()).expect("a unit form");
+        let unit = ab_window_unit_plan(ab_window_rows_plan(ab_thread_karatsuba())).expect("a unit form");
         unit(x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials, out_unit, nt_store);
     }
 
@@ -7692,7 +7820,7 @@ mod tests {
         if switches.iter().all(|s| std::env::var_os(s).is_none()) {
             k::ab_kara_force(true);
             k::ab_kara_note_worker();
-            assert!(ab_window_unit_plan(ab_window_rows_plan()).is_some());
+            assert!(ab_window_unit_plan(ab_window_rows_plan(ab_thread_karatsuba())).is_some());
         }
         let worker = ab_window_unit_worker_plan(Some(rows::<MAIN, true>));
         assert_eq!(worker.is_some(), std::env::var_os(ENV_NO_ZC_AB_WINDOW_UNIT_CALL).is_none());
@@ -7742,9 +7870,9 @@ mod tests {
                 }
                 for kara in [true, false] {
                     k::ab_kara_force(kara);
-                    let mapped = ab_window_unit_plan(ab_window_rows_plan()).is_some();
+                    let mapped = ab_window_unit_plan(ab_window_rows_plan(ab_thread_karatsuba())).is_some();
                     // This thread's mixed-row plan in this state.
-                    let mixed_worker = ab_mixed_row_worker_plan();
+                    let mixed_worker = ab_mixed_row_worker_plan(ab_thread_karatsuba());
                     for representation in [
                         Round1AbRepresentation::Complete,
                         Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false },
@@ -7790,8 +7918,13 @@ mod tests {
                                                     precompute_ab_unit::<{ $policy }, $direct>(
                                                         a_in, b_in, &table, within_outer_mask, &b_med_counts,
                                                         static_layout, context, $nt, false, representation, x0, n,
-                                                        base, out.as_mut_ptr(), &mut a_col, &mut b_col, plan,
-                                                        window_unit, mixed_plan,
+                                                        base, out.as_mut_ptr(), &mut a_col, &mut b_col,
+                                                        AbJobPlan {
+                                                            window_rows: plan,
+                                                            window_unit,
+                                                            mixed: mixed_plan,
+                                                            karatsuba: ab_thread_karatsuba(),
+                                                        },
                                                     )
                                                 };
                                                 runs.is_some()
@@ -9033,7 +9166,7 @@ mod tests {
                         for kara in [false, true] {
                             kernels::aarch64::ab_kara_force(kara);
                             // The mixed-row plan of this thread in this state.
-                            let mixed_plan = ab_mixed_row_worker_plan();
+                            let mixed_plan = ab_mixed_row_worker_plan(ab_thread_karatsuba());
                             let mut out = vec![0x3cu8; OUTER_BYTES];
                             macro_rules! go {
                                 ($policy:expr, $direct:literal, $nt:expr) => {
@@ -9537,7 +9670,7 @@ mod tests {
                         assert_eq!(done, pass, "guards: {what}");
                         assert_eq!(got, if done { want } else { [0xa5; 64] }, "row: {what}");
                         let mut routed = [0xc3u8; 64];
-                        if kernels::aarch64::ab_mixed_row_direct(&a, &b, &table, base, b_med, w0, &mut routed, nt) {
+                        if kernels::aarch64::ab_mixed_row_direct(&a, &b, &table, base, b_med, w0, &mut routed, nt, ab_thread_karatsuba()) {
                             assert!(pass, "routed guards: {what}");
                             assert_eq!(routed, want, "routed row: {what}");
                         } else {
