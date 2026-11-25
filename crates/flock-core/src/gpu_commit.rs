@@ -1896,15 +1896,17 @@ impl Drop for BuildToken {
 }
 
 /// Run `f` on a new thread named `name`, counted by [`join_builds`] until it
-/// returns. When no thread can be made, `f` is dropped unrun and its
-/// consumer makes the build on first use, as without the fan-out.
-pub(crate) fn spawn_build(name: &str, f: impl FnOnce() + Send + 'static) {
+/// returns. Return false if the thread could not start and `f` was dropped.
+pub(crate) fn spawn_build(name: &str, f: impl FnOnce() + Send + 'static) -> bool {
     *BUILDS_PENDING.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     let token = BuildToken;
-    let _ = std::thread::Builder::new().name(name.into()).spawn(move || {
-        let _token = token;
-        f();
-    });
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _token = token;
+            f();
+        })
+        .is_ok()
 }
 
 /// Block until every helper started by [`spawn_build`] has returned (at
@@ -12416,7 +12418,6 @@ kernel void blake3_pow_seg_tail(
             }
         }
 
-        #[cfg(test)]
         pub(crate) unsafe fn pipeline_resources(&self, pso: Id) -> (u64, u64, u64) {
             unsafe {
                 let static_tg: u64 = send!(
@@ -23535,6 +23536,15 @@ kernel void zc_eq_rows(
         name: &str,
     ) -> Result<Id, String> {
         unsafe {
+            let library = compile_supplemental_library(gpu, source)?;
+            let result = compile_supplemental_entry(gpu, library, name);
+            gpu.release(library);
+            result
+        }
+    }
+
+    unsafe fn compile_supplemental_library(gpu: &Gpu, source: &str) -> Result<Id, String> {
+        unsafe {
             let src = gpu.api.nsstring(source)?;
             let mut err: Id = NIL;
             let library: Id = send!(
@@ -23552,6 +23562,14 @@ kernel void zc_eq_rows(
                     gpu.api.error_string(err)
                 ));
             }
+            Ok(library)
+        }
+    }
+
+    unsafe fn compile_supplemental_entry(
+        gpu: &Gpu, library: Id, name: &str,
+    ) -> Result<Id, String> {
+        unsafe {
             let ns = gpu.api.nsstring(name)?;
             let f: Id = send!(
                 gpu.api,
@@ -23561,12 +23579,6 @@ kernel void zc_eq_rows(
                 ns
             );
             if f.is_null() {
-                send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel) -> Id,
-                    library,
-                    c"release"
-                );
                 return Err(format!("supplemental kernel {name} not found"));
             }
             let mut perr: Id = NIL;
@@ -23579,12 +23591,6 @@ kernel void zc_eq_rows(
                 &mut perr
             );
             send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-            send!(
-                gpu.api,
-                unsafe extern "C" fn(Id, Sel) -> Id,
-                library,
-                c"release"
-            );
             if pso.is_null() {
                 Err(format!(
                     "supplemental pipeline {name}: {}",
@@ -30919,6 +30925,8 @@ kernel void zc_loop_products(
     // Bank bits 2..5 fold in registers (4 levels), bank bits 0 and 1 across
     // lanes (simd shuffle xor 1, 2).
     // -----------------------------------------------------------------------
+    pub(crate) mod r1_ab_tail_only;
+
     pub(crate) mod zfold {
         use super::*;
 
@@ -31662,6 +31670,9 @@ pub(crate) use imp::{
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm, zc_ab_wait};
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::r1_ab_tail_only;
 
 /// Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
