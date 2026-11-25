@@ -1944,16 +1944,11 @@ const FOLD_TABLE_SIZE: usize = 256;
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = crate::alloc_uninit_f128_vec(FOLD_N_BYTES * FOLD_TABLE_SIZE);
-    for byte_idx in 0..FOLD_N_BYTES {
-        let bit_base = byte_idx * 8;
-        let table = &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE];
-        table[0] = F128::ZERO;
-        for (bit_in_byte, &generator) in eq_r_dprime[bit_base..bit_base + 8].iter().enumerate() {
-            let half = 1usize << bit_in_byte;
-            for value in 0..half {
-                table[value + half] = table[value] + generator;
-            }
-        }
+    for (bank, generators) in tables
+        .chunks_exact_mut(FOLD_TABLE_SIZE)
+        .zip(eq_r_dprime.chunks_exact(8))
+    {
+        fill_fold_byte_bank(generators, bank);
     }
     tables
 }
@@ -2074,7 +2069,7 @@ fn compose_nibble_join_enabled() -> bool {
 /// Their XOR gives every byte entry directly, without output-parent loads.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
+fn fill_fold_byte_bank(g: &[F128], out: &mut [F128]) {
     use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vld1q_u64, vst1q_u64};
     debug_assert_eq!(g.len(), 8);
     debug_assert_eq!(out.len(), 256);
@@ -2136,7 +2131,7 @@ fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(never)]
-fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
+fn fill_fold_byte_bank(g: &[F128], out: &mut [F128]) {
     debug_assert_eq!(g.len(), 8);
     debug_assert_eq!(out.len(), 256);
     let low = subset_sums_4([g[0], g[1], g[2], g[3]]);
@@ -2207,7 +2202,7 @@ fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128]
     for k in 0..FOLD_N_BYTES {
         let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
         if nibble_join {
-            fill_composed_byte_bank(&g[k * 8..k * 8 + 8], t);
+            fill_fold_byte_bank(&g[k * 8..k * 8 + 8], t);
         } else {
             t[0] = F128::ZERO;
             for (bit, &gv) in g[k * 8..k * 8 + 8].iter().enumerate() {
@@ -2301,20 +2296,9 @@ pub(crate) fn build_direct_fold8_table_from_w_prime(
 /// The stateful fold8 path obtains exactly this vector after binding its six
 /// retained bank coordinates.
 pub(crate) fn build_direct_fold8_table_from_generators(generators: &[F128]) -> Vec<F128> {
-    assert_eq!(generators.len(), 1 << LOG_PACKING);
-
-    let mut out = crate::alloc_uninit_f128_vec(FOLD_TABLE_LEN);
-    for byte in 0..FOLD_N_BYTES {
-        let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
-        table[0] = F128::ZERO;
-        for (bit, &generator) in generators[byte * 8..byte * 8 + 8].iter().enumerate() {
-            let half = 1usize << bit;
-            for value in 0..half {
-                table[value + half] = table[value] + generator;
-            }
-        }
-    }
-    out
+    // After binding the six bank coordinates, each group of eight generators
+    // defines the same byte-indexed linear map as the base ring-switch table.
+    build_fold_byte_table(generators)
 }
 
 /// Per-output-index value of a [`RsEqInd::DeferredDense`] fold (the value the
@@ -4151,7 +4135,7 @@ mod tests {
                 core::array::from_fn(|_| rng.f128())
             };
             let mut joined = [F128::new(u64::MAX, u64::MAX); 256];
-            fill_composed_byte_bank(&generators, &mut joined);
+            fill_fold_byte_bank(&generators, &mut joined);
             let mut doubled = [F128::ZERO; 256];
             for (bit, &generator) in generators.iter().enumerate() {
                 let half = 1usize << bit;
