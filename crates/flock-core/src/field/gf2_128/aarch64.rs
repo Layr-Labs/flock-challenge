@@ -514,7 +514,7 @@ pub(crate) unsafe fn mul_two_const_sum_prep(
 /// Prepared form of the shared-constant product pair;
 /// `FLOCK_NO_CONST_VEC2_PREP=1` restores the Karatsuba kernel.
 #[inline]
-fn use_const_vec2_prep() -> bool {
+pub(crate) fn use_const_vec2_prep() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_CONST_VEC2_PREP").is_none());
     *ON

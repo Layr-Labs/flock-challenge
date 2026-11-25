@@ -1938,6 +1938,27 @@ const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
+/// The unscaled weights have already contributed to the sumcheck claim.
+fn scale_claim_weights(weights: &mut [F128], gamma: F128) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let weights = if crate::field::gf2_128::aarch64::use_const_vec2_prep() {
+        let (pairs, tail) = weights.as_chunks_mut::<2>();
+        for pair in pairs {
+            // SAFETY: the target feature gate provides PMULL. The pair is
+            // read by value before its two reduced products replace it.
+            *pair = unsafe {
+                crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon(gamma, *pair)
+            };
+        }
+        tail
+    } else {
+        weights
+    };
+    for value in weights {
+        *value *= gamma;
+    }
+}
+
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
@@ -3478,8 +3499,8 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
             .zip(gammas_rs.par_iter())
             .enumerate()
             .map(|(i, (mut w, &g))| {
-                let scaled_eq_r_dprime: Vec<F128> =
-                    w.eq_r_dprime.iter().map(|value| g * *value).collect();
+                let mut scaled_eq_r_dprime = w.eq_r_dprime;
+                scale_claim_weights(&mut scaled_eq_r_dprime, g);
                 let table = build_fold_byte_table(&scaled_eq_r_dprime);
                 let direct_fold2 = match (kinds[i], w.s_hat_v_quad.as_deref()) {
                     (Kind::Dense(d), Some(quad)) if use_split && dense_suffixes[d].len() >= 2 => {
