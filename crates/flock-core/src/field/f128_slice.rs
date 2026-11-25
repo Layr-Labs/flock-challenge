@@ -8,6 +8,9 @@ mod portable;
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 mod aarch64;
 
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(crate) use aarch64::lincheck_split_products;
+
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",

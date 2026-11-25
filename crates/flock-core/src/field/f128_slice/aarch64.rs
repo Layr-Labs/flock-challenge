@@ -1,4 +1,4 @@
-use crate::field::F128;
+use crate::field::{F128, F256Unreduced};
 use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep, mul_two_const_sum_prep};
 use core::arch::aarch64::*;
 use core::mem::transmute;
@@ -2493,5 +2493,44 @@ unsafe fn xor_karatsuba_variable(acc: &mut KaratsubaNeon, a: uint64x2_t, b: uint
         acc.ll = veorq_u64(acc.ll, pmull(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b)));
         acc.hh = veorq_u64(acc.hh, pmull(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b)));
         acc.mm = veorq_u64(acc.mm, pmull(vgetq_lane_u64::<0>(amid), vgetq_lane_u64::<0>(bmid)));
+    }
+}
+
+/// Accumulate the lincheck top-bit split directly from the four contiguous
+/// halves. Karatsuba reconstruction is XOR-linear, so each message needs one
+/// reconstruction per chunk before the caller merges its unreduced limbs.
+pub(crate) fn lincheck_split_products(
+    c_lo: &[F128],
+    c_hi: &[F128],
+    z_lo: &[F128],
+    z_hi: &[F128],
+) -> (F256Unreduced, F256Unreduced) {
+    assert_eq!(c_lo.len(), c_hi.len());
+    assert_eq!(c_lo.len(), z_lo.len());
+    assert_eq!(c_lo.len(), z_hi.len());
+    // SAFETY: this module is compiled with AES/PMULL. F128 and uint64x2_t
+    // have the same two-limb representation; no slice is read past its end.
+    unsafe {
+        let zero = vdupq_n_u64(0);
+        let mut one = KaratsubaNeon { ll: zero, hh: zero, mm: zero };
+        let mut infinity = one;
+        for i in 0..c_lo.len() {
+            let a = transmute::<F128, uint64x2_t>(c_hi[i]);
+            let b = transmute::<F128, uint64x2_t>(z_hi[i]);
+            let da = veorq_u64(a, transmute::<F128, uint64x2_t>(c_lo[i]));
+            let db = veorq_u64(b, transmute::<F128, uint64x2_t>(z_lo[i]));
+            xor_karatsuba_variable(&mut one, a, b);
+            xor_karatsuba_variable(&mut infinity, da, db);
+        }
+        let limbs = |sum| {
+            let wide = karatsuba_to_wide(sum);
+            F256Unreduced {
+                r0: vgetq_lane_u64::<0>(wide.lo),
+                r1: vgetq_lane_u64::<1>(wide.lo),
+                r2: vgetq_lane_u64::<0>(wide.hi),
+                r3: vgetq_lane_u64::<1>(wide.hi),
+            }
+        };
+        (limbs(one), limbs(infinity))
     }
 }

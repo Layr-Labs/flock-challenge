@@ -1584,13 +1584,21 @@ fn sumcheck_round_eval_caller_first(c: &[F128], z: &[F128]) -> (F128, F128) {
     crate::epool::run_caller_first_chunks(n_chunks, &|ci: usize| {
         let lo = ci * LC_SC_CF_CHUNK;
         let hi = (lo + LC_SC_CF_CHUNK).min(half);
-        let mut e1 = crate::field::F256Unreduced::ZERO;
-        let mut einf = crate::field::F256Unreduced::ZERO;
-        for i in lo..hi {
-            e1 ^= chi[i].mul_unreduced(zhi[i]);
-            einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
-        }
-        let _ = parts[ci].set((e1, einf));
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        let partial = crate::field::f128_slice::lincheck_split_products(
+            &clo[lo..hi], &chi[lo..hi], &zlo[lo..hi], &zhi[lo..hi],
+        );
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        let partial = {
+            let mut e1 = crate::field::F256Unreduced::ZERO;
+            let mut einf = crate::field::F256Unreduced::ZERO;
+            for i in lo..hi {
+                e1 ^= chi[i].mul_unreduced(zhi[i]);
+                einf ^= (chi[i] + clo[i]).mul_unreduced(zhi[i] + zlo[i]);
+            }
+            (e1, einf)
+        };
+        let _ = parts[ci].set(partial);
     });
     lc_sc_reduce_parts(&parts)
 }
