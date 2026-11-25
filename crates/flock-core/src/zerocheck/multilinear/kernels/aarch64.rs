@@ -935,7 +935,7 @@ mod tri_fold_kara {
     use super::*;
     use core::arch::aarch64::{uint64x2_t as Q, *};
 
-    #[derive(Clone, Copy)] struct KaraNeon { ll: Q, mm: Q, hh: Q }
+    #[derive(Clone, Copy)] pub(super) struct KaraNeon { pub(super) ll: Q, pub(super) mm: Q, pub(super) hh: Q }
     #[inline(always)] unsafe fn mid_pair_q(u: Q, v: Q) -> Q { unsafe { veorq_u64(vuzp1q_u64(u, v), vuzp2q_u64(u, v)) } }
     #[inline(always)] unsafe fn mid_one_q(u: Q) -> Q { unsafe { veorq_u64(u, vextq_u64::<1>(u, u)) } }
     #[inline(always)] unsafe fn lo_acc(c: Q, a: Q, b: Q) -> Q {
@@ -945,6 +945,22 @@ mod tri_fold_kara {
     #[inline(always)] unsafe fn hi_acc(c: Q, a: Q, b: Q) -> Q {
         #[cfg(target_feature = "sha3")] { unsafe { fused_pmull_hi_acc(c, a, b) } }
         #[cfg(not(target_feature = "sha3"))] { unsafe { veorq_u64(c, pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b))) } }
+    }
+    #[inline(always)] pub(super) unsafe fn kara_acc_pair_q(
+        c0: &mut KaraNeon, c1: &mut KaraNeon, a0: Q, b0: Q, a1: Q, b1: Q,
+    ) {
+        unsafe {
+            let (ma, mb) = (mid_pair_q(a0, a1), mid_pair_q(b0, b1));
+            c0.ll = lo_acc(c0.ll, a0, b0); c0.hh = hi_acc(c0.hh, a0, b0);
+            c1.ll = lo_acc(c1.ll, a1, b1); c1.hh = hi_acc(c1.hh, a1, b1);
+            c0.mm = lo_acc(c0.mm, ma, mb); c1.mm = hi_acc(c1.mm, ma, mb);
+        }
+    }
+    #[inline(always)] pub(super) unsafe fn kara_acc_one_q(c: &mut KaraNeon, a: Q, b: Q) {
+        unsafe {
+            let (ma, mb) = (mid_one_q(a), mid_one_q(b));
+            c.ll = lo_acc(c.ll, a, b); c.hh = hi_acc(c.hh, a, b); c.mm = lo_acc(c.mm, ma, mb);
+        }
     }
     #[inline(always)] unsafe fn x_acc(c: Q, w: Q, d: Q) -> Q {
         #[cfg(target_feature = "sha3")] { unsafe { fused_cross_acc(c, w, d) } }
@@ -1008,7 +1024,10 @@ mod tri_fold_kara {
     }
 }
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-use tri_fold_kara::{Fold4KaraQ, Fold8KaraQ, fold4_kara_one_q, fold4_kara_pair_q, fold8_kara_pair_q};
+use tri_fold_kara::{
+    Fold4KaraQ, Fold8KaraQ, KaraNeon, fold4_kara_one_q, fold4_kara_pair_q, fold8_kara_pair_q,
+    kara_acc_one_q, kara_acc_pair_q,
+};
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline(always)] unsafe fn fold4_pair_expanded_tri_f_q<const F: bool>(
     values: *const F128, rho: &Fold4RhoQ, w4: &Fold4KaraQ,
@@ -8122,9 +8141,9 @@ fn fold_tri_and_message_core_with<
         } else {
             (zero, zero)
         };
-        let mut acc = [TriNeon {
+        let mut acc = [KaraNeon {
             ll: zero,
-            cross: zero,
+            mm: zero,
             hh: zero,
         }; TRI_SLOTS];
         let mut sink = zero;
@@ -8402,64 +8421,82 @@ fn fold_tri_and_message_core_with<
             if ABL & 1 != 0 {
                 continue;
             }
-            {
-                let mut e = [acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]];
+            for h in 0..2 {
+                let (mut e0, mut e1, mut e2, mut e3) =
+                    (acc[2 * h], acc[2 * h + 1], acc[4 + 2 * h], acc[5 + 2 * h]);
+                let o = 4 * h;
                 for t in 0..gn {
                     let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
-                    for j in 0..4 {
-                        tri_acc_q(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
-                        tri_acc_q(
-                            &mut e[4 + j],
-                            veorq_u64(aw[2 * j], aw[2 * j + 1]),
-                            veorq_u64(b[2 * j], b[2 * j + 1]),
-                        );
-                    }
+                    let (a1, b1) = (aw[o + 1], b[o + 1]);
+                    kara_acc_pair_q(
+                        &mut e0,
+                        &mut e2,
+                        a1,
+                        b1,
+                        veorq_u64(aw[o], a1),
+                        veorq_u64(b[o], b1),
+                    );
+                    let (a3, b3) = (aw[o + 3], b[o + 3]);
+                    kara_acc_pair_q(
+                        &mut e1,
+                        &mut e3,
+                        a3,
+                        b3,
+                        veorq_u64(aw[o + 2], a3),
+                        veorq_u64(b[o + 2], b3),
+                    );
                 }
-                acc[..8].copy_from_slice(&e);
+                (acc[2 * h], acc[2 * h + 1], acc[4 + 2 * h], acc[5 + 2 * h]) = (e0, e1, e2, e3);
             }
-            {
-                let mut l = [
-                    acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
-                ];
+            for k in 0..2 {
+                let (mut l0, mut l1, mut l2, mut l3) =
+                    (acc[8 + k], acc[10 + k], acc[12 + k], acc[14 + k]);
+                let o = 4 * k;
                 for t in 0..gn {
                     let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
-                    for k in 0..2 {
-                        let o = 4 * k;
-                        tri_acc_q(&mut l[k], aw[o + 2], b[o + 2]);
-                        let (ea, eb) = (veorq_u64(aw[o], aw[o + 2]), veorq_u64(b[o], b[o + 2]));
-                        let (oa, ob) =
-                            (veorq_u64(aw[o + 1], aw[o + 3]), veorq_u64(b[o + 1], b[o + 3]));
-                        tri_acc_q(&mut l[2 + k], ea, eb);
-                        tri_acc_q(&mut l[4 + k], oa, ob);
-                        tri_acc_q(&mut l[6 + k], veorq_u64(ea, oa), veorq_u64(eb, ob));
-                    }
+                    let (a2, b2) = (aw[o + 2], b[o + 2]);
+                    let (ea, eb) = (veorq_u64(aw[o], a2), veorq_u64(b[o], b2));
+                    kara_acc_pair_q(&mut l0, &mut l1, a2, b2, ea, eb);
+                    let (oa, ob) =
+                        (veorq_u64(aw[o + 1], aw[o + 3]), veorq_u64(b[o + 1], b[o + 3]));
+                    kara_acc_pair_q(
+                        &mut l2,
+                        &mut l3,
+                        oa,
+                        ob,
+                        veorq_u64(ea, oa),
+                        veorq_u64(eb, ob),
+                    );
                 }
-                acc[8..16].copy_from_slice(&l);
+                (acc[8 + k], acc[10 + k], acc[12 + k], acc[14 + k]) = (l0, l1, l2, l3);
             }
             {
-                let mut g = [acc[16], acc[17], acc[18], acc[20], acc[21]];
+                let (mut g0, mut g1, mut g2, mut g3, mut g4) =
+                    (acc[16], acc[17], acc[18], acc[20], acc[21]);
                 for t in 0..gn {
                     let (aw, b) = (ta[t].assume_init_mut(), tb[t].assume_init_mut());
-                    tri_acc_q(&mut g[0], aw[4], b[4]);
-                    let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
-                    let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
+                    let (a4, b4) = (aw[4], b[4]);
+                    kara_acc_one_q(&mut g0, a4, b4);
+                    let (s0a, s0b) = (veorq_u64(aw[0], a4), veorq_u64(b[0], b4));
                     let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
+                    aw[0] = s0a;
+                    aw[2] = s2a;
+                    b[0] = s0b;
+                    b[2] = s2b;
+                    kara_acc_pair_q(&mut g1, &mut g2, s0a, s0b, s2a, s2b);
+                    let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
                     let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
-                    aw[..4].copy_from_slice(&[s0a, s1a, s2a, s3a]);
-                    b[..4].copy_from_slice(&[s0b, s1b, s2b, s3b]);
-                    tri_acc_q(&mut g[1], s0a, s0b);
-                    tri_acc_q(&mut g[2], s2a, s2b);
-                    tri_acc_q(&mut g[3], s1a, s1b);
-                    tri_acc_q(&mut g[4], s3a, s3b);
+                    aw[1] = s1a;
+                    aw[3] = s3a;
+                    b[1] = s1b;
+                    b[3] = s3b;
+                    kara_acc_pair_q(&mut g3, &mut g4, s1a, s1b, s3a, s3b);
                 }
-                acc[16] = g[0];
-                acc[17] = g[1];
-                acc[18] = g[2];
-                acc[20] = g[3];
-                acc[21] = g[4];
+                (acc[16], acc[17], acc[18], acc[20], acc[21]) = (g0, g1, g2, g3, g4);
             }
             {
-                let mut g = [acc[19], acc[22], acc[23], acc[24], acc[25]];
+                let (mut g0, mut g1, mut g2, mut g3, mut g4) =
+                    (acc[19], acc[22], acc[23], acc[24], acc[25]);
                 for t in 0..gn {
                     let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
                     let (s0a, s1a, s2a, s3a) = (aw[0], aw[1], aw[2], aw[3]);
@@ -8468,23 +8505,23 @@ fn fold_tri_and_message_core_with<
                     let (s13a, s13b) = (veorq_u64(s1a, s3a), veorq_u64(s1b, s3b));
                     let (s01a, s01b) = (veorq_u64(s0a, s1a), veorq_u64(s0b, s1b));
                     let (s23a, s23b) = (veorq_u64(s2a, s3a), veorq_u64(s2b, s3b));
-                    tri_acc_q(&mut g[0], s02a, s02b);
-                    tri_acc_q(&mut g[1], s13a, s13b);
-                    tri_acc_q(&mut g[2], s01a, s01b);
-                    tri_acc_q(&mut g[3], s23a, s23b);
-                    tri_acc_q(&mut g[4], veorq_u64(s01a, s23a), veorq_u64(s01b, s23b));
+                    kara_acc_pair_q(&mut g0, &mut g1, s02a, s02b, s13a, s13b);
+                    kara_acc_pair_q(&mut g2, &mut g3, s01a, s01b, s23a, s23b);
+                    kara_acc_one_q(&mut g4, veorq_u64(s01a, s23a), veorq_u64(s01b, s23b));
                 }
-                acc[19] = g[0];
-                acc[22] = g[1];
-                acc[23] = g[2];
-                acc[24] = g[3];
-                acc[25] = g[4];
+                (acc[19], acc[22], acc[23], acc[24], acc[25]) = (g0, g1, g2, g3, g4);
             }
         }
         if ABL != 0 {
             core::hint::black_box(sink);
         }
-        acc.map(|t| core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(t)))
+        acc.map(|t| {
+            core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(TriNeon {
+                ll: t.ll,
+                cross: xor3_u64(t.mm, t.ll, t.hh),
+                hh: t.hh,
+            }))
+        })
     }
 }
 
