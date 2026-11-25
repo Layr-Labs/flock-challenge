@@ -4279,7 +4279,7 @@ pub fn ab_completion_gpu_prewarm() {
                 });
             }
             if k {
-                spawn_build("flock-zck-prewarm", crate::gpu_commit::zc_k_prewarm);
+                spawn_build("flock-zck-prewarm", || crate::gpu_commit::zc_k_prewarm(true));
             }
             if tail {
                 spawn_build("flock-tail-prewarm", crate::gpu_commit::gpu_pow_race_tail_prewarm);
@@ -4301,7 +4301,7 @@ pub fn ab_completion_gpu_prewarm() {
                     crate::gpu_commit::zc_ab_prewarm(basis);
                 }
                 if k {
-                    crate::gpu_commit::zc_k_prewarm();
+                    crate::gpu_commit::zc_k_prewarm(false);
                 }
                 if tail {
                     crate::gpu_commit::gpu_pow_race_tail_prewarm();

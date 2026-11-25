@@ -28640,7 +28640,7 @@ kernel void zc_ab_finish(
     /// Build the K arm's pipelines on `device` from the embedded metallib; the
     /// faster fold (`zc_k_fold_v2`, see [`super::zc_k_v2_enabled`]) from
     /// source, keeping the embedded fold if that fails.
-    unsafe fn zc_k_build_psos(api: &Api, device: Id) -> Result<(Id, Id), String> {
+    unsafe fn zc_k_build_psos(api: &Api, device: Id, defer_v1: bool) -> Result<(Id, Id), String> {
         unsafe {
             let release = |obj: Id| {
                 if !obj.is_null() {
@@ -28679,13 +28679,28 @@ kernel void zc_ab_finish(
                 }
                 Ok(pso)
             };
-            let mut fold = make_pipeline("zc_k_fold");
+            let query = |pso: Id, sel: &std::ffi::CStr| -> u64 {
+                send!(api, unsafe extern "C" fn(Id, Sel) -> u64, pso, sel)
+            };
+            let supports_fold = |pso| {
+                query(pso, c"maxTotalThreadsPerThreadgroup") >= 256
+                    && query(pso, c"threadExecutionWidth") == 32
+            };
+            let supports_finish = |pso| query(pso, c"maxTotalThreadsPerThreadgroup") >= 8;
+            // The counted default can defer the disposable v1 PSO. Qualify
+            // both live PSOs before releasing the library needed to build v1.
+            let mut fold = (!defer_v1).then(|| make_pipeline("zc_k_fold"));
             let finish = make_pipeline("zc_k_finish");
             // The faster fold (`FLOCK_NO_ZC_K_V2` kills): compiled
             // from source here (the prewarm thread); on any failure the
             // embedded kernel stays.
             ZC_K_V2_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
-            if super::zc_k_v2_enabled() && fold.is_ok() {
+            let try_v2 = if defer_v1 {
+                finish.as_ref().is_ok_and(|&pso| supports_finish(pso))
+            } else {
+                fold.as_ref().is_some_and(Result::is_ok)
+            };
+            if super::zc_k_v2_enabled() && try_v2 {
                 let v2 = (|| -> Result<Id, String> {
                     let src = api.nsstring(ZC_K_V2_MSL_SOURCE)?;
                     let mut err: Id = NIL;
@@ -28724,20 +28739,32 @@ kernel void zc_ab_finish(
                     Ok(pso)
                 })();
                 match v2 {
+                    Ok(pso) if defer_v1 && !supports_fold(pso) => {
+                        release(pso);
+                        if super::gpu_zc_k_debug() {
+                            eprintln!("[zc-k-gpu] v2 threadgroup shape refused; building embedded fold");
+                        }
+                    }
                     Ok(pso) => {
-                        if let Ok(old) = fold {
+                        if let Some(Ok(old)) = fold {
                             release(old);
                         }
-                        fold = Ok(pso);
+                        fold = Some(Ok(pso));
                         ZC_K_V2_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(e) => {
                         if super::gpu_zc_k_debug() {
-                            eprintln!("[zc-k-gpu] v2 fold unavailable ({e}); embedded kernel kept");
+                            if defer_v1 {
+                                eprintln!("[zc-k-gpu] v2 fold unavailable ({e}); building embedded fold");
+                            } else {
+                                eprintln!("[zc-k-gpu] v2 fold unavailable ({e}); embedded kernel kept");
+                            }
                         }
                     }
                 }
             }
+            let v1_deferred = defer_v1 && fold.is_some();
+            let fold = fold.unwrap_or_else(|| make_pipeline("zc_k_fold"));
             (api.pool_pop)(pool);
             release(library);
             let (fold_pso, finish_pso) = match (fold, finish) {
@@ -28753,18 +28780,15 @@ kernel void zc_ab_finish(
                     return Err(err);
                 }
             };
-            let query = |pso: Id, sel: &std::ffi::CStr| -> u64 {
-                send!(api, unsafe extern "C" fn(Id, Sel) -> u64, pso, sel)
-            };
             // The fold kernel's quad and SIMD reductions assume 32-wide SIMD
             // groups and a 256-thread superblock.
-            if query(fold_pso, c"maxTotalThreadsPerThreadgroup") < 256
-                || query(fold_pso, c"threadExecutionWidth") != 32
-                || query(finish_pso, c"maxTotalThreadsPerThreadgroup") < 8
-            {
+            if !v1_deferred && (!supports_fold(fold_pso) || !supports_finish(finish_pso)) {
                 release(fold_pso);
                 release(finish_pso);
                 return Err("zc-k PSOs cannot run their threadgroup shapes".into());
+            }
+            if v1_deferred && super::gpu_zc_k_debug() {
+                eprintln!("[zc-k-gpu] qualified v2 and finish; deferred v1 PSO");
             }
             Ok((fold_pso, finish_pso))
         }
@@ -28782,10 +28806,14 @@ kernel void zc_ab_finish(
     /// on the round-one arm's warm-up helper thread, after that arm's own
     /// build, so the warm-up proof's first K launch only joins the
     /// `OnceLock` (or waits for the helper if it is still building).
-    pub(crate) fn zc_k_prewarm() {
+    pub(crate) fn zc_k_prewarm(counted_ranked: bool) {
         if let Ok(gpu) = gpu() {
             let _ = ZC_K_PSOS.get_or_init(|| unsafe {
-                zc_k_build_psos(&gpu.api, gpu.device)
+                let defer_v1 = counted_ranked
+                    && cfg!(target_feature = "sha3")
+                    && super::zc_k_share_is_v2_default()
+                    && super::gpu_zc_k_share() == super::ZC_K_GPU_V2_RUNNER_CHUNKS;
+                zc_k_build_psos(&gpu.api, gpu.device, defer_v1)
                     .ok()
                     .map(|(f, g)| (f as usize, g as usize, gpu.device as usize))
             });
@@ -28801,7 +28829,7 @@ kernel void zc_ab_finish(
         if share == 0 || !super::zc_k_share_is_v2_default() {
             return share;
         }
-        zc_k_prewarm();
+        zc_k_prewarm(false);
         if ZC_K_V2_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
             share
         } else {
@@ -28820,7 +28848,7 @@ kernel void zc_ab_finish(
         unsafe {
             let waited = std::time::Instant::now();
             let shared = *ZC_K_PSOS.get_or_init(|| {
-                zc_k_build_psos(&gpu.api, gpu.device)
+                zc_k_build_psos(&gpu.api, gpu.device, false)
                     .ok()
                     .map(|(f, g)| (f as usize, g as usize, gpu.device as usize))
             });
@@ -28830,7 +28858,7 @@ kernel void zc_ab_finish(
             let (fold_pso, finish_pso, how) = match shared {
                 Some((f, g, dev)) if dev == gpu.device as usize => (f as Id, g as Id, "shared"),
                 _ => {
-                    let (f, g) = zc_k_build_psos(&gpu.api, gpu.device)?;
+                    let (f, g) = zc_k_build_psos(&gpu.api, gpu.device, false)?;
                     (f, g, "built at the launch")
                 }
             };
