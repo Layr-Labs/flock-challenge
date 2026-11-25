@@ -81,16 +81,43 @@ pub(crate) fn consts_into(out: &mut [F128], rho_a: F128, rho_b: F128, eq_lo: &[F
     }
 }
 
-/// A chunk's 26 slots from its [`BANKS`] raw bank entries: per slot, the
-/// XOR of the entries whose [`SLOT`] it is, reduced once. Reduction is
-/// XOR-linear, so this is the kernel's slot sum exactly.
-pub(crate) fn finish_banks(banks: &[[u64; 4]]) -> [F128; SLOTS] {
-    assert_eq!(banks.len(), BANKS);
-    let mut acc = [F256Unreduced::ZERO; SLOTS];
-    for (e, w) in banks.iter().enumerate() {
-        acc[SLOT[e & 31] as usize] ^= F256Unreduced { r0: w[0], r1: w[1], r2: w[2], r3: w[3] };
+const FIRST_LANE: [usize; SLOTS] = {
+    let mut first = [0; SLOTS];
+    let mut lane = SLOT.len();
+    while lane != 0 {
+        lane -= 1;
+        first[SLOT[lane] as usize] = lane;
     }
-    acc.map(F256Unreduced::reduce)
+    first
+};
+
+pub(crate) fn finish_bank_groups<const GROUPS: usize>(banks: &[[u64; 4]]) -> [F128; SLOTS] {
+    let (groups, tail) = banks.as_chunks::<32>();
+    assert!(tail.is_empty());
+    let groups: &[_; GROUPS] = groups.try_into().expect("wrong slot bank count");
+    let lane_sum = |lane: usize| {
+        let read = |[r0, r1, r2, r3]: [u64; 4]| F256Unreduced { r0, r1, r2, r3 };
+        let first = read(groups[0][lane]);
+        if GROUPS == 4 {
+            (first ^ read(groups[1][lane])) ^ (read(groups[2][lane]) ^ read(groups[3][lane]))
+        } else {
+            const { assert!(GROUPS == 1 || GROUPS == 4) };
+            first
+        }
+    };
+    core::array::from_fn(|slot| {
+        let lane = FIRST_LANE[slot];
+        let first = lane_sum(lane);
+        if lane < 24 {
+            first.reduce()
+        } else {
+            ((first ^ lane_sum(lane + 1)) ^ (lane_sum(lane + 2) ^ lane_sum(lane + 3))).reduce()
+        }
+    })
+}
+
+pub(crate) fn finish_banks(banks: &[[u64; 4]]) -> [F128; SLOTS] {
+    finish_bank_groups::<4>(banks)
 }
 
 #[cfg(test)]
@@ -362,6 +389,26 @@ mod tests {
             assert!(ga == ca && gb == cb, "outputs differ");
             assert_eq!(slots, want);
         }
+    }
+
+    #[test]
+    fn slot_bank_gather_matches_raw_scatter_for_both_layouts() {
+        fn check<const GROUPS: usize>(banks: &[[u64; 4]]) {
+            let mut want = [F128::ZERO; SLOTS];
+            for (i, &[r0, r1, r2, r3]) in banks.iter().enumerate() {
+                want[SLOT[i % 32] as usize] += F256Unreduced { r0, r1, r2, r3 }.reduce();
+            }
+            assert_eq!(finish_bank_groups::<GROUPS>(banks), want);
+        }
+
+        let mut seed = 0x9e37_79b9_7f4a_7c15;
+        let banks: [[u64; 4]; BANKS] = core::array::from_fn(|_| {
+            let a = rand(&mut seed);
+            let b = rand(&mut seed);
+            [a.lo, a.hi, b.lo, b.hi]
+        });
+        check::<1>(&banks[..32]);
+        check::<4>(&banks);
     }
 
     #[test]

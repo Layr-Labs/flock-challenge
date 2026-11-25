@@ -29,8 +29,7 @@
 //! Every step is an exact GF(2^128) product, XOR or table expansion.
 
 use super::*;
-use crate::field::F256Unreduced;
-use crate::gpu_commit::zc_t56::SLOT;
+use crate::gpu_commit::zc_t56::finish_bank_groups;
 
 /// Outputs per pass-0 chunk and array.
 pub(crate) const T0_OUT: usize = 1024;
@@ -604,14 +603,10 @@ impl ZcT0Job {
         debug_assert!(c < self.offer);
         unsafe {
             let banks = std::slice::from_raw_parts(self.banks.add(c * T0_BANKS), T0_BANKS);
-            let mut acc = [F256Unreduced::ZERO; 26];
-            for (e, w) in banks.iter().enumerate() {
-                acc[SLOT[e & 31] as usize] ^= F256Unreduced { r0: w[0], r1: w[1], r2: w[2], r3: w[3] };
-            }
             (
                 std::slice::from_raw_parts(self.out_a.add(c * T0_OUT), T0_OUT),
                 std::slice::from_raw_parts(self.out_b.add(c * T0_OUT), T0_OUT),
-                acc.map(F256Unreduced::reduce),
+                finish_bank_groups::<1>(banks),
             )
         }
     }
