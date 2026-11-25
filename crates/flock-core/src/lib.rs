@@ -53,6 +53,20 @@ pub mod zerocheck;
 /// purely for screening/rollback — mirrors `FLOCK_NO_AB_COMPACT_STORE`.
 pub const ENV_NO_MICRO_STACK: &str = "FLOCK_NO_MICRO_STACK";
 
+#[inline]
+pub fn phase_timing_env_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_PHASE_TIMING").is_some());
+    *ON
+}
+
+#[inline]
+pub fn zc_timing_env_on() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_TIMING").is_some());
+    *ON
+}
+
 /// Publish-path warm-up hook (port of the x86 track's rename warm-up, e-man07
 /// fd1b67de item 20). The ranked worker's publisher installs it during the
 /// untimed gap; the PCS open fires it once, two recursive levels before the
