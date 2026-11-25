@@ -601,6 +601,24 @@ fn fold_two_and_msg_with_scaled_basis_addend_at(
     }
 }
 
+///
+#[inline]
+pub(crate) fn fold_half_into(z0: &[F128], z1: &[F128], out: &mut [F128], r: F128) {
+    assert_eq!(z0.len(), z1.len());
+    assert_eq!(z0.len(), out.len());
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        unsafe { aarch64::fold_half_into(z0, z1, out, r) };
+        return;
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        for ((o, &a), &b) in out.iter_mut().zip(z0).zip(z1) {
+            *o = a + r * (a + b);
+        }
+    }
+}
+
 /// `out[i] = src[i] * s` for one fixed multiplier `s`: the outer-product row
 /// of the tensor-split equality-table builders. On AArch64 the multiplier is
 /// prepared once per row and each entry costs four data PMULLs and one fold;

@@ -2292,6 +2292,23 @@ unsafe fn fuse_seed(lo: &AbKOperands, hi: &AbKOperands) -> [core::arch::aarch64:
     unsafe { fuse_acc(&fuse_products(lo), hi) }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fuse_absorb_first_one(
+    acc: &mut [core::arch::aarch64::uint16x8_t; 8],
+    lo: &AbKOperands,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let mut s = *acc;
+        for v in s.iter_mut() {
+            debug_assert_eq!(vmaxvq_u16(vshrq_n_u16::<15>(*v)), 0);
+            *v = vshlq_n_u16::<1>(*v);
+        }
+        *acc = fuse_acc(&s, lo);
+    }
+}
+
 /// [`ABV_FUSE`] form of [`horner_absorb_first`]: `(acc << 1) ^ P2 ^ P6'`.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
@@ -2653,7 +2670,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
             let zero = [vdupq_n_u16(0); 8];
             let o2 = opnds!(plain, plain_sw, kplain, 2);
             if omit_high {
-                horner_absorb_first(&mut acc, &fuse_products(&o2), &zero);
+                fuse_absorb_first_one(&mut acc, &o2);
             } else {
                 let o6 = opnds!(scaled, scaled_sw, kscaled, 6);
                 fuse_absorb_first(&mut acc, &o2, &o6);
