@@ -2522,6 +2522,22 @@ pub(crate) mod witgen_simd {
         }
     }
 
+    macro_rules! stnp_imm {
+        ($x:expr, $y:expr, $p:expr, $off:expr) => {
+            core::arch::asm!("stnp {0:q}, {1:q}, [{2}, #{off}]", in(vreg) $x, in(vreg) $y, in(reg) $p, off = const $off, options(nostack))
+        };
+    }
+
+    macro_rules! flush_blk_nt {
+        ($lb:expr, $j:literal, $rj:expr, $dp:expr, $o0:expr, $o1:expr) => {
+            core::arch::asm!(
+                "ldr {w0:q}, [{lb}, #{l0}]\nldr {w1:q}, [{lb}, #{l1}]\nldr {w2:q}, [{lb}, #{l2}]\nstnp {w0:q}, {w1:q}, [{dp}, #{o0}]\nstnp {w2:q}, {rj:q}, [{dp}, #{o1}]",
+                lb = in(reg) $lb, dp = in(reg) $dp, rj = in(vreg) $rj, w0 = out(vreg) _, w1 = out(vreg) _, w2 = out(vreg) _,
+                l0 = const $j * 16, l1 = const (4 + $j) * 16, l2 = const (8 + $j) * 16, o0 = const $o0, o1 = const $o1, options(nostack, preserves_flags)
+            )
+        };
+    }
+
     /// Last useful word (bit 15408 → word 481, 17 bits used).
     const LAST_WORD: usize = (USEFUL_BITS - 1) / 32; // 481
 
@@ -2557,28 +2573,68 @@ pub(crate) mod witgen_simd {
         stage: *mut V4, // 512 block-lane words for this buffer's quad
         paired: bool,
         even: V4,
+        direct: bool,
+        zplain: bool,
+        dst: *mut u32,
+        dp: [*mut u32; 4],
+        line_buf: *mut V4, // 12 V4s: [slot 0..3][blk 0..4] (192 bytes)
+        q: [V4; 3],
     }
 
     impl W32 {
         #[inline(always)]
         fn at(stage: *mut V4, pending: V4) -> Self {
-            Self::at_paired(stage, pending, false)
+            Self::at_split(stage, pending, false, false, false, core::ptr::null_mut(), core::ptr::null_mut())
         }
 
         #[inline(always)]
-        fn at_paired(stage: *mut V4, pending: V4, paired: bool) -> Self {
-            Self {
-                pending,
-                stage,
-                paired,
-                even: unsafe { vdupq_n_u32(0) },
-            }
+        fn at_split(stage: *mut V4, pending: V4, paired: bool, direct: bool, zplain: bool, dst: *mut u32, line_buf: *mut V4) -> Self {
+            let zero = unsafe { vdupq_n_u32(0) };
+            let dp = if direct && !zplain { unsafe { std::array::from_fn(|j| dst.add(j * U32_PER_BLOCK + 256)) } } else { [core::ptr::null_mut(); 4] };
+            Self { pending, stage, paired, even: zero, direct, zplain, dst, dp, line_buf, q: [zero; 3] }
         }
 
         #[inline(always)]
         unsafe fn emit<const WORD: usize>(&mut self, v: V4) {
             unsafe {
-                if self.paired {
+                if self.direct && WORD < 480 {
+                    if WORD % 4 < 3 {
+                        self.q[WORD % 4] = v;
+                    } else if self.zplain {
+                        store_group_rows::<WORD>(self.dst, self.q[0], self.q[1], self.q[2], v);
+                    } else {
+                        let (r0, r1, r2, r3) = tr4(self.q[0], self.q[1], self.q[2], v);
+                        if WORD % 16 == 15 {
+                            flush_blk_nt!(self.line_buf, 0, r0, self.dp[0], ((WORD & !15) as isize) * 4 - 1024, (((WORD & !15) + 8) as isize) * 4 - 1024);
+                            flush_blk_nt!(self.line_buf, 1, r1, self.dp[1], ((WORD & !15) as isize) * 4 - 1024, (((WORD & !15) + 8) as isize) * 4 - 1024);
+                            flush_blk_nt!(self.line_buf, 2, r2, self.dp[2], ((WORD & !15) as isize) * 4 - 1024, (((WORD & !15) + 8) as isize) * 4 - 1024);
+                            flush_blk_nt!(self.line_buf, 3, r3, self.dp[3], ((WORD & !15) as isize) * 4 - 1024, (((WORD & !15) + 8) as isize) * 4 - 1024);
+                        } else {
+                            core::arch::asm!(
+                                "stp {r0:q}, {r1:q}, [{lb}, #{o0}]\nstp {r2:q}, {r3:q}, [{lb}, #{o1}]",
+                                r0 = in(vreg) r0, r1 = in(vreg) r1, r2 = in(vreg) r2, r3 = in(vreg) r3, lb = in(reg) self.line_buf,
+                                o0 = const ((WORD / 4) % 4) * 64, o1 = const ((WORD / 4) % 4) * 64 + 32, options(nostack, preserves_flags)
+                            );
+                        }
+                    }
+                } else if self.direct {
+                    if WORD == 480 {
+                        self.q[0] = v;
+                    } else {
+                        debug_assert_eq!(WORD, LAST_WORD);
+                        let zero = vdupq_n_u32(0);
+                        let (r0, r1, r2, r3) = tr4(self.q[0], v, zero, zero);
+                        for (j, rj) in [r0, r1, r2, r3].into_iter().enumerate() {
+                            if self.zplain {
+                                let p = self.dst.add(j * U32_PER_BLOCK + RANKED_SPARSE_TAIL_WORD);
+                                vst1q_u32(p, rj);
+                                vst1q_u32(p.add(4), zero);
+                            } else {
+                                stnp_imm!(rj, zero, self.dp[j], (RANKED_SPARSE_TAIL_WORD as isize) * 4 - 1024);
+                            }
+                        }
+                    }
+                } else if self.paired {
                     if WORD % 2 == 0 {
                         self.even = v;
                     } else {
@@ -4005,12 +4061,32 @@ pub(crate) mod witgen_simd {
             let one = vdupq_n_u32(1);
             let mut za = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
             let mut bs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let mut z_line = core::mem::MaybeUninit::<[V4; 12]>::uninit();
             let za = za.as_mut_ptr().cast::<V4>();
             let bs = bs.as_mut_ptr().cast::<V4>();
+            let z_line = z_line.as_mut_ptr().cast::<V4>();
+
+            let pending_bit = vshrq_n_u32::<31>(flags);
+            let mut wz = W32::at_split(za, pending_bit, PAIR_STAGE_STORES, WZ && MEM, ZPLAIN, z, z_line);
+            macro_rules! emit4 {
+                ($b:literal, $w0:expr, $w1:expr, $w2:expr, $w3:expr) => {{
+                    wz.emit::<$b>($w0);
+                    wz.emit::<{ $b + 1 }>($w1);
+                    wz.emit::<{ $b + 2 }>($w2);
+                    wz.emit::<{ $b + 3 }>($w3);
+                }};
+            }
 
             // ---- prefix: cv slot words 0..8 (z = a = cv) ----
-            for w in 0..8usize {
-                vst1q_u32(za.add(w) as *mut u32, cv_v[w]);
+            if WZ && MEM {
+                if ZPLAIN {
+                    emit4!(0, cv_v[0], cv_v[1], cv_v[2], cv_v[3]);
+                    emit4!(4, cv_v[4], cv_v[5], cv_v[6], cv_v[7]);
+                }
+            } else {
+                for w in 0..8usize {
+                    vst1q_u32(za.add(w) as *mut u32, cv_v[w]);
+                }
             }
             // 32..36 are ever read (the drain starts at chunk 4).
             if !WZ && !(DIRECT_SCRATCH && PRIMED) {
@@ -4028,13 +4104,25 @@ pub(crate) mod witgen_simd {
                 m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12],
                 m[13], m[14], m[15], tlo, thi, blen, flags,
             ];
-            vst1q_u32(
-                za.add(16) as *mut u32,
-                vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
-            );
-            for k in 1..20usize {
-                let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
-                vst1q_u32(za.add(16 + k) as *mut u32, w);
+            if WZ && MEM {
+                let mw: [V4; 20] = std::array::from_fn(|k| {
+                    let lo = if k == 0 { one } else { vshrq_n_u32::<31>(chain[k - 1]) };
+                    vorrq_u32(lo, vshlq_n_u32::<1>(chain[k]))
+                });
+                emit4!(16, mw[0], mw[1], mw[2], mw[3]);
+                emit4!(20, mw[4], mw[5], mw[6], mw[7]);
+                emit4!(24, mw[8], mw[9], mw[10], mw[11]);
+                emit4!(28, mw[12], mw[13], mw[14], mw[15]);
+                emit4!(32, mw[16], mw[17], mw[18], mw[19]);
+            } else {
+                vst1q_u32(
+                    za.add(16) as *mut u32,
+                    vorrq_u32(one, vshlq_n_u32::<1>(chain[0])),
+                );
+                for k in 1..20usize {
+                    let w = vorrq_u32(vshrq_n_u32::<31>(chain[k - 1]), vshlq_n_u32::<1>(chain[k]));
+                    vst1q_u32(za.add(16 + k) as *mut u32, w);
+                }
             }
 
             if DIRECT_SCRATCH && PRIMED {
@@ -4051,8 +4139,6 @@ pub(crate) mod witgen_simd {
             }
 
             // ---- G stream ----
-            let pending_bit = vshrq_n_u32::<31>(flags);
-            let mut wz = W32::at_paired(za, pending_bit, PAIR_STAGE_STORES);
             let mut wab = W32Pair {
                 pa: pending_bit,
                 pb: one,
@@ -4188,20 +4274,32 @@ pub(crate) mod witgen_simd {
                         vst1q_u32(za.add(w) as *mut u32, zero);
                     }
                 }
-            } else {
+            } else if !(WZ && MEM) {
                 // The sparse tail publisher reads words 480..483 only.
                 vst1q_u32(za.add(ZERO_FILL_WORD) as *mut u32, zero);
                 vst1q_u32(za.add(ZERO_FILL_WORD + 1) as *mut u32, zero);
             }
 
             // ---- out_lo slot, words 8..16 (z = a) ----
-            for w in 0..8usize {
-                let lo = veorq_u32(state[w], state[w + 8]);
-                vst1q_u32(za.add(8 + w) as *mut u32, lo);
+            if WZ && MEM {
+                let lo: [V4; 8] = std::array::from_fn(|w| veorq_u32(state[w], state[w + 8]));
+                if !ZPLAIN {
+                    emit4!(0, cvw!(0), cvw!(1), cvw!(2), cvw!(3));
+                    emit4!(4, cvw!(4), cvw!(5), cvw!(6), cvw!(7));
+                }
+                emit4!(8, lo[0], lo[1], lo[2], lo[3]);
+                emit4!(12, lo[4], lo[5], lo[6], lo[7]);
+            } else {
+                for w in 0..8usize {
+                    let lo = veorq_u32(state[w], state[w + 8]);
+                    vst1q_u32(za.add(8 + w) as *mut u32, lo);
+                }
             }
 
             // ---- drain ----
-            if WZ && ZPLAIN {
+            if WZ && MEM {
+                // Emitted directly to `z`.
+            } else if WZ && ZPLAIN {
                 // Scratch rows: words 484..488 are the zeros the sparse tail
                 // publisher supplies (482/483 were zeroed above); chunks
                 // 0..61 then drain with plain stores.
