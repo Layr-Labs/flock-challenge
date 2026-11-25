@@ -189,13 +189,16 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
 /// No packed-buffer scan is added to the production path.
 pub(crate) struct Blake3IdentityPrefixWitness {
     buffers: [(usize, usize); 3],
+    pub(crate) ranked_deferred_roles: bool,
 }
 
 impl Blake3IdentityPrefixWitness {
-    fn from_row_major_generator(z: &[F128], a: &[F128], b: &[F128]) -> Self {
+    fn from_row_major_generator(
+        z: &[F128], a: &[F128], b: &[F128], ranked_deferred_roles: bool,
+    ) -> Self {
         assert_eq!(a.len(), z.len());
         assert_eq!(b.len(), z.len());
-        Self { buffers: Self::identities(z, a, b) }
+        Self { buffers: Self::identities(z, a, b), ranked_deferred_roles }
     }
 
     fn identities(z: &[F128], a: &[F128], b: &[F128]) -> [(usize, usize); 3] {
@@ -5249,7 +5252,7 @@ impl Blake3Setup {
     /// [`flock_core::r1cs::WitnessLayout`]). The generic matrix provers and
     /// chain/Merkle wrappers still require row-major.
     pub fn new_batch_major(n_blocks: usize) -> Self {
-        let mut s = Self::new(n_blocks);
+        let mut s = Self::with_log_inv_rate(n_blocks, 1);
         s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
         // Batch-major is outside the recognized reverse-transpose shape.
         // Preserve the old eager CSC construction for this explicit fallback.
@@ -5345,6 +5348,10 @@ impl Blake3Setup {
     }
 
     pub fn new(n_blocks: usize) -> Self {
+        // The ranked tail's pipelines and constant buffers need no witness.
+        if n_blocks == 1 << 18 {
+            flock_core::zerocheck::univariate_skip_optimized::ranked_r1_tail_prewarm_early();
+        }
         Self::with_log_inv_rate(n_blocks, 1)
     }
 
@@ -5542,7 +5549,8 @@ impl Blake3Setup {
         // the same contention class as the measured hetero-widening losses.
         // The warm publish below and the spawn-free kickoff stay: their
         // mechanisms are contention-free.
-        let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger);
+        let warm_raw880 = call == 0 && crate::seed_pipe::is_ranked_worker();
+        let (proof, commitment, claim) = self.prove_fast_inner(blocks, challenger, warm_raw880);
         flock_core::cpu_keepalive::pool_spin_release();
         if call == 0 {
             let (proof, commitment) = warm_publish_path(proof, commitment);
@@ -5632,7 +5640,7 @@ impl Blake3Setup {
             crate::seed_pipe::BENCH_DOMAIN,
             HashKind::Blake3,
         );
-        let out = setup.prove_fast_inner(blocks, &mut challenger);
+        let out = setup.prove_fast_inner(blocks, &mut challenger, false);
         flock_core::cpu_keepalive::pool_spin_release();
         out
     }
@@ -5641,6 +5649,7 @@ impl Blake3Setup {
         &self,
         blocks: &[Compression],
         challenger: &mut Ch,
+        warm_raw880: bool,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
         let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
@@ -5648,8 +5657,8 @@ impl Blake3Setup {
         // (`ZeroOddTailLanes`); the GPU commit graph is encoded during
         // witness generation, so publish them for the whole proof.
         // `FLOCK_NO_GPU_ZERO_LANE=1` keeps the dense GPU grid.
+        let padding = self.r1cs.padding_spec();
         let _gpu_zero_lanes = {
-            let padding = self.r1cs.padding_spec();
             let num_ntts = self.pcs_params.num_ntts();
             flock_core::gpu_commit::GpuZeroTailLanes::scope(
                 num_ntts,
@@ -5708,7 +5717,7 @@ impl Blake3Setup {
                 // on the fused deferred-stripe route the AB arm publishes the
                 // quads below `r2_published_quads` only, and round two
                 // rebuilds the rest from this producer. Every quad otherwise.
-                let r2_published_quads = match &deferred_ab {
+                let stock_r2_published_quads = match &deferred_ab {
                     Some(deferred)
                         if gpu_first_pass.is_some()
                             && z_packed_lincheck.is_none()
@@ -5721,10 +5730,45 @@ impl Blake3Setup {
                     Some(deferred) => deferred.n_quads(),
                     None => 0,
                 };
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let raw880_reservation = if !warm_raw880
+                    && flock_core::gpu_commit::r2_raw_stage::enabled()
+                    && std::env::var_os("FLOCK_NO_STRIPE_IN_AB").is_none()
+                    && (fixed_input_root_stripe_rows().is_some() || root_stripe_rows().is_some())
+                    && stock_r2_published_quads == 880 * 32
+                    && ab_bytes == 1 << 29
+                    && core::mem::size_of_val(b_packed_f128.as_slice()) == ab_bytes
+                    && crate::prover::ranked_lincheck_c_reuse_enabled(&self.r1cs)
+                    && flock_core::zerocheck::private_raw880_lookahead(self.r1cs.m, &padding)
+                    && !flock_core::gpu_commit::ranked_exact_contention_tune_pending()
+                {
+                    flock_core::gpu_commit::r2_raw_stage::try_reserve(&z_packed)
+                } else {
+                    None
+                };
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let omit_raw880 = raw880_reservation.is_some();
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                let omit_raw880 = false;
+                let trace_raw880 = omit_raw880 && (phase_timing || flock_core::tmark::on());
+                let published_raw880_quads = std::sync::atomic::AtomicUsize::new(0);
+                let r2_published_quads = if omit_raw880 {
+                    let jobs = flock_core::zerocheck::PRIVATE_RAW880_PHYSICAL_JOBS;
+                    if trace_raw880 {
+                        eprintln!("[r2-raw880-private] omit=1 raw_jobs={jobs} logical_jobs=880");
+                    }
+                    jobs * 32
+                } else {
+                    stock_r2_published_quads
+                };
                 let ab_produce = |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool| {
                     if let Some(deferred) = &deferred_ab {
                         // A null scratch always publishes (see `fill_quad_to`).
-                        deferred.fill_quad_to(unit, a_scratch, b_scratch, primed, unit < r2_published_quads);
+                        let publish = unit < r2_published_quads;
+                        deferred.fill_quad_to(unit, a_scratch, b_scratch, primed, publish);
+                        if trace_raw880 && (publish || a_scratch.is_null()) {
+                            published_raw880_quads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 };
                 let ab_producer = match &deferred_ab {
@@ -5749,9 +5793,34 @@ impl Blake3Setup {
                         handle.fill_quad_to(unit, a_scratch, b_scratch, primed, false);
                     }
                 };
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let scratch_raw880 =
+                    |unit: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool| {
+                        assert!(!a_scratch.is_null() && !b_scratch.is_null());
+                        deferred_ab
+                            .as_ref()
+                            .expect("admitted ranked producer")
+                            .fill_quad_to(unit, a_scratch, b_scratch, primed, false);
+                    };
+                let raw880 = crate::prover::Raw880Mode::warm_or_off(warm_raw880);
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                let raw880 = match raw880_reservation {
+                    Some(reservation) => crate::prover::Raw880Mode::Stage {
+                        reservation,
+                        scratch: flock_core::zerocheck::univariate_skip_optimized::Round1AbProducer {
+                            unit_bytes: DeferredAb::UNIT_BYTES,
+                            produce: &scratch_raw880,
+                        },
+                        // Preserve the original R1 helper schedule when the
+                        // physical raw publication is limited to the primer.
+                        logical_helper_prefix_bytes: stock_r2_published_quads * DeferredAb::UNIT_BYTES,
+                    },
+                    None => raw880,
+                };
                 // Round two takes this registration (matched by the buffers'
                 // addresses); it is withdrawn when the prove returns.
                 let _r2_ab_rebuild = match (&ab_producer, &deferred_ab, &r2_rebuild_only) {
+                    _ if omit_raw880 => None, // The staged route owns its scratch producer directly.
                     (Some(producer), Some(deferred), _) if r2_published_quads < deferred.n_quads() => {
                         let published = r2_published_quads * DeferredAb::UNIT_BYTES;
                         // SAFETY: both buffers live until the prove below
@@ -5845,6 +5914,8 @@ impl Blake3Setup {
                 let identity_prefix_witness = Some(
                     Blake3IdentityPrefixWitness::from_row_major_generator(
                         &z_packed, &a_packed_f128, &b_packed_f128,
+                        // Non-rebuild DeferredAb requires the actual three role-token hits.
+                        deferred_ab.is_some(),
                     ),
                 );
                 if phase_timing {
@@ -5860,7 +5931,7 @@ impl Blake3Setup {
                     // A live stream implies the GPU latch is on; the empty
                     // marker is hydrated only if the Metal finish fails.
                     let codeword = codeword.unwrap_or_default();
-                    return match z_packed_lincheck {
+                    let proof = match z_packed_lincheck {
                         Some(stripe) => {
                             crate::prover::prove_fast_ligerito_from_streamed_first_pass(
                                 &self.r1cs,
@@ -5873,6 +5944,7 @@ impl Blake3Setup {
                                 codeword,
                                 stream,
                                 identity_prefix_witness,
+                                raw880,
                                 challenger,
                             )
                         }
@@ -5887,9 +5959,15 @@ impl Blake3Setup {
                             stream,
                             identity_prefix_witness,
                             ab_producer,
+                            raw880,
                             challenger,
                         ),
                     };
+                    if trace_raw880 {
+                        let actual = published_raw880_quads.load(std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("[r2-raw880-private] published raw quads={actual}");
+                    }
+                    return proof;
                 }
                 return crate::prover::prove_fast_ligerito_from_witness_with_identity_prefix(
                     &self.r1cs,
@@ -5902,6 +5980,7 @@ impl Blake3Setup {
                     lc_circuit,
                     codeword,
                     identity_prefix_witness,
+                    raw880,
                     challenger,
                 );
             }
@@ -5911,7 +5990,7 @@ impl Blake3Setup {
                 self.generate_witness_ab_with_rate2_codeword(blocks);
             let identity_prefix_witness = Some(
                 Blake3IdentityPrefixWitness::from_row_major_generator(
-                    &z_packed, &a_packed_f128, &b_packed_f128,
+                    &z_packed, &a_packed_f128, &b_packed_f128, false,
                 ),
             );
             if phase_timing {
@@ -5943,7 +6022,7 @@ impl Blake3Setup {
         let identity_prefix_witness =
             (self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor).then(|| {
                 Blake3IdentityPrefixWitness::from_row_major_generator(
-                    &z_packed, &a_packed_f128, &b_packed_f128,
+                    &z_packed, &a_packed_f128, &b_packed_f128, false,
                 )
             });
         let lc_circuit = self.lincheck_circuit();
@@ -5957,6 +6036,7 @@ impl Blake3Setup {
             lc_circuit,
             codeword,
             identity_prefix_witness,
+            crate::prover::Raw880Mode::Off,
             challenger,
         )
     }

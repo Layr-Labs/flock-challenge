@@ -1896,15 +1896,17 @@ impl Drop for BuildToken {
 }
 
 /// Run `f` on a new thread named `name`, counted by [`join_builds`] until it
-/// returns. When no thread can be made, `f` is dropped unrun and its
-/// consumer makes the build on first use, as without the fan-out.
-pub(crate) fn spawn_build(name: &str, f: impl FnOnce() + Send + 'static) {
+/// returns. Return false if the thread could not start and `f` was dropped.
+pub(crate) fn spawn_build(name: &str, f: impl FnOnce() + Send + 'static) -> bool {
     *BUILDS_PENDING.lock().unwrap_or_else(|e| e.into_inner()) += 1;
     let token = BuildToken;
-    let _ = std::thread::Builder::new().name(name.into()).spawn(move || {
-        let _token = token;
-        f();
-    });
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _token = token;
+            f();
+        })
+        .is_ok()
 }
 
 /// Block until every helper started by [`spawn_build`] has returned (at
@@ -2607,6 +2609,16 @@ pub fn gpu_keepwarm_resume() {
     if gpu_commit_latched_on() {
         imp::keepwarm_arm();
     }
+}
+
+/// Disable both root packets before either pipeline starts to build.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn root_packets_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_R1_HIGH_PRIVATE880").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+    })
 }
 
 /// Scan one ascending nonce block with the retained Metal PCS-grind state.
@@ -11213,6 +11225,8 @@ kernel void blake3_pow_seg_tail(
         /// Race grind result slots and tail pipeline (see `ENV_NO_GRIND_LAT`),
         /// filled by `pow_race_tail_prewarm`.
         pub(crate) pow_race: std::sync::Mutex<PowRaceSlots>,
+        // Optional compiled program; the genuine warm proof still owns admission.
+        raw880_early_pso: std::sync::Mutex<Option<r2_raw_stage::EarlyMetal>>,
     }
     // SAFETY: MTLDevice/MTLCommandQueue/MTLComputePipelineState are
     // documented thread-safe; command buffers/encoders are created and used
@@ -11431,6 +11445,7 @@ kernel void blake3_pow_seg_tail(
                 // threads of their own and are joined before the context is
                 // made; with it off, each runs here in this order.
                 let fan = super::pipe_fanout_enabled();
+                let raw880_pso_job = r2_raw_stage::start_early_pso(&api, device, fan);
                 let mut psos: Option<[Id; 11]> = None;
                 let prebuilt = try_embedded_metallib(&api, device);
                 let prebuilt_jobs = if fan && !prebuilt.is_null() {
@@ -12166,6 +12181,7 @@ kernel void blake3_pow_seg_tail(
                 let pso_ntt5t3 = final_t3_job.get();
                 let pso_final_leaf = final_leaf_job.get();
                 let (pso_ntt4zg4_zero_root, pso_export_from_z_zero_root_tabs) = zero_root?;
+                let raw880_early_pso = r2_raw_stage::join_early_pso(raw880_pso_job);
                 Ok(Gpu {
                     api,
                     device,
@@ -12195,6 +12211,7 @@ kernel void blake3_pow_seg_tail(
                     pow_lock: std::sync::Mutex::new(()),
                     pow_v2,
                     pow_race: std::sync::Mutex::new(PowRaceSlots::EMPTY),
+                    raw880_early_pso: std::sync::Mutex::new(raw880_early_pso),
                 })
             })();
             pool_pop(pool);
@@ -12416,7 +12433,6 @@ kernel void blake3_pow_seg_tail(
             }
         }
 
-        #[cfg(test)]
         pub(crate) unsafe fn pipeline_resources(&self, pso: Id) -> (u64, u64, u64) {
             unsafe {
                 let static_tg: u64 = send!(
@@ -23534,61 +23550,97 @@ kernel void zc_eq_rows(
         source: &str,
         name: &str,
     ) -> Result<Id, String> {
+        unsafe { compile_supplemental_pipeline_on(&gpu.api, gpu.device, source, name, |_| {}) }
+    }
+
+    unsafe fn compile_supplemental_pipeline_on(
+        api: &Api,
+        device: Id,
+        source: &str,
+        name: &str,
+        mut mark: impl FnMut(&'static str),
+    ) -> Result<Id, String> {
         unsafe {
-            let src = gpu.api.nsstring(source)?;
+            let library = compile_supplemental_library_on(api, device, source, &mut mark)?;
+            let result = compile_supplemental_entry_on(api, device, library, name, &mut mark);
+            send!(*api, unsafe extern "C" fn(Id, Sel) -> Id, library, c"release");
+            result
+        }
+    }
+
+    unsafe fn compile_supplemental_library(gpu: &Gpu, source: &str) -> Result<Id, String> {
+        unsafe { compile_supplemental_library_on(&gpu.api, gpu.device, source, &mut |_| {}) }
+    }
+
+    unsafe fn compile_supplemental_entry(gpu: &Gpu, library: Id, name: &str) -> Result<Id, String> {
+        unsafe { compile_supplemental_entry_on(&gpu.api, gpu.device, library, name, &mut |_| {}) }
+    }
+
+    unsafe fn compile_supplemental_library_on(
+        api: &Api,
+        device: Id,
+        source: &str,
+        mark: &mut impl FnMut(&'static str),
+    ) -> Result<Id, String> {
+        unsafe {
+            let src = api.nsstring(source)?;
             let mut err: Id = NIL;
+            mark("library_start");
             let library: Id = send!(
-                gpu.api,
+                *api,
                 unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                gpu.device,
+                device,
                 c"newLibraryWithSource:options:error:",
                 src,
                 NIL,
                 &mut err
             );
+            mark("library_end");
             if library.is_null() {
                 return Err(format!(
                     "supplemental shader compile failed: {}",
-                    gpu.api.error_string(err)
+                    api.error_string(err)
                 ));
             }
-            let ns = gpu.api.nsstring(name)?;
+            Ok(library)
+        }
+    }
+
+    unsafe fn compile_supplemental_entry_on(
+        api: &Api,
+        device: Id,
+        library: Id,
+        name: &str,
+        mark: &mut impl FnMut(&'static str),
+    ) -> Result<Id, String> {
+        unsafe {
+            let ns = api.nsstring(name)?;
             let f: Id = send!(
-                gpu.api,
+                *api,
                 unsafe extern "C" fn(Id, Sel, Id) -> Id,
                 library,
                 c"newFunctionWithName:",
                 ns
             );
             if f.is_null() {
-                send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel) -> Id,
-                    library,
-                    c"release"
-                );
                 return Err(format!("supplemental kernel {name} not found"));
             }
             let mut perr: Id = NIL;
+            mark("pso_start");
             let pso: Id = send!(
-                gpu.api,
+                *api,
                 unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id,
-                gpu.device,
+                device,
                 c"newComputePipelineStateWithFunction:error:",
                 f,
                 &mut perr
             );
-            send!(gpu.api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
-            send!(
-                gpu.api,
-                unsafe extern "C" fn(Id, Sel) -> Id,
-                library,
-                c"release"
-            );
+            mark("pso_end");
+            send!(*api, unsafe extern "C" fn(Id, Sel) -> Id, f, c"release");
             if pso.is_null() {
                 Err(format!(
                     "supplemental pipeline {name}: {}",
-                    gpu.api.error_string(perr)
+                    api.error_string(perr)
                 ))
             } else {
                 Ok(pso)
@@ -25465,6 +25517,11 @@ kernel void zc_r2_products_horner_cs(
 
     include!("gpu_commit/r2cs_fast.rs");
     include!("gpu_commit/r2steal.rs");
+    pub(crate) mod r1_ab_tail_only;
+
+    pub mod r2_raw_stage {
+        include!("gpu_commit/r2_raw_stage.rs");
+    }
 
     /// Host mirror of the probe kernel's `ZcR2CsLayout` (see
     /// `UniSkipCompactFold::anchor_index` / `delta_offset`): anchors and
@@ -26109,6 +26166,8 @@ kernel void zc_r2_horner_oracle(
     }
 
     pub(crate) struct ZcR2Job {
+        // Drop before compact views so no unwind releases them early.
+        state_flight: Option<r2_raw_stage::R2Flight>,
         cb: Id,
         a_buf: Id,
         b_buf: Id,
@@ -26583,6 +26642,9 @@ kernel void zc_r2_horner_oracle(
             note_poisoned_lock("zc-r2 idle-fill", false);
             return;
         };
+        if r2_raw_stage::state_busy() {
+            return;
+        }
         unsafe {
             // A stale primer (round-two window never ran, e.g. its arm was
             // gated off mid-process) must complete before its buffers are
@@ -26714,6 +26776,55 @@ kernel void zc_r2_horner_oracle(
         ab_ready_chunks: usize,
         pure: bool,
     ) -> Option<ZcR2Job> {
+        launch_zc_r2_products_cs_impl(
+            a_packed, b_packed, table_data, eq_lo, eq_hi, lo_size, hi_size, pair_in_block_mask,
+            useful_pairs_inclusive, cs_layout, cs_live, ab_ready_chunks, pure, false, None,
+        )
+    }
+
+    /// Deliberate proof-local omission. Raw fallback stays below the
+    /// physical prefix without tripping the stock unexpected-short latch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_zc_r2_products_cs_staged(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+        cs_layout: Option<ZcR2CsLayout>,
+        cs_live: Option<(usize, usize, usize)>,
+        ab_ready_chunks: usize,
+        pure: bool,
+        staged: Option<&mut r2_raw_stage::StageJob<'_>>,
+    ) -> Option<ZcR2Job> {
+        launch_zc_r2_products_cs_impl(
+            a_packed, b_packed, table_data, eq_lo, eq_hi, lo_size, hi_size, pair_in_block_mask,
+            useful_pairs_inclusive, cs_layout, cs_live, ab_ready_chunks, pure, true, staged,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_zc_r2_products_cs_impl(
+        a_packed: &[u8],
+        b_packed: &[u8],
+        table_data: &[F128],
+        eq_lo: &[F128],
+        eq_hi: &[F128],
+        lo_size: usize,
+        hi_size: usize,
+        pair_in_block_mask: usize,
+        useful_pairs_inclusive: usize,
+        cs_layout: Option<ZcR2CsLayout>,
+        cs_live: Option<(usize, usize, usize)>,
+        ab_ready_chunks: usize,
+        pure: bool,
+        omitted: bool,
+        mut staged: Option<&mut r2_raw_stage::StageJob<'_>>,
+    ) -> Option<ZcR2Job> {
         use std::sync::atomic::Ordering;
         if !super::gpu_zc_r2_enabled() || ZC_R2_POISONED.load(Ordering::Relaxed) {
             return None;
@@ -26733,6 +26844,10 @@ kernel void zc_r2_horner_oracle(
             return None;
         }
         let calibration = tuned == usize::MAX;
+        if omitted && calibration {
+            crate::tmark::mark("raw880 R2 omitted calibration refused");
+            return None;
+        }
         let chunks = if calibration {
             // Calibration cost is paid by EVERY worker process inside the
             // CI job wall (~120 of them per ranked run) and this lineage
@@ -26745,8 +26860,15 @@ kernel void zc_r2_horner_oracle(
         } else {
             tuned.min(hi_size)
         };
-        let chunks = zc_r2_clamp_to_published(chunks, ab_ready_chunks);
-        if chunks == 0 {
+        let raw_clamp = |chunks: usize| {
+            if omitted {
+                chunks.min(ab_ready_chunks)
+            } else {
+                zc_r2_clamp_to_published(chunks, ab_ready_chunks)
+            }
+        };
+        let raw_chunks = raw_clamp(chunks);
+        if raw_chunks == 0 {
             return None;
         }
         let horner =
@@ -26784,6 +26906,22 @@ kernel void zc_r2_horner_oracle(
                 return None;
             }
         };
+        let state_lease = match r2_raw_stage::StateLease::try_take() {
+            Ok(lease) => lease,
+            Err(()) => {
+                crate::tmark::mark("raw880 R2 shared state busy");
+                return None;
+            }
+        };
+        // A prior leased job may have published a different share while
+        // this caller was waiting for the state mutex. Keep that verdict.
+        if state_lease.is_some()
+            && (ZC_R2_POISONED.load(Ordering::Relaxed)
+                || tuned != ZC_R2_TUNED.load(Ordering::Relaxed))
+        {
+            crate::tmark::mark("raw880 R2 shared tune changed");
+            return None;
+        }
         unsafe {
             // An idle-fill primer staged in the ZC window binds the buffers
             // rewritten below; drain it first (it completed during the ZC
@@ -26841,8 +26979,28 @@ kernel void zc_r2_horner_oracle(
                 state.part_buf = gpu.new_buffer(need_part).ok()?;
                 state.part_cap = need_part;
             }
-            let a_buf = zc_r2_wrap(&mut state, gpu, a_packed).ok()?;
-            let b_buf = zc_r2_wrap(&mut state, gpu, b_packed).ok()?;
+            let prefer_private = omitted
+                && state_lease.is_some()
+                && !calibration
+                && cs_wanted
+                && cs_live.is_some()
+                && chunks == r2_raw_stage::OFFER
+                && ab_ready_chunks == ZC_IDLE_FILL_PRIMER_CHUNKS
+                && lo_size == 16_384
+                && hi_size == 2048
+                && pair_in_block_mask == 127
+                && useful_pairs_inclusive == 121
+                && r2cs_fast::fast2_selected()
+                && staged.as_ref().is_some_and(|job| job.ready(gpu));
+            let chunks = if prefer_private { chunks } else { raw_chunks };
+            let raw_views = if prefer_private {
+                None
+            } else {
+                Some((
+                    zc_r2_wrap(&mut state, gpu, a_packed).ok()?,
+                    zc_r2_wrap(&mut state, gpu, b_packed).ok()?,
+                ))
+            };
             // R2-CS dispatch of this launch: the calibration's oracle
             // dispatch over the calibration chunks into the scratch state, or
             // a timed prefix through this prove's existing views. Any failure
@@ -26921,16 +27079,40 @@ kernel void zc_r2_horner_oracle(
             let chunks = if !calibration && timed_cs.is_none() && cs_mode == ZC_R2_CS_ADMITTED {
                 match ZC_R2_INC_TUNED.load(Ordering::Relaxed) {
                     0 => chunks,
-                    g => zc_r2_clamp_to_published(g.min(hi_size), ab_ready_chunks),
+                    g => raw_clamp(g.min(hi_size)),
                 }
             } else {
                 chunks
+            };
+            let private = if prefer_private && timed_cs.is_some() {
+                staged.as_deref_mut().and_then(|job| job.take_ready())
+            } else {
+                if prefer_private {
+                    crate::tmark::mark("raw880 R2 compact views refused");
+                }
+                None
+            };
+            let (chunks, a_buf, b_buf) = if let Some(private) = &private {
+                let (a, b) = private.buffers();
+                (r2_raw_stage::OFFER, a, b)
+            } else {
+                let (a, b) = match raw_views {
+                    Some(raw) => raw,
+                    None => (
+                        zc_r2_wrap(&mut state, gpu, a_packed).ok()?,
+                        zc_r2_wrap(&mut state, gpu, b_packed).ok()?,
+                    ),
+                };
+                let chunks = if omitted { raw_clamp(chunks) } else { chunks };
+                (chunks, a, b)
             };
             // R2-CS steal (`super::ENV_NO_R2_STEAL`): a timed R2-CS prefix
             // with the steal kernel offers chunks `0..chunks` (the claim word
             // at `chunks`) and signals the next event value after its
             // dispatch; every other launch leaves the word above every chunk.
-            let steal_value = (timed_cs.is_some() && !state.steal_cut_buf.is_null()).then(|| {
+            // Assign the compact prefix exclusively to the GPU on the
+            // omitted route, including the physical fallback.
+            let steal_value = (!omitted && timed_cs.is_some() && !state.steal_cut_buf.is_null()).then(|| {
                 state.steal_next += 1;
                 state.steal_next
             });
@@ -26955,7 +27137,21 @@ kernel void zc_r2_horner_oracle(
                 steal_value,
                 pure,
             )
+            .inspect_err(|_| {
+                if omitted {
+                    crate::tmark::mark("raw880 R2 encode refused");
+                }
+            })
             .ok()?;
+            let private_bound = private.is_some();
+            let mut state_flight = state_lease.map(|lease| lease.bind(gpu, cb, private));
+            if omitted {
+                crate::tmark::mark(if private_bound {
+                    "raw880 R2 submitted private 880 exclusive"
+                } else {
+                    "raw880 R2 submitted physical fallback"
+                });
+            }
             let steal = steal_value.map(|value| ZcR2Steal {
                 gpu,
                 ev: state.steal_ev,
@@ -26985,6 +27181,9 @@ kernel void zc_r2_horner_oracle(
                 .unwrap_or(NIL),
                 None => NIL,
             };
+            if let Some(flight) = &mut state_flight {
+                flight.set_oracle(cs_cb);
+            }
             let (cs, _cs_views) = match cs {
                 // An unsubmitted oracle dispatch leaves R2-CS uncalibrated
                 // (its scratch state is not kept).
@@ -26996,6 +27195,7 @@ kernel void zc_r2_horner_oracle(
                 None => (None, ZcR2CsViews([NIL, NIL])),
             };
             Some(ZcR2Job {
+                state_flight,
                 cb,
                 a_buf,
                 b_buf,
@@ -27038,6 +27238,9 @@ kernel void zc_r2_horner_oracle(
         let Ok(gpu) = gpu() else { return Err("no Metal".into()) };
         let Some(state_mutex) = zc_r2_state() else { return Err("no arm state".into()) };
         let Ok(mut state) = state_mutex.lock() else { return Err("arm state poisoned".into()) };
+        if r2_raw_stage::state_busy() {
+            return Err("R2 shared state busy".into());
+        }
         let res = unsafe { zc_r2_cs_compare(gpu, &state, pairs, anchors, deltas, deltas_len, live, slots) };
         zc_r2_cs_free_scratch(gpu, &mut state);
         res
@@ -27184,12 +27387,25 @@ kernel void zc_r2_horner_oracle(
         use std::sync::atomic::Ordering;
         // No calibration scratch state outlives the verdict (the oracle
         // normally freed it already).
-        if let Ok(gpu) = gpu()
-            && let Some(state_mutex) = zc_r2_state()
-            && let Ok(mut state) = state_mutex.lock()
-        {
-            zc_r2_cs_free_scratch(gpu, &mut state);
+        let gpu = gpu().ok();
+        let mut state = gpu.and_then(|_| zc_r2_state()?.lock().ok());
+        let opted_in = r2_raw_stage::enabled();
+        if opted_in && (state.is_none() || r2_raw_stage::state_busy()) {
+            crate::tmark::mark("raw880 R2 warm verdict refused");
+            return false;
         }
+        if let (Some(gpu), Some(state)) = (gpu, state.as_mut()) {
+            zc_r2_cs_free_scratch(gpu, state);
+        }
+        // A failed calibration can already have disabled CS. Its scratch
+        // is retired above, but a repeat verdict must leave the mode alone.
+        if opted_in && ZC_R2_CS_MODE.load(Ordering::Relaxed) != ZC_R2_CS_UNCALIBRATED {
+            return false;
+        }
+        if !opted_in {
+            drop(state.take());
+        }
+        // Hold the opt-in state mutex through the mode and share publication.
         let mut admitted = ok
             && ZC_R2_CS_MODE
                 .compare_exchange(
@@ -27222,6 +27438,7 @@ kernel void zc_r2_horner_oracle(
                 ZC_R2_TUNED.store(share, Ordering::Relaxed);
             }
         }
+        drop(state);
         if super::gpu_zc_r2_debug() {
             if admitted {
                 eprintln!(
@@ -27256,10 +27473,17 @@ kernel void zc_r2_horner_oracle(
             Ok(g) => g,
             Err(_) => return ZcR2Result::Failed,
         };
+        // Opt-in flights own their command references and hold the shared
+        // state busy through host output collection.
+        let release = |cb: Id| {
+            if job.state_flight.is_none() {
+                unsafe { gpu.release(cb) };
+            }
+        };
         let poison = |cb: Id| {
             ZC_R2_POISONED.store(true, Ordering::Relaxed);
             ZC_R2_TUNED.store(0, Ordering::Relaxed);
-            unsafe { gpu.release(cb) };
+            release(cb);
             ZcR2Result::Failed
         };
         unsafe {
@@ -27280,6 +27504,11 @@ kernel void zc_r2_horner_oracle(
                 }
             } else if gpu.spin_wait_cb(job.cb, 2.0).is_err() {
                 return poison(job.cb);
+            }
+            if job.state_flight.as_ref().is_some_and(|flight| flight.discard()) {
+                crate::tmark::mark("raw880 R2 test discard after terminal");
+                release(job.cb);
+                return ZcR2Result::Failed;
             }
             let first_wall = match job.steal.as_ref() {
                 Some(s) if seen => s.t_seen.lock().map_or(None, |t| *t).unwrap_or(0.0),
@@ -27340,9 +27569,14 @@ kernel void zc_r2_horner_oracle(
             };
             let timed_cs = job.cs.is_some() && !job.calibration;
             let (out, out_w) = if timed_cs { merge(state.cs_part_buf, 8) } else { merge(state.part_buf, 4) };
-            let head_bad = timed_cs && *gpu.buffer_contents(state.cs_flag_buf).cast::<u32>() != 0;
+            let force_head_bad = job.state_flight.as_ref().is_some_and(|flight| flight.head_bad());
+            let head_bad = timed_cs
+                && (force_head_bad || *gpu.buffer_contents(state.cs_flag_buf).cast::<u32>() != 0);
+            if force_head_bad {
+                crate::tmark::mark("raw880 R2 test head bad after terminal");
+            }
             if !job.calibration {
-                gpu.release(job.cb);
+                release(job.cb);
                 if let Some(submitted) = job.submitted {
                     eprintln!(
                         "[zc-r2] timed prefix {}/{} chunks: gpu={first_wall:.2}ms \
@@ -27389,7 +27623,7 @@ kernel void zc_r2_horner_oracle(
                     // chunks (see `super::ENV_NO_ZC_R2_CS_SHARE`).
                     cs_wall_ms = zc_fold_gpu_wall_ms(gpu, job.cs_cb);
                 }
-                gpu.release(job.cs_cb);
+                release(job.cs_cb);
                 Some(ok.then(|| merge(state.cs_part_buf, 8)))
             };
 
@@ -27458,7 +27692,7 @@ kernel void zc_r2_horner_oracle(
             walls[0] = first_wall.max(0.0);
             let mut n_walls = usize::from(walls[0] > 0.0);
             let mut w_min = if n_walls > 0 { walls[0] } else { f64::MAX };
-            gpu.release(job.cb);
+            release(job.cb);
             while n_walls < walls.len() {
                 let Ok(cb2) = zc_r2_submit(
                     gpu,
@@ -31516,12 +31750,19 @@ pub(crate) use imp::{FoldEqTable, lincheck_fold_eq_table, zc_fold_eq_table};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use imp::{ZcR2Job, ZcR2Result, launch_zc_r2_products, zc_r2_wait};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[doc(hidden)]
+pub use imp::r2_raw_stage;
+
 /// R2-CS entry points (see `ENV_NO_ZC_R2_CS`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
-    ZcR2CsLayout, launch_zc_r2_products_cs, zc_k_handover_keep, zc_k_handover_take, zc_r2_cs_oracle,
+    ZcR2CsLayout, launch_zc_r2_products_cs, launch_zc_r2_products_cs_staged, zc_k_handover_keep, zc_k_handover_take, zc_r2_cs_oracle,
     zc_r2_cs_premap_early, zc_r2_cs_prewarm, zc_r2_cs_prewarm_wanted, zc_r2_cs_verdict, zc_r2_gpu_read_bound,
 };
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use imp::r1_ab_tail_only;
 
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

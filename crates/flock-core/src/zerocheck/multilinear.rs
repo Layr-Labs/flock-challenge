@@ -1971,7 +1971,7 @@ thread_local! {
 /// round-two A/B rebuild's producer into this thread's scratch. Returns the
 /// rows' addresses, valid until this thread's next call.
 fn r2_rebuild_chunk(
-    rebuild: &crate::zerocheck::univariate_skip_optimized::Round2AbRebuild,
+    rebuild: &crate::zerocheck::univariate_skip_optimized::Round2AbRebuild<'_>,
     x_hi: usize,
     chunk_bytes: usize,
 ) -> (*const u8, *const u8) {
@@ -2067,7 +2067,7 @@ fn r2_c_capture_terms(table: &UniSkipFoldTable, rows: &[F128], mlv_challenges: &
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[allow(clippy::too_many_arguments)]
 unsafe fn r2_rebuild_quad_walk(
-    r: &crate::zerocheck::univariate_skip_optimized::Round2AbRebuild,
+    r: &crate::zerocheck::univariate_skip_optimized::Round2AbRebuild<'_>,
     x_hi: usize, table: *const u8, fold7: usize, anchors: *mut F128,
     deltas: *mut u8, eq: *const F128, prep: *const F128, lo: usize,
     pair_base: usize, tail: bool, head: *const std::sync::atomic::AtomicBool,
@@ -2167,6 +2167,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead(
         deltas_backing,
         false,
         None,
+        None,
     )
 }
 
@@ -2246,6 +2247,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     deltas_backing: Option<ScratchBytes>,
     k_pass_only: bool,
     anchors_premapped: Option<Vec<F128>>,
+    private_raw880: Option<super::PrivateRaw880<'_, '_>>,
 ) -> (UniSkipCompactFold, F128, F128, Round3Lookahead) {
     assert_eq!(k_skip, 6, "lookahead compact round two is k_skip=6 only");
     assert_eq!(table.n_chunks, 8);
@@ -2312,18 +2314,35 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // whole chunks of this sweep gets the rest published first: the record
     // path.
     let chunk_ab_bytes = 2 * lo_size * n_chunks;
-    let rebuild = crate::zerocheck::univariate_skip_optimized::round2_ab_rebuild_take(a_packed, b_packed).and_then(|r| {
-        if r.published.is_multiple_of(chunk_ab_bytes)
-            && r.rebuild_from.is_multiple_of(chunk_ab_bytes)
-            && chunk_ab_bytes.is_multiple_of(r.unit_bytes)
-        {
-            Some(r)
-        } else {
-            r.complete_globals();
-            crate::zerocheck::univariate_skip_optimized::round2_ab_rebuild_latch_off();
-            None
-        }
-    });
+    let omitted_raw880 = private_raw880.is_some();
+    let rebuild = if let Some(private) = &private_raw880 {
+        // This branch has its own proof-local producer, independent of the
+        // stock pointer registry and valid through every CPU replay.
+        let bytes = 256 * 1024;
+        assert_eq!(
+            (hi_size, chunk_ab_bytes, private.scratch.unit_bytes),
+            (2048, bytes, 8192),
+        );
+        Some(super::univariate_skip_optimized::Round2AbRebuild::scratch_only(
+            a_packed,
+            b_packed,
+            super::PRIVATE_RAW880_PHYSICAL_JOBS * bytes,
+            private.scratch,
+        ))
+    } else {
+        super::univariate_skip_optimized::round2_ab_rebuild_take(a_packed, b_packed).and_then(|r| {
+            if r.published.is_multiple_of(chunk_ab_bytes)
+                && r.rebuild_from.is_multiple_of(chunk_ab_bytes)
+                && chunk_ab_bytes.is_multiple_of(r.unit_bytes)
+            {
+                Some(r)
+            } else {
+                r.complete_globals();
+                super::univariate_skip_optimized::round2_ab_rebuild_latch_off();
+                None
+            }
+        })
+    };
     // CPU walks rebuild chunks `rebuild_from..`; the GPU arm reads chunks
     // below `ab_ready` only.
     let rebuild_from = rebuild.map_or(hi_size, |r| r.rebuild_from / chunk_ab_bytes);
@@ -2486,21 +2505,40 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // odd-parity halves on those chunks (the GPU's sums are not parity-split),
     // which is what makes `W1`/`W2` recoverable everywhere.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    let gpu_job = crate::gpu_commit::launch_zc_r2_products_cs(
-        a_packed,
-        b_packed,
-        &table.data,
-        eq_lo,
-        eq_hi,
-        lo_size,
-        hi_size,
-        pair_in_block_mask,
-        useful_pairs_inclusive,
-        cs_layout,
-        cs_live,
-        ab_ready,
-        pure_wanted,
-    );
+    let gpu_job = if let Some(private) = private_raw880 {
+        crate::gpu_commit::launch_zc_r2_products_cs_staged(
+            a_packed,
+            b_packed,
+            &table.data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            cs_layout,
+            cs_live,
+            ab_ready,
+            pure_wanted,
+            private.stage,
+        )
+    } else {
+        crate::gpu_commit::launch_zc_r2_products_cs(
+            a_packed,
+            b_packed,
+            &table.data,
+            eq_lo,
+            eq_hi,
+            lo_size,
+            hi_size,
+            pair_in_block_mask,
+            useful_pairs_inclusive,
+            cs_layout,
+            cs_live,
+            ab_ready,
+            pure_wanted,
+        )
+    };
     // R2-CS owns this timed launch's prefix chunks (the CPU skips them).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let r2cs = gpu_job.as_ref().is_some_and(|j| j.cs_active());
@@ -2568,8 +2606,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let full_xb = false;
     // The full-sweep group weights `eq_lo[2u + 1]` in prepared form, shared
     // by every chunk's ranked loop (skipped when `full_xb` uses window-scaled
-    // weights; null without SHA3 or under `full_xb`, keeping fallbacks on the
-    // parent loop).
+    // weights; null without SHA3 or under `full_xb`). A head-compact replay
+    // prepares these weights on demand.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if full_xb { Vec::new() } else { kernels::aarch64::round2_eq_prep(eq_lo) };
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -2649,6 +2687,15 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
         }) || (gpu_pure && !pure_cpu));
     #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
     let r2cs = r2cs && !cs_redo_all;
+    // Layout changes can move even the suffix destinations. Let the
+    // staged command retire before writing any part of the full redo.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    let defer_sweep = omitted_raw880 && cs_redo_all;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_feature = "sha3")))]
+    let defer_sweep = false;
+    #[allow(unused_variables)]
+    let trace_private = omitted_raw880
+        && (crate::tmark::on() || std::env::var_os("FLOCK_PHASE_TIMING").is_some());
     // Every chunk the CPU walks is then a full window-scaled walk, and every
     // GPU chunk whose sums are used left the same groups out.
     #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
@@ -2728,7 +2775,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                         && degen && skip_dead && (full_xb || eq_prep_addr != 0)
                 });
                 #[cfg(not(target_feature = "sha3"))]
-                let quad: Option<&crate::zerocheck::univariate_skip_optimized::Round2AbRebuild> = None;
+                let quad: Option<&crate::zerocheck::univariate_skip_optimized::Round2AbRebuild<'_>> = None;
                 #[cfg(target_feature = "sha3")]
                 if let Some(r) = quad {
                     let table7 = if fold7_addr != 0 && !kernels::aarch64::r2_on_efficiency_helper() {
@@ -2979,14 +3026,29 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let steal = gpu_job.as_ref().and_then(|j| j.steal()).filter(|_| r2cs);
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if let Some(steal) = steal {
-        crate::epool::run_hetero_chunks_then(hi_size - gpu_prefix, &|i| chunk_body(gpu_prefix + i, false), &|| {
-            while let Some(x_hi) = steal.claim() {
-                chunk_body(x_hi, true);
-            }
-        });
-    } else {
-        crate::epool::run_hetero_chunks(hi_size, |x_hi| chunk_body(x_hi, false));
+    if !defer_sweep {
+        if let Some(steal) = steal {
+            crate::epool::run_hetero_chunks_then(
+                hi_size - gpu_prefix,
+                &|i| chunk_body(gpu_prefix + i, false),
+                &|| {
+                    while let Some(x_hi) = steal.claim() {
+                        chunk_body(x_hi, true);
+                    }
+                },
+            );
+        } else {
+            crate::epool::run_hetero_chunks(hi_size, |x_hi| chunk_body(x_hi, false));
+        }
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if trace_private {
+        let first = if defer_sweep { hi_size } else if r2cs { gpu_prefix } else { 0 };
+        let jobs = hi_size - first;
+        let rebuilt = hi_size - first.max(rebuild_from);
+        eprintln!(
+            "[r2-raw880-private] sweep CPU first={first} jobs={jobs} scratch_jobs={rebuilt} defer_layout={defer_sweep}"
+        );
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     crate::epool::run_hetero_chunks(hi_size, |x_hi| chunk_body(x_hi, false));
@@ -3000,6 +3062,19 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // out of its chunks; the whole round is redone without the capture below.
     #[allow(unused_mut)]
     let mut capture_gpu_failed = false;
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let replay_eq_prep = std::cell::OnceCell::new();
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_feature = "sha3")))]
+    let replay_eq_prep_ptr = |head: bool| {
+        // The prepared-weight replay needs ASM offsets for a head-compact
+        // destination, even if the successful full-XB sweep skipped prep.
+        #[cfg(target_feature = "sha3")]
+        if head && eq_prep_addr == 0 {
+            return replay_eq_prep.get_or_init(|| kernels::aarch64::round2_eq_prep(eq_lo)).as_ptr();
+        }
+        let _ = head;
+        eq_prep_addr as *const F128
+    };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
@@ -3023,6 +3098,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
             hi_size,
         );
         match res {
+            _ if defer_sweep => {}
             crate::gpu_commit::ZcR2Result::Calibrated => {}
             crate::gpu_commit::ZcR2Result::Prefix(vals) => {
                 for (x_hi, v) in vals.iter().enumerate() {
@@ -3053,6 +3129,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
             }
             crate::gpu_commit::ZcR2Result::Failed if skip_pure => capture_gpu_failed = true,
             crate::gpu_commit::ZcR2Result::Failed => {
+                if trace_private {
+                    eprintln!("[r2-raw880-private] replay prefix jobs={prefix}");
+                }
                 // Redo exactly the skipped prefix products — slower, still
                 // exact. Throwaway anchor/delta scratch: the real ranges were
                 // already written by the lookahead pass. The full-lookahead
@@ -3063,6 +3142,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 // walk.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
+                let eq_prep = replay_eq_prep_ptr(r2cs && head_compact);
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let (ap, bp) = r2_rows(x_hi);
@@ -3088,7 +3168,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             anchors,
                             deltas,
                             eq_lo.as_ptr(),
-                            eq_prep_addr as *const F128,
+                            eq_prep,
                             lo_size,
                             pair_idx_base,
                             pair_in_block_mask,
@@ -3129,6 +3209,10 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // round serially with the full walk, every store and every slot.
     #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
     if cs_redo_all {
+        if trace_private {
+            eprintln!("[r2-raw880-private] replay full layout jobs={hi_size}");
+        }
+        let eq_prep = replay_eq_prep_ptr(head_compact);
         for x_hi in 0..hi_size {
             let pair_idx_base = x_hi * lo_size;
             let (ap, bp) = r2_rows(x_hi);
@@ -3142,7 +3226,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     anchors_base.ptr().add(x_hi * anchor_chunk_stride),
                     deltas_base.ptr().add(x_hi * delta_chunk_stride),
                     eq_lo.as_ptr(),
-                    eq_prep_addr as *const F128,
+                    eq_prep,
                     lo_size,
                     pair_idx_base,
                     pair_in_block_mask,
@@ -3177,6 +3261,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let mut capture_sums = skip_pure;
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     if skip_pure && (capture_gpu_failed || head_fail.load(std::sync::atomic::Ordering::Relaxed)) {
+        if trace_private {
+            eprintln!("[r2-raw880-private] replay full capture jobs={hi_size}");
+        }
         capture_sums = false;
         let to_tail = head_fail.load(std::sync::atomic::Ordering::Relaxed);
         let (a_base, d_base, a_stride, d_stride, head) = if to_tail {
@@ -3198,6 +3285,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 head_fail_addr as *const std::sync::atomic::AtomicBool,
             )
         };
+        let eq_prep = replay_eq_prep_ptr(!head.is_null());
         for x_hi in 0..hi_size {
             let (ap, bp) = r2_rows(x_hi);
             let mut out = [F128::ZERO; 8];
@@ -3210,7 +3298,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     a_base.add(x_hi * a_stride),
                     d_base.add(x_hi * d_stride),
                     eq_lo.as_ptr(),
-                    eq_prep_addr as *const F128,
+                    eq_prep,
                     lo_size,
                     x_hi * lo_size,
                     pair_in_block_mask,
@@ -3242,6 +3330,9 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // layout) in the tail-compacted layout with the full lookahead walk.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     if head_compact && compact.head_compact && head_fail.load(std::sync::atomic::Ordering::Relaxed) {
+        if trace_private {
+            eprintln!("[r2-raw880-private] replay full head jobs={hi_size}");
+        }
         compact.head_compact = false;
         compact.head_b = F128::ZERO;
         let a_base = unsafe { compact.anchors.as_mut_ptr().add(compact.anchor_index(0)) };
@@ -8341,6 +8432,7 @@ mod tests {
                     Some(backing),
                     true,
                     None,
+                    None,
                 );
                 let skip_on = std::env::var_os("FLOCK_NO_R2_DEADPAIR_SKIP").is_none();
                 assert_eq!(sparse.dead_tail, cfg!(target_arch = "aarch64") && skip_on);
@@ -8446,6 +8538,7 @@ mod tests {
                 &f.padding,
                 Some(backing),
                 true,
+                None,
                 None,
             );
             unsafe { std::env::remove_var("FLOCK_NO_R2_DEADPAIR_SKIP") };

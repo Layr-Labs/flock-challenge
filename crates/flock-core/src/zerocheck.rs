@@ -78,6 +78,32 @@ fn lookahead_off() -> bool {
     std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
 }
 
+/// The private raw diagnostic must be able to take the compact lookahead
+/// branch without any dense raw A/B reads, even if Metal later refuses it.
+#[doc(hidden)]
+pub fn private_raw880_lookahead(m: usize, padding: &PaddingSpec) -> bool {
+    m == 32
+        && padding.k_log == 14
+        && padding.useful_bits_per_block == 15_409
+        && small_challenges_ghash()[1] != F128::ZERO
+        && medium_challenges_ghash()[0] != F128::ZERO
+        && !lookahead_off()
+        && !cascade2_off()
+        && multilinear::round2_lookahead_chunk_geometry(m) == Some((2048, 256 * 1024))
+}
+
+#[doc(hidden)]
+pub struct PrivateRaw880<'a, 'z> {
+    pub scratch: univariate_skip_optimized::Round1AbProducer<'a>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub stage: Option<&'a mut crate::gpu_commit::r2_raw_stage::StageJob<'z>>,
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    _z: core::marker::PhantomData<&'z ()>,
+}
+
+#[doc(hidden)]
+pub const PRIVATE_RAW880_PHYSICAL_JOBS: usize = 8;
+
 /// Test-only forced-off latch for the second-level cascade (rounds 5+6),
 /// mirroring [`ZC_LOOKAHEAD_FORCED_OFF`]: the transcript-identity test flips
 /// this instead of mutating the process environment. Flipping it cannot make
@@ -327,7 +353,7 @@ pub fn prove_packed_padded<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim) {
     let (proof, claim, _) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, false, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, false, None, None, None, challenger,
     );
     (proof, claim)
 }
@@ -348,7 +374,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c<C: Challenger>(
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
-        a_packed, b_packed, c_packed, m, padding, true, None, None, challenger,
+        a_packed, b_packed, c_packed, m, padding, true, None, None, None, challenger,
     );
     (
         proof,
@@ -399,6 +425,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab<C: Challenger>(
         true,
         Some(ab_inner),
         None,
+        None,
         challenger,
     );
     (
@@ -433,6 +460,31 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<
     ab_inner: univariate_skip_optimized::Round1AbInner,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
+    // Stock callers have complete operands or their existing rebuild scope.
+    unsafe {
+        prove_packed_padded_with_private_raw880(
+            a_packed, b_packed, c_packed, c_lincheck, m, padding, ab_inner, None, challenger,
+        )
+    }
+}
+
+/// # Safety
+/// With a private route, the first eight raw chunks must be complete and
+/// scratch must produce all later units, including every replay, without
+/// writing global A/B. The caller certifies the ranked lookahead shape.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn prove_packed_padded_with_private_raw880<C: Challenger>(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    c_packed: &[u8],
+    c_lincheck: &[u8],
+    m: usize,
+    padding: &PaddingSpec,
+    ab_inner: univariate_skip_optimized::Round1AbInner,
+    private_raw880: Option<PrivateRaw880<'_, '_>>,
+    challenger: &mut C,
+) -> (ZerocheckProof, ZerocheckClaim, CapturedSHatVC) {
     let (proof, claim, captured) = prove_packed_padded_inner(
         a_packed,
         b_packed,
@@ -442,6 +494,7 @@ pub fn prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c<
         true,
         Some(ab_inner),
         Some(c_lincheck),
+        private_raw880,
         challenger,
     );
     (
@@ -527,8 +580,11 @@ fn prove_packed_padded_inner<C: Challenger>(
     capture_s_hat_v_c: bool,
     precomputed_ab: Option<univariate_skip_optimized::Round1AbInner>,
     c_lincheck: Option<&[u8]>,
+    private_raw880: Option<PrivateRaw880<'_, '_>>,
     challenger: &mut C,
 ) -> (ZerocheckProof, ZerocheckClaim, Option<CapturedSHatVC>) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let record_high_warm = univariate_skip_optimized::gpu_ab_tail_only::begin_zerocheck();
     let k_skip = K_SKIP;
     const N_INNER: usize = 7; // 3 small + 4 medium fixed-constant eq dims
     assert!(
@@ -841,6 +897,13 @@ fn prove_packed_padded_inner<C: Challenger>(
         );
         (ab, c, None)
     };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if record_high_warm && m == 32 && padding.k_log == 14 && padding.useful_bits_per_block == 15_409
+        && let Some(ab) = &precomputed_ab
+    {
+        // Both current allocations still have their proof owners here.
+        ab.record_high_warm(c_packed);
+    }
     // The A-sized transform is dead after the round-1 message. Its byte length
     // exactly matches compact round two's delta storage, so retain its F128
     // allocation/layout and donate it instead of taking a fresh Vec<u8>.
@@ -892,8 +955,10 @@ fn prove_packed_padded_inner<C: Challenger>(
     // `r[k_skip+1] = 0` (probability 2⁻¹²⁸) makes W1/W2 unrecoverable from the
     // parity split; that case falls back to the incumbent route, which stays
     // in the tree as the oracle anyway.
-    let use_lookahead =
-        (m == 32 || cfg!(test)) && n_mlv >= 6 && r[k_skip + 1] != F128::ZERO && !lookahead_off();
+    // Admission selects this route before R1 omits raw writes. The ranked
+    // shape and nonzero fixed coordinate were checked by the caller.
+    let use_lookahead = private_raw880.is_some()
+        || ((m == 32 || cfg!(test)) && n_mlv >= 6 && r[k_skip + 1] != F128::ZERO && !lookahead_off());
 
     // The cascade gate (see the rounds 5+6 comment below) reads only values
     // fixed before round two, so it is decided here: a compact state that
@@ -912,6 +977,7 @@ fn prove_packed_padded_inner<C: Challenger>(
             compact_deltas,
             use_cascade,
             early_anchors,
+            private_raw880,
         );
         (compact, m1, mi, Some(la))
     } else {
@@ -2016,6 +2082,7 @@ mod tests {
             true,
             Some(old_ab),
             None,
+            None,
             &mut old_ch,
         );
 
@@ -2040,6 +2107,7 @@ mod tests {
             true,
             Some(new_ab),
             Some(&c_lincheck),
+            None,
             &mut new_ch,
         );
 
@@ -2111,6 +2179,7 @@ mod tests {
                 true,
                 Some(old_ab),
                 None,
+                None,
                 &mut old_ch,
             );
 
@@ -2136,6 +2205,7 @@ mod tests {
                 true,
                 Some(new_ab),
                 Some(&c_lincheck),
+                None,
                 &mut new_ch,
             );
             assert!(

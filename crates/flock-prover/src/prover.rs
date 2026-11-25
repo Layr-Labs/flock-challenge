@@ -123,7 +123,7 @@ fn ranked_direct_fold8_precompute_enabled(r1cs: &BlockR1cs) -> bool {
 /// the shortcut relies on ranked BLAKE3's block geometry and honest padding,
 /// while every miss retains the incumbent row-major C producer.
 #[inline]
-fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
+pub(crate) fn ranked_lincheck_c_reuse_enabled(r1cs: &BlockR1cs) -> bool {
     ranked_direct_fold4_precompute_enabled(r1cs)
         && r1cs.m == 32
         && r1cs.k_log == 14
@@ -490,8 +490,28 @@ pub fn prove_fast_ligerito_from_witness<Ch: Challenger>(
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_identity_prefix(
         r1cs, pcs_params, z_packed, a_packed_f128, b_packed_f128,
-        z_packed_lincheck, lincheck_circuit, prefaulted_codeword, None, challenger,
+        z_packed_lincheck, lincheck_circuit, prefaulted_codeword, None, Raw880Mode::Off, challenger,
     )
+}
+
+pub(crate) enum Raw880Mode<'a> {
+    Off,
+    Warm,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Stage {
+        reservation: flock_core::gpu_commit::r2_raw_stage::Reservation,
+        scratch: zerocheck::univariate_skip_optimized::Round1AbProducer<'a>,
+        logical_helper_prefix_bytes: usize,
+    },
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[allow(dead_code)]
+    Portable(core::marker::PhantomData<&'a ()>),
+}
+
+impl Raw880Mode<'_> {
+    pub(crate) fn warm_or_off(warm: bool) -> Self {
+        if warm { Self::Warm } else { Self::Off }
+    }
 }
 
 /// BLAKE3-only counterpart: the receipt is minted after its witness writer
@@ -507,6 +527,7 @@ pub(crate) fn prove_fast_ligerito_from_witness_with_identity_prefix<Ch: Challeng
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     prefaulted_codeword: Option<Vec<F128>>,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
+    raw880: Raw880Mode<'_>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     let commit_codeword = match prefaulted_codeword {
@@ -524,6 +545,7 @@ pub(crate) fn prove_fast_ligerito_from_witness_with_identity_prefix<Ch: Challeng
         commit_codeword,
         identity_prefix_witness,
         None,
+        raw880,
         challenger,
     )
 }
@@ -555,6 +577,7 @@ pub(crate) fn prove_fast_ligerito_from_preinitialized_codeword<Ch: Challenger>(
         CommitCodeword::Preinitialized(codeword),
         identity_prefix_witness,
         None,
+        Raw880Mode::Off,
         challenger,
     )
 }
@@ -574,6 +597,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
     codeword: Vec<F128>,
     stream: flock_core::gpu_commit::FromZFirstPassStream,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
+    raw880: Raw880Mode<'_>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -587,6 +611,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass<Ch: Challenger>(
         CommitCodeword::StreamedFirstPass(codeword, stream),
         identity_prefix_witness,
         None,
+        raw880,
         challenger,
     )
 }
@@ -616,6 +641,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     stream: flock_core::gpu_commit::FromZFirstPassStream,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
+    raw880: Raw880Mode<'_>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -629,6 +655,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
         CommitCodeword::StreamedFirstPass(codeword, stream),
         identity_prefix_witness,
         ab_producer,
+        raw880,
         challenger,
     )
 }
@@ -645,8 +672,10 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     commit_codeword: CommitCodeword,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
+    raw880: Raw880Mode<'_>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
+    let warm_raw880 = matches!(&raw880, Raw880Mode::Warm);
     let lig_config = pcs_params
         .ligerito_prover_config()
         .expect("Ligerito default config; bump m for tiny instances");
@@ -672,6 +701,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
         commit_codeword,
         identity_prefix_witness,
         ab_producer,
+        raw880,
         true,
         challenger,
     );
@@ -694,6 +724,12 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             _ => false,
         };
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if warm_raw880 {
+        flock_core::gpu_commit::r2_raw_stage::warm(&z_packed);
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = warm_raw880;
     flock_core::tmark::mark("open start");
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
@@ -2882,8 +2918,8 @@ where
 
 fn commit_with_round1_ab_precompute(
     z_packed: &[F128],
-    a_packed_f128: &[F128],
-    b_packed_f128: &[F128],
+    a_packed_f128: &Vec<F128>,
+    b_packed_f128: &Vec<F128>,
     pcs_params: &PcsParams,
     padding: &zerocheck::PaddingSpec,
     commit_codeword: CommitCodeword,
@@ -2891,7 +2927,10 @@ fn commit_with_round1_ab_precompute(
     identity_prefix_contract: Option<Round1PinnedOnePrefixStatement>,
     stripe_help: Option<&(dyn Fn() + Sync)>,
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
+    logical_helper_prefix_bytes: Option<usize>,
     after_ab: Option<&(dyn Fn() + Sync)>,
+    after_root: Option<&(dyn Fn() + Sync)>,
+    high_witness: bool,
 ) -> (
     (Commitment, pcs::ProverData),
     zerocheck::univariate_skip_optimized::Round1AbInner,
@@ -2899,11 +2938,20 @@ fn commit_with_round1_ab_precompute(
     let as_bytes = |v: &[F128]| -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     };
-    let a_packed = as_bytes(a_packed_f128);
-    let b_packed = as_bytes(b_packed_f128);
     let k_skip = zerocheck::K_SKIP;
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
     let inv_table = flock_core::ntt::InvNttTableByteSingleGf8::cached_standard_k6();
+    assert!(logical_helper_prefix_bytes.is_none() || ab_producer.is_some());
+    use zerocheck::univariate_skip_optimized::Round1AbTail;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    Round1AbTail::begin_commit();
+    let gpu_tail = (high_witness
+        && ab_producer.is_some()
+        && after_ab.is_some()
+        && identity_prefix_contract.is_some()
+        && matches!(&commit_codeword, CommitCodeword::StreamedFirstPass(..))
+        && Round1AbTail::enabled())
+        .then(Round1AbTail::default);
 
     // `stripe_help` (deferred-stripe proves only): each main-pool worker of
     // the AB queue drains leftover stripe chunks once the AB queue is empty.
@@ -2912,15 +2960,14 @@ fn commit_with_round1_ab_precompute(
     // helping moves the stripe's remainder onto otherwise idle P-workers.
     let precompute_ab = || {
         if let Some(producer) = ab_producer {
-            // Deferred A/B rows: this arm is their only writer, and it has
-            // produced every unit by the time it returns (the replay below
-            // and round two read complete buffers).
+            // Deferred A/B rows: this arm is their only writer. It produces
+            // every unit and publishes the prefix admitted by the caller.
             // SAFETY: both buffers are live, `2^m / 8` bytes long, and
             // written only by the producer during this call.
             return unsafe {
-                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced(
-                    a_packed.as_ptr(),
-                    b_packed.as_ptr(),
+                zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_produced_with_helper_prefix(
+                    a_packed_f128.as_ptr().cast(),
+                    b_packed_f128.as_ptr().cast(),
                     pcs_params.m,
                     k_skip,
                     inv_table,
@@ -2928,12 +2975,14 @@ fn commit_with_round1_ab_precompute(
                     identity_prefix_contract,
                     stripe_help,
                     producer,
+                    logical_helper_prefix_bytes,
+                    gpu_tail.as_ref(),
                 )
             };
         }
         zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_with_tail(
-            a_packed,
-            b_packed,
+            as_bytes(a_packed_f128),
+            as_bytes(b_packed_f128),
             pcs_params.m,
             k_skip,
             inv_table,
@@ -2949,6 +2998,9 @@ fn commit_with_round1_ab_precompute(
         Option<zerocheck::univariate_skip_optimized::ExactTuneBacking>,
     > = std::sync::Mutex::new(None);
     let precompute_ab_replay = || {
+        // After the producer joins, on the complete fixed warm proof.
+        let a_packed = as_bytes(a_packed_f128);
+        let b_packed = as_bytes(b_packed_f128);
         let reuse = replay_backing.lock().unwrap().take();
         if let Some(b) = reuse {
             let b = zerocheck::univariate_skip_optimized::precompute_round1_ab_inner_packed_padded_for_exact_tune_into(
@@ -2979,7 +3031,8 @@ fn commit_with_round1_ab_precompute(
     // generation. A valid cache hit may satisfy it inside the commit arm;
     // otherwise the post-join callback claims it and replays this exact A/B
     // closure beside the broad split sweep.
-    let run_ranked_exact_tune = flock_core::gpu_commit::ranked_exact_contention_tune_pending();
+    let run_ranked_exact_tune = after_root.is_none()
+        && flock_core::gpu_commit::ranked_exact_contention_tune_pending();
 
     // The BLAKE3 padding rows force every block's tail words to zero, which
     // in the SoA codeword is a static all-zero pattern on the top lanes of
@@ -3026,6 +3079,18 @@ fn commit_with_round1_ab_precompute(
             flock_core::tmark::mark("commit arm root");
             if let Some(hook) = tail_fill {
                 hook(&pre.0);
+            }
+            if matches!(&pre.1.codeword, pcs::commit::CodewordBuf::Gpu(_)) {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                if let Some(tail) = &gpu_tail {
+                    // SAFETY: the typed live Z borrow is the canonical witness of
+                    // the ranked deferred producer. The high A/B lease retires
+                    // before this join releases either current allocation.
+                    unsafe { tail.at_root(z_packed) };
+                }
+                if let Some(hook) = after_root {
+                    hook();
+                }
             }
             flock_core::tmark::mark("commit arm end");
             pre
@@ -3099,6 +3164,7 @@ pub fn prove_fast_core<Ch: Challenger>(
         CommitCodeword::Allocate,
         None,
         None,
+        Raw880Mode::Off,
         false,
         challenger,
     ).0
@@ -3136,6 +3202,7 @@ pub fn prove_fast_core_with_codeword<Ch: Challenger>(
         commit_codeword,
         None,
         None,
+        Raw880Mode::Off,
         false,
         challenger,
     ).0
@@ -3153,6 +3220,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     commit_codeword: CommitCodeword,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
+    raw880: Raw880Mode<'_>,
     reuse_first_bound: bool,
     challenger: &mut Ch,
 ) -> (ProveCore, bool, Option<Vec<F128>>) {
@@ -3160,7 +3228,36 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
+    let high_witness = identity_prefix_contract.is_some()
+        && identity_prefix_witness.as_ref().is_some_and(|w| w.ranked_deferred_roles);
     let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let (reservation, raw880_scratch, logical_helper_prefix_bytes) = match raw880 {
+        Raw880Mode::Stage { reservation, scratch, logical_helper_prefix_bytes } => {
+            (Some(reservation), Some(scratch), Some(logical_helper_prefix_bytes))
+        }
+        _ => (None, None, None),
+    };
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let logical_helper_prefix_bytes = None;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let reservation = std::sync::Mutex::new(reservation);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let raw880_job = std::sync::OnceLock::new();
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let submit_raw880 = || {
+        let reservation = reservation.try_lock().ok().and_then(|mut slot| slot.take());
+        if let Some(job) = reservation.and_then(|reservation| reservation.submit(&z_packed)) {
+            let _ = raw880_job.set(job);
+        }
+    };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let after_root: Option<&(dyn Fn() + Sync)> = raw880_scratch.is_some().then_some(&submit_raw880);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let after_root = {
+        let _ = raw880;
+        None
+    };
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
                       stripe_help: Option<&(dyn Fn() + Sync)>,
                       producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
@@ -3179,7 +3276,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             identity_prefix_contract,
             stripe_help,
             producer,
+            logical_helper_prefix_bytes,
             after_ab,
+            after_root,
+            high_witness,
         );
         if phase_timing {
             let wall = t_commit.elapsed().as_secs_f64() * 1e3;
@@ -3481,6 +3581,8 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let cpu_zc0 = phase_timing.then(process_cpu_ms);
     let t_zc = std::time::Instant::now();
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let mut raw880_job = raw880_job.into_inner();
     // Zerocheck runs on a main-pool worker so its parallel regions start as
     // nested joins (`flock_core::in_pool`). Same work, same transcript order.
     let (zc_proof, zc_claim, s_hat_v_c) = flock_core::in_pool(|| {
@@ -3504,6 +3606,25 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 z_packed.len() * core::mem::size_of::<F128>(),
             )
         };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(scratch) = raw880_scratch {
+            // SAFETY: the ranked deferred producer publishes the first eight
+            // raw chunks and fills complete scratch operands after that.
+            // The scratch-only variant cannot write the raw globals.
+            return unsafe {
+                zerocheck::prove_packed_padded_with_private_raw880(
+                    a_packed,
+                    b_packed,
+                    c_packed,
+                    &z_packed_lincheck,
+                    r1cs.m,
+                    &padding,
+                    ab_inner,
+                    Some(zerocheck::PrivateRaw880 { scratch, stage: raw880_job.as_mut() }),
+                    challenger,
+                )
+            };
+        }
         if ranked_lincheck_c_reuse_enabled(r1cs) {
             zerocheck::prove_packed_padded_capture_s_hat_v_c_with_precomputed_ab_and_lincheck_c(
                 a_packed,
@@ -3529,6 +3650,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             cpu / wall
         );
     }
+    // Pending/refused stage commands still borrow this Z allocation.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    drop(raw880_job);
     // Nothing downstream reads a/b (zerocheck consumed them in rounds 1–2);
     // recycle the two buffers (2 × 2^(m-3) bytes — 128 MB at m = 29) instead
     // of carrying them through lincheck and the PCS open.
@@ -3773,6 +3897,9 @@ fn prove_fast_ligerito_timed_with_commit_codeword<Ch: Challenger>(
         None,
         None,
         None,
+        None,
+        None,
+        false,
     );
     t.commit_s = t0.elapsed().as_secs_f64();
     bind_statement(challenger, r1cs, &commitment);
