@@ -888,11 +888,8 @@ impl Round1AbInner {
     /// Donate the now-dead transform to a byte-oriented scratch consumer
     /// without changing the allocation's element type or deallocation layout.
     pub(crate) fn into_scratch_bytes(mut self) -> crate::scratch::ScratchBytes {
-        // Round1's backing is fully initialized: a cold provenance miss was
-        // raw-zeroed before any slice existed, while a hit names this exact
-        // allocation after a prior full R2 overwrite. R2 may read slices on
-        // portable targets, but cannot mint the next token until its complete
-        // overwrite has joined and called `mark_fully_initialized`.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        crate::gpu_commit::zc_ab_abandon_staged_if_ptr(self.storage.as_ptr() as usize);
         crate::scratch::ScratchBytes::from_initialized_f128_for_full_overwrite(
             core::mem::take(&mut self.storage),
             AB_COMPACT_R2_FULL_INIT_TAG,
@@ -902,9 +899,38 @@ impl Round1AbInner {
 
 impl Drop for Round1AbInner {
     fn drop(&mut self) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        crate::gpu_commit::zc_ab_abandon_staged_if_ptr(self.storage.as_ptr() as usize);
         crate::scratch::give_f128(core::mem::take(&mut self.storage));
     }
 }
+
+pub struct AbPrefixReady {
+    target_chunks: usize, ptr: std::sync::atomic::AtomicUsize, len: std::sync::atomic::AtomicUsize,
+    meta: std::sync::atomic::AtomicU8, ready: std::sync::atomic::AtomicBool,
+}
+impl AbPrefixReady {
+    pub fn new(target_chunks: usize) -> Self { Self { target_chunks, ptr: 0.into(), len: 0.into(), meta: 0.into(), ready: false.into() } }
+    pub fn is_ready(&self) -> bool { self.ready.load(std::sync::atomic::Ordering::Acquire) }
+    fn publish(&self, ptr: usize, len: usize, hit: bool, repr: Round1AbRepresentation) {
+        let r = match repr { Round1AbRepresentation::Complete => 0, Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false } => 1, Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true } => 2, Round1AbRepresentation::Blake3MixedOnesOmitted => 3 };
+        self.ptr.store(ptr, std::sync::atomic::Ordering::Relaxed); self.len.store(len, std::sync::atomic::Ordering::Relaxed);
+        self.meta.store((r << 1) | u8::from(hit), std::sync::atomic::Ordering::Relaxed);
+    }
+    fn mark_ready(&self) { self.ready.store(true, std::sync::atomic::Ordering::Release); }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn snapshot(&self) -> Option<(usize, usize, bool, Round1AbRepresentation)> {
+        if !self.is_ready() { return None; }
+        let m = self.meta.load(std::sync::atomic::Ordering::Relaxed);
+        let repr = match m >> 1 { 1 => Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: false }, 2 => Round1AbRepresentation::Blake3IdentityPrefixOmitted { output_window: true }, 3 => Round1AbRepresentation::Blake3MixedOnesOmitted, _ => Round1AbRepresentation::Complete };
+        Some((self.ptr.load(std::sync::atomic::Ordering::Relaxed), self.len.load(std::sync::atomic::Ordering::Relaxed), (m & 1) != 0, repr))
+    }
+}
+std::thread_local! { static AB_PREFIX_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+pub struct AbPrefixScope<'a>(usize, core::marker::PhantomData<&'a AbPrefixReady>);
+impl Drop for AbPrefixScope<'_> { fn drop(&mut self) { AB_PREFIX_SLOT.with(|c| c.set(self.0)); } }
+pub fn ab_prefix_scope(p: Option<&AbPrefixReady>) -> AbPrefixScope<'_> { AbPrefixScope(AB_PREFIX_SLOT.with(|c| c.replace(p.map_or(0, |r| r as *const AbPrefixReady as usize))), core::marker::PhantomData) }
+pub fn ab_tailfill_target_chunks() -> usize { #[cfg(all(target_os = "macos", target_arch = "aarch64"))] if crate::gpu_commit::zc_ab_is_admitted() { return crate::gpu_commit::gpu_zc_ab_completion_share(); } 0 }
 
 /// Kill switch for the non-temporal store flavor of the deferred AB
 /// precompute output: `FLOCK_NO_ZC_AB_PRE_NT=1` restores the incumbent plain
@@ -1587,6 +1613,9 @@ fn precompute_round1_ab_inner_packed_padded_body(
     let compact = compact && token_hit;
     let out_bytes: &mut [u8] =
         unsafe { core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, total_bytes) };
+    if let Some(pr) = unsafe { (AB_PREFIX_SLOT.with(|c| c.get()) as *const AbPrefixReady).as_ref() } {
+        pr.publish(out_bytes.as_ptr() as usize, out_bytes.len(), provenance_hit, representation);
+    }
 
     if zc_ab_pre_hetero_enabled() {
         // QS5 hetero drain: feed the precompute through the shared two-pool
@@ -1819,6 +1848,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     // distributes independent slabs dynamically.
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
+    let prefix_ready = unsafe { (AB_PREFIX_SLOT.with(|c| c.get()) as *const AbPrefixReady).as_ref() };
+    let prefix_bytes = prefix_ready.map_or(0, |p| p.target_chunks << 22);
     // Resolve the rollback once before worker/row dispatch; no table setup.
     let transform_trim = std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref()
         != Some(std::ffi::OsStr::new("1"));
@@ -1842,6 +1873,8 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
             u => u & !1,
         };
         let n_jobs = n_units.div_ceil(units_per_job);
+        let prefix_jobs = if prefix_bytes > 0 && prefix_bytes <= out_bytes.len() { prefix_bytes.div_ceil(units_per_job * unit_bytes).min(n_jobs) } else { 0 };
+        let prefix_rem = std::sync::atomic::AtomicUsize::new(prefix_jobs);
         // Every chunk's static-B window run, when each has one: a worker
         // with a unit form then writes those rows with one call per unit.
         let window_runs = ab_window_unit_runs::<FAST_POLICY, FORCE_DIRECT>(
@@ -1902,12 +1935,17 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                         );
                     }
                 }
+                if job < prefix_jobs && prefix_rem.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                    if let Some(pr) = prefix_ready { pr.mark_ready(); }
+                }
             },
             tail,
         );
         return;
     }
     let n_jobs = n_chunks.div_ceil(chunks_per_job);
+    let prefix_jobs = if prefix_bytes > 0 && prefix_bytes <= out_bytes.len() { prefix_bytes.div_ceil(chunks_per_job * OUTER_BYTES).min(n_jobs) } else { 0 };
+    let prefix_rem = std::sync::atomic::AtomicUsize::new(prefix_jobs);
     crate::epool::run_hetero_chunks_stateful_with_tail(
         n_jobs,
         || {
@@ -1977,6 +2015,9 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
                     window_plan,
                     mixed_plan,
                 );
+            }
+            if job < prefix_jobs && prefix_rem.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                if let Some(pr) = prefix_ready { pr.mark_ready(); }
             }
         },
         tail,
@@ -4341,14 +4382,8 @@ pub fn t56_prewarm_after_tune() {
 /// tables use, regrouped as `eq_bot' = eq(r_lo[..4])` and
 /// `e_top' = eq(r_lo[4..]) * D^-1` (their product is `eq_lo * D^-1` exactly).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn launch_ab_completion_gpu_prefix(
-    ab_inner: &Round1AbInner,
-    r_outer: &[F128],
-    n_lo: usize,
-    n_hi: usize,
-    padding: &PaddingSpec,
-) -> Option<AbGpuPrefix> {
-    let share = crate::gpu_commit::gpu_zc_ab_completion_share();
+fn launch_ab_completion_gpu_prefix_raw(ab_bytes: &[u8], provenance_hit: bool, repr: Round1AbRepresentation, r_outer: &[F128], n_lo: usize, n_hi: usize, padding: &PaddingSpec, max_chunks: usize) -> Option<crate::gpu_commit::ZcAbJob> {
+    let share = crate::gpu_commit::gpu_zc_ab_completion_share().min(max_chunks);
     if share == 0 {
         return None;
     }
@@ -4358,7 +4393,7 @@ fn launch_ab_completion_gpu_prefix(
         return None;
     }
     let hi_size = 1usize << n_hi;
-    if ab_inner.len_bytes() != hi_size << (n_lo + N_INNER + 3) {
+    if ab_bytes.len() != hi_size << (n_lo + N_INNER + 3) {
         return None;
     }
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
@@ -4376,8 +4411,8 @@ fn launch_ab_completion_gpu_prefix(
         if n_b_med == 0 {
             continue;
         }
-        let first = ab_inner.representation.first_materialized_b_med(w);
-        let end = ab_inner.representation.materialized_b_med_end(w, n_b_med);
+        let first = repr.first_materialized_b_med(w);
+        let end = repr.materialized_b_med_end(w, n_b_med);
         for row in bmask.iter_mut().take(end.min(16)).skip(first) {
             *row |= 1 << bot;
         }
@@ -4386,18 +4421,26 @@ fn launch_ab_completion_gpu_prefix(
     let eq_bot = build_eq(&r_lo[..4]);
     let e_top = build_eq_scaled(&r_lo[4..], d_inv());
     let eq_hi = build_eq(&r_outer[n_lo..]);
-    let job = crate::gpu_commit::launch_zc_ab_completion(
-        ab_inner.as_bytes(),
-        ab_inner.provenance_hit,
-        share.min(hi_size),
-        &bmask,
-        basis,
-        &e_top,
-        &eq_bot,
-        &eq_hi,
-    )?;
-    Some(AbGpuPrefix { job })
+    crate::gpu_commit::launch_zc_ab_completion(ab_bytes, provenance_hit, share.min(hi_size), &bmask, basis, &e_top, &eq_bot, &eq_hi)
 }
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn launch_ab_completion_gpu_prefix(ab_inner: &Round1AbInner, r_outer: &[F128], n_lo: usize, n_hi: usize, padding: &PaddingSpec) -> Option<AbGpuPrefix> {
+    launch_ab_completion_gpu_prefix_raw(ab_inner.as_bytes(), ab_inner.provenance_hit, ab_inner.representation, r_outer, n_lo, n_hi, padding, usize::MAX).map(|job| AbGpuPrefix { job })
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn stage_ab_completion_for_tail_fill(prefix: &AbPrefixReady, padding: &PaddingSpec, r: &[F128]) -> bool {
+    if !crate::gpu_commit::zc_ab_is_admitted() { return false; }
+    let Some((ptr, len, hit, repr)) = prefix.snapshot() else { return false; };
+    let r_outer = &r[K_SKIP + N_INNER..];
+    let n_hi = fold4_n_hi_from_env().min(r_outer.len());
+    let n_lo = r_outer.len() - n_hi;
+    if ab_eq_fold_from_env().bank_bits(n_lo).is_none() || n_hi == 0 { return false; }
+    let ab_bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let Some(job) = launch_ab_completion_gpu_prefix_raw(ab_bytes, hit, repr, r_outer, n_lo, n_hi, padding, prefix.target_chunks) else { return false; };
+    crate::gpu_commit::zc_ab_stage(ptr, len, r_outer.to_vec(), job); true
+}
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub(crate) fn stage_ab_completion_for_tail_fill(_: &AbPrefixReady, _: &PaddingSpec, _: &[F128]) -> bool { false }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn launch_ab_completion_gpu_prefix(
@@ -4456,7 +4499,14 @@ where
     // GPU prefix arm (`FLOCK_NO_GPU_ZC_AB_COMPLETION` kills): submitted first
     // so the GPU starts while the CPU builds its tables. Folded drain only.
     let gpu_prefix = if bank_bits.is_some() && n_hi > 0 {
-        launch_ab_completion_gpu_prefix(ab_inner, r_outer, n_lo, n_hi, padding)
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let adopted = crate::gpu_commit::zc_ab_adopt_staged(ab_inner.as_bytes().as_ptr() as usize, ab_inner.len_bytes(), r_outer).map(|job| {
+            if std::env::var_os("FLOCK_ZC_TIMING").is_some() || std::env::var_os("FLOCK_PHASE_TIMING").is_some() { eprintln!("[zc-ab-gpu] staged_ab_adopted=true"); }
+            AbGpuPrefix { job }
+        });
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let adopted: Option<AbGpuPrefix> = None;
+        adopted.or_else(|| launch_ab_completion_gpu_prefix(ab_inner, r_outer, n_lo, n_hi, padding))
     } else {
         None
     };

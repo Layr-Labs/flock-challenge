@@ -1121,7 +1121,7 @@ pub const ENV_NO_GPU_ZC_AB_COMPLETION: &str = "FLOCK_NO_GPU_ZC_AB_COMPLETION";
 /// `FLOCK_ZC_AB_GPU_CHUNKS=<n>`, `0` = arm off, clamped to the chunk count.
 /// Unset = [`ZC_AB_GPU_DEFAULT_CHUNKS`]. A non-integer value fails loudly.
 pub const ENV_ZC_AB_GPU_CHUNKS: &str = "FLOCK_ZC_AB_GPU_CHUNKS";
-const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 32;
+const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 64;
 
 /// Requested GPU chunk share of the round-one AB completion arm; `0` = off
 /// (kill switch, share 0, or GPU commit disabled).
@@ -28037,6 +28037,33 @@ kernel void zc_ab_finish(
         }
     }
 
+    pub(crate) fn zc_ab_is_admitted() -> bool { ZC_AB_MODE.load(std::sync::atomic::Ordering::Relaxed) == ZC_AB_ADMITTED }
+    struct ZcAbStaged { ab_ptr: usize, ab_len: usize, r_outer: Vec<F128>, job: ZcAbJob }
+    static ZC_AB_STAGED: std::sync::Mutex<Option<ZcAbStaged>> = std::sync::Mutex::new(None);
+    static ZC_AB_HAS_STAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn zc_ab_retire_job(job: ZcAbJob) {
+        if let Ok(gpu) = gpu() { unsafe {
+            let ok = gpu.wait_cb(job.cb);
+            if !job.cb_tables.is_null() { let _ = gpu.wait_cb(job.cb_tables); gpu.release(job.cb_tables); }
+            if ok.is_ok() { Gpu::recycle_done(job.sig); }
+            gpu.release(job.cb);
+        } }
+    }
+    pub(crate) fn zc_ab_stage(ab_ptr: usize, ab_len: usize, r_outer: Vec<F128>, job: ZcAbJob) {
+        let prev = { let mut g = ZC_AB_STAGED.lock().unwrap_or_else(|e| e.into_inner()); ZC_AB_HAS_STAGED.store(true, std::sync::atomic::Ordering::Release); g.replace(ZcAbStaged { ab_ptr, ab_len, r_outer, job }) };
+        if let Some(old) = prev { zc_ab_retire_job(old.job); }
+    }
+    pub(crate) fn zc_ab_adopt_staged(ab_ptr: usize, ab_len: usize, r_outer: &[F128]) -> Option<ZcAbJob> {
+        if !ZC_AB_HAS_STAGED.load(std::sync::atomic::Ordering::Acquire) { return None; }
+        let s = { let mut g = ZC_AB_STAGED.lock().unwrap_or_else(|e| e.into_inner()); ZC_AB_HAS_STAGED.store(false, std::sync::atomic::Ordering::Release); g.take()? };
+        if s.ab_ptr == ab_ptr && s.ab_len == ab_len && s.r_outer.as_slice() == r_outer { Some(s.job) } else { zc_ab_retire_job(s.job); None }
+    }
+    pub(crate) fn zc_ab_abandon_staged_if_ptr(ab_ptr: usize) {
+        if !ZC_AB_HAS_STAGED.load(std::sync::atomic::Ordering::Acquire) { return; }
+        let orphan = { let mut g = ZC_AB_STAGED.lock().unwrap_or_else(|e| e.into_inner()); if g.as_ref().is_some_and(|s| ab_ptr == 0 || s.ab_ptr == ab_ptr) { ZC_AB_HAS_STAGED.store(false, std::sync::atomic::Ordering::Release); g.take() } else { None } };
+        if let Some(s) = orphan { zc_ab_retire_job(s.job); }
+    }
+
     /// Result of joining the round-one AB completion GPU prefix.
     pub(crate) enum ZcAbResult {
         /// Admitted prove: the GPU's per-chunk 64-lane partials of chunks
@@ -28070,6 +28097,7 @@ kernel void zc_ab_finish(
         use std::sync::atomic::Ordering;
         // A view handed to the K pass arm never outlives the prove whose
         // join published it.
+        zc_ab_abandon_staged_if_ptr(0);
         zc_k_view_clear();
         let debug = super::gpu_zc_ab_debug();
         let mode = ZC_AB_MODE.load(Ordering::Relaxed);
@@ -31525,7 +31553,7 @@ pub(crate) use imp::{
 
 /// Round-one AB completion GPU prefix arm (see `ENV_NO_GPU_ZC_AB_COMPLETION`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm, zc_ab_wait};
+pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_abandon_staged_if_ptr, zc_ab_adopt_staged, zc_ab_is_admitted, zc_ab_prewarm, zc_ab_stage, zc_ab_wait};
 
 /// Zerocheck cascade K pass GPU prefix arm (see `ENV_NO_ZC_K_GPU`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

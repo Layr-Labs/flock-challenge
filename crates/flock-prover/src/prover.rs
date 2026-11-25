@@ -2835,7 +2835,7 @@ mod deferred_stripe_tests {
 /// calling thread, and the Merkle root is final the instant `pcs::commit*`
 /// returns), while the AB precompute arm is typically still running. See
 /// `zerocheck::stage_commit_tail_fill`.
-type CommitTailFillHook<'a> = Box<dyn FnOnce(&Commitment) + Send + 'a>;
+type CommitTailFillHook<'a> = Box<dyn FnOnce(&Commitment, Option<&zerocheck::univariate_skip_optimized::AbPrefixReady>) + Send + 'a>;
 
 /// Build the commit-tail-fill hook for one prove: `None` when the fill is
 /// killed (`FLOCK_NO_COMMIT_TAIL_FILL=1`), off the ranked lincheck-C-reuse
@@ -2859,24 +2859,17 @@ where
         return None;
     }
     let forked = challenger.fork()?;
-    Some(Box::new(move |commitment: &Commitment| {
-        if !stripe_ready.load(std::sync::atomic::Ordering::Acquire) {
-            // The stripe fill lost the race to the graph; staging would
-            // read torn bytes. Skip — the incumbent zerocheck-entry
-            // submit runs.
+    Some(Box::new(move |commitment: &Commitment, ab_prefix| {
+        let stripe_ok = stripe_ready.load(std::sync::atomic::Ordering::Acquire);
+        let ab_ready = ab_prefix.filter(|p| p.is_ready());
+        if !stripe_ok && ab_ready.is_none() {
             if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
-                eprintln!("[commit-tail-fill] skipped: stripe not ready");
+                eprintln!("[commit-tail-fill] skipped: stripe and ab prefix not ready");
             }
             return;
         }
-        // SAFETY: the acquire above pairs with the fill worker's
-        // release-store, which follows `HelpQueue::wait_done`'s acquire of
-        // every chunk's release completion, i.e. the last stripe write by
-        // any thread; the buffer is not written again until after
-        // zerocheck consumed the stash.
-        let stripe: &[u8] =
-            unsafe { std::slice::from_raw_parts(stripe_ptr as *const u8, stripe_len) };
-        flock_core::zerocheck::stage_commit_tail_fill(forked, r1cs, commitment, stripe, padding);
+        let stripe = stripe_ok.then(|| unsafe { std::slice::from_raw_parts(stripe_ptr as *const u8, stripe_len) });
+        flock_core::zerocheck::stage_commit_tail_fill(forked, r1cs, commitment, stripe, ab_ready, padding);
     }))
 }
 
@@ -3005,6 +2998,9 @@ fn commit_with_round1_ab_precompute(
     // The CPU tail hash of the hybrid commit waits for this arm (see
     // `gpu_commit::ENV_NO_HYBRID_CPU_TAIL_HASH`).
     flock_core::gpu_commit::note_ab_arm_running(true);
+    let ab_prefix_target = if tail_fill.is_some() && pcs_params.m == 32 { zerocheck::univariate_skip_optimized::ab_tailfill_target_chunks() } else { 0 };
+    let ab_prefix = zerocheck::univariate_skip_optimized::AbPrefixReady::new(ab_prefix_target);
+    let ab_prefix_ref = (ab_prefix_target > 0).then_some(&ab_prefix);
     let result = rayon::join(
         || {
             flock_core::tmark::mark("commit arm start");
@@ -3025,7 +3021,7 @@ fn commit_with_round1_ab_precompute(
             // executes in the arm-tail idle.
             flock_core::tmark::mark("commit arm root");
             if let Some(hook) = tail_fill {
-                hook(&pre.0);
+                hook(&pre.0, ab_prefix_ref);
             }
             flock_core::tmark::mark("commit arm end");
             pre
@@ -3033,6 +3029,7 @@ fn commit_with_round1_ab_precompute(
         || {
             flock_core::tmark::mark("ab arm start");
             let t = std::time::Instant::now();
+            let _ab_prefix_guard = zerocheck::univariate_skip_optimized::ab_prefix_scope(ab_prefix_ref);
             let r = precompute_ab();
             // Inside the arm, so its completion is ordered before the
             // tail-fill hook can observe a published stripe.

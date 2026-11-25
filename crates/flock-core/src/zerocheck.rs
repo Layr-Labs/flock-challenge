@@ -469,11 +469,13 @@ pub fn stage_commit_tail_fill<C: Challenger>(
     forked: C,
     r1cs: &crate::r1cs::BlockR1cs,
     commitment: &crate::pcs::Commitment,
-    c_lincheck: &[u8],
+    c_lincheck: Option<&[u8]>,
+    ab_prefix: Option<&univariate_skip_optimized::AbPrefixReady>,
     padding: &PaddingSpec,
 ) {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
+        if c_lincheck.is_none() && ab_prefix.is_none() { return; }
         let mut forked = forked;
         let m = r1cs.m;
         let k_skip = K_SKIP;
@@ -497,23 +499,15 @@ pub fn stage_commit_tail_fill<C: Challenger>(
             r[k_skip + 3 + i] = *val;
         }
         r[k_skip + N_INNER..].copy_from_slice(&r_outer);
-        let staged = univariate_skip_optimized::stage_c_prelude_for_tail_fill(
-            c_lincheck,
-            m,
-            padding.k_log,
-            padding.useful_bits_per_block,
-            &r,
-        );
+        let staged = c_lincheck.is_some_and(|c| univariate_skip_optimized::stage_c_prelude_for_tail_fill(c, m, padding.k_log, padding.useful_bits_per_block, &r));
+        let staged_ab = ab_prefix.is_some_and(|p| univariate_skip_optimized::stage_ab_completion_for_tail_fill(p, padding, &r));
         if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
-            eprintln!(
-                "[commit-tail-fill] stage at graph completion: staged={staged} {:.2} ms",
-                t_stage.elapsed().as_secs_f64() * 1e3
-            );
+            eprintln!("[commit-tail-fill] stage at graph completion: staged={staged} staged_ab={staged_ab} {:.2} ms", t_stage.elapsed().as_secs_f64() * 1e3);
         }
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
-        let _ = (forked, r1cs, commitment, c_lincheck, padding);
+        let _ = (forked, r1cs, commitment, c_lincheck, ab_prefix, padding);
     }
 }
 
