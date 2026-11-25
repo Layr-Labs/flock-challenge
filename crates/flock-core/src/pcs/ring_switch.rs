@@ -2059,7 +2059,20 @@ fn compose_nibble_join_enabled() -> bool {
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
-    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vld1q_u64, vst1q_u64};
+    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vld1q_u64};
+    #[inline(always)]
+    unsafe fn store_pair_q(p: *mut F128, x0: uint64x2_t, x1: uint64x2_t) {
+        // SAFETY (caller): `p` is valid for a 32-byte write of two adjacent `F128`s.
+        unsafe {
+            core::arch::asm!(
+                "stp {x0:q}, {x1:q}, [{p}]",
+                p = in(reg) p,
+                x0 = in(vreg) x0,
+                x1 = in(vreg) x1,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
     debug_assert_eq!(g.len(), 8);
     debug_assert_eq!(out.len(), 256);
     // SAFETY: `g` has 8 `F128` elements and `out` has 256 `F128` elements.
@@ -2086,34 +2099,52 @@ fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
         let l13 = veorq_u64(l5, g3);
         let l14 = veorq_u64(l6, g3);
         let l15 = veorq_u64(l7, g3);
+        let mut dst = out.as_mut_ptr();
+        // Row 0 (`h == 0`): write `l0..l15` directly via paired stores without XOR-with-zero.
+        store_pair_q(dst, l0, l1);
+        store_pair_q(dst.add(2), l2, l3);
+        store_pair_q(dst.add(4), l4, l5);
+        store_pair_q(dst.add(6), l6, l7);
+        store_pair_q(dst.add(8), l8, l9);
+        store_pair_q(dst.add(10), l10, l11);
+        store_pair_q(dst.add(12), l12, l13);
+        store_pair_q(dst.add(14), l14, l15);
+
+        let store_row = |row: *mut F128, h: uint64x2_t| {
+            store_pair_q(row, h, veorq_u64(l1, h));
+            store_pair_q(row.add(2), veorq_u64(l2, h), veorq_u64(l3, h));
+            store_pair_q(row.add(4), veorq_u64(l4, h), veorq_u64(l5, h));
+            store_pair_q(row.add(6), veorq_u64(l6, h), veorq_u64(l7, h));
+            store_pair_q(row.add(8), veorq_u64(l8, h), veorq_u64(l9, h));
+            store_pair_q(row.add(10), veorq_u64(l10, h), veorq_u64(l11, h));
+            store_pair_q(row.add(12), veorq_u64(l12, h), veorq_u64(l13, h));
+            store_pair_q(row.add(14), veorq_u64(l14, h), veorq_u64(l15, h));
+        };
+
         let g4 = vld1q_u64(gp.add(4).cast::<u64>());
         let g5 = vld1q_u64(gp.add(5).cast::<u64>());
         let g6 = vld1q_u64(gp.add(6).cast::<u64>());
         let g7 = vld1q_u64(gp.add(7).cast::<u64>());
-        let h_lo: [uint64x2_t; 4] = [l0, g4, g5, veorq_u64(g4, g5)];
-        let h_hi: [uint64x2_t; 4] = [l0, g6, g7, veorq_u64(g6, g7)];
-        let mut dst = out.as_mut_ptr();
-        for &hi in &h_hi {
-            for &lo in &h_lo {
-                let h = veorq_u64(lo, hi);
-                vst1q_u64(dst.cast::<u64>(), h);
-                vst1q_u64(dst.add(1).cast::<u64>(), veorq_u64(l1, h));
-                vst1q_u64(dst.add(2).cast::<u64>(), veorq_u64(l2, h));
-                vst1q_u64(dst.add(3).cast::<u64>(), veorq_u64(l3, h));
-                vst1q_u64(dst.add(4).cast::<u64>(), veorq_u64(l4, h));
-                vst1q_u64(dst.add(5).cast::<u64>(), veorq_u64(l5, h));
-                vst1q_u64(dst.add(6).cast::<u64>(), veorq_u64(l6, h));
-                vst1q_u64(dst.add(7).cast::<u64>(), veorq_u64(l7, h));
-                vst1q_u64(dst.add(8).cast::<u64>(), veorq_u64(l8, h));
-                vst1q_u64(dst.add(9).cast::<u64>(), veorq_u64(l9, h));
-                vst1q_u64(dst.add(10).cast::<u64>(), veorq_u64(l10, h));
-                vst1q_u64(dst.add(11).cast::<u64>(), veorq_u64(l11, h));
-                vst1q_u64(dst.add(12).cast::<u64>(), veorq_u64(l12, h));
-                vst1q_u64(dst.add(13).cast::<u64>(), veorq_u64(l13, h));
-                vst1q_u64(dst.add(14).cast::<u64>(), veorq_u64(l14, h));
-                vst1q_u64(dst.add(15).cast::<u64>(), veorq_u64(l15, h));
-                dst = dst.add(16);
-            }
+        let g45 = veorq_u64(g4, g5);
+        store_row(dst.add(16), g4);
+        store_row(dst.add(32), g5);
+        store_row(dst.add(48), g45);
+        dst = dst.add(64);
+        let mut k = 0usize;
+        while k < 3 {
+            let hi = if k == 0 {
+                g6
+            } else if k == 1 {
+                g7
+            } else {
+                veorq_u64(g6, g7)
+            };
+            store_row(dst, hi);
+            store_row(dst.add(16), veorq_u64(g4, hi));
+            store_row(dst.add(32), veorq_u64(g5, hi));
+            store_row(dst.add(48), veorq_u64(g45, hi));
+            dst = dst.add(64);
+            k += 1;
         }
     }
 }
