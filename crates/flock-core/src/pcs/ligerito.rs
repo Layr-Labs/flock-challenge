@@ -6293,14 +6293,17 @@ fn l1_overlap_warmup_race(
             log_inv_rate,
             |offset, chunk| s.chunk_ready(offset, chunk.len()),
         );
-        let tree_a = s.finish();
+        let view_a = s.finish_view();
         wall_a = wall_a.min(t.elapsed().as_secs_f64() * 1e3);
-        let Some(tree_a) = tree_a else {
+        let Some((ptr, len)) = view_a else {
             crate::gpu_commit::l1_overlap_report(f64::INFINITY, wall_b, None);
             return Some(incumbent_tree);
         };
-        equal &= tree_a == incumbent_tree;
-        crate::scratch::give_hash_tree(tree_a);
+        // SAFETY: `finish_view` drained every L1 Merkle command buffer on the
+        // persistent shared tree storage; the view remains valid until the next
+        // L1 recursive Merkle dispatch in the incumbent arm below.
+        let tree_a = unsafe { core::slice::from_raw_parts(ptr as *const Hash, len) };
+        equal &= tree_a == incumbent_tree.as_slice();
 
         // Incumbent arm.
         settle();

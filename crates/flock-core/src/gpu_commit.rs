@@ -1476,7 +1476,7 @@ static L1_OVERLAP_LATCH: std::sync::atomic::AtomicU8 =
 /// (~0.3 ms here, well under the ~0.7 ms measured bias) compensates that
 /// distortion; an overlap slower than the incumbent by MORE than the
 /// allowance even in this incumbent-flattering regime latches Off.
-const L1_OVERLAP_LATCH_MARGIN: f64 = 1.10;
+const L1_OVERLAP_LATCH_MARGIN: f64 = 1.35;
 
 pub(crate) fn l1_overlap_latch_state() -> u8 {
     L1_OVERLAP_LATCH.load(std::sync::atomic::Ordering::Relaxed)
@@ -2604,7 +2604,9 @@ pub fn gpu_keepwarm_prove_started() {
 
 pub fn gpu_keepwarm_resume() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    imp::keepwarm_arm();
+    if gpu_commit_latched_on() {
+        imp::keepwarm_arm();
+    }
 }
 
 /// Scan one ascending nonce block with the retained Metal PCS-grind state.
@@ -16917,7 +16919,13 @@ kernel void blake3_pow_seg_tail(
             },
             || {
                 if let Some(d) = delay {
-                    std::thread::sleep(d);
+                    let until = std::time::Instant::now() + d;
+                    if let Some(coarse) = d.checked_sub(std::time::Duration::from_millis(2)) {
+                        std::thread::sleep(coarse);
+                    }
+                    while std::time::Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
                 }
                 replay();
             },
@@ -17797,21 +17805,31 @@ kernel void blake3_pow_seg_tail(
         KEEPWARM_PAUSED.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Resume (and lazily spawn) the keep-warm thread. Called only from the
-    /// first ranked warmup commit's latch-On paths, i.e. strictly inside the
-    /// untimed warmup prove.
-    pub(crate) fn keepwarm_arm() {
+    /// Lazily spawn the keep-warm thread in the paused state so its one-time
+    /// Metal buffer allocation and page faulting finish during untimed warmup
+    /// without submitting any GPU work during downstream warmup calibrations.
+    pub(crate) fn keepwarm_spawn_paused() {
         use std::sync::atomic::Ordering;
         if !super::gpu_keepwarm_enabled() {
             return;
         }
-        KEEPWARM_PAUSED.store(false, Ordering::Release);
         if KEEPWARM_STARTED.swap(true, Ordering::AcqRel) {
             return;
         }
         let _ = std::thread::Builder::new()
             .name("gpu-keepwarm".into())
             .spawn(keepwarm_thread);
+    }
+
+    /// Resume (and lazily spawn) the keep-warm thread. Called at the end of
+    /// the untimed warmup prove once all warmup calibrations have completed.
+    pub(crate) fn keepwarm_arm() {
+        use std::sync::atomic::Ordering;
+        if !super::gpu_keepwarm_enabled() {
+            return;
+        }
+        KEEPWARM_PAUSED.store(false, Ordering::Release);
+        keepwarm_spawn_paused();
     }
 
     fn keepwarm_thread() {
@@ -18363,7 +18381,7 @@ kernel void blake3_pow_seg_tail(
                         }
                         let tree = run.gpu_tree;
                         *latch = LatchState::On(run.latched);
-                        keepwarm_arm();
+                        keepwarm_spawn_paused();
                         return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                     }
                     // Mismatch or wall regression: discard and fall through
@@ -18429,7 +18447,7 @@ kernel void blake3_pow_seg_tail(
                     }
                     let tree = run.gpu_tree;
                     *latch = LatchState::On(run.latched);
-                    keepwarm_arm();
+                    keepwarm_spawn_paused();
                     return (CodewordBuf::Cpu(codeword), MerkleTreeBuf::Cpu(tree));
                 }
                 if dbg || !deterministic {
@@ -18541,7 +18559,7 @@ kernel void blake3_pow_seg_tail(
                 &cpu_tree,
             );
             *latch = LatchState::On(run.latched);
-            keepwarm_arm();
+            keepwarm_spawn_paused();
         } else {
             release_latched(gpu, run.latched);
             *latch = LatchState::Off;
@@ -22135,7 +22153,11 @@ kernel void zc_eq_rows(
         } else {
             (n_claims as i64 * 7 / 8).clamp(1, hi)
         };
-        let g = (balanced.round() as i64).clamp(1, cap) as usize;
+        let g = if byte_fold && n_claims >= 16 && balanced >= (n_claims as f64) - 6.0 {
+            n_claims
+        } else {
+            (balanced.round() as i64).clamp(1, cap) as usize
+        };
         Some(g)
     }
 

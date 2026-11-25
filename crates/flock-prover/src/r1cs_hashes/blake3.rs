@@ -5550,6 +5550,7 @@ impl Blake3Setup {
             if crate::seed_pipe::is_ranked_worker() && crate::seed_pipe::park_keepalive_enabled() {
                 flock_core::cpu_keepalive::keepalive_start();
             }
+            flock_core::gpu_commit::gpu_keepwarm_resume();
             self.arm_seed_pipe();
             // Last thing before the worker publishes "ready" and every thread
             // parks for the seed: light up a P-core keep-alive so the cluster
