@@ -3,6 +3,9 @@ use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep, mul_two_const_s
 use core::arch::aarch64::*;
 use core::mem::transmute;
 
+#[path = "aarch64_fold8_eight.rs"]
+pub(super) mod fold8_eight;
+
 #[derive(Clone, Copy)]
 struct WideNeon {
     lo: uint64x2_t,

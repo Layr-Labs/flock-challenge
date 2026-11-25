@@ -122,9 +122,10 @@ pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
     bstatic_w: usize,
     static_b_context: Option<StaticBContext>,
     nt_store: bool,
+    karatsuba: bool,
 ) {
     #[cfg(not(target_arch = "aarch64"))]
-    let _ = nt_store;
+    let _ = (nt_store, karatsuba);
     #[cfg(target_arch = "aarch64")]
     {
         let _ = (a_col, b_col);
@@ -141,6 +142,7 @@ pub(super) fn shift_reduce_inner_ab<const FAST_POLICY: u8>(
             bstatic_w,
             static_b_context,
             nt_store,
+            karatsuba,
         );
     }
 

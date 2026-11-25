@@ -8477,6 +8477,16 @@ fn materialize_direct_fold8(
         None
     };
     let z_rebuild_p_only = z_rebuild.is_some() && super::open_z_rebuild_p_only();
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let z_rebuild_eight_slots = z_rebuild.is_some()
+        && packed_witness.len() == 1 << 25
+        && block_len == 1 << 11
+        && claims.len() == 2
+        && odd_slot_live == 57
+        && odd_slot_lo_tail
+        && std::env::var_os("FLOCK_NO_OPEN_FOLD8_EIGHT_SLOTS").is_none();
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    let z_rebuild_eight_slots = false;
     let zr_blocks = std::sync::atomic::AtomicUsize::new(0);
     let zr_helper_blocks = std::sync::atomic::AtomicUsize::new(0);
     let fold8_block_rebuilt = |zr: &super::OpenZRebuild,
@@ -8495,6 +8505,22 @@ fn materialize_direct_fold8(
             scratch,
         );
         let q0 = block * block_len / 8;
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        if z_rebuild_eight_slots {
+            for (quad, (f, b)) in f_out.chunks_exact_mut(8).zip(b_out.chunks_exact_mut(8)).enumerate() {
+                // SAFETY: the registration outlives the block and `zs`
+                // covers the full quad. The padding receipt covers odd slots.
+                unsafe { zr.produce_quad(q0 + quad, zs.as_mut_ptr()) };
+                crate::field::f128_slice::fold_banked_slots8_padded_whole_into(
+                    &fold_weight, zs[..512].try_into().unwrap(), f.try_into().unwrap(),
+                );
+                let lo = &first_claim.eq_lo[8 * quad..8 * quad + 8];
+                for (dst, &eq) in b.iter_mut().zip(lo) {
+                    *dst = super::ring_switch::fold_one_slot(eq, scratch);
+                }
+            }
+            return direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out);
+        }
         let mut slot = 0usize;
         while slot < block_len {
             // SAFETY: `zs` holds 512 elements; the registration outlives
@@ -8536,7 +8562,7 @@ fn materialize_direct_fold8(
             let helper = crate::epool::epool().is_some_and(|p| p.current_thread_index().is_some());
             if !(z_rebuild_p_only && helper) {
                 if st.1.len() < 512 {
-                    st.1 = crate::alloc_uninit_f128_vec(512);
+                    st.1 = vec![F128::ZERO; 512];
                 }
                 zr_blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if helper {
@@ -8728,7 +8754,7 @@ fn materialize_direct_fold8(
         }
         if zfold_debug_any() && z_rebuild.is_some() {
             eprintln!(
-                "    [zfold] z rebuild: {} CPU blocks rebuilt ({} on helper threads){}",
+                "    [zfold] z rebuild: {} CPU blocks rebuilt ({} on helper threads){}; eight-slot={z_rebuild_eight_slots}",
                 zr_blocks.load(std::sync::atomic::Ordering::Relaxed),
                 zr_helper_blocks.load(std::sync::atomic::Ordering::Relaxed),
                 if z_rebuild_p_only { ", P-only" } else { "" },

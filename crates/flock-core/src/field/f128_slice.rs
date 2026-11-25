@@ -229,6 +229,20 @@ pub(crate) fn fold_banked_slots4_whole_into<const BANKS: usize>(
     out[..4].copy_from_slice(&fold_banked_slots4::<BANKS>(weight, input));
 }
 
+/// Fold eight 64-bank slots from one rebuilt Z quad. Every odd slot has
+/// only a low limb in bank 56 and zero inputs in banks 57 through 63.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline]
+pub(crate) fn fold_banked_slots8_padded_whole_into(
+    weight: &[F128; 64],
+    input: &[F128; 512],
+    out: &mut [F128; 8],
+) {
+    // SAFETY: the AES feature supplies PMULL and the arrays cover every read
+    // and write. The padding promise controls only which products are skipped.
+    unsafe { aarch64::fold8_eight::one_scan::<57, true>(weight, input, out) }
+}
+
 
 /// Fold the ranked zerocheck AB bank matrix, laid out bank-major, into its
 /// 64 lane sums. Two adjacent lanes share each of the 128 weight loads, and
