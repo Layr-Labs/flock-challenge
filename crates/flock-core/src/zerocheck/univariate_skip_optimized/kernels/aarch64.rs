@@ -3741,18 +3741,38 @@ static AB_KARA_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn ab_kara_enabled() -> bool {
-    let on = match AB_KARA_STATE.load(core::sync::atomic::Ordering::Relaxed) {
+    ab_kara_process_enabled() && !AB_KARA_THREAD_PLAIN.with(|plain| plain.get())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn ab_kara_process_enabled() -> bool {
+    match AB_KARA_STATE.load(core::sync::atomic::Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => ab_kara_resolve(),
-    };
-    on && !AB_KARA_THREAD_PLAIN.with(|plain| plain.get())
+    }
 }
 
 /// Second switch: exactly `FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN=1` lets the
 /// efficiency-core helper threads use the Karatsuba apply as well.
 #[cfg(target_arch = "aarch64")]
 pub(crate) const ENV_NO_ZC_AB_KARA_HELPER_PLAIN: &str = "FLOCK_NO_ZC_AB_KARA_HELPER_PLAIN";
+
+#[cfg(target_arch = "aarch64")]
+fn ab_kara_helper_plain_override() -> Option<bool> {
+    static PLAIN: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *PLAIN.get_or_init(|| {
+        std::env::var_os(ENV_NO_ZC_AB_KARA_HELPER_PLAIN)
+            .map(|v| v != std::ffi::OsStr::new("1"))
+    })
+}
+
+/// An explicit all-helper setting takes precedence over the job policy.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn ab_kara_published_prefix_enabled() -> bool {
+    ab_kara_helper_plain_override().is_none() && ab_kara_process_enabled()
+}
 
 #[cfg(target_arch = "aarch64")]
 thread_local! {
@@ -3767,17 +3787,13 @@ thread_local! {
 /// units and loses on a narrower core with two (measured: about 12% slower
 /// there). The choice is per thread and both forms write the same bytes.
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_kara_note_worker() {
-    static HELPER_PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+pub(crate) fn ab_kara_note_worker() -> bool {
     let helper = std::thread::current()
         .name()
         .is_some_and(|name| name.starts_with("flock-ecore-"));
-    let plain = helper
-        && *HELPER_PLAIN.get_or_init(|| {
-            std::env::var_os(ENV_NO_ZC_AB_KARA_HELPER_PLAIN).as_deref()
-                != Some(std::ffi::OsStr::new("1"))
-        });
+    let plain = helper && ab_kara_helper_plain_override().unwrap_or(true);
     AB_KARA_THREAD_PLAIN.with(|cell| cell.set(plain));
+    helper
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -5233,11 +5249,11 @@ pub(crate) const ENV_NO_ZC_AB_HZ: &str = "FLOCK_NO_ZC_AB_HZ";
 /// half-pair form not switched off.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) fn ab_hz_helper_enabled() -> bool {
+pub(crate) fn ab_hz_helper_enabled(karatsuba: bool) -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var_os(ENV_NO_ZC_AB_HZ).is_none_or(|v| v != *"1")
     });
-    *ON && !ab_kara_enabled()
+    *ON && !karatsuba
 }
 
 /// Kill switch for [`ab_mixed_hz_enabled`]: any value of
@@ -5252,9 +5268,10 @@ pub(crate) const ENV_NO_ZC_AB_MIXED_HZ: &str = "FLOCK_NO_ZC_AB_MIXED_HZ";
 /// the plain apply and runs its static-B rows in [`AB_HZ_VARIANT`].
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-pub(crate) fn ab_mixed_hz_enabled() -> bool {
+pub(crate) fn ab_mixed_hz_enabled(karatsuba: bool) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_MIXED_HZ).is_none()) && ab_hz_helper_enabled()
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_ZC_AB_MIXED_HZ).is_none())
+        && ab_hz_helper_enabled(karatsuba)
 }
 
 /// Test access: one mixed const-one row (`window 0, b_med 2` mask `0x03`
@@ -5641,6 +5658,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked(
         bstatic_w,
         static_b_context,
         nt_store,
+        ab_kara_enabled(),
     );
 }
 
@@ -5669,6 +5687,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
     bstatic_w: usize,
     static_b_context: Option<StaticBContext>,
     nt_store: bool,
+    karatsuba: bool,
 ) {
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     let bw = |k: usize| -> u64 {
@@ -5746,7 +5765,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                     )
                 });
                 if (a_k0 | a_k1) & 0xffff_ff00_0000_0000 == 0 {
-                    if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled()
+                    if karatsuba && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled()
                         && ab_kara_slot_enabled() && ab_z_mt_enabled()
                     {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_KARA_SLOT | ABV_Z_MT }>(
@@ -5758,7 +5777,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                             out,
                             nt_store,
                         );
-                    } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
+                    } else if karatsuba && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
                             a_packed,
                             b_packed,
@@ -5768,7 +5787,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                             out,
                             nt_store,
                         );
-                    } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
+                    } else if karatsuba && ab_kara_unscaled_enabled() && ab_z_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { AB_Z_VARIANT }>(
                             a_packed,
                             b_packed,
@@ -5778,7 +5797,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                             out,
                             nt_store,
                         );
-                    } else if ab_kara_enabled() && ab_kara_unscaled_enabled() {
+                    } else if karatsuba && ab_kara_unscaled_enabled() {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_KARA | ABV_KARA_UNSCALED }>(
                             a_packed,
                             b_packed,
@@ -5788,7 +5807,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                             out,
                             nt_store,
                         );
-                    } else if ab_kara_enabled() {
+                    } else if karatsuba {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_KARA }>(
                             a_packed,
                             b_packed,
@@ -5798,7 +5817,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                             out,
                             nt_store,
                         );
-                    } else if ab_mixed_hz_enabled() {
+                    } else if ab_mixed_hz_enabled(karatsuba) {
                         shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0x03, { ABV_HZ }>(
                             a_packed,
                             b_packed,
@@ -5864,7 +5883,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
         0xf0 if bw(4) & bw(5) & bw(6) & bw(7) == u64::MAX => {
             if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-                if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled()
+                if karatsuba && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled()
                     && ab_kara_slot_enabled() && ab_z_mt_enabled()
                 {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { AB_Z_VARIANT | ABV_KARA_XOR16 | ABV_KARA_SLOT | ABV_Z_MT }>(
@@ -5876,7 +5895,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                         out,
                         nt_store,
                     );
-                } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
+                } else if karatsuba && ab_kara_unscaled_enabled() && ab_z_enabled() && ab_kara_xor16_enabled() {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { AB_Z_VARIANT | ABV_KARA_XOR16 }>(
                         a_packed,
                         b_packed,
@@ -5886,7 +5905,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                         out,
                         nt_store,
                     );
-                } else if ab_kara_enabled() && ab_kara_unscaled_enabled() && ab_z_enabled() {
+                } else if karatsuba && ab_kara_unscaled_enabled() && ab_z_enabled() {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { AB_Z_VARIANT }>(
                         a_packed,
                         b_packed,
@@ -5896,7 +5915,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                         out,
                         nt_store,
                     );
-                } else if ab_kara_enabled() && ab_kara_unscaled_enabled() {
+                } else if karatsuba && ab_kara_unscaled_enabled() {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_KARA | ABV_KARA_UNSCALED }>(
                         a_packed,
                         b_packed,
@@ -5906,7 +5925,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                         out,
                         nt_store,
                     );
-                } else if ab_kara_enabled() {
+                } else if karatsuba {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_KARA }>(
                         a_packed,
                         b_packed,
@@ -5916,7 +5935,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
                         out,
                         nt_store,
                     );
-                } else if ab_mixed_hz_enabled() {
+                } else if ab_mixed_hz_enabled(karatsuba) {
                     shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, { ABV_HZ }>(
                         a_packed,
                         b_packed,
@@ -5993,7 +6012,7 @@ pub(crate) fn shift_reduce_inner_ab_fused_neon_checked_with_fast_policy<const FA
         }
     }
     if fast_shift_reduce_with_policy::<FAST_POLICY>() {
-        if ab_kara_enabled() {
+        if karatsuba {
             shift_reduce_inner_ab_fused_neon_h4::<{ ABV_KARA }>(
                 a_packed,
                 b_packed,
@@ -6075,8 +6094,9 @@ pub(crate) fn ab_mixed_row_direct(
     w0: bool,
     out: &mut [u8; 64],
     nt_store: bool,
+    karatsuba: bool,
 ) -> bool {
-    ab_kara_enabled()
+    karatsuba
         && ab_mixed_row_direct_route()
         && ab_mixed_row_guarded(a_packed, b_packed, inv_table, chunk_byte_base, b_med, w0, out, nt_store)
 }
@@ -6104,6 +6124,7 @@ pub(crate) fn ab_mixed_row_residual(
     w0: bool,
     out: &mut [u8; 64],
     nt_store: bool,
+    karatsuba: bool,
 ) {
     const MAIN: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_KARA_LANEZ | ABV_OMIT_MIXED_ONES;
     const HELPER: u32 = ABV_HZ | ABV_OMIT_MIXED_ONES;
@@ -6122,7 +6143,7 @@ pub(crate) fn ab_mixed_row_residual(
             }
         };
     }
-    if ab_kara_enabled() {
+    if karatsuba {
         run!(MAIN);
     } else {
         run!(HELPER);
@@ -6219,17 +6240,11 @@ pub(crate) const AB_MIXED_PLAN_V0: u8 = 1;
 #[cfg(target_arch = "aarch64")]
 pub(crate) const AB_MIXED_PLAN_VL: u8 = 2;
 
-/// The mixed-row plan of this thread: the route [`ab_mixed_row_direct`] and
-/// the kernel [`ab_mixed_row_guarded`] pick, resolved once. Every input is a
-/// per-process switch except the per-thread plain flag of
-/// [`ab_kara_enabled`], which [`ab_kara_note_worker`] sets before a worker's
-/// first job, so a worker resolves this right after that call (as the
-/// window-rows plan). [`AB_MIXED_PLAN_ROUTE`] when the direct route is off on
-/// this thread (the per-row call then returns `false` and the dispatcher
-/// runs, as before).
+/// The mixed-row plan for the selected arithmetic. [`AB_MIXED_PLAN_ROUTE`]
+/// keeps the per-row route and dispatcher when the direct route is off.
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn ab_mixed_row_plan() -> u8 {
-    if !(ab_kara_enabled() && ab_mixed_row_direct_route()) {
+pub(crate) fn ab_mixed_row_plan(karatsuba: bool) -> u8 {
+    if !(karatsuba && ab_mixed_row_direct_route()) {
         AB_MIXED_PLAN_ROUTE
     } else if ab_mixed_h2_enabled() && ab_mixed_fuse_enabled() && ab_kara_lanez_enabled() {
         AB_MIXED_PLAN_VL
