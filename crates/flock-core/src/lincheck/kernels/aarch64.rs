@@ -1102,14 +1102,263 @@ fn lc_table_regs_enabled() -> bool {
 ///
 /// # Safety
 /// `eq8` must be valid for 8 reads and `table` for 256 writes.
+#[inline(always)]
+unsafe fn load_pair_u64x2(
+    ptr: *const F128,
+) -> (core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t) {
+    let a: core::arch::aarch64::uint64x2_t;
+    let b: core::arch::aarch64::uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "ldp {a:q}, {b:q}, [{ptr}]",
+            ptr = in(reg) ptr,
+            a = lateout(vreg) a,
+            b = lateout(vreg) b,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    (a, b)
+}
+
+#[inline(always)]
+unsafe fn store_quad_0_32(
+    p: *mut F128,
+    a0: core::arch::aarch64::uint64x2_t,
+    a1: core::arch::aarch64::uint64x2_t,
+    a2: core::arch::aarch64::uint64x2_t,
+    a3: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a0:q}, {a1:q}, [{p}]",
+            "stp {a2:q}, {a3:q}, [{p}, #32]",
+            p = in(reg) p,
+            a0 = in(vreg) a0,
+            a1 = in(vreg) a1,
+            a2 = in(vreg) a2,
+            a3 = in(vreg) a3,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[inline(always)]
+unsafe fn store_quad_64_96(
+    p: *mut F128,
+    a0: core::arch::aarch64::uint64x2_t,
+    a1: core::arch::aarch64::uint64x2_t,
+    a2: core::arch::aarch64::uint64x2_t,
+    a3: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a0:q}, {a1:q}, [{p}, #64]",
+            "stp {a2:q}, {a3:q}, [{p}, #96]",
+            p = in(reg) p,
+            a0 = in(vreg) a0,
+            a1 = in(vreg) a1,
+            a2 = in(vreg) a2,
+            a3 = in(vreg) a3,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[inline(always)]
+unsafe fn store_quad_128_160(
+    p: *mut F128,
+    a0: core::arch::aarch64::uint64x2_t,
+    a1: core::arch::aarch64::uint64x2_t,
+    a2: core::arch::aarch64::uint64x2_t,
+    a3: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a0:q}, {a1:q}, [{p}, #128]",
+            "stp {a2:q}, {a3:q}, [{p}, #160]",
+            p = in(reg) p,
+            a0 = in(vreg) a0,
+            a1 = in(vreg) a1,
+            a2 = in(vreg) a2,
+            a3 = in(vreg) a3,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[inline(always)]
+unsafe fn store_quad_192_224(
+    p: *mut F128,
+    a0: core::arch::aarch64::uint64x2_t,
+    a1: core::arch::aarch64::uint64x2_t,
+    a2: core::arch::aarch64::uint64x2_t,
+    a3: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a0:q}, {a1:q}, [{p}, #192]",
+            "stp {a2:q}, {a3:q}, [{p}, #224]",
+            p = in(reg) p,
+            a0 = in(vreg) a0,
+            a1 = in(vreg) a1,
+            a2 = in(vreg) a2,
+            a3 = in(vreg) a3,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[inline(always)]
+unsafe fn xor3_u64x2(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+    c: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    #[cfg(target_feature = "sha3")]
+    {
+        unsafe { core::arch::aarch64::veor3q_u64(a, b, c) }
+    }
+    #[cfg(not(target_feature = "sha3"))]
+    {
+        unsafe { core::arch::aarch64::veorq_u64(a, core::arch::aarch64::veorq_u64(b, c)) }
+    }
+}
+
+/// Stream-friendly NEON XOR reduction across `parts` for one output band
+/// `dst = parts[0][lo..lo+len] ^ parts[1][lo..lo+len] ^ ...`.
+///
+/// Keeps `dst` L1-resident while streaming at most 3 sequential inputs per pass
+/// (avoiding multi-stream prefetcher/TLB pressure): initializes `dst` with a
+/// 3-way `eor3.16b` pass (`parts[0] ^ parts[1] ^ parts[2]`), then folds pairs
+/// of remaining partials (`dst ^= parts[p] ^ parts[p+1]`) with `ldp q, q`,
+/// `eor3.16b`, and `stp q, q`, halving both `dst` read-modify-write passes and
+/// XOR instructions relative to single-partial scalar accumulation.
+#[inline(never)]
+unsafe fn xor_reduce_band_neon(parts: &[&[F128]], lo: usize, dst: &mut [F128]) {
+    use core::arch::aarch64::*;
+    let len = dst.len();
+    let n_parts = parts.len();
+    if n_parts == 0 || len == 0 {
+        return;
+    }
+    if n_parts == 1 {
+        dst.copy_from_slice(&parts[0][lo..lo + len]);
+        return;
+    }
+    let dst_ptr = dst.as_mut_ptr();
+    let vec_len = len & !3usize;
+    unsafe {
+        let mut p;
+        if n_parts >= 3 {
+            let s0 = parts[0].as_ptr().add(lo);
+            let s1 = parts[1].as_ptr().add(lo);
+            let s2 = parts[2].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let (a0, a1) = load_pair_u64x2(s0.add(i));
+                let (b0, b1) = load_pair_u64x2(s1.add(i));
+                let (c0, c1) = load_pair_u64x2(s2.add(i));
+                let r0 = xor3_u64x2(a0, b0, c0);
+                let r1 = xor3_u64x2(a1, b1, c1);
+                let (a2, a3) = load_pair_u64x2(s0.add(i + 2));
+                let (b2, b3) = load_pair_u64x2(s1.add(i + 2));
+                let (c2, c3) = load_pair_u64x2(s2.add(i + 2));
+                let r2 = xor3_u64x2(a2, b2, c2);
+                let r3 = xor3_u64x2(a3, b3, c3);
+                store_quad_0_32(dst_ptr.add(i), r0, r1, r2, r3);
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) = *s0.add(i) + *s1.add(i) + *s2.add(i);
+                i += 1;
+            }
+            p = 3;
+        } else {
+            let s0 = parts[0].as_ptr().add(lo);
+            let s1 = parts[1].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let (a0, a1) = load_pair_u64x2(s0.add(i));
+                let (b0, b1) = load_pair_u64x2(s1.add(i));
+                let (a2, a3) = load_pair_u64x2(s0.add(i + 2));
+                let (b2, b3) = load_pair_u64x2(s1.add(i + 2));
+                store_quad_0_32(
+                    dst_ptr.add(i),
+                    veorq_u64(a0, b0),
+                    veorq_u64(a1, b1),
+                    veorq_u64(a2, b2),
+                    veorq_u64(a3, b3),
+                );
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) = *s0.add(i) + *s1.add(i);
+                i += 1;
+            }
+            p = 2;
+        }
+
+        while p + 1 < n_parts {
+            let s0 = parts[p].as_ptr().add(lo);
+            let s1 = parts[p + 1].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let d = dst_ptr.add(i);
+                let (d0, d1) = load_pair_u64x2(d);
+                let (a0, a1) = load_pair_u64x2(s0.add(i));
+                let (b0, b1) = load_pair_u64x2(s1.add(i));
+                let r0 = xor3_u64x2(d0, a0, b0);
+                let r1 = xor3_u64x2(d1, a1, b1);
+                let (d2, d3) = load_pair_u64x2(d.add(2));
+                let (a2, a3) = load_pair_u64x2(s0.add(i + 2));
+                let (b2, b3) = load_pair_u64x2(s1.add(i + 2));
+                let r2 = xor3_u64x2(d2, a2, b2);
+                let r3 = xor3_u64x2(d3, a3, b3);
+                store_quad_0_32(d, r0, r1, r2, r3);
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) += *s0.add(i) + *s1.add(i);
+                i += 1;
+            }
+            p += 2;
+        }
+
+        if p < n_parts {
+            let s0 = parts[p].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let d = dst_ptr.add(i);
+                let (d0, d1) = load_pair_u64x2(d);
+                let (a0, a1) = load_pair_u64x2(s0.add(i));
+                let (d2, d3) = load_pair_u64x2(d.add(2));
+                let (a2, a3) = load_pair_u64x2(s0.add(i + 2));
+                store_quad_0_32(
+                    d,
+                    veorq_u64(d0, a0),
+                    veorq_u64(d1, a1),
+                    veorq_u64(d2, a2),
+                    veorq_u64(d3, a3),
+                );
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) += *s0.add(i);
+                i += 1;
+            }
+        }
+    }
+}
+
 #[inline(never)]
 unsafe fn build_sum_table_regs(eq8: *const F128, table: *mut F128) {
     use core::arch::aarch64::*;
     unsafe {
-        let ld = |i: usize| vld1q_u64(eq8.add(i).cast::<u64>());
         let x = |a: uint64x2_t, b: uint64x2_t| veorq_u64(a, b);
-        let (e0, e1, e2, e3) = (ld(0), ld(1), ld(2), ld(3));
-        let (e4, e5, e6, e7) = (ld(4), ld(5), ld(6), ld(7));
+        let (e0, e1) = load_pair_u64x2(eq8);
+        let (e2, e3) = load_pair_u64x2(eq8.add(2));
+        let (e4, e5) = load_pair_u64x2(eq8.add(4));
+        let (e6, e7) = load_pair_u64x2(eq8.add(6));
         let l1 = e0;
         let l2 = e1;
         let l3 = x(e0, e1);
@@ -1125,44 +1374,19 @@ unsafe fn build_sum_table_regs(eq8: *const F128, table: *mut F128) {
         let l13 = x(e3, l5);
         let l14 = x(e3, l6);
         let l15 = x(e3, l7);
-        let st = |i: usize, v: uint64x2_t| vst1q_u64(table.add(i).cast::<u64>(), v);
-        // Row 0: the low sums themselves.
-        st(0, vdupq_n_u64(0));
-        st(1, l1);
-        st(2, l2);
-        st(3, l3);
-        st(4, l4);
-        st(5, l5);
-        st(6, l6);
-        st(7, l7);
-        st(8, l8);
-        st(9, l9);
-        st(10, l10);
-        st(11, l11);
-        st(12, l12);
-        st(13, l13);
-        st(14, l14);
-        st(15, l15);
+        // Row 0: the low sums themselves, emitted as 8 paired 256-bit stores.
+        store_quad_0_32(table, vdupq_n_u64(0), l1, l2, l3);
+        store_quad_64_96(table, l4, l5, l6, l7);
+        store_quad_128_160(table, l8, l9, l10, l11);
+        store_quad_192_224(table, l12, l13, l14, l15);
         macro_rules! row {
             ($g:expr, $h:expr) => {{
                 let h = $h;
-                let base = 16 * $g;
-                st(base, h);
-                st(base + 1, x(l1, h));
-                st(base + 2, x(l2, h));
-                st(base + 3, x(l3, h));
-                st(base + 4, x(l4, h));
-                st(base + 5, x(l5, h));
-                st(base + 6, x(l6, h));
-                st(base + 7, x(l7, h));
-                st(base + 8, x(l8, h));
-                st(base + 9, x(l9, h));
-                st(base + 10, x(l10, h));
-                st(base + 11, x(l11, h));
-                st(base + 12, x(l12, h));
-                st(base + 13, x(l13, h));
-                st(base + 14, x(l14, h));
-                st(base + 15, x(l15, h));
+                let row_ptr = table.add(16 * $g);
+                store_quad_0_32(row_ptr, h, x(l1, h), x(l2, h), x(l3, h));
+                store_quad_64_96(row_ptr, x(l4, h), x(l5, h), x(l6, h), x(l7, h));
+                store_quad_128_160(row_ptr, x(l8, h), x(l9, h), x(l10, h), x(l11, h));
+                store_quad_192_224(row_ptr, x(l12, h), x(l13, h), x(l14, h), x(l15, h));
             }};
         }
         // Gray-code order of the high nibble: 1, 3, 2, 6, 7, 5, 4, 12, 13,
@@ -1614,7 +1838,7 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         // (`lincheck::RootStripe`; 11_249 also drops the fixed block_len/flags
         // input columns).
         && (useful_bits == 15_409 || useful_bits == 11_313 || useful_bits == 11_249)
-        && std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none();
+        && lincheck_block16_enabled();
     oblock_padded_tiled_impl::<TILE_T>(
         z_packed,
         m,
@@ -1754,9 +1978,9 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     };
 
     // XOR-reduce `parts` (each `[0..useful)` valid) in ONE parallel pass over
-    // column bands: each worker owns a band of the output, copies partial 0,
-    // and XORs the rest, so the band lands in registers/L1 once and is written
-    // without an up-front zero-fill of `out`.
+    // column bands: each worker holds 8 `F128`s (128 B) in NEON registers
+    // across all partials, folds pairs with `eor3.16b` (`ldp q, q`), and writes
+    // `dst` once via `stp q, q` without an up-front zero-fill of `out`.
     let reduce = |parts: &[&[F128]]| -> Vec<F128> {
         let band = useful.div_ceil(rayon::current_num_threads().max(1)).max(1024);
         let mut out = crate::scratch::take_lincheck_z_vec(k);
@@ -1766,13 +1990,8 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             .enumerate()
             .for_each(|(bi, dst)| {
                 let lo = bi * band;
-                dst.copy_from_slice(&parts[0][lo..lo + dst.len()]);
-                for part in &parts[1..] {
-                    let src = &part[lo..lo + dst.len()];
-                    for (o, s) in dst.iter_mut().zip(src.iter()) {
-                        *o += *s;
-                    }
-                }
+                // SAFETY: every partial in `parts` has length `useful >= lo + dst.len()`.
+                unsafe { xor_reduce_band_neon(parts, lo, dst) };
             });
         out
     };
@@ -1872,6 +2091,13 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     drop(parts);
     crate::scratch::give_f128(partials);
     out
+}
+
+/// Block16 SHA3 fold kernel gate (default on; `FLOCK_NO_LINCHECK_BLOCK16` any
+/// value restores the Block8 path). Read once per process.
+fn lincheck_block16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none())
 }
 
 /// Worker-owned partials over quarter-claims in the oblock fold (default on;

@@ -5182,7 +5182,11 @@ pub(crate) fn fold_cascade_t_into_packed_prefix_gpu(
     let eq_hi = &eq.hi;
 
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-    let nt_stores = out_n >= (1usize << 20) && std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none();
+    let nt_stores = {
+        static NT_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        out_n >= (1usize << 20)
+            && *NT_ENABLED.get_or_init(|| std::env::var_os("FLOCK_ZC_NT_LEGACY").is_none())
+    };
     let rho_c = if depth == 3 { rhos[2] } else { F128::ZERO };
     // The group weights `eq_lo[4y + 3]` as prepared pairs, one table per
     // pass shared by every chunk.
