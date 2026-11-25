@@ -3121,6 +3121,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 // Window 0 has sixteen live groups per parity; window 1 has
                 // fourteen, then group 60 (even, `b = 14`) with its second
                 // pair padded; groups 61..64 are dead.
+                let trips = if win == 0 { 16 } else { 14 };
                 let mut p1_even = tri_zero;
                 let mut pinf_even = tri_zero;
                 let mut p1_odd = tri_zero;
@@ -3134,9 +3135,9 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 let mut pr = rho_prep;
                 // One group's eight products from its two folded pairs, its
                 // a rows scaled by `$scale`; `$pad1`: the second pair is
-                // padded (its rows are zero); `$first`: accumulators are zero.
+                // padded (its rows are zero).
                 macro_rules! products {
-                    ($rows0:expr, $rows1:expr, $pad1:literal, $first:literal, $scale:expr) => {{
+                    ($rows0:expr, $rows1:expr, $pad1:literal, $scale:expr) => {{
                         let (a0, a1, b0, b1, deg0) = $rows0;
                         let (a2, a3, b2, b3, deg1) = $rows1;
                         let scale = $scale;
@@ -3144,131 +3145,128 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                             // b == 1 across the group: W3, W4, W5 and both
                             // G(inf) terms vanish and every other product is
                             // the scaled `a_i`.
-                            p1_even.ll = if $first { scale(a1) } else { veorq_u64(p1_even.ll, scale(a1)) };
-                            p1_odd.ll = if $first { scale(a3) } else { veorq_u64(p1_odd.ll, scale(a3)) };
-                            w0.ll = if $first { scale(a2) } else { veorq_u64(w0.ll, scale(a2)) };
+                            p1_even.ll = veorq_u64(p1_even.ll, scale(a1));
+                            p1_odd.ll = veorq_u64(p1_odd.ll, scale(a3));
+                            w0.ll = veorq_u64(w0.ll, scale(a2));
                         } else {
                             let a0w = scale(a0);
                             let a1w = scale(a1);
                             let (a2w, a3w) = if $pad1 { (zero, zero) } else { (scale(a2), scale(a3)) };
-                            macro_rules! pacc {
-                                ($acc:expr, $x:expr, $y:expr) => {
-                                    if $first { tri_set_q($acc, $x, $y) } else { tri_acc_q($acc, $x, $y) }
-                                };
-                            }
-                            pacc!(&mut p1_even, a1w, b1);
+                            tri_acc_q(&mut p1_even, a1w, b1);
                             if !deg0 {
-                                pacc!(&mut pinf_even, veorq_u64(a0w, a1w), veorq_u64(b0, b1));
+                                tri_acc_q(&mut pinf_even, veorq_u64(a0w, a1w), veorq_u64(b0, b1));
                             }
                             if !$pad1 {
-                                pacc!(&mut p1_odd, a3w, b3);
+                                tri_acc_q(&mut p1_odd, a3w, b3);
                                 if !deg1 {
-                                    pacc!(&mut pinf_odd, veorq_u64(a2w, a3w), veorq_u64(b2, b3));
+                                    tri_acc_q(&mut pinf_odd, veorq_u64(a2w, a3w), veorq_u64(b2, b3));
                                 }
-                                pacc!(&mut w0, a2w, b2);
+                                tri_acc_q(&mut w0, a2w, b2);
                             }
                             let e_aw = veorq_u64(a0w, a2w);
                             let o_aw = veorq_u64(a1w, a3w);
                             let e_b = veorq_u64(b0, b2);
                             let o_b = veorq_u64(b1, b3);
-                            pacc!(&mut w3, e_aw, e_b);
-                            pacc!(&mut w4, o_aw, o_b);
-                            pacc!(&mut w5, veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                            tri_acc_q(&mut w3, e_aw, e_b);
+                            tri_acc_q(&mut w4, o_aw, o_b);
+                            tri_acc_q(&mut w5, veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
                         }
                     }};
                 }
-                macro_rules! fold_head {
-                    ($trip:expr, $i:literal) => {{
-                        let g = 2 * $trip + $i;
-                        let head_a = anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * g);
-                        let head_d = deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * g);
-                        let (ha, hb) = (pa.wrapping_add(32 * $i), pb.wrapping_add(32 * $i));
-                        let (r0, r1, ones) = if head_inline {
-                            r2_head_group_fold_and_store_inline::<F7>(
-                                table_data, ha, hb, head_a, head_d, degen, b_ones, nt_deltas,
-                            )
+                // Group `$i` of the trip (its rows `32 $i` bytes on): the
+                // walk's own folds and stores, or a head group's (window 0's
+                // first two trips of a head-compacted block are its groups
+                // 0..4).
+                macro_rules! fold_group {
+                    ($trip:expr, $i:literal, $c0:literal, $c1:literal, $n0:literal, $n1:literal) => {{
+                        if head && win == 0 && $trip < HC_HEAD_PAIRS / 4 {
+                            let g = 2 * $trip + $i;
+                            let head_a = anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * g);
+                            let head_d = deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * g);
+                            let (ha, hb) = (pa.wrapping_add(32 * $i), pb.wrapping_add(32 * $i));
+                            let (r0, r1, ones) = if head_inline {
+                                r2_head_group_fold_and_store_inline::<F7>(
+                                    table_data, ha, hb, head_a, head_d, degen, b_ones, nt_deltas,
+                                )
+                            } else {
+                                r2_head_group_fold_and_store::<F7>(
+                                    table_data, ha, hb, head_a, head_d, degen, b_ones, nt_deltas,
+                                )
+                            };
+                            head_ok &= ones;
+                            (r0, r1)
                         } else {
-                            r2_head_group_fold_and_store::<F7>(
-                                table_data, ha, hb, head_a, head_d, degen, b_ones, nt_deltas,
+                            (
+                                r2_pair_fold_and_store_off::<F7, $c0, $n0>(
+                                    table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas,
+                                ),
+                                r2_pair_fold_and_store_off::<F7, $c1, $n1>(
+                                    table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas,
+                                ),
                             )
-                        };
-                        head_ok &= ones;
-                        (r0, r1)
+                        }
                     }};
                 }
-                macro_rules! pair_off {
-                    ($c:literal, $n:literal) => {
-                        r2_pair_fold_and_store_off::<F7, $c, $n>(table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas)
-                    };
-                }
-                macro_rules! step_ptrs {
-                    () => {{
-                        xb = vshlq_n_u64::<1>(xb);
-                        (pr, pa, pb, pn, pd) = (
-                            pr.wrapping_add(2), pa.wrapping_add(64), pb.wrapping_add(64),
-                            pn.wrapping_add(8), pd.wrapping_add(64),
-                        );
-                        core::arch::asm!(
-                            "// {0} {1} {2} {3} {4}",
-                            inout(reg) pa, inout(reg) pb, inout(reg) pn, inout(reg) pd, inout(reg) pr,
-                            options(pure, nomem, nostack, preserves_flags),
-                        );
-                    }};
-                }
-                macro_rules! body_trip {
-                    ($first:literal, $xb1:literal) => {{
-                        let (r0, r1) = (pair_off!(0, 0), pair_off!(16, 32));
-                        if $xb1 { products!(r0, r1, false, $first, |v| v); }
-                        else { products!(r0, r1, false, $first, |v| mul_xb_q(v, xb, k87)); }
-                        let (r0, r1) = (pair_off!(32, 64), pair_off!(48, 96));
-                        let (p0, p1) = (vld1q_u64(pr.cast::<u64>()), vld1q_u64(pr.add(1).cast::<u64>()));
-                        step_ptrs!();
-                        products!(r0, r1, false, false, |v| mul_prep86_seeded_q(p0, p1, v, k86));
-                    }};
-                }
-                // Peeled head / first-live trips: body loop has no `skip_pure` or `head`
-                // branches, skips `mul_xb_q` when `xb == 1`, and initializes with `tri_set_q`.
-                let (body_start, body_end) = if win == 0 {
-                    if skip_pure {
-                        for g in 0..HC_HEAD_PAIRS / 2 {
-                            head_ok &= r2_head_group_store_even::<F7>(
-                                table_data, pa.wrapping_add(32 * g), pb.wrapping_add(32 * g),
-                                anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * g),
-                                deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * g), nt_deltas,
+                // The walk's own order, two groups (`t = 0`, `t = 1` of one
+                // `b`) per trip.
+                for trip in 0..trips {
+                    // R2 C capture (`skip_pure`): the head groups 0..4
+                    // (window 0, trips 0 and 1) and group 59 (window 1, trip
+                    // 13, second group) make their stores from the even rows
+                    // only and add no products; their message terms come
+                    // from round one's C fold. A b row that is not all ones
+                    // clears `head_ok` (the caller then redoes the round).
+                    if skip_pure && ((win == 0 && trip < HC_HEAD_PAIRS / 4) || (win == 1 && trip == 13)) {
+                        if win == 0 {
+                            for i in 0..2usize {
+                                let g = 2 * trip + i;
+                                head_ok &= r2_head_group_store_even::<F7>(
+                                    table_data,
+                                    pa.wrapping_add(32 * i),
+                                    pb.wrapping_add(32 * i),
+                                    anchors0.add(HC_ANCHORS_PER_BLOCK * block + 2 * g),
+                                    deltas0.add(HC_DELTA_BYTES_PER_BLOCK * block + 16 * g),
+                                    nt_deltas,
+                                );
+                            }
+                        } else {
+                            let (rows0, rows1) = fold_group!(trip, 0, 0, 16, 0, 32);
+                            products!(rows0, rows1, false, |v| mul_xb_q(v, xb, k87));
+                            head_ok &= r2_group_store_even_off::<F7, 32, 48, 64, 96>(
+                                table_data, pa, pb, pn, pd, b_ones, nt_deltas,
                             );
                         }
-                        xb = vdupq_n_u64(4);
-                        (pr, pa, pb, pn, pd) = (pr.wrapping_add(4), pa.wrapping_add(128), pb.wrapping_add(128), pn.wrapping_add(16), pd.wrapping_add(128));
-                        body_trip!(true, false);
-                        (3, 16)
-                    } else if head {
-                        for trip in 0..HC_HEAD_PAIRS / 4 {
-                            let (r0, r1) = fold_head!(trip, 0);
-                            if trip == 0 { products!(r0, r1, false, true, |v| v); }
-                            else { products!(r0, r1, false, false, |v| mul_xb_q(v, xb, k87)); }
-                            let (r0, r1) = fold_head!(trip, 1);
-                            let (p0, p1) = (vld1q_u64(pr.cast::<u64>()), vld1q_u64(pr.add(1).cast::<u64>()));
-                            step_ptrs!();
-                            products!(r0, r1, false, false, |v| mul_prep86_seeded_q(p0, p1, v, k86));
-                        }
-                        (HC_HEAD_PAIRS / 4, 16)
-                    } else {
-                        body_trip!(true, true);
-                        (1, 16)
+                        xb = vshlq_n_u64::<1>(xb);
+                        pr = pr.wrapping_add(2);
+                        pa = pa.wrapping_add(64);
+                        pb = pb.wrapping_add(64);
+                        pn = pn.wrapping_add(8);
+                        pd = pd.wrapping_add(64);
+                        continue;
                     }
-                } else {
-                    body_trip!(true, true);
-                    (1, if skip_pure { 13 } else { 14 })
-                };
-                for _ in body_start..body_end {
-                    body_trip!(false, false);
-                }
-                if win == 1 && skip_pure {
-                    products!(pair_off!(0, 0), pair_off!(16, 32), false, false, |v| mul_xb_q(v, xb, k87));
-                    head_ok &= r2_group_store_even_off::<F7, 32, 48, 64, 96>(
-                        table_data, pa, pb, pn, pd, b_ones, nt_deltas,
+                    let (rows0, rows1) = fold_group!(trip, 0, 0, 16, 0, 32);
+                    products!(rows0, rows1, false, |v| mul_xb_q(v, xb, k87));
+                    let (rows0, rows1) = fold_group!(trip, 1, 32, 48, 64, 96);
+                    let p0 = vld1q_u64(pr.cast::<u64>());
+                    let p1 = vld1q_u64(pr.add(1).cast::<u64>());
+                    xb = vshlq_n_u64::<1>(xb);
+                    pr = pr.wrapping_add(2);
+                    pa = pa.wrapping_add(64);
+                    pb = pb.wrapping_add(64);
+                    pn = pn.wrapping_add(8);
+                    pd = pd.wrapping_add(64);
+                    // Emits nothing; keeps each stream in its own register
+                    // rather than one index plus adds.
+                    core::arch::asm!(
+                        "// {0} {1} {2} {3} {4}",
+                        inout(reg) pa,
+                        inout(reg) pb,
+                        inout(reg) pn,
+                        inout(reg) pd,
+                        inout(reg) pr,
+                        options(pure, nomem, nostack, preserves_flags),
                     );
-                    step_ptrs!();
+                    products!(rows0, rows1, false, |v| mul_prep86_q(p0, p1, v, k86));
                 }
                 if win == 1 {
                     // Group 60 (`t = 0`, `b = 14`): pair 120 live, pair 121
@@ -3278,7 +3276,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                         table_data, a_packed, b_packed, anchors, deltas, x_lo0, false, degen, b_ones,
                         true, nt_deltas,
                     );
-                    products!(rows0, (zero, zero, zero, zero, false), true, false, |v| mul_xb_q(v, xb, k87));
+                    products!(rows0, (zero, zero, zero, zero, false), true, |v| mul_xb_q(v, xb, k87));
                 }
                 // The window's sums, reduced, times its weight.
                 let lambda = vld1q_u64(eq_lo.add(2 * first + 1).cast::<u64>());
@@ -5851,24 +5849,19 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         let mut win_first = 0usize;
         let mut in_window = 0usize;
         let k87 = vdupq_n_u64(0x87);
-        macro_rules! k_xb_flush {
-            ($wf:expr) => {{
-                let lambda = vld1q_u64(eq_prep.add(2 * ($wf) + 1).cast::<u64>());
-                let lambda_sw = swap_halves_q(lambda);
-                for (sum, w) in sums.0.iter_mut().zip(wacc.0.iter()) {
-                    let v = reduce_tri_binius_xor_q(w.ll, w.cross, w.hh, zero);
-                    tri_acc_sw(sum, lambda, lambda_sw, v);
-                }
-                xb_q = vdupq_n_u64(1);
-            }};
-        }
         macro_rules! k_xb_step {
             () => {{
                 xb_q = vshlq_n_u64::<2>(xb_q);
                 in_window += 1;
                 if in_window == 8 {
-                    k_xb_flush!(win_first);
+                    let lambda = vld1q_u64(eq_prep.add(2 * win_first + 1).cast::<u64>());
+                    let lambda_sw = swap_halves_q(lambda);
+                    for (sum, w) in sums.0.iter_mut().zip(wacc.0.iter()) {
+                        let v = reduce_tri_binius_xor_q(w.ll, w.cross, w.hh, zero);
+                        tri_acc_sw(sum, lambda, lambda_sw, v);
+                    }
                     wacc = LookaheadTriAcc::zero();
+                    xb_q = vdupq_n_u64(1);
                     in_window = 0;
                     win_first += 8;
                 }
@@ -5888,9 +5881,11 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         let mut anchors = anchors0;
         let mut deltas = deltas0;
         // Head-compacted state: this block's head (a anchors of pairs 0..7,
-        // then their a deltas).
+        // then their a deltas) and whether the current group is the head
+        // group.
         let mut head_a = anchors0;
         let mut head_d = deltas0;
+        let mut head_grp = false;
         let head_b_q = core::mem::transmute::<F128, uint64x2_t>(head_b);
         let mut b_ok = true;
         let mut b_main = b_out;
@@ -5901,9 +5896,9 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         let n5 = out_pairs / 2;
 
         macro_rules! fold_lane {
-            ($g:expr, $b_flat:ident, $is_head:expr) => {{
+            ($g:expr, $b_flat:ident) => {{
                 let g = $g;
-                let (anc_a0, anc_b0, anc_a1, anc_b1, da0, db0, da1, db1) = if $is_head {
+                let (anc_a0, anc_b0, anc_a1, anc_b1, da0, db0, da1, db1) = if head_grp {
                     // Head lane `g % 64` (pairs `2 (g % 64)`, `+ 1`): a only.
                     let gi = g & 63;
                     let hp = head_a.add(2 * gi).cast::<u64>();
@@ -5957,20 +5952,21 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         // `$o`: the index of the group's first output in `a_out` / `b_out`.
         macro_rules! k_group {
             ($t:expr, $o:expr) => {
-                k_group!(@ $t, $o, false, ($t) == bt0, false, true)
+                k_group!(@ $t, $o, false)
             };
-            (@ $t:expr, $o:expr, $fused:literal, $is_bt0:expr, $first:literal, $step_flush:literal) => {{
+            (@ $t:expr, $o:expr, $fused:literal) => {{
                 macro_rules! kacc {
                     ($acc:expr, $x:expr, $y:expr) => {
-                        if XB && $first { tri_set_q($acc, $x, $y) }
-                        else if $fused { tri_acc_q($acc, $x, $y) }
-                        else { tri_acc_q_crossfused($acc, $x, $y) }
+                        if $fused {
+                            tri_acc_q($acc, $x, $y)
+                        } else {
+                            tri_acc_q_crossfused($acc, $x, $y)
+                        }
                     };
                 }
                 let t = $t;
-                let is_bt0 = $is_bt0;
-                let is_head = head_compact && is_bt0;
                 let mut b_flat = true;
+                head_grp = head_compact && t == bt0;
                 let ao = a_out.add($o);
                 // bpack: group `bt0` (b outputs 0..3) has no b entries, group
                 // `bt0 + 14` stores outputs 56, 57 and keeps 58 for output 60.
@@ -5979,18 +5975,18 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 } else {
                     b_out.add($o)
                 };
-                let (a0, b0) = fold_lane!(4 * t, b_flat, is_head);
-                let (a1, b1) = fold_lane!(4 * t + 1, b_flat, is_head);
+                let (a0, b0) = fold_lane!(4 * t, b_flat);
+                let (a1, b1) = fold_lane!(4 * t + 1, b_flat);
                 store_pair_nt_off::<0>(ao, a0, a1);
-                if !bpack || !is_bt0 {
+                if !bpack || t != bt0 {
                     store_pair_nt_off::<0>(bo, b0, b1);
                 }
-                let (a2, b2) = fold_lane!(4 * t + 2, b_flat, is_head);
-                let (a3, b3) = fold_lane!(4 * t + 3, b_flat, is_head);
+                let (a2, b2) = fold_lane!(4 * t + 2, b_flat);
+                let (a3, b3) = fold_lane!(4 * t + 3, b_flat);
                 store_pair_nt_off::<32>(ao, a2, a3);
                 if !bpack {
                     store_pair_nt_off::<32>(bo, b2, b3);
-                } else if is_bt0 {
+                } else if t == bt0 {
                     b_ok &= is_zero_q(vorrq_u64(
                         vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
                         vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
@@ -6008,10 +6004,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                         vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
                     ))
                 {
-                    if XB && $first {
-                        *acc = LookaheadTriAcc::zero().0;
-                        (acc[0].ll, acc[2].ll, acc[4].ll) = (a1, a3, a2);
-                    } else if XB {
+                    if XB {
                         acc[0].ll = veorq_u64(acc[0].ll, mul_xb_q(a1, xb_q, k87));
                         acc[2].ll = veorq_u64(acc[2].ll, mul_xb_q(a3, xb_q, k87));
                         acc[4].ll = veorq_u64(acc[4].ll, mul_xb_q(a2, xb_q, k87));
@@ -6020,14 +6013,12 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                         let wp = eq_prep.add(2 * t).cast::<u64>();
                         let (w_p0, w_p1) = (vld1q_u64(wp), vld1q_u64(wp.add(2)));
                         let w = vzip1q_u64(w_p0, w_p1);
-                        kacc!(&mut acc[0], w, a1);
-                        kacc!(&mut acc[2], w, a3);
-                        kacc!(&mut acc[4], w, a2);
+                        tri_acc_q_crossfused(&mut acc[0], w, a1);
+                        tri_acc_q_crossfused(&mut acc[2], w, a3);
+                        tri_acc_q_crossfused(&mut acc[4], w, a2);
                     }
                 } else {
-                    let (a0, a1, a2, a3) = if XB && $first {
-                        (a0, a1, a2, a3)
-                    } else if XB {
+                    let (a0w, a1w, a2w, a3w) = if XB {
                         (
                             mul_xb_q(a0, xb_q, k87),
                             mul_xb_q(a1, xb_q, k87),
@@ -6044,20 +6035,19 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                             mul_prep86_q(w_p0, w_p1, a3, k86),
                         )
                     };
-                    kacc!(&mut acc[0], a1, b1);
-                    kacc!(&mut acc[1], veorq_u64(a0, a1), veorq_u64(b0, b1));
-                    kacc!(&mut acc[2], a3, b3);
-                    kacc!(&mut acc[3], veorq_u64(a2, a3), veorq_u64(b2, b3));
-                    kacc!(&mut acc[4], a2, b2);
-                    let (e_aw, e_b) = (veorq_u64(a0, a2), veorq_u64(b0, b2));
-                    let (o_aw, o_b) = (veorq_u64(a1, a3), veorq_u64(b1, b3));
+                    tri_acc_q_crossfused(&mut acc[0], a1w, b1);
+                    tri_acc_q_crossfused(&mut acc[1], veorq_u64(a0w, a1w), veorq_u64(b0, b1));
+                    tri_acc_q_crossfused(&mut acc[2], a3w, b3);
+                    tri_acc_q_crossfused(&mut acc[3], veorq_u64(a2w, a3w), veorq_u64(b2, b3));
+                    tri_acc_q_crossfused(&mut acc[4], a2w, b2);
+                    let (e_aw, e_b) = (veorq_u64(a0w, a2w), veorq_u64(b0, b2));
+                    let (o_aw, o_b) = (veorq_u64(a1w, a3w), veorq_u64(b1, b3));
                     kacc!(&mut acc[5], e_aw, e_b);
                     kacc!(&mut acc[6], o_aw, o_b);
                     kacc!(&mut acc[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
                 }
                 if XB {
-                    if $step_flush { k_xb_step!(); }
-                    else { xb_q = if $first { vdupq_n_u64(4) } else { vshlq_n_u64::<2>(xb_q) }; }
+                    k_xb_step!();
                 }
             }};
         }
@@ -6092,22 +6082,15 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     deltas = deltas0.wrapping_sub(TC_DELTA_GAP * blk);
                 }
                 if allfused {
-                    // Two 8-group XB windows: peel `t0` & `t0+8`, share 3-pair body, flush at `t0+7`/`t0+15`.
-                    k_group!(@ t0, o0, true, true, true, false);
-                    for win in 0..2usize {
-                        let base = t0 + 8 * win;
-                        if win == 1 { k_group!(@ base, o0 + 4 * (base - t0), true, false, true, false); }
-                        let mut t = base + 1;
-                        while t < base + 7 {
-                            k_group!(@ t, o0 + 4 * (t - t0), true, false, false, false);
-                            k_group!(@ t + 1, o0 + 4 * (t + 1 - t0), true, false, false, false);
-                            t += 2;
-                        }
-                        if win == 0 {
-                            k_group!(@ base + 7, o0 + 28, true, false, false, false);
-                            if XB { k_xb_flush!(t0); }
-                        }
+                    // Two groups per trip (seven pairs and one more): the
+                    // fused results alternate registers.
+                    let mut t = t0;
+                    while t + 2 <= t0 + 15 {
+                        k_group!(@ t, o0 + 4 * (t - t0), true);
+                        k_group!(@ t + 1, o0 + 4 * (t + 1 - t0), true);
+                        t += 2;
                     }
+                    k_group!(@ t, o0 + 4 * (t - t0), true);
                 } else {
                     for t in t0..t0 + 15 {
                         k_group!(t, o0 + 4 * (t - t0));
@@ -6167,24 +6150,19 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                     t.hh = veorq_u64(t.hh, hh);
                 }
                 if XB {
-                    k_xb_flush!(t0 + 8);
-                    if !allfused {
-                        wacc = LookaheadTriAcc::zero();
-                        in_window = 0;
-                        win_first += 8;
-                    }
+                    k_xb_step!();
                 }
             }
         } else {
             if allfused {
                 let mut t = 0;
                 while t + 2 <= n5 {
-                    k_group!(@ t, 4 * t, true, false, false, true);
-                    k_group!(@ t + 1, 4 * (t + 1), true, false, false, true);
+                    k_group!(@ t, 4 * t, true);
+                    k_group!(@ t + 1, 4 * (t + 1), true);
                     t += 2;
                 }
                 if t < n5 {
-                    k_group!(@ t, 4 * t, true, false, false, true);
+                    k_group!(@ t, 4 * t, true);
                 }
             } else {
                 for t in 0..n5 {
@@ -7763,15 +7741,9 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
 ) -> [F128; TRI_SLOTS] {
     if zc_tri_group_inline_enabled() {
         if DEPTH == 2 && zc_tri_fold_regs_enabled() {
-            if zc_tri_fused_fold_enabled() {
-                fold_tri_and_message_core::<DEPTH, NT, ABL, false, true, true, true>(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
-                )
-            } else {
-                fold_tri_and_message_core::<DEPTH, NT, ABL, false, true, true, false>(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
-                )
-            }
+            fold_tri_and_message_core::<DEPTH, NT, ABL, false, true, true, false>(
+                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
+            )
         } else if DEPTH == 3 && zc_tri_fused_fold_enabled() {
             // Depth three: the inlined group fold with prepared-constant
             // products; `FLOCK_NO_ZC_TRI_FUSED_FOLD` takes the parent's
@@ -8273,8 +8245,8 @@ fn fold_tri_and_message_core_with<
 
         const TG: usize = 16;
         let ng = n_out / 8;
-        let mut ta = [core::mem::MaybeUninit::<[uint64x2_t; 8]>::uninit(); TG];
-        let mut tb = [core::mem::MaybeUninit::<[uint64x2_t; 8]>::uninit(); TG];
+        let mut ta = [[zero; 8]; TG];
+        let mut tb = [[zero; 8]; TG];
         let mut g0 = 0usize;
         while g0 < ng {
             let gn = (ng - g0).min(TG);
@@ -8308,7 +8280,6 @@ fn fold_tri_and_message_core_with<
                     sink = xor3_u64(sink, a[0], b[7]);
                     continue;
                 }
-                let ta_p = ta[t].as_mut_ptr().cast::<uint64x2_t>();
                 if FF {
                     // The weight's prepared pair (one paired load): five
                     // `PMULL`s and 10 instructions per row; the same fully
@@ -8318,21 +8289,21 @@ fn fold_tri_and_message_core_with<
                     let p1 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 3).cast::<u64>());
                     if seeded {
                         for i in 0..8 {
-                            ta_p.add(i).write(mul_prep86_seeded_q(p0, p1, a[i], pp.k));
+                            ta[t][i] = mul_prep86_seeded_q(p0, p1, a[i], pp.k);
                         }
                     } else {
                         for i in 0..8 {
-                            ta_p.add(i).write(mul_prep86_q(p0, p1, a[i], pp.k));
+                            ta[t][i] = mul_prep86_q(p0, p1, a[i], pp.k);
                         }
                     }
                 } else {
                     let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
                     let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
                     for i in 0..8 {
-                        ta_p.add(i).write(mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]));
+                        ta[t][i] = mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]);
                     }
                 }
-                tb[t].write(b);
+                tb[t] = b;
             }
             g0 += gn;
             if ABL & 1 != 0 {
@@ -8341,7 +8312,7 @@ fn fold_tri_and_message_core_with<
             {
                 let mut e = [acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]];
                 for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
+                    let (aw, b) = (&ta[t], &tb[t]);
                     for j in 0..4 {
                         tri_acc_q(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
                         tri_acc_q(
@@ -8358,7 +8329,7 @@ fn fold_tri_and_message_core_with<
                     acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
                 ];
                 for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
+                    let (aw, b) = (&ta[t], &tb[t]);
                     for k in 0..2 {
                         let o = 4 * k;
                         tri_acc_q(&mut l[k], aw[o + 2], b[o + 2]);
@@ -8375,14 +8346,12 @@ fn fold_tri_and_message_core_with<
             {
                 let mut g = [acc[16], acc[17], acc[18], acc[20], acc[21]];
                 for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_mut(), tb[t].assume_init_mut());
+                    let (aw, b) = (&ta[t], &tb[t]);
                     tri_acc_q(&mut g[0], aw[4], b[4]);
                     let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
                     let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
                     let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
                     let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
-                    aw[..4].copy_from_slice(&[s0a, s1a, s2a, s3a]);
-                    b[..4].copy_from_slice(&[s0b, s1b, s2b, s3b]);
                     tri_acc_q(&mut g[1], s0a, s0b);
                     tri_acc_q(&mut g[2], s2a, s2b);
                     tri_acc_q(&mut g[3], s1a, s1b);
@@ -8397,9 +8366,11 @@ fn fold_tri_and_message_core_with<
             {
                 let mut g = [acc[19], acc[22], acc[23], acc[24], acc[25]];
                 for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
-                    let (s0a, s1a, s2a, s3a) = (aw[0], aw[1], aw[2], aw[3]);
-                    let (s0b, s1b, s2b, s3b) = (b[0], b[1], b[2], b[3]);
+                    let (aw, b) = (&ta[t], &tb[t]);
+                    let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
+                    let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
+                    let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
+                    let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
                     let (s02a, s02b) = (veorq_u64(s0a, s2a), veorq_u64(s0b, s2b));
                     let (s13a, s13b) = (veorq_u64(s1a, s3a), veorq_u64(s1b, s3b));
                     let (s01a, s01b) = (veorq_u64(s0a, s1a), veorq_u64(s0b, s1b));

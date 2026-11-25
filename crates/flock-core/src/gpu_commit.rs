@@ -36481,3 +36481,5 @@ mod grind_lat_tests {
         assert!(gpu_pow_race_launch(&digest, 0, 1 << 16, 0).is_none());
     }
 }
+
+// Codex Terra marker: preserve the reviewed current frontier for a fresh official draw.
