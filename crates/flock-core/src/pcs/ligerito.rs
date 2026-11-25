@@ -8253,17 +8253,23 @@ fn materialize_direct_fold8(
             has_ordinary,
         );
 
-    let fold_weight: [F128; 64] = std::array::from_fn(|bank| {
-        let mut weight = F128::ONE;
-        for (bit, &challenge) in challenges.iter().enumerate() {
-            weight *= if (bank >> bit) & 1 == 0 {
-                F128::ONE + challenge
-            } else {
-                challenge
-            };
-        }
-        weight
-    });
+    // The four weights for bits 0 and 1 share the mixed term r0*r1.
+    // In characteristic two, adding that term to either coordinate gives
+    // its weight with the other bit clear. Higher bits extend whole halves.
+    let [r0, r1, ..] = challenges;
+    let both = r0 * r1;
+    let mut fold_weight = [F128::ZERO; 64];
+    fold_weight[..4].copy_from_slice(&[
+        F128::ONE + r0 + r1 + both,
+        r0 + both,
+        r1 + both,
+        both,
+    ]);
+    for (level, &r) in challenges[2..].iter().enumerate() {
+        let width = 4 << level;
+        let (lo, hi) = fold_weight[..2 * width].split_at_mut(width);
+        crate::field::f128_slice::expand_eq_table_level(lo, hi, r);
+    }
     let direct_tables: Vec<Vec<F128>> = claims
         .iter()
         .map(|claim| {
