@@ -1580,7 +1580,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         // `total_bytes`; zero is a valid object representation for F128.
         unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
     }
-    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+    if use_provenance && crate::zc_timing_env_on() {
         let (hits, misses) = ab_compact_backing_token_counts();
         eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
     }
@@ -2376,12 +2376,12 @@ unsafe fn precompute_ab_unit<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     mixed_plan: u8,
 ) {
     const OUTER_BYTES: usize = (1 << N_MEDIUM) * 64;
+    let direct = if FORCE_DIRECT {
+        true
+    } else {
+        nt && ab_pre_nt_direct_enabled()
+    };
     let window_run_done = if let Some((rows, partials)) = window_unit {
-        let direct = if FORCE_DIRECT {
-            true
-        } else {
-            nt && ab_pre_nt_direct_enabled()
-        };
         // SAFETY: the caller's contract.
         let out = unsafe { core::slice::from_raw_parts_mut(out_unit, unit_chunks * OUTER_BYTES) };
         rows(x_outer, within_outer_mask, a_unit, b_unit, inv_table, chunk_byte_base, partials, out, direct);
@@ -2389,6 +2389,34 @@ unsafe fn precompute_ab_unit<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     } else {
         false
     };
+    #[cfg(target_arch = "aarch64")]
+    if window_run_done
+        && compact
+        && representation.omits_mixed_ones()
+        && within_outer_mask == 1
+        && direct
+        && blake3_static_layout
+        && static_b_context.is_some()
+        && x_outer.is_multiple_of(2)
+        && unit_chunks > 0
+        && unit_chunks.is_multiple_of(2)
+        && b_med_counts == [16, 15]
+    {
+        // SAFETY: the caller's contract; `window_unit` already wrote rows
+        // `3..16` (even chunks) and `0..13` (odd chunks), leaving only
+        // residual mixed rows `b_med = 2` (even) and `b_med = 13` (odd).
+        let out = unsafe { core::slice::from_raw_parts_mut(out_unit, unit_chunks * OUTER_BYTES) };
+        kernels::aarch64::ab_mixed_rows_residual_unit(
+            a_unit,
+            b_unit,
+            inv_table,
+            chunk_byte_base,
+            unit_chunks,
+            out,
+            true,
+        );
+        return;
+    }
     for local in 0..unit_chunks {
         // SAFETY: chunk `local` lies inside the unit (the caller's contract).
         let out_outer =
@@ -4741,7 +4769,7 @@ pub(crate) fn round1_c_prelude(
             if let Some((eq_outer, job, submitted)) =
                 crate::gpu_commit::adopt_staged_zc_fold(c_lincheck, r)
             {
-                if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                if crate::zc_timing_env_on() {
                     eprintln!("[commit-tail-fill] staged C prelude adopted");
                 }
                 return Round1CPrelude {

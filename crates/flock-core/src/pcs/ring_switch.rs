@@ -1938,28 +1938,6 @@ const FOLD_N_BYTES: usize = 16;
 /// Entries per byte-lookup table.
 const FOLD_TABLE_SIZE: usize = 256;
 
-// The SHA3 extension includes EOR3; retain the two-EOR form for generic
-// AArch64 builds that do not enable it.
-#[cfg(target_feature = "sha3")]
-#[inline(always)]
-fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
-    unsafe {
-        core::mem::transmute::<core::arch::aarch64::uint64x2_t, F128>(
-            core::arch::aarch64::veor3q_u64(
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(a),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(b),
-                core::mem::transmute::<F128, core::arch::aarch64::uint64x2_t>(c),
-            ),
-        )
-    }
-}
-
-#[cfg(not(target_feature = "sha3"))]
-#[inline(always)]
-fn xor3_f128(a: F128, b: F128, c: F128) -> F128 {
-    a + (b + c)
-}
-
 /// Build the 16×256 byte-lookup table the fold indexes: `table[k·256 + v]` =
 /// `Σ_{bit b set in v} eq_r_dprime[k·8 + b]`. For the ring-switch fold,
 /// `eq_r_dprime` already has γ_k baked in, so the table carries γ too.
@@ -1982,8 +1960,56 @@ pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
 
 /// One folded output slot: `Σ_{k=0..16} tables[k·256 + byte_k(elem)]`, where
 /// `byte_k` are the 16 little-endian bytes of `elem`. `tables` MUST be a
-/// `build_fold_byte_table` output (length `16·256`). Tree-reduced (depth 4)
-/// rather than a length-15 XOR chain so the adds pipeline.
+/// `build_fold_byte_table` output (length `16·256`).
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
+    use core::arch::aarch64::{uint64x2_t, veor3q_u64, veorq_u64, vld1q_u64};
+    debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    let lo = elem.lo as usize;
+    let hi = elem.hi as usize;
+    let ptr = tables.as_ptr();
+    // SAFETY: each index is `bank * 256 + byte` with `bank ∈ 0..16`, `byte ∈ 0..256`,
+    // max offset `4095 = 16·256 - 1`, in-bounds for `tables`. `F128` is
+    // `#[repr(C, align(16))]` with `(lo: u64, hi: u64)`, matching `uint64x2_t`.
+    unsafe {
+        let load = |bank: usize, byte: usize| -> uint64x2_t {
+            vld1q_u64(ptr.add(bank * FOLD_TABLE_SIZE + byte).cast::<u64>())
+        };
+        // Optimal 16-input reduction tree: 7 EOR3 + 1 EOR (depth 3).
+        let t0 = veor3q_u64(
+            load(0, lo & 0xff),
+            load(1, (lo >> 8) & 0xff),
+            load(2, (lo >> 16) & 0xff),
+        );
+        let t1 = veor3q_u64(
+            load(3, (lo >> 24) & 0xff),
+            load(4, (lo >> 32) & 0xff),
+            load(5, (lo >> 40) & 0xff),
+        );
+        let t2 = veor3q_u64(
+            load(6, (lo >> 48) & 0xff),
+            load(7, lo >> 56),
+            load(8, hi & 0xff),
+        );
+        let u0 = veor3q_u64(t0, t1, t2);
+        let t3 = veor3q_u64(
+            load(9, (hi >> 8) & 0xff),
+            load(10, (hi >> 16) & 0xff),
+            load(11, (hi >> 24) & 0xff),
+        );
+        let t4 = veor3q_u64(
+            load(12, (hi >> 32) & 0xff),
+            load(13, (hi >> 40) & 0xff),
+            load(14, (hi >> 48) & 0xff),
+        );
+        let u1 = veor3q_u64(t3, t4, load(15, hi >> 56));
+        core::mem::transmute::<uint64x2_t, F128>(veorq_u64(u0, u1))
+    }
+}
+
+/// One folded output slot: portable fallback when AArch64 SHA3/EOR3 is absent.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "sha3")))]
 #[inline(always)]
 pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     debug_assert_eq!(tables.len(), FOLD_N_BYTES * FOLD_TABLE_SIZE);
@@ -2012,7 +2038,6 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
             *tables_ptr.add(15 * FOLD_TABLE_SIZE + hi_bytes[7] as usize),
         )
     };
-    // Level 1: 8 pair sums.
     let p0 = l0 + l1;
     let p1 = l2 + l3;
     let p2 = l4 + l5;
@@ -2021,11 +2046,10 @@ pub(crate) fn fold_one_slot(elem: F128, tables: &[F128]) -> F128 {
     let p5 = h2 + h3;
     let p6 = h4 + h5;
     let p7 = h6 + h7;
-    // Levels 2–3: three-input nodes reduce the 16-load tree from depth 4 to 3.
-    let q0 = xor3_f128(p0, p1, p2);
-    let q1 = xor3_f128(p3, p4, p5);
+    let q0 = p0 + (p1 + p2);
+    let q1 = p3 + (p4 + p5);
     let q2 = p6 + p7;
-    xor3_f128(q0, q1, q2)
+    q0 + (q1 + q2)
 }
 
 /// Total length of a fold byte table (`build_fold_byte_table` output).
@@ -2048,6 +2072,69 @@ fn compose_nibble_join_enabled() -> bool {
 
 /// The low and high nibbles select disjoint subsets of these eight generators.
 /// Their XOR gives every byte entry directly, without output-parent loads.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
+    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vld1q_u64, vst1q_u64};
+    debug_assert_eq!(g.len(), 8);
+    debug_assert_eq!(out.len(), 256);
+    // SAFETY: `g` has 8 `F128` elements and `out` has 256 `F128` elements.
+    // `F128` is `#[repr(C, align(16))]` with `(lo: u64, hi: u64)`, matching `uint64x2_t`.
+    unsafe {
+        let gp = g.as_ptr();
+        let g0 = vld1q_u64(gp.cast::<u64>());
+        let g1 = vld1q_u64(gp.add(1).cast::<u64>());
+        let g2 = vld1q_u64(gp.add(2).cast::<u64>());
+        let g3 = vld1q_u64(gp.add(3).cast::<u64>());
+        let l0 = vdupq_n_u64(0);
+        let l1 = g0;
+        let l2 = g1;
+        let l3 = veorq_u64(g0, g1);
+        let l4 = g2;
+        let l5 = veorq_u64(l1, g2);
+        let l6 = veorq_u64(l2, g2);
+        let l7 = veorq_u64(l3, g2);
+        let l8 = g3;
+        let l9 = veorq_u64(l1, g3);
+        let l10 = veorq_u64(l2, g3);
+        let l11 = veorq_u64(l3, g3);
+        let l12 = veorq_u64(l4, g3);
+        let l13 = veorq_u64(l5, g3);
+        let l14 = veorq_u64(l6, g3);
+        let l15 = veorq_u64(l7, g3);
+        let g4 = vld1q_u64(gp.add(4).cast::<u64>());
+        let g5 = vld1q_u64(gp.add(5).cast::<u64>());
+        let g6 = vld1q_u64(gp.add(6).cast::<u64>());
+        let g7 = vld1q_u64(gp.add(7).cast::<u64>());
+        let h_lo: [uint64x2_t; 4] = [l0, g4, g5, veorq_u64(g4, g5)];
+        let h_hi: [uint64x2_t; 4] = [l0, g6, g7, veorq_u64(g6, g7)];
+        let mut dst = out.as_mut_ptr();
+        for &hi in &h_hi {
+            for &lo in &h_lo {
+                let h = veorq_u64(lo, hi);
+                vst1q_u64(dst.cast::<u64>(), h);
+                vst1q_u64(dst.add(1).cast::<u64>(), veorq_u64(l1, h));
+                vst1q_u64(dst.add(2).cast::<u64>(), veorq_u64(l2, h));
+                vst1q_u64(dst.add(3).cast::<u64>(), veorq_u64(l3, h));
+                vst1q_u64(dst.add(4).cast::<u64>(), veorq_u64(l4, h));
+                vst1q_u64(dst.add(5).cast::<u64>(), veorq_u64(l5, h));
+                vst1q_u64(dst.add(6).cast::<u64>(), veorq_u64(l6, h));
+                vst1q_u64(dst.add(7).cast::<u64>(), veorq_u64(l7, h));
+                vst1q_u64(dst.add(8).cast::<u64>(), veorq_u64(l8, h));
+                vst1q_u64(dst.add(9).cast::<u64>(), veorq_u64(l9, h));
+                vst1q_u64(dst.add(10).cast::<u64>(), veorq_u64(l10, h));
+                vst1q_u64(dst.add(11).cast::<u64>(), veorq_u64(l11, h));
+                vst1q_u64(dst.add(12).cast::<u64>(), veorq_u64(l12, h));
+                vst1q_u64(dst.add(13).cast::<u64>(), veorq_u64(l13, h));
+                vst1q_u64(dst.add(14).cast::<u64>(), veorq_u64(l14, h));
+                vst1q_u64(dst.add(15).cast::<u64>(), veorq_u64(l15, h));
+                dst = dst.add(16);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(never)]
 fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
     debug_assert_eq!(g.len(), 8);

@@ -6129,6 +6129,61 @@ pub(crate) fn ab_mixed_row_residual(
     }
 }
 
+/// Produce the residual mixed rows of every even/odd chunk pair in a unit
+/// (`b_med = 2` with mask `0x03` on even chunks, `b_med = 13` with mask `0xf0`
+/// on odd chunks), hoisting the Karatsuba branch and bounds check once per unit.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ab_mixed_rows_residual_unit(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8,
+    chunk_byte_base: usize,
+    unit_chunks: usize,
+    out_unit: &mut [u8],
+    nt_store: bool,
+) {
+    const MAIN: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_KARA_LANEZ | ABV_OMIT_MIXED_ONES;
+    const HELPER: u32 = ABV_HZ | ABV_OMIT_MIXED_ONES;
+    const ROW_BYTES: usize = N_CHUNKS * 8;
+    const OUTER_BYTES: usize = 16 * ROW_BYTES;
+    if unit_chunks == 0 {
+        return;
+    }
+    assert!(unit_chunks.is_multiple_of(2));
+    assert!(out_unit.len() >= unit_chunks * OUTER_BYTES);
+    let last_end = chunk_byte_base
+        .checked_add((unit_chunks - 1) * OUTER_BYTES + 14 * ROW_BYTES)
+        .expect("residual unit byte offset overflow");
+    assert!(last_end <= a_packed.len().min(b_packed.len()));
+    let out_ptr = out_unit.as_mut_ptr();
+    macro_rules! run_unit {
+        ($variant:ident) => {
+            let mut local = 0usize;
+            while local < unit_chunks {
+                let even_off = local * OUTER_BYTES + 2 * ROW_BYTES;
+                let odd_off = (local + 1) * OUTER_BYTES + 13 * ROW_BYTES;
+                // SAFETY: `local + 1 < unit_chunks`, both 64-byte rows lie inside `out_unit`.
+                let even_dst = unsafe { &mut *out_ptr.add(even_off).cast::<[u8; 64]>() };
+                let odd_dst = unsafe { &mut *out_ptr.add(odd_off).cast::<[u8; 64]>() };
+                shift_reduce_inner_mixed_const_b_h4::<0x03, false, 0, $variant>(
+                    a_packed, b_packed, inv_table, chunk_byte_base + even_off, None, even_dst, nt_store,
+                );
+                shift_reduce_inner_mixed_const_b_h4::<0xf0, false, 0, $variant>(
+                    a_packed, b_packed, inv_table, chunk_byte_base + odd_off, None, odd_dst, nt_store,
+                );
+                local += 2;
+            }
+        };
+    }
+    if ab_kara_enabled() {
+        run_unit!(MAIN);
+    } else {
+        run_unit!(HELPER);
+    }
+}
+
 /// The guards and the kernel call of [`ab_mixed_row_direct`]: the
 /// dispatcher's guards for the row's mask (B K0 and K1 all ones and the top
 /// three bytes of A K0 and K1 zero for `0x03`; B K4..K7 all ones for `0xf0`),
