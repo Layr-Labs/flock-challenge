@@ -194,17 +194,31 @@ pub unsafe fn ghash_mul_binius(a: F128, b: F128) -> F128 {
 #[target_feature(enable = "aes")]
 pub unsafe fn ghash_square_binius(a: F128) -> F128 {
     unsafe {
+        let c87 = vdupq_n_u64(0x87);
         let t0 = pmull(a.lo, a.lo);
         let t2 = pmull(a.hi, a.hi);
-        let k = vreinterpretq_p64_u64(vdupq_n_u64(0x87));
-        let fold0 = transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(t2), k,
-        ));
-        let t1 = veorq_u64(fold0, vextq_u64::<1>(t0, t2));
-        let fold1 = transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(t1), k,
-        ));
-        let result = veorq_u64(fold1, vzip1q_u64(t0, t1));
+        let s2 = vextq_u64::<1>(t0, t2);
+        let t1: uint64x2_t;
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+            m = in(vreg) t2,
+            c = in(vreg) c87,
+            s = in(vreg) s2,
+            o = out(vreg) t1,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        let s1 = vzip1q_u64(t0, t1);
+        let result: uint64x2_t;
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+            m = in(vreg) t1,
+            c = in(vreg) c87,
+            s = in(vreg) s1,
+            o = out(vreg) result,
+            options(pure, nomem, nostack, preserves_flags),
+        );
         F128 {
             lo: vgetq_lane_u64::<0>(result),
             hi: vgetq_lane_u64::<1>(result),
@@ -609,7 +623,7 @@ pub(crate) unsafe fn mul_four_const_sum_prep_xor(
 /// Prepared form of the shared-constant product pair;
 /// `FLOCK_NO_CONST_VEC2_PREP=1` restores the Karatsuba kernel.
 #[inline]
-fn use_const_vec2_prep() -> bool {
+pub(crate) fn use_const_vec2_prep() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_CONST_VEC2_PREP").is_none());
     *ON

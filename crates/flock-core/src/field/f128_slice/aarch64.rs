@@ -726,6 +726,21 @@ unsafe fn load_pair_whole(p: *const F128) -> (uint64x2_t, uint64x2_t) {
     (x0, x1)
 }
 
+/// One 32-byte pair store (`stp q, q`) matching [`load_pair_whole`].
+#[inline(always)]
+unsafe fn store_pair_whole(p: *mut F128, x0: uint64x2_t, x1: uint64x2_t) {
+    // SAFETY (caller): `p` is valid for a 32-byte write of two adjacent `F128`s.
+    unsafe {
+        core::arch::asm!(
+            "stp {x0:q}, {x1:q}, [{p}]",
+            p = in(reg) p,
+            x0 = in(vreg) x0,
+            x1 = in(vreg) x1,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// One whole 16-byte load of an input element (`ldr q`) that the optimizer may
 /// not narrow or split.
 #[inline(always)]
@@ -1142,17 +1157,51 @@ pub(super) unsafe fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128
 /// Expand one equality-table level with a shared multiplier `r`.
 ///
 /// For every old value `v = lo[i]`, writes `hi[i] = v * r` and
-/// `lo[i] = v + hi[i]`. The two-lane constant Karatsuba primitive uses six
-/// PMULLs for each pair of products and shares their vectorized reduction.
+/// `lo[i] = v + hi[i]`. When prepared constants are enabled, `const_prep(r)`
+/// is hoisted once per level and four elements are processed per iteration
+/// using whole-pair loads/stores purely in NEON vector registers.
 ///
 /// # Safety
 /// Requires the `aes` target feature. `lo` and `hi` must have equal lengths.
 #[inline]
+#[target_feature(enable = "aes")]
 pub(super) unsafe fn expand_eq_table_level(lo: &mut [F128], hi: &mut [F128], r: F128) {
-    use crate::field::gf2_128::aarch64::ghash_mul_const_vec2_neon;
+    use crate::field::gf2_128::aarch64::{ghash_mul_const_vec2_neon, use_const_vec2_prep};
 
     debug_assert_eq!(lo.len(), hi.len());
-    let paired = lo.len() & !1;
+    let n = lo.len();
+    if use_const_vec2_prep() {
+        unsafe {
+            let p = const_prep(transmute::<F128, uint64x2_t>(r));
+            let lp = lo.as_mut_ptr();
+            let hp = hi.as_mut_ptr();
+            let main = n & !3;
+            let mut i = 0usize;
+            while i < main {
+                let (v0, v1) = load_pair_whole(lp.add(i));
+                let (v2, v3) = load_pair_whole(lp.add(i + 2));
+                let h0 = mul_const_prep(p, v0);
+                let h1 = mul_const_prep(p, v1);
+                let h2 = mul_const_prep(p, v2);
+                let h3 = mul_const_prep(p, v3);
+                store_pair_whole(hp.add(i), h0, h1);
+                store_pair_whole(hp.add(i + 2), h2, h3);
+                store_pair_whole(lp.add(i), veorq_u64(v0, h0), veorq_u64(v1, h1));
+                store_pair_whole(lp.add(i + 2), veorq_u64(v2, h2), veorq_u64(v3, h3));
+                i += 4;
+            }
+            while i < n {
+                let v = load_whole(lp.add(i));
+                let h = mul_const_prep(p, v);
+                vst1q_u64(hp.add(i).cast::<u64>(), h);
+                vst1q_u64(lp.add(i).cast::<u64>(), veorq_u64(v, h));
+                i += 1;
+            }
+        }
+        return;
+    }
+
+    let paired = n & !1;
     let mut i = 0usize;
     while i < paired {
         let values = [lo[i], lo[i + 1]];
@@ -1165,7 +1214,7 @@ pub(super) unsafe fn expand_eq_table_level(lo: &mut [F128], hi: &mut [F128], r: 
         i += 2;
     }
 
-    if i < lo.len() {
+    if i < n {
         let value = lo[i];
         let product = value * r;
         hi[i] = product;
@@ -2061,7 +2110,70 @@ pub(super) unsafe fn fold2_two_and_msg(
     unsafe { fold2_two_and_msg_impl(f, b, base, wf, wb, r_a, r_b, nt_stores, use_fold2_const_prep()) }
 }
 
-/// `out[i] = src[i] * s` with the multiplier prepared once.
+/// `out[i] = z0[i] + r * (z0[i] + z1[i])` with `r` prepared once and `z0[i]`
+/// absorbed into [`mul_const_prep_xor`] at zero extra SIMD issue slots.
+///
+/// # Safety
+/// Requires the `aes` target feature and equal slice lengths.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_half_into(z0: &[F128], z1: &[F128], out: &mut [F128], r: F128) {
+    use crate::field::gf2_128::aarch64::{ghash_mul_const_vec2_neon, use_const_vec2_prep};
+
+    debug_assert_eq!(z0.len(), z1.len());
+    debug_assert_eq!(z0.len(), out.len());
+    let n = z0.len();
+    if use_const_vec2_prep() {
+        unsafe {
+            let p = const_prep(transmute::<F128, uint64x2_t>(r));
+            let p0 = z0.as_ptr();
+            let p1 = z1.as_ptr();
+            let po = out.as_mut_ptr();
+            let main = n & !3;
+            let mut i = 0usize;
+            while i < main {
+                let (a0, a1) = load_pair_whole(p0.add(i));
+                let (a2, a3) = load_pair_whole(p0.add(i + 2));
+                let (b0, b1) = load_pair_whole(p1.add(i));
+                let (b2, b3) = load_pair_whole(p1.add(i + 2));
+                let o0 = mul_const_prep_xor(p, veorq_u64(a0, b0), a0);
+                let o1 = mul_const_prep_xor(p, veorq_u64(a1, b1), a1);
+                let o2 = mul_const_prep_xor(p, veorq_u64(a2, b2), a2);
+                let o3 = mul_const_prep_xor(p, veorq_u64(a3, b3), a3);
+                store_pair_whole(po.add(i), o0, o1);
+                store_pair_whole(po.add(i + 2), o2, o3);
+                i += 4;
+            }
+            while i < n {
+                let a = load_whole(p0.add(i));
+                let b = load_whole(p1.add(i));
+                vst1q_u64(
+                    po.add(i).cast::<u64>(),
+                    mul_const_prep_xor(p, veorq_u64(a, b), a),
+                );
+                i += 1;
+            }
+        }
+        return;
+    }
+
+    let paired = n & !1;
+    let mut i = 0usize;
+    while i < paired {
+        let a0 = z0[i];
+        let a1 = z0[i + 1];
+        let prod = unsafe { ghash_mul_const_vec2_neon(r, [a0 + z1[i], a1 + z1[i + 1]]) };
+        out[i] = a0 + prod[0];
+        out[i + 1] = a1 + prod[1];
+        i += 2;
+    }
+    if i < n {
+        let a = z0[i];
+        out[i] = a + r * (a + z1[i]);
+    }
+}
+
+/// `out[i] = src[i] * s` with the multiplier prepared once, unrolled 4-wide
+/// with whole-pair loads and stores.
 ///
 /// # Safety
 /// Requires the `aes` target feature and `out.len() == src.len()`.
@@ -2071,9 +2183,23 @@ pub(super) unsafe fn scale_slice_prepared(out: &mut [F128], src: &[F128], s: F12
         let p = const_prep(transmute::<F128, uint64x2_t>(s));
         let n = out.len().min(src.len());
         let (po, ps) = (out.as_mut_ptr(), src.as_ptr());
-        for i in 0..n {
-            let v = vld1q_u64(ps.add(i).cast::<u64>());
+        let main = n & !3;
+        let mut i = 0usize;
+        while i < main {
+            let (v0, v1) = load_pair_whole(ps.add(i));
+            let (v2, v3) = load_pair_whole(ps.add(i + 2));
+            let o0 = mul_const_prep(p, v0);
+            let o1 = mul_const_prep(p, v1);
+            let o2 = mul_const_prep(p, v2);
+            let o3 = mul_const_prep(p, v3);
+            store_pair_whole(po.add(i), o0, o1);
+            store_pair_whole(po.add(i + 2), o2, o3);
+            i += 4;
+        }
+        while i < n {
+            let v = load_whole(ps.add(i));
             vst1q_u64(po.add(i).cast::<u64>(), mul_const_prep(p, v));
+            i += 1;
         }
     }
 }
