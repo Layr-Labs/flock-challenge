@@ -765,6 +765,7 @@ unsafe fn mul_sw_tri_binius_fused_q(
 /// `ρa·ρb`, the third fold level's `ρc` (zero at depth two), and `k` with
 /// `0x86` in its high lane.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy)]
 struct TriPrepQ {
     a0: core::arch::aarch64::uint64x2_t,
@@ -779,6 +780,7 @@ struct TriPrepQ {
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[cfg_attr(not(test), allow(dead_code))]
 impl TriPrepQ {
     #[inline(always)]
     unsafe fn new(
@@ -831,6 +833,7 @@ unsafe fn fold86_add_q(
 /// instructions where [`fold4_expanded_tri_one_fused_q`] takes 14 and 31.
 /// Fully reduced: the same bits.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 unsafe fn fold4_prep_one_q(
     v0: core::arch::aarch64::uint64x2_t,
@@ -893,6 +896,7 @@ unsafe fn fold4_prep_one_q(
 /// 10 instructions where [`mul_sw_tri_binius_fused_q`] plus the add takes
 /// 12 and six `PMULL`s. The same bits.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline(always)]
 unsafe fn mul_prep86_add_q(
     p0: core::arch::aarch64::uint64x2_t,
@@ -925,36 +929,91 @@ unsafe fn mul_prep86_add_q(
     }
 }
 
-/// [`fold4_pair_expanded_tri_q`] through [`fold4_prep_one_q`] (`F`) or
-/// [`fold4_expanded_tri_one_q`]: the same loads, the same outputs.
+/// Karatsuba fold4/fold8 helpers for the tri pass (`DEPTH == 2` and `DEPTH == 3`).
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-#[inline(always)]
-unsafe fn fold4_pair_expanded_tri_f_q<const F: bool>(
-    values: *const F128,
-    rho: &Fold4RhoQ,
-    pp: &TriPrepQ,
-) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-) {
-    use core::arch::aarch64::*;
-    unsafe {
-        if !F {
-            return fold4_pair_expanded_tri_q(values, rho);
-        }
-        let v0 = vld1q_u64(values.add(0).cast::<u64>());
-        let v1 = vld1q_u64(values.add(1).cast::<u64>());
-        let v2 = vld1q_u64(values.add(2).cast::<u64>());
-        let v3 = vld1q_u64(values.add(3).cast::<u64>());
-        let v4 = vld1q_u64(values.add(4).cast::<u64>());
-        let v5 = vld1q_u64(values.add(5).cast::<u64>());
-        let v6 = vld1q_u64(values.add(6).cast::<u64>());
-        let v7 = vld1q_u64(values.add(7).cast::<u64>());
-        (
-            fold4_prep_one_q(v0, v1, v2, v3, pp),
-            fold4_prep_one_q(v4, v5, v6, v7, pp),
-        )
+mod tri_fold_kara {
+    use super::*;
+    use core::arch::aarch64::{uint64x2_t as Q, *};
+
+    #[derive(Clone, Copy)] struct KaraNeon { ll: Q, mm: Q, hh: Q }
+    #[inline(always)] unsafe fn mid_pair_q(u: Q, v: Q) -> Q { unsafe { veorq_u64(vuzp1q_u64(u, v), vuzp2q_u64(u, v)) } }
+    #[inline(always)] unsafe fn mid_one_q(u: Q) -> Q { unsafe { veorq_u64(u, vextq_u64::<1>(u, u)) } }
+    #[inline(always)] unsafe fn lo_acc(c: Q, a: Q, b: Q) -> Q {
+        #[cfg(target_feature = "sha3")] { unsafe { fused_pmull_lo_acc(c, a, b) } }
+        #[cfg(not(target_feature = "sha3"))] { unsafe { veorq_u64(c, pmull_lane(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(b))) } }
     }
+    #[inline(always)] unsafe fn hi_acc(c: Q, a: Q, b: Q) -> Q {
+        #[cfg(target_feature = "sha3")] { unsafe { fused_pmull_hi_acc(c, a, b) } }
+        #[cfg(not(target_feature = "sha3"))] { unsafe { veorq_u64(c, pmull_lane(vgetq_lane_u64::<1>(a), vgetq_lane_u64::<1>(b))) } }
+    }
+    #[inline(always)] unsafe fn x_acc(c: Q, w: Q, d: Q) -> Q {
+        #[cfg(target_feature = "sha3")] { unsafe { fused_cross_acc(c, w, d) } }
+        #[cfg(not(target_feature = "sha3"))] { unsafe { veorq_u64(c, cross_sum_q(w, d)) } }
+    }
+    #[inline(always)] unsafe fn red(v: KaraNeon, c87: Q, extra: Q) -> Q {
+        unsafe { let t1 = fold86_add_q(v.hh, c87, veorq_u64(vextq_u64::<1>(v.ll, v.hh), xor3_u64(v.mm, v.ll, v.hh))); fold86_add_q(t1, c87, veorq_u64(vzip1q_u64(v.ll, t1), extra)) }
+    }
+    #[derive(Clone, Copy)] pub(super) struct KaraW2 { lo: Q, hi: Q, mid: Q }
+    impl KaraW2 {
+        #[inline(always)] pub(super) unsafe fn new(a: Q, b: Q) -> Self { unsafe { let (lo, hi) = (vuzp1q_u64(a, b), vuzp2q_u64(a, b)); Self { lo, hi, mid: veorq_u64(lo, hi) } } }
+    }
+    #[inline(always)] unsafe fn w2_set(w: KaraW2, x: Q, y: Q) -> KaraNeon {
+        unsafe { let (lo, hi) = (vuzp1q_u64(x, y), vuzp2q_u64(x, y)); KaraNeon { ll: cross_sum_q(w.lo, lo), mm: cross_sum_q(w.mid, veorq_u64(lo, hi)), hh: cross_sum_q(w.hi, hi) } }
+    }
+    #[inline(always)] unsafe fn w2_acc(acc: &mut KaraNeon, w: KaraW2, x: Q, y: Q) {
+        unsafe { let (lo, hi) = (vuzp1q_u64(x, y), vuzp2q_u64(x, y)); acc.ll = x_acc(acc.ll, w.lo, lo); acc.hh = x_acc(acc.hh, w.hi, hi); acc.mm = x_acc(acc.mm, w.mid, veorq_u64(lo, hi)); }
+    }
+    #[inline(always)] unsafe fn w1_pair_acc(a0: &mut KaraNeon, a1: &mut KaraNeon, w: Q, wm: Q, d0: Q, d1: Q) {
+        unsafe { let dm = mid_pair_q(d0, d1); a0.ll = lo_acc(a0.ll, w, d0); a0.hh = hi_acc(a0.hh, w, d0); a1.ll = lo_acc(a1.ll, w, d1); a1.hh = hi_acc(a1.hh, w, d1); a0.mm = lo_acc(a0.mm, wm, dm); a1.mm = hi_acc(a1.mm, wm, dm); }
+    }
+    #[derive(Clone, Copy)] pub(super) struct Fold4KaraQ { pub(super) ab: KaraW2, p3: Q, p3_mid: Q, pub(super) c87: Q, pub(super) k: Q }
+    impl Fold4KaraQ {
+        #[inline(always)] pub(super) unsafe fn new(a: Q, b: Q, ab: Q) -> Self { unsafe { Self { ab: KaraW2::new(a, b), p3: ab, p3_mid: mid_one_q(ab), c87: vdupq_n_u64(0x87), k: vdupq_n_u64(0x86) } } }
+    }
+    #[inline(always)] pub(super) unsafe fn fold4_kara_one_q(v0: Q, v1: Q, v2: Q, v3: Q, w: &Fold4KaraQ) -> Q {
+        unsafe {
+            let (da, db) = (veorq_u64(v0, v1), veorq_u64(v0, v2));
+            let (dab, mut acc) = (xor3_u64(da, v2, v3), w2_set(w.ab, da, db));
+            acc.ll = lo_acc(acc.ll, w.p3, dab); acc.hh = hi_acc(acc.hh, w.p3, dab); acc.mm = lo_acc(acc.mm, w.p3_mid, mid_one_q(dab));
+            red(acc, w.c87, v0)
+        }
+    }
+    #[inline(always)] unsafe fn fold4_half(p: *const F128, ab: KaraW2) -> (Q, Q, KaraNeon) {
+        unsafe { let ld = |k: usize| vld1q_u64(p.add(k).cast::<u64>()); let (v0, v1, v2, v3) = (ld(0), ld(1), ld(2), ld(3)); let (da, db) = (veorq_u64(v0, v1), veorq_u64(v0, v2)); (v0, xor3_u64(da, v2, v3), w2_set(ab, da, db)) }
+    }
+    #[inline(always)] pub(super) unsafe fn fold4_kara_pair_q(values: *const F128, w: &Fold4KaraQ) -> (Q, Q) {
+        unsafe { let (v0, dab0, mut acc0) = fold4_half(values, w.ab); let (u0, dab1, mut acc1) = fold4_half(values.add(4), w.ab); w1_pair_acc(&mut acc0, &mut acc1, w.p3, w.p3_mid, dab0, dab1); (red(acc0, w.c87, v0), red(acc1, w.c87, u0)) }
+    }
+    #[derive(Clone, Copy)] pub(super) struct Fold8KaraQ { pub(super) ab: KaraW2, pub(super) abc1: KaraW2, pub(super) acbc: KaraW2, pub(super) p7: Q, pub(super) p7_mid: Q }
+    impl Fold8KaraQ {
+        #[inline(always)] pub(super) unsafe fn new(ra: F128, rb: F128, rab: F128, rc: F128) -> Self {
+            unsafe { let q = |v: F128| core::mem::transmute::<F128, Q>(v); let p7 = q(rab * rc); Self { ab: KaraW2::new(q(ra), q(rb)), abc1: KaraW2::new(q(rab), q(rc)), acbc: KaraW2::new(q(ra * rc), q(rb * rc)), p7, p7_mid: mid_one_q(p7) } }
+        }
+    }
+    #[inline(always)] unsafe fn fold8_half(src: *const F128, w: &Fold8KaraQ) -> (Q, Q, KaraNeon) {
+        unsafe {
+            let ld = |k: usize| vld1q_u64(src.add(k).cast::<u64>());
+            let (v0, v1, v2, v3) = (ld(0), ld(1), ld(2), ld(3));
+            let (d1, d2) = (veorq_u64(v0, v1), veorq_u64(v0, v2));
+            let (d3, mut acc) = (xor3_u64(d1, v2, v3), w2_set(w.ab, d1, d2));
+            let v4 = ld(4); w2_acc(&mut acc, w.abc1, d3, veorq_u64(v0, v4));
+            let (v5, v6, v7) = (ld(5), ld(6), ld(7));
+            let (d5, d6) = (xor3_u64(d1, v4, v5), xor3_u64(d2, v4, v6));
+            let d7 = xor3_u64(xor3_u64(d1, d3, d5), v6, v7);
+            w2_acc(&mut acc, w.acbc, d5, d6); (v0, d7, acc)
+        }
+    }
+    #[inline(always)] pub(super) unsafe fn fold8_kara_pair_q(src: *const F128, w: &Fold8KaraQ, c87: Q) -> (Q, Q) {
+        unsafe { let (v0, d7_0, mut acc0) = fold8_half(src, w); let (u0, d7_1, mut acc1) = fold8_half(src.add(8), w); w1_pair_acc(&mut acc0, &mut acc1, w.p7, w.p7_mid, d7_0, d7_1); (red(acc0, c87, v0), red(acc1, c87, u0)) }
+    }
+}
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+use tri_fold_kara::{Fold4KaraQ, Fold8KaraQ, fold4_kara_one_q, fold4_kara_pair_q, fold8_kara_pair_q};
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)] unsafe fn fold4_pair_expanded_tri_f_q<const F: bool>(
+    values: *const F128, rho: &Fold4RhoQ, w4: &Fold4KaraQ,
+) -> (core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t) {
+    unsafe { if F { fold4_kara_pair_q(values, w4) } else { fold4_pair_expanded_tri_q(values, rho) } }
 }
 
 /// `a * b` in the field with the caller's `a_sw = swap_halves_q(a)`, reduced
@@ -8046,8 +8105,13 @@ fn fold_tri_and_message_core_with<
         let rho = Fold4RhoQ::new(q(rho_a), q(rho_b), q(rho_ab));
         let rc = q(rho_c);
         let rc_sw = swap_halves_q(rc);
-        let pp = TriPrepQ::new(q(rho_a), q(rho_b), q(rho_ab), rc);
+        let pp = Fold4KaraQ::new(q(rho_a), q(rho_b), q(rho_ab));
         let zero = vdupq_n_u64(0);
+        let w8 = if DEPTH == 3 && FF {
+            Fold8KaraQ::new(rho_a, rho_b, rho_ab, rho_c)
+        } else {
+            Fold8KaraQ { ab: pp.ab, abc1: pp.ab, acbc: pp.ab, p7: zero, p7_mid: zero }
+        };
         // `PACK` with `FF`: the fold of one input `x` with three zero inputs,
         // `x + ρa·x + ρb·x + ρab·x`, is `x·(1 + ρa)(1 + ρb)`; `op` is that
         // constant's prepared pair (`FLOCK_NO_ZC_TRI_ONE_IN=1` keeps the
@@ -8075,9 +8139,13 @@ fn fold_tri_and_message_core_with<
             rho: &Fold4RhoQ,
             rc: uint64x2_t,
             rc_sw: uint64x2_t,
-            pp: &TriPrepQ,
+            pp: &Fold4KaraQ,
+            w8: &Fold8KaraQ,
         ) -> [uint64x2_t; 8] {
             unsafe {
+                if DEPTH == 3 && FF {
+                    return fold_eight_sl_d3(src, w8, pp.c87);
+                }
                 let mut v = [vdupq_n_u64(0); 8];
                 if DEPTH == 2 {
                     for h in 0..4 {
@@ -8087,15 +8155,23 @@ fn fold_tri_and_message_core_with<
                     }
                 } else {
                     for (h, slot) in v.iter_mut().enumerate() {
-                        let (t0, t1) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8 * h), rho, pp);
-                        *slot = if FF {
-                            mul_prep86_add_q(pp.c0, pp.c1, veorq_u64(t0, t1), pp.k, t0)
-                        } else {
-                            veorq_u64(t0, mul_sw_tri_binius_q(rc, rc_sw, veorq_u64(t0, t1)))
-                        };
+                        let (t0, t1) = fold4_pair_expanded_tri_f_q::<false>(src.add(8 * h), rho, pp);
+                        *slot = veorq_u64(t0, mul_sw_tri_binius_q(rc, rc_sw, veorq_u64(t0, t1)));
                     }
                 }
                 v
+            }
+        }
+
+        /// Straight-line depth-three group fold via direct Karatsuba 8-fold.
+        #[inline(always)]
+        unsafe fn fold_eight_sl_d3(src: *const F128, w8: &Fold8KaraQ, c87: uint64x2_t) -> [uint64x2_t; 8] {
+            unsafe {
+                let (v0, v1) = fold8_kara_pair_q(src, w8, c87);
+                let (v2, v3) = fold8_kara_pair_q(src.add(16), w8, c87);
+                let (v4, v5) = fold8_kara_pair_q(src.add(32), w8, c87);
+                let (v6, v7) = fold8_kara_pair_q(src.add(48), w8, c87);
+                [v0, v1, v2, v3, v4, v5, v6, v7]
             }
         }
 
@@ -8105,7 +8181,7 @@ fn fold_tri_and_message_core_with<
         unsafe fn fold_eight_sl<const FF: bool>(
             src: *const F128,
             rho: &Fold4RhoQ,
-            pp: &TriPrepQ,
+            pp: &Fold4KaraQ,
         ) -> [uint64x2_t; 8] {
             unsafe {
                 let (v0, v1) = fold4_pair_expanded_tri_f_q::<FF>(src, rho, pp);
@@ -8127,34 +8203,31 @@ fn fold_tri_and_message_core_with<
             src: *const F128,
             side: *const F128,
             rho: &Fold4RhoQ,
-            pp: &TriPrepQ,
+            pp: &Fold4KaraQ,
             one_in: bool,
             op: &(uint64x2_t, uint64x2_t),
             seeded: bool,
         ) -> [uint64x2_t; 8] {
             unsafe {
-                let mut v = [vdupq_n_u64(0); 8];
-                for h in 0..3 {
-                    let (x, y) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8 * h), rho, pp);
-                    v[2 * h] = x;
-                    v[2 * h + 1] = y;
-                }
+                let (v0, v1) = fold4_pair_expanded_tri_f_q::<FF>(src, rho, pp);
+                let (v2, v3) = fold4_pair_expanded_tri_f_q::<FF>(src.add(8), rho, pp);
+                let (v4, v5) = fold4_pair_expanded_tri_f_q::<FF>(src.add(16), rho, pp);
                 let ld = |p: *const F128| vld1q_u64(p.cast::<u64>());
                 let zero = vdupq_n_u64(0);
                 let one = |a, b, c, d| {
                     if FF {
-                        fold4_prep_one_q(a, b, c, d, pp)
+                        fold4_kara_one_q(a, b, c, d, pp)
                     } else {
                         fold4_expanded_tri_one_q(a, b, c, d, rho)
                     }
                 };
-                v[6] = one(ld(src.add(24)), ld(src.add(25)), ld(src.add(26)), ld(src.add(27)));
-                v[7] = if FF && one_in {
+                let v6 = one(ld(src.add(24)), ld(src.add(25)), ld(src.add(26)), ld(src.add(27)));
+                let v7 = if FF && one_in {
                     mul_prep86_sel_q(seeded, op.0, op.1, ld(side), pp.k)
                 } else {
                     one(ld(side), zero, zero, zero)
                 };
-                v
+                [v0, v1, v2, v3, v4, v5, v6, v7]
             }
         }
         // Group `y` (32 logical inputs): packed, block `y / 2` of superblock
@@ -8166,12 +8239,12 @@ fn fold_tri_and_message_core_with<
                 let sup = ip.add(PACK_SUPER * (blk / PACK_BLOCKS));
                 let main = sup.add(60 * w);
                 if y % 2 == 0 {
-                    fold_eight::<2, false>(main, &rho, rc, rc_sw, &pp)
+                    fold_eight::<2, false>(main, &rho, rc, rc_sw, &pp, &w8)
                 } else {
                     fold_eight_packed_tail::<false>(main.add(32), sup.add(60 * PACK_BLOCKS + w), &rho, &pp, false, &op, false)
                 }
             } else {
-                fold_eight::<DEPTH, false>(ip.add((8 * y) << DEPTH), &rho, rc, rc_sw, &pp)
+                fold_eight::<DEPTH, false>(ip.add((8 * y) << DEPTH), &rho, rc, rc_sw, &pp, &w8)
             }
         };
         // `INL`: the same group fold as `fold_group`, as an always-inlined
@@ -8187,7 +8260,8 @@ fn fold_tri_and_message_core_with<
             rho: &Fold4RhoQ,
             rc: uint64x2_t,
             rc_sw: uint64x2_t,
-            pp: &TriPrepQ,
+            pp: &Fold4KaraQ,
+            w8: &Fold8KaraQ,
             one_in: bool,
             op: &(uint64x2_t, uint64x2_t),
             seeded: bool,
@@ -8201,15 +8275,17 @@ fn fold_tri_and_message_core_with<
                         if SL {
                             fold_eight_sl::<FF>(main, rho, pp)
                         } else {
-                            fold_eight::<2, FF>(main, rho, rc, rc_sw, pp)
+                            fold_eight::<2, FF>(main, rho, rc, rc_sw, pp, w8)
                         }
                     } else {
                         fold_eight_packed_tail::<FF>(main.add(32), sup.add(60 * PACK_BLOCKS + w), rho, pp, one_in, op, seeded)
                     }
+                } else if DEPTH == 3 && FF {
+                    fold_eight_sl_d3(ip.add((8 * y) << 3), w8, pp.c87)
                 } else if SL && DEPTH == 2 {
                     fold_eight_sl::<FF>(ip.add((8 * y) << 2), rho, pp)
                 } else {
-                    fold_eight::<DEPTH, FF>(ip.add((8 * y) << DEPTH), rho, rc, rc_sw, pp)
+                    fold_eight::<DEPTH, FF>(ip.add((8 * y) << DEPTH), rho, rc, rc_sw, pp, w8)
                 }
             }
         }
@@ -8229,7 +8305,7 @@ fn fold_tri_and_message_core_with<
             ip: *const F128,
             y: usize,
             rho: &Fold4RhoQ,
-            pp: &TriPrepQ,
+            pp: &Fold4KaraQ,
             one_in: bool,
             op: &(uint64x2_t, uint64x2_t),
             seeded: bool,
@@ -8241,7 +8317,7 @@ fn fold_tri_and_message_core_with<
                 let one_q = core::mem::transmute::<F128, uint64x2_t>(F128::ONE);
                 let one = |a, b, c, d| {
                     if FF && one_in {
-                        fold4_prep_one_q(a, b, c, d, pp)
+                        fold4_kara_one_q(a, b, c, d, pp)
                     } else if FF {
                         fold4_expanded_tri_one_fused_q(a, b, c, d, rho)
                     } else {
@@ -8280,58 +8356,46 @@ fn fold_tri_and_message_core_with<
             let gn = (ng - g0).min(TG);
             for t in 0..gn {
                 let y = g0 + t;
-                let (a, b) = if INL {
-                    (
-                        fold_group_inl::<DEPTH, PACK, SL, FF>(a_ip, y, &rho, rc, rc_sw, &pp, one_in, &op, seeded),
-                        if PACK && bpack {
-                            fold_group_bpack::<FF>(b_ip, y, &rho, &pp, one_in, &op, seeded)
-                        } else {
-                            fold_group_inl::<DEPTH, PACK, SL, FF>(b_ip, y, &rho, rc, rc_sw, &pp, one_in, &op, seeded)
-                        },
-                    )
-                } else if PACK && bpack {
-                    (fold_group(a_ip, y), fold_group_bpack::<false>(b_ip, y, &rho, &pp, false, &op, false))
+                let a = if INL {
+                    fold_group_inl::<DEPTH, PACK, SL, FF>(a_ip, y, &rho, rc, rc_sw, &pp, &w8, one_in, &op, seeded)
                 } else {
-                    (fold_group(a_ip, y), fold_group(b_ip, y))
+                    fold_group(a_ip, y)
                 };
                 if ABL & 2 == 0 {
-                    for h in 0..4 {
-                        store_pair::<NT>(a_op.add(8 * y + 2 * h), a[2 * h], a[2 * h + 1]);
-                        store_pair::<NT>(b_op.add(8 * y + 2 * h), b[2 * h], b[2 * h + 1]);
-                    }
+                    for h in 0..4 { store_pair::<NT>(a_op.add(8 * y + 2 * h), a[2 * h], a[2 * h + 1]); }
                 } else {
-                    for h in 0..8 {
-                        sink = xor3_u64(sink, a[h], b[h]);
-                    }
+                    for h in 0..8 { sink = veorq_u64(sink, a[h]); }
                 }
-                if ABL & 1 != 0 {
-                    sink = xor3_u64(sink, a[0], b[7]);
-                    continue;
-                }
-                let ta_p = ta[t].as_mut_ptr().cast::<uint64x2_t>();
-                if FF {
-                    // The weight's prepared pair (one paired load): five
-                    // `PMULL`s and 10 instructions per row; the same fully
-                    // reduced products as the schoolbook and Karatsuba forms.
-                    // `seeded`: six SIMD issue slots per row instead of seven.
-                    let p0 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 2).cast::<u64>());
-                    let p1 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 3).cast::<u64>());
-                    if seeded {
-                        for i in 0..8 {
-                            ta_p.add(i).write(mul_prep86_seeded_q(p0, p1, a[i], pp.k));
-                        }
+                if ABL & 1 == 0 {
+                    let ta_p = ta[t].as_mut_ptr().cast::<uint64x2_t>();
+                    if FF {
+                        let p0 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 2).cast::<u64>());
+                        let p1 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 3).cast::<u64>());
+                        if seeded { for i in 0..8 { ta_p.add(i).write(mul_prep86_seeded_q(p0, p1, a[i], pp.k)); } }
+                        else { for i in 0..8 { ta_p.add(i).write(mul_prep86_q(p0, p1, a[i], pp.k)); } }
                     } else {
-                        for i in 0..8 {
-                            ta_p.add(i).write(mul_prep86_q(p0, p1, a[i], pp.k));
-                        }
+                        let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
+                        let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
+                        for i in 0..8 { ta_p.add(i).write(mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i])); }
                     }
+                } else { sink = veorq_u64(sink, a[0]); }
+                let b = if INL {
+                    if PACK && bpack {
+                        fold_group_bpack::<FF>(b_ip, y, &rho, &pp, one_in, &op, seeded)
+                    } else {
+                        fold_group_inl::<DEPTH, PACK, SL, FF>(b_ip, y, &rho, rc, rc_sw, &pp, &w8, one_in, &op, seeded)
+                    }
+                } else if PACK && bpack {
+                    fold_group_bpack::<false>(b_ip, y, &rho, &pp, false, &op, false)
                 } else {
-                    let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
-                    let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
-                    for i in 0..8 {
-                        ta_p.add(i).write(mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]));
-                    }
+                    fold_group(b_ip, y)
+                };
+                if ABL & 2 == 0 {
+                    for h in 0..4 { store_pair::<NT>(b_op.add(8 * y + 2 * h), b[2 * h], b[2 * h + 1]); }
+                } else {
+                    for h in 0..8 { sink = veorq_u64(sink, b[h]); }
                 }
+                if ABL & 1 != 0 { sink = veorq_u64(sink, b[7]); continue; }
                 tb[t].write(b);
             }
             g0 += gn;

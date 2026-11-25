@@ -331,6 +331,11 @@ pub(super) unsafe fn butterfly_fused_3layer_row_with_policy(
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(super) use aarch64::{
+    butterfly_fused_3layer_row_with_const_q, prepare_3layer, use_prepared_3layer_absorb,
+};
+
 #[inline]
 pub(super) unsafe fn butterfly_fused_3layer_rows(
     ptr: *mut F128,

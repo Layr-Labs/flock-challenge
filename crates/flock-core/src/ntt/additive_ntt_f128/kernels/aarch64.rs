@@ -1031,10 +1031,22 @@ fn use_const_ext() -> bool {
     *ON
 }
 
-type Prep = (
+pub(in super::super) type Prep = (
     core::arch::aarch64::uint64x2_t,
     core::arch::aarch64::uint64x2_t,
 );
+
+#[target_feature(enable = "aes")]
+#[inline]
+pub(in super::super) unsafe fn prepare_3layer(twiddles: &[F128; 7]) -> [Prep; 7] {
+    use core::arch::aarch64::*;
+    unsafe { core::array::from_fn(|i| three_coeffs(vld1q_u64((&raw const twiddles[i]).cast::<u64>()))) }
+}
+
+#[inline]
+pub(in super::super) fn use_prepared_3layer_absorb() -> bool {
+    use_three_const_fold() && use_ntt_absorb()
+}
 
 /// Prepared twin of [`fused3_zero_root_q`] (twiddles 0, 1, 3 zero).
 #[inline(always)]
@@ -1073,8 +1085,8 @@ unsafe fn fused3_zero_root_prepared_q(
 }
 
 #[target_feature(enable = "aes")]
-#[inline]
-unsafe fn butterfly_fused_3layer_row_with_const_q<const ABSORB: bool>(
+#[inline(never)]
+pub(in super::super) unsafe fn butterfly_fused_3layer_row_with_const_q<const ABSORB: bool>(
     ptr: *mut F128,
     eighth: usize,
     num_ntts: usize,
@@ -1512,6 +1524,33 @@ unsafe fn butterfly_fused_2layer_low_impl<const DIRECT: bool>(
 // The two descendants share that pending half. The other outer product
 // must be reduced before it becomes an inner-layer multiplicand.
 #[inline(always)]
+unsafe fn load_pair_q(ptr: *const F128) -> (core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t) {
+    let (a, b);
+    unsafe { core::arch::asm!("ldp {a:q}, {b:q}, [{ptr}]", ptr = in(reg) ptr, a = out(vreg) a, b = out(vreg) b, options(readonly, nostack, preserves_flags)); }
+    (a, b)
+}
+
+#[inline(always)]
+unsafe fn store_pair_q_adv(ptr: &mut *mut F128, a: core::arch::aarch64::uint64x2_t, b: core::arch::aarch64::uint64x2_t) {
+    unsafe { core::arch::asm!("stp {a:q}, {b:q}, [{ptr}], #32", ptr = inout(reg) *ptr, a = in(vreg) a, b = in(vreg) b, options(nostack, preserves_flags)); }
+}
+
+#[inline(always)]
+unsafe fn butterfly_low_fold_zero_q(
+    u: core::arch::aarch64::uint64x2_t,
+    v: core::arch::aarch64::uint64x2_t,
+    t: core::arch::aarch64::uint64x2_t,
+) -> (core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t) {
+    unsafe {
+        use core::arch::aarch64::*;
+        let nu = fused_pmull_lo_acc(u, v, t);
+        let mid = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(v), vreinterpretq_p64_u64(t)));
+        let fu = fold_x64_into(nu, mid);
+        (fu, veorq_u64(v, fu))
+    }
+}
+
+#[inline(always)]
 unsafe fn butterfly_low_lazy_q(
     u: core::arch::aarch64::uint64x2_t,
     v: core::arch::aarch64::uint64x2_t,
@@ -1524,12 +1563,9 @@ unsafe fn butterfly_low_lazy_q(
 ) {
     unsafe {
         use core::arch::aarch64::*;
-        let hi = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(
-            vreinterpretq_p64_u64(v),
-            vreinterpretq_p64_u64(t),
-        ));
         let nu = fused_pmull_lo_acc(u, v, t);
-        (nu, veorq_u64(v, nu), veorq_u64(hi, p))
+        let mid = fused_pmull_hi_acc(p, v, t);
+        (nu, veorq_u64(v, nu), mid)
     }
 }
 
@@ -1572,24 +1608,37 @@ unsafe fn butterfly_fused_2layer_low_lazy(
         let to = vdupq_n_u64(t_outer.lo);
         let ta = vdupq_n_u64(t_inner_a.lo);
         let tb = vdupq_n_u64(t_inner_b.lo);
-        let zero = vdupq_n_u64(0);
         let n = a.len();
-        let [ea, eb, ec, ed] = row_ends([a, b, c, d]);
-        let mut off = -((n * core::mem::size_of::<F128>()) as isize);
-        while off != 0 {
-            let xa = vld1q_u64(ea.offset(off).cast::<u64>());
-            let xb = vld1q_u64(eb.offset(off).cast::<u64>());
-            let xc = vld1q_u64(ec.offset(off).cast::<u64>());
-            let xd = vld1q_u64(ed.offset(off).cast::<u64>());
-            let (na, nc, p) = butterfly_low_lazy_q(xa, xc, to, zero);
-            let (nb, nd) = butterfly_low_fold_q(xb, xd, to, zero);
+        let [mut pa, mut pb, mut pc, mut pd] = row_ptrs([a, b, c, d]);
+        let mut pairs = n >> 1;
+        while pairs != 0 {
+            let ((xa0, xa1), (xc0, xc1)) = (load_pair_q(pa), load_pair_q(pc));
+            let na0 = fused_pmull_lo_acc(xa0, xc0, to);
+            let p0 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(xc0), vreinterpretq_p64_u64(to)));
+            let na1 = fused_pmull_lo_acc(xa1, xc1, to);
+            let p1 = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(xc1), vreinterpretq_p64_u64(to)));
+            let ((xb0, xb1), (xd0, xd1)) = (load_pair_q(pb), load_pair_q(pd));
+            let ((nb0, nd0), (nb1, nd1)) = (butterfly_low_fold_zero_q(xb0, xd0, to), butterfly_low_fold_zero_q(xb1, xd1, to));
+            let ((fa0, fb0), (fa1, fb1)) = (butterfly_low_fold_q(na0, nb0, ta, p0), butterfly_low_fold_q(na1, nb1, ta, p1));
+            store_pair_q_adv(&mut pa, fa0, fa1);
+            store_pair_q_adv(&mut pb, fb0, fb1);
+            let fc0 = fold_x64_plus_into(fused_pmull_lo_acc(na0, nd0, tb), fused_pmull_hi_acc(p0, nd0, tb), xc0);
+            let fc1 = fold_x64_plus_into(fused_pmull_lo_acc(na1, nd1, tb), fused_pmull_hi_acc(p1, nd1, tb), xc1);
+            store_pair_q_adv(&mut pc, fc0, fc1);
+            store_pair_q_adv(&mut pd, veorq_u64(nd0, fc0), veorq_u64(nd1, fc1));
+            pairs -= 1;
+        }
+        if n & 1 != 0 {
+            let (xa, xb, xc, xd) = (vld1q_u64(pa.cast::<u64>()), vld1q_u64(pb.cast::<u64>()), vld1q_u64(pc.cast::<u64>()), vld1q_u64(pd.cast::<u64>()));
+            let na = fused_pmull_lo_acc(xa, xc, to);
+            let p = core::mem::transmute::<u128, uint64x2_t>(vmull_high_p64(vreinterpretq_p64_u64(xc), vreinterpretq_p64_u64(to)));
+            let (nb, nd) = butterfly_low_fold_zero_q(xb, xd, to);
             let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
-            let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
-            vst1q_u64(ea.offset(off).cast::<u64>(), fa);
-            vst1q_u64(eb.offset(off).cast::<u64>(), fb);
-            vst1q_u64(ec.offset(off).cast::<u64>(), fc);
-            vst1q_u64(ed.offset(off).cast::<u64>(), fd);
-            off = next_lane_off(off);
+            let fc = fold_x64_plus_into(fused_pmull_lo_acc(na, nd, tb), fused_pmull_hi_acc(p, nd, tb), xc);
+            vst1q_u64(pa.cast::<u64>(), fa);
+            vst1q_u64(pb.cast::<u64>(), fb);
+            vst1q_u64(pc.cast::<u64>(), fc);
+            vst1q_u64(pd.cast::<u64>(), veorq_u64(nd, fc));
         }
     }
 }
@@ -1612,19 +1661,11 @@ fn next_lane_off(off: isize) -> isize {
     o
 }
 
-/// One-past-the-end byte pointers of four equal-length rows. The lane loops
-/// address lane `l` of a row of `n` lanes at the negative byte offset
-/// `16 (l - n)` from its end, so one register is both the shared address
-/// offset and the loop counter (it reaches zero after the last lane).
-///
-/// Panics unless the four rows have equal length (the callers slice all four
-/// to one lane count, so the check folds away in the lane kernels).
 #[inline(always)]
-fn row_ends(rows: [&mut [F128]; 4]) -> [*mut u8; 4] {
+fn row_ptrs(rows: [&mut [F128]; 4]) -> [*mut F128; 4] {
     let n = rows[0].len();
     assert!(rows.iter().all(|row| row.len() == n), "lane rows must have equal length");
-    // SAFETY: one past the end of each row.
-    rows.map(|row| unsafe { row.as_mut_ptr().add(n).cast::<u8>() })
+    rows.map(|row| row.as_mut_ptr())
 }
 
 /// Whether [`butterfly_fused_2layer_low_twiddles`] runs its lazy form
@@ -1666,7 +1707,6 @@ pub(super) unsafe fn butterfly_fused_2layer_low_lazy_zero_tail_blocks<F>(
     let dense = num_ntts - zero_tail;
     unsafe {
         use core::arch::aarch64::*;
-        let zero = vdupq_n_u64(0);
         for (i, block) in blocks.chunks_exact_mut(4 * num_ntts).enumerate() {
             let (t_outer, t_inner_a, t_inner_b) = twiddles(i);
             let (a, rest) = block.split_at_mut(num_ntts);
@@ -1683,17 +1723,27 @@ pub(super) unsafe fn butterfly_fused_2layer_low_lazy_zero_tail_blocks<F>(
                 b_tail.iter().chain(d_tail.iter()).all(|x| *x == F128::ZERO),
                 "zero-tail final pair needs zero b and d rows in the tail lanes"
             );
-            let [ea, eb, ec, ed] = row_ends([a_tail, b_tail, c_tail, d_tail]);
-            let mut off = -((zero_tail * core::mem::size_of::<F128>()) as isize);
-            while off != 0 {
-                let xa = vld1q_u64(ea.offset(off).cast::<u64>());
-                let xc = vld1q_u64(ec.offset(off).cast::<u64>());
-                let (fa, fc) = butterfly_low_fold_q(xa, xc, to, zero);
-                vst1q_u64(ea.offset(off).cast::<u64>(), fa);
-                vst1q_u64(eb.offset(off).cast::<u64>(), fa);
-                vst1q_u64(ec.offset(off).cast::<u64>(), fc);
-                vst1q_u64(ed.offset(off).cast::<u64>(), fc);
-                off = next_lane_off(off);
+            let [mut pa, mut pb, mut pc, mut pd] = row_ptrs([a_tail, b_tail, c_tail, d_tail]);
+            let mut pairs = zero_tail >> 1;
+            while pairs != 0 {
+                let (xa0, xa1) = load_pair_q(pa);
+                let (xc0, xc1) = load_pair_q(pc);
+                let (fa0, fc0) = butterfly_low_fold_zero_q(xa0, xc0, to);
+                let (fa1, fc1) = butterfly_low_fold_zero_q(xa1, xc1, to);
+                store_pair_q_adv(&mut pa, fa0, fa1);
+                store_pair_q_adv(&mut pb, fa0, fa1);
+                store_pair_q_adv(&mut pc, fc0, fc1);
+                store_pair_q_adv(&mut pd, fc0, fc1);
+                pairs -= 1;
+            }
+            if zero_tail & 1 != 0 {
+                let xa = vld1q_u64(pa.cast::<u64>());
+                let xc = vld1q_u64(pc.cast::<u64>());
+                let (fa, fc) = butterfly_low_fold_zero_q(xa, xc, to);
+                vst1q_u64(pa.cast::<u64>(), fa);
+                vst1q_u64(pb.cast::<u64>(), fa);
+                vst1q_u64(pc.cast::<u64>(), fc);
+                vst1q_u64(pd.cast::<u64>(), fc);
             }
         }
     }
@@ -2154,13 +2204,55 @@ unsafe fn butterfly_fused_2layer_row_with_const_q<const ABSORB: bool>(
     unsafe {
         use core::arch::aarch64::*;
         let n = a.len();
-        let [ea, eb, ec, ed] = row_ends([a, b, c, d]);
-        let mut off = -((n * core::mem::size_of::<F128>()) as isize);
-        while off != 0 {
-            let xa = vld1q_u64(ea.offset(off).cast::<u64>());
-            let xb = vld1q_u64(eb.offset(off).cast::<u64>());
-            let xc = vld1q_u64(ec.offset(off).cast::<u64>());
-            let xd = vld1q_u64(ed.offset(off).cast::<u64>());
+        let [mut pa, mut pb, mut pc, mut pd] = row_ptrs([a, b, c, d]);
+        let mut pairs = n >> 1;
+        while pairs != 0 {
+            let (xa0, xa1) = load_pair_q(pa);
+            let (xc0, xc1) = load_pair_q(pc);
+            if ABSORB {
+                let na0 = fused_pmull_hi_acc(fused_pmull_lo_acc(xa0, xc0, to.0), xc0, to.0);
+                let p0 = cross_sum_q(xc0, to.1);
+                let na1 = fused_pmull_hi_acc(fused_pmull_lo_acc(xa1, xc1, to.0), xc1, to.0);
+                let p1 = cross_sum_q(xc1, to.1);
+                let (xb0, xb1) = load_pair_q(pb);
+                let (xd0, xd1) = load_pair_q(pd);
+                let (nb0, nd0) = const_fold_zero(xb0, xd0, to);
+                let (nb1, nd1) = const_fold_zero(xb1, xd1, to);
+                let (fa0, fb0) = const_fold(na0, nb0, ta, p0);
+                let (fa1, fb1) = const_fold(na1, nb1, ta, p1);
+                store_pair_q_adv(&mut pa, fa0, fa1);
+                store_pair_q_adv(&mut pb, fb0, fb1);
+                let lc0 = fused_pmull_hi_acc(fused_pmull_lo_acc(na0, nd0, tb.0), nd0, tb.0);
+                let mc0 = fused_pmull_hi_acc(fused_pmull_lo_acc(p0, nd0, tb.1), nd0, tb.1);
+                let fc0 = fold_x64_plus_into(lc0, mc0, xc0);
+                let lc1 = fused_pmull_hi_acc(fused_pmull_lo_acc(na1, nd1, tb.0), nd1, tb.0);
+                let mc1 = fused_pmull_hi_acc(fused_pmull_lo_acc(p1, nd1, tb.1), nd1, tb.1);
+                let fc1 = fold_x64_plus_into(lc1, mc1, xc1);
+                store_pair_q_adv(&mut pc, fc0, fc1);
+                store_pair_q_adv(&mut pd, veorq_u64(nd0, fc0), veorq_u64(nd1, fc1));
+            } else {
+                let (na0, nc0, p0) = const_lazy_zero(xa0, xc0, to);
+                let (na1, nc1, p1) = const_lazy_zero(xa1, xc1, to);
+                let (xb0, xb1) = load_pair_q(pb);
+                let (xd0, xd1) = load_pair_q(pd);
+                let (nb0, nd0) = const_fold_zero(xb0, xd0, to);
+                let (nb1, nd1) = const_fold_zero(xb1, xd1, to);
+                let (fa0, fb0) = const_fold(na0, nb0, ta, p0);
+                let (fa1, fb1) = const_fold(na1, nb1, ta, p1);
+                store_pair_q_adv(&mut pa, fa0, fa1);
+                store_pair_q_adv(&mut pb, fb0, fb1);
+                let (fc0, fd0) = const_fold(nc0, nd0, tb, p0);
+                let (fc1, fd1) = const_fold(nc1, nd1, tb, p1);
+                store_pair_q_adv(&mut pc, fc0, fc1);
+                store_pair_q_adv(&mut pd, fd0, fd1);
+            }
+            pairs -= 1;
+        }
+        if n & 1 != 0 {
+            let xa = vld1q_u64(pa.cast::<u64>());
+            let xb = vld1q_u64(pb.cast::<u64>());
+            let xc = vld1q_u64(pc.cast::<u64>());
+            let xd = vld1q_u64(pd.cast::<u64>());
             let (fa, fb, fc, fd) = if ABSORB {
                 let na = fused_pmull_hi_acc(fused_pmull_lo_acc(xa, xc, to.0), xc, to.0);
                 let p = cross_sum_q(xc, to.1);
@@ -2177,11 +2269,10 @@ unsafe fn butterfly_fused_2layer_row_with_const_q<const ABSORB: bool>(
                 let (fc, fd) = const_fold(nc, nd, tb, p);
                 (fa, fb, fc, fd)
             };
-            vst1q_u64(ea.offset(off).cast::<u64>(), fa);
-            vst1q_u64(eb.offset(off).cast::<u64>(), fb);
-            vst1q_u64(ec.offset(off).cast::<u64>(), fc);
-            vst1q_u64(ed.offset(off).cast::<u64>(), fd);
-            off = next_lane_off(off);
+            vst1q_u64(pa.cast::<u64>(), fa);
+            vst1q_u64(pb.cast::<u64>(), fb);
+            vst1q_u64(pc.cast::<u64>(), fc);
+            vst1q_u64(pd.cast::<u64>(), fd);
         }
     }
 }

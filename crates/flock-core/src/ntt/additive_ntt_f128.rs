@@ -1501,6 +1501,13 @@ impl AdditiveNttF128 {
             })
             .collect();
         let use_neon = kernels::vector_resident_rows();
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        let tw_prep = (use_neon && kernels::use_prepared_3layer_absorb()).then(|| unsafe {
+            (
+                tw4.iter().map(|t| kernels::prepare_3layer(t)).collect::<Vec<_>>(),
+                tw7.iter().map(|t| kernels::prepare_3layer(t)).collect::<Vec<_>>(),
+            )
+        });
         // Both eighths are even, so a row group never mixes position parity
         // and the static odd tail holds exactly as in the incumbent passes.
         let odd_lanes = NUM_NTTS - odd_tail.min(NUM_NTTS);
@@ -1551,6 +1558,13 @@ impl AdditiveNttF128 {
                                 block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local], use_neon,
                             );
                         } else {
+                            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                            if let Some((ref tw4_prep, _)) = tw_prep {
+                                kernels::butterfly_fused_3layer_row_with_const_q::<true>(
+                                    block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4_prep[local],
+                                );
+                                continue;
+                            }
                             kernels::butterfly_fused_3layer_row_with_policy(
                                 block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local], use_neon,
                             );
@@ -1568,6 +1582,13 @@ impl AdditiveNttF128 {
                                 sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
                             );
                         } else {
+                            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                            if let Some((_, ref tw7_prep)) = tw_prep {
+                                kernels::butterfly_fused_3layer_row_with_const_q::<true>(
+                                    sub_base, EIGHTH7, NUM_NTTS, lanes, r, &tw7_prep[8 * local + b],
+                                );
+                                continue;
+                            }
                             kernels::butterfly_fused_3layer_row_with_policy(
                                 sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
                             );
