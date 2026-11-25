@@ -5585,10 +5585,19 @@ fn transpose_forward_ntt_sparse_retained_with(
         remaining -= 3;
         transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, remaining);
     }
-    for layer in (drop_log..remaining).rev() {
+    for layer in (drop_log + 1..remaining).rev() {
         transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, layer);
     }
-    let retained = xor_collapse_cosets(&data, log_d - drop_log);
+    let retained = match (remaining > drop_log, drop_log) {
+        (true, 2) => collapse_final_butterflies::<2>(ntt, &data),
+        (true, 3) => collapse_final_butterflies::<3>(ntt, &data),
+        (has_layer, _) => {
+            if has_layer {
+                transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, drop_log);
+            }
+            xor_collapse_cosets(&data, log_d - drop_log)
+        }
+    };
     crate::scratch::give_sparse_ntt_data(data);
     Some(retained)
 }
@@ -5688,6 +5697,53 @@ fn transpose_forward_ntt_factored_final_3layer_low_half(
                 }
             }
         });
+}
+
+/// Fuse the last nontrivial transpose layer with the top-only coset folds.
+///
+/// For block c, its butterfly contributes p = a + b to the top row and
+/// b + t[c]*p to the bottom row. Twiddles are linear in the block index:
+/// t[c] is the sum of t[1 << j] over the set bits of c. Accumulate the
+/// corresponding p sums first, then multiply just once per index bit.
+fn collapse_final_butterflies<const BITS: usize>(
+    ntt: &AdditiveNttF128,
+    data: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    let blocks = 1usize << BITS;
+    let keep = data.len() / blocks;
+    let half = keep / 2;
+    debug_assert!(data.len().is_power_of_two() && half > 0);
+    let basis: [F128; BITS] = std::array::from_fn(|bit| ntt.twiddle(BITS, 1 << bit));
+    let mut out = vec![F128::ZERO; keep];
+    let (tops, bottoms) = out.split_at_mut(half);
+    tops.par_iter_mut().zip(bottoms.par_iter_mut())
+        .with_min_len(small_ntt_min_jobs(2 * blocks))
+        .enumerate()
+        .for_each(|(row, (top, bottom))| {
+            let mut top_sum = F128::ZERO;
+            let mut bottom_sum = F128::ZERO;
+            let mut groups = [F128::ZERO; BITS];
+            for block in 0..blocks {
+                let start = block * keep + row;
+                let b = data[start + half];
+                let pair = data[start] + b;
+                top_sum += pair;
+                bottom_sum += b;
+                for (bit, group) in groups.iter_mut().enumerate() {
+                    if block & (1 << bit) != 0 {
+                        *group += pair;
+                    }
+                }
+            }
+            for (weight, group) in basis.iter().zip(groups) {
+                bottom_sum += *weight * group;
+            }
+            *top = top_sum;
+            *bottom = bottom_sum;
+        });
+    out
 }
 
 fn xor_collapse_cosets(data: &[F128], keep_log: usize) -> Vec<F128> {
