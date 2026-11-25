@@ -25498,8 +25498,25 @@ kernel void zc_r2_products_horner_cs(
         }
     }
 
-    fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
-        if incumbent {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct ZcR2SourceFlags {
+        incumbent: bool,
+        planes: bool,
+        clmul16: bool,
+    }
+
+    impl ZcR2SourceFlags {
+        fn new(incumbent: bool) -> Self {
+            Self {
+                incumbent,
+                planes: !incumbent && super::gpu_zc_r2_planes_enabled(),
+                clmul16: !incumbent && super::gpu_zc_r2_clmul16_enabled(),
+            }
+        }
+    }
+
+    fn zc_r2_source_with_flags(flags: ZcR2SourceFlags) -> std::borrow::Cow<'static, str> {
+        if flags.incumbent {
             std::borrow::Cow::Owned(format!(
                 "#define FLOCK_ZC_R2_CLMUL_INCUMBENT 1\n{ZC_R2_MSL_SOURCE}"
             ))
@@ -25508,10 +25525,10 @@ kernel void zc_r2_products_horner_cs(
             // (`ENV_NO_ZC_R2_PLANES`) and the 16-bit carry-less pieces
             // (`ENV_NO_GPU_ZC_R2_CLMUL16`, which then also take the product).
             let mut defs = String::new();
-            if super::gpu_zc_r2_planes_enabled() {
+            if flags.planes {
                 defs.push_str("#define FLOCK_ZC_R2_PLANES 1\n");
             }
-            if super::gpu_zc_r2_clmul16_enabled() {
+            if flags.clmul16 {
                 defs.push_str("#define FLOCK_ZC_R2_CLMUL16 1\n");
             }
             if defs.is_empty() {
@@ -25520,6 +25537,11 @@ kernel void zc_r2_products_horner_cs(
                 std::borrow::Cow::Owned(format!("{defs}{ZC_R2_MSL_SOURCE}"))
             }
         }
+    }
+
+    #[cfg(test)]
+    fn zc_r2_msl_source(incumbent: bool) -> std::borrow::Cow<'static, str> {
+        zc_r2_source_with_flags(ZcR2SourceFlags::new(incumbent))
     }
 
     #[cfg(test)]
@@ -25772,28 +25794,16 @@ kernel void zc_r2_horner_oracle(
         (g as usize).min(hi_size)
     }
 
-    fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
+    type ZcR2OrdinaryPipelines = (Id, Id, (u64, u64, u64));
+
+    fn zc_r2_build_ordinary(
+        gpu: &Gpu,
+        library: impl FnOnce() -> Result<Id, String>,
+    ) -> Result<ZcR2OrdinaryPipelines, String> {
         unsafe {
             let pool = gpu.pool_push();
             let built = (|| -> Result<(Id, Id), String> {
-                let source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled());
-                let src = gpu.api.nsstring(&source)?;
-                let mut err: Id = NIL;
-                let library: Id = send!(
-                    gpu.api,
-                    unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
-                    gpu.device,
-                    c"newLibraryWithSource:options:error:",
-                    src,
-                    NIL,
-                    &mut err
-                );
-                if library.is_null() {
-                    return Err(format!(
-                        "zc-r2 shader compile failed: {}",
-                        gpu.api.error_string(err)
-                    ));
-                }
+                let library = library()?;
                 let make_pipeline = |name: &str| -> Result<Id, String> {
                     let ns = gpu.api.nsstring(name)?;
                     let f: Id = send!(
@@ -25892,7 +25902,65 @@ kernel void zc_r2_horner_oracle(
                 gpu.release(pso);
                 return Err("zc-r2 Horner PSO cannot run 256 threads".into());
             }
-            let nib_buf = gpu.new_buffer(256 * 16)?;
+            Ok((pso, horner_pso, horner_resources))
+        }
+    }
+
+    fn zc_r2_standalone_library(gpu: &Gpu, flags: ZcR2SourceFlags) -> Result<Id, String> {
+        unsafe {
+            let source = zc_r2_source_with_flags(flags);
+            let src = gpu.api.nsstring(&source)?;
+            let mut err: Id = NIL;
+            let library: Id = send!(
+                gpu.api,
+                unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id,
+                gpu.device,
+                c"newLibraryWithSource:options:error:",
+                src,
+                NIL,
+                &mut err
+            );
+            if library.is_null() {
+                return Err(format!(
+                    "zc-r2 shader compile failed: {}",
+                    gpu.api.error_string(err)
+                ));
+            }
+            Ok(library)
+        }
+    }
+
+    fn zc_r2_init(gpu: &'static Gpu) -> Result<ZcR2, String> {
+        let flags = ZcR2SourceFlags::new(!super::gpu_zc_r2_karatsuba_enabled());
+        let standalone = || zc_r2_build_ordinary(gpu, || zc_r2_standalone_library(gpu, flags));
+        let ((pso, horner_pso, horner_resources), library_source) =
+            if let Some(library) = zc_r2_take_ready_library(gpu, flags) {
+                match zc_r2_build_ordinary(gpu, || Ok(library)) {
+                    Ok(built) => (built, "shared"),
+                    Err(e) => {
+                        if super::gpu_zc_r2_debug() {
+                            eprintln!("[zc-r2] ready library: {e}; standalone fallback");
+                        }
+                        (standalone()?, "standalone")
+                    }
+                }
+            } else {
+                (standalone()?, "standalone")
+            };
+        if super::gpu_zc_r2_debug() {
+            eprintln!(
+                "[zc-r2] ordinary library={library_source}; Horner resources {horner_resources:?}"
+            );
+        }
+        unsafe {
+            let nib_buf = match gpu.new_buffer(256 * 16) {
+                Ok(buf) => buf,
+                Err(e) => {
+                    gpu.release(horner_pso);
+                    gpu.release(pso);
+                    return Err(e);
+                }
+            };
             Ok(ZcR2 {
                 pso,
                 horner_pso,
@@ -25929,6 +25997,63 @@ kernel void zc_r2_horner_oracle(
     /// the pipeline failed (R2-CS off for the process).
     static ZC_R2_CS_PSO: std::sync::OnceLock<Option<(usize, usize)>> = std::sync::OnceLock::new();
 
+    // One ownership transfer from the successful CS build to ordinary R2.
+    // Null is an open slot. The address of ZC_R2_LIBRARY_CLOSED is a sentinel,
+    // never an Objective-C object. Ordinary R2 closes the slot on a cold miss.
+    static ZC_R2_READY_LIBRARY: std::sync::atomic::AtomicPtr<c_void> =
+        std::sync::atomic::AtomicPtr::new(NIL);
+    static ZC_R2_LIBRARY_CLOSED: u8 = 0;
+    static ZC_R2_READY_LIBRARY_KEY: OnceLock<(usize, ZcR2SourceFlags)> = OnceLock::new();
+
+    fn zc_r2_closed_library_slot() -> Id {
+        std::ptr::from_ref(&ZC_R2_LIBRARY_CLOSED).cast_mut().cast()
+    }
+
+    fn zc_r2_ready_library_enabled() -> bool {
+        crate::is_ranked_worker_process() && !super::env_is_one("FLOCK_NO_R2_READY_LIBRARY_REUSE")
+    }
+
+    /// The sole CS producer offers the +1 returned by newLibraryWithSource.
+    /// If the ordinary initializer has already taken or refused it, release.
+    fn zc_r2_offer_ready_library(gpu: &Gpu, library: Id, flags: ZcR2SourceFlags) {
+        use std::sync::atomic::Ordering;
+        if library.is_null() {
+            return;
+        }
+        if ZC_R2_READY_LIBRARY_KEY.set((gpu.device as usize, flags)).is_ok()
+            && ZC_R2_READY_LIBRARY
+                .compare_exchange(NIL, library, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+        {
+            return;
+        }
+        unsafe { gpu.release(library) };
+    }
+
+    /// Observe only a completed offer. A miss does not join the CS builder.
+    fn zc_r2_take_ready_library(gpu: &Gpu, flags: ZcR2SourceFlags) -> Option<Id> {
+        use std::sync::atomic::Ordering;
+        if !zc_r2_ready_library_enabled() {
+            return None;
+        }
+        let closed = zc_r2_closed_library_slot();
+        let library = ZC_R2_READY_LIBRARY.swap(closed, Ordering::AcqRel);
+        if library.is_null() || library == closed {
+            if super::gpu_zc_r2_debug() {
+                eprintln!("[zc-r2] ready library: unavailable; standalone");
+            }
+            return None;
+        }
+        if ZC_R2_READY_LIBRARY_KEY.get() == Some(&(gpu.device as usize, flags)) {
+            return Some(library);
+        }
+        unsafe { gpu.release(library) };
+        if super::gpu_zc_r2_debug() {
+            eprintln!("[zc-r2] ready library: device or source mismatch; standalone");
+        }
+        None
+    }
+
     /// Whether the R2-CS pipeline was built from the steal source
     /// (`super::ENV_NO_R2_STEAL`): its kernel reads the claim word.
     static ZC_R2_STEAL_KERNEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -25936,16 +26061,16 @@ kernel void zc_r2_horner_oracle(
     /// Compile the R2-CS library on `gpu`'s device and make its pipeline;
     /// with the steal on, from the steal source first (the record's source
     /// if that one does not build).
-    fn zc_r2_cs_build_pso(gpu: &Gpu) -> Result<Id, String> {
-        let mut source = zc_r2_msl_source(!super::gpu_zc_r2_karatsuba_enabled()).into_owned();
+    fn zc_r2_cs_build_pso(gpu: &Gpu, flags: ZcR2SourceFlags) -> Result<(Id, Id), String> {
+        let mut source = zc_r2_source_with_flags(flags).into_owned();
         source.push_str(&r2cs_fast::source(ZC_R2_CS_MSL_SOURCE));
         if super::zc_r2_steal_enabled()
             && let Some(steal) = r2steal::source(&source)
         {
             match zc_r2_cs_compile(gpu, &steal) {
-                Ok(pso) => {
+                Ok(built) => {
                     ZC_R2_STEAL_KERNEL.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return Ok(pso);
+                    return Ok(built);
                 }
                 Err(e) => {
                     if super::gpu_zc_r2_debug() {
@@ -25957,10 +26082,10 @@ kernel void zc_r2_horner_oracle(
         zc_r2_cs_compile(gpu, &source)
     }
 
-    fn zc_r2_cs_compile(gpu: &Gpu, source: &str) -> Result<Id, String> {
+    fn zc_r2_cs_compile(gpu: &Gpu, source: &str) -> Result<(Id, Id), String> {
         unsafe {
             let pool = gpu.pool_push();
-            let built = (|| -> Result<Id, String> {
+            let built = (|| -> Result<(Id, Id), String> {
                 let src = gpu.api.nsstring(source)?;
                 let mut err: Id = NIL;
                 let library: Id = send!(
@@ -26002,8 +26127,13 @@ kernel void zc_r2_horner_oracle(
                     }
                     Ok(pso)
                 })();
-                gpu.release(library);
-                made
+                let library = if made.is_ok() && zc_r2_ready_library_enabled() {
+                    library
+                } else {
+                    gpu.release(library);
+                    NIL
+                };
+                made.map(|pso| (pso, library))
             })();
             gpu.pool_pop(pool);
             built
@@ -26013,13 +26143,19 @@ kernel void zc_r2_horner_oracle(
     /// The R2-CS pipeline for `gpu`'s device, joining its build (or doing it
     /// when no prewarm thread started it). `None` = R2-CS off.
     fn zc_r2_cs_pso(gpu: &Gpu) -> Option<Id> {
-        let built = *ZC_R2_CS_PSO.get_or_init(|| match zc_r2_cs_build_pso(gpu) {
-            Ok(pso) => Some((pso as usize, gpu.device as usize)),
-            Err(e) => {
-                if super::gpu_zc_r2_debug() {
-                    eprintln!("[zc-r2] R2-CS PSO unavailable (R2-CS off): {e}");
+        let built = *ZC_R2_CS_PSO.get_or_init(|| {
+            let flags = ZcR2SourceFlags::new(!super::gpu_zc_r2_karatsuba_enabled());
+            match zc_r2_cs_build_pso(gpu, flags) {
+                Ok((pso, library)) => {
+                    zc_r2_offer_ready_library(gpu, library, flags);
+                    Some((pso as usize, gpu.device as usize))
                 }
-                None
+                Err(e) => {
+                    if super::gpu_zc_r2_debug() {
+                        eprintln!("[zc-r2] R2-CS PSO unavailable (R2-CS off): {e}");
+                    }
+                    None
+                }
             }
         });
         built.filter(|&(_, dev)| dev == gpu.device as usize).map(|(pso, _)| pso as Id)

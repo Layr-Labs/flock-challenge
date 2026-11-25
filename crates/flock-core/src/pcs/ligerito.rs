@@ -5594,48 +5594,47 @@ fn transpose_forward_ntt_sparse_retained_with(
 }
 
 /// The same retained row with four multipliers prepared before the row loop.
-/// Each constant multiply absorbs its subsequent additive term directly into
-/// `mul_const_prep_xor` (zero extra SIMD issue slots) while staying in NEON
-/// vector registers.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
 #[inline(always)]
 fn l0_factored_final3_prepared_row(
     values: [F128; 8],
     constants: [crate::field::gf2_128::aarch64::ConstPrep; 4],
 ) -> [F128; 4] {
-    use core::arch::aarch64::{uint64x2_t, veorq_u64};
-    use crate::field::gf2_128::aarch64::mul_const_prep_xor;
+    use core::arch::aarch64::uint64x2_t;
+    use crate::field::gf2_128::aarch64::mul_const_prep;
 
-    // SAFETY: AES is enabled; F128 is repr(C, align(16)) two u64 limbs with
-    // little-endian lane order matching uint64x2_t.
-    unsafe {
-        let to_q = |x: F128| core::mem::transmute::<F128, uint64x2_t>(x);
-        let from_q = |x: uint64x2_t| core::mem::transmute::<uint64x2_t, F128>(x);
-        let x0 = to_q(values[0]);
-        let x1 = to_q(values[1]);
-        let x2 = to_q(values[2]);
-        let x3 = to_q(values[3]);
-        let x4 = to_q(values[4]);
-        let x5 = to_q(values[5]);
-        let x6 = to_q(values[6]);
-        let x7 = to_q(values[7]);
-        let p0 = veorq_u64(x0, x1);
-        let p1 = veorq_u64(x2, x3);
-        let p2 = veorq_u64(x4, x5);
-        let p3 = veorq_u64(x6, x7);
-        let q3 = mul_const_prep_xor(constants[0], p1, x3);
-        let q5 = mul_const_prep_xor(constants[1], p2, x5);
-        let q7 = mul_const_prep_xor(constants[2], p3, x7);
-        let t0 = veorq_u64(p0, p1);
-        let t1 = veorq_u64(x1, q3);
-        let t2 = veorq_u64(p2, p3);
-        let t3 = veorq_u64(q5, q7);
-        let out0 = veorq_u64(t0, t2);
-        let out1 = veorq_u64(t1, t3);
-        let out2 = mul_const_prep_xor(constants[3], t2, veorq_u64(p1, p3));
-        let out3 = mul_const_prep_xor(constants[3], t3, veorq_u64(q3, q7));
-        [from_q(out0), from_q(out1), from_q(out2), from_q(out3)]
-    }
+    let mul = |c, x: F128| {
+        // SAFETY: AES is enabled. F128 has two u64 limbs without padding;
+        // little-endian layout maps lo/hi to vector lanes 0/1.
+        unsafe {
+            core::mem::transmute::<uint64x2_t, F128>(mul_const_prep(
+                c,
+                core::mem::transmute::<F128, uint64x2_t>(x),
+            ))
+        }
+    };
+    let [x0, x1, x2, x3, x4, x5, x6, x7] = values;
+    let p0 = x0 + x1;
+    let p1 = x2 + x3;
+    let p2 = x4 + x5;
+    let p3 = x6 + x7;
+    let x = mul(constants[0], p1);
+    let y = mul(constants[2], p3);
+    let z = mul(constants[1], p2);
+    let q3 = x + x3;
+    let q5 = z + x5;
+    let q7 = y + x7;
+    let t0 = p0 + p1;
+    let t1 = x1 + q3;
+    let t2 = p2 + p3;
+    let t3 = q5 + q7;
+
+    [
+        t0 + t2,
+        t1 + t3,
+        p1 + (mul(constants[3], t2) + p3),
+        q3 + (mul(constants[3], t3) + q7),
+    ]
 }
 
 fn transpose_forward_ntt_factored_final_3layer_low_half(

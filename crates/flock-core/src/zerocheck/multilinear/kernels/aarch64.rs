@@ -7741,15 +7741,9 @@ pub(crate) fn fold_tri_and_message_aarch64<const DEPTH: usize, const NT: bool, c
 ) -> [F128; TRI_SLOTS] {
     if zc_tri_group_inline_enabled() {
         if DEPTH == 2 && zc_tri_fold_regs_enabled() {
-            if zc_tri_fused_fold_enabled() {
-                fold_tri_and_message_core::<DEPTH, NT, ABL, false, true, true, true>(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
-                )
-            } else {
-                fold_tri_and_message_core::<DEPTH, NT, ABL, false, true, true, false>(
-                    a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
-                )
-            }
+            fold_tri_and_message_core::<DEPTH, NT, ABL, false, true, true, false>(
+                a_in, b_in, a_out, b_out, rho_a, rho_b, rho_c, eq_lo, eq_prep,
+            )
         } else if DEPTH == 3 && zc_tri_fused_fold_enabled() {
             // Depth three: the inlined group fold with prepared-constant
             // products; `FLOCK_NO_ZC_TRI_FUSED_FOLD` takes the parent's
