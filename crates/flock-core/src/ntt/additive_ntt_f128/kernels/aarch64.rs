@@ -1196,6 +1196,8 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
 ) {
     use core::arch::aarch64::*;
     unsafe {
+        let ext = use_const_ext();
+        let (p2, p4, p5, p6) = (three_coeffs(t2), three_coeffs(t4), three_coeffs(t5), three_coeffs(t6));
         for lane in 0..lanes {
             let base = ptr.add(r * num_ntts + lane);
             let step = eighth * num_ntts;
@@ -1203,14 +1205,8 @@ unsafe fn butterfly_fused_3layer_zero_root_row_with_q(
             let mut v: [uint64x2_t; 8] =
                 core::array::from_fn(|i| vld1q_u64(base.add(i * step).cast::<u64>()));
 
-            if use_const_ext() {
-                fused3_zero_root_prepared_q(
-                    &mut v,
-                    three_coeffs(t2),
-                    three_coeffs(t4),
-                    three_coeffs(t5),
-                    three_coeffs(t6),
-                );
+            if ext {
+                fused3_zero_root_prepared_q(&mut v, p2, p4, p5, p6);
             } else {
                 fused3_zero_root_q(&mut v, t2, t4, t5, t6);
             }
@@ -1328,6 +1324,74 @@ pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
             }
         }
     }
+}
+
+#[inline(always)]
+unsafe fn prefetch_tile_ahead(
+    ptr: *const F128, step: usize, num_ntts: usize, a: usize, outer_count: usize,
+    outer_step: usize, r: usize, r0: usize, next_row0_ptr: *const F128,
+) {
+    let p = unsafe {
+        if a + 1 < outer_count { ptr.add(((a + 1) * outer_step + r) * num_ntts) }
+        else if !next_row0_ptr.is_null() { next_row0_ptr.add((r - r0) * num_ntts) }
+        else { return }
+    };
+    for i in 0..8usize {
+        let mut off = 0usize;
+        while off < num_ntts * core::mem::size_of::<F128>() {
+            unsafe { core::arch::asm!("prfm pldl2keep, [{a}]", a = in(reg) p.add(i * step).cast::<u8>().add(off), options(nostack, readonly, preserves_flags)) };
+            off += 128;
+        }
+    }
+}
+
+/// Process `outer_count` strides (`a * outer_step + r`, `r in r0..r0 + rows`)
+/// sharing one seven-twiddle set; prepares `three_coeffs` once and uses the
+/// zero-spill (`<false>`) prepared kernel so all 14 twiddle Q-regs stay live
+/// across every row (146 insns/lane, 0 spills vs `<true>`'s 169 insns + 20 movs).
+#[target_feature(enable = "aes")]
+#[inline(never)]
+unsafe fn butterfly_fused_3layer_tile_rows(
+    ptr: *mut F128, eighth: usize, num_ntts: usize, odd_lanes: usize,
+    r0: usize, rows: usize, outer_count: usize, outer_step: usize,
+    twiddles: &[F128; 7], prefetch: bool, next_row0_ptr: *const F128,
+) {
+    use core::arch::aarch64::*;
+    let step = eighth * num_ntts;
+    unsafe {
+        let t: [uint64x2_t; 7] = core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
+        let prepared = core::array::from_fn(|i| three_coeffs(t[i]));
+        for a in 0..outer_count {
+            for r in r0..r0 + rows {
+                if prefetch {
+                    prefetch_tile_ahead(ptr, step, num_ntts, a, outer_count, outer_step, r, r0, next_row0_ptr);
+                }
+                let row = a * outer_step + r;
+                let lanes = if row & 1 == 1 { odd_lanes } else { num_ntts };
+                butterfly_fused_3layer_row_with_const_q::<false>(ptr, eighth, num_ntts, lanes, row, &prepared);
+            }
+        }
+    }
+}
+
+/// Cache-resident layers-4..10 tile of the ranked hybrid CPU suffix: resolves
+/// `use_three_const_fold` once and prepares each 7-twiddle set once across its rows.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_3layer_tile(
+    block_base: *mut F128, eighth4: usize, eighth7: usize, num_ntts: usize,
+    odd_lanes: usize, r0: usize, rows: usize, tw4: &[F128; 7], tw7: &[[F128; 7]],
+    zero_root_block: bool, prefetch: bool, next_row0_ptr: *const F128,
+) -> bool {
+    if zero_root_block || !use_three_const_fold() {
+        return false;
+    }
+    unsafe {
+        butterfly_fused_3layer_tile_rows(block_base, eighth4, num_ntts, odd_lanes, r0, rows, 8, eighth7, tw4, prefetch, next_row0_ptr);
+        for b in 0..8usize {
+            butterfly_fused_3layer_tile_rows(block_base.add(b * eighth4 * num_ntts), eighth7, num_ntts, odd_lanes, r0, rows, 1, 0, &tw7[b], false, core::ptr::null());
+        }
+    }
+    true
 }
 
 /// Two low-constant products with everything held in q registers: product

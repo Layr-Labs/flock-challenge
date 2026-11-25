@@ -1525,6 +1525,15 @@ impl AdditiveNttF128 {
             // touches only positions of its own tile.
             unsafe {
                 let block_base = (base as *mut F128).add(abs_b * BLOCK4_POS * NUM_NTTS);
+                let next_ptr = next_row0
+                    .map_or(core::ptr::null(), |p0| (base as *const F128).add(p0 * NUM_NTTS));
+                if kernels::try_butterfly_fused_3layer_tile(
+                    block_base, EIGHTH4, EIGHTH7, NUM_NTTS, odd_lanes, r0, ROWS,
+                    &tw4[local], &tw7[8 * local..8 * local + 8], abs_b == 0,
+                    prefetch, next_ptr, use_neon,
+                ) {
+                    return;
+                }
                 for a in 0..8usize {
                     for r in r0..r0 + ROWS {
                         if prefetch {

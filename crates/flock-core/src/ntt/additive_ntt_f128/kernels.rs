@@ -385,6 +385,20 @@ pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
     false
 }
 
+#[inline]
+pub(super) unsafe fn try_butterfly_fused_3layer_tile(
+    block_base: *mut F128, eighth4: usize, eighth7: usize, num_ntts: usize,
+    odd_lanes: usize, r0: usize, rows: usize, tw4: &[F128; 7], tw7: &[[F128; 7]],
+    zero_root_block: bool, prefetch: bool, next_row0_ptr: *const F128, use_neon: bool,
+) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    if use_neon {
+        return unsafe { aarch64::butterfly_fused_3layer_tile(block_base, eighth4, eighth7, num_ntts, odd_lanes, r0, rows, tw4, tw7, zero_root_block, prefetch, next_row0_ptr) };
+    }
+    let _ = (block_base, eighth4, eighth7, num_ntts, odd_lanes, r0, rows, tw4, tw7, zero_root_block, prefetch, next_row0_ptr, use_neon);
+    false
+}
+
 /// Whether the AArch64 vector-resident radix-8 row kernels are used.
 ///
 /// `FLOCK_NO_NTT_NEON_ROWS=1` restores the portable `F128`-typed chain in the
