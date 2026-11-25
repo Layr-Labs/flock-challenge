@@ -5249,7 +5249,7 @@ impl Blake3Setup {
     /// [`flock_core::r1cs::WitnessLayout`]). The generic matrix provers and
     /// chain/Merkle wrappers still require row-major.
     pub fn new_batch_major(n_blocks: usize) -> Self {
-        let mut s = Self::new(n_blocks);
+        let mut s = Self::with_log_inv_rate(n_blocks, 1);
         s.r1cs.layout = flock_core::r1cs::WitnessLayout::BatchMajor;
         // Batch-major is outside the recognized reverse-transpose shape.
         // Preserve the old eager CSC construction for this explicit fallback.
@@ -5345,6 +5345,10 @@ impl Blake3Setup {
     }
 
     pub fn new(n_blocks: usize) -> Self {
+        // The ranked tail's pipelines and constant buffers need no witness.
+        if n_blocks == 1 << 18 {
+            flock_core::zerocheck::univariate_skip_optimized::ranked_r1_tail_prewarm_early();
+        }
         Self::with_log_inv_rate(n_blocks, 1)
     }
 

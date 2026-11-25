@@ -3048,7 +3048,7 @@ pub(crate) fn r2_full_xb_rho_prep(eq_lo: &[F128]) -> Option<Vec<F128>> {
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
+unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool, const STATIC_NT: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -3073,7 +3073,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
         assert!(!head || tail_compact);
         assert!(lo_size.is_multiple_of(128));
         let head_inline = head && r2_head_inline_enabled();
-        let nt_deltas = tail_compact && r2_nt_deltas_enabled();
+        let nt_deltas = STATIC_NT || (tail_compact && r2_nt_deltas_enabled());
         let mut head_ok = true;
         let zero = vdupq_n_u64(0);
         let tri_zero = TriNeon {
@@ -3325,17 +3325,30 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb(
     skip_pure: bool,
     out: *mut F128,
 ) {
+    // C capture is admitted only for the ranked head-compacted walk.
+    // Fix its usual store mode before entering the loop, and keep the
+    // configurable store selection for every other route.
+    let static_nt = skip_pure && tail_compact && r2_nt_deltas_enabled();
+    let fold7 = !table7.is_null();
+    let table = if fold7 { table7 } else { table_data };
     unsafe {
-        if table7.is_null() {
-            fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false>(
-                table_data, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
+        match (fold7, static_nt) {
+            (false, true) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false, true>(
+                table, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
                 head_fail, skip_pure, out,
-            )
-        } else {
-            fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true>(
-                table7, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
+            ),
+            (true, true) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true, true>(
+                table, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
                 head_fail, skip_pure, out,
-            )
+            ),
+            (false, false) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false, false>(
+                table, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
+                head_fail, skip_pure, out,
+            ),
+            (true, false) => fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true, false>(
+                table, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
+                head_fail, skip_pure, out,
+            ),
         }
     }
 }

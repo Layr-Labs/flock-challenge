@@ -2568,8 +2568,8 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     let full_xb = false;
     // The full-sweep group weights `eq_lo[2u + 1]` in prepared form, shared
     // by every chunk's ranked loop (skipped when `full_xb` uses window-scaled
-    // weights; null without SHA3 or under `full_xb`, keeping fallbacks on the
-    // parent loop).
+    // weights; null without SHA3 or under `full_xb`). A head-compact replay
+    // prepares these weights on demand.
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
     let eq_prep = if full_xb { Vec::new() } else { kernels::aarch64::round2_eq_prep(eq_lo) };
     #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
@@ -3000,6 +3000,19 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // out of its chunks; the whole round is redone without the capture below.
     #[allow(unused_mut)]
     let mut capture_gpu_failed = false;
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    let replay_eq_prep = std::cell::OnceCell::new();
+    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_feature = "sha3")))]
+    let replay_eq_prep_ptr = |head: bool| {
+        // The prepared-weight replay needs ASM offsets for a head-compact
+        // destination, even if the successful full-XB sweep skipped prep.
+        #[cfg(target_feature = "sha3")]
+        if head && eq_prep_addr == 0 {
+            return replay_eq_prep.get_or_init(|| kernels::aarch64::round2_eq_prep(eq_lo)).as_ptr();
+        }
+        let _ = head;
+        eq_prep_addr as *const F128
+    };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if let Some(job) = gpu_job {
         let cpu_wall_ms = t_cpu_sweep.elapsed().as_secs_f64() * 1e3;
@@ -3063,6 +3076,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 // walk.
                 let mut scr_anchors = vec![F128::ZERO; anchor_chunk_size];
                 let mut scr_deltas = vec![0u8; delta_chunk_size];
+                let eq_prep = replay_eq_prep_ptr(r2cs && head_compact);
                 for x_hi in 0..prefix {
                     let pair_idx_base = x_hi * lo_size;
                     let (ap, bp) = r2_rows(x_hi);
@@ -3088,7 +3102,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                             anchors,
                             deltas,
                             eq_lo.as_ptr(),
-                            eq_prep_addr as *const F128,
+                            eq_prep,
                             lo_size,
                             pair_idx_base,
                             pair_in_block_mask,
@@ -3129,6 +3143,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
     // round serially with the full walk, every store and every slot.
     #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
     if cs_redo_all {
+        let eq_prep = replay_eq_prep_ptr(head_compact);
         for x_hi in 0..hi_size {
             let pair_idx_base = x_hi * lo_size;
             let (ap, bp) = r2_rows(x_hi);
@@ -3142,7 +3157,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     anchors_base.ptr().add(x_hi * anchor_chunk_stride),
                     deltas_base.ptr().add(x_hi * delta_chunk_stride),
                     eq_lo.as_ptr(),
-                    eq_prep_addr as *const F128,
+                    eq_prep,
                     lo_size,
                     pair_idx_base,
                     pair_in_block_mask,
@@ -3198,6 +3213,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                 head_fail_addr as *const std::sync::atomic::AtomicBool,
             )
         };
+        let eq_prep = replay_eq_prep_ptr(!head.is_null());
         for x_hi in 0..hi_size {
             let (ap, bp) = r2_rows(x_hi);
             let mut out = [F128::ZERO; 8];
@@ -3210,7 +3226,7 @@ pub(crate) fn uni_skip_fold_and_round_pair_compact_padded_lookahead_for(
                     a_base.add(x_hi * a_stride),
                     d_base.add(x_hi * d_stride),
                     eq_lo.as_ptr(),
-                    eq_prep_addr as *const F128,
+                    eq_prep,
                     lo_size,
                     x_hi * lo_size,
                     pair_in_block_mask,
