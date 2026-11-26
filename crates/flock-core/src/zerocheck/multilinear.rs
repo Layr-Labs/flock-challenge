@@ -4084,6 +4084,50 @@ fn fold2_compact_and_round45_into_packed_b(
     };
     crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
 
+    // Late-GPU steal (`gpu_commit::zc_k_steal_enabled`): take the GPU's
+    // chunks from the top until its buffer completes; `steal_lo` is the
+    // lowest chunk taken (the prefix length the join reads).
+    #[allow(unused_mut)]
+    let mut steal_lo = cpu_base;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
+    if let Some(job) = gpu_job.as_ref()
+        && job.steal_active()
+    {
+        let top = std::sync::atomic::AtomicUsize::new(job.chunks());
+        let t_steal = std::time::Instant::now();
+        crate::epool::run_hetero_chunks(32, |_| loop {
+            if job.poll_done() {
+                break;
+            }
+            let cur = top.load(std::sync::atomic::Ordering::Acquire);
+            if cur == 0 {
+                break;
+            }
+            if top
+                .compare_exchange(
+                    cur,
+                    cur - 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            job.publish_cut(cur - 1);
+            chunk_body(cur - 1);
+        });
+        steal_lo = top.load(std::sync::atomic::Ordering::Acquire);
+        if crate::gpu_commit::gpu_zc_k_debug() {
+            eprintln!(
+                "[zc-k-steal] CPU took {} of {} GPU chunks in {:.2} ms",
+                job.chunks() - steal_lo,
+                job.chunks(),
+                t_steal.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+
     // Join the GPU prefix (it was submitted first and is normally done).
     #[allow(unused_mut)]
     let mut gpu_prefix: Option<KGpuPrefix> = None;
@@ -4121,14 +4165,18 @@ fn fold2_compact_and_round45_into_packed_b(
                         }
                     }
                 } else {
-                    partials[..chunks].copy_from_slice(&parts);
+                    // Chunks at or above `steal_lo` were folded by the CPU
+                    // into its own slots and buffers.
+                    let lo = steal_lo.min(chunks);
+                    partials[..lo].copy_from_slice(&parts[..lo]);
+                    let (len_a, len_b) = (len_a / chunks.max(1) * lo, len_b / chunks.max(1) * lo);
                     gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
                 }
             }
             crate::gpu_commit::ZcKResult::Failed => {
                 // The GPU failed after admission: the CPU folds the prefix
                 // chunks with the same kernel (the arm is now disabled).
-                crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
+                crate::epool::run_hetero_chunks(steal_lo.min(cpu_base), &chunk_body);
             }
         }
     }

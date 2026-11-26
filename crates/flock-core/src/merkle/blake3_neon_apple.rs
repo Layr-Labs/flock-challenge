@@ -58,20 +58,7 @@ const MSG_SCHEDULE: [[u8; 16]; 7] = [
     [11, 15, 5, 0, 1, 9, 8, 6, 14, 10, 2, 12, 3, 4, 7, 13],
 ];
 
-// Leaf byte offsets are computed at compile time; parent words retain their indices.
-const LEAF_MSG_SCHEDULE: [[u8; 16]; 7] = {
-    let mut offsets = MSG_SCHEDULE;
-    let mut row = 0;
-    while row < 7 {
-        let mut word = 0;
-        while word < 16 {
-            offsets[row][word] *= 16;
-            word += 1;
-        }
-        row += 1;
-    }
-    offsets
-};
+const ROTATE8_TABLE: [u8; 16] = [1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
 
 #[inline(always)]
 unsafe fn rotate16(x: uint32x4_t) -> uint32x4_t {
@@ -84,12 +71,13 @@ unsafe fn rotate12(x: uint32x4_t) -> uint32x4_t {
 }
 
 #[inline(always)]
+unsafe fn rotate8_with(x: uint32x4_t, table: uint8x16_t) -> uint32x4_t {
+    unsafe { vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(x), table)) }
+}
+
+#[inline(always)]
 unsafe fn rotate8(x: uint32x4_t) -> uint32x4_t {
-    const ROTATE: [u8; 16] = [1, 2, 3, 0, 5, 6, 7, 4, 9, 10, 11, 8, 13, 14, 15, 12];
-    unsafe {
-        let table = vld1q_u8(ROTATE.as_ptr());
-        vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(x), table))
-    }
+    unsafe { rotate8_with(x, vld1q_u8(ROTATE8_TABLE.as_ptr())) }
 }
 
 #[inline(always)]
@@ -155,79 +143,51 @@ unsafe fn store_cv4(state: &mut [uint32x4_t; 16], out: *mut u8) {
 }
 
 #[inline(always)]
-unsafe fn round4<const BYTE_OFFSETS: bool>(
+unsafe fn round2(
     v0: &mut [uint32x4_t; 16],
     v1: &mut [uint32x4_t; 16],
-    v2: &mut [uint32x4_t; 16],
-    v3: &mut [uint32x4_t; 16],
     m0: &[uint32x4_t; 16],
     m1: &[uint32x4_t; 16],
-    m2: &[uint32x4_t; 16],
-    m3: &[uint32x4_t; 16],
     schedule: &[u8; 16],
+    rot8: uint8x16_t,
 ) {
-    macro_rules! message {
-        ($m:ident, $index:ident) => {
-            if BYTE_OFFSETS {
-                $m.as_ptr().byte_add($index).read()
-            } else {
-                *$m.get_unchecked($index)
-            }
-        };
-    }
-    macro_rules! g4 {
+    macro_rules! g2 {
         ($a:literal, $b:literal, $c:literal, $d:literal, $x:expr, $y:expr) => {{
             let x = $x as usize;
             let y = $y as usize;
             unsafe {
-                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), message!(m0, x));
-                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), message!(m1, x));
-                v2[$a] = vaddq_u32(vaddq_u32(v2[$a], v2[$b]), message!(m2, x));
-                v3[$a] = vaddq_u32(vaddq_u32(v3[$a], v3[$b]), message!(m3, x));
+                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), *m0.get_unchecked(x));
+                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), *m1.get_unchecked(x));
                 v0[$d] = rotate16(veorq_u32(v0[$d], v0[$a]));
                 v1[$d] = rotate16(veorq_u32(v1[$d], v1[$a]));
-                v2[$d] = rotate16(veorq_u32(v2[$d], v2[$a]));
-                v3[$d] = rotate16(veorq_u32(v3[$d], v3[$a]));
                 v0[$c] = vaddq_u32(v0[$c], v0[$d]);
                 v1[$c] = vaddq_u32(v1[$c], v1[$d]);
-                v2[$c] = vaddq_u32(v2[$c], v2[$d]);
-                v3[$c] = vaddq_u32(v3[$c], v3[$d]);
                 v0[$b] = rotate12(veorq_u32(v0[$b], v0[$c]));
                 v1[$b] = rotate12(veorq_u32(v1[$b], v1[$c]));
-                v2[$b] = rotate12(veorq_u32(v2[$b], v2[$c]));
-                v3[$b] = rotate12(veorq_u32(v3[$b], v3[$c]));
-                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), message!(m0, y));
-                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), message!(m1, y));
-                v2[$a] = vaddq_u32(vaddq_u32(v2[$a], v2[$b]), message!(m2, y));
-                v3[$a] = vaddq_u32(vaddq_u32(v3[$a], v3[$b]), message!(m3, y));
-                v0[$d] = rotate8(veorq_u32(v0[$d], v0[$a]));
-                v1[$d] = rotate8(veorq_u32(v1[$d], v1[$a]));
-                v2[$d] = rotate8(veorq_u32(v2[$d], v2[$a]));
-                v3[$d] = rotate8(veorq_u32(v3[$d], v3[$a]));
+                v0[$a] = vaddq_u32(vaddq_u32(v0[$a], v0[$b]), *m0.get_unchecked(y));
+                v1[$a] = vaddq_u32(vaddq_u32(v1[$a], v1[$b]), *m1.get_unchecked(y));
+                v0[$d] = rotate8_with(veorq_u32(v0[$d], v0[$a]), rot8);
+                v1[$d] = rotate8_with(veorq_u32(v1[$d], v1[$a]), rot8);
                 v0[$c] = vaddq_u32(v0[$c], v0[$d]);
                 v1[$c] = vaddq_u32(v1[$c], v1[$d]);
-                v2[$c] = vaddq_u32(v2[$c], v2[$d]);
-                v3[$c] = vaddq_u32(v3[$c], v3[$d]);
                 v0[$b] = rotate7(veorq_u32(v0[$b], v0[$c]));
                 v1[$b] = rotate7(veorq_u32(v1[$b], v1[$c]));
-                v2[$b] = rotate7(veorq_u32(v2[$b], v2[$c]));
-                v3[$b] = rotate7(veorq_u32(v3[$b], v3[$c]));
             }
         }};
     }
 
-    g4!(0, 4, 8, 12, schedule[0], schedule[1]);
-    g4!(1, 5, 9, 13, schedule[2], schedule[3]);
-    g4!(2, 6, 10, 14, schedule[4], schedule[5]);
-    g4!(3, 7, 11, 15, schedule[6], schedule[7]);
-    g4!(0, 5, 10, 15, schedule[8], schedule[9]);
-    g4!(1, 6, 11, 12, schedule[10], schedule[11]);
-    g4!(2, 7, 8, 13, schedule[12], schedule[13]);
-    g4!(3, 4, 9, 14, schedule[14], schedule[15]);
+    g2!(0, 4, 8, 12, schedule[0], schedule[1]);
+    g2!(1, 5, 9, 13, schedule[2], schedule[3]);
+    g2!(2, 6, 10, 14, schedule[4], schedule[5]);
+    g2!(3, 7, 11, 15, schedule[6], schedule[7]);
+    g2!(0, 5, 10, 15, schedule[8], schedule[9]);
+    g2!(1, 6, 11, 12, schedule[10], schedule[11]);
+    g2!(2, 7, 8, 13, schedule[12], schedule[13]);
+    g2!(3, 4, 9, 14, schedule[14], schedule[15]);
 }
 
 
-/// Hash complete groups of sixteen contiguous 64-byte BLAKE3 parent blocks.
+/// Hash complete groups of eight contiguous 64-byte BLAKE3 parent blocks.
 ///
 /// This intrinsic path is Apple-only through the parent module's cfg. Tails
 /// remain on upstream `hash_many`, so arbitrary Rayon partitions are safe.
@@ -236,7 +196,7 @@ pub(super) fn hash_complete_parent_groups(data: &[u8], out: &mut [[u8; 32]]) -> 
     hash_complete_groups_flags(data, out, 4)
 }
 
-/// Sixteen-way PoW grind blocks: 64-byte single-chunk pre-images with
+/// Eight-way PoW grind blocks: 64-byte single-chunk pre-images with
 /// `CHUNK_START | CHUNK_END | ROOT` (11) instead of the Merkle `PARENT`
 /// flag (4) — the same layout, IV, counter-zero, and 32-byte output
 /// contract as [`hash_complete_parent_groups`], so each output agrees with
@@ -497,6 +457,17 @@ unsafe fn g3s_c_only(
     }
 }
 
+/// Kill switch for the 32-bit zero-high-nonce specialization in
+/// [`pow_scan_reg`] (`FLOCK_NO_POW_ZERO_HI`, any value restores the full
+/// 64-bit nonce path on every scan). Read once per process.
+pub const ENV_NO_POW_ZERO_HI: &str = "FLOCK_NO_POW_ZERO_HI";
+
+#[inline]
+fn pow_zero_hi_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_POW_ZERO_HI).is_none())
+}
+
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zero bits, or `None` — the register-resident specialization of
 /// `blake3_pow_scan` for `1 <= bits <= 32`. Byte-exact against `blake3::hash`
@@ -513,10 +484,20 @@ pub(crate) fn pow_scan_reg(
     debug_assert!((1..=32).contains(&bits));
     let fx = pow_fixed(state_digest);
     let mask = word0_mask(bits);
-    unsafe { pow_scan_reg_inner(&fx, start, len, mask) }
+    let end = start.saturating_add(len);
+    if pow_zero_hi_enabled() && end <= (u32::MAX as u64) + 1 {
+        unsafe { pow_scan_reg_inner::<true>(&fx, start, len, mask) }
+    } else {
+        unsafe { pow_scan_reg_inner::<false>(&fx, start, len, mask) }
+    }
 }
 
-unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> Option<u64> {
+unsafe fn pow_scan_reg_inner<const ZERO_HI: bool>(
+    fx: &PowFixed,
+    start: u64,
+    len: u64,
+    mask: u32,
+) -> Option<u64> {
     unsafe {
         // Broadcast the grind-invariant state once; these stay live across
         // every attempt in the scan.
@@ -531,25 +512,42 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             #[cfg(feature = "hash-count")]
             crate::challenger::fs_count::POW_SHA256
                 .fetch_add(12, std::sync::atomic::Ordering::Relaxed);
-            // Nonce lanes: scalar build handles the (astronomically rare)
-            // 32-bit carry between lanes for free.
-            let mut lo = [[0u32; 4]; 3];
-            let mut hi = [[0u32; 4]; 3];
-            for i in 0..12 {
-                let n = base + i as u64;
-                lo[i / 4][i % 4] = n as u32;
-                hi[i / 4][i % 4] = (n >> 32) as u32;
-            }
-            let n8 = [
-                vld1q_u32(lo[0].as_ptr()),
-                vld1q_u32(lo[1].as_ptr()),
-                vld1q_u32(lo[2].as_ptr()),
-            ];
-            let n9 = [
-                vld1q_u32(hi[0].as_ptr()),
-                vld1q_u32(hi[1].as_ptr()),
-                vld1q_u32(hi[2].as_ptr()),
-            ];
+            // When ZERO_HI holds, `end <= 2^32`, so every nonce's high word
+            // (`m[9]`) is identically zero and `n8` is formed directly from
+            // `base as u32` without a 12-word scalar stack build.
+            let (n8, n9_msg) = if ZERO_HI {
+                const OFF0: [u32; 4] = [0, 1, 2, 3];
+                const OFF1: [u32; 4] = [4, 5, 6, 7];
+                const OFF2: [u32; 4] = [8, 9, 10, 11];
+                let bv = vdupq_n_u32(base as u32);
+                let n8 = [
+                    vaddq_u32(bv, vld1q_u32(OFF0.as_ptr())),
+                    vaddq_u32(bv, vld1q_u32(OFF1.as_ptr())),
+                    vaddq_u32(bv, vld1q_u32(OFF2.as_ptr())),
+                ];
+                (n8, Msg3::Z)
+            } else {
+                // Nonce lanes: scalar build handles the (astronomically rare)
+                // 32-bit carry between lanes for free.
+                let mut lo = [[0u32; 4]; 3];
+                let mut hi = [[0u32; 4]; 3];
+                for i in 0..12 {
+                    let n = base + i as u64;
+                    lo[i / 4][i % 4] = n as u32;
+                    hi[i / 4][i % 4] = (n >> 32) as u32;
+                }
+                let n8 = [
+                    vld1q_u32(lo[0].as_ptr()),
+                    vld1q_u32(lo[1].as_ptr()),
+                    vld1q_u32(lo[2].as_ptr()),
+                ];
+                let n9 = [
+                    vld1q_u32(hi[0].as_ptr()),
+                    vld1q_u32(hi[1].as_ptr()),
+                    vld1q_u32(hi[2].as_ptr()),
+                ];
+                (n8, Msg3::P(n9))
+            };
 
             // Round 1 = just the nonce G at (0,5,10,15), from precomputed
             // column-half inputs; all other words come in as constants.
@@ -561,7 +559,10 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
                 let mut d = rotate16(veorq_u32(cb[15], a));
                 let mut c = vaddq_u32(cb[10], d);
                 let mut b = rotate12(veorq_u32(cb[5], c));
-                a = vaddq_u32(vaddq_u32(a, b), n9[k]);
+                a = vaddq_u32(a, b);
+                if let Msg3::P(n9) = n9_msg {
+                    a = vaddq_u32(a, n9[k]);
+                }
                 d = rotate8(veorq_u32(d, a));
                 c = vaddq_u32(c, d);
                 b = rotate7(veorq_u32(b, c));
@@ -579,7 +580,7 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::S(dv[4]), Msg3::Z);
             g3s(v0, v1, v2, 0, 5, 10, 15, Msg3::S(dv[1]), Msg3::Z);
             g3s(v0, v1, v2, 1, 6, 11, 12, Msg3::Z, Msg3::S(dv[5]));
-            g3s(v0, v1, v2, 2, 7, 8, 13, Msg3::P(n9), Msg3::Z);
+            g3s(v0, v1, v2, 2, 7, 8, 13, n9_msg, Msg3::Z);
             g3s(v0, v1, v2, 3, 4, 9, 14, Msg3::Z, Msg3::P(n8));
 
             // round 3 (schedule row 2)
@@ -588,13 +589,13 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::Z, Msg3::S(dv[2]));
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::S(dv[7]), Msg3::Z);
             g3s(v0, v1, v2, 0, 5, 10, 15, Msg3::S(dv[6]), Msg3::S(dv[5]));
-            g3s(v0, v1, v2, 1, 6, 11, 12, Msg3::P(n9), Msg3::S(dv[0]));
+            g3s(v0, v1, v2, 1, 6, 11, 12, n9_msg, Msg3::S(dv[0]));
             g3s(v0, v1, v2, 2, 7, 8, 13, Msg3::Z, Msg3::Z);
             g3s(v0, v1, v2, 3, 4, 9, 14, Msg3::P(n8), Msg3::S(dv[1]));
 
             // round 4 (schedule row 3)
             g3s(v0, v1, v2, 0, 4, 8, 12, Msg3::Z, Msg3::S(dv[7]));
-            g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::Z, Msg3::P(n9));
+            g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::Z, n9_msg);
             g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::Z, Msg3::S(dv[3]));
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::Z, Msg3::Z);
             g3s(v0, v1, v2, 0, 5, 10, 15, Msg3::S(dv[4]), Msg3::S(dv[0]));
@@ -604,7 +605,7 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
 
             // round 5 (schedule row 4)
             g3s(v0, v1, v2, 0, 4, 8, 12, Msg3::Z, Msg3::Z);
-            g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::P(n9), Msg3::Z);
+            g3s(v0, v1, v2, 1, 5, 9, 13, n9_msg, Msg3::Z);
             g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::Z, Msg3::Z);
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::Z, Msg3::P(n8));
             g3s(v0, v1, v2, 0, 5, 10, 15, Msg3::S(dv[7]), Msg3::S(dv[2]));
@@ -613,7 +614,7 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             g3s(v0, v1, v2, 3, 4, 9, 14, Msg3::S(dv[6]), Msg3::S(dv[4]));
 
             // round 6 (schedule row 5)
-            g3s(v0, v1, v2, 0, 4, 8, 12, Msg3::P(n9), Msg3::Z);
+            g3s(v0, v1, v2, 0, 4, 8, 12, n9_msg, Msg3::Z);
             g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::Z, Msg3::S(dv[5]));
             g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::P(n8), Msg3::Z);
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::Z, Msg3::S(dv[1]));
@@ -628,7 +629,7 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             // nor word 8 and are dropped.
             g3s(v0, v1, v2, 0, 4, 8, 12, Msg3::Z, Msg3::Z);
             g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::S(dv[5]), Msg3::S(dv[0]));
-            g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::S(dv[1]), Msg3::P(n9));
+            g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::S(dv[1]), n9_msg);
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::P(n8), Msg3::S(dv[6]));
             g3s_a_only(v0, v1, v2, 0, 5, 10, 15, Msg3::Z, Msg3::Z);
             g3s_c_only(v0, v1, v2, 2, 7, 8, 13, Msg3::S(dv[3]), Msg3::S(dv[4]));
@@ -693,21 +694,23 @@ unsafe fn transpose_block4_strided(base: *const u8, stride: usize, out: &mut [ui
     }
 }
 
-/// Hash complete groups of sixteen contiguous 128-byte Merkle leaves: each
+/// Hash complete groups of eight contiguous 128-byte Merkle leaves: each
 /// leaf is one two-block BLAKE3 chunk (counter zero, `CHUNK_START` on block
 /// zero, `CHUNK_END` on block one, no `ROOT`), i.e. the same chaining value
 /// upstream `hash_many::<128>` returns for the recursive-commit leaf shape.
-/// Four independent four-lane states per round overlap arithmetic chains.
+/// Two independent four-lane states per round overlap arithmetic chains while
+/// fitting inside the architectural NEON register file with minimal spills.
 /// Returns the number of outputs written; the caller hashes the tail.
 pub(super) fn hash_complete_leaf128_groups(data: &[u8], out: &mut [[u8; 32]]) -> usize {
     debug_assert_eq!(data.len(), out.len() * 128);
-    let groups = out.len() / 16;
+    let groups = out.len() / 8;
     if groups == 0 {
         return 0;
     }
 
     unsafe {
         let zero = vdupq_n_u32(0);
+        let rot8 = vld1q_u8(ROTATE8_TABLE.as_ptr());
         let iv = [
             vdupq_n_u32(IV[0]),
             vdupq_n_u32(IV[1]),
@@ -726,28 +729,22 @@ pub(super) fn hash_complete_leaf128_groups(data: &[u8], out: &mut [[u8; 32]]) ->
             zero, zero, block_len, start_flags,
         ];
         for group in 0..groups {
-            let input = data.as_ptr().add(group * 16 * 128);
+            let input = data.as_ptr().add(group * 8 * 128);
             let mut m0 = [zero; 16];
             let mut m1 = [zero; 16];
-            let mut m2 = [zero; 16];
-            let mut m3 = [zero; 16];
 
             // Block zero of each leaf (bytes 0..64), CHUNK_START.
             transpose_block4_strided(input, 128, &mut m0);
             transpose_block4_strided(input.add(4 * 128), 128, &mut m1);
-            transpose_block4_strided(input.add(8 * 128), 128, &mut m2);
-            transpose_block4_strided(input.add(12 * 128), 128, &mut m3);
             let mut v0 = init0;
             let mut v1 = init0;
-            let mut v2 = init0;
-            let mut v3 = init0;
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[0]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[1]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[2]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[3]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[4]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[5]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[6]);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[0], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[1], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[2], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[3], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[4], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[5], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[6], rot8);
             // Chaining value h' = v[0..8] ^ v[8..16], then block one with
             // CHUNK_END under that chaining value.
             let next = |v: &[uint32x4_t; 16]| -> [uint32x4_t; 16] {
@@ -772,42 +769,37 @@ pub(super) fn hash_complete_leaf128_groups(data: &[u8], out: &mut [[u8; 32]]) ->
             };
             v0 = next(&v0);
             v1 = next(&v1);
-            v2 = next(&v2);
-            v3 = next(&v3);
             transpose_block4_strided(input.add(64), 128, &mut m0);
             transpose_block4_strided(input.add(4 * 128 + 64), 128, &mut m1);
-            transpose_block4_strided(input.add(8 * 128 + 64), 128, &mut m2);
-            transpose_block4_strided(input.add(12 * 128 + 64), 128, &mut m3);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[0]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[1]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[2]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[3]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[4]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[5]);
-            round4::<true>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &LEAF_MSG_SCHEDULE[6]);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[0], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[1], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[2], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[3], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[4], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[5], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[6], rot8);
 
-            let output = out.as_mut_ptr().cast::<u8>().add(group * 16 * 32);
+            let output = out.as_mut_ptr().cast::<u8>().add(group * 8 * 32);
             store_cv4(&mut v0, output);
             store_cv4(&mut v1, output.add(4 * 32));
-            store_cv4(&mut v2, output.add(8 * 32));
-            store_cv4(&mut v3, output.add(12 * 32));
         }
     }
-    groups * 16
+    groups * 8
 }
 
-/// Shared driver: hash complete groups of sixteen contiguous 64-byte blocks
+/// Shared driver: hash complete groups of eight contiguous 64-byte blocks
 /// with the given BLAKE3 domain `flags`. Returns the number of outputs
 /// written; the caller handles the tail through upstream `hash_many`.
 fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> usize {
     debug_assert_eq!(data.len(), out.len() * 64);
-    let groups = out.len() / 16;
+    let groups = out.len() / 8;
     if groups == 0 {
         return 0;
     }
 
     unsafe {
         let zero = vdupq_n_u32(0);
+        let rot8 = vld1q_u8(ROTATE8_TABLE.as_ptr());
         let iv = [
             vdupq_n_u32(IV[0]),
             vdupq_n_u32(IV[1]),
@@ -837,34 +829,26 @@ fn hash_complete_groups_flags(data: &[u8], out: &mut [[u8; 32]], flags: u32) -> 
             vdupq_n_u32(flags),
         ];
         for group in 0..groups {
-            let input = data.as_ptr().add(group * 16 * 64);
+            let input = data.as_ptr().add(group * 8 * 64);
             let mut m0 = [zero; 16];
             let mut m1 = [zero; 16];
-            let mut m2 = [zero; 16];
-            let mut m3 = [zero; 16];
             transpose_parent4(input, &mut m0);
             transpose_parent4(input.add(4 * 64), &mut m1);
-            transpose_parent4(input.add(8 * 64), &mut m2);
-            transpose_parent4(input.add(12 * 64), &mut m3);
 
             let mut v0 = init;
             let mut v1 = init;
-            let mut v2 = init;
-            let mut v3 = init;
-            round4::<false>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &MSG_SCHEDULE[0]);
-            round4::<false>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &MSG_SCHEDULE[1]);
-            round4::<false>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &MSG_SCHEDULE[2]);
-            round4::<false>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &MSG_SCHEDULE[3]);
-            round4::<false>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &MSG_SCHEDULE[4]);
-            round4::<false>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &MSG_SCHEDULE[5]);
-            round4::<false>(&mut v0, &mut v1, &mut v2, &mut v3, &m0, &m1, &m2, &m3, &MSG_SCHEDULE[6]);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[0], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[1], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[2], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[3], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[4], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[5], rot8);
+            round2(&mut v0, &mut v1, &m0, &m1, &MSG_SCHEDULE[6], rot8);
 
-            let output = out.as_mut_ptr().cast::<u8>().add(group * 16 * 32);
+            let output = out.as_mut_ptr().cast::<u8>().add(group * 8 * 32);
             store_cv4(&mut v0, output);
             store_cv4(&mut v1, output.add(4 * 32));
-            store_cv4(&mut v2, output.add(8 * 32));
-            store_cv4(&mut v3, output.add(12 * 32));
         }
     }
-    groups * 16
+    groups * 8
 }

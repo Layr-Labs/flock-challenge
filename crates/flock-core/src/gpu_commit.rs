@@ -1121,7 +1121,7 @@ pub const ENV_NO_GPU_ZC_AB_COMPLETION: &str = "FLOCK_NO_GPU_ZC_AB_COMPLETION";
 /// `FLOCK_ZC_AB_GPU_CHUNKS=<n>`, `0` = arm off, clamped to the chunk count.
 /// Unset = [`ZC_AB_GPU_DEFAULT_CHUNKS`]. A non-integer value fails loudly.
 pub const ENV_ZC_AB_GPU_CHUNKS: &str = "FLOCK_ZC_AB_GPU_CHUNKS";
-const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 32;
+const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 48;
 
 /// Requested GPU chunk share of the round-one AB completion arm; `0` = off
 /// (kill switch, share 0, or GPU commit disabled).
@@ -1154,8 +1154,7 @@ pub(crate) fn gpu_zc_ab_one_cb_enabled() -> bool {
 /// line (`FLOCK_ZC_AB_GPU_DEBUG=1`, or any `FLOCK_PHASE_TIMING` run).
 pub(crate) fn gpu_zc_ab_debug() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_ZC_AB_GPU_DEBUG").is_some()
-            || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+        std::env::var_os("FLOCK_ZC_AB_GPU_DEBUG").is_some() || crate::phase_timing_env_on()
     });
     *ON
 }
@@ -1203,7 +1202,7 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 1024;
 
 pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
-const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
+const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 928;
 
 /// Kill switch for the K arm's faster fold kernel (`FLOCK_NO_ZC_K_V2`, any
 /// value): the embedded `zc_k_fold` and the record's share
@@ -1253,12 +1252,25 @@ pub(crate) fn gpu_zc_k_share() -> usize {
     if gpu_commit_enabled() { *SHARE } else { 0 }
 }
 
+/// Late-GPU steal for the K pass arm (`FLOCK_NO_ZC_K_STEAL`, any value,
+/// keeps the record's join): once the CPU queue has drained, instead of
+/// waiting for the GPU prefix the workers take its chunks from the top (one
+/// claim at a time, descending) until the prefix command buffer completes,
+/// publishing each taken chunk to the cut word (`flag_buf` word 1, which
+/// `zc_k_fold_v2` and `zc_k_finish_steal` skip from); the join then reads the GPU's
+/// outputs and sums only below the lowest taken chunk. Every chunk is folded
+/// by the CPU or the GPU with the same proven kernel and the GPU's rows above
+/// the cut are never read, so proof bytes are unchanged. Read once.
+pub(crate) fn zc_k_steal_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_K_STEAL").is_none())
+}
+
 /// Diagnostic trace for the K pass arm (`FLOCK_ZC_K_GPU_DEBUG=1`, or any
 /// `FLOCK_PHASE_TIMING` run): the oracle verdict and one line per prove.
 pub(crate) fn gpu_zc_k_debug() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_ZC_K_GPU_DEBUG").is_some()
-            || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+        std::env::var_os("FLOCK_ZC_K_GPU_DEBUG").is_some() || crate::phase_timing_env_on()
     });
     *ON
 }
@@ -1286,7 +1298,7 @@ pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
 
 /// The 5+6 arm's default share, in 5+6 chunks (of 512), when
 /// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
-pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 160;
+pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 232;
 
 /// Kill switch for the 5+6 arm's late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1`:
 /// the record's join, where the CPU queue, having folded the chunks after the
@@ -1341,8 +1353,7 @@ pub(crate) fn gpu_zc_t56_cap() -> usize {
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 pub(crate) fn gpu_zc_t56_debug() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_ZC_T56_GPU_DEBUG").is_some()
-            || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+        std::env::var_os("FLOCK_ZC_T56_GPU_DEBUG").is_some() || crate::phase_timing_env_on()
     });
     *ON
 }
@@ -1711,7 +1722,7 @@ pub const ENV_SPLIT_CPU_TILT: &str = "FLOCK_SPLIT_CPU_TILT";
 
 /// Default CPU-ward tilt of the tuned commit split, in 256ths of the
 /// position range (see [`ENV_NO_SPLIT_CPU_TILT`]).
-pub(crate) const SPLIT_CPU_TILT_256: usize = 4;
+pub(crate) const SPLIT_CPU_TILT_256: usize = 0;
 
 /// The tilt in 256ths (see [`ENV_NO_SPLIT_CPU_TILT`]).
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
@@ -4274,13 +4285,91 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     const GPU_COMMIT_DEFAULT: bool = true;
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+        && gpu_commit_env_clear()
 }
 
 /// True after untimed warmup permanently selected the ranked GPU path.
 /// The opt-out only restores speculative CPU buffers; it does not disable GPU.
 pub(crate) fn gpu_commit_latched_on() -> bool {
-    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none() && imp::gpu_commit_latched_on()
+    lazy_gpu_codeword_env_clear() && imp::gpu_commit_latched_on()
+}
+
+/// Kill switch for keeping the GPU commit's gate environment reads once per
+/// process (`FLOCK_NO_GPU_ENV_ONCE`, any value: every gate below reads its
+/// variable from the process environment on every call, as before). Read
+/// once per process.
+pub const ENV_NO_GPU_ENV_ONCE: &str = "FLOCK_NO_GPU_ENV_ONCE";
+
+pub(crate) fn gpu_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ENV_ONCE).is_none());
+    *ON
+}
+
+/// `FLOCK_NO_GPU_COMMIT` unset (the environment term of
+/// [`gpu_commit_enabled`]). The process environment does not change while a
+/// worker runs, so the first answer is kept; [`ENV_NO_GPU_ENV_ONCE`]
+/// restores the per-call lookup.
+#[inline]
+fn gpu_commit_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_COMMIT).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+}
+
+/// `FLOCK_NO_LAZY_GPU_CODEWORD` unset (the environment term of
+/// [`gpu_commit_latched_on`]), kept the same way.
+#[inline]
+fn lazy_gpu_codeword_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none()
+}
+
+/// `FLOCK_NO_GPU_TABLE_REUSE` unset (the shared-table term of the final
+/// leaf pass, the g4x2 dead-lane pass and the table share of the three NTT
+/// tile encoders), kept the same way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_table_reuse_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+}
+
+/// `FLOCK_COMMIT_TIMING` set (the commit's timing trace term), kept the same
+/// way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn commit_timing_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
+}
+
+/// `FLOCK_GPU_COMMIT_DEBUG` set (the GPU commit's debug trace term), kept
+/// the same way.
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_commit_debug_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
 }
 
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
@@ -5936,13 +6025,20 @@ kernel void zc_k_fold_v2(
     ushort sl [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]])
 {
+    // Late-GPU steal: `flag[1]` = cut + 1 (0 = no cut). Read it once per
+    // threadgroup: independent loads could straddle a CPU publication and
+    // let only some threads return before a barrier. Reuse the table-build
+    // barrier to publish one uniform decision before touching chunk outputs.
+    threadgroup uint cut_tg;
     threadgroup uint4 nib[256];
     threadgroup uint4 rtab[512];
     threadgroup uint4 sred[8][8];
+    if (lid == 0u) { cut_tg = atomic_load_explicit(flag + 1, memory_order_relaxed); }
     nib[lid] = nib_dev[lid];
     rtab[lid] = nib_dev[256u + lid];
     rtab[256u + lid] = nib_dev[512u + lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (cut_tg != 0u && tg / p.sb_per_chunk >= cut_tg - 1u) { return; }
 
     uint i = lid & 63u;
     uint k = lid >> 6u;
@@ -6024,6 +6120,29 @@ kernel void zc_k_fold_v2(
         for (uint j = 0u; j < 8u; j++) { s ^= sred[j][lid]; }
         tg_part[ulong(tg) * 8ul + ulong(lid)] = s;
     }
+}
+
+// `zc_k_finish` for the late-GPU steal (`super::zc_k_steal_enabled`): the
+// same per-chunk sum, but a chunk at or above the cut word (`flag[1]` =
+// cut + 1, 0 = none) was taken by the CPU and is left unwritten. Built from
+// this source with the faster fold, so the embedded metallib (whose
+// `zc_k_finish` is unchanged) stays fresh.
+kernel void zc_k_finish_steal(
+    device const uint4* tg_part [[buffer(0)]],
+    device const uint4* consts  [[buffer(1)]],
+    device uint4*       part    [[buffer(2)]],
+    constant ZcKParams& p       [[buffer(3)]],
+    device atomic_uint* flag    [[buffer(4)]],
+    uint chunk [[threadgroup_position_in_grid]],
+    uint k     [[thread_index_in_threadgroup]])
+{
+    uint cw = atomic_load_explicit(flag + 1, memory_order_relaxed);
+    if (cw != 0u && chunk >= cw - 1u) { return; }
+    uint4 s = uint4(0u);
+    for (uint j = 0u; j < p.sb_per_chunk; j++) {
+        s ^= tg_part[(ulong(chunk) * ulong(p.sb_per_chunk) + ulong(j)) * 8ul + ulong(k)];
+    }
+    part[ulong(chunk) * 8ul + ulong(k)] = zck_mul(consts[p.eq_hi_off + chunk], s);
 }
 
 "#;
@@ -9678,7 +9797,7 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
             && super::pass_tune_enabled()
             && super::gpu_mixed_final_selected(log_d, log_d - 4, 4)
             && super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled())
-            && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+            && super::gpu_table_reuse_env_clear()
     }
 
     pub(crate) unsafe fn encode_ntt_and_merkle(
@@ -11523,7 +11642,7 @@ kernel void blake3_pow_seg_tail(
                 let skip_final_t3 = super::ranked_dead_pso_skip_enabled()
                     && super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled()
                     && super::pass_tune_enabled() && super::gpu_parent3_enabled()
-                    && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none() && !gw_split_cb_enabled();
+                    && super::gpu_table_reuse_env_clear() && !gw_split_cb_enabled();
                 let skip_legacy_ntt = skip_final_t3
                     && super::gpu_from_z_zero_root_selected(20) && super::gpu_g4x2_enabled();
                 let main_start = if skip_legacy_ntt { 8 } else { 0 };
@@ -13163,7 +13282,7 @@ kernel void blake3_pow_seg_tail(
         let text = *TEXT.get_or_init(|| {
             super::gpu_dead_lane_enabled() && with_g4x2_dead_lanes(g4x2_msl_source()).is_some()
         });
-        text && !gpu.pso_ntt4g4x2.is_null() && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+        text && !gpu.pso_ntt4g4x2.is_null() && super::gpu_table_reuse_env_clear()
     }
 
     /// [`super::select_from_z_zero_store_from`] for this process and
@@ -13256,7 +13375,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13341,7 +13460,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13421,7 +13540,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -14773,8 +14892,7 @@ kernel void blake3_pow_seg_tail(
     }
 
     fn debug_enabled() -> bool {
-        std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
-            || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+        super::commit_timing_env_on() || super::gpu_commit_debug_env_on()
     }
 
     /// Observability for poisoned process-global locks. The poisoning panic
@@ -14782,7 +14900,7 @@ kernel void blake3_pow_seg_tail(
     /// `catch_unwind`); the score-relevant symptom — a GPU arm silently
     /// degraded or recovered — must be visible under FLOCK_GPU_COMMIT_DEBUG.
     fn note_poisoned_lock(tag: &str, recovered: bool) {
-        if std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some() {
+        if super::gpu_commit_debug_env_on() {
             eprintln!(
                 "[gpu-commit] {tag}: poisoned lock {}",
                 if recovered {
@@ -15777,7 +15895,7 @@ kernel void blake3_pow_seg_tail(
             ll /= 2;
             lo = wlo;
         }
-        if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if after_ab && crate::phase_timing_env_on() {
             eprintln!(
                 "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
                  suffix units in {tail_ms:.2} ms",
@@ -17193,7 +17311,7 @@ kernel void blake3_pow_seg_tail(
         {
             return;
         }
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         if super::ranked_exact_contention_tune_pending() {
             // The outer warmup join will replay its real A/B branch beside a
             // balanced broad sweep. Avoid double-tuning against a synthetic
@@ -17500,7 +17618,7 @@ kernel void blake3_pow_seg_tail(
             return;
         }
 
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         let latch = latch_lock();
         let LatchState::On(latched) = &*latch else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -17938,7 +18056,7 @@ kernel void blake3_pow_seg_tail(
                 if verified { chosen } else { 0 },
             );
         }
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let k = if verified { chosen } else { 0 };
             eprintln!(
                 "[phase-timing] hybrid split: cpu {} of 256 (ntt priority helpers {})",
@@ -18862,7 +18980,7 @@ kernel void blake3_pow_seg_tail(
         let tree = unsafe {
             super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
         }
         // The replicated input codeword was never read by the from-z graph;
@@ -19134,7 +19252,7 @@ kernel void blake3_pow_seg_tail(
                 total_nodes,
             )
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             let wall_ms = stream.started.elapsed().as_secs_f64() * 1e3;
             eprintln!(
                 "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"
@@ -26757,7 +26875,7 @@ kernel void zc_r2_horner_oracle(
             0.0
         };
         unsafe { gpu.release(cb) };
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let fold_gpu = f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
             let window = f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
             eprintln!(
@@ -28689,6 +28807,8 @@ kernel void zc_ab_finish(
     /// Whether the fold pipeline last built is `zc_k_fold_v2` (it then reads
     /// the rho2 nibble table after the byte-table nibbles in `nib_buf`).
     static ZC_K_V2_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// Whether the finish pipeline reads the late-steal cut word.
+    static ZC_K_STEAL_FINISH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// Build the K arm's pipelines on `device` from the embedded metallib; the
     /// faster fold (`zc_k_fold_v2`, see [`super::zc_k_v2_enabled`]) from
@@ -28739,14 +28859,21 @@ kernel void zc_ab_finish(
             };
             let skip_v1 = super::ranked_dead_pso_skip_enabled() && super::zc_k_v2_enabled();
             let mut fold = if skip_v1 { Err(String::new()) } else { make_pipeline("zc_k_fold") };
-            let finish = make_pipeline("zc_k_finish");
+            let mut finish = make_pipeline("zc_k_finish");
+            let mut steal_finish: Id = NIL;
             // The faster fold (`FLOCK_NO_ZC_K_V2` kills): compiled
             // from source here (the prewarm thread); on any failure the
             // embedded kernel stays.
             ZC_K_V2_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+            ZC_K_STEAL_FINISH.store(false, std::sync::atomic::Ordering::Relaxed);
             if super::zc_k_v2_enabled() && (skip_v1 || fold.is_ok()) {
                 let v2 = (|| -> Result<Id, String> {
                     let (lib, owns) = zc_shared_library(api, device).map_or_else(|| compile_library(api, device, ZC_K_V2_MSL_SOURCE, "zc-k v2").map(|l| (l, true)), |l| Ok((l, false)))?;
+                    if super::zc_k_steal_enabled() {
+                        if let Ok(sf) = build_pso(api, device, lib, "zc_k_finish_steal") {
+                            steal_finish = sf;
+                        }
+                    }
                     let pso = build_pso(api, device, lib, "zc_k_fold_v2");
                     if owns { release(lib); }
                     pso
@@ -28758,11 +28885,18 @@ kernel void zc_ab_finish(
                         }
                         fold = Ok(pso);
                         ZC_K_V2_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if !steal_finish.is_null() {
+                            if let Ok(old) = std::mem::replace(&mut finish, Ok(steal_finish)) {
+                                release(old);
+                            }
+                            ZC_K_STEAL_FINISH.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         if skip_v1 && (debug_enabled() || super::gpu_zc_k_debug()) {
                             eprintln!("[zc-k-gpu] ranked dead-PSO skip: skipped zc_k_fold (cached_lib={})", !owns_library);
                         }
                     }
                     Err(e) => {
+                        release(steal_finish);
                         if super::gpu_zc_k_debug() {
                             eprintln!("[zc-k-gpu] v2 fold unavailable ({e}); embedded kernel kept");
                         }
@@ -28924,12 +29058,22 @@ kernel void zc_ab_finish(
         /// Views released at the join (the deltas one may be the round-one
         /// arm's retained view).
         views: [Id; 2],
+        /// The late-steal cut word: `flag_buf` word 1 (`cut + 1`, 0 = none;
+        /// read by `zc_k_fold_v2` and `zc_k_finish_steal`).
+        cut: usize,
+        /// The launch ran `zc_k_fold_v2` + `zc_k_finish_steal`.
+        v2: bool,
         chunks: usize,
         per_chunk_a: usize,
         per_chunk_b: usize,
         calibration: bool,
         submitted: std::time::Instant,
     }
+
+    // SAFETY: the steal loop's workers only poll the buffer's completion
+    // (`cb_done`, a status/shared-event read) and store the cut word; waiting
+    // and releasing stay with the launching thread.
+    unsafe impl Sync for ZcKJob {}
 
     // SAFETY: the handles are only waited/released by the launching thread;
     // Metal objects are themselves thread-safe.
@@ -28949,6 +29093,37 @@ kernel void zc_ab_finish(
         /// GPU prefix length in chunks.
         pub(crate) fn chunks(&self) -> usize {
             self.chunks
+        }
+
+        /// Whether the CPU may take GPU chunks from the top after its own
+        /// queue (`super::zc_k_steal_enabled`; never in the oracle probe;
+        /// only with the fold and finish that read the cut).
+        pub(crate) fn steal_active(&self) -> bool {
+            !self.calibration && self.v2 && super::zc_k_steal_enabled()
+        }
+
+        /// Non-blocking: the prefix command buffer has completed.
+        pub(crate) fn poll_done(&self) -> bool {
+            match gpu() {
+                Ok(g) => unsafe { g.cb_done(self.cb, self.sig.as_ref()) },
+                Err(_) => true,
+            }
+        }
+
+        /// Publish a chunk the CPU has taken (every chunk at or above it is
+        /// the CPU's): the cut word only moves down.
+        pub(crate) fn publish_cut(&self, chunk: usize) {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            let v = chunk as u32 + 1;
+            // SAFETY: a live shared-storage buffer word for the arm's lifetime.
+            let w = unsafe { &*(self.cut as *const AtomicU32) };
+            let mut cur = w.load(Ordering::Relaxed);
+            while cur == 0 || v < cur {
+                match w.compare_exchange_weak(cur, v, Ordering::Release, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(x) => cur = x,
+                }
+            }
         }
     }
 
@@ -29142,6 +29317,20 @@ kernel void zc_ab_finish(
                         gpu.set_buffer(enc, state.nib_buf, 0, 1);
                         gpu.set_buffer(enc, state.touch_buf, 0, 2);
                         gpu.set_bytes(enc, pb, 3);
+                        // The steal finish kernel reads the cut word from buffer 4: bind an always-zero
+                        // word (cut 0 = no cut) so this touch dispatch always reads the view.
+                        static ZERO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                        let zero = *ZERO.get_or_init(|| {
+                            gpu.new_buffer(256)
+                                .map(|b| {
+                                    std::ptr::write_bytes(gpu.buffer_contents(b), 0, 256);
+                                    b as usize
+                                })
+                                .unwrap_or(0)
+                        }) as Id;
+                        if !zero.is_null() {
+                            gpu.set_buffer(enc, zero, 0, 4);
+                        }
                         gpu.dispatch(enc, 1, 1);
                         gpu.end_encoding(enc);
                         gpu.commit_async(cb);
@@ -29402,6 +29591,8 @@ kernel void zc_ab_finish(
             }
             std::ptr::copy_nonoverlapping(eq_hi.as_ptr(), consts.add(2 + n_weights), chunks);
             *gpu.buffer_contents(state.flag_buf).cast::<u32>() = 0;
+            // Cut word (late-GPU steal): 0 = no cut.
+            *gpu.buffer_contents(state.flag_buf).cast::<u32>().add(1) = 0;
             #[repr(C)]
             struct P {
                 sb_per_chunk: u32,
@@ -29450,6 +29641,7 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.consts_buf, 0, 1);
                 gpu.set_buffer(enc, state.part_buf, 0, 2);
                 gpu.set_bytes(enc, pb, 3);
+                gpu.set_buffer(enc, state.flag_buf, 0, 4);
                 gpu.dispatch(enc, chunks as u64, 8);
                 gpu.end_encoding(enc);
                 // Armed in the warm-up's oracle launch too, so the timed
@@ -29465,6 +29657,8 @@ kernel void zc_ab_finish(
                     cb,
                     sig,
                     views: [a_view, d_view],
+                    cut: gpu.buffer_contents(state.flag_buf).cast::<u32>().add(1) as usize,
+                    v2: ZC_K_V2_ACTIVE.load(Ordering::Relaxed) && ZC_K_STEAL_FINISH.load(Ordering::Relaxed),
                     chunks,
                     per_chunk_a,
                     per_chunk_b,
