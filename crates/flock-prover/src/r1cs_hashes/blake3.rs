@@ -4626,7 +4626,7 @@ pub(crate) mod witgen_simd {
                     .map(|&gps| AtomicUsize::new(SEGMENTS * gps / SLAB))
                     .collect();
                 let done: Vec<AtomicBool> = (0..n_bands).map(|_| AtomicBool::new(false)).collect();
-                let timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+                let timing = flock_core::phase_timing_env_on();
                 let t0 = std::time::Instant::now();
                 let done_ns: Vec<AtomicU64> = (0..n_bands).map(|_| AtomicU64::new(0)).collect();
                 let submit_ns: Vec<AtomicU64> = (0..n_bands).map(|_| AtomicU64::new(0)).collect();
@@ -4743,7 +4743,7 @@ pub(crate) mod witgen_simd {
                 // join − last_claim is the per-band join-barrier bubble (the
                 // stretch where at most one worker is still finishing its final
                 // slab while every other core waits at the band join).
-                let band_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+                let band_timing = flock_core::phase_timing_env_on();
                 let t_bands = std::time::Instant::now();
                 let mut offset = 0usize;
                 for (band_i, &band_gps) in schedule.iter().enumerate() {
@@ -5643,7 +5643,7 @@ impl Blake3Setup {
         challenger: &mut Ch,
     ) -> (flock_core::proof::R1csProofLigerito, Commitment, R1csClaim) {
         assert_eq!(blocks.len(), self.n_blocks);
-        let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+        let phase_timing = flock_core::phase_timing_env_on();
         // The padding rows force the same zero columns the CPU suffix skips
         // (`ZeroOddTailLanes`); the GPU commit graph is encoded during
         // witness generation, so publish them for the whole proof.
