@@ -17,6 +17,40 @@
 //! Workspace-wide Clippy `allow`s for the hand-tuned numeric kernels are
 //! declared in `[workspace.lints.clippy]` at the repo root.
 
+/// Kill switch for the environment-lookup sweep (`FLOCK_NO_ENV_ONCE_SWEEP`,
+/// any value: every gate wrapped in [`env_once_sweep!`] reads its variables
+/// from the process environment again on every call, as before). Read once
+/// per process.
+pub const ENV_NO_ENV_ONCE_SWEEP: &str = "FLOCK_NO_ENV_ONCE_SWEEP";
+
+#[doc(hidden)]
+#[inline]
+pub fn env_once_sweep_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_ENV_ONCE_SWEEP).is_none());
+    *ON
+}
+
+/// Evaluate an environment-only `bool` expression once per process and keep
+/// the answer (one `LazyLock` per expansion site). Used on gates reached more
+/// than once per prove (per round, per level, per pass or from several call
+/// sites); the worker's environment never changes after start, so the first
+/// answer equals every later one. The expression must read only the process
+/// environment (the closure cannot capture locals). `FLOCK_NO_ENV_ONCE_SWEEP`
+/// restores the per-call evaluation.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! env_once_sweep {
+    ($e:expr) => {{
+        if $crate::env_once_sweep_enabled() {
+            static ENV_ONCE_SWEEP: ::std::sync::LazyLock<bool> = ::std::sync::LazyLock::new(|| $e);
+            *ENV_ONCE_SWEEP
+        } else {
+            $e
+        }
+    }};
+}
+
 pub mod bits;
 pub mod challenger;
 pub mod cpu_keepalive;
@@ -174,7 +208,7 @@ pub const ENV_NO_READY_PAUSE: &str = "FLOCK_NO_READY_PAUSE";
 /// proof through readiness to the timed proof runs exactly as it did, so the
 /// pause cannot reach the timed proof. It is a plain sleep, the same in every
 /// worker, and reads nothing but the executable name and the argument count.
-const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(2400);
+const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(2410);
 
 /// Pure selector: the pause a process takes at start-up, if any.
 fn ranked_start_pause_for(

@@ -2134,9 +2134,9 @@ fn ranked_dense_final_direct_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_dense_final_direct_disabled_value(
+        crate::env_once_sweep!(ranked_dense_final_direct_disabled_value(
             std::env::var_os(ENV_NO_LIG_DENSE_FINAL_DIRECT).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2204,9 +2204,9 @@ fn ranked_dense_low_domain_trunc_enabled(use_dense_final_direct: bool) -> bool {
 
     ranked_dense_low_domain_trunc_policy_selected(
         use_dense_final_direct,
-        ranked_dense_low_domain_trunc_disabled_value(
+        crate::env_once_sweep!(ranked_dense_low_domain_trunc_disabled_value(
             std::env::var_os(ENV_NO_LIG_DENSE_LOW_DOMAIN_TRUNC).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2298,9 +2298,9 @@ fn ranked_l2_pruned_sparse_ntt_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_pruned_sparse_ntt_disabled_value(
+        crate::env_once_sweep!(ranked_l2_pruned_sparse_ntt_disabled_value(
             std::env::var_os(ENV_NO_LIG_L2_PRUNED_SPARSE_NTT).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2416,9 +2416,9 @@ fn ranked_l2_fused_densify_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_fused_densify_disabled_value(
+        crate::env_once_sweep!(ranked_l2_fused_densify_disabled_value(
             std::env::var_os(ENV_NO_LIG_L2_FUSED_DENSIFY).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2507,9 +2507,9 @@ fn ranked_l2_fused_final5_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_fused_final5_disabled_value(
+        crate::env_once_sweep!(ranked_l2_fused_final5_disabled_value(
             std::env::var_os(ENV_NO_LIG_L2_FUSED_FINAL5).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -2596,9 +2596,9 @@ fn ranked_l2_factored_final5_enabled(
             target_arch = "aarch64",
             target_feature = "aes"
         )),
-        ranked_l2_factored_final5_disabled_value(
+        crate::env_once_sweep!(ranked_l2_factored_final5_disabled_value(
             std::env::var_os(ENV_NO_LIG_L2_FACTORED_FINAL5).as_deref(),
-        ),
+        )),
     )
 }
 
@@ -3112,7 +3112,7 @@ fn transpose_forward_ntt_fused_3layer(
     // Read once per group, not per product; an in-process diagnostic can ablate
     // this fold without changing the transpose schedule or prepared twiddles.
     #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
-    let pmull_fold = std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none();
+    let pmull_fold = crate::env_once_sweep!(std::env::var_os("FLOCK_NO_TRANSPOSE_PAIR_PMULL").is_none());
 
     type Twiddle = Fused3Twiddle;
 
@@ -3667,7 +3667,7 @@ fn use_ranked_induce_truncated_final_ntt(
             n_queries,
             alpha_len,
         )
-        && std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none()
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_LIG_INDUCE_TRUNCATED_NTT").is_none())
 }
 
 /// Enable the fused final-transpose/ordinary-message pass only at the exact
@@ -3712,7 +3712,7 @@ fn use_ranked_induce_fused_msg(
             n_queries,
             alpha_len,
         )
-        && std::env::var_os("FLOCK_NO_LIG_INDUCE_FUSED_MSG").is_none()
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_LIG_INDUCE_FUSED_MSG").is_none())
 }
 
 /// Independent literal-`1` rollback for the five-product L0 final-three row.
@@ -5895,6 +5895,22 @@ pub(crate) fn ligero_commit(
 }
 
 /// Shared dispatch of [`ligero_commit`] / [`ligero_commit_with_tree_view`].
+/// The per-level `FLOCK_NO_RECURSIVE_FROM_MESSAGE_L{1,2}` term of
+/// [`ligero_commit_select`] (one commit per recursive level), kept once per
+/// process by name (`FLOCK_NO_ENV_ONCE_SWEEP` restores the per-call lookup).
+#[inline]
+fn recursive_from_message_level_clear(name: &str) -> bool {
+    match name {
+        "FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1" => crate::env_once_sweep!(
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1").is_none()
+        ),
+        "FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2" => crate::env_once_sweep!(
+            std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L2").is_none()
+        ),
+        _ => std::env::var_os(name).is_none(),
+    }
+}
+
 fn ligero_commit_select(
     poly: &[F128],
     log_msg_cols: usize,
@@ -5910,7 +5926,7 @@ fn ligero_commit_select(
         _ => None,
     };
     let recursive_from_message_shape = kind == HashKind::Blake3 && level_opt_out.is_some();
-    let level_enabled = level_opt_out.is_some_and(|name| std::env::var_os(name).is_none());
+    let level_enabled = level_opt_out.is_some_and(recursive_from_message_level_clear);
     let fuse_from_message = cfg!(all(
         target_os = "macos",
         target_arch = "aarch64",
@@ -6408,7 +6424,7 @@ fn prove_trace_env() -> bool {
         });
         return *ON;
     }
-    std::env::var("LIG_PROVE_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+    crate::env_once_sweep!(std::env::var("LIG_PROVE_TRACE").is_ok()) || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
 }
 
 /// [`c2::enabled`] with the `FLOCK_NO_LIG_C2` value kept the same way (the
@@ -6437,8 +6453,8 @@ fn commit_trace_env() -> bool {
         });
         return *ON;
     }
-    std::env::var_os("LIG_PROVE_TRACE").is_some()
-        || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+    crate::env_once_sweep!(std::env::var_os("LIG_PROVE_TRACE").is_some())
+        || crate::env_once_sweep!(std::env::var_os("FLOCK_OPEN_TIMING").is_some())
 }
 
 /// The `FLOCK_NO_RECURSIVE_FROM_MESSAGE` term of the recursive commit
@@ -6451,7 +6467,7 @@ fn recursive_from_message_env_clear() -> bool {
         });
         return *CLEAR;
     }
-    std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none()
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_RECURSIVE_FROM_MESSAGE").is_none())
 }
 
 /// The `FLOCK_NO_L1_TREE_VIEW` (exact `'1'`) term of
@@ -6464,7 +6480,7 @@ fn l1_tree_view_env_on() -> bool {
         });
         return *ON;
     }
-    std::env::var("FLOCK_NO_L1_TREE_VIEW").map_or(true, |v| v != "1")
+    crate::env_once_sweep!(std::env::var("FLOCK_NO_L1_TREE_VIEW").map_or(true, |v| v != "1"))
 }
 
 /// The environment term of [`ranked_fold2_enabled`], kept the same way.
@@ -7646,7 +7662,7 @@ fn use_ranked_direct_ab_hetero_materialize(
             claim_count,
             has_ordinary,
         )
-        && std::env::var_os("FLOCK_NO_DIRECT_AB_HETERO_MATERIALIZE").is_none()
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NO_DIRECT_AB_HETERO_MATERIALIZE").is_none())
         && crate::epool::epool().is_some()
 }
 
@@ -9936,7 +9952,7 @@ pub fn recursive_prover<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = std::env::var("LIGERITO_TRACE").is_ok();
+    let trace = crate::env_once_sweep!(std::env::var("LIGERITO_TRACE").is_ok());
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
@@ -10013,7 +10029,7 @@ pub fn recursive_prover_with_l0<Ch: Challenger>(
     claimed_value: F128,
     challenger: &mut Ch,
 ) -> LigeritoProof {
-    let trace = std::env::var("LIGERITO_TRACE").is_ok();
+    let trace = crate::env_once_sweep!(std::env::var("LIGERITO_TRACE").is_ok());
     macro_rules! tlog {
         ($($arg:tt)*) => { if trace { eprintln!($($arg)*); } }
     }
@@ -11296,7 +11312,7 @@ where
     // (e.g. ring_switch::eval_rs_eq_prefix + finish_from_prefix).
     F: Fn(&[F128], usize) -> Vec<F128>,
 {
-    let trace = std::env::var("LIG_VERIFY_TRACE").is_ok();
+    let trace = crate::env_once_sweep!(std::env::var("LIG_VERIFY_TRACE").is_ok());
     let mut t_merkle = std::time::Duration::ZERO;
     let mut t_sample_q = std::time::Duration::ZERO;
     let mut t_enforced = std::time::Duration::ZERO;
