@@ -40,7 +40,7 @@ kernel void zc_r2_products_horner_cs(
     ushort simd_group [[simdgroup_index_in_threadgroup]],
     ushort simd_lane  [[thread_index_in_simdgroup]])
 {
-    threadgroup uint4 tab8[1824];
+    threadgroup uint4 tab8[928];
     threadgroup ulong4* red = reinterpret_cast<threadgroup ulong4*>(tab8);
     threadgroup uint4* nib = tab8;
     nib[lid] = nib_tab_dev[lid];
@@ -49,11 +49,10 @@ kernel void zc_r2_products_horner_cs(
         uint lo_n = lid & 15u;
         uint hi_n = lid >> 4u;
         uint4 b0 = nib[lo_n] ^ nib[16u + hi_n];
-        if (lid < 32u) {
-            tab8[1792u + lid] = nib[224u + lid];
-        }
-        for (uint b = 1u; b < 7u; b++) {
-            tab8[b * 256u + lid] = nib[b * 32u + lo_n] ^ nib[b * 32u + 16u + hi_n];
+        tab8[256u + lid] = nib[32u + lo_n] ^ nib[48u + hi_n];
+        tab8[512u + lid] = nib[64u + lo_n] ^ nib[80u + hi_n];
+        if (lid < 160u) {
+            tab8[768u + lid] = nib[96u + lid];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         tab8[lid] = b0;

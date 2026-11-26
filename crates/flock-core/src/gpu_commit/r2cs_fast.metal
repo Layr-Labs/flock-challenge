@@ -85,22 +85,20 @@ static inline U256k zc_r2_cs_u8_to_k(U256u u) {
     return r;
 }
 
-// 7 full byte tables (bytes 0..6: 7 * 256 = 1792 uint4s) + byte 7's 32 nibble
-// entries (tab[1792..1824]): 29,184 B total, leaving headroom below Apple
-// Silicon's 32,768 B threadgroup memory cap for r2steal's claim word while
-// cutting SRAM loads per fold from 16 to 9 (-44%).
+// 3 full byte tables (bytes 0..2: 3 * 256 = 768 uint4s) + bytes 3..7's 160
+// nibble entries (tab[768..928]): 14,848 B total (<= 16 KiB with r2steal's
+// claim word) to double threadgroup occupancy on Apple Silicon GPUs.
 static inline uint4 zc_r2_cs_fold7b_1n(uint lo, uint hi, threadgroup const uint4* tab) {
     uchar4 a = as_type<uchar4>(lo);
     uchar4 b = as_type<uchar4>(hi);
     return tab[a.x]
-         ^ tab[256u  + a.y]
-         ^ tab[512u  + a.z]
-         ^ tab[768u  + a.w]
-         ^ tab[1024u + b.x]
-         ^ tab[1280u + b.y]
-         ^ tab[1536u + b.z]
-         ^ tab[1792u + (b.w & 15u)]
-         ^ tab[1808u + (b.w >> 4u)];
+         ^ tab[256u + a.y]
+         ^ tab[512u + a.z]
+         ^ tab[768u + (a.w & 15u)] ^ tab[784u + (a.w >> 4u)]
+         ^ tab[800u + (b.x & 15u)] ^ tab[816u + (b.x >> 4u)]
+         ^ tab[832u + (b.y & 15u)] ^ tab[848u + (b.y >> 4u)]
+         ^ tab[864u + (b.z & 15u)] ^ tab[880u + (b.z >> 4u)]
+         ^ tab[896u + (b.w & 15u)] ^ tab[912u + (b.w >> 4u)];
 }
 
 // Nine products of the bit-position-mod-3 planes of two 16-bit values
