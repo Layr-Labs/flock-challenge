@@ -3098,6 +3098,57 @@ fn fused3_twiddles_cached(ntt: &AdditiveNttF128, layer: usize) -> Option<&'stati
     Some(&tables[dim][layer].get_or_init(|| fused3_twiddles_uncached(ntt, layer).into_boxed_slice()))
 }
 
+/// Kill switch: setting `FLOCK_NO_TRANSPOSE_FUSED3_XOR` reverts
+/// [`transpose_forward_ntt_fused_3layer`] from the two-row paired `ldp`/`stp`
+/// + `mul_const_prep_xor` path back to the incumbent single-row
+/// `mul_const_pair_prep_pmull` + post-XOR path. Read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+pub const ENV_NO_TRANSPOSE_FUSED3_XOR: &str = "FLOCK_NO_TRANSPOSE_FUSED3_XOR";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn transpose_fused3_xor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_TRANSPOSE_FUSED3_XOR).is_none())
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+unsafe fn ligerito_load_pair_q(
+    p: *const F128,
+) -> (core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t) {
+    let a: core::arch::aarch64::uint64x2_t;
+    let b: core::arch::aarch64::uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "ldp {a:q}, {b:q}, [{p}]",
+            p = in(reg) p,
+            a = lateout(vreg) a,
+            b = lateout(vreg) b,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+    (a, b)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+unsafe fn ligerito_store_pair_q(
+    p: *mut F128,
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a:q}, {b:q}, [{p}]",
+            p = in(reg) p,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Apply three consecutive transpose layers in one read/write pass. `layer`
 /// is the lowest (root-most) of the three; the transpose executes forward
 /// layers `layer+2`, `layer+1`, then `layer`.
@@ -3177,6 +3228,92 @@ fn transpose_forward_ntt_fused_3layer(
     // even for the final few large blocks without opening nested parallel
     // regions, which caused long-tail scheduler stalls in this phase.
     let data_ptr = data.as_mut_ptr() as usize;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if pmull_fold && transpose_fused3_xor_enabled() {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64};
+        use crate::field::gf2_128::aarch64::mul_const_prep_xor;
+
+        macro_rules! fused3_row_xor_q {
+            ($v:ident, $tw:expr) => {{
+                macro_rules! bxor {
+                    ($a:literal, $b:literal, $t:expr) => {{
+                        let bot = $v[$b];
+                        let s = veorq_u64($v[$a], bot);
+                        $v[$a] = s;
+                        $v[$b] = mul_const_prep_xor($t, s, bot);
+                    }};
+                }
+                bxor!(0, 1, $tw[3]);
+                bxor!(2, 3, $tw[4]);
+                bxor!(4, 5, $tw[5]);
+                bxor!(6, 7, $tw[6]);
+                bxor!(0, 2, $tw[1]);
+                bxor!(1, 3, $tw[1]);
+                bxor!(4, 6, $tw[2]);
+                bxor!(5, 7, $tw[2]);
+                bxor!(0, 4, $tw[0]);
+                bxor!(1, 5, $tw[0]);
+                bxor!(2, 6, $tw[0]);
+                bxor!(3, 7, $tw[0]);
+            }};
+        }
+
+        if eighth >= 2 {
+            let pairs_per_block = eighth >> 1;
+            let pair_log = eighth_log - 1;
+            let pair_mask = pairs_per_block - 1;
+            (0..num_blocks * pairs_per_block)
+                .into_par_iter()
+                .with_min_len(small_ntt_min_jobs(16))
+                .for_each(|job| {
+                    let block = job >> pair_log;
+                    let row = (job & pair_mask) << 1;
+                    let base = block * block_size + row;
+                    let tw = &twiddles[block];
+                    // SAFETY: each `(block, row_pair)` owns the 16 distinct
+                    // adjacent entries `base + i*eighth + {0,1}` (`row + 1 < eighth`).
+                    unsafe {
+                        let ptr = data_ptr as *mut F128;
+                        let (e0, o0) = ligerito_load_pair_q(ptr.add(base));
+                        let (e1, o1) = ligerito_load_pair_q(ptr.add(base + eighth));
+                        let (e2, o2) = ligerito_load_pair_q(ptr.add(base + 2 * eighth));
+                        let (e3, o3) = ligerito_load_pair_q(ptr.add(base + 3 * eighth));
+                        let (e4, o4) = ligerito_load_pair_q(ptr.add(base + 4 * eighth));
+                        let (e5, o5) = ligerito_load_pair_q(ptr.add(base + 5 * eighth));
+                        let (e6, o6) = ligerito_load_pair_q(ptr.add(base + 6 * eighth));
+                        let (e7, o7) = ligerito_load_pair_q(ptr.add(base + 7 * eighth));
+                        let mut ve = [e0, e1, e2, e3, e4, e5, e6, e7];
+                        let mut vo = [o0, o1, o2, o3, o4, o5, o6, o7];
+                        fused3_row_xor_q!(ve, tw);
+                        fused3_row_xor_q!(vo, tw);
+                        for i in 0..8 {
+                            ligerito_store_pair_q(ptr.add(base + i * eighth), ve[i], vo[i]);
+                        }
+                    }
+                });
+        } else {
+            (0..num_blocks)
+                .into_par_iter()
+                .with_min_len(small_ntt_min_jobs(8))
+                .for_each(|block| {
+                    let base = block * block_size;
+                    let tw = &twiddles[block];
+                    // SAFETY: each block owns its disjoint 8-element slice.
+                    unsafe {
+                        let ptr = data_ptr as *mut F128;
+                        let mut v: [uint64x2_t; 8] = core::array::from_fn(|i| {
+                            vld1q_u64(ptr.add(base + i).cast::<u64>())
+                        });
+                        fused3_row_xor_q!(v, tw);
+                        for (i, &val) in v.iter().enumerate() {
+                            vst1q_u64(ptr.add(base + i).cast::<u64>(), val);
+                        }
+                    }
+                });
+        }
+        return;
+    }
     (0..num_blocks * eighth)
         .into_par_iter()
         .with_min_len(small_ntt_min_jobs(8))
@@ -3458,6 +3595,111 @@ fn l0_factored_final3_retained_row(
     ]
 }
 
+/// Kill switch: setting `FLOCK_NO_L0_FINAL3_PREP_ACC` reverts
+/// [`transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg`]
+/// from the prepared NEON `mul_const_prep_xor` + paired `ldp`/`stp` +
+/// deferred-reduction `TriAcc` accumulator back to the incumbent scalar-multiply
+/// path. Read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+pub const ENV_NO_L0_FINAL3_PREP_ACC: &str = "FLOCK_NO_L0_FINAL3_PREP_ACC";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn l0_final3_prep_acc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_L0_FINAL3_PREP_ACC).is_none())
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+unsafe fn l0_factored_final3_prepared_row_q(
+    v: [core::arch::aarch64::uint64x2_t; 8],
+    constants: [crate::field::gf2_128::aarch64::ConstPrep; 4],
+) -> [core::arch::aarch64::uint64x2_t; 4] {
+    use core::arch::aarch64::veorq_u64;
+    use crate::field::gf2_128::aarch64::mul_const_prep_xor;
+    unsafe {
+        let [x0, x1, x2, x3, x4, x5, x6, x7] = v;
+        let p0 = veorq_u64(x0, x1);
+        let p1 = veorq_u64(x2, x3);
+        let p2 = veorq_u64(x4, x5);
+        let p3 = veorq_u64(x6, x7);
+        let q3 = mul_const_prep_xor(constants[0], p1, x3);
+        let q5 = mul_const_prep_xor(constants[1], p2, x5);
+        let q7 = mul_const_prep_xor(constants[2], p3, x7);
+        let t0 = veorq_u64(p0, p1);
+        let t1 = veorq_u64(x1, q3);
+        let t2 = veorq_u64(p2, p3);
+        let t3 = veorq_u64(q5, q7);
+        let out0 = veorq_u64(t0, t2);
+        let out1 = veorq_u64(t1, t3);
+        let out2 = mul_const_prep_xor(constants[3], t2, veorq_u64(p1, p3));
+        let out3 = mul_const_prep_xor(constants[3], t3, veorq_u64(q3, q7));
+        [out0, out1, out2, out3]
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[derive(Clone, Copy)]
+struct L0TriAcc {
+    ll: core::arch::aarch64::uint64x2_t,
+    cr: core::arch::aarch64::uint64x2_t,
+    hh: core::arch::aarch64::uint64x2_t,
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+impl L0TriAcc {
+    #[inline(always)]
+    unsafe fn zero() -> Self {
+        unsafe {
+            let z = core::arch::aarch64::vdupq_n_u64(0);
+            Self { ll: z, cr: z, hh: z }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn fma(
+        &mut self,
+        a: core::arch::aarch64::uint64x2_t,
+        b: core::arch::aarch64::uint64x2_t,
+    ) {
+        unsafe {
+            let b_sw = core::arch::aarch64::vextq_u64::<1>(b, b);
+            core::arch::asm!(
+                "pmull {t:v}.1q, {a:v}.1d, {b:v}.1d",
+                "eor {ll:v}.16b, {ll:v}.16b, {t:v}.16b",
+                "pmull2 {t:v}.1q, {a:v}.2d, {b:v}.2d",
+                "eor {hh:v}.16b, {hh:v}.16b, {t:v}.16b",
+                "pmull {t:v}.1q, {a:v}.1d, {bs:v}.1d",
+                "eor {cr:v}.16b, {cr:v}.16b, {t:v}.16b",
+                "pmull2 {t:v}.1q, {a:v}.2d, {bs:v}.2d",
+                "eor {cr:v}.16b, {cr:v}.16b, {t:v}.16b",
+                a = in(vreg) a,
+                b = in(vreg) b,
+                bs = in(vreg) b_sw,
+                ll = inout(vreg) self.ll,
+                cr = inout(vreg) self.cr,
+                hh = inout(vreg) self.hh,
+                t = out(vreg) _,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn reduce(self) -> F128 {
+        use core::arch::aarch64::vgetq_lane_u64;
+        unsafe {
+            crate::field::gf2_128::ghash_reduce(
+                vgetq_lane_u64::<0>(self.ll),
+                vgetq_lane_u64::<1>(self.ll) ^ vgetq_lane_u64::<0>(self.cr),
+                vgetq_lane_u64::<0>(self.hh) ^ vgetq_lane_u64::<1>(self.cr),
+                vgetq_lane_u64::<1>(self.hh),
+            )
+        }
+    }
+}
+
 /// Exact ranked child of
 /// [`transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg`].
 /// Only the retained-row algebra changes; paired row ownership, stores, the
@@ -3496,6 +3738,64 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
     };
 
     let data_ptr = data.as_mut_ptr() as usize;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if l0_final3_prep_acc_enabled() {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64};
+        use crate::field::gf2_128::aarch64::const_prep;
+        // SAFETY: AES and little-endian F128 lane order match uint64x2_t.
+        let prep_consts = unsafe {
+            [constants.a, constants.d, constants.a_plus_d, constants.b]
+                .map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t)))
+        };
+        let f_ptr = f.as_ptr() as usize;
+        let (u_0, u_2) = (0..eighth / 2)
+            .into_par_iter()
+            .with_min_len(small_ntt_min_jobs(16))
+            .fold(
+                || unsafe { (L0TriAcc::zero(), L0TriAcc::zero()) },
+                |(mut acc0, mut acc2), row_pair| {
+                    let even_row = 2 * row_pair;
+                    // SAFETY: every job owns the 16 distinct adjacent inputs
+                    // `even_row + i*eighth + {0,1}`, writes the 8 retained
+                    // outputs in-place, and reads the matching 8 `f` entries.
+                    unsafe {
+                        let ptr = data_ptr as *mut F128;
+                        let fptr = f_ptr as *const F128;
+                        let (e0, o0) = ligerito_load_pair_q(ptr.add(even_row));
+                        let (e1, o1) = ligerito_load_pair_q(ptr.add(even_row + eighth));
+                        let (e2, o2) = ligerito_load_pair_q(ptr.add(even_row + 2 * eighth));
+                        let (e3, o3) = ligerito_load_pair_q(ptr.add(even_row + 3 * eighth));
+                        let (e4, o4) = ligerito_load_pair_q(ptr.add(even_row + 4 * eighth));
+                        let (e5, o5) = ligerito_load_pair_q(ptr.add(even_row + 5 * eighth));
+                        let (e6, o6) = ligerito_load_pair_q(ptr.add(even_row + 6 * eighth));
+                        let (e7, o7) = ligerito_load_pair_q(ptr.add(even_row + 7 * eighth));
+                        let even = l0_factored_final3_prepared_row_q(
+                            [e0, e1, e2, e3, e4, e5, e6, e7],
+                            prep_consts,
+                        );
+                        let odd = l0_factored_final3_prepared_row_q(
+                            [o0, o1, o2, o3, o4, o5, o6, o7],
+                            prep_consts,
+                        );
+                        for segment in 0..4 {
+                            let even_index = segment * eighth + even_row;
+                            ligerito_store_pair_q(ptr.add(even_index), even[segment], odd[segment]);
+                            let (f0, f1) = ligerito_load_pair_q(fptr.add(even_index));
+                            acc0.fma(f0, even[segment]);
+                            acc2.fma(veorq_u64(f0, f1), veorq_u64(even[segment], odd[segment]));
+                        }
+                    }
+                    (acc0, acc2)
+                },
+            )
+            .map(|(acc0, acc2)| unsafe { (acc0.reduce(), acc2.reduce()) })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a_0, a_2), (b_0, b_2)| (a_0 + b_0, a_2 + b_2),
+            );
+        return SumcheckMessage { u_0, u_2 };
+    }
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
         .with_min_len(small_ntt_min_jobs(16))
