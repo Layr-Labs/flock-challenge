@@ -611,6 +611,476 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Disjoint-row sibling of [`fold_banked_slots2`]: folds two arbitrary
+/// `BANKS`-element rows against one shared `weight`, unzipping each weight pair
+/// once across both rows via macro-fused [`KaraNeon`] and one paired reduction.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). Both `a` and `b` must hold at
+/// least `BANKS` elements.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_pair_disjoint<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    a: &[F128],
+    b: &[F128],
+) -> [F128; 2] {
+    unsafe {
+        debug_assert!(a.len() >= BANKS && b.len() >= BANKS);
+        let mut first0 = KaraNeon::zero();
+        let mut first1 = KaraNeon::zero();
+        let mut second0 = KaraNeon::zero();
+        let mut second1 = KaraNeon::zero();
+
+        let w = weight.as_ptr();
+        let x0 = a.as_ptr();
+        let x1 = b.as_ptr();
+        let main = BANKS & !1;
+        let mut bank = 0usize;
+        while bank < main {
+            let (w0, w1) = load_pair_whole(w.add(bank));
+            let w_lo = vuzp1q_u64(w0, w1);
+            let w_hi = vuzp2q_u64(w0, w1);
+            let w_mid = veorq_u64(w_lo, w_hi);
+            let (x00, x01) = load_pair_whole(x0.add(bank));
+            let e_lo = vuzp1q_u64(x00, x01);
+            let e_hi = vuzp2q_u64(x00, x01);
+            let e_mid = veorq_u64(e_lo, e_hi);
+            first0.ll = fused_pmull_lo_acc(first0.ll, e_lo, w_lo);
+            first1.ll = fused_pmull_hi_acc(first1.ll, e_lo, w_lo);
+            first0.hh = fused_pmull_lo_acc(first0.hh, e_hi, w_hi);
+            first1.hh = fused_pmull_hi_acc(first1.hh, e_hi, w_hi);
+            first0.mm = fused_pmull_lo_acc(first0.mm, e_mid, w_mid);
+            first1.mm = fused_pmull_hi_acc(first1.mm, e_mid, w_mid);
+            let (x10, x11) = load_pair_whole(x1.add(bank));
+            let o_lo = vuzp1q_u64(x10, x11);
+            let o_hi = vuzp2q_u64(x10, x11);
+            let o_mid = veorq_u64(o_lo, o_hi);
+            second0.ll = fused_pmull_lo_acc(second0.ll, o_lo, w_lo);
+            second1.ll = fused_pmull_hi_acc(second1.ll, o_lo, w_lo);
+            second0.hh = fused_pmull_lo_acc(second0.hh, o_hi, w_hi);
+            second1.hh = fused_pmull_hi_acc(second1.hh, o_hi, w_hi);
+            second0.mm = fused_pmull_lo_acc(second0.mm, o_mid, w_mid);
+            second1.mm = fused_pmull_hi_acc(second1.mm, o_mid, w_mid);
+            bank += 2;
+        }
+        if bank < BANKS {
+            let wk = load_whole(w.add(bank));
+            let wk_mid = veorq_u64(wk, vextq_u64::<1>(wk, wk));
+            kara_acc_single(&mut first0, load_whole(x0.add(bank)), wk, wk_mid);
+            kara_acc_single(&mut second0, load_whole(x1.add(bank)), wk, wk_mid);
+        }
+
+        first0.ll = veorq_u64(first0.ll, first1.ll);
+        first0.hh = veorq_u64(first0.hh, first1.hh);
+        first0.mm = veorq_u64(first0.mm, first1.mm);
+        second0.ll = veorq_u64(second0.ll, second1.ll);
+        second0.hh = veorq_u64(second0.hh, second1.hh);
+        second0.mm = veorq_u64(second0.mm, second1.mm);
+        let reduced = reduce_wide_pair(kara_to_wide(first0), kara_to_wide(second0));
+        [
+            transmute::<uint64x2_t, F128>(reduced[0]),
+            transmute::<uint64x2_t, F128>(reduced[1]),
+        ]
+    }
+}
+
+/// Disjoint-row sibling of [`fold_banked_slots4`]: folds four arbitrary
+/// `BANKS`-element rows against one shared `weight`, unzipping each weight pair
+/// once across all four rows via macro-fused [`KaraNeon`] (supporting both even
+/// and odd `BANKS`) and two paired reductions.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL). Each of `r0..r3` must hold at
+/// least `BANKS` elements.
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_quad_disjoint<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    r0: &[F128],
+    r1: &[F128],
+    r2: &[F128],
+    r3: &[F128],
+) -> [F128; 4] {
+    unsafe {
+        debug_assert!(
+            r0.len() >= BANKS && r1.len() >= BANKS && r2.len() >= BANKS && r3.len() >= BANKS
+        );
+        let mut acc = [KaraNeon::zero(); 4];
+        let w = weight.as_ptr();
+        let p0 = r0.as_ptr();
+        let p1 = r1.as_ptr();
+        let p2 = r2.as_ptr();
+        let p3 = r3.as_ptr();
+        let main = BANKS & !1;
+        let mut bank = 0usize;
+        while bank < main {
+            let (w0, w1) = load_pair_whole(w.add(bank));
+            let w_lo = vuzp1q_u64(w0, w1);
+            let w_hi = vuzp2q_u64(w0, w1);
+            let w_mid = veorq_u64(w_lo, w_hi);
+            let (a0, a1) = load_pair_whole(p0.add(bank));
+            kara_acc_two_banks(&mut acc[0], a0, a1, w_lo, w_hi, w_mid);
+            let (b0, b1) = load_pair_whole(p1.add(bank));
+            kara_acc_two_banks(&mut acc[1], b0, b1, w_lo, w_hi, w_mid);
+            let (c0, c1) = load_pair_whole(p2.add(bank));
+            kara_acc_two_banks(&mut acc[2], c0, c1, w_lo, w_hi, w_mid);
+            let (d0, d1) = load_pair_whole(p3.add(bank));
+            kara_acc_two_banks(&mut acc[3], d0, d1, w_lo, w_hi, w_mid);
+            bank += 2;
+        }
+        if bank < BANKS {
+            let wk = load_whole(w.add(bank));
+            let wk_mid = veorq_u64(wk, vextq_u64::<1>(wk, wk));
+            kara_acc_single(&mut acc[0], load_whole(p0.add(bank)), wk, wk_mid);
+            kara_acc_single(&mut acc[1], load_whole(p1.add(bank)), wk, wk_mid);
+            kara_acc_single(&mut acc[2], load_whole(p2.add(bank)), wk, wk_mid);
+            kara_acc_single(&mut acc[3], load_whole(p3.add(bank)), wk, wk_mid);
+        }
+        let low = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
+        let high = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
+        [
+            transmute::<uint64x2_t, F128>(low[0]),
+            transmute::<uint64x2_t, F128>(low[1]),
+            transmute::<uint64x2_t, F128>(high[0]),
+            transmute::<uint64x2_t, F128>(high[1]),
+        ]
+    }
+}
+
+/// Software prefetch of the leading cache lines of a codeword row into L1D.
+#[inline(always)]
+pub(super) unsafe fn prefetch_l1_row(row: &[F128]) {
+    let p = row.as_ptr().cast::<u8>();
+    let bytes = core::mem::size_of_val(row);
+    if bytes == 0 {
+        return;
+    }
+    // SAFETY: `prfm` is a non-faulting hint; `p` points to a valid slice.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) p,
+            options(nostack, preserves_flags),
+        );
+        if bytes > 128 {
+            core::arch::asm!(
+                "prfm pldl1keep, [{p}, #128]",
+                p = in(reg) p,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+/// Pre-unzipped Karatsuba NEON weight table for 64-lane C2 L0 row dots,
+/// hoisted once per `c2::Dual::new_sync` across all queries and rows.
+/// Splits into 57-lane head (`28` pairs + bank `56`) and 7-lane tail (`3` pairs
+/// + bank `63`) so the forward head scan warms `[57..64]` into L1D before the
+/// shared-tail check and fuses the tail directly into unreduced `KaraNeon`
+/// accumulators (saving a full `reduce_wide_pair` per 4-row quad).
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedKaraWeights64 {
+    head_pairs: [(uint64x2_t, uint64x2_t, uint64x2_t); 28],
+    w56: uint64x2_t,
+    w56_mid: uint64x2_t,
+    tail_pairs: [(uint64x2_t, uint64x2_t, uint64x2_t); 3],
+    w63: uint64x2_t,
+    w63_mid: uint64x2_t,
+}
+
+impl PreparedKaraWeights64 {
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn new(weight: &[F128; 64]) -> Self {
+        unsafe {
+            let wp = weight.as_ptr();
+            let zero = vdupq_n_u64(0);
+            let mut head_pairs = [(zero, zero, zero); 28];
+            for i in 0..28 {
+                let (w0, w1) = load_pair_whole(wp.add(2 * i));
+                let lo = vuzp1q_u64(w0, w1);
+                let hi = vuzp2q_u64(w0, w1);
+                head_pairs[i] = (lo, hi, veorq_u64(lo, hi));
+            }
+            let w56 = load_whole(wp.add(56));
+            let w56_mid = veorq_u64(w56, vextq_u64::<1>(w56, w56));
+            let mut tail_pairs = [(zero, zero, zero); 3];
+            for i in 0..3 {
+                let (w0, w1) = load_pair_whole(wp.add(57 + 2 * i));
+                let lo = vuzp1q_u64(w0, w1);
+                let hi = vuzp2q_u64(w0, w1);
+                tail_pairs[i] = (lo, hi, veorq_u64(lo, hi));
+            }
+            let w63 = load_whole(wp.add(63));
+            let w63_mid = veorq_u64(w63, vextq_u64::<1>(w63, w63));
+            Self {
+                head_pairs,
+                w56,
+                w56_mid,
+                tail_pairs,
+                w63,
+                w63_mid,
+            }
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn dot_quad_shared_tail(
+        &self,
+        r0: &[F128],
+        r1: &[F128],
+        r2: &[F128],
+        r3: &[F128],
+        shared_tail_enabled: bool,
+    ) -> [F128; 4] {
+        unsafe {
+            debug_assert!(r0.len() >= 64 && r1.len() >= 64 && r2.len() >= 64 && r3.len() >= 64);
+            let p0 = r0.as_ptr();
+            let p1 = r1.as_ptr();
+            let p2 = r2.as_ptr();
+            let p3 = r3.as_ptr();
+            let mut acc = [KaraNeon::zero(); 4];
+            for idx in 0..28 {
+                let bank = 2 * idx;
+                let (w_lo, w_hi, w_mid) = self.head_pairs[idx];
+                let (a0, a1) = load_pair_whole(p0.add(bank));
+                kara_acc_two_banks(&mut acc[0], a0, a1, w_lo, w_hi, w_mid);
+                let (b0, b1) = load_pair_whole(p1.add(bank));
+                kara_acc_two_banks(&mut acc[1], b0, b1, w_lo, w_hi, w_mid);
+                let (c0, c1) = load_pair_whole(p2.add(bank));
+                kara_acc_two_banks(&mut acc[2], c0, c1, w_lo, w_hi, w_mid);
+                let (d0, d1) = load_pair_whole(p3.add(bank));
+                kara_acc_two_banks(&mut acc[3], d0, d1, w_lo, w_hi, w_mid);
+            }
+            kara_acc_single(&mut acc[0], load_whole(p0.add(56)), self.w56, self.w56_mid);
+            kara_acc_single(&mut acc[1], load_whole(p1.add(56)), self.w56, self.w56_mid);
+            kara_acc_single(&mut acc[2], load_whole(p2.add(56)), self.w56, self.w56_mid);
+            kara_acc_single(&mut acc[3], load_whole(p3.add(56)), self.w56, self.w56_mid);
+
+            if shared_tail_enabled && r0[57..64] == r1[57..64] && r2[57..64] == r3[57..64] {
+                let mut t01 = KaraNeon::zero();
+                let mut t23 = KaraNeon::zero();
+                for idx in 0..3 {
+                    let bank = 57 + 2 * idx;
+                    let (w_lo, w_hi, w_mid) = self.tail_pairs[idx];
+                    let (a0, a1) = load_pair_whole(p0.add(bank));
+                    kara_acc_two_banks(&mut t01, a0, a1, w_lo, w_hi, w_mid);
+                    let (c0, c1) = load_pair_whole(p2.add(bank));
+                    kara_acc_two_banks(&mut t23, c0, c1, w_lo, w_hi, w_mid);
+                }
+                kara_acc_single(&mut t01, load_whole(p0.add(63)), self.w63, self.w63_mid);
+                kara_acc_single(&mut t23, load_whole(p2.add(63)), self.w63, self.w63_mid);
+                for k in 0..2 {
+                    acc[k].ll = veorq_u64(acc[k].ll, t01.ll);
+                    acc[k].hh = veorq_u64(acc[k].hh, t01.hh);
+                    acc[k].mm = veorq_u64(acc[k].mm, t01.mm);
+                }
+                for k in 2..4 {
+                    acc[k].ll = veorq_u64(acc[k].ll, t23.ll);
+                    acc[k].hh = veorq_u64(acc[k].hh, t23.hh);
+                    acc[k].mm = veorq_u64(acc[k].mm, t23.mm);
+                }
+            } else {
+                for idx in 0..3 {
+                    let bank = 57 + 2 * idx;
+                    let (w_lo, w_hi, w_mid) = self.tail_pairs[idx];
+                    let (a0, a1) = load_pair_whole(p0.add(bank));
+                    kara_acc_two_banks(&mut acc[0], a0, a1, w_lo, w_hi, w_mid);
+                    let (b0, b1) = load_pair_whole(p1.add(bank));
+                    kara_acc_two_banks(&mut acc[1], b0, b1, w_lo, w_hi, w_mid);
+                    let (c0, c1) = load_pair_whole(p2.add(bank));
+                    kara_acc_two_banks(&mut acc[2], c0, c1, w_lo, w_hi, w_mid);
+                    let (d0, d1) = load_pair_whole(p3.add(bank));
+                    kara_acc_two_banks(&mut acc[3], d0, d1, w_lo, w_hi, w_mid);
+                }
+                kara_acc_single(&mut acc[0], load_whole(p0.add(63)), self.w63, self.w63_mid);
+                kara_acc_single(&mut acc[1], load_whole(p1.add(63)), self.w63, self.w63_mid);
+                kara_acc_single(&mut acc[2], load_whole(p2.add(63)), self.w63, self.w63_mid);
+                kara_acc_single(&mut acc[3], load_whole(p3.add(63)), self.w63, self.w63_mid);
+            }
+            let low = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
+            let high = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
+            [
+                transmute::<uint64x2_t, F128>(low[0]),
+                transmute::<uint64x2_t, F128>(low[1]),
+                transmute::<uint64x2_t, F128>(high[0]),
+                transmute::<uint64x2_t, F128>(high[1]),
+            ]
+        }
+    }
+}
+
+/// Pre-unzipped Karatsuba NEON weight table for 8-lane C2 L1–L4 row dots.
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedKaraWeights8 {
+    pairs: [(uint64x2_t, uint64x2_t, uint64x2_t); 4],
+}
+
+impl PreparedKaraWeights8 {
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn new(weight: &[F128; 8]) -> Self {
+        unsafe {
+            let wp = weight.as_ptr();
+            let zero = vdupq_n_u64(0);
+            let mut pairs = [(zero, zero, zero); 4];
+            for i in 0..4 {
+                let (w0, w1) = load_pair_whole(wp.add(2 * i));
+                let lo = vuzp1q_u64(w0, w1);
+                let hi = vuzp2q_u64(w0, w1);
+                pairs[i] = (lo, hi, veorq_u64(lo, hi));
+            }
+            Self { pairs }
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn dot_quad(
+        &self,
+        r0: &[F128],
+        r1: &[F128],
+        r2: &[F128],
+        r3: &[F128],
+    ) -> [F128; 4] {
+        unsafe {
+            debug_assert!(r0.len() >= 8 && r1.len() >= 8 && r2.len() >= 8 && r3.len() >= 8);
+            let p0 = r0.as_ptr();
+            let p1 = r1.as_ptr();
+            let p2 = r2.as_ptr();
+            let p3 = r3.as_ptr();
+            let mut acc = [KaraNeon::zero(); 4];
+            for idx in 0..4 {
+                let bank = 2 * idx;
+                let (w_lo, w_hi, w_mid) = self.pairs[idx];
+                let (a0, a1) = load_pair_whole(p0.add(bank));
+                kara_acc_two_banks(&mut acc[0], a0, a1, w_lo, w_hi, w_mid);
+                let (b0, b1) = load_pair_whole(p1.add(bank));
+                kara_acc_two_banks(&mut acc[1], b0, b1, w_lo, w_hi, w_mid);
+                let (c0, c1) = load_pair_whole(p2.add(bank));
+                kara_acc_two_banks(&mut acc[2], c0, c1, w_lo, w_hi, w_mid);
+                let (d0, d1) = load_pair_whole(p3.add(bank));
+                kara_acc_two_banks(&mut acc[3], d0, d1, w_lo, w_hi, w_mid);
+            }
+            let low = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
+            let high = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
+            [
+                transmute::<uint64x2_t, F128>(low[0]),
+                transmute::<uint64x2_t, F128>(low[1]),
+                transmute::<uint64x2_t, F128>(high[0]),
+                transmute::<uint64x2_t, F128>(high[1]),
+            ]
+        }
+    }
+}
+
+/// Dynamic-length deferred-reduction Karatsuba NEON dot product of `weight`
+/// and `row`. Bit-identical to `row.iter().zip(weight.iter()).map(|(&r, &e)| r * e).fold(F128::ZERO, |a, b| a + b)`.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL).
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn dot_slice_kara(weight: &[F128], row: &[F128]) -> F128 {
+    let len = weight.len().min(row.len());
+    if len == 0 {
+        return F128::ZERO;
+    }
+    unsafe {
+        let mut acc = KaraNeon::zero();
+        let w = weight.as_ptr();
+        let r = row.as_ptr();
+        let main = len & !1;
+        let mut i = 0usize;
+        while i < main {
+            let (w0, w1) = load_pair_whole(w.add(i));
+            let w_lo = vuzp1q_u64(w0, w1);
+            let w_hi = vuzp2q_u64(w0, w1);
+            let w_mid = veorq_u64(w_lo, w_hi);
+            let (a0, a1) = load_pair_whole(r.add(i));
+            kara_acc_two_banks(&mut acc, a0, a1, w_lo, w_hi, w_mid);
+            i += 2;
+        }
+        if i < len {
+            let wk = load_whole(w.add(i));
+            let wk_mid = veorq_u64(wk, vextq_u64::<1>(wk, wk));
+            kara_acc_single(&mut acc, load_whole(r.add(i)), wk, wk_mid);
+        }
+        let wide = kara_to_wide(acc);
+        let reduced = reduce_wide_pair(wide, wide);
+        transmute::<uint64x2_t, F128>(reduced[0])
+    }
+}
+
+/// Dynamic-length 4-row weight-sharing deferred-reduction Karatsuba NEON dot
+/// product. Unzips each pair of `weight` elements once across all four rows
+/// and reduces the four 256-bit accumulators in two paired GHASH reductions.
+///
+/// # Safety
+/// Requires the `aes` target feature (PMULL).
+#[inline]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn dot_quad_slices_kara(
+    weight: &[F128],
+    r0: &[F128],
+    r1: &[F128],
+    r2: &[F128],
+    r3: &[F128],
+) -> [F128; 4] {
+    let len = weight
+        .len()
+        .min(r0.len())
+        .min(r1.len())
+        .min(r2.len())
+        .min(r3.len());
+    if len == 0 {
+        return [F128::ZERO; 4];
+    }
+    unsafe {
+        let mut acc = [KaraNeon::zero(); 4];
+        let w = weight.as_ptr();
+        let p0 = r0.as_ptr();
+        let p1 = r1.as_ptr();
+        let p2 = r2.as_ptr();
+        let p3 = r3.as_ptr();
+        let main = len & !1;
+        let mut i = 0usize;
+        while i < main {
+            let (w0, w1) = load_pair_whole(w.add(i));
+            let w_lo = vuzp1q_u64(w0, w1);
+            let w_hi = vuzp2q_u64(w0, w1);
+            let w_mid = veorq_u64(w_lo, w_hi);
+            let (a0, a1) = load_pair_whole(p0.add(i));
+            kara_acc_two_banks(&mut acc[0], a0, a1, w_lo, w_hi, w_mid);
+            let (b0, b1) = load_pair_whole(p1.add(i));
+            kara_acc_two_banks(&mut acc[1], b0, b1, w_lo, w_hi, w_mid);
+            let (c0, c1) = load_pair_whole(p2.add(i));
+            kara_acc_two_banks(&mut acc[2], c0, c1, w_lo, w_hi, w_mid);
+            let (d0, d1) = load_pair_whole(p3.add(i));
+            kara_acc_two_banks(&mut acc[3], d0, d1, w_lo, w_hi, w_mid);
+            i += 2;
+        }
+        if i < len {
+            let wk = load_whole(w.add(i));
+            let wk_mid = veorq_u64(wk, vextq_u64::<1>(wk, wk));
+            kara_acc_single(&mut acc[0], load_whole(p0.add(i)), wk, wk_mid);
+            kara_acc_single(&mut acc[1], load_whole(p1.add(i)), wk, wk_mid);
+            kara_acc_single(&mut acc[2], load_whole(p2.add(i)), wk, wk_mid);
+            kara_acc_single(&mut acc[3], load_whole(p3.add(i)), wk, wk_mid);
+        }
+        let low = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
+        let high = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
+        [
+            transmute::<uint64x2_t, F128>(low[0]),
+            transmute::<uint64x2_t, F128>(low[1]),
+            transmute::<uint64x2_t, F128>(high[0]),
+            transmute::<uint64x2_t, F128>(high[1]),
+        ]
+    }
+}
+
 ///
 /// # Safety
 /// Requires the `aes` target feature (PMULL). `input` must hold at least
