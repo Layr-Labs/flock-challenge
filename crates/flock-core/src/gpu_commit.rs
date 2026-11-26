@@ -36561,3 +36561,5 @@ mod grind_lat_tests {
         assert!(gpu_pow_race_launch(&digest, 0, 1 << 16, 0).is_none());
     }
 }
+
+// GPT 6.1 Terra frontier draw for the current accepted tree.
