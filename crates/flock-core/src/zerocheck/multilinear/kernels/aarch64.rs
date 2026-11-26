@@ -2129,25 +2129,23 @@ unsafe fn r2_pair_fold_and_store<const F7: bool>(
 /// [`r2_pair_fold_and_store`] for a live pair addressed from per-stream
 /// pointers: its rows and its delta sit `CODE` bytes after `a_row`, `b_row`
 /// and `deltas`, its anchors `ANC` bytes after `anchors`. Same loads, stores
-/// and values; the stores take the offset as an immediate.
+/// and values; the stores take the offset as an immediate. When `CONST_FLAGS`
+/// is true, `DEGEN` and `NT_DELTAS` replace the runtime flags at compile time.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn r2_pair_fold_and_store_off<const F7: bool, const CODE: usize, const ANC: usize>(
-    table_data: *const u8,
-    a_row: *const u8,
-    b_row: *const u8,
-    anchors: *mut F128,
-    deltas: *mut u8,
-    degen: bool,
-    b_ones: core::arch::aarch64::uint64x2_t,
-    nt_deltas: bool,
+#[allow(clippy::too_many_arguments)]
+unsafe fn r2_pair_fold_and_store_off_g<
+    const F7: bool, const CODE: usize, const ANC: usize,
+    const CONST_FLAGS: bool, const DEGEN: bool, const NT_DELTAS: bool,
+>(
+    table_data: *const u8, a_row: *const u8, b_row: *const u8,
+    anchors: *mut F128, deltas: *mut u8,
+    degen_rt: bool, b_ones: core::arch::aarch64::uint64x2_t, nt_deltas_rt: bool,
 ) -> (
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    core::arch::aarch64::uint64x2_t,
-    bool,
+    core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t, bool,
 ) {
+    let (degen, nt_deltas) = if CONST_FLAGS { (DEGEN, NT_DELTAS) } else { (degen_rt, nt_deltas_rt) };
     unsafe {
         let a0_code = u64::from_le(core::ptr::read_unaligned(a_row.add(CODE).cast::<u64>()));
         let a1_code = u64::from_le(core::ptr::read_unaligned(a_row.add(CODE + 8).cast::<u64>()));
@@ -2174,6 +2172,23 @@ unsafe fn r2_pair_fold_and_store_off<const F7: bool, const CODE: usize, const AN
             store_delta_pair_gpr_off::<CODE>(deltas, a0_code, a1_code, b0_code, b1_code);
         }
         (a0, a1, b0, b1, false)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn r2_pair_fold_and_store_off<const F7: bool, const CODE: usize, const ANC: usize>(
+    table_data: *const u8, a_row: *const u8, b_row: *const u8,
+    anchors: *mut F128, deltas: *mut u8,
+    degen: bool, b_ones: core::arch::aarch64::uint64x2_t, nt_deltas: bool,
+) -> (
+    core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t, bool,
+) {
+    unsafe {
+        r2_pair_fold_and_store_off_g::<F7, CODE, ANC, false, false, false>(
+            table_data, a_row, b_row, anchors, deltas, degen, b_ones, nt_deltas,
+        )
     }
 }
 
@@ -3105,51 +3120,42 @@ pub(crate) fn r2_full_xb_rho_prep(eq_lo: &[F128]) -> Option<Vec<F128>> {
 /// the weight relation above with `rho_prep` =
 /// [`r2_full_xb_rho_prep`]`(eq_lo)`.
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
-    table_data: *const u8,
-    a_packed: *const u8,
-    b_packed: *const u8,
-    anchors: *mut F128,
-    deltas: *mut u8,
-    eq_lo: *const F128,
-    rho_prep: *const F128,
-    lo_size: usize,
-    degen: bool,
-    tail_compact: bool,
-    head_fail: *const core::sync::atomic::AtomicBool,
-    skip_pure: bool,
-    out: *mut F128,
+unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_core<
+    const F7: bool, const RANKED_FAST: bool,
+>(
+    table_data: *const u8, a_packed: *const u8, b_packed: *const u8,
+    anchors: *mut F128, deltas: *mut u8, eq_lo: *const F128, rho_prep: *const F128,
+    lo_size: usize, degen: bool, tail_compact: bool,
+    head_fail: *const core::sync::atomic::AtomicBool, skip_pure: bool, out: *mut F128,
 ) {
     use core::arch::aarch64::*;
 
     unsafe {
         let (anchors0, deltas0) = (anchors, deltas);
-        let head = !head_fail.is_null();
-        // R2 C capture: head-compacted, degenerate b pairs only.
-        assert!(!skip_pure || (head && degen));
-        assert!(!head || tail_compact);
-        assert!(lo_size.is_multiple_of(128));
-        let head_inline = head && r2_head_inline_enabled();
-        let nt_deltas = tail_compact && r2_nt_deltas_enabled();
+        let (degen, tail_compact, head, skip_pure, head_inline, nt_deltas) = if RANKED_FAST {
+            (true, true, true, true, true, true)
+        } else {
+            let head = !head_fail.is_null();
+            (degen, tail_compact, head, skip_pure, head && r2_head_inline_enabled(),
+             tail_compact && r2_nt_deltas_enabled())
+        };
         let mut head_ok = true;
         let zero = vdupq_n_u64(0);
-        let tri_zero = TriNeon {
-            ll: zero,
-            cross: zero,
-            hh: zero,
-        };
+        let tri_zero = TriNeon { ll: zero, cross: zero, hh: zero };
         let k87 = vdupq_n_u64(0x87);
-        let b_ones = if F7 {
-            fold_two_row_codes_q7(table_data, u64::MAX, u64::MAX).0
+        let (b_ones, ones_is_one) = if RANKED_FAST {
+            (core::mem::transmute::<F128, uint64x2_t>(F128::ONE), true)
         } else {
-            fold_row_q(table_data, [0xFFu8; 8].as_ptr())
+            let b_ones = if F7 {
+                fold_two_row_codes_q7(table_data, u64::MAX, u64::MAX).0
+            } else {
+                fold_row_q(table_data, [0xFFu8; 8].as_ptr())
+            };
+            (b_ones, is_zero_q(veorq_u64(b_ones, core::mem::transmute::<F128, uint64x2_t>(F128::ONE))))
         };
-        let ones_is_one = is_zero_q(veorq_u64(
-            b_ones,
-            core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
-        ));
         // The chunk sums, in slot order.
         let mut sums = [tri_zero; 8];
         let k86 = vdupq_n_u64(0x86);
@@ -3257,7 +3263,9 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 }
                 macro_rules! pair_off {
                     ($c:literal, $n:literal) => {
-                        r2_pair_fold_and_store_off::<F7, $c, $n>(table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas)
+                        r2_pair_fold_and_store_off_g::<F7, $c, $n, RANKED_FAST, true, true>(
+                            table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas,
+                        )
                     };
                 }
                 macro_rules! step_ptrs {
@@ -3356,6 +3364,64 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
         }
         for (i, sum) in sums.into_iter().enumerate() {
             *out.add(i) = core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(sum));
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[cold]
+#[inline(never)]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_cold<const F7: bool>(
+    table_data: *const u8, a_packed: *const u8, b_packed: *const u8,
+    anchors: *mut F128, deltas: *mut u8, eq_lo: *const F128, rho_prep: *const F128,
+    lo_size: usize, degen: bool, tail_compact: bool,
+    head_fail: *const core::sync::atomic::AtomicBool, skip_pure: bool, out: *mut F128,
+) {
+    unsafe {
+        fold_round2_compact_chunk_neon_lookahead_8_xb_core::<F7, false>(
+            table_data, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size,
+            degen, tail_compact, head_fail, skip_pure, out,
+        );
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[target_feature(enable = "aes")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
+    table_data: *const u8, a_packed: *const u8, b_packed: *const u8,
+    anchors: *mut F128, deltas: *mut u8, eq_lo: *const F128, rho_prep: *const F128,
+    lo_size: usize, degen: bool, tail_compact: bool,
+    head_fail: *const core::sync::atomic::AtomicBool, skip_pure: bool, out: *mut F128,
+) {
+    use core::arch::aarch64::*;
+
+    unsafe {
+        let head = !head_fail.is_null();
+        // R2 C capture: head-compacted, degenerate b pairs only.
+        assert!(!skip_pure || (head && degen));
+        assert!(!head || tail_compact);
+        assert!(lo_size.is_multiple_of(128));
+        let b_ones = if F7 {
+            fold_two_row_codes_q7(table_data, u64::MAX, u64::MAX).0
+        } else {
+            fold_row_q(table_data, [0xFFu8; 8].as_ptr())
+        };
+        let ones_is_one = is_zero_q(veorq_u64(
+            b_ones, core::mem::transmute::<F128, uint64x2_t>(F128::ONE),
+        ));
+        if degen && tail_compact && head && skip_pure && r2_nt_deltas_enabled() && ones_is_one {
+            fold_round2_compact_chunk_neon_lookahead_8_xb_core::<F7, true>(
+                table_data, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size,
+                true, true, head_fail, true, out,
+            );
+        } else {
+            fold_round2_compact_chunk_neon_lookahead_8_xb_cold::<F7>(
+                table_data, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size,
+                degen, tail_compact, head_fail, skip_pure, out,
+            );
         }
     }
 }

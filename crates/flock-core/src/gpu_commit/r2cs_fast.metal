@@ -76,31 +76,46 @@ static inline void zc_r2_cs_horner_shift_u8(thread U256u& h) {
     h.lo.x = (h.lo.x << 1) ^ (c * 0x4015u);
 }
 
-static inline U256k zc_r2_cs_u8_to_k(U256u u) {
-    U256k r;
-    r.r0 = (ulong(u.lo.y) << 32) | u.lo.x;
-    r.r1 = (ulong(u.lo.w) << 32) | u.lo.z;
-    r.r2 = (ulong(u.hi.y) << 32) | u.hi.x;
-    r.r3 = (ulong(u.hi.w) << 32) | u.hi.z;
-    return r;
+// Pure 32-bit GF(2^128) reduction, SIMD parity XOR, and eq_hi weigh for r2cs_fast2.
+static inline uint4 zc_r2_cs_gf_reduce_u(U256u p) {
+    uint4 h = p.hi;
+    uint4 t = h ^ (h << 1u) ^ (h << 2u) ^ (h << 7u);
+    uint ov = (h.w >> 31u) ^ (h.w >> 30u) ^ (h.w >> 25u);
+    t.x ^= ov ^ (ov << 1u) ^ (ov << 2u) ^ (ov << 7u);
+    t.y ^= (h.x >> 31u) ^ (h.x >> 30u) ^ (h.x >> 25u);
+    t.z ^= (h.y >> 31u) ^ (h.y >> 30u) ^ (h.y >> 25u);
+    t.w ^= (h.z >> 31u) ^ (h.z >> 30u) ^ (h.z >> 25u);
+    return p.lo ^ t;
 }
 
-// 7 full byte tables (bytes 0..6: 7 * 256 = 1792 uint4s) + byte 7's 32 nibble
-// entries (tab[1792..1824]): 29,184 B total, leaving headroom below Apple
-// Silicon's 32,768 B threadgroup memory cap for r2steal's claim word while
-// cutting SRAM loads per fold from 16 to 9 (-44%).
+static inline U256u zc_r2_cs_simd_parity_xor_u(U256u m, ushort width) {
+    uint4 lo = m.lo;
+    uint4 hi = m.hi;
+    for (ushort o = width >> 1; o >= 2; o >>= 1) {
+        lo ^= simd_shuffle_xor(lo, o);
+        hi ^= simd_shuffle_xor(hi, o);
+    }
+    return { lo, hi };
+}
+
+static inline uint4 zc_r2_cs_weigh_u(uint4 e, U256u u) {
+    return zc_r2_cs_gf_reduce_u(zc_r2_cs_clmul128_u16(e, zc_r2_cs_gf_reduce_u(u)));
+}
+
+// 3 full byte tables (bytes 0..2: 3 * 256 = 768 uint4s) + bytes 3..7's 160
+// nibble entries (tab[768..928]): 14,848 B total (<= 16 KiB with r2steal's
+// claim word) to double threadgroup occupancy on Apple Silicon GPUs.
 static inline uint4 zc_r2_cs_fold7b_1n(uint lo, uint hi, threadgroup const uint4* tab) {
     uchar4 a = as_type<uchar4>(lo);
     uchar4 b = as_type<uchar4>(hi);
     return tab[a.x]
-         ^ tab[256u  + a.y]
-         ^ tab[512u  + a.z]
-         ^ tab[768u  + a.w]
-         ^ tab[1024u + b.x]
-         ^ tab[1280u + b.y]
-         ^ tab[1536u + b.z]
-         ^ tab[1792u + (b.w & 15u)]
-         ^ tab[1808u + (b.w >> 4u)];
+         ^ tab[256u + a.y]
+         ^ tab[512u + a.z]
+         ^ tab[768u + (a.w & 15u)] ^ tab[784u + (a.w >> 4u)]
+         ^ tab[800u + (b.x & 15u)] ^ tab[816u + (b.x >> 4u)]
+         ^ tab[832u + (b.y & 15u)] ^ tab[848u + (b.y >> 4u)]
+         ^ tab[864u + (b.z & 15u)] ^ tab[880u + (b.z >> 4u)]
+         ^ tab[896u + (b.w & 15u)] ^ tab[912u + (b.w >> 4u)];
 }
 
 // Nine products of the bit-position-mod-3 planes of two 16-bit values
