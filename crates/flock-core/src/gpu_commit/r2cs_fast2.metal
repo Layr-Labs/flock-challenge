@@ -40,8 +40,8 @@ kernel void zc_r2_products_horner_cs(
     ushort simd_group [[simdgroup_index_in_threadgroup]],
     ushort simd_lane  [[thread_index_in_simdgroup]])
 {
-    threadgroup uint4 tab8[1824];
-    threadgroup ulong4* red = reinterpret_cast<threadgroup ulong4*>(tab8);
+    threadgroup uint4 tab8[928];
+    threadgroup uint4* red_u = tab8;
     threadgroup uint4* nib = tab8;
     nib[lid] = nib_tab_dev[lid];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -49,11 +49,10 @@ kernel void zc_r2_products_horner_cs(
         uint lo_n = lid & 15u;
         uint hi_n = lid >> 4u;
         uint4 b0 = nib[lo_n] ^ nib[16u + hi_n];
-        if (lid < 32u) {
-            tab8[1792u + lid] = nib[224u + lid];
-        }
-        for (uint b = 1u; b < 7u; b++) {
-            tab8[b * 256u + lid] = nib[b * 32u + lo_n] ^ nib[b * 32u + 16u + hi_n];
+        tab8[256u + lid] = nib[32u + lo_n] ^ nib[48u + hi_n];
+        tab8[512u + lid] = nib[64u + lo_n] ^ nib[80u + hi_n];
+        if (lid < 160u) {
+            tab8[768u + lid] = nib[96u + lid];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         tab8[lid] = b0;
@@ -203,16 +202,18 @@ kernel void zc_r2_products_horner_cs(
     // (group * 4 + accumulator) * 2 + parity; lanes 0..7 then sum and weigh
     // one output slot each.
     {
-        uint4 r0 = gf_reduce(zc_r2_cs_u8_to_k(h1));
-        uint4 r1 = gf_reduce(zc_r2_cs_u8_to_k(hi));
-        uint4 r2 = gf_reduce(zc_r2_cs_u8_to_k(wa));
-        uint4 r3 = gf_reduce(zc_r2_cs_u8_to_k(wb));
+        uint4 r0 = zc_r2_cs_gf_reduce_u(h1);
+        uint4 r1 = zc_r2_cs_gf_reduce_u(hi);
+        uint4 r2 = zc_r2_cs_gf_reduce_u(wa);
+        uint4 r3 = zc_r2_cs_gf_reduce_u(wb);
         #pragma clang loop unroll(disable)
         for (uint k = 0u; k < 4u; k++) {
-            U256k t = zc_r2_cs_simd_parity_xor(zc_r2_cs_u8_to_k(zc_r2_cs_clmul128_u16(k < 2u ? e : lam, r0)), simd_width);
+            U256u t = zc_r2_cs_simd_parity_xor_u(zc_r2_cs_clmul128_u16(k < 2u ? e : lam, r0), simd_width);
             uint4 tr = r0; r0 = r1; r1 = r2; r2 = r3; r3 = tr;
             if (simd_lane < 2u) {
-                red[(uint(simd_group) * 4u + k) * 2u + uint(simd_lane)] = ulong4(t.r0, t.r1, t.r2, t.r3);
+                uint idx = ((uint(simd_group) * 4u + k) * 2u + uint(simd_lane)) * 2u;
+                red_u[idx]      = t.lo;
+                red_u[idx + 1u] = t.hi;
             }
         }
     }
@@ -223,10 +224,12 @@ kernel void zc_r2_products_horner_cs(
         // W3 (wa, 0), W4 (wb, 0), W5 (wb, 1).
         uint acc = (0x33221010u >> (4u * lid)) & 0xfu;
         uint par = (0x10011100u >> (4u * lid)) & 0xfu;
-        ulong4 s = ulong4(0ul);
+        U256u s = {uint4(0u), uint4(0u)};
         for (uint g = 0u; g < 256u / uint(simd_width); g++) {
-            s ^= red[(g * 4u + acc) * 2u + par];
+            uint idx = ((g * 4u + acc) * 2u + par) * 2u;
+            s.lo ^= red_u[idx];
+            s.hi ^= red_u[idx + 1u];
         }
-        partials[tgid * 8u + lid] = zc_r2_cs_weigh(eq_hi[hi_chunk], s);
+        partials[tgid * 8u + lid] = zc_r2_cs_weigh_u(eq_hi[hi_chunk], s);
     }
 }

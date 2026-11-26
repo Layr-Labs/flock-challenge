@@ -974,7 +974,7 @@ pub const ENV_NO_ZC_R2_CS_SHARE: &str = "FLOCK_NO_ZC_R2_CS_SHARE";
 /// faster in a timed prove than the record's), the GPU arm at the ceiling
 /// would end `(880 - 757) * 1.705` CPU chunks late, about 1.4 ms on the
 /// ranked machine; the gain at the ceiling is 123 CPU chunks, about 0.8 ms.
-pub(crate) const ZC_R2_CS_SHARE_CEIL_PCT: usize = 43;
+pub(crate) const ZC_R2_CS_SHARE_CEIL_PCT: usize = 60;
 
 /// Measured prices below this are taken as bad samples: a wall this small
 /// means the oracle dispatch did not run or its timestamps are broken.
@@ -1121,7 +1121,7 @@ pub const ENV_NO_GPU_ZC_AB_COMPLETION: &str = "FLOCK_NO_GPU_ZC_AB_COMPLETION";
 /// `FLOCK_ZC_AB_GPU_CHUNKS=<n>`, `0` = arm off, clamped to the chunk count.
 /// Unset = [`ZC_AB_GPU_DEFAULT_CHUNKS`]. A non-integer value fails loudly.
 pub const ENV_ZC_AB_GPU_CHUNKS: &str = "FLOCK_ZC_AB_GPU_CHUNKS";
-const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 32;
+const ZC_AB_GPU_DEFAULT_CHUNKS: usize = 80;
 
 /// Requested GPU chunk share of the round-one AB completion arm; `0` = off
 /// (kill switch, share 0, or GPU commit disabled).
@@ -1154,8 +1154,7 @@ pub(crate) fn gpu_zc_ab_one_cb_enabled() -> bool {
 /// line (`FLOCK_ZC_AB_GPU_DEBUG=1`, or any `FLOCK_PHASE_TIMING` run).
 pub(crate) fn gpu_zc_ab_debug() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_ZC_AB_GPU_DEBUG").is_some()
-            || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+        std::env::var_os("FLOCK_ZC_AB_GPU_DEBUG").is_some() || crate::phase_timing_env_on()
     });
     *ON
 }
@@ -1203,7 +1202,7 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 1024;
 
 pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
-const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
+const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 1024;
 
 /// Kill switch for the K arm's faster fold kernel (`FLOCK_NO_ZC_K_V2`, any
 /// value): the embedded `zc_k_fold` and the record's share
@@ -1257,8 +1256,7 @@ pub(crate) fn gpu_zc_k_share() -> usize {
 /// `FLOCK_PHASE_TIMING` run): the oracle verdict and one line per prove.
 pub(crate) fn gpu_zc_k_debug() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_ZC_K_GPU_DEBUG").is_some()
-            || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+        std::env::var_os("FLOCK_ZC_K_GPU_DEBUG").is_some() || crate::phase_timing_env_on()
     });
     *ON
 }
@@ -1286,7 +1284,7 @@ pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
 
 /// The 5+6 arm's default share, in 5+6 chunks (of 512), when
 /// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
-pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 160;
+pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 320;
 
 /// Kill switch for the 5+6 arm's late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1`:
 /// the record's join, where the CPU queue, having folded the chunks after the
@@ -1341,8 +1339,7 @@ pub(crate) fn gpu_zc_t56_cap() -> usize {
 #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
 pub(crate) fn gpu_zc_t56_debug() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FLOCK_ZC_T56_GPU_DEBUG").is_some()
-            || std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+        std::env::var_os("FLOCK_ZC_T56_GPU_DEBUG").is_some() || crate::phase_timing_env_on()
     });
     *ON
 }
@@ -3293,7 +3290,7 @@ pub(crate) fn gpu_g4x2_zl_one_round_enabled() -> bool {
 /// zero-lane pipeline. Read once per process.
 pub(crate) fn gpu_g4x2_tab_dbuf_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_G4X2_TAB_DBUF").is_none())
+    *ON.get_or_init(|| env_is_one("FLOCK_G4X2_TAB_DBUF"))
 }
 
 pub(crate) fn gpu_t3_bytetab2_enabled() -> bool {
@@ -4274,13 +4271,78 @@ pub(crate) fn gpu_commit_enabled() -> bool {
     const GPU_COMMIT_DEFAULT: bool = true;
     GPU_COMMIT_DEFAULT
         && cfg!(all(target_os = "macos", target_arch = "aarch64"))
-        && std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+        && gpu_commit_env_clear()
 }
 
 /// True after untimed warmup permanently selected the ranked GPU path.
 /// The opt-out only restores speculative CPU buffers; it does not disable GPU.
 pub(crate) fn gpu_commit_latched_on() -> bool {
-    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none() && imp::gpu_commit_latched_on()
+    lazy_gpu_codeword_env_clear() && imp::gpu_commit_latched_on()
+}
+
+/// Kill switch for keeping the GPU commit's gate environment reads once per
+/// process (`FLOCK_NO_GPU_ENV_ONCE`, any value: every gate below reads its
+/// variable from the process environment on every call, as before). Read
+/// once per process.
+pub const ENV_NO_GPU_ENV_ONCE: &str = "FLOCK_NO_GPU_ENV_ONCE";
+
+pub(crate) fn gpu_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_ENV_ONCE).is_none());
+    *ON
+}
+
+#[inline]
+fn gpu_commit_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_GPU_COMMIT).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_GPU_COMMIT).is_none()
+}
+
+#[inline]
+fn lazy_gpu_codeword_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none());
+        return *CLEAR;
+    }
+    std::env::var_os(ENV_NO_LAZY_GPU_CODEWORD).is_none()
+}
+
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_table_reuse_env_clear() -> bool {
+    if gpu_env_once_enabled() {
+        static CLEAR: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none());
+        return *CLEAR;
+    }
+    std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+}
+
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn commit_timing_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
+}
+
+#[inline]
+#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+pub(crate) fn gpu_commit_debug_env_on() -> bool {
+    if gpu_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
 }
 
 /// Build the flat breadth-first twiddle table for `log_d` layers: layer `l`
@@ -5785,56 +5847,28 @@ kernel void zc_k_finish(
 #include <metal_stdlib>
 using namespace metal;
 
-// 16x16 carry-less product from 9 native 32-bit integer products: each
-// factor split by bit position mod 3, so a product of two masked parts has at
-// most 6 overlapping terms per result bit (16 bits / spacing 3) and its sums
-// stay below the next same-residue bit (no carry crosses into a kept bit).
-static inline uint zck_clmul16(uint a, uint b) {
-    // 16-bit masks: the ushort parts hold the same values, and
-    // uint(ushort) products can lower to native 16x16->32 multiplies.
-    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
-    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+// Native 16x16->32 carry-less product via explicit ushort operands: on Apple
+// Silicon GPUs, uint(ushort) * uint(ushort) lowers to a single 16x16->32 imad
+// instead of a multi-instruction 32x32 multiply.
+static inline uint zck_clmul16_u16(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
     uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
     uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
     uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
-// 32x32 by one Karatsuba step over 16-bit halves (27 32-bit products instead
-// of the embedded kernel's 16 64-bit ones).
-static inline ulong zck_clmul32(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zck_clmul16(al, bl);
-    uint hi = zck_clmul16(ah, bh);
-    uint mid = zck_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
-    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
-}
-
-struct ZckU128 { ulong lo; ulong hi; };
-
-static inline ZckU128 zck_clmul64(ulong a, ulong b) {
-    uint al = uint(a), ah = uint(a >> 32);
-    uint bl = uint(b), bh = uint(b >> 32);
-    ulong p_lo = zck_clmul32(al, bl);
-    ulong p_hi = zck_clmul32(ah, bh);
-    ulong p_mid = zck_clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
-    ZckU128 r;
-    r.lo = p_lo ^ (p_mid << 32);
-    r.hi = p_hi ^ (p_mid >> 32);
-    return r;
-}
-
-// a * b mod x^128 + x^7 + x^2 + x + 1 (Karatsuba product, then reduction).
-// The Karatsuba levels on 32-bit lanes (a 64-bit v is uint2(v, v >> 32)):
-// lo ^ (mid << 16) ^ (hi << 32) is uint2(lo ^ (mid << 16), hi ^ (mid >> 16)),
-// and p_lo ^ (p_mid << 32), p_hi ^ (p_mid >> 32) are the uint4 words below,
-// so r0, r1, h0, h1 are the same limbs and the reduction is unchanged.
+// a * b mod x^128 + x^7 + x^2 + x + 1 (pure 32-bit Karatsuba product, then reduction).
 static inline uint2 zck_clmul32_u(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zck_clmul16(al, bl);
-    uint hi = zck_clmul16(ah, bh);
-    uint mid = zck_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = zck_clmul16_u16(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = zck_clmul16_u16(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = zck_clmul16_u16(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
     return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
 }
 
@@ -5849,17 +5883,15 @@ static inline uint4 zck_mul(uint4 a, uint4 b) {
     uint4 p0 = zck_clmul64_u(a.xy, b.xy);
     uint4 p2 = zck_clmul64_u(a.zw, b.zw);
     uint4 pm = zck_clmul64_u(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
-    ulong r0 = (ulong(p0.y) << 32) | p0.x;
-    ulong r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
-    ulong h0 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
-    ulong h1 = (ulong(p2.w) << 32) | p2.z;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = r0 ^ t0, l1 = r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+    uint4 lo = uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y);
+    uint4 h  = uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w);
+    uint4 t  = h ^ (h << 1u) ^ (h << 2u) ^ (h << 7u);
+    uint ov  = (h.w >> 31u) ^ (h.w >> 30u) ^ (h.w >> 25u);
+    t.x ^= ov ^ (ov << 1u) ^ (ov << 2u) ^ (ov << 7u);
+    t.y ^= (h.x >> 31u) ^ (h.x >> 30u) ^ (h.x >> 25u);
+    t.z ^= (h.y >> 31u) ^ (h.y >> 30u) ^ (h.y >> 25u);
+    t.w ^= (h.z >> 31u) ^ (h.z >> 30u) ^ (h.z >> 25u);
+    return lo ^ t;
 }
 
 // T(code) for one 8-byte delta code (lo = bytes 0..3, hi = bytes 4..7).
@@ -6881,14 +6913,11 @@ EXPORT_ZERO_ROOT_TABLES(export_zero_root_old, build_zero_root_tabs_old)
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 ";
-    /// Never-read residency pad of the one-round group: 8,192 + 512 +
-    /// 15,872 = 24,576 B of threadgroup memory, three 128-thread groups per
-    /// core (the record's 12,736 B gives six 64-thread groups).
-    const G4X2_ONE_ROUND_PAD: [(&str, &str); 4] = [
+    /// One-round threadgroup width bound; keeps the base `tabB[512u]` (8,192 B) +
+    /// `twl[32u]` (512 B) + `pad[252u]` (4,032 B) = 12,736 B (12.4 KiB <= 16 KiB)
+    /// threadgroup memory footprint to stay below Apple Silicon's 16 KiB cliff.
+    const G4X2_ONE_ROUND_PAD: [(&str, &str); 1] = [
         ("[[max_total_threads_per_threadgroup(64)]]\n", "[[max_total_threads_per_threadgroup(128)]]\n"),
-        ("    threadgroup uint4 pad[252u];\n", "    threadgroup uint4 pad[992u];\n"),
-        ("pad[lid % 252u]", "pad[lid % 992u]"),
-        ("pad[(lid + 1u) % 252u]", "pad[(lid + 1u) % 992u]"),
     ];
 
     /// `src` (a two-round g4x2 text with the record's build) with the
@@ -9678,7 +9707,7 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
             && super::pass_tune_enabled()
             && super::gpu_mixed_final_selected(log_d, log_d - 4, 4)
             && super::select_gpu_parent3(n_leaves, super::gpu_parent3_enabled())
-            && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+            && super::gpu_table_reuse_env_clear()
     }
 
     pub(crate) unsafe fn encode_ntt_and_merkle(
@@ -11456,7 +11485,7 @@ kernel void blake3_pow_seg_tail(
         (dev == device as usize && lib != 0).then_some(lib as Id)
     }
     fn merkle_shared_library(api: &Api, device: Id) -> Option<Id> { shared_library(&MERKLE_SHARED_LIB, api, device, "merkle-shared", || format!("{REC_MERKLE_MSL_SOURCE}\n{PARENT_TOP_KERNEL}")) }
-    fn zc_shared_library(api: &Api, device: Id) -> Option<Id> { shared_library(&ZC_SHARED_LIB, api, device, "zc-shared", || format!("{}\n{}\n{}", ab_mul9::source(ZC_AB_MSL_SOURCE), strip_msl_preamble(ZC_K_V2_MSL_SOURCE), strip_msl_preamble(zfold::ZF_MSL_SOURCE))) }
+    fn zc_shared_library(api: &Api, device: Id) -> Option<Id> { shared_library(&ZC_SHARED_LIB, api, device, "zc-shared", || format!("{}\n{}\n{}", ab_mul9::source(ZC_AB_MSL_SOURCE), strip_msl_preamble(ZC_K_V2_MSL_SOURCE), strip_msl_preamble(zfold::ZF_MSL_SOURCE_W32))) }
     fn pow_race_tail_fragment() -> Option<String> {
         let s = strip_msl_preamble(POW_RACE_TAIL_MSL_SOURCE);
         let a = s.find("struct PowParams {")?;
@@ -11523,7 +11552,7 @@ kernel void blake3_pow_seg_tail(
                 let skip_final_t3 = super::ranked_dead_pso_skip_enabled()
                     && super::gpu_final_leaf_enabled() && super::gpu_hybrid_final_leaf_enabled()
                     && super::pass_tune_enabled() && super::gpu_parent3_enabled()
-                    && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none() && !gw_split_cb_enabled();
+                    && super::gpu_table_reuse_env_clear() && !gw_split_cb_enabled();
                 let skip_legacy_ntt = skip_final_t3
                     && super::gpu_from_z_zero_root_selected(20) && super::gpu_g4x2_enabled();
                 let main_start = if skip_legacy_ntt { 8 } else { 0 };
@@ -13163,7 +13192,7 @@ kernel void blake3_pow_seg_tail(
         let text = *TEXT.get_or_init(|| {
             super::gpu_dead_lane_enabled() && with_g4x2_dead_lanes(g4x2_msl_source()).is_some()
         });
-        text && !gpu.pso_ntt4g4x2.is_null() && std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_none()
+        text && !gpu.pso_ntt4g4x2.is_null() && super::gpu_table_reuse_env_clear()
     }
 
     /// [`super::select_from_z_zero_store_from`] for this process and
@@ -13256,7 +13285,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13341,7 +13370,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -13421,7 +13450,7 @@ kernel void blake3_pow_seg_tail(
         unsafe {
             gpu.set_buffer(enc, data_buf, 0, 0);
             gpu.set_buffer(enc, tw_buf, 0, 1);
-            let share_log = if std::env::var_os("FLOCK_NO_GPU_TABLE_REUSE").is_some() {
+            let share_log = if !super::gpu_table_reuse_env_clear() {
                 0usize
             } else {
                 2usize
@@ -14773,8 +14802,7 @@ kernel void blake3_pow_seg_tail(
     }
 
     fn debug_enabled() -> bool {
-        std::env::var_os("FLOCK_COMMIT_TIMING").is_some()
-            || std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some()
+        super::commit_timing_env_on() || super::gpu_commit_debug_env_on()
     }
 
     /// Observability for poisoned process-global locks. The poisoning panic
@@ -14782,7 +14810,7 @@ kernel void blake3_pow_seg_tail(
     /// `catch_unwind`); the score-relevant symptom — a GPU arm silently
     /// degraded or recovered — must be visible under FLOCK_GPU_COMMIT_DEBUG.
     fn note_poisoned_lock(tag: &str, recovered: bool) {
-        if std::env::var_os("FLOCK_GPU_COMMIT_DEBUG").is_some() {
+        if super::gpu_commit_debug_env_on() {
             eprintln!(
                 "[gpu-commit] {tag}: poisoned lock {}",
                 if recovered {
@@ -15777,7 +15805,7 @@ kernel void blake3_pow_seg_tail(
             ll /= 2;
             lo = wlo;
         }
-        if after_ab && std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if after_ab && crate::phase_timing_env_on() {
             eprintln!(
                 "[late-tail] {} {late_wait_ms:.2} ms after cb3's commit; CPU took {} of {total_units} \
                  suffix units in {tail_ms:.2} ms",
@@ -17193,7 +17221,7 @@ kernel void blake3_pow_seg_tail(
         {
             return;
         }
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         if super::ranked_exact_contention_tune_pending() {
             // The outer warmup join will replay its real A/B branch beside a
             // balanced broad sweep. Avoid double-tuning against a synthetic
@@ -17500,7 +17528,7 @@ kernel void blake3_pow_seg_tail(
             return;
         }
 
-        let dbg = debug_enabled() || std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+        let dbg = debug_enabled() || super::commit_timing_env_on();
         let latch = latch_lock();
         let LatchState::On(latched) = &*latch else {
             finish_ranked_exact_contention_tune(params, cpu_tree, 0);
@@ -17938,7 +17966,7 @@ kernel void blake3_pow_seg_tail(
                 if verified { chosen } else { 0 },
             );
         }
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let k = if verified { chosen } else { 0 };
             eprintln!(
                 "[phase-timing] hybrid split: cpu {} of 256 (ntt priority helpers {})",
@@ -18862,7 +18890,7 @@ kernel void blake3_pow_seg_tail(
         let tree = unsafe {
             super::GpuMerkleTree::new(gpu.buffer_contents(tree_buf).cast::<Hash>(), total_nodes)
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             eprintln!("[commit-timing] gpu-commit: graph {graph_ms:.2} ms + zero-copy tree");
         }
         // The replicated input codeword was never read by the from-z graph;
@@ -19134,7 +19162,7 @@ kernel void blake3_pow_seg_tail(
                 total_nodes,
             )
         };
-        if std::env::var_os("FLOCK_COMMIT_TIMING").is_some() || debug_enabled() {
+        if super::commit_timing_env_on() || debug_enabled() {
             let wall_ms = stream.started.elapsed().as_secs_f64() * 1e3;
             eprintln!(
                 "[commit-timing] gpu-commit: streamed witness+graph window {wall_ms:.2} ms + zero-copy tree"
@@ -20454,7 +20482,7 @@ kernel void lc_fold_stripes_factored_b4(
     uint tgid [[threadgroup_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]])
 {
-    constexpr uint B = 8u;
+    constexpr uint B = 4u;
     threadgroup uint4 tab[B * 256u];
 
     uint chunk  = tgid / p.i_groups;
@@ -20467,27 +20495,28 @@ kernel void lc_fold_stripes_factored_b4(
     uint c0 = i_base + 4u * lid;
     bool live = c0 < p.useful;
     uint kw = p.k >> 2;
-    // Eight stripes x 32 builders (one SIMD group per stripe) occupy the
-    // 256-lane group and read each stripe's 8 eq weights uniformly from L1.
-    uint s = lid >> 5;
+    // Four stripes x 64 builders (2 SIMD groups per stripe, <= 16 KiB SRAM)
+    // occupy the 256-lane group and keep coalesced uint4 loads.
+    uint s = lid >> 6;
     uint h = lid & 31u;
-    uint tab_base = s * 256u + h;
+    uint hi = (lid >> 5) & 1u;
+    uint tab_base = s * 256u + (hi << 7) + h;
 
     for (uint sb = s_lo; sb < s_hi; sb += B) {
         uint ns = min(B, s_hi - sb);
-        uint w[8];
+        uint w[4];
         if (live && ns == B) {
             uint q = (sb * p.k + c0) >> 2;
             for (uint t = 0u; t < B; ++t) { w[t] = z32[q + t * kw]; }
         }
 
-        // Retire previous block's table readers before rebuilding 8 tables.
+        // Retire previous block's table readers before rebuilding 4 tables.
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (s < ns) {
             device const uint4* ep = eq + (sb + s) * 8u;
             uint4 e0 = ep[0u], e1 = ep[1u], e2 = ep[2u], e3 = ep[3u];
             uint4 e4 = ep[4u], e5 = ep[5u], e6 = ep[6u], e7 = ep[7u];
-            uint4 l5 = uint4(0u);
+            uint4 l5 = hi != 0u ? e7 : uint4(0u);
             if (h & 1u)  l5 ^= e0;
             if (h & 2u)  l5 ^= e1;
             if (h & 4u)  l5 ^= e2;
@@ -20496,14 +20525,10 @@ kernel void lc_fold_stripes_factored_b4(
             uint4 l5e5  = l5 ^ e5;
             uint4 l5e6  = l5 ^ e6;
             uint4 l5e56 = l5e5 ^ e6;
-            tab[tab_base]        = l5;
-            tab[tab_base + 32u]  = l5e5;
-            tab[tab_base + 64u]  = l5e6;
-            tab[tab_base + 96u]  = l5e56;
-            tab[tab_base + 128u] = l5 ^ e7;
-            tab[tab_base + 160u] = l5e5 ^ e7;
-            tab[tab_base + 192u] = l5e6 ^ e7;
-            tab[tab_base + 224u] = l5e56 ^ e7;
+            tab[tab_base]       = l5;
+            tab[tab_base + 32u] = l5e5;
+            tab[tab_base + 64u] = l5e6;
+            tab[tab_base + 96u] = l5e56;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -24333,16 +24358,22 @@ kernel void rec_parent_hash(device const uint4* children [[buffer(0)]],
                     read_len /= 8;
                 }
             }
-            gpu.set_pipeline(enc, pso_parent);
-            while read_len > 1 {
-                let write_start = read_start + read_len;
-                let n_out = read_len / 2;
-                gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
-                gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
-                let tpg = 256u64.min(n_out as u64);
-                gpu.dispatch(enc, n_out as u64 / tpg, tpg);
-                read_start = write_start;
-                read_len = n_out;
+            if read_len > 1 {
+                if fused && read_len.is_power_of_two() && read_len <= 128 {
+                    encode_merkle_tops(gpu, enc, tree_buf, pso_parent, &[(read_start, read_len, 0, read_len)]);
+                } else {
+                    gpu.set_pipeline(enc, pso_parent);
+                    while read_len > 1 {
+                        let write_start = read_start + read_len;
+                        let n_out = read_len / 2;
+                        gpu.set_buffer(enc, tree_buf, read_start * 32, 0);
+                        gpu.set_buffer(enc, tree_buf, write_start * 32, 1);
+                        let tpg = 256u64.min(n_out as u64);
+                        gpu.dispatch(enc, n_out as u64 / tpg, tpg);
+                        read_start = write_start;
+                        read_len = n_out;
+                    }
+                }
             }
         }
     }
@@ -26757,7 +26788,7 @@ kernel void zc_r2_horner_oracle(
             0.0
         };
         unsafe { gpu.release(cb) };
-        if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+        if crate::phase_timing_env_on() {
             let fold_gpu = f64::from_bits(ZC_IDLE_FILL_FOLD_GPU_MS.load(Ordering::Relaxed));
             let window = f64::from_bits(ZC_IDLE_FILL_WINDOW_MS.load(Ordering::Relaxed));
             eprintln!(
@@ -27859,61 +27890,56 @@ kernel void zc_r2_horner_oracle(
 #include <metal_stdlib>
 using namespace metal;
 
-static inline ulong clmul32(uint a, uint b) {
-    const ulong M0 = 0x1111111111111111UL, M1 = 0x2222222222222222UL,
-                M2 = 0x4444444444444444UL, M3 = 0x8888888888888888UL;
-    ulong a0 = a & 0x11111111u, a1 = a & 0x22222222u,
-          a2 = a & 0x44444444u, a3 = a & 0x88888888u;
-    ulong b0 = b & 0x11111111u, b1 = b & 0x22222222u,
-          b2 = b & 0x44444444u, b3 = b & 0x88888888u;
-    ulong r0 = (a0*b0 ^ a1*b3 ^ a2*b2 ^ a3*b1) & M0;
-    ulong r1 = (a0*b1 ^ a1*b0 ^ a2*b3 ^ a3*b2) & M1;
-    ulong r2 = (a0*b2 ^ a1*b1 ^ a2*b0 ^ a3*b3) & M2;
-    ulong r3 = (a0*b3 ^ a1*b2 ^ a2*b1 ^ a3*b0) & M3;
-    return r0 | r1 | r2 | r3;
+struct ZcabU256 { uint4 lo; uint4 hi; };
+
+static inline uint zcab_clmul16_m3_u16(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
+    return r0 | r1 | r2;
 }
 
-struct U128k { ulong lo; ulong hi; };
-struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
-
-static inline U128k clmul64(ulong a, ulong b) {
-    uint al = uint(a), ah = uint(a >> 32);
-    uint bl = uint(b), bh = uint(b >> 32);
-    ulong p_lo = clmul32(al, bl);
-    ulong p_hi = clmul32(ah, bh);
-    ulong p_mid = clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
-    U128k r;
-    r.lo = p_lo ^ (p_mid << 32);
-    r.hi = p_hi ^ (p_mid >> 32);
-    return r;
+static inline uint2 zcab_clmul32_u16(uint a, uint b) {
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = zcab_clmul16_m3_u16(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = zcab_clmul16_m3_u16(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = zcab_clmul16_m3_u16(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
+    return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
 }
 
-static inline U256k clmul128(uint4 a, uint4 b) {
-    ulong al = (ulong(a.y) << 32) | a.x, ah = (ulong(a.w) << 32) | a.z;
-    ulong bl = (ulong(b.y) << 32) | b.x, bh = (ulong(b.w) << 32) | b.z;
-    U128k p0 = clmul64(al, bl);
-    U128k p2 = clmul64(ah, bh);
-    U128k pm = clmul64(al ^ ah, bl ^ bh);
-    pm.lo ^= p0.lo ^ p2.lo;
-    pm.hi ^= p0.hi ^ p2.hi;
-    U256k r;
-    r.r0 = p0.lo;
-    r.r1 = p0.hi ^ pm.lo;
-    r.r2 = p2.lo ^ pm.hi;
-    r.r3 = p2.hi;
-    return r;
+static inline uint4 zcab_clmul64_u16(uint2 a, uint2 b) {
+    uint2 p0 = zcab_clmul32_u16(a.x, b.x);
+    uint2 p2 = zcab_clmul32_u16(a.y, b.y);
+    uint2 pm = zcab_clmul32_u16(a.x ^ a.y, b.x ^ b.y) ^ p0 ^ p2;
+    return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
 }
 
-// Reduce a 255-bit product (or an XOR of such) mod x^128 + x^7 + x^2 + x + 1.
-static inline uint4 gf_reduce(U256k p) {
-    ulong h0 = p.r2, h1 = p.r3;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+static inline ZcabU256 zcab_clmul128_u16(uint4 a, uint4 b) {
+    uint4 p0 = zcab_clmul64_u16(a.xy, b.xy);
+    uint4 p2 = zcab_clmul64_u16(a.zw, b.zw);
+    uint4 pm = zcab_clmul64_u16(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
+    return {
+        uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y),
+        uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w)
+    };
+}
+
+// Pure 32-bit reduction of a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
+static inline uint4 zcab_gf_reduce_u(ZcabU256 p) {
+    uint4 h = p.hi;
+    uint4 t = h ^ (h << 1u) ^ (h << 2u) ^ (h << 7u);
+    uint ov = (h.w >> 31u) ^ (h.w >> 30u) ^ (h.w >> 25u);
+    t.x ^= ov ^ (ov << 1u) ^ (ov << 2u) ^ (ov << 7u);
+    t.y ^= (h.x >> 31u) ^ (h.x >> 30u) ^ (h.x >> 25u);
+    t.z ^= (h.y >> 31u) ^ (h.y >> 30u) ^ (h.y >> 25u);
+    t.w ^= (h.z >> 31u) ^ (h.z >> 30u) ^ (h.z >> 25u);
+    return p.lo ^ t;
 }
 
 struct ZcAbParams {
@@ -27941,32 +27967,31 @@ kernel void zc_ab_tables(
 {
     threadgroup uint4 scaled[8];
     if (lid < 8u) {
-        scaled[lid] = gf_reduce(clmul128(basis[lid], e_top[t]));
+        scaled[lid] = zcab_gf_reduce_u(zcab_clmul128_u16(basis[lid], e_top[t]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint4 acc = uint4(0u);
     for (uint k = 0u; k < 8u; k++) {
         if (((lid >> k) & 1u) != 0u) { acc ^= scaled[k]; }
     }
-    ulong lo = (ulong(acc.y) << 32) | ulong(acc.x);
-    ulong hi = (ulong(acc.w) << 32) | ulong(acc.z);
     device uint4* row = tables + (ulong(t) << 12) + ulong(lid);
     for (uint b = 0u; b < 16u; b++) {
         if (b != 0u) {
-            // Multiply by x mod x^128 + x^7 + x^2 + x + 1.
-            ulong red = (hi >> 63) * 0x87ul;
-            hi = (hi << 1) | (lo >> 63);
-            lo = (lo << 1) ^ red;
+            // Multiply by x mod x^128 + x^7 + x^2 + x + 1 in pure 32-bit uint4.
+            uint carry = acc.w >> 31u;
+            acc = uint4((acc.x << 1u) ^ (carry * 0x87u),
+                        (acc.y << 1u) | (acc.x >> 31u),
+                        (acc.z << 1u) | (acc.y >> 31u),
+                        (acc.w << 1u) | (acc.z >> 31u));
         }
-        row[b * 256u] = uint4(uint(lo), uint(lo >> 32), uint(hi), uint(hi >> 32));
+        row[b * 256u] = acc;
     }
 }
 
-// Four chunks share each 8-table (32 KiB) threadgroup tile (`c4_b8_32k`):
+// Four chunks share each 4-table (16 KiB) threadgroup tile (`c4_b4_16k`):
 // 256 threads = 4 chunks x 64 lambda lanes. All 256 threads cooperatively load
-// 8 consecutive 4 KiB tables into threadgroup SRAM (coalesced uint4 loads),
-// then each lane gathers 16 rows x 8 tables directly from SRAM instead of
-// thrashing L2/DRAM across the 16 MiB device tables buffer. Writes the exact
+// 4 consecutive 4 KiB tables into threadgroup SRAM (coalesced uint4 loads),
+// staying at <= 16 KiB TG SRAM for 2x AGX G16 occupancy. Writes the exact
 // same raw bot' banks layout (`banks[(out_tg * 16 + bot) * 64 + lam]`).
 kernel void zc_ab_gather(
     device const uchar* ab       [[buffer(0)]],
@@ -27977,7 +28002,7 @@ kernel void zc_ab_gather(
     uint lid [[thread_index_in_threadgroup]])
 {
     constexpr uint C_PER_TG = 4u;
-    constexpr uint B_TILE   = 8u;
+    constexpr uint B_TILE   = 4u;
     constexpr uint TPG      = C_PER_TG * 64u;
     threadgroup uint4 stab[B_TILE * 256u];
 
@@ -28052,18 +28077,17 @@ kernel void zc_ab_finish(
     uint chunk [[threadgroup_position_in_grid]],
     uint lam   [[thread_index_in_threadgroup]])
 {
-    U256k s;
-    s.r0 = 0ul; s.r1 = 0ul; s.r2 = 0ul; s.r3 = 0ul;
+    ZcabU256 s = {uint4(0u), uint4(0u)};
     for (uint bot = 0u; bot < 16u; bot++) {
         uint4 v = uint4(0u);
         for (uint g = 0u; g < p.groups_per_chunk; g++) {
             ulong group = ulong(chunk) * ulong(p.groups_per_chunk) + ulong(g);
             v ^= banks[(group * 16ul + ulong(bot)) * 64ul + ulong(lam)];
         }
-        U256k q = clmul128(eq_bot[bot], v);
-        s.r0 ^= q.r0; s.r1 ^= q.r1; s.r2 ^= q.r2; s.r3 ^= q.r3;
+        ZcabU256 q = zcab_clmul128_u16(eq_bot[bot], v);
+        s.lo ^= q.lo; s.hi ^= q.hi;
     }
-    partials[chunk * 64u + lam] = gf_reduce(clmul128(eq_hi[chunk], gf_reduce(s)));
+    partials[chunk * 64u + lam] = zcab_gf_reduce_u(zcab_clmul128_u16(eq_hi[chunk], zcab_gf_reduce_u(s)));
 }
 "#;
 
@@ -28077,11 +28101,12 @@ kernel void zc_ab_finish(
     const ZC_AB_TOPS: usize = 256;
     /// Smallest top' block per threadgroup.
     const ZC_AB_MIN_TOPS_PER_GROUP: usize = 8;
-    /// Largest top' block per threadgroup (the k_bouter bench shape).
-    const ZC_AB_MAX_TOPS_PER_GROUP: usize = 128;
-    /// Partials slots (threadgroups of one launch; < 512 under
+    /// Largest top' block per threadgroup (clamped to 32 -> 8 groups/chunk so
+    /// 64 chunks launch 128 threadgroups to saturate 40-core M3 Max GPUs).
+    const ZC_AB_MAX_TOPS_PER_GROUP: usize = 32;
+    /// Partials slots (threadgroups of one launch; up to 128 * 8 = 1024 under
     /// [`zc_ab_tops_per_group`] for every share up to 128 chunks).
-    const ZC_AB_MAX_GROUPS: usize = 512;
+    const ZC_AB_MAX_GROUPS: usize = 1024;
 
     /// top' block per threadgroup for a `chunks`-chunk prefix: the largest
     /// power of two <= `chunks`, clamped to [8, 128]. Each chunk splits into
@@ -31001,6 +31026,7 @@ kernel void zc_loop_products(
     pub(crate) mod zfold {
         use super::*;
 
+        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) const ZF_MSL_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -31446,8 +31472,8 @@ kernel void zf_fold8_w32(device const uint4* z      [[buffer(0)]],
             unsafe {
                 let pool = gpu.pool_push();
                 let r = (|| -> Result<ZfState, String> {
-                    let pso = zc_shared_library(&gpu.api, gpu.device).and_then(|lib| build_pso(&gpu.api, gpu.device, lib, "zf_fold8").ok())
-                        .map_or_else(|| compile_supplemental_pipeline(gpu, ZF_MSL_SOURCE, "zf_fold8"), Ok)?;
+                    let pso = zc_shared_library(&gpu.api, gpu.device).and_then(|lib| build_pso(&gpu.api, gpu.device, lib, "zf_fold8_w32").ok())
+                        .map_or_else(|| compile_supplemental_pipeline(gpu, ZF_MSL_SOURCE_W32, "zf_fold8_w32"), Ok)?;
                     let consts = gpu.new_buffer(ZF_CONSTS_BYTES)?;
                     let cut = gpu.new_buffer(16)?;
                     let ev: Id = send!(

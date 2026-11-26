@@ -14,13 +14,13 @@ mod ab_mul9 {
         if control == Some(OsStr::new("1")) {
             return Cow::Borrowed(original);
         }
-        let start = original
-            .find("static inline ulong clmul32(")
-            .expect("AB multiplier");
-        let end = start
-            + original[start..]
-                .find("\nstruct U128k")
-                .expect("AB product limbs");
+        let Some(start) = original.find("static inline ulong clmul32(") else {
+            return Cow::Borrowed(original);
+        };
+        let Some(rel_end) = original[start..].find("\nstruct U128k") else {
+            return Cow::Borrowed(original);
+        };
+        let end = start + rel_end;
         let mut source = String::with_capacity(original.len() + PRIMITIVE.len());
         source.push_str(&original[..start]);
         source.push_str(PRIMITIVE);
