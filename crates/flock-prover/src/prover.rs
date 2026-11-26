@@ -75,8 +75,8 @@ fn direct_ab_env_clear() -> bool {
         });
         return *CLEAR;
     }
-    std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none()
-        && std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none()
+    flock_core::env_once_sweep!(std::env::var_os("FLOCK_NO_OPEN_DIRECT_AB").is_none())
+        && flock_core::env_once_sweep!(std::env::var_os("FLOCK_NO_LIG_FOLD2").is_none())
 }
 
 /// The environment term of [`ranked_lincheck_c_reuse_enabled`], kept the same
