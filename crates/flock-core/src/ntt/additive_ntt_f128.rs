@@ -1533,17 +1533,14 @@ impl AdditiveNttF128 {
             unsafe {
                 let block_base = (base as *mut F128).add(abs_b * BLOCK4_POS * NUM_NTTS);
                 for a in 0..8usize {
-                    for r in r0..r0 + ROWS {
-                        if prefetch {
+                    if prefetch {
+                        for r in r0..r0 + ROWS {
                             let ahead = if a + 1 < 8 {
                                 Some(abs_b * BLOCK4_POS + (a + 1) * EIGHTH7 + r)
                             } else {
                                 next_row0.map(|p0| p0 + (r - r0))
                             };
                             if let Some(pos) = ahead {
-                                // SAFETY: `pos` is a row-group start inside
-                                // `data` (a valid tile row); prefetch hints
-                                // never fault and never write.
                                 prefetch_row_group_l2(
                                     (base as *const F128).add(pos * NUM_NTTS),
                                     EIGHTH4 * NUM_NTTS,
@@ -1551,6 +1548,14 @@ impl AdditiveNttF128 {
                                 );
                             }
                         }
+                    }
+                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                    if let (true, Some((tw4_prep, _))) = (abs_b != 0, &tw_prep) {
+                        let rs = a * EIGHTH7 + r0;
+                        kernels::butterfly_fused_3layer_row_with_const_q::<true>(block_base, EIGHTH4, NUM_NTTS, NUM_NTTS, odd_lanes, rs, rs + ROWS, &tw4_prep[local]);
+                        continue;
+                    }
+                    for r in r0..r0 + ROWS {
                         let row = a * EIGHTH7 + r;
                         let lanes = if row & 1 == 1 { odd_lanes } else { NUM_NTTS };
                         if abs_b == 0 {
@@ -1558,13 +1563,6 @@ impl AdditiveNttF128 {
                                 block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local], use_neon,
                             );
                         } else {
-                            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-                            if let Some((ref tw4_prep, _)) = tw_prep {
-                                kernels::butterfly_fused_3layer_row_with_const_q::<true>(
-                                    block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4_prep[local],
-                                );
-                                continue;
-                            }
                             kernels::butterfly_fused_3layer_row_with_policy(
                                 block_base, EIGHTH4, NUM_NTTS, lanes, row, &tw4[local], use_neon,
                             );
@@ -1575,6 +1573,11 @@ impl AdditiveNttF128 {
                     let abs_c = 8 * abs_b + b;
                     let sub_base = block_base.add(b * EIGHTH4 * NUM_NTTS);
                     let tw = &tw7[8 * local + b];
+                    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                    if let (true, Some((_, tw7_prep))) = (abs_c != 0, &tw_prep) {
+                        kernels::butterfly_fused_3layer_row_with_const_q::<true>(sub_base, EIGHTH7, NUM_NTTS, NUM_NTTS, odd_lanes, r0, r0 + ROWS, &tw7_prep[8 * local + b]);
+                        continue;
+                    }
                     for r in r0..r0 + ROWS {
                         let lanes = if r & 1 == 1 { odd_lanes } else { NUM_NTTS };
                         if abs_c == 0 {
@@ -1582,13 +1585,6 @@ impl AdditiveNttF128 {
                                 sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
                             );
                         } else {
-                            #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
-                            if let Some((_, ref tw7_prep)) = tw_prep {
-                                kernels::butterfly_fused_3layer_row_with_const_q::<true>(
-                                    sub_base, EIGHTH7, NUM_NTTS, lanes, r, &tw7_prep[8 * local + b],
-                                );
-                                continue;
-                            }
                             kernels::butterfly_fused_3layer_row_with_policy(
                                 sub_base, EIGHTH7, NUM_NTTS, lanes, r, tw, use_neon,
                             );
