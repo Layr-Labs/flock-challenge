@@ -1928,6 +1928,15 @@ const FOLD_TABLE_SIZE: usize = 256;
 pub(crate) fn build_fold_byte_table(eq_r_dprime: &[F128]) -> Vec<F128> {
     assert_eq!(eq_r_dprime.len(), 1 << LOG_PACKING);
     let mut tables = crate::alloc_uninit_f128_vec(FOLD_N_BYTES * FOLD_TABLE_SIZE);
+    #[cfg(target_arch = "aarch64")]
+    if rs_compose_pair_enabled() {
+        for byte_idx in 0..FOLD_N_BYTES {
+            let bit_base = byte_idx * 8;
+            let table = &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE];
+            fill_composed_byte_bank_from_slice_stp(&eq_r_dprime[bit_base..bit_base + 8], table);
+        }
+        return tables;
+    }
     for byte_idx in 0..FOLD_N_BYTES {
         let bit_base = byte_idx * 8;
         let table = &mut tables[byte_idx * FOLD_TABLE_SIZE..(byte_idx + 1) * FOLD_TABLE_SIZE];
@@ -2054,6 +2063,187 @@ fn compose_nibble_join_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_COMPOSE_NIBBLE_JOIN").is_none())
 }
 
+/// Kill switch for stack-free bank-streaming `compose_fold_byte_table_into` and
+/// register-resident paired-`stp` byte-bank table fill across ring-switching
+/// (`FLOCK_NO_RS_COMPOSE_PAIR`, any value restores the incumbent `g[128]` stack
+/// buffer, single `vst1q_u64` stores, and scalar doubling loops). Read once per
+/// process.
+pub const ENV_NO_RS_COMPOSE_PAIR: &str = "FLOCK_NO_RS_COMPOSE_PAIR";
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn rs_compose_pair_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_RS_COMPOSE_PAIR).is_none())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn rs_stp_pair<const OFF: usize>(
+    p: *mut F128,
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a:q}, {b:q}, [{p}, #{off}]",
+            p = in(reg) p,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            off = const OFF,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+#[inline(always)]
+unsafe fn fold_one_slot_q(elem: F128, ptr: *const F128) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::{uint64x2_t, veor3q_u64, veorq_u64, vld1q_u64};
+    let lo = elem.lo as usize;
+    let hi = elem.hi as usize;
+    unsafe {
+        let load = |bank: usize, byte: usize| -> uint64x2_t {
+            vld1q_u64(ptr.add(bank * FOLD_TABLE_SIZE + byte).cast::<u64>())
+        };
+        let t0 = veor3q_u64(
+            load(0, lo & 0xff),
+            load(1, (lo >> 8) & 0xff),
+            load(2, (lo >> 16) & 0xff),
+        );
+        let t1 = veor3q_u64(
+            load(3, (lo >> 24) & 0xff),
+            load(4, (lo >> 32) & 0xff),
+            load(5, (lo >> 40) & 0xff),
+        );
+        let t2 = veor3q_u64(
+            load(6, (lo >> 48) & 0xff),
+            load(7, lo >> 56),
+            load(8, hi & 0xff),
+        );
+        let u0 = veor3q_u64(t0, t1, t2);
+        let t3 = veor3q_u64(
+            load(9, (hi >> 8) & 0xff),
+            load(10, (hi >> 16) & 0xff),
+            load(11, (hi >> 24) & 0xff),
+        );
+        let t4 = veor3q_u64(
+            load(12, (hi >> 32) & 0xff),
+            load(13, (hi >> 40) & 0xff),
+            load(14, (hi >> 48) & 0xff),
+        );
+        let u1 = veor3q_u64(t3, t4, load(15, hi >> 56));
+        veorq_u64(u0, u1)
+    }
+}
+
+/// Register-resident, stack-free, paired-`stp` 256-entry byte-bank subset-sum
+/// filler: keeps `l0..l15`, `g4..g7`, `g4^g5`, `g6^g7` in NEON Q-registers,
+/// elides row-0 XORs, and halves 256 vector stores to 128 `stp` instructions.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fill_composed_byte_bank_regs_stp(
+    g0: core::arch::aarch64::uint64x2_t,
+    g1: core::arch::aarch64::uint64x2_t,
+    g2: core::arch::aarch64::uint64x2_t,
+    g3: core::arch::aarch64::uint64x2_t,
+    g4: core::arch::aarch64::uint64x2_t,
+    g5: core::arch::aarch64::uint64x2_t,
+    g6: core::arch::aarch64::uint64x2_t,
+    g7: core::arch::aarch64::uint64x2_t,
+    dst: *mut F128,
+) {
+    use core::arch::aarch64::{vdupq_n_u64, veorq_u64};
+    unsafe {
+        let l0 = vdupq_n_u64(0);
+        let l1 = g0;
+        let l2 = g1;
+        let l3 = veorq_u64(g0, g1);
+        let l4 = g2;
+        let l5 = veorq_u64(l1, g2);
+        let l6 = veorq_u64(l2, g2);
+        let l7 = veorq_u64(l3, g2);
+        let l8 = g3;
+        let l9 = veorq_u64(l1, g3);
+        let l10 = veorq_u64(l2, g3);
+        let l11 = veorq_u64(l3, g3);
+        let l12 = veorq_u64(l4, g3);
+        let l13 = veorq_u64(l5, g3);
+        let l14 = veorq_u64(l6, g3);
+        let l15 = veorq_u64(l7, g3);
+
+        macro_rules! emit_row {
+            ($p:expr, $h:expr) => {{
+                let p = $p;
+                let h = $h;
+                rs_stp_pair::<0>(p, h, veorq_u64(l1, h));
+                rs_stp_pair::<32>(p, veorq_u64(l2, h), veorq_u64(l3, h));
+                rs_stp_pair::<64>(p, veorq_u64(l4, h), veorq_u64(l5, h));
+                rs_stp_pair::<96>(p, veorq_u64(l6, h), veorq_u64(l7, h));
+                rs_stp_pair::<128>(p, veorq_u64(l8, h), veorq_u64(l9, h));
+                rs_stp_pair::<160>(p, veorq_u64(l10, h), veorq_u64(l11, h));
+                rs_stp_pair::<192>(p, veorq_u64(l12, h), veorq_u64(l13, h));
+                rs_stp_pair::<224>(p, veorq_u64(l14, h), veorq_u64(l15, h));
+            }};
+        }
+
+        // Row 0 (`h = 0`): emit directly with zero XORs.
+        rs_stp_pair::<0>(dst, l0, l1);
+        rs_stp_pair::<32>(dst, l2, l3);
+        rs_stp_pair::<64>(dst, l4, l5);
+        rs_stp_pair::<96>(dst, l6, l7);
+        rs_stp_pair::<128>(dst, l8, l9);
+        rs_stp_pair::<160>(dst, l10, l11);
+        rs_stp_pair::<192>(dst, l12, l13);
+        rs_stp_pair::<224>(dst, l14, l15);
+
+        let g45 = veorq_u64(g4, g5);
+        let g67 = veorq_u64(g6, g7);
+
+        emit_row!(dst.add(16), g4);
+        emit_row!(dst.add(32), g5);
+        emit_row!(dst.add(48), g45);
+
+        emit_row!(dst.add(64), g6);
+        emit_row!(dst.add(80), veorq_u64(g4, g6));
+        emit_row!(dst.add(96), veorq_u64(g5, g6));
+        emit_row!(dst.add(112), veorq_u64(g45, g6));
+
+        emit_row!(dst.add(128), g7);
+        emit_row!(dst.add(144), veorq_u64(g4, g7));
+        emit_row!(dst.add(160), veorq_u64(g5, g7));
+        emit_row!(dst.add(176), veorq_u64(g45, g7));
+
+        emit_row!(dst.add(192), g67);
+        emit_row!(dst.add(208), veorq_u64(g4, g67));
+        emit_row!(dst.add(224), veorq_u64(g5, g67));
+        emit_row!(dst.add(240), veorq_u64(g45, g67));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fill_composed_byte_bank_from_slice_stp(g: &[F128], out: &mut [F128]) {
+    use core::arch::aarch64::vld1q_u64;
+    debug_assert_eq!(g.len(), 8);
+    debug_assert_eq!(out.len(), 256);
+    unsafe {
+        let gp = g.as_ptr();
+        fill_composed_byte_bank_regs_stp(
+            vld1q_u64(gp.cast::<u64>()),
+            vld1q_u64(gp.add(1).cast::<u64>()),
+            vld1q_u64(gp.add(2).cast::<u64>()),
+            vld1q_u64(gp.add(3).cast::<u64>()),
+            vld1q_u64(gp.add(4).cast::<u64>()),
+            vld1q_u64(gp.add(5).cast::<u64>()),
+            vld1q_u64(gp.add(6).cast::<u64>()),
+            vld1q_u64(gp.add(7).cast::<u64>()),
+            out.as_mut_ptr(),
+        );
+    }
+}
+
 /// The low and high nibbles select disjoint subsets of these eight generators.
 /// Their XOR gives every byte entry directly, without output-parent loads.
 #[cfg(target_arch = "aarch64")]
@@ -2160,6 +2350,52 @@ pub(crate) fn compose_fold_byte_table_into(e_hi: F128, base: &[F128], out: &mut 
 fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128], x_ladder: bool) {
     debug_assert_eq!(base.len(), FOLD_TABLE_LEN);
     debug_assert_eq!(out.len(), FOLD_TABLE_LEN);
+    let nibble_join = compose_nibble_join_enabled();
+    #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+    if x_ladder && nibble_join && rs_compose_pair_enabled() {
+        let base_ptr = base.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+        let mut bp = e_hi;
+        // SAFETY: `base.len() == FOLD_TABLE_LEN` and `out.len() == FOLD_TABLE_LEN`.
+        // Streams 8 generators per byte bank directly in NEON registers into
+        // `fill_composed_byte_bank_regs_stp`, eliminating the 2 KiB `g[128]`
+        // stack buffer and halving stores via paired `stp`.
+        unsafe {
+            for k in 0..FOLD_N_BYTES {
+                let bp0 = bp;
+                let bp1 = mul_by_x(bp0);
+                let bp2 = mul_by_x(bp1);
+                let bp3 = mul_by_x(bp2);
+                let bp4 = mul_by_x(bp3);
+                let bp5 = mul_by_x(bp4);
+                let bp6 = mul_by_x(bp5);
+                let bp7 = mul_by_x(bp6);
+                bp = mul_by_x(bp7);
+
+                let g0 = fold_one_slot_q(bp0, base_ptr);
+                let g1 = fold_one_slot_q(bp1, base_ptr);
+                let g2 = fold_one_slot_q(bp2, base_ptr);
+                let g3 = fold_one_slot_q(bp3, base_ptr);
+                let g4 = fold_one_slot_q(bp4, base_ptr);
+                let g5 = fold_one_slot_q(bp5, base_ptr);
+                let g6 = fold_one_slot_q(bp6, base_ptr);
+                let g7 = fold_one_slot_q(bp7, base_ptr);
+
+                fill_composed_byte_bank_regs_stp(
+                    g0,
+                    g1,
+                    g2,
+                    g3,
+                    g4,
+                    g5,
+                    g6,
+                    g7,
+                    out_ptr.add(k * FOLD_TABLE_SIZE),
+                );
+            }
+        }
+        return;
+    }
     let mut g = [F128::ZERO; 128];
     if x_ladder {
         // Generators g_b = L(x^b · e_hi) over the single-bit basis elements
@@ -2187,7 +2423,6 @@ fn compose_fold_byte_table_into_mode(e_hi: F128, base: &[F128], out: &mut [F128]
     }
     // Per byte position: subset-sum doubling is the rollback. The default
     // joins two four-bit subset tables and writes all entries directly.
-    let nibble_join = compose_nibble_join_enabled();
     for k in 0..FOLD_N_BYTES {
         let t = &mut out[k * FOLD_TABLE_SIZE..(k + 1) * FOLD_TABLE_SIZE];
         if nibble_join {
@@ -2288,6 +2523,14 @@ pub(crate) fn build_direct_fold8_table_from_generators(generators: &[F128]) -> V
     assert_eq!(generators.len(), 1 << LOG_PACKING);
 
     let mut out = crate::alloc_uninit_f128_vec(FOLD_TABLE_LEN);
+    #[cfg(target_arch = "aarch64")]
+    if rs_compose_pair_enabled() {
+        for byte in 0..FOLD_N_BYTES {
+            let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
+            fill_composed_byte_bank_from_slice_stp(&generators[byte * 8..byte * 8 + 8], table);
+        }
+        return out;
+    }
     for byte in 0..FOLD_N_BYTES {
         let table = &mut out[byte * FOLD_TABLE_SIZE..(byte + 1) * FOLD_TABLE_SIZE];
         table[0] = F128::ZERO;

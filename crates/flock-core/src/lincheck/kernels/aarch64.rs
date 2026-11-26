@@ -1059,6 +1059,220 @@ unsafe fn process_tile_block16_neon_sha3_unscaled(
     );
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+macro_rules! define_tile_block16_neon_sha3_unscaled_alt {
+    ($fn_name:ident, $rev:expr, $step_r:literal, $step_acc:literal) => {
+        #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+        #[inline(never)]
+        #[allow(unsafe_op_in_unsafe_fn)]
+        unsafe fn $fn_name(
+            row_ptr: *const u8,
+            row_stride: usize,
+            tables_ptr: *const u8,
+            out_ptr: *mut F128,
+            n_blocks: usize,
+        ) {
+            use std::arch::asm;
+            debug_assert!(n_blocks > 0);
+            const TABLE_BYTES: usize = 256 * core::mem::size_of::<F128>();
+
+            let (start_r, start_acc) = if $rev {
+                (
+                    row_ptr.add((n_blocks - 1) * 16),
+                    out_ptr.add((n_blocks - 1) * 16),
+                )
+            } else {
+                (row_ptr, out_ptr)
+            };
+
+            macro_rules! stripe_pair_alt {
+                ($ra:literal, $rb:literal, $ta:literal, $tb:literal) => {
+                    concat!(
+                        "ldp x11, x12, [", $ra, "], ", $step_r, "\n",
+                        "ldp x13, x14, [", $rb, "], ", $step_r, "\n",
+                        "ubfiz x16, x11, #4, #8\n",
+                        "ubfiz x17, x13, #4, #8\n",
+                        "ldr q24, [", $ta, ", x16]\n",
+                        "ldr q25, [", $tb, ", x17]\n",
+                        "eor3.16b v0, v0, v24, v25\n",
+                        "and x16, {mask}, x11, lsr #4\n",
+                        "and x17, {mask}, x13, lsr #4\n",
+                        "ldr q26, [", $ta, ", x16]\n",
+                        "ldr q27, [", $tb, ", x17]\n",
+                        "eor3.16b v1, v1, v26, v27\n",
+                        "and x16, {mask}, x11, lsr #12\n",
+                        "and x17, {mask}, x13, lsr #12\n",
+                        "ldr q24, [", $ta, ", x16]\n",
+                        "ldr q25, [", $tb, ", x17]\n",
+                        "eor3.16b v2, v2, v24, v25\n",
+                        "and x16, {mask}, x11, lsr #20\n",
+                        "and x17, {mask}, x13, lsr #20\n",
+                        "ldr q26, [", $ta, ", x16]\n",
+                        "ldr q27, [", $tb, ", x17]\n",
+                        "eor3.16b v3, v3, v26, v27\n",
+                        "and x16, {mask}, x11, lsr #28\n",
+                        "and x17, {mask}, x13, lsr #28\n",
+                        "ldr q24, [", $ta, ", x16]\n",
+                        "ldr q25, [", $tb, ", x17]\n",
+                        "eor3.16b v4, v4, v24, v25\n",
+                        "and x16, {mask}, x11, lsr #36\n",
+                        "and x17, {mask}, x13, lsr #36\n",
+                        "ldr q26, [", $ta, ", x16]\n",
+                        "ldr q27, [", $tb, ", x17]\n",
+                        "eor3.16b v5, v5, v26, v27\n",
+                        "and x16, {mask}, x11, lsr #44\n",
+                        "and x17, {mask}, x13, lsr #44\n",
+                        "ldr q24, [", $ta, ", x16]\n",
+                        "ldr q25, [", $tb, ", x17]\n",
+                        "eor3.16b v6, v6, v24, v25\n",
+                        "and x16, {mask}, x11, lsr #52\n",
+                        "and x17, {mask}, x13, lsr #52\n",
+                        "ldr q26, [", $ta, ", x16]\n",
+                        "ldr q27, [", $tb, ", x17]\n",
+                        "eor3.16b v7, v7, v26, v27\n",
+                        "ubfiz x16, x12, #4, #8\n",
+                        "ubfiz x17, x14, #4, #8\n",
+                        "ldr q24, [", $ta, ", x16]\n",
+                        "ldr q25, [", $tb, ", x17]\n",
+                        "eor3.16b v16, v16, v24, v25\n",
+                        "and x16, {mask}, x12, lsr #4\n",
+                        "and x17, {mask}, x14, lsr #4\n",
+                        "ldr q26, [", $ta, ", x16]\n",
+                        "ldr q27, [", $tb, ", x17]\n",
+                        "eor3.16b v17, v17, v26, v27\n",
+                        "and x16, {mask}, x12, lsr #12\n",
+                        "and x17, {mask}, x14, lsr #12\n",
+                        "ldr q24, [", $ta, ", x16]\n",
+                        "ldr q25, [", $tb, ", x17]\n",
+                        "eor3.16b v18, v18, v24, v25\n",
+                        "and x16, {mask}, x12, lsr #20\n",
+                        "and x17, {mask}, x14, lsr #20\n",
+                        "ldr q26, [", $ta, ", x16]\n",
+                        "ldr q27, [", $tb, ", x17]\n",
+                        "eor3.16b v19, v19, v26, v27\n",
+                        "and x16, {mask}, x12, lsr #28\n",
+                        "and x17, {mask}, x14, lsr #28\n",
+                        "ldr q24, [", $ta, ", x16]\n",
+                        "ldr q25, [", $tb, ", x17]\n",
+                        "eor3.16b v20, v20, v24, v25\n",
+                        "and x16, {mask}, x12, lsr #36\n",
+                        "and x17, {mask}, x14, lsr #36\n",
+                        "ldr q26, [", $ta, ", x16]\n",
+                        "ldr q27, [", $tb, ", x17]\n",
+                        "eor3.16b v21, v21, v26, v27\n",
+                        "and x16, {mask}, x12, lsr #44\n",
+                        "and x17, {mask}, x14, lsr #44\n",
+                        "ldr q24, [", $ta, ", x16]\n",
+                        "ldr q25, [", $tb, ", x17]\n",
+                        "eor3.16b v22, v22, v24, v25\n",
+                        "and x16, {mask}, x12, lsr #52\n",
+                        "and x17, {mask}, x14, lsr #52\n",
+                        "ldr q26, [", $ta, ", x16]\n",
+                        "ldr q27, [", $tb, ", x17]\n",
+                        "eor3.16b v23, v23, v26, v27\n",
+                    )
+                };
+            }
+
+            asm!(
+                "2:",
+                "ldp q0, q1, [{acc}]",
+                "ldp q2, q3, [{acc}, #32]",
+                "ldp q4, q5, [{acc}, #64]",
+                "ldp q6, q7, [{acc}, #96]",
+                "ldp q16, q17, [{acc}, #128]",
+                "ldp q18, q19, [{acc}, #160]",
+                "ldp q20, q21, [{acc}, #192]",
+                "ldp q22, q23, [{acc}, #224]",
+                stripe_pair_alt!("{r0}", "{r1}", "{t0}", "{t1}"),
+                stripe_pair_alt!("{r2}", "{r3}", "{t2}", "{t3}"),
+                stripe_pair_alt!("{r4}", "{r5}", "{t4}", "{t5}"),
+                stripe_pair_alt!("{r6}", "{r7}", "{t6}", "{t7}"),
+                "stp q2, q3, [{acc}, #32]",
+                "stp q4, q5, [{acc}, #64]",
+                "stp q6, q7, [{acc}, #96]",
+                "stp q16, q17, [{acc}, #128]",
+                "stp q18, q19, [{acc}, #160]",
+                "stp q20, q21, [{acc}, #192]",
+                "stp q22, q23, [{acc}, #224]",
+                concat!("stp q0, q1, [{acc}], ", $step_acc),
+                "subs {n}, {n}, #1",
+                "b.ne 2b",
+                acc = inout(reg) start_acc => _,
+                n = inout(reg) n_blocks => _,
+                r0 = inout(reg) start_r => _,
+                r1 = inout(reg) start_r.add(row_stride) => _,
+                r2 = inout(reg) start_r.add(2 * row_stride) => _,
+                r3 = inout(reg) start_r.add(3 * row_stride) => _,
+                r4 = inout(reg) start_r.add(4 * row_stride) => _,
+                r5 = inout(reg) start_r.add(5 * row_stride) => _,
+                r6 = inout(reg) start_r.add(6 * row_stride) => _,
+                r7 = inout(reg) start_r.add(7 * row_stride) => _,
+                t0 = in(reg) tables_ptr,
+                t1 = in(reg) tables_ptr.add(TABLE_BYTES),
+                t2 = in(reg) tables_ptr.add(2 * TABLE_BYTES),
+                t3 = in(reg) tables_ptr.add(3 * TABLE_BYTES),
+                t4 = in(reg) tables_ptr.add(4 * TABLE_BYTES),
+                t5 = in(reg) tables_ptr.add(5 * TABLE_BYTES),
+                t6 = in(reg) tables_ptr.add(6 * TABLE_BYTES),
+                t7 = in(reg) tables_ptr.add(7 * TABLE_BYTES),
+                mask = in(reg) 0xff0u64,
+                out("x11") _,
+                out("x12") _,
+                out("x13") _,
+                out("x14") _,
+                out("x16") _,
+                out("x17") _,
+                out("v0") _,
+                out("v1") _,
+                out("v2") _,
+                out("v3") _,
+                out("v4") _,
+                out("v5") _,
+                out("v6") _,
+                out("v7") _,
+                out("v16") _,
+                out("v17") _,
+                out("v18") _,
+                out("v19") _,
+                out("v20") _,
+                out("v21") _,
+                out("v22") _,
+                out("v23") _,
+                out("v24") _,
+                out("v25") _,
+                out("v26") _,
+                out("v27") _,
+                options(nostack),
+            );
+        }
+    };
+}
+
+// Forward whole-tile Block16 drain with disjoint scratch-register alternation
+// (`(q24, q25)` on even columns, `(q26, q27)` on odd columns) to break
+// back-to-back WAW hazards on the table-lookup load pair.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+define_tile_block16_neon_sha3_unscaled_alt!(
+    process_tile_block16_neon_sha3_unscaled_alt,
+    false,
+    "#16",
+    "#256"
+);
+
+// Reverse whole-tile Block16 drain paired with
+// `process_tile_block16_neon_sha3_unscaled_alt` for alternating snake-order
+// tile traversal: keeps the hot trailing ~96 KiB of the 180 KiB per-worker
+// accumulator resident in Apple P-core L1D across adjacent tile boundaries
+// without rebuilding any sum tables.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+define_tile_block16_neon_sha3_unscaled_alt!(
+    process_tile_block16_neon_sha3_unscaled_alt_rev,
+    true,
+    "#-16",
+    "#-256"
+);
+
 /// Whole-tile Block16 drain (default on). `FLOCK_NO_LC_TILE_ROWS=1` (exact
 /// `"1"`) restores the per-block calls. Only the unscaled load form has a
 /// tile-rows kernel, so `FLOCK_NO_LC_UNSCALED=1` also takes the per-block
@@ -1350,6 +1564,115 @@ fn block16_unscaled_matches_scaled_all_byte_values() {
                 "unscaled: byte {position}, value {value}"
             );
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64", target_feature = "sha3"))]
+#[test]
+fn tile_block16_snake_alt_matches_incumbent_forward() {
+    const STRIDE: usize = 512;
+    const TABLES_LEN: usize = 8 * 256;
+
+    let mut tables = vec![F128::ZERO; TABLES_LEN];
+    let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next_u64 = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        s
+    };
+    for t in 0..8 {
+        for e in 1..256 {
+            tables[t * 256 + e] = F128 {
+                lo: next_u64(),
+                hi: next_u64(),
+            };
+        }
+    }
+    let mut rows_a = vec![0u8; 8 * STRIDE];
+    let mut rows_b = vec![0u8; 8 * STRIDE];
+    for b in rows_a.iter_mut() {
+        *b = (next_u64() >> 56) as u8;
+    }
+    for b in rows_b.iter_mut() {
+        *b = (next_u64() >> 56) as u8;
+    }
+
+    for n_blocks in [1usize, 2, 7, 19] {
+        let cols = n_blocks * 16;
+        let mut ref_out = vec![F128::ZERO; cols + 8];
+        let mut fwd_out = vec![F128::ZERO; cols + 8];
+        let mut rev_out = vec![F128::ZERO; cols + 8];
+        let mut snake_out = vec![F128::ZERO; cols + 8];
+        let mut ref_snake = vec![F128::ZERO; cols + 8];
+        for i in 0..cols + 8 {
+            let v = F128 {
+                lo: next_u64(),
+                hi: next_u64(),
+            };
+            ref_out[i] = v;
+            fwd_out[i] = v;
+            rev_out[i] = v;
+            snake_out[i] = v;
+            ref_snake[i] = v;
+        }
+        unsafe {
+            process_tile_block16_neon_sha3_unscaled(
+                rows_a.as_ptr(),
+                STRIDE,
+                tables.as_ptr().cast(),
+                ref_out.as_mut_ptr(),
+                n_blocks,
+            );
+            process_tile_block16_neon_sha3_unscaled_alt(
+                rows_a.as_ptr(),
+                STRIDE,
+                tables.as_ptr().cast(),
+                fwd_out.as_mut_ptr(),
+                n_blocks,
+            );
+            process_tile_block16_neon_sha3_unscaled_alt_rev(
+                rows_a.as_ptr(),
+                STRIDE,
+                tables.as_ptr().cast(),
+                rev_out.as_mut_ptr(),
+                n_blocks,
+            );
+            process_tile_block16_neon_sha3_unscaled(
+                rows_a.as_ptr(),
+                STRIDE,
+                tables.as_ptr().cast(),
+                ref_snake.as_mut_ptr(),
+                n_blocks,
+            );
+            process_tile_block16_neon_sha3_unscaled(
+                rows_b.as_ptr(),
+                STRIDE,
+                tables.as_ptr().cast(),
+                ref_snake.as_mut_ptr(),
+                n_blocks,
+            );
+            process_tile_block16_neon_sha3_unscaled_alt(
+                rows_a.as_ptr(),
+                STRIDE,
+                tables.as_ptr().cast(),
+                snake_out.as_mut_ptr(),
+                n_blocks,
+            );
+            process_tile_block16_neon_sha3_unscaled_alt_rev(
+                rows_b.as_ptr(),
+                STRIDE,
+                tables.as_ptr().cast(),
+                snake_out.as_mut_ptr(),
+                n_blocks,
+            );
+        }
+        assert_eq!(fwd_out, ref_out, "alt forward mismatch for n_blocks={n_blocks}");
+        assert_eq!(rev_out, ref_out, "alt reverse mismatch for n_blocks={n_blocks}");
+        assert_eq!(
+            snake_out, ref_snake,
+            "two-tile snake mismatch for n_blocks={n_blocks}"
+        );
     }
 }
 
@@ -1692,6 +2015,8 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     // block); decided once per fold.
     #[cfg(target_feature = "sha3")]
     let tile_rows = block16 && lc_tile_rows_enabled();
+    #[cfg(target_feature = "sha3")]
+    let tile_snake = tile_rows && lc_tile_snake_enabled();
     // The tables from registers (`FLOCK_NO_LC_TABLE_REGS=1` keeps the
     // doubling); decided once per fold.
     let table_regs = lc_table_regs_enabled();
@@ -1729,9 +2054,24 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
                     // tile are `k`-byte rows at `z_base + s * k` and
                     // `16 * n16 <= useful <= k`; `partial` holds `useful`
                     // accumulators. Same blocks, rows, tables and
-                    // accumulators as the per-block calls below.
+                    // accumulators as the per-block calls below; GF(2^128)
+                    // XOR across disjoint 16-column blocks is order-invariant.
                     unsafe {
-                        process_tile_block16_neon_sha3_unscaled(z_base, k, tables_ptr, partial, n16);
+                        if tile_snake {
+                            if tile & 1 == 0 {
+                                process_tile_block16_neon_sha3_unscaled_alt(
+                                    z_base, k, tables_ptr, partial, n16,
+                                );
+                            } else {
+                                process_tile_block16_neon_sha3_unscaled_alt_rev(
+                                    z_base, k, tables_ptr, partial, n16,
+                                );
+                            }
+                        } else {
+                            process_tile_block16_neon_sha3_unscaled(
+                                z_base, k, tables_ptr, partial, n16,
+                            );
+                        }
                     }
                     bs = 16 * n16;
                 }
@@ -1754,9 +2094,13 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     };
 
     // XOR-reduce `parts` (each `[0..useful)` valid) in ONE parallel pass over
-    // column bands: each worker owns a band of the output, copies partial 0,
-    // and XORs the rest, so the band lands in registers/L1 once and is written
-    // without an up-front zero-fill of `out`.
+    // column bands: each worker owns a band of the output and reduces all
+    // partials for that band so the band stays L1-resident without an up-front
+    // zero-fill of `out`. When `FLOCK_NO_LC_REDUCE_EOR3` is unset, each band
+    // uses 3-stream initial + 2-stream in-place `eor3.16b` (`ldp`/`stp`) passes
+    // to halve memory passes over `dst` while preserving stream-prefetcher
+    // locality.
+    let use_eor3_reduce = lc_reduce_eor3_enabled();
     let reduce = |parts: &[&[F128]]| -> Vec<F128> {
         let band = useful.div_ceil(rayon::current_num_threads().max(1)).max(1024);
         let mut out = crate::scratch::take_lincheck_z_vec(k);
@@ -1766,11 +2110,17 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             .enumerate()
             .for_each(|(bi, dst)| {
                 let lo = bi * band;
-                dst.copy_from_slice(&parts[0][lo..lo + dst.len()]);
-                for part in &parts[1..] {
-                    let src = &part[lo..lo + dst.len()];
-                    for (o, s) in dst.iter_mut().zip(src.iter()) {
-                        *o += *s;
+                if use_eor3_reduce {
+                    // SAFETY: `parts` slices each cover `lo..lo + dst.len()` and
+                    // `aarch64` NEON is always available (with `eor3` under `sha3`).
+                    unsafe { xor_reduce_band_neon(parts, lo, dst) };
+                } else {
+                    dst.copy_from_slice(&parts[0][lo..lo + dst.len()]);
+                    for part in &parts[1..] {
+                        let src = &part[lo..lo + dst.len()];
+                        for (o, s) in dst.iter_mut().zip(src.iter()) {
+                            *o += *s;
+                        }
                     }
                 }
             });
@@ -1882,4 +2232,208 @@ fn lincheck_worker_partials_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("FLOCK_NO_LINCHECK_WORKER_PARTIALS").ok().as_deref() != Some("1")
     })
+}
+
+/// Kill switch for the 3-way-init + 2-way `eor3.16b` (`ldp`/`stp`) oblock
+/// partial-sum reducer (`FLOCK_NO_LC_REDUCE_EOR3`, any value restores the
+/// incumbent `copy_from_slice` + per-partial XOR loop). Read once per process.
+pub const ENV_NO_LC_REDUCE_EOR3: &str = "FLOCK_NO_LC_REDUCE_EOR3";
+
+fn lc_reduce_eor3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_LC_REDUCE_EOR3).is_none())
+}
+
+/// Kill switch for alternating forward/reverse snake tile traversal with
+/// disjoint `(q24, q25)/(q26, q27)` scratch-register alternation in the
+/// whole-tile Block16 drain (`FLOCK_NO_LC_TILE_SNAKE`, any value restores
+/// forward-only [`process_tile_block16_neon_sha3_unscaled`]). Read once per
+/// process.
+pub const ENV_NO_LC_TILE_SNAKE: &str = "FLOCK_NO_LC_TILE_SNAKE";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn lc_tile_snake_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_LC_TILE_SNAKE).is_none())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lc_load_pair_q(
+    ptr: *const F128,
+) -> (core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t) {
+    let a: core::arch::aarch64::uint64x2_t;
+    let b: core::arch::aarch64::uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "ldp {a:q}, {b:q}, [{ptr}]",
+            ptr = in(reg) ptr,
+            a = lateout(vreg) a,
+            b = lateout(vreg) b,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    (a, b)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lc_store_quad_q(
+    p: *mut F128,
+    a0: core::arch::aarch64::uint64x2_t,
+    a1: core::arch::aarch64::uint64x2_t,
+    a2: core::arch::aarch64::uint64x2_t,
+    a3: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a0:q}, {a1:q}, [{p}]",
+            "stp {a2:q}, {a3:q}, [{p}, #32]",
+            p = in(reg) p,
+            a0 = in(vreg) a0,
+            a1 = in(vreg) a1,
+            a2 = in(vreg) a2,
+            a3 = in(vreg) a3,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lc_xor3_q(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+    c: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    #[cfg(target_feature = "sha3")]
+    {
+        unsafe { veor3q_u64(a, b, c) }
+    }
+    #[cfg(not(target_feature = "sha3"))]
+    {
+        unsafe { veorq_u64(a, veorq_u64(b, c)) }
+    }
+}
+
+/// Stream-friendly 3-way-init + 2-way `eor3.16b` (`ldp`/`stp`) band XOR reducer.
+/// Bit-identical to copying `parts[0][lo..lo+len]` and XORing `parts[1..]`.
+///
+/// # Safety
+/// Every slice in `parts` must have length at least `lo + dst.len()`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn xor_reduce_band_neon(parts: &[&[F128]], lo: usize, dst: &mut [F128]) {
+    use core::arch::aarch64::*;
+
+    let len = dst.len();
+    let n_parts = parts.len();
+    if n_parts == 0 || len == 0 {
+        return;
+    }
+    if n_parts == 1 {
+        dst.copy_from_slice(&parts[0][lo..lo + len]);
+        return;
+    }
+    let dst_ptr = dst.as_mut_ptr();
+    let vec_len = len & !3usize;
+    let mut p;
+    unsafe {
+        if n_parts >= 3 {
+            let s0 = parts[0].as_ptr().add(lo);
+            let s1 = parts[1].as_ptr().add(lo);
+            let s2 = parts[2].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let (a0, a1) = lc_load_pair_q(s0.add(i));
+                let (b0, b1) = lc_load_pair_q(s1.add(i));
+                let (c0, c1) = lc_load_pair_q(s2.add(i));
+                let r0 = lc_xor3_q(a0, b0, c0);
+                let r1 = lc_xor3_q(a1, b1, c1);
+                let (a2, a3) = lc_load_pair_q(s0.add(i + 2));
+                let (b2, b3) = lc_load_pair_q(s1.add(i + 2));
+                let (c2, c3) = lc_load_pair_q(s2.add(i + 2));
+                let r2 = lc_xor3_q(a2, b2, c2);
+                let r3 = lc_xor3_q(a3, b3, c3);
+                lc_store_quad_q(dst_ptr.add(i), r0, r1, r2, r3);
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) = *s0.add(i) + *s1.add(i) + *s2.add(i);
+                i += 1;
+            }
+            p = 3;
+        } else {
+            let s0 = parts[0].as_ptr().add(lo);
+            let s1 = parts[1].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let (a0, a1) = lc_load_pair_q(s0.add(i));
+                let (b0, b1) = lc_load_pair_q(s1.add(i));
+                let (a2, a3) = lc_load_pair_q(s0.add(i + 2));
+                let (b2, b3) = lc_load_pair_q(s1.add(i + 2));
+                lc_store_quad_q(
+                    dst_ptr.add(i),
+                    veorq_u64(a0, b0),
+                    veorq_u64(a1, b1),
+                    veorq_u64(a2, b2),
+                    veorq_u64(a3, b3),
+                );
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) = *s0.add(i) + *s1.add(i);
+                i += 1;
+            }
+            p = 2;
+        }
+        while p + 1 < n_parts {
+            let s0 = parts[p].as_ptr().add(lo);
+            let s1 = parts[p + 1].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let d = dst_ptr.add(i);
+                let (d0, d1) = lc_load_pair_q(d);
+                let (a0, a1) = lc_load_pair_q(s0.add(i));
+                let (b0, b1) = lc_load_pair_q(s1.add(i));
+                let r0 = lc_xor3_q(d0, a0, b0);
+                let r1 = lc_xor3_q(d1, a1, b1);
+                let (d2, d3) = lc_load_pair_q(d.add(2));
+                let (a2, a3) = lc_load_pair_q(s0.add(i + 2));
+                let (b2, b3) = lc_load_pair_q(s1.add(i + 2));
+                let r2 = lc_xor3_q(d2, a2, b2);
+                let r3 = lc_xor3_q(d3, a3, b3);
+                lc_store_quad_q(d, r0, r1, r2, r3);
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) += *s0.add(i) + *s1.add(i);
+                i += 1;
+            }
+            p += 2;
+        }
+        if p < n_parts {
+            let s0 = parts[p].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let d = dst_ptr.add(i);
+                let (d0, d1) = lc_load_pair_q(d);
+                let (a0, a1) = lc_load_pair_q(s0.add(i));
+                let (d2, d3) = lc_load_pair_q(d.add(2));
+                let (a2, a3) = lc_load_pair_q(s0.add(i + 2));
+                lc_store_quad_q(
+                    d,
+                    veorq_u64(d0, a0),
+                    veorq_u64(d1, a1),
+                    veorq_u64(d2, a2),
+                    veorq_u64(d3, a3),
+                );
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) += *s0.add(i);
+                i += 1;
+            }
+        }
+    }
 }

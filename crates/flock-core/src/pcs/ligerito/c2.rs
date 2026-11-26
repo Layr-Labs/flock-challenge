@@ -35,6 +35,18 @@ fn c2_shared_tail_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FLOCK_NO_C2_SHARED_TAIL").is_none())
 }
 
+/// Kill switch for four-row weight-sharing Karatsuba NEON lane dots in C2
+/// dual construction (`FLOCK_NO_C2_ROW_DOT_KARA`, any value restores the
+/// incumbent per-pair `row_dot_pair` `fold_banked_slot` calls). Read once per
+/// process.
+pub const ENV_NO_C2_ROW_DOT_KARA: &str = "FLOCK_NO_C2_ROW_DOT_KARA";
+
+#[inline]
+fn c2_row_dot_kara_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_C2_ROW_DOT_KARA).is_none())
+}
+
 /// The lane dots `[a · w, b · w]` of two adjacent C2 rows. When both have
 /// 64 lanes and agree on lanes 57..64, that tail's seven products are formed
 /// once and added to each row's 57-lane head: the same field sums. At L0
@@ -60,6 +72,48 @@ fn row_dot_pair(a: &[F128], b: &[F128], w: &[F128]) -> [F128; 2] {
     [dot(a, w), dot(b, w)]
 }
 
+/// The lane dots `[r0 · w, r1 · w, r2 · w, r3 · w]` of four consecutive C2
+/// rows. Shares each weight pair across all four rows via Karatsuba NEON
+/// (`fold_banked_quad_disjoint` / `fold_banked_pair_disjoint`), preserving the
+/// exact L0 shared-tail decomposition (`57 + 7`) and bit-identical field sums.
+#[inline]
+fn row_dot_quad(r0: &[F128], r1: &[F128], r2: &[F128], r3: &[F128], w: &[F128]) -> [F128; 4] {
+    if !c2_row_dot_kara_enabled() {
+        let [d0, d1] = row_dot_pair(r0, r1, w);
+        let [d2, d3] = row_dot_pair(r2, r3, w);
+        return [d0, d1, d2, d3];
+    }
+    use crate::field::f128_slice::{fold_banked_pair_disjoint, fold_banked_quad_disjoint};
+    if c2_shared_tail_enabled()
+        && w.len() == 64
+        && r0.len() == 64
+        && r1.len() == 64
+        && r2.len() == 64
+        && r3.len() == 64
+        && r0[ROW_HEAD..] == r1[ROW_HEAD..]
+        && r2[ROW_HEAD..] == r3[ROW_HEAD..]
+    {
+        let head: &[F128; ROW_HEAD] = w[..ROW_HEAD].try_into().unwrap();
+        let tail_w: &[F128; 64 - ROW_HEAD] = w[ROW_HEAD..].try_into().unwrap();
+        let [t01, t23] =
+            fold_banked_pair_disjoint::<{ 64 - ROW_HEAD }>(tail_w, &r0[ROW_HEAD..], &r2[ROW_HEAD..]);
+        let [h0, h1, h2, h3] = fold_banked_quad_disjoint::<ROW_HEAD>(head, r0, r1, r2, r3);
+        return [h0 + t01, h1 + t01, h2 + t23, h3 + t23];
+    }
+    if r0.len() == w.len() && r1.len() == w.len() && r2.len() == w.len() && r3.len() == w.len() {
+        match w.len() {
+            64 => return fold_banked_quad_disjoint::<64>(w.try_into().unwrap(), r0, r1, r2, r3),
+            8 => return fold_banked_quad_disjoint::<8>(w.try_into().unwrap(), r0, r1, r2, r3),
+            4 => return fold_banked_quad_disjoint::<4>(w.try_into().unwrap(), r0, r1, r2, r3),
+            2 => return fold_banked_quad_disjoint::<2>(w.try_into().unwrap(), r0, r1, r2, r3),
+            _ => {}
+        }
+    }
+    let [d0, d1] = row_dot_pair(r0, r1, w);
+    let [d2, d3] = row_dot_pair(r2, r3, w);
+    [d0, d1, d2, d3]
+}
+
 #[inline]
 fn dot2(local: &[F128], weights: &[F128], half: usize) -> [F128; 2] {
     debug_assert_eq!(local.len(), 2 * half);
@@ -82,6 +136,20 @@ fn one_plus_scale(ntt: &AdditiveNttF128, log_d: usize, s: usize, query: usize) -
     val
 }
 
+/// Kill switch for prepared NEON constant multiplications in C2 dual helpers
+/// (`invert_local_staged`, `Dual::message`, `Dual::scale`): setting
+/// `FLOCK_NO_C2_DUAL_PREP` restores the incumbent scalar `F128 * F128` loops.
+/// Read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+pub const ENV_NO_C2_DUAL_PREP: &str = "FLOCK_NO_C2_DUAL_PREP";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline]
+fn c2_dual_prep_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_C2_DUAL_PREP).is_none())
+}
+
 #[inline]
 fn invert_local_staged(
     ntt: &AdditiveNttF128,
@@ -93,6 +161,40 @@ fn invert_local_staged(
     cache: &mut [F128; 16],
 ) -> [F128; 30] {
     let mut stages = [F128::ZERO; 30];
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if c2_dual_prep_enabled() {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64};
+        use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep_xor};
+
+        // SAFETY: AES and little-endian F128 layout hold by cfg; `cache_len <= 16`.
+        unsafe {
+            let mut c: [uint64x2_t; 16] =
+                core::array::from_fn(|i| core::mem::transmute::<F128, uint64x2_t>(cache[i]));
+            for (stage, layer) in ((log_d - inv_layers)..log_d).rev().enumerate() {
+                let size = 1usize << (log_d - layer);
+                let half = size / 2;
+                for off in (0..cache_len).step_by(size) {
+                    let twiddle = ntt.twiddle(layer, (base + off) / size);
+                    let prep = const_prep(core::mem::transmute::<F128, uint64x2_t>(twiddle));
+                    for j in 0..half {
+                        let y0 = c[off + j];
+                        let v = veorq_u64(y0, c[off + half + j]);
+                        c[off + j] = mul_const_prep_xor(prep, v, y0);
+                        c[off + half + j] = v;
+                    }
+                }
+                let len = 2usize << stage;
+                let start = qoff & !(len - 1);
+                for j in 0..len {
+                    stages[len - 2 + j] = core::mem::transmute::<uint64x2_t, F128>(c[start + j]);
+                }
+            }
+            for i in 0..cache_len {
+                cache[i] = core::mem::transmute::<uint64x2_t, F128>(c[i]);
+            }
+        }
+        return stages;
+    }
     for (stage, layer) in ((log_d - inv_layers)..log_d).rev().enumerate() {
         let size = 1usize << (log_d - layer);
         let half = size / 2;
@@ -173,8 +275,14 @@ impl Dual {
             let base = q & !mask;
             let qoff = q - base;
             let mut cache = [F128::ZERO; 16];
-            for j in (0..cache_len).step_by(2) {
-                [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
+            for j in (0..cache_len).step_by(4) {
+                [cache[j], cache[j + 1], cache[j + 2], cache[j + 3]] = row_dot_quad(
+                    row(base + j),
+                    row(base + j + 1),
+                    row(base + j + 2),
+                    row(base + j + 3),
+                    &lane_weights,
+                );
             }
             enforced ^= alpha.mul_unreduced(cache[qoff]);
             stages.push(invert_local_staged(
@@ -262,8 +370,14 @@ impl Dual {
                     let base = q & !mask;
                     let qoff = q - base;
                     let mut cache = [F128::ZERO; 16];
-                    for j in (0..cache_len).step_by(2) {
-                        [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
+                    for j in (0..cache_len).step_by(4) {
+                        [cache[j], cache[j + 1], cache[j + 2], cache[j + 3]] = row_dot_quad(
+                            row(base + j),
+                            row(base + j + 1),
+                            row(base + j + 2),
+                            row(base + j + 3),
+                            &lane_weights,
+                        );
                     }
                     let enf = w.mul_unreduced(cache[qoff]);
                     *stage_out = invert_local_staged(
@@ -303,8 +417,14 @@ impl Dual {
                 let base = q & !mask;
                 let qoff = q - base;
                 let mut cache = [F128::ZERO; 16];
-                for j in (0..cache_len).step_by(2) {
-                    [cache[j], cache[j + 1]] = row_dot_pair(row(base + j), row(base + j + 1), &lane_weights);
+                for j in (0..cache_len).step_by(4) {
+                    [cache[j], cache[j + 1], cache[j + 2], cache[j + 3]] = row_dot_quad(
+                        row(base + j),
+                        row(base + j + 1),
+                        row(base + j + 2),
+                        row(base + j + 3),
+                        &lane_weights,
+                    );
                 }
                 enf_sum ^= w.mul_unreduced(cache[qoff]);
                 *stage_out = invert_local_staged(
@@ -367,6 +487,15 @@ impl Dual {
         let mut u2 = crate::field::F256Unreduced::ZERO;
         if rs.len() == self.step_depth + 1 {
             let r_prev = rs[self.step_depth];
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            let r_prev_prep = if c2_dual_prep_enabled() {
+                use core::arch::aarch64::uint64x2_t;
+                use crate::field::gf2_128::aarch64::const_prep;
+                // SAFETY: AES and little-endian F128 layout hold by cfg.
+                Some(unsafe { const_prep(core::mem::transmute::<F128, uint64x2_t>(r_prev)) })
+            } else {
+                None
+            };
             for (((stage, qscales), w0), w2) in self
                 .stages
                 .iter()
@@ -376,6 +505,22 @@ impl Dual {
             {
                 let local = &stage[size - 2..2 * size - 2];
                 let [f0, f1] = dot2(local, &eq_weights, half);
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+                let c0 = if let Some(prep) = r_prev_prep {
+                    use core::arch::aarch64::uint64x2_t;
+                    use crate::field::gf2_128::aarch64::mul_const_prep_xor;
+                    // SAFETY: AES and little-endian F128 layout hold by cfg.
+                    unsafe {
+                        core::mem::transmute::<uint64x2_t, F128>(mul_const_prep_xor(
+                            prep,
+                            core::mem::transmute::<F128, uint64x2_t>(*w2),
+                            core::mem::transmute::<F128, uint64x2_t>(*w0),
+                        ))
+                    }
+                } else {
+                    *w0 + mul(r_prev, *w2)
+                };
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
                 let c0 = *w0 + mul(r_prev, *w2);
                 let c2 = mul(c0, qscales[k - 1]);
                 *w0 = c0;
@@ -406,6 +551,15 @@ impl Dual {
     }
 
     pub(super) fn scale(&mut self, beta: F128) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+        let beta_prep = if c2_dual_prep_enabled() {
+            use core::arch::aarch64::uint64x2_t;
+            use crate::field::gf2_128::aarch64::const_prep;
+            // SAFETY: AES and little-endian F128 layout hold by cfg.
+            Some(unsafe { const_prep(core::mem::transmute::<F128, uint64x2_t>(beta)) })
+        } else {
+            None
+        };
         for (((w, w0), w2), qscales) in self
             .weights
             .iter_mut()
@@ -413,6 +567,21 @@ impl Dual {
             .zip(&mut self.w2_pows)
             .zip(&self.scales)
         {
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            let nw = if let Some(prep) = beta_prep {
+                use core::arch::aarch64::uint64x2_t;
+                use crate::field::gf2_128::aarch64::mul_const_prep;
+                // SAFETY: AES and little-endian F128 layout hold by cfg.
+                unsafe {
+                    core::mem::transmute::<uint64x2_t, F128>(mul_const_prep(
+                        prep,
+                        core::mem::transmute::<F128, uint64x2_t>(*w),
+                    ))
+                }
+            } else {
+                mul(*w, beta)
+            };
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
             let nw = mul(*w, beta);
             *w = nw;
             *w0 = nw;
