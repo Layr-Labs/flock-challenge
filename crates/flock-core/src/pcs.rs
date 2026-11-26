@@ -1191,8 +1191,8 @@ fn direct_fold8_all_claim_mix_supported(
         [(_, ab), (_, c)]
             if ab.direct_fold8.is_some()
                 && c.direct_fold8.is_some()
-                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
-                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. })
+                && matches!(&ab.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. } | ring_switch::RsEqInd::Elided { .. })
+                && matches!(&c.rs_eq_ind, ring_switch::RsEqInd::DeferredDense { .. } | ring_switch::RsEqInd::Elided { .. })
     )
 }
 
