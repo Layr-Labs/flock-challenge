@@ -1754,9 +1754,13 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
     };
 
     // XOR-reduce `parts` (each `[0..useful)` valid) in ONE parallel pass over
-    // column bands: each worker owns a band of the output, copies partial 0,
-    // and XORs the rest, so the band lands in registers/L1 once and is written
-    // without an up-front zero-fill of `out`.
+    // column bands: each worker owns a band of the output and reduces all
+    // partials for that band so the band stays L1-resident without an up-front
+    // zero-fill of `out`. When `FLOCK_NO_LC_REDUCE_EOR3` is unset, each band
+    // uses 3-stream initial + 2-stream in-place `eor3.16b` (`ldp`/`stp`) passes
+    // to halve memory passes over `dst` while preserving stream-prefetcher
+    // locality.
+    let use_eor3_reduce = lc_reduce_eor3_enabled();
     let reduce = |parts: &[&[F128]]| -> Vec<F128> {
         let band = useful.div_ceil(rayon::current_num_threads().max(1)).max(1024);
         let mut out = crate::scratch::take_lincheck_z_vec(k);
@@ -1766,11 +1770,17 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             .enumerate()
             .for_each(|(bi, dst)| {
                 let lo = bi * band;
-                dst.copy_from_slice(&parts[0][lo..lo + dst.len()]);
-                for part in &parts[1..] {
-                    let src = &part[lo..lo + dst.len()];
-                    for (o, s) in dst.iter_mut().zip(src.iter()) {
-                        *o += *s;
+                if use_eor3_reduce {
+                    // SAFETY: `parts` slices each cover `lo..lo + dst.len()` and
+                    // `aarch64` NEON is always available (with `eor3` under `sha3`).
+                    unsafe { xor_reduce_band_neon(parts, lo, dst) };
+                } else {
+                    dst.copy_from_slice(&parts[0][lo..lo + dst.len()]);
+                    for part in &parts[1..] {
+                        let src = &part[lo..lo + dst.len()];
+                        for (o, s) in dst.iter_mut().zip(src.iter()) {
+                            *o += *s;
+                        }
                     }
                 }
             });
@@ -1882,4 +1892,195 @@ fn lincheck_worker_partials_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("FLOCK_NO_LINCHECK_WORKER_PARTIALS").ok().as_deref() != Some("1")
     })
+}
+
+/// Kill switch for the 3-way-init + 2-way `eor3.16b` (`ldp`/`stp`) oblock
+/// partial-sum reducer (`FLOCK_NO_LC_REDUCE_EOR3`, any value restores the
+/// incumbent `copy_from_slice` + per-partial XOR loop). Read once per process.
+pub const ENV_NO_LC_REDUCE_EOR3: &str = "FLOCK_NO_LC_REDUCE_EOR3";
+
+fn lc_reduce_eor3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_LC_REDUCE_EOR3).is_none())
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lc_load_pair_q(
+    ptr: *const F128,
+) -> (core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t) {
+    let a: core::arch::aarch64::uint64x2_t;
+    let b: core::arch::aarch64::uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "ldp {a:q}, {b:q}, [{ptr}]",
+            ptr = in(reg) ptr,
+            a = lateout(vreg) a,
+            b = lateout(vreg) b,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    (a, b)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lc_store_quad_q(
+    p: *mut F128,
+    a0: core::arch::aarch64::uint64x2_t,
+    a1: core::arch::aarch64::uint64x2_t,
+    a2: core::arch::aarch64::uint64x2_t,
+    a3: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a0:q}, {a1:q}, [{p}]",
+            "stp {a2:q}, {a3:q}, [{p}, #32]",
+            p = in(reg) p,
+            a0 = in(vreg) a0,
+            a1 = in(vreg) a1,
+            a2 = in(vreg) a2,
+            a3 = in(vreg) a3,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn lc_xor3_q(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+    c: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    use core::arch::aarch64::*;
+    #[cfg(target_feature = "sha3")]
+    {
+        unsafe { veor3q_u64(a, b, c) }
+    }
+    #[cfg(not(target_feature = "sha3"))]
+    {
+        unsafe { veorq_u64(a, veorq_u64(b, c)) }
+    }
+}
+
+/// Stream-friendly 3-way-init + 2-way `eor3.16b` (`ldp`/`stp`) band XOR reducer.
+/// Bit-identical to copying `parts[0][lo..lo+len]` and XORing `parts[1..]`.
+///
+/// # Safety
+/// Every slice in `parts` must have length at least `lo + dst.len()`.
+#[cfg(target_arch = "aarch64")]
+unsafe fn xor_reduce_band_neon(parts: &[&[F128]], lo: usize, dst: &mut [F128]) {
+    use core::arch::aarch64::*;
+
+    let len = dst.len();
+    let n_parts = parts.len();
+    if n_parts == 0 || len == 0 {
+        return;
+    }
+    if n_parts == 1 {
+        dst.copy_from_slice(&parts[0][lo..lo + len]);
+        return;
+    }
+    let dst_ptr = dst.as_mut_ptr();
+    let vec_len = len & !3usize;
+    let mut p;
+    unsafe {
+        if n_parts >= 3 {
+            let s0 = parts[0].as_ptr().add(lo);
+            let s1 = parts[1].as_ptr().add(lo);
+            let s2 = parts[2].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let (a0, a1) = lc_load_pair_q(s0.add(i));
+                let (b0, b1) = lc_load_pair_q(s1.add(i));
+                let (c0, c1) = lc_load_pair_q(s2.add(i));
+                let r0 = lc_xor3_q(a0, b0, c0);
+                let r1 = lc_xor3_q(a1, b1, c1);
+                let (a2, a3) = lc_load_pair_q(s0.add(i + 2));
+                let (b2, b3) = lc_load_pair_q(s1.add(i + 2));
+                let (c2, c3) = lc_load_pair_q(s2.add(i + 2));
+                let r2 = lc_xor3_q(a2, b2, c2);
+                let r3 = lc_xor3_q(a3, b3, c3);
+                lc_store_quad_q(dst_ptr.add(i), r0, r1, r2, r3);
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) = *s0.add(i) + *s1.add(i) + *s2.add(i);
+                i += 1;
+            }
+            p = 3;
+        } else {
+            let s0 = parts[0].as_ptr().add(lo);
+            let s1 = parts[1].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let (a0, a1) = lc_load_pair_q(s0.add(i));
+                let (b0, b1) = lc_load_pair_q(s1.add(i));
+                let (a2, a3) = lc_load_pair_q(s0.add(i + 2));
+                let (b2, b3) = lc_load_pair_q(s1.add(i + 2));
+                lc_store_quad_q(
+                    dst_ptr.add(i),
+                    veorq_u64(a0, b0),
+                    veorq_u64(a1, b1),
+                    veorq_u64(a2, b2),
+                    veorq_u64(a3, b3),
+                );
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) = *s0.add(i) + *s1.add(i);
+                i += 1;
+            }
+            p = 2;
+        }
+        while p + 1 < n_parts {
+            let s0 = parts[p].as_ptr().add(lo);
+            let s1 = parts[p + 1].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let d = dst_ptr.add(i);
+                let (d0, d1) = lc_load_pair_q(d);
+                let (a0, a1) = lc_load_pair_q(s0.add(i));
+                let (b0, b1) = lc_load_pair_q(s1.add(i));
+                let r0 = lc_xor3_q(d0, a0, b0);
+                let r1 = lc_xor3_q(d1, a1, b1);
+                let (d2, d3) = lc_load_pair_q(d.add(2));
+                let (a2, a3) = lc_load_pair_q(s0.add(i + 2));
+                let (b2, b3) = lc_load_pair_q(s1.add(i + 2));
+                let r2 = lc_xor3_q(d2, a2, b2);
+                let r3 = lc_xor3_q(d3, a3, b3);
+                lc_store_quad_q(d, r0, r1, r2, r3);
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) += *s0.add(i) + *s1.add(i);
+                i += 1;
+            }
+            p += 2;
+        }
+        if p < n_parts {
+            let s0 = parts[p].as_ptr().add(lo);
+            let mut i = 0usize;
+            while i < vec_len {
+                let d = dst_ptr.add(i);
+                let (d0, d1) = lc_load_pair_q(d);
+                let (a0, a1) = lc_load_pair_q(s0.add(i));
+                let (d2, d3) = lc_load_pair_q(d.add(2));
+                let (a2, a3) = lc_load_pair_q(s0.add(i + 2));
+                lc_store_quad_q(
+                    d,
+                    veorq_u64(d0, a0),
+                    veorq_u64(d1, a1),
+                    veorq_u64(d2, a2),
+                    veorq_u64(d3, a3),
+                );
+                i += 4;
+            }
+            while i < len {
+                *dst_ptr.add(i) += *s0.add(i);
+                i += 1;
+            }
+        }
+    }
 }

@@ -844,11 +844,44 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
 
         let low = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
         let high = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
-        let o = out.as_mut_ptr().cast::<u64>();
-        vst1q_u64(o, low[0]);
-        vst1q_u64(o.add(2), low[1]);
-        vst1q_u64(o.add(4), high[0]);
-        vst1q_u64(o.add(6), high[1]);
+        let o = out.as_mut_ptr();
+        if use_f128_stp_pair() {
+            store_pair_whole(o, low[0], low[1]);
+            store_pair_whole(o.add(2), high[0], high[1]);
+        } else {
+            let o = o.cast::<u64>();
+            vst1q_u64(o, low[0]);
+            vst1q_u64(o.add(2), low[1]);
+            vst1q_u64(o.add(4), high[0]);
+            vst1q_u64(o.add(6), high[1]);
+        }
+    }
+}
+
+/// Kill switch for paired `stp q, q` stores in hot AArch64 fold kernels
+/// (`FLOCK_NO_F128_STP_PAIR`, any value restores paired `vst1q_u64` stores).
+/// Read once per process.
+pub const ENV_NO_F128_STP_PAIR: &str = "FLOCK_NO_F128_STP_PAIR";
+
+#[inline]
+fn use_f128_stp_pair() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_F128_STP_PAIR).is_none())
+}
+
+#[inline(always)]
+unsafe fn store_two_whole<const STP_PAIR: bool>(
+    p: *mut F128,
+    x0: uint64x2_t,
+    x1: uint64x2_t,
+) {
+    unsafe {
+        if STP_PAIR {
+            store_pair_whole(p, x0, x1);
+        } else {
+            vst1q_u64(p.cast::<u64>(), x0);
+            vst1q_u64(p.add(1).cast::<u64>(), x1);
+        }
     }
 }
 
@@ -862,6 +895,21 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
 #[inline(never)]
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn fold_bank_major_128x64_rows2(
+    weight: &[F128; 128],
+    input: &[F128],
+    output: &mut [F128; 64],
+) {
+    unsafe {
+        if use_f128_stp_pair() {
+            fold_bank_major_128x64_rows2_impl::<true>(weight, input, output);
+        } else {
+            fold_bank_major_128x64_rows2_impl::<false>(weight, input, output);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn fold_bank_major_128x64_rows2_impl<const STP_PAIR: bool>(
     weight: &[F128; 128],
     input: &[F128],
     output: &mut [F128; 64],
@@ -896,10 +944,8 @@ pub(super) unsafe fn fold_bank_major_128x64_rows2(
 
             let lo = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
             let hi = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
-            vst1q_u64(out.add(lane).cast::<u64>(), lo[0]);
-            vst1q_u64(out.add(lane + 1).cast::<u64>(), lo[1]);
-            vst1q_u64(out.add(lane + 2).cast::<u64>(), hi[0]);
-            vst1q_u64(out.add(lane + 3).cast::<u64>(), hi[1]);
+            store_two_whole::<STP_PAIR>(out.add(lane), lo[0], lo[1]);
+            store_two_whole::<STP_PAIR>(out.add(lane + 2), hi[0], hi[1]);
             lane += 4;
         }
     }
@@ -915,6 +961,21 @@ pub(super) unsafe fn fold_bank_major_128x64_rows2(
 #[inline(never)]
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn fold_bank_major_64x128_rows2(
+    weight: &[F128; 64],
+    input: &[F128],
+    output: &mut [F128; 128],
+) {
+    unsafe {
+        if use_f128_stp_pair() {
+            fold_bank_major_64x128_rows2_impl::<true>(weight, input, output);
+        } else {
+            fold_bank_major_64x128_rows2_impl::<false>(weight, input, output);
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn fold_bank_major_64x128_rows2_impl<const STP_PAIR: bool>(
     weight: &[F128; 64],
     input: &[F128],
     output: &mut [F128; 128],
@@ -949,10 +1010,8 @@ pub(super) unsafe fn fold_bank_major_64x128_rows2(
 
             let lo = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
             let hi = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
-            vst1q_u64(out.add(lane).cast::<u64>(), lo[0]);
-            vst1q_u64(out.add(lane + 1).cast::<u64>(), lo[1]);
-            vst1q_u64(out.add(lane + 2).cast::<u64>(), hi[0]);
-            vst1q_u64(out.add(lane + 3).cast::<u64>(), hi[1]);
+            store_two_whole::<STP_PAIR>(out.add(lane), lo[0], lo[1]);
+            store_two_whole::<STP_PAIR>(out.add(lane + 2), hi[0], hi[1]);
             lane += 4;
         }
     }
@@ -1287,17 +1346,18 @@ pub(super) unsafe fn fold_two_and_msg(
     // SAFETY: same contract as the caller; the two arms differ only in how
     // the fixed-multiplier products are formed.
     unsafe {
-        if use_fold_const_prep() {
-            fold_two_and_msg_impl::<true>(f, b, base, nf, nb, r)
-        } else {
-            fold_two_and_msg_impl::<false>(f, b, base, nf, nb, r)
+        match (use_fold_const_prep(), use_f128_stp_pair()) {
+            (true, true) => fold_two_and_msg_impl::<true, true>(f, b, base, nf, nb, r),
+            (true, false) => fold_two_and_msg_impl::<true, false>(f, b, base, nf, nb, r),
+            (false, true) => fold_two_and_msg_impl::<false, true>(f, b, base, nf, nb, r),
+            (false, false) => fold_two_and_msg_impl::<false, false>(f, b, base, nf, nb, r),
         }
     }
 }
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_two_and_msg_impl<const PREP: bool>(
+unsafe fn fold_two_and_msg_impl<const PREP: bool, const STP_PAIR: bool>(
     f: &[F128],
     b: &[F128],
     base: usize,
@@ -1351,10 +1411,8 @@ unsafe fn fold_two_and_msg_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+            store_two_whole::<STP_PAIR>(nf.as_mut_ptr().add(t), f0, f1);
+            store_two_whole::<STP_PAIR>(nb.as_mut_ptr().add(t), b0, b1);
 
             tri_acc_q(&mut u0, f0, b0);
             tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
@@ -1385,17 +1443,18 @@ pub(super) unsafe fn fold_two_and_msg_in_place(
     // SAFETY: same contract as the caller; the two arms differ only in how
     // the fixed-multiplier products are formed.
     unsafe {
-        if use_fold_const_prep() {
-            fold_two_and_msg_in_place_impl::<true>(f, b, r)
-        } else {
-            fold_two_and_msg_in_place_impl::<false>(f, b, r)
+        match (use_fold_const_prep(), use_f128_stp_pair()) {
+            (true, true) => fold_two_and_msg_in_place_impl::<true, true>(f, b, r),
+            (true, false) => fold_two_and_msg_in_place_impl::<true, false>(f, b, r),
+            (false, true) => fold_two_and_msg_in_place_impl::<false, true>(f, b, r),
+            (false, false) => fold_two_and_msg_in_place_impl::<false, false>(f, b, r),
         }
     }
 }
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool>(
+unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool, const STP_PAIR: bool>(
     f: &mut [F128],
     b: &mut [F128],
     r: F128,
@@ -1449,10 +1508,8 @@ unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(f_ptr.add(t).cast::<u64>(), f0);
-            vst1q_u64(f_ptr.add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(b_ptr.add(t).cast::<u64>(), b0);
-            vst1q_u64(b_ptr.add(t + 1).cast::<u64>(), b1);
+            store_two_whole::<STP_PAIR>(f_ptr.add(t), f0, f1);
+            store_two_whole::<STP_PAIR>(b_ptr.add(t), b0, b1);
 
             tri_acc_q(&mut u0, f0, b0);
             tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
@@ -1488,17 +1545,18 @@ pub(super) unsafe fn fold_two_and_msg_with_scaled_basis_addend(
     // SAFETY: same contract as the caller; the two arms differ only in how
     // the fixed-multiplier products are formed.
     unsafe {
-        if use_fold_const_prep() {
-            fold_two_and_msg_with_scaled_basis_addend_impl::<true>(f, b, basis_addend, base, nf, nb, r, scale)
-        } else {
-            fold_two_and_msg_with_scaled_basis_addend_impl::<false>(f, b, basis_addend, base, nf, nb, r, scale)
+        match (use_fold_const_prep(), use_f128_stp_pair()) {
+            (true, true) => fold_two_and_msg_with_scaled_basis_addend_impl::<true, true>(f, b, basis_addend, base, nf, nb, r, scale),
+            (true, false) => fold_two_and_msg_with_scaled_basis_addend_impl::<true, false>(f, b, basis_addend, base, nf, nb, r, scale),
+            (false, true) => fold_two_and_msg_with_scaled_basis_addend_impl::<false, true>(f, b, basis_addend, base, nf, nb, r, scale),
+            (false, false) => fold_two_and_msg_with_scaled_basis_addend_impl::<false, false>(f, b, basis_addend, base, nf, nb, r, scale),
         }
     }
 }
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
+unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool, const STP_PAIR: bool>(
     f: &[F128],
     b: &[F128],
     basis_addend: &[F128],
@@ -1572,10 +1630,8 @@ unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+            store_two_whole::<STP_PAIR>(nf.as_mut_ptr().add(t), f0, f1);
+            store_two_whole::<STP_PAIR>(nb.as_mut_ptr().add(t), b0, b1);
 
             tri_acc_q(&mut u0, f0, b0);
             tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
@@ -1618,21 +1674,26 @@ pub(super) unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_adden
     gamma: F128,
 ) -> (F128, F128) {
     unsafe {
-        if use_fold_const_prep() {
-            fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl::<true>(
+        match (use_fold_const_prep(), use_f128_stp_pair()) {
+            (true, true) => fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl::<true, true>(
                 f, b, deferred_basis, local_addend, base, nf, nb, r, alpha, alpha_r, gamma,
-            )
-        } else {
-            fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl::<false>(
+            ),
+            (true, false) => fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl::<true, false>(
                 f, b, deferred_basis, local_addend, base, nf, nb, r, alpha, alpha_r, gamma,
-            )
+            ),
+            (false, true) => fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl::<false, true>(
+                f, b, deferred_basis, local_addend, base, nf, nb, r, alpha, alpha_r, gamma,
+            ),
+            (false, false) => fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl::<false, false>(
+                f, b, deferred_basis, local_addend, base, nf, nb, r, alpha, alpha_r, gamma,
+            ),
         }
     }
 }
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<const PREP: bool>(
+unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<const PREP: bool, const STP_PAIR: bool>(
     f: &[F128],
     b: &[F128],
     deferred_basis: &[F128],
@@ -1666,8 +1727,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                     veorq_u64(f_even1, folded_f[1]),
                 )
             };
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
+            store_two_whole::<STP_PAIR>(nf.as_mut_ptr().add(t), f0, f1);
             t += 2;
         }
 
@@ -1708,8 +1768,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                     addend1,
                     b_even1,
                 );
-                vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-                vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+                store_two_whole::<STP_PAIR>(nb.as_mut_ptr().add(t), b0, b1);
                 t += 2;
             }
         } else {
@@ -1749,8 +1808,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                 );
                 let b0 = veorq_u64(partial_b0, deferred_delta_and_addend[0]);
                 let b1 = veorq_u64(partial_b1, deferred_delta_and_addend[1]);
-                vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-                vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+                store_two_whole::<STP_PAIR>(nb.as_mut_ptr().add(t), b0, b1);
                 t += 2;
             }
         }
@@ -1802,7 +1860,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
 /// # Safety
 /// Caller guarantees PMULL and: `f.len() == b.len()`, `wf.len() == wb.len()`,
 /// `wf.len() % 4 == 0`, `base % 4 == 0`, and `4 * (base + wf.len()) <= f.len()`.
-unsafe fn fold2_two_and_msgs_impl(
+unsafe fn fold2_two_and_msgs_impl<const STP_PAIR: bool>(
     f: &[F128],
     b: &[F128],
     base: usize,
@@ -1888,7 +1946,7 @@ unsafe fn fold2_two_and_msgs_impl(
                     let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                     (veorq_u64(vf0, pw[0]), veorq_u64(vb0, pw[1]))
                 };
-                if !nt_stores {
+                if !nt_stores && !STP_PAIR {
                     vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
                     vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
                 }
@@ -1900,6 +1958,11 @@ unsafe fn fold2_two_and_msgs_impl(
                 store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
                 store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
                 store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
+            } else if STP_PAIR {
+                store_pair_whole(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
+                store_pair_whole(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
+                store_pair_whole(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
+                store_pair_whole(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
             }
             let s0f = veorq_u64(w_regs_f[0], w_regs_f[1]);
             let s0b = veorq_u64(w_regs_b[0], w_regs_b[1]);
@@ -1942,7 +2005,7 @@ unsafe fn fold2_two_and_msgs_impl(
 /// # Safety
 /// Caller guarantees PMULL and: `f.len() == b.len()`, `wf.len() == wb.len()`,
 /// `wf.len() % 4 == 0`, `base % 4 == 0`, and `4 * (base + wf.len()) <= f.len()`.
-unsafe fn fold2_two_and_msg_impl(
+unsafe fn fold2_two_and_msg_impl<const STP_PAIR: bool>(
     f: &[F128],
     b: &[F128],
     base: usize,
@@ -2025,7 +2088,7 @@ unsafe fn fold2_two_and_msg_impl(
                     let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                     (veorq_u64(vf0, pw[0]), veorq_u64(vb0, pw[1]))
                 };
-                if !nt_stores {
+                if !nt_stores && !STP_PAIR {
                     vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
                     vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
                 }
@@ -2037,6 +2100,11 @@ unsafe fn fold2_two_and_msg_impl(
                 store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
                 store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
                 store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
+            } else if STP_PAIR {
+                store_pair_whole(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
+                store_pair_whole(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
+                store_pair_whole(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
+                store_pair_whole(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
             }
 
             let s0f = veorq_u64(w_regs_f[0], w_regs_f[1]);
@@ -2088,7 +2156,13 @@ pub(super) unsafe fn fold2_two_and_msgs(
     r_b: F128,
     nt_stores: bool,
 ) -> (F128, F128, [F128; 6]) {
-    unsafe { fold2_two_and_msgs_impl(f, b, base, wf, wb, r_a, r_b, nt_stores, use_fold2_const_prep()) }
+    unsafe {
+        if use_f128_stp_pair() {
+            fold2_two_and_msgs_impl::<true>(f, b, base, wf, wb, r_a, r_b, nt_stores, use_fold2_const_prep())
+        } else {
+            fold2_two_and_msgs_impl::<false>(f, b, base, wf, wb, r_a, r_b, nt_stores, use_fold2_const_prep())
+        }
+    }
 }
 
 /// See [`fold2_two_and_msg_impl`]; selects the constant-product form once.
@@ -2107,7 +2181,13 @@ pub(super) unsafe fn fold2_two_and_msg(
     r_b: F128,
     nt_stores: bool,
 ) -> (F128, F128) {
-    unsafe { fold2_two_and_msg_impl(f, b, base, wf, wb, r_a, r_b, nt_stores, use_fold2_const_prep()) }
+    unsafe {
+        if use_f128_stp_pair() {
+            fold2_two_and_msg_impl::<true>(f, b, base, wf, wb, r_a, r_b, nt_stores, use_fold2_const_prep())
+        } else {
+            fold2_two_and_msg_impl::<false>(f, b, base, wf, wb, r_a, r_b, nt_stores, use_fold2_const_prep())
+        }
+    }
 }
 
 /// `out[i] = z0[i] + r * (z0[i] + z1[i])` with `r` prepared once and `z0[i]`
