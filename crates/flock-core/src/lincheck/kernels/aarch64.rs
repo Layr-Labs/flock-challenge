@@ -658,405 +658,70 @@ unsafe fn process_tile_block16_neon_sha3_unscaled(
     tables_ptr: *const u8,
     out_ptr: *mut F128,
     n_blocks: usize,
+    reverse: bool,
 ) {
     use std::arch::asm;
     debug_assert!(n_blocks > 0);
     const TABLE_BYTES: usize = 256 * core::mem::size_of::<F128>();
-
-    asm!(
-        "2:",
-        "ldp q0, q1, [{acc}]",
-        "ldp q2, q3, [{acc}, #32]",
-        "ldp q4, q5, [{acc}, #64]",
-        "ldp q6, q7, [{acc}, #96]",
-        "ldp q16, q17, [{acc}, #128]",
-        "ldp q18, q19, [{acc}, #160]",
-        "ldp q20, q21, [{acc}, #192]",
-        "ldp q22, q23, [{acc}, #224]",
-        "ldp x11, x12, [{r0}], #16",
-        "ldp x13, x14, [{r1}], #16",
-        "ubfiz x16, x11, #4, #8",
-        "ubfiz x17, x13, #4, #8",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v0, v0, v24, v25",
-        "and x16, {mask}, x11, lsr #4",
-        "and x17, {mask}, x13, lsr #4",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v1, v1, v24, v25",
-        "and x16, {mask}, x11, lsr #12",
-        "and x17, {mask}, x13, lsr #12",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v2, v2, v24, v25",
-        "and x16, {mask}, x11, lsr #20",
-        "and x17, {mask}, x13, lsr #20",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v3, v3, v24, v25",
-        "and x16, {mask}, x11, lsr #28",
-        "and x17, {mask}, x13, lsr #28",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v4, v4, v24, v25",
-        "and x16, {mask}, x11, lsr #36",
-        "and x17, {mask}, x13, lsr #36",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v5, v5, v24, v25",
-        "and x16, {mask}, x11, lsr #44",
-        "and x17, {mask}, x13, lsr #44",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v6, v6, v24, v25",
-        "and x16, {mask}, x11, lsr #52",
-        "and x17, {mask}, x13, lsr #52",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v7, v7, v24, v25",
-        "ubfiz x16, x12, #4, #8",
-        "ubfiz x17, x14, #4, #8",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v16, v16, v24, v25",
-        "and x16, {mask}, x12, lsr #4",
-        "and x17, {mask}, x14, lsr #4",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v17, v17, v24, v25",
-        "and x16, {mask}, x12, lsr #12",
-        "and x17, {mask}, x14, lsr #12",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v18, v18, v24, v25",
-        "and x16, {mask}, x12, lsr #20",
-        "and x17, {mask}, x14, lsr #20",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v19, v19, v24, v25",
-        "and x16, {mask}, x12, lsr #28",
-        "and x17, {mask}, x14, lsr #28",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v20, v20, v24, v25",
-        "and x16, {mask}, x12, lsr #36",
-        "and x17, {mask}, x14, lsr #36",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v21, v21, v24, v25",
-        "and x16, {mask}, x12, lsr #44",
-        "and x17, {mask}, x14, lsr #44",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v22, v22, v24, v25",
-        "and x16, {mask}, x12, lsr #52",
-        "and x17, {mask}, x14, lsr #52",
-        "ldr q24, [{t0}, x16]",
-        "ldr q25, [{t1}, x17]",
-        "eor3.16b v23, v23, v24, v25",
-        "ldp x11, x12, [{r2}], #16",
-        "ldp x13, x14, [{r3}], #16",
-        "ubfiz x16, x11, #4, #8",
-        "ubfiz x17, x13, #4, #8",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v0, v0, v24, v25",
-        "and x16, {mask}, x11, lsr #4",
-        "and x17, {mask}, x13, lsr #4",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v1, v1, v24, v25",
-        "and x16, {mask}, x11, lsr #12",
-        "and x17, {mask}, x13, lsr #12",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v2, v2, v24, v25",
-        "and x16, {mask}, x11, lsr #20",
-        "and x17, {mask}, x13, lsr #20",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v3, v3, v24, v25",
-        "and x16, {mask}, x11, lsr #28",
-        "and x17, {mask}, x13, lsr #28",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v4, v4, v24, v25",
-        "and x16, {mask}, x11, lsr #36",
-        "and x17, {mask}, x13, lsr #36",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v5, v5, v24, v25",
-        "and x16, {mask}, x11, lsr #44",
-        "and x17, {mask}, x13, lsr #44",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v6, v6, v24, v25",
-        "and x16, {mask}, x11, lsr #52",
-        "and x17, {mask}, x13, lsr #52",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v7, v7, v24, v25",
-        "ubfiz x16, x12, #4, #8",
-        "ubfiz x17, x14, #4, #8",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v16, v16, v24, v25",
-        "and x16, {mask}, x12, lsr #4",
-        "and x17, {mask}, x14, lsr #4",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v17, v17, v24, v25",
-        "and x16, {mask}, x12, lsr #12",
-        "and x17, {mask}, x14, lsr #12",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v18, v18, v24, v25",
-        "and x16, {mask}, x12, lsr #20",
-        "and x17, {mask}, x14, lsr #20",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v19, v19, v24, v25",
-        "and x16, {mask}, x12, lsr #28",
-        "and x17, {mask}, x14, lsr #28",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v20, v20, v24, v25",
-        "and x16, {mask}, x12, lsr #36",
-        "and x17, {mask}, x14, lsr #36",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v21, v21, v24, v25",
-        "and x16, {mask}, x12, lsr #44",
-        "and x17, {mask}, x14, lsr #44",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v22, v22, v24, v25",
-        "and x16, {mask}, x12, lsr #52",
-        "and x17, {mask}, x14, lsr #52",
-        "ldr q24, [{t2}, x16]",
-        "ldr q25, [{t3}, x17]",
-        "eor3.16b v23, v23, v24, v25",
-        "ldp x11, x12, [{r4}], #16",
-        "ldp x13, x14, [{r5}], #16",
-        "ubfiz x16, x11, #4, #8",
-        "ubfiz x17, x13, #4, #8",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v0, v0, v24, v25",
-        "and x16, {mask}, x11, lsr #4",
-        "and x17, {mask}, x13, lsr #4",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v1, v1, v24, v25",
-        "and x16, {mask}, x11, lsr #12",
-        "and x17, {mask}, x13, lsr #12",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v2, v2, v24, v25",
-        "and x16, {mask}, x11, lsr #20",
-        "and x17, {mask}, x13, lsr #20",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v3, v3, v24, v25",
-        "and x16, {mask}, x11, lsr #28",
-        "and x17, {mask}, x13, lsr #28",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v4, v4, v24, v25",
-        "and x16, {mask}, x11, lsr #36",
-        "and x17, {mask}, x13, lsr #36",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v5, v5, v24, v25",
-        "and x16, {mask}, x11, lsr #44",
-        "and x17, {mask}, x13, lsr #44",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v6, v6, v24, v25",
-        "and x16, {mask}, x11, lsr #52",
-        "and x17, {mask}, x13, lsr #52",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v7, v7, v24, v25",
-        "ubfiz x16, x12, #4, #8",
-        "ubfiz x17, x14, #4, #8",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v16, v16, v24, v25",
-        "and x16, {mask}, x12, lsr #4",
-        "and x17, {mask}, x14, lsr #4",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v17, v17, v24, v25",
-        "and x16, {mask}, x12, lsr #12",
-        "and x17, {mask}, x14, lsr #12",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v18, v18, v24, v25",
-        "and x16, {mask}, x12, lsr #20",
-        "and x17, {mask}, x14, lsr #20",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v19, v19, v24, v25",
-        "and x16, {mask}, x12, lsr #28",
-        "and x17, {mask}, x14, lsr #28",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v20, v20, v24, v25",
-        "and x16, {mask}, x12, lsr #36",
-        "and x17, {mask}, x14, lsr #36",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v21, v21, v24, v25",
-        "and x16, {mask}, x12, lsr #44",
-        "and x17, {mask}, x14, lsr #44",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v22, v22, v24, v25",
-        "and x16, {mask}, x12, lsr #52",
-        "and x17, {mask}, x14, lsr #52",
-        "ldr q24, [{t4}, x16]",
-        "ldr q25, [{t5}, x17]",
-        "eor3.16b v23, v23, v24, v25",
-        "ldp x11, x12, [{r6}], #16",
-        "ldp x13, x14, [{r7}], #16",
-        "ubfiz x16, x11, #4, #8",
-        "ubfiz x17, x13, #4, #8",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v0, v0, v24, v25",
-        "and x16, {mask}, x11, lsr #4",
-        "and x17, {mask}, x13, lsr #4",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v1, v1, v24, v25",
-        "and x16, {mask}, x11, lsr #12",
-        "and x17, {mask}, x13, lsr #12",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v2, v2, v24, v25",
-        "and x16, {mask}, x11, lsr #20",
-        "and x17, {mask}, x13, lsr #20",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v3, v3, v24, v25",
-        "and x16, {mask}, x11, lsr #28",
-        "and x17, {mask}, x13, lsr #28",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v4, v4, v24, v25",
-        "and x16, {mask}, x11, lsr #36",
-        "and x17, {mask}, x13, lsr #36",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v5, v5, v24, v25",
-        "and x16, {mask}, x11, lsr #44",
-        "and x17, {mask}, x13, lsr #44",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v6, v6, v24, v25",
-        "and x16, {mask}, x11, lsr #52",
-        "and x17, {mask}, x13, lsr #52",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v7, v7, v24, v25",
-        "ubfiz x16, x12, #4, #8",
-        "ubfiz x17, x14, #4, #8",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v16, v16, v24, v25",
-        "and x16, {mask}, x12, lsr #4",
-        "and x17, {mask}, x14, lsr #4",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v17, v17, v24, v25",
-        "and x16, {mask}, x12, lsr #12",
-        "and x17, {mask}, x14, lsr #12",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v18, v18, v24, v25",
-        "and x16, {mask}, x12, lsr #20",
-        "and x17, {mask}, x14, lsr #20",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v19, v19, v24, v25",
-        "and x16, {mask}, x12, lsr #28",
-        "and x17, {mask}, x14, lsr #28",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v20, v20, v24, v25",
-        "and x16, {mask}, x12, lsr #36",
-        "and x17, {mask}, x14, lsr #36",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v21, v21, v24, v25",
-        "and x16, {mask}, x12, lsr #44",
-        "and x17, {mask}, x14, lsr #44",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v22, v22, v24, v25",
-        "and x16, {mask}, x12, lsr #52",
-        "and x17, {mask}, x14, lsr #52",
-        "ldr q24, [{t6}, x16]",
-        "ldr q25, [{t7}, x17]",
-        "eor3.16b v23, v23, v24, v25",
-        "stp q2, q3, [{acc}, #32]",
-        "stp q4, q5, [{acc}, #64]",
-        "stp q6, q7, [{acc}, #96]",
-        "stp q16, q17, [{acc}, #128]",
-        "stp q18, q19, [{acc}, #160]",
-        "stp q20, q21, [{acc}, #192]",
-        "stp q22, q23, [{acc}, #224]",
-        "stp q0, q1, [{acc}], #256",
-        "subs {n}, {n}, #1",
-        "b.ne 2b",
-
-        acc = inout(reg) out_ptr => _,
-        n = inout(reg) n_blocks => _,
-        r0 = inout(reg) row_ptr => _,
-        r1 = inout(reg) row_ptr.add(row_stride) => _,
-        r2 = inout(reg) row_ptr.add(2 * row_stride) => _,
-        r3 = inout(reg) row_ptr.add(3 * row_stride) => _,
-        r4 = inout(reg) row_ptr.add(4 * row_stride) => _,
-        r5 = inout(reg) row_ptr.add(5 * row_stride) => _,
-        r6 = inout(reg) row_ptr.add(6 * row_stride) => _,
-        r7 = inout(reg) row_ptr.add(7 * row_stride) => _,
-        t0 = in(reg) tables_ptr,
-        t1 = in(reg) tables_ptr.add(TABLE_BYTES),
-        t2 = in(reg) tables_ptr.add(2 * TABLE_BYTES),
-        t3 = in(reg) tables_ptr.add(3 * TABLE_BYTES),
-        t4 = in(reg) tables_ptr.add(4 * TABLE_BYTES),
-        t5 = in(reg) tables_ptr.add(5 * TABLE_BYTES),
-        t6 = in(reg) tables_ptr.add(6 * TABLE_BYTES),
-        t7 = in(reg) tables_ptr.add(7 * TABLE_BYTES),
-        mask = in(reg) 0xff0u64,
-        out("x11") _,
-        out("x12") _,
-        out("x13") _,
-        out("x14") _,
-        out("x16") _,
-        out("x17") _,
-        out("v0") _,
-        out("v1") _,
-        out("v2") _,
-        out("v3") _,
-        out("v4") _,
-        out("v5") _,
-        out("v6") _,
-        out("v7") _,
-        out("v16") _,
-        out("v17") _,
-        out("v18") _,
-        out("v19") _,
-        out("v20") _,
-        out("v21") _,
-        out("v22") _,
-        out("v23") _,
-        out("v24") _,
-        out("v25") _,
-        options(nostack),
-    );
+    let off = if reverse { (n_blocks - 1) * 16 } else { 0 };
+    let (r_start, a_start, rstep) = (row_ptr.add(off), out_ptr.add(off), if reverse { -16isize } else { 16 });
+    macro_rules! tile_block16_asm {
+        ($(($ra:literal, $rb:literal, $ta:literal, $tb:literal)),+ $(,)?) => {
+            asm!(
+                "2:",
+                "ldp q0, q1, [{acc}]\nldp q2, q3, [{acc}, #32]\nldp q4, q5, [{acc}, #64]\nldp q6, q7, [{acc}, #96]",
+                "ldp q16, q17, [{acc}, #128]\nldp q18, q19, [{acc}, #160]\nldp q20, q21, [{acc}, #192]\nldp q22, q23, [{acc}, #224]",
+                $(concat!(
+                    "ldp x11, x12, [", $ra, "]\nldp x13, x14, [", $rb, "]\n",
+                    "add ", $ra, ", ", $ra, ", {rstep}\nadd ", $rb, ", ", $rb, ", {rstep}\n",
+                    "prfm pldl1keep, [", $ra, ", {rstep}, lsl #3]\nprfm pldl1keep, [", $rb, ", {rstep}, lsl #3]\n",
+                    "ubfiz x16, x11, #4, #8\nubfiz x17, x13, #4, #8\nldr q24, [", $ta, ", x16]\nldr q25, [", $tb, ", x17]\n",
+                    "and x16, {mask}, x11, lsr #4\nand x17, {mask}, x13, lsr #4\nldr q26, [", $ta, ", x16]\nldr q27, [", $tb, ", x17]\n",
+                    "eor3.16b v0, v0, v24, v25\neor3.16b v1, v1, v26, v27\n",
+                    "and x16, {mask}, x11, lsr #12\nand x17, {mask}, x13, lsr #12\nldr q24, [", $ta, ", x16]\nldr q25, [", $tb, ", x17]\n",
+                    "and x16, {mask}, x11, lsr #20\nand x17, {mask}, x13, lsr #20\nldr q26, [", $ta, ", x16]\nldr q27, [", $tb, ", x17]\n",
+                    "eor3.16b v2, v2, v24, v25\neor3.16b v3, v3, v26, v27\n",
+                    "and x16, {mask}, x11, lsr #28\nand x17, {mask}, x13, lsr #28\nldr q24, [", $ta, ", x16]\nldr q25, [", $tb, ", x17]\n",
+                    "and x16, {mask}, x11, lsr #36\nand x17, {mask}, x13, lsr #36\nldr q26, [", $ta, ", x16]\nldr q27, [", $tb, ", x17]\n",
+                    "eor3.16b v4, v4, v24, v25\neor3.16b v5, v5, v26, v27\n",
+                    "and x16, {mask}, x11, lsr #44\nand x17, {mask}, x13, lsr #44\nldr q24, [", $ta, ", x16]\nldr q25, [", $tb, ", x17]\n",
+                    "and x16, {mask}, x11, lsr #52\nand x17, {mask}, x13, lsr #52\nldr q26, [", $ta, ", x16]\nldr q27, [", $tb, ", x17]\n",
+                    "eor3.16b v6, v6, v24, v25\neor3.16b v7, v7, v26, v27\n",
+                    "ubfiz x16, x12, #4, #8\nubfiz x17, x14, #4, #8\nldr q24, [", $ta, ", x16]\nldr q25, [", $tb, ", x17]\n",
+                    "and x16, {mask}, x12, lsr #4\nand x17, {mask}, x14, lsr #4\nldr q26, [", $ta, ", x16]\nldr q27, [", $tb, ", x17]\n",
+                    "eor3.16b v16, v16, v24, v25\neor3.16b v17, v17, v26, v27\n",
+                    "and x16, {mask}, x12, lsr #12\nand x17, {mask}, x14, lsr #12\nldr q24, [", $ta, ", x16]\nldr q25, [", $tb, ", x17]\n",
+                    "and x16, {mask}, x12, lsr #20\nand x17, {mask}, x14, lsr #20\nldr q26, [", $ta, ", x16]\nldr q27, [", $tb, ", x17]\n",
+                    "eor3.16b v18, v18, v24, v25\neor3.16b v19, v19, v26, v27\n",
+                    "and x16, {mask}, x12, lsr #28\nand x17, {mask}, x14, lsr #28\nldr q24, [", $ta, ", x16]\nldr q25, [", $tb, ", x17]\n",
+                    "and x16, {mask}, x12, lsr #36\nand x17, {mask}, x14, lsr #36\nldr q26, [", $ta, ", x16]\nldr q27, [", $tb, ", x17]\n",
+                    "eor3.16b v20, v20, v24, v25\neor3.16b v21, v21, v26, v27\n",
+                    "and x16, {mask}, x12, lsr #44\nand x17, {mask}, x14, lsr #44\nldr q24, [", $ta, ", x16]\nldr q25, [", $tb, ", x17]\n",
+                    "and x16, {mask}, x12, lsr #52\nand x17, {mask}, x14, lsr #52\nldr q26, [", $ta, ", x16]\nldr q27, [", $tb, ", x17]\n",
+                    "eor3.16b v22, v22, v24, v25\neor3.16b v23, v23, v26, v27\n",
+                ),)+
+                "stp q2, q3, [{acc}, #32]\nstp q4, q5, [{acc}, #64]\nstp q6, q7, [{acc}, #96]\nstp q16, q17, [{acc}, #128]",
+                "stp q18, q19, [{acc}, #160]\nstp q20, q21, [{acc}, #192]\nstp q22, q23, [{acc}, #224]\nstp q0, q1, [{acc}]",
+                "add {acc}, {acc}, {rstep}, lsl #4\nsubs {n}, {n}, #1\nb.ne 2b",
+                acc = inout(reg) a_start => _, n = inout(reg) n_blocks => _, rstep = in(reg) rstep,
+                r0 = inout(reg) r_start => _, r1 = inout(reg) r_start.add(row_stride) => _,
+                r2 = inout(reg) r_start.add(2 * row_stride) => _, r3 = inout(reg) r_start.add(3 * row_stride) => _,
+                r4 = inout(reg) r_start.add(4 * row_stride) => _, r5 = inout(reg) r_start.add(5 * row_stride) => _,
+                r6 = inout(reg) r_start.add(6 * row_stride) => _, r7 = inout(reg) r_start.add(7 * row_stride) => _,
+                t0 = in(reg) tables_ptr, t1 = in(reg) tables_ptr.add(TABLE_BYTES),
+                t2 = in(reg) tables_ptr.add(2 * TABLE_BYTES), t3 = in(reg) tables_ptr.add(3 * TABLE_BYTES),
+                t4 = in(reg) tables_ptr.add(4 * TABLE_BYTES), t5 = in(reg) tables_ptr.add(5 * TABLE_BYTES),
+                t6 = in(reg) tables_ptr.add(6 * TABLE_BYTES), t7 = in(reg) tables_ptr.add(7 * TABLE_BYTES),
+                mask = in(reg) 0xff0u64,
+                out("x11") _, out("x12") _, out("x13") _, out("x14") _, out("x16") _, out("x17") _,
+                out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+                out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+                options(nostack),
+            );
+        };
+    }
+    tile_block16_asm!(("{r0}", "{r1}", "{t0}", "{t1}"), ("{r2}", "{r3}", "{t2}", "{t3}"), ("{r4}", "{r5}", "{t4}", "{t5}"), ("{r6}", "{r7}", "{t6}", "{t7}"));
 }
 
 /// Whole-tile Block16 drain (default on). `FLOCK_NO_LC_TILE_ROWS=1` (exact
@@ -1125,44 +790,24 @@ unsafe fn build_sum_table_regs(eq8: *const F128, table: *mut F128) {
         let l13 = x(e3, l5);
         let l14 = x(e3, l6);
         let l15 = x(e3, l7);
-        let st = |i: usize, v: uint64x2_t| vst1q_u64(table.add(i).cast::<u64>(), v);
-        // Row 0: the low sums themselves.
-        st(0, vdupq_n_u64(0));
-        st(1, l1);
-        st(2, l2);
-        st(3, l3);
-        st(4, l4);
-        st(5, l5);
-        st(6, l6);
-        st(7, l7);
-        st(8, l8);
-        st(9, l9);
-        st(10, l10);
-        st(11, l11);
-        st(12, l12);
-        st(13, l13);
-        st(14, l14);
-        st(15, l15);
+        macro_rules! stp_off {
+            ($p:expr, $off:literal, $a:expr, $b:expr) => {
+                std::arch::asm!(concat!("stp {a:q}, {b:q}, [{p}, #", $off, "]"),
+                    p = in(reg) $p, a = in(vreg) $a, b = in(vreg) $b, options(nostack, preserves_flags));
+            };
+        }
+        // Row 0: the low sums themselves (paired 256-bit stores).
+        stp_off!(table, 0, vdupq_n_u64(0), l1); stp_off!(table, 32, l2, l3);
+        stp_off!(table, 64, l4, l5); stp_off!(table, 96, l6, l7);
+        stp_off!(table, 128, l8, l9); stp_off!(table, 160, l10, l11);
+        stp_off!(table, 192, l12, l13); stp_off!(table, 224, l14, l15);
         macro_rules! row {
             ($g:expr, $h:expr) => {{
-                let h = $h;
-                let base = 16 * $g;
-                st(base, h);
-                st(base + 1, x(l1, h));
-                st(base + 2, x(l2, h));
-                st(base + 3, x(l3, h));
-                st(base + 4, x(l4, h));
-                st(base + 5, x(l5, h));
-                st(base + 6, x(l6, h));
-                st(base + 7, x(l7, h));
-                st(base + 8, x(l8, h));
-                st(base + 9, x(l9, h));
-                st(base + 10, x(l10, h));
-                st(base + 11, x(l11, h));
-                st(base + 12, x(l12, h));
-                st(base + 13, x(l13, h));
-                st(base + 14, x(l14, h));
-                st(base + 15, x(l15, h));
+                let (h, p) = ($h, table.add(16 * $g));
+                stp_off!(p, 0, h, x(l1, h)); stp_off!(p, 32, x(l2, h), x(l3, h));
+                stp_off!(p, 64, x(l4, h), x(l5, h)); stp_off!(p, 96, x(l6, h), x(l7, h));
+                stp_off!(p, 128, x(l8, h), x(l9, h)); stp_off!(p, 160, x(l10, h), x(l11, h));
+                stp_off!(p, 192, x(l12, h), x(l13, h)); stp_off!(p, 224, x(l14, h), x(l15, h));
             }};
         }
         // Gray-code order of the high nibble: 1, 3, 2, 6, 7, 5, 4, 12, 13,
@@ -1598,6 +1243,13 @@ pub(crate) fn partial_fold_packed_z_neon_oblock_padded_range(
 }
 
 #[cfg(target_arch = "aarch64")]
+fn lc_block16_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none());
+    *ON
+}
+
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
     z_packed: &[u8],
     m: usize,
@@ -1614,7 +1266,7 @@ pub(crate) fn oblock_padded_tiled<const TILE_T: usize>(
         // (`lincheck::RootStripe`; 11_249 also drops the fixed block_len/flags
         // input columns).
         && (useful_bits == 15_409 || useful_bits == 11_313 || useful_bits == 11_249)
-        && std::env::var_os("FLOCK_NO_LINCHECK_BLOCK16").is_none();
+        && lc_block16_enabled();
     oblock_padded_tiled_impl::<TILE_T>(
         z_packed,
         m,
@@ -1724,16 +1376,17 @@ fn oblock_padded_tiled_impl<const TILE_T: usize>(
             if block16 {
                 let n16 = useful / 16;
                 if tile_rows && n16 > 0 {
-                    // SAFETY: TILE_T == 8 (the block16 gate), so `tables_ptr`
-                    // holds eight complete tables; stripe rows `0..8` of this
-                    // tile are `k`-byte rows at `z_base + s * k` and
-                    // `16 * n16 <= useful <= k`; `partial` holds `useful`
-                    // accumulators. Same blocks, rows, tables and
-                    // accumulators as the per-block calls below.
-                    unsafe {
-                        process_tile_block16_neon_sha3_unscaled(z_base, k, tables_ptr, partial, n16);
+                    // Alternating forward/reverse (snake) tile scan keeps ~96 KiB of `partial` L1D-hot.
+                    let reverse = (tile & 1) != 0;
+                    if reverse {
+                        let mut tbs = 16 * n16;
+                        while tbs < useful {
+                            unsafe { process_block_neon_single::<TILE_T>(z_base, k, tbs, tables_ptr, partial.add(tbs)) };
+                            tbs += BLOCK_K;
+                        }
                     }
-                    bs = 16 * n16;
+                    unsafe { process_tile_block16_neon_sha3_unscaled(z_base, k, tables_ptr, partial, n16, reverse) };
+                    bs = if reverse { useful } else { 16 * n16 };
                 }
                 while bs + 16 <= useful {
                     unsafe {
