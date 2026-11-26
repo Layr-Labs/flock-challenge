@@ -1749,6 +1749,19 @@ pub(super) unsafe fn butterfly_fused_2layer_low_lazy_zero_tail_blocks<F>(
     }
 }
 
+/// Kill switch for 2-lane paired `ldp`/`stp` in the remaining single-lane
+/// AArch64 NTT kernels (`butterfly_fused_2layer_low_inner_rows`,
+/// `butterfly_block`, and `butterfly_row_pair`). Setting
+/// `FLOCK_NO_NTT_PAIR_2LANE` to any value restores the 1-lane loops. Read once
+/// per process.
+pub const ENV_NO_NTT_PAIR_2LANE: &str = "FLOCK_NO_NTT_PAIR_2LANE";
+
+#[inline]
+fn use_ntt_pair_2lane() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_NTT_PAIR_2LANE).is_none())
+}
+
 ///
 /// # Safety
 #[target_feature(enable = "aes")]
@@ -1773,6 +1786,44 @@ pub(super) unsafe fn butterfly_fused_2layer_low_inner_rows(
         let (top_half, bot_half) = block.split_at_mut(2 * stride);
         let (q1, q2) = top_half.split_at_mut(stride);
         let (q3, q4) = bot_half.split_at_mut(stride);
+        if use_ntt_pair_2lane() {
+            let [mut pa, mut pb, mut pc, mut pd] = row_ptrs([q1, q2, q3, q4]);
+            let mut pairs = stride >> 1;
+            while pairs != 0 {
+                let (xa0, xa1) = load_pair_q(pa);
+                let (xb0, xb1) = load_pair_q(pb);
+                let (xc0, xc1) = load_pair_q(pc);
+                let (xd0, xd1) = load_pair_q(pd);
+                let (na0, nc0, p0) = const_lazy_zero(xa0, xc0, to);
+                let (nb0, nd0) = const_fold_zero(xb0, xd0, to);
+                let (fa0, fb0) = butterfly_low_fold_q(na0, nb0, ta, p0);
+                let (fc0, fd0) = butterfly_low_fold_q(nc0, nd0, tb, p0);
+                let (na1, nc1, p1) = const_lazy_zero(xa1, xc1, to);
+                let (nb1, nd1) = const_fold_zero(xb1, xd1, to);
+                let (fa1, fb1) = butterfly_low_fold_q(na1, nb1, ta, p1);
+                let (fc1, fd1) = butterfly_low_fold_q(nc1, nd1, tb, p1);
+                store_pair_q_adv(&mut pa, fa0, fa1);
+                store_pair_q_adv(&mut pb, fb0, fb1);
+                store_pair_q_adv(&mut pc, fc0, fc1);
+                store_pair_q_adv(&mut pd, fd0, fd1);
+                pairs -= 1;
+            }
+            if stride & 1 != 0 {
+                let xa = vld1q_u64(pa.cast::<u64>());
+                let xb = vld1q_u64(pb.cast::<u64>());
+                let xc = vld1q_u64(pc.cast::<u64>());
+                let xd = vld1q_u64(pd.cast::<u64>());
+                let (na, nc, p) = const_lazy_zero(xa, xc, to);
+                let (nb, nd) = const_fold_zero(xb, xd, to);
+                let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
+                let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
+                vst1q_u64(pa.cast::<u64>(), fa);
+                vst1q_u64(pb.cast::<u64>(), fb);
+                vst1q_u64(pc.cast::<u64>(), fc);
+                vst1q_u64(pd.cast::<u64>(), fd);
+            }
+            return;
+        }
         for (((a, b), c), d) in q1
             .iter_mut()
             .zip(q2.iter_mut())
@@ -1812,12 +1863,36 @@ pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: us
             let t = vld1q_u64((&raw const twiddle).cast::<u64>());
             let prep = three_coeffs(t);
             let base = chunk.as_mut_ptr();
-            for idx0 in 0..half {
-                let pu = base.add(idx0).cast::<u64>();
-                let pv = base.add(idx0 + half).cast::<u64>();
-                let (nu, nv) = three_fold_zero(vld1q_u64(pu), vld1q_u64(pv), prep);
-                vst1q_u64(pu, nu);
-                vst1q_u64(pv, nv);
+            if use_ntt_pair_2lane() {
+                let mut pu = base;
+                let mut pv = base.add(half);
+                let mut pairs = half >> 1;
+                while pairs != 0 {
+                    let (u0, u1) = load_pair_q(pu);
+                    let (v0, v1) = load_pair_q(pv);
+                    let (nu0, nv0) = three_fold_zero(u0, v0, prep);
+                    let (nu1, nv1) = three_fold_zero(u1, v1, prep);
+                    store_pair_q_adv(&mut pu, nu0, nu1);
+                    store_pair_q_adv(&mut pv, nv0, nv1);
+                    pairs -= 1;
+                }
+                if half & 1 != 0 {
+                    let (nu, nv) = three_fold_zero(
+                        vld1q_u64(pu.cast::<u64>()),
+                        vld1q_u64(pv.cast::<u64>()),
+                        prep,
+                    );
+                    vst1q_u64(pu.cast::<u64>(), nu);
+                    vst1q_u64(pv.cast::<u64>(), nv);
+                }
+            } else {
+                for idx0 in 0..half {
+                    let pu = base.add(idx0).cast::<u64>();
+                    let pv = base.add(idx0 + half).cast::<u64>();
+                    let (nu, nv) = three_fold_zero(vld1q_u64(pu), vld1q_u64(pv), prep);
+                    vst1q_u64(pu, nu);
+                    vst1q_u64(pv, nv);
+                }
             }
         }
         return;
@@ -1889,8 +1964,34 @@ pub(super) unsafe fn butterfly_row_pair(top: &mut [F128], bot: &mut [F128], twid
     unsafe {
         let t = vld1q_u64((&raw const twiddle).cast::<u64>());
         let (t_lo, t_mid) = three_coeffs(t);
-        let pt = top.as_mut_ptr();
-        let pb = bot.as_mut_ptr();
+        let mut pt = top.as_mut_ptr();
+        let mut pb = bot.as_mut_ptr();
+        if use_ntt_pair_2lane() {
+            let mut pairs = lanes >> 1;
+            while pairs != 0 {
+                let (u0, u1) = load_pair_q(pt);
+                let (v0, v1) = load_pair_q(pb);
+                let l0 = fused_pmull_hi_acc(fused_pmull_lo_acc(u0, v0, t_lo), v0, t_lo);
+                let m0 = cross_sum_q(v0, t_mid);
+                let nu0 = fold_x64_into(l0, m0);
+                let l1 = fused_pmull_hi_acc(fused_pmull_lo_acc(u1, v1, t_lo), v1, t_lo);
+                let m1 = cross_sum_q(v1, t_mid);
+                let nu1 = fold_x64_into(l1, m1);
+                store_pair_q_adv(&mut pt, nu0, nu1);
+                store_pair_q_adv(&mut pb, veorq_u64(v0, nu0), veorq_u64(v1, nu1));
+                pairs -= 1;
+            }
+            if lanes & 1 != 0 {
+                let u = vld1q_u64(pt.cast::<u64>());
+                let v = vld1q_u64(pb.cast::<u64>());
+                let l = fused_pmull_hi_acc(fused_pmull_lo_acc(u, v, t_lo), v, t_lo);
+                let m = cross_sum_q(v, t_mid);
+                let nu = fold_x64_into(l, m);
+                vst1q_u64(pt.cast::<u64>(), nu);
+                vst1q_u64(pb.cast::<u64>(), veorq_u64(v, nu));
+            }
+            return;
+        }
         for lane in 0..lanes {
             let pu = pt.add(lane).cast::<u64>();
             let pv = pb.add(lane).cast::<u64>();

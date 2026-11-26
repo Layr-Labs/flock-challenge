@@ -1458,11 +1458,74 @@ unsafe fn xor3_u8(
     unsafe { core::arch::aarch64::veorq_u8(a, core::arch::aarch64::veorq_u8(b, c)) }
 }
 
-/// NEON 64-byte bit-transpose. Two-stage:
-///   1. `vqtbl4q_u8` reorders the 64 input bytes so each 8-byte group within
-///      the output is one byte-chunk's worth of `x_small=0..8` bytes.
-///   2. Three rounds of bit-swap at distances 7, 14, 28 across `uint64x2_t`
-///      lanes do the actual 8×8 bit transpose.
+/// Kill switch for the 28-op row-form NEON 64-byte bit-transpose
+/// (`crate::bits::transpose_8_row_pairs_to_regs` + paired `ldp`/`stp`) inside
+/// [`bit_transpose_64bytes_neon`] and [`bit_transpose_64bytes_neon_regs`].
+/// Setting `FLOCK_NO_BT64_ROW_FORM` to any value restores the 64-op delta-swap
+/// path. Read once per process.
+#[cfg(target_arch = "aarch64")]
+pub const ENV_NO_BT64_ROW_FORM: &str = "FLOCK_NO_BT64_ROW_FORM";
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn bt64_row_form_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    #[cold]
+    #[inline(never)]
+    fn init() -> bool {
+        let on = std::env::var_os(ENV_NO_BT64_ROW_FORM).is_none();
+        STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+        on
+    }
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => init(),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bt_load_pair_u8(
+    p: *const u8,
+) -> (core::arch::aarch64::uint8x16_t, core::arch::aarch64::uint8x16_t) {
+    let a: core::arch::aarch64::uint8x16_t;
+    let b: core::arch::aarch64::uint8x16_t;
+    unsafe {
+        core::arch::asm!(
+            "ldp {a:q}, {b:q}, [{p}]",
+            p = in(reg) p,
+            a = lateout(vreg) a,
+            b = lateout(vreg) b,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    (a, b)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bt_store_pair_u8(
+    p: *mut u8,
+    a: core::arch::aarch64::uint8x16_t,
+    b: core::arch::aarch64::uint8x16_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a:q}, {b:q}, [{p}]",
+            p = in(reg) p,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// NEON 64-byte bit-transpose. Defaults to the 28-op row-form kernel
+/// (`crate::bits::transpose_8_row_pairs_to_regs`) with paired `ldp`/`stp`,
+/// falling back to the 64-op `vqtbl4q_u8` + delta-swap path when
+/// [`ENV_NO_BT64_ROW_FORM`] is set.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [u8; 64]) {
@@ -1470,12 +1533,20 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon(input: &[u8; 64], output: &mut [
 
     unsafe {
         let in_ptr = input.as_ptr();
+        let out_ptr = output.as_mut_ptr();
+        if bt64_row_form_enabled() {
+            let (v0, v1) = bt_load_pair_u8(in_ptr);
+            let (v2, v3) = bt_load_pair_u8(in_ptr.add(32));
+            let [y0, y1, y2, y3] = crate::bits::transpose_8_row_pairs_to_regs(v0, v1, v2, v3);
+            bt_store_pair_u8(out_ptr, y0, y1);
+            bt_store_pair_u8(out_ptr.add(32), y2, y3);
+            return;
+        }
         let v0 = vld1q_u8(in_ptr);
         let v1 = vld1q_u8(in_ptr.add(16));
         let v2 = vld1q_u8(in_ptr.add(32));
         let v3 = vld1q_u8(in_ptr.add(48));
         let [y0, y1, y2, y3] = bit_transpose_64bytes_neon_regs(v0, v1, v2, v3);
-        let out_ptr = output.as_mut_ptr();
         vst1q_u8(out_ptr, vreinterpretq_u8_u64(y0));
         vst1q_u8(out_ptr.add(16), vreinterpretq_u8_u64(y1));
         vst1q_u8(out_ptr.add(32), vreinterpretq_u8_u64(y2));
@@ -1497,6 +1568,15 @@ pub(crate) unsafe fn bit_transpose_64bytes_neon_regs(
     use core::arch::aarch64::*;
 
     unsafe {
+        if bt64_row_form_enabled() {
+            let [y0, y1, y2, y3] = crate::bits::transpose_8_row_pairs_to_regs(v0, v1, v2, v3);
+            return [
+                vreinterpretq_u64_u8(y0),
+                vreinterpretq_u64_u8(y1),
+                vreinterpretq_u64_u8(y2),
+                vreinterpretq_u64_u8(y3),
+            ];
+        }
         let table = uint8x16x4_t(v0, v1, v2, v3);
 
         // vqtbl4q indexes that bring bytes belonging to byte-chunk b ∈ 0..8
