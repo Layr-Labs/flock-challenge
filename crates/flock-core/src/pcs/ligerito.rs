@@ -1822,6 +1822,52 @@ fn eval_sk_at_vks_uncached(log_n: usize) -> Vec<F128> {
 ///
 /// `sks_at_x` is a scratch buffer of length `≥ log_n`. `sks_vks` is from
 /// [`eval_sk_at_vks`]; `inv_sks_vks[k] = sks_vks[k].inv()` precomputed once
+/// Kill switch: setting `FLOCK_NO_SCALED_BASIS_PREP` reverts the Ligerito
+/// novel-basis doubling and accumulator merge helpers
+/// (`evaluate_scaled_basis_inplace`, `evaluate_scaled_basis_add_final_direct`,
+/// `evaluate_scaled_basis_low_domain_lower`, and
+/// `evaluate_scaled_basis_add_low_domain_truncated`) from prepared NEON
+/// `const_prep` + `mul_const_prep` / `mul_const_prep_xor` + paired `ldp`/`stp`
+/// back to the incumbent scalar loops. Read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+pub const ENV_NO_SCALED_BASIS_PREP: &str = "FLOCK_NO_SCALED_BASIS_PREP";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn scaled_basis_prep_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_SCALED_BASIS_PREP).is_none())
+}
+
+/// Fill `buf[cl..2*cl]` with `factor * buf[0..cl]` using prepared constant
+/// multiplication and paired `ldp`/`stp` when `cl >= 2`.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn scale_double_prefix_prep(buf: &mut [F128], cl: usize, factor: F128) {
+    debug_assert!(buf.len() >= 2 * cl);
+    if cl == 1 {
+        buf[1] = factor * buf[0];
+        return;
+    }
+    debug_assert!(cl.is_multiple_of(2));
+    use core::arch::aarch64::uint64x2_t;
+    use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep};
+    // SAFETY: AES and little-endian F128 layout match uint64x2_t; `cl` is a
+    // power-of-two >= 2 and `2 * cl <= buf.len()`.
+    unsafe {
+        let pf = const_prep(core::mem::transmute::<F128, uint64x2_t>(factor));
+        let ptr = buf.as_mut_ptr();
+        let mut i = 0;
+        while i < cl {
+            let (x0, x1) = ligerito_load_pair_q(ptr.add(i));
+            let y0 = mul_const_prep(pf, x0);
+            let y1 = mul_const_prep(pf, x1);
+            ligerito_store_pair_q(ptr.add(i + cl), y0, y1);
+            i += 2;
+        }
+    }
+}
+
 /// across many queries.
 fn evaluate_scaled_basis_inplace(
     sks_at_x: &mut [F128],
@@ -1848,6 +1894,13 @@ fn evaluate_scaled_basis_inplace(
     }
 
     basis[0] = alpha;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if scaled_basis_prep_enabled() {
+        for k in 0..log_n {
+            scale_double_prefix_prep(basis, 1usize << k, sks_at_x[k]);
+        }
+        return;
+    }
     for k in 0..log_n {
         let s_at_x = sks_at_x[k];
         let current_len = 1 << k;
@@ -1892,6 +1945,45 @@ fn evaluate_scaled_basis_add_final_direct(
     }
 
     lower_basis[0] = alpha;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if scaled_basis_prep_enabled() {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64};
+        use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep_xor};
+        for k in 0..log_n - 1 {
+            scale_double_prefix_prep(lower_basis, 1usize << k, sks_at_x[k]);
+        }
+        let final_s_at_x = sks_at_x[log_n - 1];
+        // SAFETY: `lower_basis.len() == half` and `accum_basis.len() == 2 * half`;
+        // `accum_low` and `accum_high` are disjoint halves of `accum_basis`.
+        unsafe {
+            let pfs = const_prep(core::mem::transmute::<F128, uint64x2_t>(final_s_at_x));
+            let lp = lower_basis.as_ptr();
+            let al = accum_basis.as_mut_ptr();
+            let ah = al.add(half);
+            let mut i = 0;
+            while i + 2 <= half {
+                let (v0, v1) = ligerito_load_pair_q(lp.add(i));
+                let (l0, l1) = ligerito_load_pair_q(al.add(i));
+                let (h0, h1) = ligerito_load_pair_q(ah.add(i));
+                ligerito_store_pair_q(al.add(i), veorq_u64(l0, v0), veorq_u64(l1, v1));
+                ligerito_store_pair_q(
+                    ah.add(i),
+                    mul_const_prep_xor(pfs, v0, h0),
+                    mul_const_prep_xor(pfs, v1, h1),
+                );
+                i += 2;
+            }
+            if i < half {
+                let v0 = vld1q_u64(lp.add(i).cast::<u64>());
+                let l0 = vld1q_u64(al.add(i).cast::<u64>());
+                let h0 = vld1q_u64(ah.add(i).cast::<u64>());
+                vst1q_u64(al.add(i).cast::<u64>(), veorq_u64(l0, v0));
+                vst1q_u64(ah.add(i).cast::<u64>(), mul_const_prep_xor(pfs, v0, h0));
+            }
+        }
+        return;
+    }
+
     for k in 0..log_n - 1 {
         let s_at_x = sks_at_x[k];
         let current_len = 1 << k;
@@ -1965,6 +2057,13 @@ fn evaluate_scaled_basis_low_domain_lower(
     }
 
     lower_basis[0] = alpha;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if scaled_basis_prep_enabled() {
+        for k in 0..lower_log {
+            scale_double_prefix_prep(lower_basis, 1usize << k, sks_at_x[k]);
+        }
+        return;
+    }
     for k in 0..lower_log {
         let factor = sks_at_x[k];
         let current_len = 1usize << k;
@@ -2040,6 +2139,35 @@ fn evaluate_scaled_basis_add_low_domain_truncated(
         active_len,
         alpha,
     );
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if scaled_basis_prep_enabled() {
+        use core::arch::aarch64::{veorq_u64, vld1q_u64, vst1q_u64};
+        // SAFETY: `2 * lower_len == active_len <= accum_basis.len()` and
+        // `lower_len <= lower_basis.len()`; the two accumulator halves are disjoint.
+        unsafe {
+            let lp = lower_basis.as_ptr();
+            let al = accum_basis.as_mut_ptr();
+            let ah = al.add(lower_len);
+            let mut i = 0;
+            while i + 2 <= lower_len {
+                let (v0, v1) = ligerito_load_pair_q(lp.add(i));
+                let (l0, l1) = ligerito_load_pair_q(al.add(i));
+                let (h0, h1) = ligerito_load_pair_q(ah.add(i));
+                ligerito_store_pair_q(al.add(i), veorq_u64(l0, v0), veorq_u64(l1, v1));
+                ligerito_store_pair_q(ah.add(i), veorq_u64(h0, v0), veorq_u64(h1, v1));
+                i += 2;
+            }
+            if i < lower_len {
+                let v0 = vld1q_u64(lp.add(i).cast::<u64>());
+                let l0 = vld1q_u64(al.add(i).cast::<u64>());
+                let h0 = vld1q_u64(ah.add(i).cast::<u64>());
+                vst1q_u64(al.add(i).cast::<u64>(), veorq_u64(l0, v0));
+                vst1q_u64(ah.add(i).cast::<u64>(), veorq_u64(h0, v0));
+            }
+        }
+        return;
+    }
 
     // The upper half starts at the dynamic `lower_len`, not at the full
     // accumulator's `n / 2`. Everything at `active_len..n` stays untouched.
@@ -3015,12 +3143,26 @@ pub(crate) fn induce_sumcheck_poly(
     // deletes the zero-seeded output buffer and its redundant first XOR-add
     // pass), then fold the rest in. Zero-query calls keep the zeroed-output
     // behavior of the original.
-    let mut iter = partials.into_iter().filter(|(lb, _)| !lb.is_empty());
-    let (mut basis_poly, mut enforced_sum) = match iter.next() {
-        Some(first) => first,
-        None => return (vec![F128::ZERO; n], F128::ZERO),
-    };
-    for (lb, ls) in iter {
+    let mut non_empty: Vec<(Vec<F128>, F128)> =
+        partials.into_iter().filter(|(lb, _)| !lb.is_empty()).collect();
+    if non_empty.is_empty() {
+        return (vec![F128::ZERO; n], F128::ZERO);
+    }
+    let (mut basis_poly, mut enforced_sum) = non_empty.swap_remove(0);
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "aes",
+        target_feature = "sha3",
+        target_endian = "little"
+    ))]
+    if !non_empty.is_empty() && ind_reduce_eor3_enabled() {
+        for &(_, ls) in &non_empty {
+            enforced_sum += ls;
+        }
+        reduce_induce_partials_eor3(&mut basis_poly, &non_empty);
+        return (basis_poly, enforced_sum);
+    }
+    for (lb, ls) in non_empty {
         for (acc, &v) in basis_poly.iter_mut().zip(lb.iter()) {
             *acc += v;
         }
@@ -3028,6 +3170,118 @@ pub(crate) fn induce_sumcheck_poly(
     }
 
     (basis_poly, enforced_sum)
+}
+
+/// Kill switch for the 4-stream `eor3.16b` (`ldp`/`stp`) partial-basis XOR
+/// reducer in [`induce_sumcheck_poly`] (`FLOCK_NO_IND_REDUCE_EOR3`, any value
+/// restores the sequential scalar loop). Read once per process.
+pub const ENV_NO_IND_REDUCE_EOR3: &str = "FLOCK_NO_IND_REDUCE_EOR3";
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "aes",
+    target_feature = "sha3",
+    target_endian = "little"
+))]
+#[inline(always)]
+fn ind_reduce_eor3_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_IND_REDUCE_EOR3).is_none())
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "aes",
+    target_feature = "sha3",
+    target_endian = "little"
+))]
+fn reduce_induce_partials_eor3(basis_poly: &mut [F128], rest: &[(Vec<F128>, F128)]) {
+    use core::arch::aarch64::{veor3q_u64, veorq_u64};
+    let n = basis_poly.len();
+    let vec_n = n & !3usize;
+    let dst = basis_poly.as_mut_ptr();
+    let mut k = 0usize;
+    unsafe {
+        while k + 3 < rest.len() {
+            debug_assert_eq!(rest[k].0.len(), n);
+            debug_assert_eq!(rest[k + 1].0.len(), n);
+            debug_assert_eq!(rest[k + 2].0.len(), n);
+            debug_assert_eq!(rest[k + 3].0.len(), n);
+            let s0 = rest[k].0.as_ptr();
+            let s1 = rest[k + 1].0.as_ptr();
+            let s2 = rest[k + 2].0.as_ptr();
+            let s3 = rest[k + 3].0.as_ptr();
+            let mut i = 0usize;
+            while i < vec_n {
+                let d = dst.add(i);
+                let (d0, d1) = ligerito_load_pair_q(d);
+                let (a0, a1) = ligerito_load_pair_q(s0.add(i));
+                let (b0, b1) = ligerito_load_pair_q(s1.add(i));
+                let (c0, c1) = ligerito_load_pair_q(s2.add(i));
+                let (e0, e1) = ligerito_load_pair_q(s3.add(i));
+                let r0 = veor3q_u64(veor3q_u64(d0, a0, b0), c0, e0);
+                let r1 = veor3q_u64(veor3q_u64(d1, a1, b1), c1, e1);
+                let (d2, d3) = ligerito_load_pair_q(d.add(2));
+                let (a2, a3) = ligerito_load_pair_q(s0.add(i + 2));
+                let (b2, b3) = ligerito_load_pair_q(s1.add(i + 2));
+                let (c2, c3) = ligerito_load_pair_q(s2.add(i + 2));
+                let (e2, e3) = ligerito_load_pair_q(s3.add(i + 2));
+                let r2 = veor3q_u64(veor3q_u64(d2, a2, b2), c2, e2);
+                let r3 = veor3q_u64(veor3q_u64(d3, a3, b3), c3, e3);
+                ligerito_store_pair_q(d, r0, r1);
+                ligerito_store_pair_q(d.add(2), r2, r3);
+                i += 4;
+            }
+            while i < n {
+                *dst.add(i) += *s0.add(i) + *s1.add(i) + *s2.add(i) + *s3.add(i);
+                i += 1;
+            }
+            k += 4;
+        }
+        while k + 1 < rest.len() {
+            debug_assert_eq!(rest[k].0.len(), n);
+            debug_assert_eq!(rest[k + 1].0.len(), n);
+            let s0 = rest[k].0.as_ptr();
+            let s1 = rest[k + 1].0.as_ptr();
+            let mut i = 0usize;
+            while i < vec_n {
+                let d = dst.add(i);
+                let (d0, d1) = ligerito_load_pair_q(d);
+                let (a0, a1) = ligerito_load_pair_q(s0.add(i));
+                let (b0, b1) = ligerito_load_pair_q(s1.add(i));
+                let (d2, d3) = ligerito_load_pair_q(d.add(2));
+                let (a2, a3) = ligerito_load_pair_q(s0.add(i + 2));
+                let (b2, b3) = ligerito_load_pair_q(s1.add(i + 2));
+                ligerito_store_pair_q(d, veor3q_u64(d0, a0, b0), veor3q_u64(d1, a1, b1));
+                ligerito_store_pair_q(d.add(2), veor3q_u64(d2, a2, b2), veor3q_u64(d3, a3, b3));
+                i += 4;
+            }
+            while i < n {
+                *dst.add(i) += *s0.add(i) + *s1.add(i);
+                i += 1;
+            }
+            k += 2;
+        }
+        if k < rest.len() {
+            debug_assert_eq!(rest[k].0.len(), n);
+            let s0 = rest[k].0.as_ptr();
+            let mut i = 0usize;
+            while i < vec_n {
+                let d = dst.add(i);
+                let (d0, d1) = ligerito_load_pair_q(d);
+                let (a0, a1) = ligerito_load_pair_q(s0.add(i));
+                let (d2, d3) = ligerito_load_pair_q(d.add(2));
+                let (a2, a3) = ligerito_load_pair_q(s0.add(i + 2));
+                ligerito_store_pair_q(d, veorq_u64(d0, a0), veorq_u64(d1, a1));
+                ligerito_store_pair_q(d.add(2), veorq_u64(d2, a2), veorq_u64(d3, a3));
+                i += 4;
+            }
+            while i < n {
+                *dst.add(i) += *s0.add(i);
+                i += 1;
+            }
+        }
+    }
 }
 
 /// One prepared multiplier of the fused three-layer transpose: the PMULL
@@ -3096,6 +3350,57 @@ fn fused3_twiddles_cached(ntt: &AdditiveNttF128, layer: usize) -> Option<&'stati
         std::array::from_fn(|_| std::array::from_fn(|_| std::sync::OnceLock::new()))
     });
     Some(&tables[dim][layer].get_or_init(|| fused3_twiddles_uncached(ntt, layer).into_boxed_slice()))
+}
+
+/// Kill switch: setting `FLOCK_NO_TRANSPOSE_FUSED3_XOR` reverts
+/// [`transpose_forward_ntt_fused_3layer`] from the two-row paired `ldp`/`stp`
+/// + `mul_const_prep_xor` path back to the incumbent single-row
+/// `mul_const_pair_prep_pmull` + post-XOR path. Read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+pub const ENV_NO_TRANSPOSE_FUSED3_XOR: &str = "FLOCK_NO_TRANSPOSE_FUSED3_XOR";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn transpose_fused3_xor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_TRANSPOSE_FUSED3_XOR).is_none())
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+unsafe fn ligerito_load_pair_q(
+    p: *const F128,
+) -> (core::arch::aarch64::uint64x2_t, core::arch::aarch64::uint64x2_t) {
+    let a: core::arch::aarch64::uint64x2_t;
+    let b: core::arch::aarch64::uint64x2_t;
+    unsafe {
+        core::arch::asm!(
+            "ldp {a:q}, {b:q}, [{p}]",
+            p = in(reg) p,
+            a = lateout(vreg) a,
+            b = lateout(vreg) b,
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+    (a, b)
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+unsafe fn ligerito_store_pair_q(
+    p: *mut F128,
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a:q}, {b:q}, [{p}]",
+            p = in(reg) p,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
 /// Apply three consecutive transpose layers in one read/write pass. `layer`
@@ -3177,6 +3482,92 @@ fn transpose_forward_ntt_fused_3layer(
     // even for the final few large blocks without opening nested parallel
     // regions, which caused long-tail scheduler stalls in this phase.
     let data_ptr = data.as_mut_ptr() as usize;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if pmull_fold && transpose_fused3_xor_enabled() {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64};
+        use crate::field::gf2_128::aarch64::mul_const_prep_xor;
+
+        macro_rules! fused3_row_xor_q {
+            ($v:ident, $tw:expr) => {{
+                macro_rules! bxor {
+                    ($a:literal, $b:literal, $t:expr) => {{
+                        let bot = $v[$b];
+                        let s = veorq_u64($v[$a], bot);
+                        $v[$a] = s;
+                        $v[$b] = mul_const_prep_xor($t, s, bot);
+                    }};
+                }
+                bxor!(0, 1, $tw[3]);
+                bxor!(2, 3, $tw[4]);
+                bxor!(4, 5, $tw[5]);
+                bxor!(6, 7, $tw[6]);
+                bxor!(0, 2, $tw[1]);
+                bxor!(1, 3, $tw[1]);
+                bxor!(4, 6, $tw[2]);
+                bxor!(5, 7, $tw[2]);
+                bxor!(0, 4, $tw[0]);
+                bxor!(1, 5, $tw[0]);
+                bxor!(2, 6, $tw[0]);
+                bxor!(3, 7, $tw[0]);
+            }};
+        }
+
+        if eighth >= 2 {
+            let pairs_per_block = eighth >> 1;
+            let pair_log = eighth_log - 1;
+            let pair_mask = pairs_per_block - 1;
+            (0..num_blocks * pairs_per_block)
+                .into_par_iter()
+                .with_min_len(small_ntt_min_jobs(16))
+                .for_each(|job| {
+                    let block = job >> pair_log;
+                    let row = (job & pair_mask) << 1;
+                    let base = block * block_size + row;
+                    let tw = &twiddles[block];
+                    // SAFETY: each `(block, row_pair)` owns the 16 distinct
+                    // adjacent entries `base + i*eighth + {0,1}` (`row + 1 < eighth`).
+                    unsafe {
+                        let ptr = data_ptr as *mut F128;
+                        let (e0, o0) = ligerito_load_pair_q(ptr.add(base));
+                        let (e1, o1) = ligerito_load_pair_q(ptr.add(base + eighth));
+                        let (e2, o2) = ligerito_load_pair_q(ptr.add(base + 2 * eighth));
+                        let (e3, o3) = ligerito_load_pair_q(ptr.add(base + 3 * eighth));
+                        let (e4, o4) = ligerito_load_pair_q(ptr.add(base + 4 * eighth));
+                        let (e5, o5) = ligerito_load_pair_q(ptr.add(base + 5 * eighth));
+                        let (e6, o6) = ligerito_load_pair_q(ptr.add(base + 6 * eighth));
+                        let (e7, o7) = ligerito_load_pair_q(ptr.add(base + 7 * eighth));
+                        let mut ve = [e0, e1, e2, e3, e4, e5, e6, e7];
+                        let mut vo = [o0, o1, o2, o3, o4, o5, o6, o7];
+                        fused3_row_xor_q!(ve, tw);
+                        fused3_row_xor_q!(vo, tw);
+                        for i in 0..8 {
+                            ligerito_store_pair_q(ptr.add(base + i * eighth), ve[i], vo[i]);
+                        }
+                    }
+                });
+        } else {
+            (0..num_blocks)
+                .into_par_iter()
+                .with_min_len(small_ntt_min_jobs(8))
+                .for_each(|block| {
+                    let base = block * block_size;
+                    let tw = &twiddles[block];
+                    // SAFETY: each block owns its disjoint 8-element slice.
+                    unsafe {
+                        let ptr = data_ptr as *mut F128;
+                        let mut v: [uint64x2_t; 8] = core::array::from_fn(|i| {
+                            vld1q_u64(ptr.add(base + i).cast::<u64>())
+                        });
+                        fused3_row_xor_q!(v, tw);
+                        for (i, &val) in v.iter().enumerate() {
+                            vst1q_u64(ptr.add(base + i).cast::<u64>(), val);
+                        }
+                    }
+                });
+        }
+        return;
+    }
     (0..num_blocks * eighth)
         .into_par_iter()
         .with_min_len(small_ntt_min_jobs(8))
@@ -3458,6 +3849,111 @@ fn l0_factored_final3_retained_row(
     ]
 }
 
+/// Kill switch: setting `FLOCK_NO_L0_FINAL3_PREP_ACC` reverts
+/// [`transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg`]
+/// from the prepared NEON `mul_const_prep_xor` + paired `ldp`/`stp` +
+/// deferred-reduction `TriAcc` accumulator back to the incumbent scalar-multiply
+/// path. Read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+pub const ENV_NO_L0_FINAL3_PREP_ACC: &str = "FLOCK_NO_L0_FINAL3_PREP_ACC";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn l0_final3_prep_acc_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_L0_FINAL3_PREP_ACC).is_none())
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+unsafe fn l0_factored_final3_prepared_row_q(
+    v: [core::arch::aarch64::uint64x2_t; 8],
+    constants: [crate::field::gf2_128::aarch64::ConstPrep; 4],
+) -> [core::arch::aarch64::uint64x2_t; 4] {
+    use core::arch::aarch64::veorq_u64;
+    use crate::field::gf2_128::aarch64::mul_const_prep_xor;
+    unsafe {
+        let [x0, x1, x2, x3, x4, x5, x6, x7] = v;
+        let p0 = veorq_u64(x0, x1);
+        let p1 = veorq_u64(x2, x3);
+        let p2 = veorq_u64(x4, x5);
+        let p3 = veorq_u64(x6, x7);
+        let q3 = mul_const_prep_xor(constants[0], p1, x3);
+        let q5 = mul_const_prep_xor(constants[1], p2, x5);
+        let q7 = mul_const_prep_xor(constants[2], p3, x7);
+        let t0 = veorq_u64(p0, p1);
+        let t1 = veorq_u64(x1, q3);
+        let t2 = veorq_u64(p2, p3);
+        let t3 = veorq_u64(q5, q7);
+        let out0 = veorq_u64(t0, t2);
+        let out1 = veorq_u64(t1, t3);
+        let out2 = mul_const_prep_xor(constants[3], t2, veorq_u64(p1, p3));
+        let out3 = mul_const_prep_xor(constants[3], t3, veorq_u64(q3, q7));
+        [out0, out1, out2, out3]
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[derive(Clone, Copy)]
+struct L0TriAcc {
+    ll: core::arch::aarch64::uint64x2_t,
+    cr: core::arch::aarch64::uint64x2_t,
+    hh: core::arch::aarch64::uint64x2_t,
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+impl L0TriAcc {
+    #[inline(always)]
+    unsafe fn zero() -> Self {
+        unsafe {
+            let z = core::arch::aarch64::vdupq_n_u64(0);
+            Self { ll: z, cr: z, hh: z }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn fma(
+        &mut self,
+        a: core::arch::aarch64::uint64x2_t,
+        b: core::arch::aarch64::uint64x2_t,
+    ) {
+        unsafe {
+            let b_sw = core::arch::aarch64::vextq_u64::<1>(b, b);
+            core::arch::asm!(
+                "pmull {t:v}.1q, {a:v}.1d, {b:v}.1d",
+                "eor {ll:v}.16b, {ll:v}.16b, {t:v}.16b",
+                "pmull2 {t:v}.1q, {a:v}.2d, {b:v}.2d",
+                "eor {hh:v}.16b, {hh:v}.16b, {t:v}.16b",
+                "pmull {t:v}.1q, {a:v}.1d, {bs:v}.1d",
+                "eor {cr:v}.16b, {cr:v}.16b, {t:v}.16b",
+                "pmull2 {t:v}.1q, {a:v}.2d, {bs:v}.2d",
+                "eor {cr:v}.16b, {cr:v}.16b, {t:v}.16b",
+                a = in(vreg) a,
+                b = in(vreg) b,
+                bs = in(vreg) b_sw,
+                ll = inout(vreg) self.ll,
+                cr = inout(vreg) self.cr,
+                hh = inout(vreg) self.hh,
+                t = out(vreg) _,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn reduce(self) -> F128 {
+        use core::arch::aarch64::vgetq_lane_u64;
+        unsafe {
+            crate::field::gf2_128::ghash_reduce(
+                vgetq_lane_u64::<0>(self.ll),
+                vgetq_lane_u64::<1>(self.ll) ^ vgetq_lane_u64::<0>(self.cr),
+                vgetq_lane_u64::<0>(self.hh) ^ vgetq_lane_u64::<1>(self.cr),
+                vgetq_lane_u64::<1>(self.hh),
+            )
+        }
+    }
+}
+
 /// Exact ranked child of
 /// [`transpose_forward_ntt_fused_final_3layer_low_half_with_round_msg`].
 /// Only the retained-row algebra changes; paired row ownership, stores, the
@@ -3496,6 +3992,64 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
     };
 
     let data_ptr = data.as_mut_ptr() as usize;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if l0_final3_prep_acc_enabled() {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64};
+        use crate::field::gf2_128::aarch64::const_prep;
+        // SAFETY: AES and little-endian F128 lane order match uint64x2_t.
+        let prep_consts = unsafe {
+            [constants.a, constants.d, constants.a_plus_d, constants.b]
+                .map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t)))
+        };
+        let f_ptr = f.as_ptr() as usize;
+        let (u_0, u_2) = (0..eighth / 2)
+            .into_par_iter()
+            .with_min_len(small_ntt_min_jobs(16))
+            .fold(
+                || unsafe { (L0TriAcc::zero(), L0TriAcc::zero()) },
+                |(mut acc0, mut acc2), row_pair| {
+                    let even_row = 2 * row_pair;
+                    // SAFETY: every job owns the 16 distinct adjacent inputs
+                    // `even_row + i*eighth + {0,1}`, writes the 8 retained
+                    // outputs in-place, and reads the matching 8 `f` entries.
+                    unsafe {
+                        let ptr = data_ptr as *mut F128;
+                        let fptr = f_ptr as *const F128;
+                        let (e0, o0) = ligerito_load_pair_q(ptr.add(even_row));
+                        let (e1, o1) = ligerito_load_pair_q(ptr.add(even_row + eighth));
+                        let (e2, o2) = ligerito_load_pair_q(ptr.add(even_row + 2 * eighth));
+                        let (e3, o3) = ligerito_load_pair_q(ptr.add(even_row + 3 * eighth));
+                        let (e4, o4) = ligerito_load_pair_q(ptr.add(even_row + 4 * eighth));
+                        let (e5, o5) = ligerito_load_pair_q(ptr.add(even_row + 5 * eighth));
+                        let (e6, o6) = ligerito_load_pair_q(ptr.add(even_row + 6 * eighth));
+                        let (e7, o7) = ligerito_load_pair_q(ptr.add(even_row + 7 * eighth));
+                        let even = l0_factored_final3_prepared_row_q(
+                            [e0, e1, e2, e3, e4, e5, e6, e7],
+                            prep_consts,
+                        );
+                        let odd = l0_factored_final3_prepared_row_q(
+                            [o0, o1, o2, o3, o4, o5, o6, o7],
+                            prep_consts,
+                        );
+                        for segment in 0..4 {
+                            let even_index = segment * eighth + even_row;
+                            ligerito_store_pair_q(ptr.add(even_index), even[segment], odd[segment]);
+                            let (f0, f1) = ligerito_load_pair_q(fptr.add(even_index));
+                            acc0.fma(f0, even[segment]);
+                            acc2.fma(veorq_u64(f0, f1), veorq_u64(even[segment], odd[segment]));
+                        }
+                    }
+                    (acc0, acc2)
+                },
+            )
+            .map(|(acc0, acc2)| unsafe { (acc0.reduce(), acc2.reduce()) })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(a_0, a_2), (b_0, b_2)| (a_0 + b_0, a_2 + b_2),
+            );
+        return SumcheckMessage { u_0, u_2 };
+    }
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
         .with_min_len(small_ntt_min_jobs(16))
@@ -4217,6 +4771,18 @@ fn scatter_active_windows(
     arena
 }
 
+/// Kill switch for lean parked-arena + NEON singleton/multi-input window
+/// transforms in L0/L2 sparse transpose-NTT (`FLOCK_NO_SPARSE_WIN_LEAN`, any
+/// value restores fresh zeroed-arena allocation and scalar window transforms).
+/// Read once per process.
+pub const ENV_NO_SPARSE_WIN_LEAN: &str = "FLOCK_NO_SPARSE_WIN_LEAN";
+
+#[inline(always)]
+fn sparse_win_lean_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_SPARSE_WIN_LEAN).is_none())
+}
+
 #[inline]
 fn transform_active_window(
     ntt: &AdditiveNttF128,
@@ -4225,6 +4791,8 @@ fn transform_active_window(
     prefix_k: usize,
     log_d: usize,
 ) {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    let use_neon = sparse_win_lean_enabled();
     for s in 0..prefix_k {
         let layer = log_d - 1 - s;
         let half = 1usize << s;
@@ -4233,6 +4801,32 @@ fn transform_active_window(
         for block in 0..nblocks {
             let twiddle = ntt.twiddle(layer, (window_index << (prefix_k - s - 1)) + block);
             let base = block * block_size;
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            if use_neon && half >= 2 {
+                use core::arch::aarch64::{uint64x2_t, veorq_u64};
+                use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep_xor};
+                // SAFETY: `half` is a power of two >= 2 and `base + 2 * half <= window.len()`.
+                unsafe {
+                    let prep = const_prep(core::mem::transmute::<F128, uint64x2_t>(twiddle));
+                    let tp = window.as_mut_ptr().add(base);
+                    let bp = tp.add(half);
+                    let mut row = 0usize;
+                    while row < half {
+                        let (t0, t1) = ligerito_load_pair_q(tp.add(row));
+                        let (b0, b1) = ligerito_load_pair_q(bp.add(row));
+                        let s0 = veorq_u64(t0, b0);
+                        let s1 = veorq_u64(t1, b1);
+                        ligerito_store_pair_q(tp.add(row), s0, s1);
+                        ligerito_store_pair_q(
+                            bp.add(row),
+                            mul_const_prep_xor(prep, s0, b0),
+                            mul_const_prep_xor(prep, s1, b1),
+                        );
+                        row += 2;
+                    }
+                }
+                continue;
+            }
             for row in 0..half {
                 let top = window[base + row];
                 let bottom = window[base + row + half];
@@ -4366,6 +4960,226 @@ fn densify_active_windows(
 /// It removes the full-domain densify write and the first group's matching
 /// input read. A block with no active input is linear-zero and can initialize
 /// its complete output block without executing any field products.
+/// Kill switch: setting `FLOCK_NO_C2_MAT_NEON` disables the AArch64 NEON
+/// prepared-constant, sparse-skip, and single-pass EOR3 paths across the C2
+/// retained-transpose materialization pipeline (`expand_singleton_window_lean`,
+/// `densify_*_first_3layer`, `transpose_forward_ntt_single_layer_flat`, and
+/// `xor_collapse_cosets`). Read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+pub const ENV_NO_C2_MAT_NEON: &str = "FLOCK_NO_C2_MAT_NEON";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn c2_mat_neon_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_C2_MAT_NEON).is_none())
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "aes",
+    target_endian = "little",
+    target_feature = "sha3"
+))]
+#[inline(always)]
+unsafe fn ligerito_xor3_u64(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+    c: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    unsafe { core::arch::aarch64::veor3q_u64(a, b, c) }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "aes",
+    target_endian = "little",
+    not(target_feature = "sha3")
+))]
+#[inline(always)]
+unsafe fn ligerito_xor3_u64(
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+    c: core::arch::aarch64::uint64x2_t,
+) -> core::arch::aarch64::uint64x2_t {
+    unsafe {
+        core::arch::aarch64::veorq_u64(a, core::arch::aarch64::veorq_u64(b, c))
+    }
+}
+
+/// Sparse-aware prepared NEON fused first 3-layer densifier.
+///
+/// Pre-resolves the eight window pointers and `active_mask: u8` once per
+/// block, skips dead-zero butterflies across all three layers, and folds every
+/// post-product XOR into macro-fused `mul_const_prep_xor`. Output is
+/// bit-identical to [`densify_active_windows_fused_first_3layer`].
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+fn densify_active_windows_prepared_sparse_first_3layer(
+    ntt: &AdditiveNttF128,
+    arena: &[F128],
+    groups: &[ActiveWindow],
+    log_d: usize,
+    prefix_k: usize,
+) -> Vec<F128> {
+    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vld1q_u64, vst1q_u64};
+    use crate::field::gf2_128::aarch64::{
+        const_prep, mul_const_prep, mul_const_prep_xor, ConstPrep,
+    };
+    use rayon::prelude::*;
+
+    assert!(
+        log_d >= prefix_k + 3,
+        "fused densification requires a complete three-layer suffix group"
+    );
+    let n = 1usize << log_d;
+    let window_len = 1usize << prefix_k;
+    let n_windows = n / window_len;
+    let first_layer = log_d - prefix_k - 3;
+    let num_blocks = 1usize << first_layer;
+    let block_size = window_len << 3;
+    debug_assert_eq!(num_blocks * block_size, n);
+    debug_assert_eq!(n_windows, num_blocks << 3);
+    debug_assert_eq!(arena.len(), groups.len() * window_len);
+
+    let window_to_arena = active_window_to_arena(groups, n_windows);
+    let kept = fused3_twiddles_cached(ntt, first_layer);
+    let built: Vec<[ConstPrep; 7]>;
+    let twiddles: &[[ConstPrep; 7]] = match kept {
+        Some(kept) => kept,
+        None => {
+            built = (0..num_blocks)
+                .map(|block| {
+                    let mut tw = [F128::ZERO; 7];
+                    tw[0] = ntt.twiddle(first_layer, block);
+                    for half in 0..2 {
+                        tw[1 + half] = ntt.twiddle(first_layer + 1, 2 * block + half);
+                    }
+                    for quarter in 0..4 {
+                        tw[3 + quarter] = ntt.twiddle(first_layer + 2, 4 * block + quarter);
+                    }
+                    // SAFETY: AES and little-endian F128 layout are required by cfg.
+                    unsafe { tw.map(|t| const_prep(core::mem::transmute::<F128, uint64x2_t>(t))) }
+                })
+                .collect();
+            &built
+        }
+    };
+    assert_eq!(twiddles.len(), num_blocks);
+
+    let mut data = crate::scratch::take_sparse_ntt_data(n);
+    // SAFETY: length stays 0 until every disjoint block initializes its range.
+    unsafe { data.set_len(0); }
+    let data_ptr = data.as_mut_ptr() as usize;
+    let arena_ptr = arena.as_ptr() as usize;
+
+    (0..num_blocks).into_par_iter().for_each(|block| {
+        let output_start = block * block_size;
+        let output_ptr = data_ptr as *mut F128;
+        let ap = arena_ptr as *const F128;
+        let mut active_mask = 0u8;
+        let mut ptrs = [ap; 8];
+        for i in 0..8 {
+            let arena_index = window_to_arena[8 * block + i];
+            if arena_index != INACTIVE_WINDOW {
+                active_mask |= 1u8 << i;
+                // SAFETY: `arena_index < groups.len()`, so `arena_index * window_len` is in bounds.
+                ptrs[i] = unsafe { ap.add(arena_index * window_len) };
+            }
+        }
+        // SAFETY: each job owns `[output_start, output_start + block_size)` exclusively,
+        // every active pointer covers `window_len` valid `F128` elements, and `F128` is
+        // `#[repr(C, align(16))]` with two `u64` limbs matching `uint64x2_t`.
+        unsafe {
+            if active_mask == 0 {
+                core::ptr::write_bytes(output_ptr.add(output_start), 0, block_size);
+                return;
+            }
+            let zero = vdupq_n_u64(0);
+            let tw = &twiddles[block];
+            let out_base = output_ptr.add(output_start);
+            for row in 0..window_len {
+                let mut v = [zero; 8];
+                for i in 0..8 {
+                    if (active_mask & (1u8 << i)) != 0 {
+                        v[i] = vld1q_u64(ptrs[i].add(row).cast::<u64>());
+                    }
+                }
+                for p in 0..4 {
+                    let m = (active_mask >> (2 * p)) & 3;
+                    if m == 0 {
+                        continue;
+                    }
+                    let t = tw[3 + p];
+                    if m == 1 {
+                        v[2 * p + 1] = mul_const_prep(t, v[2 * p]);
+                    } else if m == 2 {
+                        let b = v[2 * p + 1];
+                        v[2 * p] = b;
+                        v[2 * p + 1] = mul_const_prep_xor(t, b, b);
+                    } else {
+                        let b = v[2 * p + 1];
+                        let s = veorq_u64(v[2 * p], b);
+                        v[2 * p] = s;
+                        v[2 * p + 1] = mul_const_prep_xor(t, s, b);
+                    }
+                }
+                for h in 0..2 {
+                    let hm = (active_mask >> (4 * h)) & 0xF;
+                    if hm == 0 {
+                        continue;
+                    }
+                    let t = tw[1 + h];
+                    let base = 4 * h;
+                    if (hm & 0x3) == 0 {
+                        for k in 0..2 {
+                            let b = v[base + 2 + k];
+                            v[base + k] = b;
+                            v[base + 2 + k] = mul_const_prep_xor(t, b, b);
+                        }
+                    } else if (hm & 0xC) == 0 {
+                        for k in 0..2 {
+                            v[base + 2 + k] = mul_const_prep(t, v[base + k]);
+                        }
+                    } else {
+                        for k in 0..2 {
+                            let b = v[base + 2 + k];
+                            let s = veorq_u64(v[base + k], b);
+                            v[base + k] = s;
+                            v[base + 2 + k] = mul_const_prep_xor(t, s, b);
+                        }
+                    }
+                }
+                let t0 = tw[0];
+                if (active_mask & 0x0F) == 0 {
+                    for k in 0..4 {
+                        let b = v[4 + k];
+                        v[k] = b;
+                        v[4 + k] = mul_const_prep_xor(t0, b, b);
+                    }
+                } else if (active_mask & 0xF0) == 0 {
+                    for k in 0..4 {
+                        v[4 + k] = mul_const_prep(t0, v[k]);
+                    }
+                } else {
+                    for k in 0..4 {
+                        let b = v[4 + k];
+                        let s = veorq_u64(v[k], b);
+                        v[k] = s;
+                        v[4 + k] = mul_const_prep_xor(t0, s, b);
+                    }
+                }
+                for i in 0..8 {
+                    vst1q_u64(out_base.add(row + i * window_len).cast::<u64>(), v[i]);
+                }
+            }
+        }
+    });
+
+    // SAFETY: every block initialized all `block_size` output elements before the join.
+    unsafe { data.set_len(n); }
+    data
+}
+
 fn densify_active_windows_fused_first_3layer(
     ntt: &AdditiveNttF128,
     arena: &[F128],
@@ -4373,6 +5187,12 @@ fn densify_active_windows_fused_first_3layer(
     log_d: usize,
     prefix_k: usize,
 ) -> Vec<F128> {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if c2_mat_neon_enabled() {
+        return densify_active_windows_prepared_sparse_first_3layer(
+            ntt, arena, groups, log_d, prefix_k,
+        );
+    }
     // Off AES aarch64 the kept prepared rows are these plain rows.
     #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
     let kept = log_d
@@ -4555,6 +5375,11 @@ fn densify_c2_windows_prepared_first_3layer(
     log_d: usize,
     prefix_k: usize,
 ) -> Vec<F128> {
+    if c2_mat_neon_enabled() {
+        return densify_active_windows_prepared_sparse_first_3layer(
+            ntt, arena, groups, log_d, prefix_k,
+        );
+    }
     use core::arch::aarch64::uint64x2_t;
     use crate::field::gf2_128::aarch64::{const_prep, mul_const_pair_prep, ConstPrep};
 
@@ -4767,6 +5592,53 @@ fn transpose_forward_ntt_single_layer_flat(
     let twiddles = single_layer_twiddles(ntt, layer);
     let twiddles: &[F128] = &twiddles;
     let data_ptr = data.as_mut_ptr() as usize;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if c2_mat_neon_enabled() && half >= 4 {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64};
+        use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep_xor, ConstPrep};
+
+        let prepped: Vec<ConstPrep> = twiddles
+            .iter()
+            .map(|&t| unsafe { const_prep(core::mem::transmute::<F128, uint64x2_t>(t)) })
+            .collect();
+        let quad_half_log = half_log - 2;
+        let quad_mask = (half >> 2) - 1;
+        (0..num_blocks * (half >> 2))
+            .into_par_iter()
+            .with_min_len(small_ntt_min_jobs(8))
+            .for_each(|job| {
+                let block = job >> quad_half_log;
+                let row = (job & quad_mask) << 2;
+                let top_index = block * block_size + row;
+                let bottom_index = top_index + half;
+                let prep = prepped[block];
+                // SAFETY: each job owns four disjoint butterfly pairs inside `[0, 1 << log_d)`;
+                // `half >= 4` and `row` is a multiple of 4 so paired loads/stores stay in bounds.
+                unsafe {
+                    let ptr = data_ptr as *mut F128;
+                    let top_ptr = ptr.add(top_index);
+                    let bot_ptr = ptr.add(bottom_index);
+                    let (t0, t1) = ligerito_load_pair_q(top_ptr);
+                    let (b0, b1) = ligerito_load_pair_q(bot_ptr);
+                    let (t2, t3) = ligerito_load_pair_q(top_ptr.add(2));
+                    let (b2, b3) = ligerito_load_pair_q(bot_ptr.add(2));
+                    let s0 = veorq_u64(t0, b0);
+                    let s1 = veorq_u64(t1, b1);
+                    let s2 = veorq_u64(t2, b2);
+                    let s3 = veorq_u64(t3, b3);
+                    ligerito_store_pair_q(top_ptr, s0, s1);
+                    ligerito_store_pair_q(top_ptr.add(2), s2, s3);
+                    let o0 = mul_const_prep_xor(prep, s0, b0);
+                    let o1 = mul_const_prep_xor(prep, s1, b1);
+                    let o2 = mul_const_prep_xor(prep, s2, b2);
+                    let o3 = mul_const_prep_xor(prep, s3, b3);
+                    ligerito_store_pair_q(bot_ptr, o0, o1);
+                    ligerito_store_pair_q(bot_ptr.add(2), o2, o3);
+                }
+            });
+        return;
+    }
 
     (0..num_blocks * half)
         .into_par_iter()
@@ -5128,6 +6000,225 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
     }
 }
 
+/// Kill switch for prepared-NEON paired `ldp`/`stp` + `mul_const_prep_xor` in
+/// `SumcheckProver::glue` (`FLOCK_NO_SC_GLUE_PREP`, any value restores the
+/// scalar `acc += alpha * v` loop). Read once per process.
+pub const ENV_NO_SC_GLUE_PREP: &str = "FLOCK_NO_SC_GLUE_PREP";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn sc_glue_prep_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_SC_GLUE_PREP).is_none())
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline]
+fn glue_add_scaled_prep_slice(
+    dst: &mut [F128],
+    src: &[F128],
+    prep: crate::field::gf2_128::aarch64::ConstPrep,
+    alpha: F128,
+) {
+    use crate::field::gf2_128::aarch64::mul_const_prep_xor;
+    debug_assert_eq!(dst.len(), src.len());
+    let n = dst.len();
+    let dp = dst.as_mut_ptr();
+    let sp = src.as_ptr();
+    let mut i = 0usize;
+    unsafe {
+        while i + 1 < n {
+            let (d0, d1) = ligerito_load_pair_q(dp.add(i));
+            let (s0, s1) = ligerito_load_pair_q(sp.add(i));
+            let r0 = mul_const_prep_xor(prep, s0, d0);
+            let r1 = mul_const_prep_xor(prep, s1, d1);
+            ligerito_store_pair_q(dp.add(i), r0, r1);
+            i += 2;
+        }
+        if i < n {
+            *dp.add(i) += alpha * *sp.add(i);
+        }
+    }
+}
+
+/// Kill switch for prepared-NEON deferred-reduction `mul_three/four_const_sum_prep_xor`
+/// and `eor3.16b` Boolean moments in the ranked L2 final-5-layer factored tail
+/// (`FLOCK_NO_L2_FINAL5_PREP`, any value restores the incumbent scalar tile).
+/// Read once per process.
+pub const ENV_NO_L2_FINAL5_PREP: &str = "FLOCK_NO_L2_FINAL5_PREP";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn l2_final5_prep_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_L2_FINAL5_PREP).is_none())
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[derive(Clone, Copy)]
+struct L2FactoredFinal5Prep {
+    delta: crate::field::gf2_128::aarch64::ConstPrep,
+    a: [crate::field::gf2_128::aarch64::ConstPrep; 3],
+    b: [crate::field::gf2_128::aarch64::ConstPrep; 3],
+    g: [crate::field::gf2_128::aarch64::ConstPrep; 3],
+    e: [crate::field::gf2_128::aarch64::ConstPrep; 3],
+    h: [crate::field::gf2_128::aarch64::ConstPrep; 3],
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+impl L2FactoredFinal5Prep {
+    #[inline]
+    fn from_constants(c: &L2FactoredFinal5Constants) -> Self {
+        use core::arch::aarch64::uint64x2_t;
+        use crate::field::gf2_128::aarch64::const_prep;
+        // SAFETY: `F128` is `#[repr(C, align(16))]` with `(lo, hi)` matching `uint64x2_t`.
+        let prep = |v: F128| unsafe { const_prep(core::mem::transmute::<F128, uint64x2_t>(v)) };
+        Self {
+            delta: prep(c.delta),
+            a: [prep(c.a[0]), prep(c.a[1]), prep(c.a[2])],
+            b: [prep(c.b[0]), prep(c.b[1]), prep(c.b[2])],
+            g: [prep(c.g[0]), prep(c.g[1]), prep(c.g[2])],
+            e: [prep(c.e[0]), prep(c.e[1]), prep(c.e[2])],
+            h: [prep(c.h[0]), prep(c.h[1]), prep(c.h[2])],
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(never)]
+fn transpose_forward_ntt_final_5layer_factored_tile_neon(
+    data_ptr: usize,
+    retained_ptr: usize,
+    row_start: usize,
+    eighth: usize,
+    quarter: usize,
+    cp: &L2FactoredFinal5Prep,
+) {
+    use core::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64};
+    use crate::field::gf2_128::aarch64::{
+        mul_const_prep, mul_four_const_sum_prep_xor, mul_three_const_sum_prep_xor,
+    };
+
+    let mut staged = [[[core::mem::MaybeUninit::<uint64x2_t>::uninit();
+        L2_FACTORED_FINAL5_CHANNELS];
+        L2_FACTORED_FINAL5_ROW_TILE];
+        L2_FACTORED_FINAL5_COSETS];
+
+    // Preserve exact 8-row (128 B cache-line) coset-major sequential gather.
+    unsafe {
+        let dp = data_ptr as *const F128;
+        for coset in 0..L2_FACTORED_FINAL5_COSETS {
+            let cbase = coset * eighth + row_start;
+            for local_row in 0..L2_FACTORED_FINAL5_ROW_TILE {
+                let x0 = vld1q_u64(dp.add(cbase + local_row).cast::<u64>());
+                let x1 = vld1q_u64(dp.add(cbase + quarter + local_row).cast::<u64>());
+                let x2 = vld1q_u64(dp.add(cbase + 2 * quarter + local_row).cast::<u64>());
+                let x3 = vld1q_u64(dp.add(cbase + 3 * quarter + local_row).cast::<u64>());
+                let p1 = veorq_u64(x2, x3);
+                staged[coset][local_row][0].write(ligerito_xor3_u64(x0, x1, p1));
+                staged[coset][local_row][1].write(p1);
+                staged[coset][local_row][2].write(veorq_u64(x1, x3));
+                staged[coset][local_row][3].write(x3);
+            }
+        }
+
+        let op = retained_ptr as *mut F128;
+        for local_row in 0..L2_FACTORED_FINAL5_ROW_TILE {
+            let load_ch = |ch: usize| -> [uint64x2_t; 8] {
+                [
+                    staged[0][local_row][ch].assume_init(),
+                    staged[1][local_row][ch].assume_init(),
+                    staged[2][local_row][ch].assume_init(),
+                    staged[3][local_row][ch].assume_init(),
+                    staged[4][local_row][ch].assume_init(),
+                    staged[5][local_row][ch].assume_init(),
+                    staged[6][local_row][ch].assume_init(),
+                    staged[7][local_row][ch].assume_init(),
+                ]
+            };
+
+            let pv = load_ch(0);
+            let ps01 = veorq_u64(pv[0], pv[1]);
+            let ps23 = veorq_u64(pv[2], pv[3]);
+            let ps45 = veorq_u64(pv[4], pv[5]);
+            let ps67 = veorq_u64(pv[6], pv[7]);
+            let p_up = veorq_u64(ps45, ps67);
+            let p = ligerito_xor3_u64(ps01, ps23, p_up);
+            let odd_hi = veorq_u64(pv[5], pv[7]);
+            let pi0 = ligerito_xor3_u64(pv[1], pv[3], odd_hi);
+            let pi1 = veorq_u64(ps23, ps67);
+            let pi2 = p_up;
+            let pij0 = veorq_u64(pv[3], pv[7]);
+            let pij1 = odd_hi;
+            let pij2 = ps67;
+
+            let rv = load_ch(1);
+            let rs01 = veorq_u64(rv[0], rv[1]);
+            let rs23 = veorq_u64(rv[2], rv[3]);
+            let rs45 = veorq_u64(rv[4], rv[5]);
+            let rs67 = veorq_u64(rv[6], rv[7]);
+            let r_up = veorq_u64(rs45, rs67);
+            let r = ligerito_xor3_u64(rs01, rs23, r_up);
+            let ri0 = veorq_u64(veorq_u64(rv[1], rv[3]), veorq_u64(rv[5], rv[7]));
+            let ri1 = veorq_u64(rs23, rs67);
+            let ri2 = r_up;
+
+            let dv = load_ch(2);
+            let ds01 = veorq_u64(dv[0], dv[1]);
+            let ds23 = veorq_u64(dv[2], dv[3]);
+            let ds45 = veorq_u64(dv[4], dv[5]);
+            let ds67 = veorq_u64(dv[6], dv[7]);
+            let d_up = veorq_u64(ds45, ds67);
+            let d = ligerito_xor3_u64(ds01, ds23, d_up);
+            let di0 = veorq_u64(veorq_u64(dv[1], dv[3]), veorq_u64(dv[5], dv[7]));
+            let di1 = veorq_u64(ds23, ds67);
+            let di2 = d_up;
+
+            let bv = load_ch(3);
+            let b1 = ligerito_xor3_u64(
+                ligerito_xor3_u64(bv[0], bv[1], bv[2]),
+                ligerito_xor3_u64(bv[3], bv[4], bv[5]),
+                veorq_u64(bv[6], bv[7]),
+            );
+
+            let delta_r = mul_const_prep(cp.delta, r);
+            let out1 = mul_three_const_sum_prep_xor(
+                cp.a[0],
+                pi0,
+                cp.a[1],
+                pi1,
+                cp.a[2],
+                pi2,
+                veorq_u64(d, delta_r),
+            );
+            let out2 = mul_three_const_sum_prep_xor(cp.b[0], pi0, cp.b[1], pi1, cp.b[2], pi2, r);
+            let o3a = mul_four_const_sum_prep_xor(
+                cp.g[0],
+                pi0,
+                cp.g[1],
+                pi1,
+                cp.g[2],
+                pi2,
+                cp.e[0],
+                ri0,
+                veorq_u64(b1, delta_r),
+            );
+            let o3b = mul_four_const_sum_prep_xor(
+                cp.e[1], ri1, cp.e[2], ri2, cp.b[0], di0, cp.b[1], di1, o3a,
+            );
+            let out3 = mul_four_const_sum_prep_xor(
+                cp.b[2], di2, cp.h[0], pij0, cp.h[1], pij1, cp.h[2], pij2, o3b,
+            );
+
+            let row = row_start + local_row;
+            vst1q_u64(op.add(row).cast::<u64>(), p);
+            vst1q_u64(op.add(quarter + row).cast::<u64>(), out1);
+            vst1q_u64(op.add(2 * quarter + row).cast::<u64>(), out2);
+            vst1q_u64(op.add(3 * quarter + row).cast::<u64>(), out3);
+        }
+    }
+}
+
 /// Arithmetic-factored version of the ranked direct final-five tail.
 ///
 /// The post-layer-5 input and retained output traffic are identical to the
@@ -5153,6 +6244,26 @@ fn transpose_forward_ntt_final_5layer_low_eighth_factored(
     let data_ptr = data.as_ptr() as usize;
     let mut retained = Vec::<F128>::with_capacity(eighth);
     let retained_ptr = retained.as_mut_ptr() as usize;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if l2_final5_prep_enabled() {
+        let prepared = L2FactoredFinal5Prep::from_constants(&constants);
+        (0..quarter / L2_FACTORED_FINAL5_ROW_TILE)
+            .into_par_iter()
+            .for_each(|tile| {
+                transpose_forward_ntt_final_5layer_factored_tile_neon(
+                    data_ptr,
+                    retained_ptr,
+                    tile * L2_FACTORED_FINAL5_ROW_TILE,
+                    eighth,
+                    quarter,
+                    &prepared,
+                );
+            });
+        // SAFETY: 256 disjoint leaf tiles initialize every retained output slot.
+        unsafe { retained.set_len(eighth) };
+        return retained;
+    }
 
     (0..quarter / L2_FACTORED_FINAL5_ROW_TILE)
         .into_par_iter()
@@ -5197,8 +6308,16 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
     // full k=8 sparse prefix and leaves five ordinary dense suffix layers.
     let prefix_k = 8usize.min(log_d - 3);
     let groups = group_sorted_positions(positions, prefix_k);
-    let mut arena = scatter_active_windows(&groups, positions, values, prefix_k);
-    transform_active_windows(ntt, &mut arena, &groups, positions, values, prefix_k, log_d);
+    let lean_win = sparse_win_lean_enabled();
+    let arena = if lean_win {
+        let mut a = take_c2_window_arena(groups.len() * (1usize << prefix_k));
+        transform_active_windows_lean(ntt, &mut a, &groups, positions, values, prefix_k, log_d);
+        a
+    } else {
+        let mut a = scatter_active_windows(&groups, positions, values, prefix_k);
+        transform_active_windows(ntt, &mut a, &groups, positions, values, prefix_k, log_d);
+        a
+    };
 
     let (mut data, mut remaining) = if use_l2_fused_densify {
         assert_eq!(log_d, 16, "ranked L2 fused densify requires log_d=16");
@@ -5216,6 +6335,11 @@ fn transpose_forward_ntt_sparse_rate8_low_eighth(
             log_d - prefix_k,
         )
     };
+    if lean_win {
+        give_c2_window_arena(arena);
+    } else {
+        drop(arena);
+    }
 
     if use_l2_factored_final5 {
         assert!(
@@ -5322,10 +6446,16 @@ fn transpose_forward_ntt_sparse_impl(
     }
 
     let groups = group_sorted_positions(positions, k);
-
-    let mut arena = scatter_active_windows(&groups, positions, values, k);
-
-    transform_active_windows(ntt, &mut arena, &groups, positions, values, k, log_d);
+    let lean_win = sparse_win_lean_enabled();
+    let arena = if lean_win {
+        let mut a = take_c2_window_arena(groups.len() * (1usize << k));
+        transform_active_windows_lean(ntt, &mut a, &groups, positions, values, k, log_d);
+        a
+    } else {
+        let mut a = scatter_active_windows(&groups, positions, values, k);
+        transform_active_windows(ntt, &mut a, &groups, positions, values, k, log_d);
+        a
+    };
 
     let use_fused_densify = use_ranked_fused_densify_first(log_d, k, positions.len());
     let (mut data, dense_prefix_k) = if use_fused_densify {
@@ -5336,6 +6466,11 @@ fn transpose_forward_ntt_sparse_impl(
     } else {
         (densify_active_windows(&arena, &groups, log_d, k), k)
     };
+    if lean_win {
+        give_c2_window_arena(arena);
+    } else {
+        drop(arena);
+    }
 
     let intro_msg = transpose_forward_ntt_dense_suffix_impl(
         ntt,
@@ -5419,6 +6554,8 @@ fn expand_singleton_window_lean(
     value: F128,
 ) {
     window[local_pos] = value;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    let use_neon = c2_mat_neon_enabled();
     for s in 0..prefix_k {
         let layer = log_d - 1 - s;
         let half = 1usize << s;
@@ -5427,6 +6564,39 @@ fn expand_singleton_window_lean(
         let twiddle = ntt.twiddle(layer, (window_index << (prefix_k - s - 1)) + block);
         let base = block * block_size;
         let (top, bottom) = window[base..base + block_size].split_at_mut(half);
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+        if use_neon && half >= 2 {
+            use core::arch::aarch64::uint64x2_t;
+            use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep, mul_const_prep_xor};
+
+            // SAFETY: `half` is a power of two >= 2 so `top` and `bottom` are
+            // disjoint even-length slices; AES and little-endian F128 layout hold.
+            unsafe {
+                let prep = const_prep(core::mem::transmute::<F128, uint64x2_t>(twiddle));
+                let tp = top.as_mut_ptr();
+                let bp = bottom.as_mut_ptr();
+                let mut i = 0usize;
+                if local_pos & half == 0 {
+                    while i < half {
+                        let (t0, t1) = ligerito_load_pair_q(tp.add(i));
+                        let o0 = mul_const_prep(prep, t0);
+                        let o1 = mul_const_prep(prep, t1);
+                        ligerito_store_pair_q(bp.add(i), o0, o1);
+                        i += 2;
+                    }
+                } else {
+                    while i < half {
+                        let (b0, b1) = ligerito_load_pair_q(bp.add(i));
+                        ligerito_store_pair_q(tp.add(i), b0, b1);
+                        let o0 = mul_const_prep_xor(prep, b0, b0);
+                        let o1 = mul_const_prep_xor(prep, b1, b1);
+                        ligerito_store_pair_q(bp.add(i), o0, o1);
+                        i += 2;
+                    }
+                }
+            }
+            continue;
+        }
         if local_pos & half == 0 {
             for (t, b) in top.iter().zip(bottom.iter_mut()) {
                 *b = twiddle * *t;
@@ -5697,6 +6867,98 @@ fn xor_collapse_cosets(data: &[F128], keep_log: usize) -> Vec<F128> {
     let keep = 1usize << keep_log;
     assert!(data.len().is_power_of_two() && data.len() >= keep);
     let cosets = data.len() >> keep_log;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if c2_mat_neon_enabled() && cosets >= 2 && keep >= 2 {
+        use core::arch::aarch64::veorq_u64;
+
+        let mut out = crate::alloc_uninit_f128_vec(keep);
+        let data_ptr = data.as_ptr() as usize;
+        let collapse_chunk = |base: usize, chunk: &mut [F128]| {
+            let len = chunk.len();
+            debug_assert!(len.is_multiple_of(2));
+            let dp = data_ptr as *const F128;
+            let op = chunk.as_mut_ptr();
+            // SAFETY: `base + len <= keep`, `cosets * keep == data.len()`, and `len` is even.
+            unsafe {
+                let mut i = 0usize;
+                if cosets == 4 {
+                    while i < len {
+                        let off = base + i;
+                        let (a0, a1) = ligerito_load_pair_q(dp.add(off));
+                        let (b0, b1) = ligerito_load_pair_q(dp.add(keep + off));
+                        let (c0, c1) = ligerito_load_pair_q(dp.add(2 * keep + off));
+                        let (d0, d1) = ligerito_load_pair_q(dp.add(3 * keep + off));
+                        let r0 = veorq_u64(ligerito_xor3_u64(a0, b0, c0), d0);
+                        let r1 = veorq_u64(ligerito_xor3_u64(a1, b1, c1), d1);
+                        ligerito_store_pair_q(op.add(i), r0, r1);
+                        i += 2;
+                    }
+                } else if cosets == 8 {
+                    while i < len {
+                        let off = base + i;
+                        let (a0, a1) = ligerito_load_pair_q(dp.add(off));
+                        let (b0, b1) = ligerito_load_pair_q(dp.add(keep + off));
+                        let (c0, c1) = ligerito_load_pair_q(dp.add(2 * keep + off));
+                        let (d0, d1) = ligerito_load_pair_q(dp.add(3 * keep + off));
+                        let (e0, e1) = ligerito_load_pair_q(dp.add(4 * keep + off));
+                        let (f0, f1) = ligerito_load_pair_q(dp.add(5 * keep + off));
+                        let (g0, g1) = ligerito_load_pair_q(dp.add(6 * keep + off));
+                        let (h0, h1) = ligerito_load_pair_q(dp.add(7 * keep + off));
+                        let t0 = ligerito_xor3_u64(a0, b0, c0);
+                        let t1 = ligerito_xor3_u64(d0, e0, f0);
+                        let r0 = veorq_u64(ligerito_xor3_u64(t0, t1, g0), h0);
+                        let u0 = ligerito_xor3_u64(a1, b1, c1);
+                        let u1 = ligerito_xor3_u64(d1, e1, f1);
+                        let r1 = veorq_u64(ligerito_xor3_u64(u0, u1, g1), h1);
+                        ligerito_store_pair_q(op.add(i), r0, r1);
+                        i += 2;
+                    }
+                } else if cosets == 2 {
+                    while i < len {
+                        let off = base + i;
+                        let (a0, a1) = ligerito_load_pair_q(dp.add(off));
+                        let (b0, b1) = ligerito_load_pair_q(dp.add(keep + off));
+                        ligerito_store_pair_q(op.add(i), veorq_u64(a0, b0), veorq_u64(a1, b1));
+                        i += 2;
+                    }
+                } else {
+                    while i < len {
+                        let off = base + i;
+                        let (a0, a1) = ligerito_load_pair_q(dp.add(off));
+                        let (b0, b1) = ligerito_load_pair_q(dp.add(keep + off));
+                        let (c0, c1) = ligerito_load_pair_q(dp.add(2 * keep + off));
+                        let mut acc0 = ligerito_xor3_u64(a0, b0, c0);
+                        let mut acc1 = ligerito_xor3_u64(a1, b1, c1);
+                        let mut coset = 3usize;
+                        while coset + 2 <= cosets {
+                            let (x0, x1) = ligerito_load_pair_q(dp.add(coset * keep + off));
+                            let (y0, y1) = ligerito_load_pair_q(dp.add((coset + 1) * keep + off));
+                            acc0 = ligerito_xor3_u64(acc0, x0, y0);
+                            acc1 = ligerito_xor3_u64(acc1, x1, y1);
+                            coset += 2;
+                        }
+                        if coset < cosets {
+                            let (x0, x1) = ligerito_load_pair_q(dp.add(coset * keep + off));
+                            acc0 = veorq_u64(acc0, x0);
+                            acc1 = veorq_u64(acc1, x1);
+                        }
+                        ligerito_store_pair_q(op.add(i), acc0, acc1);
+                        i += 2;
+                    }
+                }
+            }
+        };
+        if keep >= 2 * SMALL_NTT_MIN_ELEMS {
+            out.par_chunks_mut(SMALL_NTT_MIN_ELEMS)
+                .enumerate()
+                .for_each(|(ci, chunk)| collapse_chunk(ci * SMALL_NTT_MIN_ELEMS, chunk));
+        } else {
+            collapse_chunk(0, out.as_mut_slice());
+        }
+        return out;
+    }
+
     let mut out = data[..keep].to_vec();
     let add_cosets = |base: usize, chunk: &mut [F128]| {
         let len = chunk.len();
@@ -9687,6 +10949,26 @@ impl SumcheckProver {
             .expect("glue without introduce_new");
         assert_eq!(b_new.len(), self.combined_basis.len());
         const PAR_THRESHOLD: usize = 4096;
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+        if sc_glue_prep_enabled() {
+            let prep = unsafe {
+                crate::field::gf2_128::aarch64::const_prep(core::mem::transmute::<
+                    F128,
+                    core::arch::aarch64::uint64x2_t,
+                >(alpha))
+            };
+            if self.combined_basis.len() < PAR_THRESHOLD {
+                glue_add_scaled_prep_slice(&mut self.combined_basis, &b_new, prep, alpha);
+            } else {
+                self.combined_basis
+                    .par_chunks_mut(1024)
+                    .zip(b_new.par_chunks(1024))
+                    .for_each(|(acc, src)| glue_add_scaled_prep_slice(acc, src, prep, alpha));
+            }
+            crate::scratch::give_sparse_ntt_data(b_new);
+            self.t_r += alpha * h_new;
+            return;
+        }
         if self.combined_basis.len() < PAR_THRESHOLD {
             for (acc, &v) in self.combined_basis.iter_mut().zip(b_new.iter()) {
                 *acc += alpha * v;
