@@ -480,7 +480,7 @@ pub fn prove<C: Challenger>(
     let mu = n.trailing_zeros() as usize;
 
     // Phase timing (set PERM_TRACE=1). `tp` returns ms since the last reset.
-    let trace = std::env::var("PERM_TRACE").is_ok();
+    let trace = crate::env_once_sweep!(std::env::var("PERM_TRACE").is_ok());
     let mut t = std::time::Instant::now();
     let mut tp = |label: &str| {
         if trace {

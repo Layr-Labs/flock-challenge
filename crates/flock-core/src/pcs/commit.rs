@@ -336,8 +336,8 @@ fn ntt_top_epool_env_clear() -> bool {
         });
         return *CLEAR;
     }
-    std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none()
-        && std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none()
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_NTT_TOP_EPOOL").is_none())
+        && crate::env_once_sweep!(std::env::var_os("FLOCK_NTT_BLOCK_REGIONS").is_none())
 }
 
 /// The `FLOCK_NO_NTT_FROM_MSG` term of [`use_ranked_from_message_commit`],
@@ -374,7 +374,7 @@ fn merkle_subtree_parents_env_off() -> bool {
         });
         return *OFF;
     }
-    std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some()
+    crate::env_once_sweep!(std::env::var_os("FLOCK_NO_MERKLE_SUBTREE_PARENTS").is_some())
 }
 
 /// The `FLOCK_NO_PREFAULT` opt-out of [`prefault_codeword_during`], kept the
@@ -810,7 +810,7 @@ pub(crate) fn cpu_transform_and_tree(
         let total_nodes = 2 * params.n_leaves() - 1;
         crate::gpu_commit::take_tree(total_nodes)
     });
-    let timing = std::env::var_os("FLOCK_COMMIT_TIMING").is_some();
+    let timing = crate::env_once_sweep!(std::env::var_os("FLOCK_COMMIT_TIMING").is_some());
     let cpu_ntt0 = timing.then(commit_cpu_ms);
     let t_ntt = std::time::Instant::now();
     let mut prehashed_parent_levels = 0usize;

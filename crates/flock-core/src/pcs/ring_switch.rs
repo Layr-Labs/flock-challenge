@@ -2941,7 +2941,7 @@ pub fn prove<Ch: Challenger>(
     // So packed_witness.len() = 2^(x_outer.len() - 1). Enforce that.
     assert_eq!(l, 1 << (x_outer.len() - 1));
 
-    let trace = std::env::var("PCS_TRACE").is_ok();
+    let trace = crate::env_once_sweep!(std::env::var("PCS_TRACE").is_ok());
 
     challenger.observe_label(b"flock-ring-switch-v0");
 
@@ -3102,7 +3102,7 @@ fn batched_open_trace_env() -> bool {
         });
         return *ON;
     }
-    std::env::var("PCS_TRACE").is_ok() || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
+    crate::env_once_sweep!(std::env::var("PCS_TRACE").is_ok()) || std::env::var_os("FLOCK_OPEN_TIMING").is_some()
 }
 
 /// The `FLOCK_NO_OPEN_DEFERRED_C` term of the deferred-C precondition, kept
