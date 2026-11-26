@@ -3939,6 +3939,7 @@ fn seeded_sweep_hoist_applies(
 /// index makes the same `accumulate_convert_ab_nomul_seeded::<U>` call with
 /// the same rows, span, table and bank as the per-index loop.
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn seeded_sweep_hoisted<const U: bool>(
     range: std::ops::Range<usize>,
     x_hi: usize,
@@ -3956,19 +3957,59 @@ fn seeded_sweep_hoisted<const U: bool>(
     let x_hi_outer = x_hi << n_lo;
     let x_hi_inner = x_hi << n_lo_and_inner;
     let mut spans = [(0usize, 0usize, false); HOIST_MAX_WINDOWS];
+    #[cfg(target_arch = "aarch64")]
+    let mut first_by_win = [u8::MAX; HOIST_MAX_WINDOWS];
+    #[cfg(target_arch = "aarch64")]
+    let mut all_live_pair16 = true;
     for (within_hash_outer, span) in spans.iter_mut().enumerate().take(within_outer_mask + 1) {
         let n_b_med = b_med_counts[within_hash_outer] as usize;
         if n_b_med != 0 {
-            *span = (
-                representation.first_materialized_b_med(within_hash_outer),
-                representation.materialized_b_med_end(within_hash_outer, n_b_med),
-                true,
-            );
+            let first = representation.first_materialized_b_med(within_hash_outer);
+            let end = representation.materialized_b_med_end(within_hash_outer, n_b_med);
+            #[cfg(target_arch = "aarch64")]
+            {
+                all_live_pair16 &= first <= end && end <= 16 && end - first == 14;
+                first_by_win[within_hash_outer] = first as u8;
+            }
+            *span = (first, end, true);
         }
     }
     let ab = ab_inner.as_ptr();
     let tp = tables.as_ptr();
     let bp = banks.as_mut_ptr();
+    #[cfg(target_arch = "aarch64")]
+    if U && all_live_pair16 && kernels::ab_completion_pair16_enabled() {
+        let ab_len = ab_inner.len();
+        for x_outer_lo in range {
+            let within_hash_outer = (x_outer_lo | x_hi_outer) & within_outer_mask;
+            // SAFETY: `within_hash_outer <= within_outer_mask < HOIST_MAX_WINDOWS`.
+            let first_b_med = unsafe { *first_by_win.get_unchecked(within_hash_outer) } as usize;
+            if first_b_med == u8::MAX as usize {
+                continue;
+            }
+            let chunk_byte_base = ((x_outer_lo << N_INNER) | x_hi_inner) * N_CHUNKS;
+            let pf_off = chunk_byte_base + 2048;
+            if pf_off < ab_len {
+                // SAFETY: `pf_off < ab_inner.len()`; prefetch is a read-only hint.
+                unsafe {
+                    core::arch::asm!(
+                        "prfm pldl1strm, [{p}]",
+                        p = in(reg) ab.add(pf_off),
+                        options(nostack, preserves_flags, readonly),
+                    );
+                }
+            }
+            // SAFETY: `seeded_sweep_hoist_applies` checked range bounds and
+            // `all_live_pair16` verified `first_b_med + 14 <= 16`.
+            unsafe {
+                let rows = &*ab.add(chunk_byte_base).cast::<[[u8; 64]; 1 << N_MEDIUM]>();
+                let table = core::slice::from_raw_parts(tp.add((x_outer_lo >> bank_bits) * CONVERT_TABLE_SIZE), CONVERT_TABLE_SIZE);
+                let bank = &mut *bp.add((x_outer_lo & bank_mask) * ELL).cast::<[F128; ELL]>();
+                kernels::aarch64::accumulate_convert_ab_nomul_seeded_pair16::<U>(rows, first_b_med, table, bank);
+            }
+        }
+        return;
+    }
     for x_outer_lo in range {
         let within_hash_outer = (x_outer_lo | x_hi_outer) & within_outer_mask;
         // SAFETY: `within_hash_outer <= within_outer_mask < HOIST_MAX_WINDOWS`.

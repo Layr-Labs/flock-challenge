@@ -229,6 +229,22 @@ pub(crate) fn fold_banked_slots4_whole_into<const BANKS: usize>(
     out[..4].copy_from_slice(&fold_banked_slots4::<BANKS>(weight, input));
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+pub(crate) struct PreUnzippedWeights64([[core::arch::aarch64::uint64x2_t; 3]; 32]);
+#[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+pub(crate) struct PreUnzippedWeights64([F128; 64]);
+#[inline]
+pub(crate) fn preunzip_fold_weights64(w: &[F128; 64]) -> PreUnzippedWeights64 {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))] { PreUnzippedWeights64(unsafe { aarch64::preunzip_fold_weights64(w) }) }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))] { PreUnzippedWeights64(*w) }
+}
+#[inline]
+pub(crate) fn fold_banked_slots8_whole_into_preunzipped(w: &PreUnzippedWeights64, inp: &[F128], out: &mut [F128], ol: usize, olt: bool) {
+    assert!(inp.len() >= 512 && out.len() >= 8);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))] unsafe { aarch64::fold_banked_slots8_whole_into_preunzipped(&w.0, inp, out, ol, olt); }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))] { fold_banked_slots4_whole_into::<64>(&w.0, &inp[..256], &mut out[..4], ol, olt); fold_banked_slots4_whole_into::<64>(&w.0, &inp[256..512], &mut out[4..8], ol, olt); }
+}
+
 
 /// Fold the ranked zerocheck AB bank matrix, laid out bank-major, into its
 /// 64 lane sums. Two adjacent lanes share each of the 128 weight loads, and

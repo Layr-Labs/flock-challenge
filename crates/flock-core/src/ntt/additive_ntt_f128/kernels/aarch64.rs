@@ -140,7 +140,7 @@ unsafe fn fold_x64_into(
     m: core::arch::aarch64::uint64x2_t,
 ) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
-    unsafe { xor3(l, vextq_u64::<1>(vdupq_n_u64(0), m), pmull_hi_q(m, vdupq_n_u64(0x87))) }
+    unsafe { xor3(l, vextq_u64::<1>(m, m), pmull_hi_q(m, vdupq_n_u64(0x86))) }
 }
 
 /// `a.hi * b.hi` as one `pmull2`, with `b` taken as a vector operand (so a
@@ -174,8 +174,8 @@ unsafe fn fold_x64_into(
 ) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
     unsafe {
-        let s = veorq_u64(l, vextq_u64::<1>(vdupq_n_u64(0), m));
-        fused_pmull_hi_acc(s, m, vdupq_n_u64(0x87))
+        let s = veorq_u64(l, vextq_u64::<1>(m, m));
+        fused_pmull_hi_acc(s, m, vdupq_n_u64(0x86))
     }
 }
 
@@ -193,13 +193,7 @@ unsafe fn fold_x64_plus_into(
     x: core::arch::aarch64::uint64x2_t,
 ) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
-    unsafe {
-        xor3(
-            l,
-            vextq_u64::<1>(vdupq_n_u64(0), m),
-            fused_pmull_hi_acc(x, m, vdupq_n_u64(0x87)),
-        )
-    }
+    unsafe { xor3(l, vextq_u64::<1>(m, m), fused_pmull_hi_acc(x, m, vdupq_n_u64(0x86))) }
 }
 
 /// [`fold_x64_plus_into`] without the `sha3` extension (one extra `eor`).
@@ -644,23 +638,8 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
     twiddles: &[F128; 7],
 ) {
     use core::arch::aarch64::*;
-
-    #[inline(always)]
-    unsafe fn store_pair_nt(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
-        unsafe {
-            core::arch::asm!(
-                "stnp {x:q}, {y:q}, [{dst}]",
-                dst = in(reg) dst,
-                x = in(vreg) x,
-                y = in(vreg) y,
-                options(nostack, preserves_flags),
-            );
-        }
-    }
-
     unsafe {
         debug_assert_eq!(num_ntts, 8);
-        // The caller guarantees eight lanes; keep the width constant in release builds.
         let num_ntts = 8;
         debug_assert!(row_start <= row_end && row_end <= eighth);
         if ZERO_ROOT {
@@ -668,53 +647,36 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
             debug_assert_eq!(twiddles[1], F128::ZERO);
             debug_assert_eq!(twiddles[3], F128::ZERO);
         }
-        let t: [uint64x2_t; 7] =
-            core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
-        let ext = use_const_ext();
-        let prep: [Prep; 7] = core::array::from_fn(|i| three_coeffs(t[i]));
-        let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
+        let prep: [Prep; 7] =
+            core::array::from_fn(|i| three_coeffs(vld1q_u64((&raw const twiddles[i]).cast::<u64>())));
+        let tp = prep.as_ptr();
         let step = eighth * num_ntts;
-
-        for r in row_start..row_end {
-            let off = r * num_ntts;
-            for lane in 0..num_ntts {
-                let src_base = src.add(off + lane);
-                let mut v: [uint64x2_t; 8] =
-                    core::array::from_fn(|i| vld1q_u64(src_base.add(i * step).cast::<u64>()));
-
-                if ext {
-                    if ZERO_ROOT {
-                        fused3_zero_root_prepared_q(&mut v, prep[2], prep[4], prep[5], prep[6]);
-                    } else {
-                        fused3_prepared_q(&mut v, &prep);
-                    }
-                } else if ZERO_ROOT {
-                    fused3_zero_root_q(&mut v, t[2], t[4], t[5], t[6]);
-                } else {
-                    fused3_general_q(&mut v, &t);
-                }
-
-                for (i, value) in v.iter().enumerate() {
-                    vst1q_u64(
-                        stage.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
-                        *value,
-                    );
-                }
-            }
-
-            // All 64 stage values are initialized above before this drain.
-            // Drain each 128 B row before the next group reuses the stage.
-            for i in 0..8 {
-                let src_row = stage.as_ptr().add(i * num_ntts);
-                let dst_row = dst.add(off + i * step);
-                let mut lane = 0;
-                while lane < num_ntts {
-                    let x = vld1q_u64(src_row.add(lane).cast::<u64>());
-                    let y = vld1q_u64(src_row.add(lane + 1).cast::<u64>());
-                    store_pair_nt(dst_row.add(lane), x, y);
-                    lane += 2;
-                }
-            }
+        let mut s: [*const F128; 8] = core::array::from_fn(|i| src.add(row_start * num_ntts + i * step));
+        let mut d: [*mut F128; 8] = core::array::from_fn(|i| dst.add(row_start * num_ntts + i * step));
+        let mut pairs = (row_end - row_start) * 4;
+        while pairs != 0 {
+            if ZERO_ROOT {
+                let ((x0_0, x0_1), (x4_0, x4_1)) = (load_pair_q_adv(&mut s[0]), load_pair_q_adv(&mut s[4]));
+                let ((x1_0, x1_1), (x5_0, x5_1)) = (load_pair_q_adv(&mut s[1]), load_pair_q_adv(&mut s[5]));
+                let ((v4_0, v4_1), (v5_0, v5_1)) = ((veorq_u64(x4_0, x0_0), veorq_u64(x4_1, x0_1)), (veorq_u64(x5_0, x1_0), veorq_u64(x5_1, x1_1)));
+                store_pair_nt_adv(&mut d[0], x0_0, x0_1); store_pair_nt_adv(&mut d[1], veorq_u64(x1_0, x0_0), veorq_u64(x1_1, x0_1));
+                let ((x2_0, x2_1), (x6_0, x6_1)) = (load_pair_q_adv(&mut s[2]), load_pair_q_adv(&mut s[6]));
+                let ((x3_0, x3_1), (x7_0, x7_1)) = (load_pair_q_adv(&mut s[3]), load_pair_q_adv(&mut s[7]));
+                let ((v6_0, v6_1), (v7_0, v7_1)) = ((veorq_u64(x6_0, x2_0), veorq_u64(x6_1, x2_1)), (veorq_u64(x7_0, x3_0), veorq_u64(x7_1, x3_1)));
+                let t4 = load_prep_q::<4>(tp);
+                let ((o2_0, o3_0), (o2_1, o3_1)) = (three_fold_zero(veorq_u64(x2_0, x0_0), veorq_u64(x3_0, x1_0), t4), three_fold_zero(veorq_u64(x2_1, x0_1), veorq_u64(x3_1, x1_1), t4));
+                store_pair_nt_adv(&mut d[2], o2_0, o2_1); store_pair_nt_adv(&mut d[3], o3_0, o3_1);
+                let t2 = load_prep_q::<2>(tp);
+                let ((u4_0, r6_0, p4_0), (u4_1, r6_1, p4_1)) = (three_lazy_zero(v4_0, v6_0, t2), three_lazy_zero(v4_1, v6_1, t2));
+                let ((u5_0, r7_0), (u5_1, r7_1)) = (three_fold_zero(v5_0, v7_0, t2), three_fold_zero(v5_1, v7_1, t2));
+                let t5 = load_prep_q::<5>(tp);
+                let ((o4_0, o5_0), (o4_1, o5_1)) = (three_fold(u4_0, u5_0, t5, p4_0), three_fold(u4_1, u5_1, t5, p4_1));
+                store_pair_nt_adv(&mut d[4], o4_0, o4_1); store_pair_nt_adv(&mut d[5], o5_0, o5_1);
+                let t6 = load_prep_q::<6>(tp);
+                let ((o6_0, o7_0), (o6_1, o7_1)) = (three_fold(r6_0, r7_0, t6, p4_0), three_fold(r6_1, r7_1, t6, p4_1));
+                store_pair_nt_adv(&mut d[6], o6_0, o6_1); store_pair_nt_adv(&mut d[7], o7_0, o7_1);
+            } else { fused3_prepared_2lane_q::<true, true>(&mut s, &mut d, tp); }
+            pairs -= 1;
         }
     }
 }
@@ -1084,39 +1046,87 @@ unsafe fn fused3_zero_root_prepared_q(
     }
 }
 
+#[inline(always)]
+unsafe fn load_pair_q_adv(ptr: &mut *const F128) -> Prep {
+    let (a, b);
+    unsafe { core::arch::asm!("ldp {a:q}, {b:q}, [{ptr}], #32", ptr = inout(reg) *ptr, a = out(vreg) a, b = out(vreg) b, options(readonly, nostack, preserves_flags)); }
+    (a, b)
+}
+#[inline(always)]
+unsafe fn store_pair_nt_adv(ptr: &mut *mut F128, a: core::arch::aarch64::uint64x2_t, b: core::arch::aarch64::uint64x2_t) {
+    unsafe { core::arch::asm!("stnp {a:q}, {b:q}, [{ptr}]\nadd {ptr}, {ptr}, #32", ptr = inout(reg) *ptr, a = in(vreg) a, b = in(vreg) b, options(nostack, preserves_flags)); }
+}
+#[inline(always)]
+unsafe fn load_prep_q<const I: usize>(t: *const Prep) -> Prep {
+    let (lo, mid);
+    unsafe { core::arch::asm!("ldp {lo:q}, {mid:q}, [{t}, #{off}]", t = in(reg) t, off = const (I * 32), lo = out(vreg) lo, mid = out(vreg) mid, options(readonly, nostack, preserves_flags)); }
+    (lo, mid)
+}
+#[inline(always)]
+unsafe fn fused3_prepared_2lane_q<const ABSORB: bool, const OUT_OF_PLACE: bool>(src: &mut [*const F128; 8], dst: &mut [*mut F128; 8], tp: *const Prep) {
+    use core::arch::aarch64::*;
+    #[inline(always)] unsafe fn acc2(u: uint64x2_t, v: uint64x2_t, c: uint64x2_t) -> uint64x2_t { unsafe { fused_pmull_hi_acc(fused_pmull_lo_acc(u, v, c), v, c) } }
+    #[inline(always)] unsafe fn lz0<const A: bool>(u: uint64x2_t, v: uint64x2_t, t: Prep) -> (uint64x2_t, uint64x2_t, uint64x2_t) { unsafe { if A { (acc2(u, v, t.0), v, cross_sum_q(v, t.1)) } else { three_lazy_zero(u, v, t) } } }
+    #[inline(always)] unsafe fn afold<const A: bool>(ua: uint64x2_t, us: uint64x2_t, v: uint64x2_t, t: Prep, p: uint64x2_t, x: uint64x2_t) -> Prep {
+        unsafe { if A { let o = fold_x64_plus_into(acc2(ua, v, t.0), acc2(p, v, t.1), x); (o, veorq_u64(v, o)) } else { three_fold(us, v, t, p) } }
+    }
+    macro_rules! ld { ($i:expr) => { if OUT_OF_PLACE { load_pair_q_adv(&mut src[$i]) } else { load_pair_q(dst[$i]) } }; }
+    macro_rules! st { ($i:expr, $a:expr, $b:expr) => { if OUT_OF_PLACE { store_pair_nt_adv(&mut dst[$i], $a, $b) } else { store_pair_q_adv(&mut dst[$i], $a, $b) } }; }
+    unsafe {
+        let t0 = load_prep_q::<0>(tp);
+        let ((x1_0, x1_1), (x5_0, x5_1)) = (ld!(1), ld!(5));
+        let ((u1_0, v5_0, p1_0), (u1_1, v5_1, p1_1)) = (lz0::<ABSORB>(x1_0, x5_0, t0), lz0::<ABSORB>(x1_1, x5_1, t0));
+        let ((x3_0, x3_1), (x7_0, x7_1)) = (ld!(3), ld!(7));
+        let ((u3_0, r7_0), (u3_1, r7_1)) = (three_fold_zero(x3_0, x7_0, t0), three_fold_zero(x3_1, x7_1, t0));
+        let t1 = load_prep_q::<1>(tp);
+        let ((u1b_0, r3_0), (u1b_1, r3_1)) = (three_fold(u1_0, u3_0, t1, p1_0), three_fold(u1_1, u3_1, t1, p1_1));
+        let t2 = load_prep_q::<2>(tp);
+        let ((u5b_0, r7b_0), (u5b_1, r7b_1)) = (afold::<ABSORB>(u1_0, v5_0, r7_0, t2, p1_0, v5_0), afold::<ABSORB>(u1_1, v5_1, r7_1, t2, p1_1, v5_1));
+        let ((x0_0, x0_1), (x4_0, x4_1)) = (ld!(0), ld!(4));
+        let ((u0_0, v4_0, p0_0), (u0_1, v4_1, p0_1)) = (lz0::<ABSORB>(x0_0, x4_0, t0), lz0::<ABSORB>(x0_1, x4_1, t0));
+        let ((x2_0, x2_1), (x6_0, x6_1)) = (ld!(2), ld!(6));
+        let ((u2_0, r6_0), (u2_1, r6_1)) = (three_fold_zero(x2_0, x6_0, t0), three_fold_zero(x2_1, x6_1, t0));
+        let ((u0b_0, v2_0, q0_0), (u0b_1, v2_1, q0_1)) = if ABSORB { ((acc2(u0_0, u2_0, t1.0), u2_0, acc2(p0_0, u2_0, t1.1)), (acc2(u0_1, u2_1, t1.0), u2_1, acc2(p0_1, u2_1, t1.1))) } else { (three_lazy(u0_0, u2_0, t1, p0_0), three_lazy(u0_1, u2_1, t1, p0_1)) };
+        let ((u4p_0, r6b_0, q4_0), (u4p_1, r6b_1, q4_1)) = if ABSORB {
+            let ((u4p0, q40), (u4p1, q41)) = ((acc2(u0_0, r6_0, t2.0), acc2(p0_0, r6_0, t2.1)), (acc2(u0_1, r6_1, t2.0), acc2(p0_1, r6_1, t2.1)));
+            ((u4p0, xor3(r6_0, u4p0, v4_0), q40), (u4p1, xor3(r6_1, u4p1, v4_1), q41))
+        } else { (three_lazy(v4_0, r6_0, t2, p0_0), three_lazy(v4_1, r6_1, t2, p0_1)) };
+        let t5 = load_prep_q::<5>(tp);
+        let ((o4_0, o5_0), (o4_1, o5_1)) = (afold::<ABSORB>(u4p_0, u4p_0, u5b_0, t5, q4_0, v4_0), afold::<ABSORB>(u4p_1, u4p_1, u5b_1, t5, q4_1, v4_1));
+        st!(4, o4_0, o4_1); st!(5, o5_0, o5_1);
+        let t6 = load_prep_q::<6>(tp);
+        let ((o6_0, o7_0), (o6_1, o7_1)) = (three_fold(r6b_0, r7b_0, t6, q4_0), three_fold(r6b_1, r7b_1, t6, q4_1));
+        st!(6, o6_0, o6_1); st!(7, o7_0, o7_1);
+        let t3 = load_prep_q::<3>(tp);
+        let ((o0_0, o1_0), (o0_1, o1_1)) = (three_fold(u0b_0, u1b_0, t3, q0_0), three_fold(u0b_1, u1b_1, t3, q0_1));
+        st!(0, o0_0, o0_1); st!(1, o1_0, o1_1);
+        let t4 = load_prep_q::<4>(tp);
+        let ((o2_0, o3_0), (o2_1, o3_1)) = (afold::<ABSORB>(u0b_0, v2_0, r3_0, t4, q0_0, v2_0), afold::<ABSORB>(u0b_1, v2_1, r3_1, t4, q0_1, v2_1));
+        st!(2, o2_0, o2_1); st!(3, o3_0, o3_1);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "aes")]
 #[inline(never)]
 pub(in super::super) unsafe fn butterfly_fused_3layer_row_with_const_q<const ABSORB: bool>(
-    ptr: *mut F128,
-    eighth: usize,
-    num_ntts: usize,
-    lanes: usize,
-    r: usize,
-    t: &[(
-        core::arch::aarch64::uint64x2_t,
-        core::arch::aarch64::uint64x2_t,
-    ); 7],
+    ptr: *mut F128, eighth: usize, num_ntts: usize, even_lanes: usize, odd_lanes: usize, row_start: usize, row_end: usize, t: &[Prep; 7],
 ) {
     use core::arch::aarch64::*;
     unsafe {
-        // Each of the eight rows is addressed from its end at one shared
-        // negative byte offset, which is also the loop counter.
-        let step = eighth * num_ntts;
-        let ends: [*mut u8; 8] =
-            core::array::from_fn(|i| ptr.add(r * num_ntts + i * step + lanes).cast::<u8>());
-        let mut off = -((lanes * core::mem::size_of::<F128>()) as isize);
-        while off != 0 {
-            let mut v: [uint64x2_t; 8] =
-                core::array::from_fn(|i| vld1q_u64(ends[i].offset(off).cast::<u64>()));
-            if ABSORB {
-                fused3_prepared_absorb_q(&mut v, t);
-            } else {
-                fused3_prepared_q(&mut v, t);
+        let (step, tp, mut dummy_src) = (eighth * num_ntts, t.as_ptr(), [core::ptr::null::<F128>(); 8]);
+        for r in row_start..row_end {
+            let lanes = if r & 1 == 1 { odd_lanes } else { even_lanes };
+            let row_base = ptr.add(r * num_ntts);
+            let mut p: [*mut F128; 8] = core::array::from_fn(|i| row_base.add(i * step));
+            let mut pairs = lanes >> 1;
+            while pairs != 0 { fused3_prepared_2lane_q::<ABSORB, false>(&mut dummy_src, &mut p, tp); pairs -= 1; }
+            if lanes & 1 != 0 {
+                let mut v: [uint64x2_t; 8] = core::array::from_fn(|i| vld1q_u64(p[i].cast::<u64>()));
+                let tl = [load_prep_q::<0>(tp), load_prep_q::<1>(tp), load_prep_q::<2>(tp), load_prep_q::<3>(tp), load_prep_q::<4>(tp), load_prep_q::<5>(tp), load_prep_q::<6>(tp)];
+                if ABSORB { fused3_prepared_absorb_q(&mut v, &tl); } else { fused3_prepared_q(&mut v, &tl); }
+                for (i, value) in v.into_iter().enumerate() { vst1q_u64(p[i].cast::<u64>(), value); }
             }
-            for (i, value) in v.into_iter().enumerate() {
-                vst1q_u64(ends[i].offset(off).cast::<u64>(), value);
-            }
-            off = next_lane_off(off);
         }
     }
 }
@@ -1143,11 +1153,11 @@ pub(super) unsafe fn butterfly_fused_3layer_row(
             let prepared = core::array::from_fn(|i| three_coeffs(t[i]));
             if use_ntt_absorb() {
                 butterfly_fused_3layer_row_with_const_q::<true>(
-                    ptr, eighth, num_ntts, lanes, r, &prepared,
+                    ptr, eighth, num_ntts, lanes, lanes, r, r + 1, &prepared,
                 );
             } else {
                 butterfly_fused_3layer_row_with_const_q::<false>(
-                    ptr, eighth, num_ntts, lanes, r, &prepared,
+                    ptr, eighth, num_ntts, lanes, lanes, r, r + 1, &prepared,
                 );
             }
         } else {
@@ -1173,11 +1183,9 @@ pub(super) unsafe fn butterfly_fused_3layer_rows(
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         if use_three_const_fold() {
             let prepared = core::array::from_fn(|i| three_coeffs(t[i]));
-            for r in row_start..row_end {
-                butterfly_fused_3layer_row_with_const_q::<false>(
-                    ptr, eighth, num_ntts, num_ntts, r, &prepared,
-                );
-            }
+            butterfly_fused_3layer_row_with_const_q::<false>(
+                ptr, eighth, num_ntts, num_ntts, num_ntts, row_start, row_end, &prepared,
+            );
         } else {
             for r in row_start..row_end {
                 butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
@@ -1328,11 +1336,9 @@ pub(super) unsafe fn butterfly_fused_3layer_lead_rows(
                     three_coeffs(t[5]),
                     three_coeffs(t[6]),
                 ];
-                for r in 0..eighth {
-                    butterfly_fused_3layer_row_with_const_q::<false>(
-                        ptr, eighth, num_ntts, num_ntts, r, &prepared,
-                    );
-                }
+                butterfly_fused_3layer_row_with_const_q::<true>(
+                    ptr, eighth, num_ntts, num_ntts, num_ntts, 0, eighth, &prepared,
+                );
             } else {
                 for r in 0..eighth {
                     butterfly_fused_3layer_row_with_q(ptr, eighth, num_ntts, num_ntts, r, &t);
@@ -1641,24 +1647,6 @@ unsafe fn butterfly_fused_2layer_low_lazy(
             vst1q_u64(pd.cast::<u64>(), veorq_u64(nd, fc));
         }
     }
-}
-
-/// `off + 16` (one `F128` lane), opaque to the optimizer: the lane loops then
-/// keep `off` as their only induction variable, address every row at
-/// `[end, off]` and test `off` itself for the exit (`add` + `cbnz` per lane).
-#[inline(always)]
-fn next_lane_off(off: isize) -> isize {
-    const _: () = assert!(core::mem::size_of::<F128>() == 16);
-    let mut o = off;
-    // SAFETY: register-only arithmetic.
-    unsafe {
-        core::arch::asm!(
-            "add {o}, {o}, #16",
-            o = inout(reg) o,
-            options(pure, nomem, nostack, preserves_flags),
-        );
-    }
-    o
 }
 
 #[inline(always)]
@@ -2484,7 +2472,9 @@ mod three_const_fold_tests {
                                     1,
                                     n,
                                     n,
+                                    n,
                                     0,
+                                    1,
                                     &prepared,
                                 );
                             } else if mode == 1 {
@@ -2494,7 +2484,9 @@ mod three_const_fold_tests {
                                     1,
                                     n,
                                     n,
+                                    n,
                                     0,
+                                    1,
                                     &prepared,
                                 );
                             } else {
@@ -3018,7 +3010,7 @@ mod lane_loop_tests {
                         let prepared: [Prep; 7] = core::array::from_fn(|i| {
                             three_coeffs(vld1q_u64((&raw const tw[i]).cast::<u64>()))
                         });
-                        butterfly_fused_3layer_row_with_const_q::<false>(actual.as_mut_ptr(), 1, num_ntts, lanes, 0, &prepared);
+                        butterfly_fused_3layer_row_with_const_q::<false>(actual.as_mut_ptr(), 1, num_ntts, lanes, lanes, 0, 1, &prepared);
                     }
                     assert!(actual == expected, "radix-8 num_ntts={num_ntts} lanes={lanes}");
                 }

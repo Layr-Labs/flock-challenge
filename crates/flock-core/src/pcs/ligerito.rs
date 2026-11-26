@@ -3134,26 +3134,31 @@ fn transpose_forward_ntt_fused_3layer(
         pmull_fold: bool,
     ) {
         use core::arch::aarch64::uint64x2_t;
-        use crate::field::gf2_128::aarch64::{mul_const_pair_prep, mul_const_pair_prep_pmull};
+        use crate::field::gf2_128::aarch64::{mul_const_pair_prep, mul_const_prep_xor};
 
         let bottom = [values[b[0]], values[b[1]]];
         let sums = [values[a[0]] + bottom[0], values[a[1]] + bottom[1]];
-        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
-        // layout maps lo/hi to vector lanes 0/1 without padding.
-        let products = unsafe {
-            let x0 = core::mem::transmute::<F128, uint64x2_t>(sums[0]);
-            let x1 = core::mem::transmute::<F128, uint64x2_t>(sums[1]);
-            let products = if pmull_fold {
-                mul_const_pair_prep_pmull(tw[0], x0, tw[1], x1)
-            } else {
-                mul_const_pair_prep(tw[0], x0, tw[1], x1)
-            };
-            products.map(|p| core::mem::transmute::<uint64x2_t, F128>(p))
-        };
         values[a[0]] = sums[0];
         values[a[1]] = sums[1];
-        values[b[0]] = products[0] + bottom[0];
-        values[b[1]] = products[1] + bottom[1];
+        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
+        // layout maps lo/hi to vector lanes 0/1 without padding.
+        unsafe {
+            let x0 = core::mem::transmute::<F128, uint64x2_t>(sums[0]);
+            let x1 = core::mem::transmute::<F128, uint64x2_t>(sums[1]);
+            if pmull_fold {
+                let b0 = core::mem::transmute::<F128, uint64x2_t>(bottom[0]);
+                let b1 = core::mem::transmute::<F128, uint64x2_t>(bottom[1]);
+                values[b[0]] =
+                    core::mem::transmute::<uint64x2_t, F128>(mul_const_prep_xor(tw[0], x0, b0));
+                values[b[1]] =
+                    core::mem::transmute::<uint64x2_t, F128>(mul_const_prep_xor(tw[1], x1, b1));
+            } else {
+                let products = mul_const_pair_prep(tw[0], x0, tw[1], x1)
+                    .map(|p| core::mem::transmute::<uint64x2_t, F128>(p));
+                values[b[0]] = products[0] + bottom[0];
+                values[b[1]] = products[1] + bottom[1];
+            }
+        }
     }
 
     let num_blocks = 1usize << layer;
@@ -3429,6 +3434,7 @@ struct L0FactoredFinal3Constants {
 /// The ordinary butterfly control spends four layer-2 and four layer-1
 /// products. Standard additive-NTT identities eliminate the zero twiddles
 /// and share `A*p1`, `(A+D)*p3`, and `D*p2` across retained outputs.
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))))]
 #[inline(always)]
 fn l0_factored_final3_retained_row(
     values: [F128; 8],
@@ -3496,6 +3502,50 @@ fn transpose_forward_ntt_factored_final_3layer_low_half_with_round_msg(
     };
 
     let data_ptr = data.as_mut_ptr() as usize;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    let (u_0, u_2) = {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64};
+        use crate::field::gf2_128::aarch64::{const_prep, TriNeon};
+        let to_q = |x: F128| unsafe { core::mem::transmute::<F128, uint64x2_t>(x) };
+        let prep = [constants.a, constants.d, constants.a_plus_d, constants.b]
+            .map(|t| unsafe { const_prep(to_q(t)) });
+        (0..eighth / 2)
+            .into_par_iter()
+            .with_min_len(small_ntt_min_jobs(16))
+            .fold(
+                || unsafe { (TriNeon::zero(), TriNeon::zero()) },
+                |(mut u0, mut u2), row_pair| {
+                    let even_row = 2 * row_pair;
+                    let odd_row = even_row + 1;
+                    // SAFETY: each `row_pair` owns 16 disjoint inputs and 8 retained outputs.
+                    unsafe {
+                        let ptr = data_ptr as *mut F128;
+                        let f_ptr = f.as_ptr();
+                        let even = l0_factored_final3_prepared_row(
+                            core::array::from_fn(|i| *ptr.add(even_row + i * eighth)),
+                            prep,
+                        );
+                        let odd = l0_factored_final3_prepared_row(
+                            core::array::from_fn(|i| *ptr.add(odd_row + i * eighth)),
+                            prep,
+                        );
+                        for segment in 0..4 {
+                            let idx = segment * eighth + even_row;
+                            *ptr.add(idx) = even[segment];
+                            *ptr.add(idx + 1) = odd[segment];
+                            let (f0, f1) = (to_q(*f_ptr.add(idx)), to_q(*f_ptr.add(idx + 1)));
+                            let (ev, od) = (to_q(even[segment]), to_q(odd[segment]));
+                            u0.acc_q(f0, ev);
+                            u2.acc_q(veorq_u64(f0, f1), veorq_u64(ev, od));
+                        }
+                    }
+                    (u0, u2)
+                },
+            )
+            .map(|(u0, u2)| unsafe { (u0.reduce(), u2.reduce()) })
+            .reduce(|| (F128::ZERO, F128::ZERO), |(a0, a2), (b0, b2)| (a0 + b0, a2 + b2))
+    };
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
     let (u_0, u_2) = (0..eighth / 2)
         .into_par_iter()
         .with_min_len(small_ntt_min_jobs(16))
@@ -4556,7 +4606,7 @@ fn densify_c2_windows_prepared_first_3layer(
     prefix_k: usize,
 ) -> Vec<F128> {
     use core::arch::aarch64::uint64x2_t;
-    use crate::field::gf2_128::aarch64::{const_prep, mul_const_pair_prep, ConstPrep};
+    use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep_xor, ConstPrep};
 
     #[inline(always)]
     fn butterfly_pair(
@@ -4567,21 +4617,22 @@ fn densify_c2_windows_prepared_first_3layer(
     ) {
         let bottom = [values[b[0]], values[b[1]]];
         let sums = [values[a[0]] + bottom[0], values[a[1]] + bottom[1]];
-        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
-        // layout maps lo/hi to vector lanes 0/1 without padding.
-        let products = unsafe {
-            let products = mul_const_pair_prep(
-                tw[0],
-                core::mem::transmute::<F128, uint64x2_t>(sums[0]),
-                tw[1],
-                core::mem::transmute::<F128, uint64x2_t>(sums[1]),
-            );
-            products.map(|p| core::mem::transmute::<uint64x2_t, F128>(p))
-        };
         values[a[0]] = sums[0];
         values[a[1]] = sums[1];
-        values[b[0]] = products[0] + bottom[0];
-        values[b[1]] = products[1] + bottom[1];
+        // SAFETY: AES is enabled. F128 is two u64 limbs; little-endian
+        // layout maps lo/hi to vector lanes 0/1 without padding.
+        unsafe {
+            values[b[0]] = core::mem::transmute::<uint64x2_t, F128>(mul_const_prep_xor(
+                tw[0],
+                core::mem::transmute::<F128, uint64x2_t>(sums[0]),
+                core::mem::transmute::<F128, uint64x2_t>(bottom[0]),
+            ));
+            values[b[1]] = core::mem::transmute::<uint64x2_t, F128>(mul_const_prep_xor(
+                tw[1],
+                core::mem::transmute::<F128, uint64x2_t>(sums[1]),
+                core::mem::transmute::<F128, uint64x2_t>(bottom[1]),
+            ));
+        }
     }
 
     // The kept rows are the `const_prep` rows built below
@@ -4767,6 +4818,31 @@ fn transpose_forward_ntt_single_layer_flat(
     let twiddles = single_layer_twiddles(ntt, layer);
     let twiddles: &[F128] = &twiddles;
     let data_ptr = data.as_mut_ptr() as usize;
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    if half >= 4 {
+        use core::arch::aarch64::{uint64x2_t, veorq_u64, vld1q_u64, vst1q_u64};
+        use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep_xor};
+        let (tile, tile_log) = (half.min(64), half.min(64).trailing_zeros() as usize);
+        let (tpb_log, tpb_mask) = (half_log - tile_log, (1usize << (half_log - tile_log)) - 1);
+        (0..(num_blocks << tpb_log)).into_par_iter().with_min_len(small_ntt_min_jobs(tile << 1)).for_each(|job| {
+            let (block, row0) = (job >> tpb_log, (job & tpb_mask) << tile_log);
+            unsafe {
+                let p = const_prep(core::mem::transmute::<F128, uint64x2_t>(twiddles[block]));
+                let tp = (data_ptr as *mut F128).add(block * block_size + row0).cast::<u64>();
+                let bp = tp.add(half * 2);
+                for o in (0..tile * 2).step_by(8) {
+                    let (a0, a1, a2, a3) = (vld1q_u64(tp.add(o)), vld1q_u64(tp.add(o + 2)), vld1q_u64(tp.add(o + 4)), vld1q_u64(tp.add(o + 6)));
+                    let (b0, b1, b2, b3) = (vld1q_u64(bp.add(o)), vld1q_u64(bp.add(o + 2)), vld1q_u64(bp.add(o + 4)), vld1q_u64(bp.add(o + 6)));
+                    let (s0, s1, s2, s3) = (veorq_u64(a0, b0), veorq_u64(a1, b1), veorq_u64(a2, b2), veorq_u64(a3, b3));
+                    vst1q_u64(tp.add(o), s0); vst1q_u64(tp.add(o + 2), s1); vst1q_u64(tp.add(o + 4), s2); vst1q_u64(tp.add(o + 6), s3);
+                    vst1q_u64(bp.add(o), mul_const_prep_xor(p, s0, b0)); vst1q_u64(bp.add(o + 2), mul_const_prep_xor(p, s1, b1));
+                    vst1q_u64(bp.add(o + 4), mul_const_prep_xor(p, s2, b2)); vst1q_u64(bp.add(o + 6), mul_const_prep_xor(p, s3, b3));
+                }
+            }
+        });
+        return;
+    }
 
     (0..num_blocks * half)
         .into_par_iter()
@@ -5033,6 +5109,31 @@ const L2_FACTORED_FINAL5_COSETS: usize = 8;
 const L2_FACTORED_FINAL5_CHANNELS: usize = 4;
 const L2_FACTORED_FINAL5_ROW_TILE: usize = 8;
 
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(always)]
+fn l2_factored_final5_eval_neon(
+    c: &[crate::field::gf2_128::aarch64::ConstPrep; 16],
+    p: F128, r: F128, d: F128, b1: F128,
+    p_i: [F128; 3], r_i: [F128; 3], d_i: [F128; 3], p_ij: [F128; 3],
+) -> [F128; 4] {
+    use core::arch::aarch64::{uint64x2_t, veorq_u64};
+    use crate::field::gf2_128::aarch64::{mul_const_prep, mul_three_const_sum_prep_xor};
+    unsafe {
+        let q = |x: F128| core::mem::transmute::<F128, uint64x2_t>(x);
+        let f = |x: uint64x2_t| core::mem::transmute::<uint64x2_t, F128>(x);
+        let (rq, dq, b1q) = (q(r), q(d), q(b1));
+        let (pi, ri, di, pij) = (p_i.map(q), r_i.map(q), d_i.map(q), p_ij.map(q));
+        let dr = mul_const_prep(c[0], rq);
+        let v1 = mul_three_const_sum_prep_xor(c[1], pi[0], c[2], pi[1], c[3], pi[2], veorq_u64(dq, dr));
+        let v2 = mul_three_const_sum_prep_xor(c[4], pi[0], c[5], pi[1], c[6], pi[2], rq);
+        let v3 = mul_three_const_sum_prep_xor(c[7], pi[0], c[8], pi[1], c[9], pi[2], veorq_u64(b1q, dr));
+        let v3 = mul_three_const_sum_prep_xor(c[10], ri[0], c[11], ri[1], c[12], ri[2], v3);
+        let v3 = mul_three_const_sum_prep_xor(c[4], di[0], c[5], di[1], c[6], di[2], v3);
+        let v3 = mul_three_const_sum_prep_xor(c[13], pij[0], c[14], pij[1], c[15], pij[2], v3);
+        [p, f(v1), f(v2), f(v3)]
+    }
+}
+
 /// One leaf tile of the factored direct tail. Keeping this helper out of line
 /// ensures Rayon recursion does not retain a 4 KiB stage array in every
 /// bridge frame; only a leaf tile owns the stage.
@@ -5043,6 +5144,9 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
     row_start: usize,
     eighth: usize,
     quarter: usize,
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    constants: &[crate::field::gf2_128::aarch64::ConstPrep; 16],
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
     constants: &L2FactoredFinal5Constants,
 ) {
     let mut staged = [[[core::mem::MaybeUninit::<F128>::uninit();
@@ -5089,6 +5193,10 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
         let (d, d_i) = l2_factored_first_moments(load_channel(2));
         let b1 = l2_factored_sum8(load_channel(3));
 
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+        let values = l2_factored_final5_eval_neon(constants, p, r, d, b1, p_i, r_i, d_i, p_ij);
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+        let values = {
         let delta_r = constants.delta * r;
 
         let ap = constants.a[0] * p_i[0]
@@ -5110,12 +5218,13 @@ fn transpose_forward_ntt_final_5layer_factored_tile(
             + constants.h[1] * p_ij[1]
             + constants.h[2] * p_ij[2];
 
-        let values = [
+        [
             p,
             d + delta_r + ap,
             r + bp,
             b1 + delta_r + gp + er + bd + hp,
-        ];
+        ]
+        };
         let row = row_start + local_row;
         // SAFETY: the caller assigns one disjoint 8-row tile. Each tile
         // writes those rows exactly once in all four retained quarters.
@@ -5150,6 +5259,17 @@ fn transpose_forward_ntt_final_5layer_low_eighth_factored(
     assert!(quarter.is_multiple_of(L2_FACTORED_FINAL5_ROW_TILE));
 
     let constants = l2_factored_final5_constants(ntt);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+    let constants = {
+        use core::arch::aarch64::uint64x2_t;
+        use crate::field::gf2_128::aarch64::const_prep;
+        let c = constants;
+        [
+            c.delta, c.a[0], c.a[1], c.a[2], c.b[0], c.b[1], c.b[2],
+            c.g[0], c.g[1], c.g[2], c.e[0], c.e[1], c.e[2], c.h[0], c.h[1], c.h[2],
+        ]
+        .map(|t| unsafe { const_prep(core::mem::transmute::<F128, uint64x2_t>(t)) })
+    };
     let data_ptr = data.as_ptr() as usize;
     let mut retained = Vec::<F128>::with_capacity(eighth);
     let retained_ptr = retained.as_mut_ptr() as usize;
@@ -5427,6 +5547,30 @@ fn expand_singleton_window_lean(
         let twiddle = ntt.twiddle(layer, (window_index << (prefix_k - s - 1)) + block);
         let base = block * block_size;
         let (top, bottom) = window[base..base + block_size].split_at_mut(half);
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+        if half >= 4 {
+            use core::arch::aarch64::{uint64x2_t, vld1q_u64, vst1q_u64};
+            use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep, mul_const_prep_xor};
+            unsafe {
+                let p = const_prep(core::mem::transmute::<F128, uint64x2_t>(twiddle));
+                let (tp, bp) = (top.as_mut_ptr().cast::<u64>(), bottom.as_mut_ptr().cast::<u64>());
+                if local_pos & half == 0 {
+                    for o in (0..half * 2).step_by(8) {
+                        let (v0, v1, v2, v3) = (vld1q_u64(tp.add(o)), vld1q_u64(tp.add(o + 2)), vld1q_u64(tp.add(o + 4)), vld1q_u64(tp.add(o + 6)));
+                        vst1q_u64(bp.add(o), mul_const_prep(p, v0)); vst1q_u64(bp.add(o + 2), mul_const_prep(p, v1));
+                        vst1q_u64(bp.add(o + 4), mul_const_prep(p, v2)); vst1q_u64(bp.add(o + 6), mul_const_prep(p, v3));
+                    }
+                } else {
+                    for o in (0..half * 2).step_by(8) {
+                        let (v0, v1, v2, v3) = (vld1q_u64(bp.add(o)), vld1q_u64(bp.add(o + 2)), vld1q_u64(bp.add(o + 4)), vld1q_u64(bp.add(o + 6)));
+                        vst1q_u64(tp.add(o), v0); vst1q_u64(tp.add(o + 2), v1); vst1q_u64(tp.add(o + 4), v2); vst1q_u64(tp.add(o + 6), v3);
+                        vst1q_u64(bp.add(o), mul_const_prep_xor(p, v0, v0)); vst1q_u64(bp.add(o + 2), mul_const_prep_xor(p, v1, v1));
+                        vst1q_u64(bp.add(o + 4), mul_const_prep_xor(p, v2, v2)); vst1q_u64(bp.add(o + 6), mul_const_prep_xor(p, v3, v3));
+                    }
+                }
+            }
+            continue;
+        }
         if local_pos & half == 0 {
             for (t, b) in top.iter().zip(bottom.iter_mut()) {
                 *b = twiddle * *t;
@@ -8265,6 +8409,7 @@ fn materialize_direct_fold8(
         }
         weight
     });
+    let fold_weight_pre = crate::field::f128_slice::preunzip_fold_weights64(&fold_weight);
     let direct_tables: Vec<Vec<F128>> = claims
         .iter()
         .map(|claim| {
@@ -8357,6 +8502,17 @@ fn materialize_direct_fold8(
         );
         let mut slot = 0usize;
         if quad_fold64 {
+            if $whole && !has_ordinary {
+                while slot + 7 < block_len {
+                    let base = 64 * slot;
+                    crate::field::f128_slice::fold_banked_slots8_whole_into_preunzipped(
+                        &fold_weight_pre, &f_in[base..base + 512], &mut f_out[slot..slot + 8],
+                        $odd_live, $odd_live == 57 && odd_slot_lo_tail,
+                    );
+                    for k in 0..8 { b_out[slot + k] = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + k], scratch); }
+                    slot += 8;
+                }
+            }
             while slot + 3 < block_len {
                 let base = 64 * slot;
                 if $whole {
@@ -8501,28 +8657,11 @@ fn materialize_direct_fold8(
             // SAFETY: `zs` holds 512 elements; the registration outlives
             // this materialize (it belongs to the prove that called it).
             unsafe { zr.produce_quad(q0 + slot / 8, zs.as_mut_ptr()) };
-            for half in 0..2 {
-                let base = 256 * half;
-                crate::field::f128_slice::fold_banked_slots4_whole_into::<64>(
-                    &fold_weight,
-                    &zs[base..base + 256],
-                    &mut f_out[slot..slot + 4],
-                    odd_slot_live,
-                    odd_slot_lo_tail,
-                );
-                let direct0 = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
-                let direct1 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 1], scratch);
-                let direct2 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 2], scratch);
-                let direct3 =
-                    super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + 3], scratch);
-                b_out[slot] = direct0;
-                b_out[slot + 1] = direct1;
-                b_out[slot + 2] = direct2;
-                b_out[slot + 3] = direct3;
-                slot += 4;
-            }
+            crate::field::f128_slice::fold_banked_slots8_whole_into_preunzipped(
+                &fold_weight_pre, &zs[..512], &mut f_out[slot..slot + 8], odd_slot_live, odd_slot_lo_tail,
+            );
+            for k in 0..8 { b_out[slot + k] = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot + k], scratch); }
+            slot += 8;
         }
         direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
     };

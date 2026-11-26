@@ -759,6 +759,9 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     if recycle_bound && let Some(statistic) = s_hat_v_ab {
         flock_core::scratch::give_lincheck_eq(statistic);
     }
+    if let Some(fold8) = s_hat_v_c.fold8 {
+        flock_core::scratch::give_fold8_f128(fold8);
+    }
     flock_core::epool::set_linger_phase(false);
     flock_core::tmark::mark("open returned");
     if phase_timing {

@@ -1509,7 +1509,7 @@ pub fn s_hat_v_fold8_from_z_vec(z_vec: &[F128], x_inner_rest_tail: &[F128]) -> V
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         {
             // Every slot in `out` is written before any read.
-            let mut out = crate::alloc_uninit_f128_vec(half);
+            let mut out = crate::scratch::take_fold8_f128(half);
             crate::field::f128_slice::fold_half_into(z0, z1, &mut out, r);
             return out;
         }
@@ -2059,7 +2059,20 @@ fn compose_nibble_join_enabled() -> bool {
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
-    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vld1q_u64, vst1q_u64};
+    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vld1q_u64};
+    #[inline(always)]
+    unsafe fn store_pair_q(p: *mut F128, x0: uint64x2_t, x1: uint64x2_t) {
+        // SAFETY (caller): `p` is valid for a 32-byte write of two adjacent `F128`s.
+        unsafe {
+            core::arch::asm!(
+                "stp {x0:q}, {x1:q}, [{p}]",
+                p = in(reg) p,
+                x0 = in(vreg) x0,
+                x1 = in(vreg) x1,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
     debug_assert_eq!(g.len(), 8);
     debug_assert_eq!(out.len(), 256);
     // SAFETY: `g` has 8 `F128` elements and `out` has 256 `F128` elements.
@@ -2086,34 +2099,52 @@ fn fill_composed_byte_bank(g: &[F128], out: &mut [F128]) {
         let l13 = veorq_u64(l5, g3);
         let l14 = veorq_u64(l6, g3);
         let l15 = veorq_u64(l7, g3);
+        let mut dst = out.as_mut_ptr();
+        // Row 0 (`h == 0`): write `l0..l15` directly via paired stores without XOR-with-zero.
+        store_pair_q(dst, l0, l1);
+        store_pair_q(dst.add(2), l2, l3);
+        store_pair_q(dst.add(4), l4, l5);
+        store_pair_q(dst.add(6), l6, l7);
+        store_pair_q(dst.add(8), l8, l9);
+        store_pair_q(dst.add(10), l10, l11);
+        store_pair_q(dst.add(12), l12, l13);
+        store_pair_q(dst.add(14), l14, l15);
+
+        let store_row = |row: *mut F128, h: uint64x2_t| {
+            store_pair_q(row, h, veorq_u64(l1, h));
+            store_pair_q(row.add(2), veorq_u64(l2, h), veorq_u64(l3, h));
+            store_pair_q(row.add(4), veorq_u64(l4, h), veorq_u64(l5, h));
+            store_pair_q(row.add(6), veorq_u64(l6, h), veorq_u64(l7, h));
+            store_pair_q(row.add(8), veorq_u64(l8, h), veorq_u64(l9, h));
+            store_pair_q(row.add(10), veorq_u64(l10, h), veorq_u64(l11, h));
+            store_pair_q(row.add(12), veorq_u64(l12, h), veorq_u64(l13, h));
+            store_pair_q(row.add(14), veorq_u64(l14, h), veorq_u64(l15, h));
+        };
+
         let g4 = vld1q_u64(gp.add(4).cast::<u64>());
         let g5 = vld1q_u64(gp.add(5).cast::<u64>());
         let g6 = vld1q_u64(gp.add(6).cast::<u64>());
         let g7 = vld1q_u64(gp.add(7).cast::<u64>());
-        let h_lo: [uint64x2_t; 4] = [l0, g4, g5, veorq_u64(g4, g5)];
-        let h_hi: [uint64x2_t; 4] = [l0, g6, g7, veorq_u64(g6, g7)];
-        let mut dst = out.as_mut_ptr();
-        for &hi in &h_hi {
-            for &lo in &h_lo {
-                let h = veorq_u64(lo, hi);
-                vst1q_u64(dst.cast::<u64>(), h);
-                vst1q_u64(dst.add(1).cast::<u64>(), veorq_u64(l1, h));
-                vst1q_u64(dst.add(2).cast::<u64>(), veorq_u64(l2, h));
-                vst1q_u64(dst.add(3).cast::<u64>(), veorq_u64(l3, h));
-                vst1q_u64(dst.add(4).cast::<u64>(), veorq_u64(l4, h));
-                vst1q_u64(dst.add(5).cast::<u64>(), veorq_u64(l5, h));
-                vst1q_u64(dst.add(6).cast::<u64>(), veorq_u64(l6, h));
-                vst1q_u64(dst.add(7).cast::<u64>(), veorq_u64(l7, h));
-                vst1q_u64(dst.add(8).cast::<u64>(), veorq_u64(l8, h));
-                vst1q_u64(dst.add(9).cast::<u64>(), veorq_u64(l9, h));
-                vst1q_u64(dst.add(10).cast::<u64>(), veorq_u64(l10, h));
-                vst1q_u64(dst.add(11).cast::<u64>(), veorq_u64(l11, h));
-                vst1q_u64(dst.add(12).cast::<u64>(), veorq_u64(l12, h));
-                vst1q_u64(dst.add(13).cast::<u64>(), veorq_u64(l13, h));
-                vst1q_u64(dst.add(14).cast::<u64>(), veorq_u64(l14, h));
-                vst1q_u64(dst.add(15).cast::<u64>(), veorq_u64(l15, h));
-                dst = dst.add(16);
-            }
+        let g45 = veorq_u64(g4, g5);
+        store_row(dst.add(16), g4);
+        store_row(dst.add(32), g5);
+        store_row(dst.add(48), g45);
+        dst = dst.add(64);
+        let mut k = 0usize;
+        while k < 3 {
+            let hi = if k == 0 {
+                g6
+            } else if k == 1 {
+                g7
+            } else {
+                veorq_u64(g6, g7)
+            };
+            store_row(dst, hi);
+            store_row(dst.add(16), veorq_u64(g4, hi));
+            store_row(dst.add(32), veorq_u64(g5, hi));
+            store_row(dst.add(48), veorq_u64(g45, hi));
+            dst = dst.add(64);
+            k += 1;
         }
     }
 }
@@ -2802,6 +2833,7 @@ pub enum RsEqInd {
         len: usize,
         entries: Vec<(usize, F128)>,
     },
+    Elided { len: usize },
 }
 
 /// Whether a caller-proved dead deferred basis may skip its factor build.
@@ -2835,6 +2867,7 @@ impl RsEqInd {
             Self::Dense(v) => v.len(),
             Self::DeferredDense { eq_lo, eq_hi, .. } => eq_lo.len() * eq_hi.len(),
             Self::Sparse { len, .. } => *len,
+            Self::Elided { len } => *len,
         }
     }
 
@@ -2867,6 +2900,7 @@ impl RsEqInd {
                     out[idx] += gamma * val;
                 }
             }
+            Self::Elided { .. } => unreachable!("elided rs_eq_ind cannot be accumulated"),
         }
     }
 
@@ -2892,6 +2926,7 @@ impl RsEqInd {
                 }
                 out
             }
+            Self::Elided { .. } => unreachable!("elided rs_eq_ind cannot be materialized"),
         }
     }
 
@@ -2908,6 +2943,7 @@ impl RsEqInd {
                 }
                 out
             }
+            Self::Elided { .. } => unreachable!("elided rs_eq_ind cannot be materialized"),
         }
     }
 }
@@ -3716,23 +3752,11 @@ pub(crate) fn prove_batched_padded_with_owned_canonical_fold8<Ch: Challenger>(
                             // `build_eq_split`), and field elements have a unique
                             // bit representation.
                             let suffix = dense_suffixes[d];
-                            let n_lo = deferred_split_n_lo(suffix.len());
-                            let (eq_lo, eq_hi) = if elide_basis {
-                                // Only the logical length is observed on the
-                                // direct-fold8 route.  Preserve it exactly
-                                // without evaluating or zero-filling either
-                                // dead tensor factor.
-                                (
-                                    crate::alloc_uninit_f128_vec(1usize << n_lo),
-                                    crate::alloc_uninit_f128_vec(1usize << (suffix.len() - n_lo)),
-                                )
+                            if elide_basis {
+                                RsEqInd::Elided { len: 1usize << suffix.len() }
                             } else {
-                                build_eq_split(suffix, n_lo)
-                            };
-                            RsEqInd::DeferredDense {
-                                eq_lo,
-                                eq_hi,
-                                table,
+                                let (eq_lo, eq_hi) = build_eq_split(suffix, deferred_split_n_lo(suffix.len()));
+                                RsEqInd::DeferredDense { eq_lo, eq_hi, table }
                             }
                         } else {
                             RsEqInd::Dense(fold_b128_elems(&dense_tensors[d], &scaled_eq_r_dprime))
@@ -5186,28 +5210,7 @@ mod tests {
                 control[claim].1.rs_eq_ind.len()
             );
 
-            let (control_lo, control_hi, control_table) = match &control[claim].1.rs_eq_ind {
-                RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => (eq_lo, eq_hi, table),
-                _ => panic!("control claim must be deferred dense"),
-            };
-            let (candidate_lo, candidate_hi, candidate_table) = match &candidate[claim].1.rs_eq_ind
-            {
-                RsEqInd::DeferredDense {
-                    eq_lo,
-                    eq_hi,
-                    table,
-                } => (eq_lo, eq_hi, table),
-                _ => panic!("candidate claim must be deferred dense"),
-            };
-            assert_eq!(candidate_lo.len(), control_lo.len());
-            assert_eq!(candidate_hi.len(), control_hi.len());
-            assert!(candidate_lo.iter().all(|&value| value == F128::ZERO));
-            assert!(candidate_hi.iter().all(|&value| value == F128::ZERO));
-            assert_eq!(candidate_table, control_table);
+            assert!(matches!(candidate[claim].1.rs_eq_ind, RsEqInd::Elided { len } if len == control[claim].1.rs_eq_ind.len()));
 
             let control_direct = control[claim]
                 .1

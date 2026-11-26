@@ -179,6 +179,34 @@ unsafe fn kara_acc_single(
     }
 }
 
+/// `acc0 += a0 * b0` and `acc1 += a1 * b1` in paired [`KaraNeon`] form: six
+/// macro-fused `pmull+eor` / `pmull2+eor` pairs (3 PMULLs/product, 1-deep
+/// chains per accumulator) instead of eight schoolbook PMULLs.
+#[inline(always)]
+unsafe fn kara_acc_pair(
+    acc0: &mut KaraNeon,
+    acc1: &mut KaraNeon,
+    a0: uint64x2_t,
+    b0: uint64x2_t,
+    a1: uint64x2_t,
+    b1: uint64x2_t,
+) {
+    unsafe {
+        let a_lo = vuzp1q_u64(a0, a1);
+        let a_hi = vuzp2q_u64(a0, a1);
+        let a_mid = veorq_u64(a_lo, a_hi);
+        let b_lo = vuzp1q_u64(b0, b1);
+        let b_hi = vuzp2q_u64(b0, b1);
+        let b_mid = veorq_u64(b_lo, b_hi);
+        acc0.ll = fused_pmull_lo_acc(acc0.ll, a_lo, b_lo);
+        acc1.ll = fused_pmull_hi_acc(acc1.ll, a_lo, b_lo);
+        acc0.hh = fused_pmull_lo_acc(acc0.hh, a_hi, b_hi);
+        acc1.hh = fused_pmull_hi_acc(acc1.hh, a_hi, b_hi);
+        acc0.mm = fused_pmull_lo_acc(acc0.mm, a_mid, b_mid);
+        acc1.mm = fused_pmull_hi_acc(acc1.mm, a_mid, b_mid);
+    }
+}
+
 /// `acc += a * b` in [`TriNeon`] form using pre-swapped `a_sw = swap_halves(a)`:
 /// four macro-fused `pmull+eor` / `pmull2+eor` SIMD issue slots.
 #[inline(always)]
@@ -852,6 +880,100 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
     }
 }
 
+/// Pre-unzip 64 fold weights into 32 L1-resident `(w_lo, w_hi, w_mid)` triples.
+#[inline] #[target_feature(enable = "aes")]
+pub(super) unsafe fn preunzip_fold_weights64(weight: &[F128; 64]) -> [[uint64x2_t; 3]; 32] {
+    unsafe {
+        let (wp, mut out) = (weight.as_ptr(), core::mem::MaybeUninit::<[[uint64x2_t; 3]; 32]>::uninit());
+        let dst = out.as_mut_ptr().cast::<[uint64x2_t; 3]>();
+        for p in 0..32 {
+            let (w0, w1) = load_pair_whole(wp.add(p * 2));
+            let (w_lo, w_hi) = (vuzp1q_u64(w0, w1), vuzp2q_u64(w0, w1));
+            dst.add(p).write([w_lo, w_hi, veorq_u64(w_lo, w_hi)]);
+        }
+        out.assume_init()
+    }
+}
+
+/// Eight-slot 64-bank fold with pre-unzipped weights, 24 pinned `v0..v23`
+/// Karatsuba accumulators (zero inner-loop spills), and 4 paired `stp q, q` stores.
+#[inline(never)] #[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_banked_slots8_whole_into_preunzipped(
+    weight: &[[uint64x2_t; 3]; 32], input: &[F128], out: &mut [F128], odd_live: usize, odd_lo_tail: bool,
+) {
+    unsafe {
+        debug_assert!(input.len() >= 512 && out.len() >= 8);
+        macro_rules! slots8_step {
+            ($ldp:literal, $ll:literal, $hh:literal, $mm:literal) => { concat!(
+                $ldp, "uzp1 v29.2d, v27.2d, v28.2d\n", "uzp2 v30.2d, v27.2d, v28.2d\n", "eor v31.16b, v29.16b, v30.16b\n",
+                "pmull v27.1q, v29.1d, v24.1d\n", "eor v27.16b, v27.16b, ", $ll, ".16b\n",
+                "pmull2 ", $ll, ".1q, v29.2d, v24.2d\n", "eor ", $ll, ".16b, ", $ll, ".16b, v27.16b\n",
+                "pmull v28.1q, v30.1d, v25.1d\n", "eor v28.16b, v28.16b, ", $hh, ".16b\n",
+                "pmull2 ", $hh, ".1q, v30.2d, v25.2d\n", "eor ", $hh, ".16b, ", $hh, ".16b, v28.16b\n",
+                "pmull v27.1q, v31.1d, v26.1d\n", "eor v27.16b, v27.16b, ", $mm, ".16b\n",
+                "pmull2 ", $mm, ".1q, v31.2d, v26.2d\n", "eor ", $mm, ".16b, ", $mm, ".16b, v27.16b\n",
+            ) };
+        }
+        macro_rules! lo_tail_step {
+            ($p:literal, $ll:literal, $mm:literal) => { concat!(
+                "ldr q27, [", $p, "]\npmull v28.1q, v27.1d, v24.1d\neor ", $ll, ".16b, ", $ll, ".16b, v28.16b\n",
+                "pmull v29.1q, v27.1d, v26.1d\neor ", $mm, ".16b, ", $mm, ".16b, v29.16b\n",
+            ) };
+        }
+        let lo_tail = odd_lo_tail && odd_live < 64 && odd_live % 2 == 1;
+        let split = if odd_live >= 64 { 64 } else if lo_tail { odd_live - 1 } else { (odd_live + 1) & !1 };
+        let (x, mut raw) = (input.as_ptr(), core::mem::MaybeUninit::<[[uint64x2_t; 3]; 8]>::uninit());
+        core::arch::asm!(
+            "movi v0.2d, #0",  "movi v1.2d, #0",  "movi v2.2d, #0",  "movi v3.2d, #0",  "movi v4.2d, #0",  "movi v5.2d, #0",
+            "movi v6.2d, #0",  "movi v7.2d, #0",  "movi v8.2d, #0",  "movi v9.2d, #0",  "movi v10.2d, #0", "movi v11.2d, #0",
+            "movi v12.2d, #0", "movi v13.2d, #0", "movi v14.2d, #0", "movi v15.2d, #0", "movi v16.2d, #0", "movi v17.2d, #0",
+            "movi v18.2d, #0", "movi v19.2d, #0", "movi v20.2d, #0", "movi v21.2d, #0", "movi v22.2d, #0", "movi v23.2d, #0",
+            "cbz {cnt}, 4f", "2:", "ldr q26, [{wp}, #32]", "ldp q24, q25, [{wp}], #48",
+            slots8_step!("ldp q27, q28, [{p0}, #-1024]\n", "v0",  "v1",  "v2"),
+            slots8_step!("ldp q27, q28, [{p0}], #32\n",     "v3",  "v4",  "v5"),
+            slots8_step!("ldp q27, q28, [{p1}, #-1024]\n", "v6",  "v7",  "v8"),
+            slots8_step!("ldp q27, q28, [{p1}], #32\n",     "v9",  "v10", "v11"),
+            slots8_step!("ldp q27, q28, [{p2}, #-1024]\n", "v12", "v13", "v14"),
+            slots8_step!("ldp q27, q28, [{p2}], #32\n",     "v15", "v16", "v17"),
+            slots8_step!("ldp q27, q28, [{p3}, #-1024]\n", "v18", "v19", "v20"),
+            slots8_step!("ldp q27, q28, [{p3}], #32\n",     "v21", "v22", "v23"),
+            "subs {cnt}, {cnt}, #1", "b.ne 2b",
+            "4:", "cbz {lo_tail}, 5f", "ldr q24, [{wp}, #0]", "ldr q26, [{wp}, #32]",
+            lo_tail_step!("{p0}", "v3",  "v5"),  lo_tail_step!("{p1}", "v9",  "v11"),
+            lo_tail_step!("{p2}", "v15", "v17"), lo_tail_step!("{p3}", "v21", "v23"),
+            "5:", "cbz {tail}, 6f",
+            "sub {p0}, {p0}, #1024", "sub {p1}, {p1}, #1024", "sub {p2}, {p2}, #1024", "sub {p3}, {p3}, #1024",
+            "3:", "ldr q26, [{wp}, #32]", "ldp q24, q25, [{wp}], #48",
+            slots8_step!("ldp q27, q28, [{p0}], #32\n", "v0",  "v1",  "v2"),
+            slots8_step!("ldp q27, q28, [{p1}], #32\n", "v6",  "v7",  "v8"),
+            slots8_step!("ldp q27, q28, [{p2}], #32\n", "v12", "v13", "v14"),
+            slots8_step!("ldp q27, q28, [{p3}], #32\n", "v18", "v19", "v20"),
+            "subs {tail}, {tail}, #1", "b.ne 3b",
+            "6:",
+            "stp q0, q1, [{acc}, #0]",     "stp q2, q3, [{acc}, #32]",    "stp q4, q5, [{acc}, #64]",
+            "stp q6, q7, [{acc}, #96]",    "stp q8, q9, [{acc}, #128]",   "stp q10, q11, [{acc}, #160]",
+            "stp q12, q13, [{acc}, #192]", "stp q14, q15, [{acc}, #224]", "stp q16, q17, [{acc}, #256]",
+            "stp q18, q19, [{acc}, #288]", "stp q20, q21, [{acc}, #320]", "stp q22, q23, [{acc}, #352]",
+            wp = inout(reg) weight.as_ptr() => _, p0 = inout(reg) x.add(64) => _, p1 = inout(reg) x.add(192) => _,
+            p2 = inout(reg) x.add(320) => _, p3 = inout(reg) x.add(448) => _,
+            cnt = inout(reg) (split / 2) => _, tail = inout(reg) ((64 - split) / 2) => _,
+            lo_tail = in(reg) usize::from(lo_tail), acc = in(reg) raw.as_mut_ptr().cast::<uint64x2_t>(),
+            out("v0") _,  out("v1") _,  out("v2") _,  out("v3") _,  out("v4") _,  out("v5") _,  out("v6") _,  out("v7") _,
+            out("v8") _,  out("v9") _,  out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            options(nostack),
+        );
+        let (acc, o) = (raw.assume_init(), out.as_mut_ptr());
+        for p in 0..4 {
+            let a = KaraNeon { ll: acc[p * 2][0], hh: acc[p * 2][1], mm: acc[p * 2][2] };
+            let b = KaraNeon { ll: acc[p * 2 + 1][0], hh: acc[p * 2 + 1][1], mm: acc[p * 2 + 1][2] };
+            let r = reduce_wide_pair(kara_to_wide(a), kara_to_wide(b));
+            store_pair_whole(o.add(p * 2), r[0], r[1]);
+        }
+    }
+}
+
 /// Fixed 128-bank by 64-lane bank-major fold for the ranked zerocheck AB
 /// completion. Two consecutive weights are unzipped once and shared across
 /// four adjacent lanes with macro-fused [`KaraNeon`] accumulators.
@@ -1016,9 +1138,10 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
 }
 
 /// [`round0`] fused with the final additive basis update: for every slot,
-/// `basis[i] += delta(i)` is stored and the updated value feeds four
-/// macro-fused [`TriNeon`] streams, so the completed basis is never re-read.
-/// `delta` is called once per slot in increasing slot order.
+/// `basis[i] += delta(i)` is stored via paired vector loads/stores and the
+/// updated values feed four paired [`KaraNeon`] streams (3 PMULLs/product),
+/// so the completed basis is never re-read. `delta` is called once per slot in
+/// increasing slot order.
 ///
 /// # Safety
 /// Requires the `aes` target feature (PMULL). `witness` and `basis` must have
@@ -1033,50 +1156,57 @@ pub(super) unsafe fn round0_add_basis<D: FnMut(usize) -> F128>(
         debug_assert_eq!(witness.len(), basis.len());
         debug_assert!(witness.len().is_multiple_of(2));
 
-        let mut u0_a = TriNeon::zero();
-        let mut u0_b = TriNeon::zero();
-        let mut u2_a = TriNeon::zero();
-        let mut u2_b = TriNeon::zero();
+        let mut u0_a = KaraNeon::zero();
+        let mut u0_b = KaraNeon::zero();
+        let mut u2_a = KaraNeon::zero();
+        let mut u2_b = KaraNeon::zero();
 
         let n = witness.len();
         let main = n & !3;
         let wp = witness.as_ptr();
         let bp = basis.as_mut_ptr();
-        // SAFETY (closure): `j < n = basis.len()` at every call site below.
-        let mut update = |j: usize| -> uint64x2_t {
-            let v = *bp.add(j) + delta(j);
-            *bp.add(j) = v;
-            transmute::<F128, uint64x2_t>(v)
-        };
         let mut i = 0usize;
         while i < main {
+            let d0 = transmute::<F128, uint64x2_t>(delta(i));
+            let d1 = transmute::<F128, uint64x2_t>(delta(i + 1));
+            let (cur0, cur1) = load_pair_whole(bp.add(i));
+            let b0 = veorq_u64(cur0, d0);
+            let b1 = veorq_u64(cur1, d1);
+            store_pair_whole(bp.add(i), b0, b1);
+            let sb0 = veorq_u64(b0, b1);
+
+            let d2 = transmute::<F128, uint64x2_t>(delta(i + 2));
+            let d3 = transmute::<F128, uint64x2_t>(delta(i + 3));
+            let (cur2, cur3) = load_pair_whole(bp.add(i + 2));
+            let b2 = veorq_u64(cur2, d2);
+            let b3 = veorq_u64(cur3, d3);
+            store_pair_whole(bp.add(i + 2), b2, b3);
+            let sb2 = veorq_u64(b2, b3);
+
             let (a0, a1) = load_pair_whole(wp.add(i));
             let (a2, a3) = load_pair_whole(wp.add(i + 2));
-            let b0 = update(i);
-            let b1 = update(i + 1);
-            let b2 = update(i + 2);
-            let b3 = update(i + 3);
-            tri_acc_q(&mut u0_a, a0, b0);
-            tri_acc_q(&mut u0_b, a2, b2);
-            tri_acc_q(&mut u2_a, veorq_u64(a0, a1), veorq_u64(b0, b1));
-            tri_acc_q(&mut u2_b, veorq_u64(a2, a3), veorq_u64(b2, b3));
+            kara_acc_pair(&mut u0_a, &mut u0_b, a0, b0, a2, b2);
+            kara_acc_pair(&mut u2_a, &mut u2_b, veorq_u64(a0, a1), sb0, veorq_u64(a2, a3), sb2);
             i += 4;
         }
         while i < n {
+            let d0 = transmute::<F128, uint64x2_t>(delta(i));
+            let d1 = transmute::<F128, uint64x2_t>(delta(i + 1));
+            let (cur0, cur1) = load_pair_whole(bp.add(i));
+            let b0 = veorq_u64(cur0, d0);
+            let b1 = veorq_u64(cur1, d1);
+            store_pair_whole(bp.add(i), b0, b1);
             let (a0, a1) = load_pair_whole(wp.add(i));
-            let b0 = update(i);
-            let b1 = update(i + 1);
-            tri_acc_q(&mut u0_a, a0, b0);
-            tri_acc_q(&mut u2_a, veorq_u64(a0, a1), veorq_u64(b0, b1));
+            kara_acc_pair(&mut u0_a, &mut u2_a, a0, b0, veorq_u64(a0, a1), veorq_u64(b0, b1));
             i += 2;
         }
 
         for (left, right) in [(&mut u0_a, u0_b), (&mut u2_a, u2_b)] {
             left.ll = veorq_u64(left.ll, right.ll);
             left.hh = veorq_u64(left.hh, right.hh);
-            left.cross = veorq_u64(left.cross, right.cross);
+            left.mm = veorq_u64(left.mm, right.mm);
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0_a), tri_to_wide(u2_a));
+        let reduced = reduce_wide_pair(kara_to_wide(u0_a), kara_to_wide(u2_a));
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1308,8 +1438,8 @@ unsafe fn fold_two_and_msg_impl<const PREP: bool>(
     unsafe {
         let r_q = transmute::<F128, uint64x2_t>(r);
         let r_prep = const_prep(r_q);
-        let mut u0 = TriNeon::zero();
-        let mut u2 = TriNeon::zero();
+        let mut u0 = KaraNeon::zero();
+        let mut u2 = KaraNeon::zero();
         let mut t = 0;
         while t < nf.len() {
             let source = 2 * (base + t);
@@ -1351,16 +1481,13 @@ unsafe fn fold_two_and_msg_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+            store_pair_whole(nf.as_mut_ptr().add(t), f0, f1);
+            store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
 
-            tri_acc_q(&mut u0, f0, b0);
-            tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
+            kara_acc_pair(&mut u0, &mut u2, f0, b0, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
+        let reduced = reduce_wide_pair(kara_to_wide(u0), kara_to_wide(u2));
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1406,8 +1533,8 @@ unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool>(
         let half = f.len() / 2;
         let r_q = transmute::<F128, uint64x2_t>(r);
         let r_prep = const_prep(r_q);
-        let mut u0 = TriNeon::zero();
-        let mut u2 = TriNeon::zero();
+        let mut u0 = KaraNeon::zero();
+        let mut u2 = KaraNeon::zero();
         let mut t = 0;
         while t < half {
             let source = 2 * t;
@@ -1449,16 +1576,13 @@ unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(f_ptr.add(t).cast::<u64>(), f0);
-            vst1q_u64(f_ptr.add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(b_ptr.add(t).cast::<u64>(), b0);
-            vst1q_u64(b_ptr.add(t + 1).cast::<u64>(), b1);
+            store_pair_whole(f_ptr.add(t), f0, f1);
+            store_pair_whole(b_ptr.add(t), b0, b1);
 
-            tri_acc_q(&mut u0, f0, b0);
-            tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
+            kara_acc_pair(&mut u0, &mut u2, f0, b0, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
+        let reduced = reduce_wide_pair(kara_to_wide(u0), kara_to_wide(u2));
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1513,8 +1637,8 @@ unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
         let r_prep = const_prep(r_q);
         let scale_q = transmute::<F128, uint64x2_t>(scale);
         let scale_prep = const_prep(scale_q);
-        let mut u0 = TriNeon::zero();
-        let mut u2 = TriNeon::zero();
+        let mut u0 = KaraNeon::zero();
+        let mut u2 = KaraNeon::zero();
         let mut t = 0usize;
         while t < nf.len() {
             let source = 2 * (base + t);
@@ -1572,16 +1696,13 @@ unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+            store_pair_whole(nf.as_mut_ptr().add(t), f0, f1);
+            store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
 
-            tri_acc_q(&mut u0, f0, b0);
-            tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
+            kara_acc_pair(&mut u0, &mut u2, f0, b0, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
+        let reduced = reduce_wide_pair(kara_to_wide(u0), kara_to_wide(u2));
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1666,8 +1787,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                     veorq_u64(f_even1, folded_f[1]),
                 )
             };
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
+            store_pair_whole(nf.as_mut_ptr().add(t), f0, f1);
             t += 2;
         }
 
@@ -1708,8 +1828,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                     addend1,
                     b_even1,
                 );
-                vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-                vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+                store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
                 t += 2;
             }
         } else {
@@ -1749,16 +1868,15 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                 );
                 let b0 = veorq_u64(partial_b0, deferred_delta_and_addend[0]);
                 let b1 = veorq_u64(partial_b1, deferred_delta_and_addend[1]);
-                vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-                vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+                store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
                 t += 2;
             }
         }
 
-        let mut u0_a = TriNeon::zero();
-        let mut u0_b = TriNeon::zero();
-        let mut u2_a = TriNeon::zero();
-        let mut u2_b = TriNeon::zero();
+        let mut u0_a = KaraNeon::zero();
+        let mut u0_b = KaraNeon::zero();
+        let mut u2_a = KaraNeon::zero();
+        let mut u2_b = KaraNeon::zero();
         let main = nf.len() & !3;
         let mut t = 0usize;
         while t < main {
@@ -1766,25 +1884,29 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
             let (f2, f3) = load_pair_whole(nf.as_ptr().add(t + 2));
             let (b0, b1) = load_pair_whole(nb.as_ptr().add(t));
             let (b2, b3) = load_pair_whole(nb.as_ptr().add(t + 2));
-            tri_acc_q(&mut u0_a, f0, b0);
-            tri_acc_q(&mut u0_b, f2, b2);
-            tri_acc_q(&mut u2_a, veorq_u64(f0, f1), veorq_u64(b0, b1));
-            tri_acc_q(&mut u2_b, veorq_u64(f2, f3), veorq_u64(b2, b3));
+            kara_acc_pair(&mut u0_a, &mut u0_b, f0, b0, f2, b2);
+            kara_acc_pair(
+                &mut u2_a,
+                &mut u2_b,
+                veorq_u64(f0, f1),
+                veorq_u64(b0, b1),
+                veorq_u64(f2, f3),
+                veorq_u64(b2, b3),
+            );
             t += 4;
         }
         while t < nf.len() {
             let (f0, f1) = load_pair_whole(nf.as_ptr().add(t));
             let (b0, b1) = load_pair_whole(nb.as_ptr().add(t));
-            tri_acc_q(&mut u0_a, f0, b0);
-            tri_acc_q(&mut u2_a, veorq_u64(f0, f1), veorq_u64(b0, b1));
+            kara_acc_pair(&mut u0_a, &mut u2_a, f0, b0, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
         for (left, right) in [(&mut u0_a, u0_b), (&mut u2_a, u2_b)] {
             left.ll = veorq_u64(left.ll, right.ll);
             left.hh = veorq_u64(left.hh, right.hh);
-            left.cross = veorq_u64(left.cross, right.cross);
+            left.mm = veorq_u64(left.mm, right.mm);
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0_a), tri_to_wide(u2_a));
+        let reduced = reduce_wide_pair(kara_to_wide(u0_a), kara_to_wide(u2_a));
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),

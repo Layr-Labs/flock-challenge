@@ -46,7 +46,7 @@ fn bstatic_horner_blk<const BLK: usize, const V: u32>(
     out: &mut [u8; 64],
     nt_store: bool,
 ) {
-    bstatic_horner_blk_body::<BLK, V, false>(
+    bstatic_horner_blk_body::<BLK, V, false, false>(
         a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, out, nt_store,
     );
 }
@@ -61,7 +61,7 @@ fn bstatic_horner_blk<const BLK: usize, const V: u32>(
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
+fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool, const SKIP_GUARD: bool>(
     a_packed: &[u8],
     b_packed: &[u8],
     inv_table: &InvNttTableByteSingleGf8,
@@ -81,9 +81,7 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
     let b_med = BLK % 16;
     let byte_base_b = chunk_byte_base + b_med * N_CHUNKS * 8;
     if HOIST {
-        debug_assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
-    } else {
-        assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
+        debug_assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len()); } else { assert!(byte_base_b + 8 * N_CHUNKS <= a_packed.len() && byte_base_b + 8 * N_CHUNKS <= b_packed.len());
     }
     let plain = inv_table.data_ptr();
     let plain_sw = inv_table.half_swapped_data_ptr();
@@ -179,28 +177,59 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
         }
         // The operands of one K row (the A image of `$k`, then the B image),
         // for the `ABV_FUSE` accumulation: the same applies as `prods!`.
-        macro_rules! opnds {
-            ($at:expr, $at_sw:expr, $kara:expr, $k:literal, $bimg:expr) => {{
-                let aw = u64::from_le(core::ptr::read_unaligned(a_base.add($k * N_CHUNKS).cast::<u64>()));
-                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw);
-                let (db0, db1, db2, db3) = $bimg;
-                ([da0, da1, da2, da3], [db0, db1, db2, db3])
-            }};
+        enum LazyOp<const VR: u32, F: Fn() -> AbKOperands> { F(F), S(*const u8, *const u8, *const u8, *const u8, *const u8, *const u8, usize, usize, bool) }
+        impl<const VR: u32, F: Fn() -> AbKOperands> LazyOp<VR, F> {
+            #[inline(always)]
+            unsafe fn eval(&self) -> AbKOperands { unsafe { match self {
+                Self::F(f) => f(),
+                &Self::S(ab, bb, pl, psw, kp, ks, k, nb, hi) => {
+                    let aw = u64::from_le(core::ptr::read_unaligned(ab.add(k * N_CHUNKS).cast::<u64>()));
+                    let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<VR, false>(pl, psw, kp, aw);
+                    let bw = !u64::from_le(core::ptr::read_unaligned(bb.add(k * N_CHUNKS).cast::<u64>()));
+                    let (db0, db1, db2, db3) = match (nb, hi) {
+                        (1, false) => apply_word_sparse_x4::<1, false>(ks, bw), (1, true) => apply_word_sparse_x4::<1, true>(ks, bw),
+                        (2, false) => apply_word_sparse_x4::<2, false>(ks, bw), (2, true) => apply_word_sparse_x4::<2, true>(ks, bw),
+                        (3, false) => apply_word_sparse_x4::<3, false>(ks, bw), (3, true) => apply_word_sparse_x4::<3, true>(ks, bw),
+                        (4, false) => apply_word_sparse_x4::<4, false>(ks, bw), (4, true) => apply_word_sparse_x4::<4, true>(ks, bw),
+                        _ => core::hint::unreachable_unchecked(),
+                    };
+                    ([da0, da1, da2, da3], [db0, db1, db2, db3])
+                }
+            } } }
         }
-        // [`ABV_SPARSE_SCALE`]: the operands of the row's one `x^4` word whose
-        // B varies only in `$nb` bytes at one end (`$high`): the A word out
-        // of the plain image, the B word out of the `x^4` image restricted to
-        // its varying bytes. The products are congruent mod p to those of
-        // `opnds!` with the scaled A image.
+        #[inline(always)]
+        unsafe fn fuse_seed<const VR: u32, A: Fn() -> AbKOperands, B: Fn() -> AbKOperands>(lo: &LazyOp<VR, A>, hi: &LazyOp<VR, B>) -> [uint16x8_t; 8] {
+            unsafe { let a = fuse_products(&lo.eval()); fuse_acc(&a, &hi.eval()) }
+        }
+        #[inline(always)]
+        unsafe fn fuse_absorb_first<const VR: u32, A: Fn() -> AbKOperands, B: Fn() -> AbKOperands>(acc: &mut [uint16x8_t; 8], lo: &LazyOp<VR, A>, hi: &LazyOp<VR, B>) {
+            unsafe { fuse_absorb_first_one(acc, &lo.eval()); *acc = fuse_acc(acc, &hi.eval()); }
+        }
+        #[inline(always)]
+        unsafe fn fuse_absorb_k1<const VR: u32, A: Fn() -> AbKOperands, B: Fn() -> AbKOperands>(acc: &mut [uint16x8_t; 8], lo: &LazyOp<VR, A>, hi: &LazyOp<VR, B>) {
+            unsafe {
+                let p = fuse_acc(&fuse_products(&lo.eval()), &hi.eval());
+                let fold = vld1q_u8(HORNER2_FOLD.as_ptr());
+                for i in 0..8 {
+                    let t = acc[i];
+                    let f = vqtbl1q_u8(fold, vreinterpretq_u8_u16(vshrq_n_u16::<14>(t)));
+                    acc[i] = vreinterpretq_u16_u8(xor3_u8(vreinterpretq_u8_u16(vshlq_n_u16::<2>(t)), f, vreinterpretq_u8_u16(vshlq_n_u16::<1>(p[i]))));
+                }
+            }
+        }
+        #[inline(always)]
+        unsafe fn fuse_absorb_k0<const VR: u32, A: Fn() -> AbKOperands, B: Fn() -> AbKOperands>(acc: &mut [uint16x8_t; 8], lo: &LazyOp<VR, A>, hi: &LazyOp<VR, B>) {
+            unsafe { *acc = fuse_acc(acc, &lo.eval()); *acc = fuse_acc(acc, &hi.eval()); }
+        }
+        macro_rules! opnds { ($at:expr, $at_sw:expr, $kara:expr, $k:literal, $bimg:expr) => { LazyOp::<V, _>::F(|| {
+            let aw = u64::from_le(core::ptr::read_unaligned(a_base.add($k * N_CHUNKS).cast::<u64>()));
+            let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V, { $k >= 4 }>($at, $at_sw, $kara, aw);
+            let (db0, db1, db2, db3) = $bimg;
+            ([da0, da1, da2, da3], [db0, db1, db2, db3])
+        }) }; }
         #[allow(unused_macros)]
-        macro_rules! opnds_ss {
-            ($k:literal, $nb:literal, $high:literal) => {{
-                let aw = u64::from_le(core::ptr::read_unaligned(a_base.add($k * N_CHUNKS).cast::<u64>()));
-                let (da0, da1, da2, da3) = apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, aw);
-                let (db0, db1, db2, db3) = apply_word_sparse_x4::<$nb, $high>(kscaled, !bw!($k));
-                ([da0, da1, da2, da3], [db0, db1, db2, db3])
-            }};
-        }
+        macro_rules! opnds_ss { ($k:literal, $nb:literal, $high:literal) => { LazyOp::<V, _>::S(a_base, b_base, plain, plain_sw, kplain, kscaled, $k, $nb, $high) }; }
+        let bstatic_horner_fallback = |a, b, t, c, m, o, n| { if SKIP_GUARD { core::hint::unreachable_unchecked() } else { bstatic_horner_fallback(a, b, t, c, m, o, n) } };
         macro_rules! seed {
             ($lo:ident, $hi:ident) => {
                 [
@@ -1390,9 +1419,7 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u32, const HOIST: bool>(
     let kara = if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
     } else if V & ABV_HZ != 0 {
-        ab_hz_tables(inv_table)
-    } else {
-        core::ptr::null()
+        ab_hz_tables(inv_table) } else { core::ptr::null()
     };
     macro_rules! rows {
         ($($blk:literal),*) => {{
@@ -1400,7 +1427,7 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u32, const HOIST: bool>(
                 // SAFETY: `$blk % 16 < 16` and `out_outer` holds 16 rows of 64 bytes.
                 let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
                 if V & ABV_INLINE_WINDOW != 0 {
-                    bstatic_horner_blk_body::<$blk, V, HOIST>(
+                    bstatic_horner_blk_body::<$blk, V, HOIST, false>(
                         a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store,
                     );
                 } else {
@@ -1410,9 +1437,7 @@ pub(crate) fn bstatic_horner_window_rows_impl<const V: u32, const HOIST: bool>(
         }};
     }
     if w == 0 {
-        rows!(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    } else {
-        rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
+        rows!(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); } else { rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
     }
 }
 
@@ -1649,9 +1674,7 @@ fn bstatic_horner_window_unit_flag<const V: u32, const HOIST: bool>(
     let kara = if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
     } else if V & ABV_HZ != 0 {
-        ab_hz_tables(inv_table)
-    } else {
-        core::ptr::null()
+        ab_hz_tables(inv_table) } else { core::ptr::null()
     };
     for (i, out_outer) in out_unit.chunks_exact_mut(16 * 64).enumerate() {
         let w = (x_outer + i) & window_mask;
@@ -1669,7 +1692,7 @@ fn bstatic_horner_window_unit_flag<const V: u32, const HOIST: bool>(
                     // SAFETY: `$blk % 16 < 16` and `out_outer` holds 16 rows of 64 bytes.
                     let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
                     if V & ABV_INLINE_WINDOW != 0 {
-                        bstatic_horner_blk_body::<$blk, V, HOIST>(
+                        bstatic_horner_blk_body::<$blk, V, HOIST, false>(
                             a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, nt_store,
                         );
                     } else {
@@ -1683,6 +1706,84 @@ fn bstatic_horner_window_unit_flag<const V: u32, const HOIST: bool>(
         } else {
             rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
         }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn window_guard_bad<const W: usize>(b_chunk: *const u8) -> u64 {
+    macro_rules! g { ($m:literal, $($k:literal : $mask:literal),+) => {{
+        let r = unsafe { b_chunk.add($m * N_CHUNKS * 8) };
+        $( (!u64::from_le(unsafe { core::ptr::read_unaligned(r.add($k * N_CHUNKS).cast::<u64>()) }) & $mask) )|+
+    }}; }
+    if W == 0 { g!(3, 1: 0x0000ffffffffffff, 4: 0xffff000000000000, 5: 0x000000ffffffffff) | g!(4, 0: 0xffff000000000000, 1: 0x000000ffffffffff, 4: 0xffffff0000000000, 5: 0x00000000ffffffff) | g!(5, 0: 0xffffffff00000000, 1: 0x0000000000ffffff, 4: 0xffffffffff000000, 5: 0x000000000000ffff)
+        | g!(6, 0: 0xffffffffff000000, 1: 0x000000000000ffff, 4: 0xffffffffffff0000) | g!(7, 0: 0xffffffffffffff00, 4: 0x00ffffffffffffff) | g!(8, 0: 0x00ffffffffffffff, 4: 0x0000ffffffffffff, 7: 0xffff000000000000)
+        | g!(9, 0: 0x000000ffffffffff, 3: 0xffffff0000000000, 4: 0x00000000ffffffff, 7: 0xffffff0000000000) | g!(10, 0: 0x00000000ffffffff, 3: 0xffffffff00000000, 4: 0x0000000000ffffff, 7: 0xffffffffff000000) | g!(11, 0: 0x000000000000ffff, 3: 0xffffffffffff0000, 7: 0xffffffffffff0000)
+        | g!(12, 3: 0xffffffffffffff00, 7: 0x00ffffffffffffff) | g!(13, 3: 0x0000ffffffffffff, 7: 0x0000ffffffffffff) | g!(14, 2: 0xffff000000000000, 3: 0x000000ffffffffff, 6: 0xffffff0000000000, 7: 0x00000000ffffffff)
+        | g!(15, 2: 0xffffffff00000000, 3: 0x0000000000ffffff, 6: 0xffffffff00000000, 7: 0x0000000000ffffff) } else { g!(0, 2: 0xffffffffff000000, 3: 0x000000000000ffff, 6: 0xffffffffffff0000) | g!(1, 2: 0xffffffffffffff00, 6: 0xffffffffffffff00) | g!(2, 2: 0x00ffffffffffffff, 6: 0x0000ffffffffffff)
+        | g!(3, 1: 0xffff000000000000, 2: 0x000000ffffffffff, 5: 0xffff000000000000, 6: 0x000000ffffffffff) | g!(4, 1: 0xffffff0000000000, 2: 0x00000000ffffffff, 5: 0xffffffff00000000, 6: 0x0000000000ffffff) | g!(5, 1: 0xffffffffff000000, 2: 0x000000000000ffff, 5: 0xffffffffff000000, 6: 0x000000000000ffff)
+        | g!(6, 1: 0xffffffffffff0000, 5: 0xffffffffffffff00) | g!(7, 1: 0x00ffffffffffffff, 5: 0x00ffffffffffffff) | g!(8, 1: 0x0000ffffffffffff, 4: 0xffff000000000000, 5: 0x000000ffffffffff)
+        | g!(9, 0: 0xffffff0000000000, 1: 0x00000000ffffffff, 4: 0xffffff0000000000, 5: 0x00000000ffffffff) | g!(10, 0: 0xffffffff00000000, 1: 0x0000000000ffffff, 4: 0xffffffffff000000, 5: 0x000000000000ffff) | g!(11, 0: 0xffffffffffff0000, 4: 0xffffffffffff0000)
+        | g!(12, 0: 0xffffffffffffff00, 4: 0x00ffffffffffffff)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn bstatic_horner_window_half_fallback<const W: usize>(
+    x_outer: usize, window_mask: usize, a_packed: &[u8], b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8, chunk_byte_base: usize, out_unit: &mut [u8], nt_store: bool,
+) {
+    let (lo, hi) = BSTATIC_HORNER_WINDOW_ROWS[W];
+    for (i, out_outer) in out_unit.chunks_exact_mut(16 * 64).enumerate() {
+        if ((x_outer + i) & window_mask) == W {
+            let cbase = chunk_byte_base + i * 16 * 64;
+            for b_med in lo..hi {
+                let dst = unsafe { &mut *out_outer.as_mut_ptr().add(b_med * 64).cast::<[u8; 64]>() };
+                bstatic_horner_fallback(a_packed, b_packed, inv_table, cbase, b_med, dst, nt_store);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn bstatic_horner_window_half_nt<const V: u32, const NT: bool, const W: usize>(
+    x_outer: usize, window_mask: usize, a_packed: &[u8], b_packed: &[u8],
+    inv_table: &InvNttTableByteSingleGf8, chunk_byte_base: usize,
+    partials: &'static [[u8; 64]; 248], kara: *const u8, out_unit: &mut [u8],
+) {
+    let n_chunks = out_unit.len() / (16 * 64);
+    let (i0, step) = if window_mask == 1 { (((x_outer & 1) ^ W), 2) } else { (0, 1) };
+    let (mut bad, mut j) = (0u64, i0);
+    while j < n_chunks {
+        let w = (x_outer + j) & window_mask;
+        assert!(w <= 1);
+        if w == W {
+            let cbase = chunk_byte_base + j * 16 * 64;
+            let end = cbase + BSTATIC_HORNER_WINDOW_ROWS[W].1 * N_CHUNKS * 8;
+            assert!(end <= a_packed.len() && end <= b_packed.len());
+            bad |= unsafe { window_guard_bad::<W>(b_packed.as_ptr().add(cbase)) };
+        }
+        j += step;
+    }
+    if bad != 0 { bstatic_horner_window_half_fallback::<W>(x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, out_unit, NT); return; }
+    let mut i = i0;
+    while i < n_chunks {
+        if window_mask == 1 || ((x_outer + i) & window_mask) == W {
+            let cbase = chunk_byte_base + i * 16 * 64;
+            let out = unsafe { out_unit.as_mut_ptr().add(i * 16 * 64) };
+            macro_rules! rows { ($($blk:literal),*) => {{ $(
+                let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
+                if V & ABV_INLINE_WINDOW != 0 { bstatic_horner_blk_body::<$blk, V, true, true>(a_packed, b_packed, inv_table, cbase, partials, kara, dst, NT); }
+                else { bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, cbase, partials, kara, dst, NT); }
+            )* }}; }
+            if W == 0 { rows!(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); } else { rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28); }
+        }
+        i += step;
     }
 }
 
@@ -1706,41 +1807,11 @@ fn bstatic_horner_window_unit_nt<const V: u32, const HOIST: bool, const NT: bool
     let kara = if V & ABV_KARA != 0 {
         ab_kara_tables(inv_table)
     } else if V & ABV_HZ != 0 {
-        ab_hz_tables(inv_table)
-    } else {
-        core::ptr::null()
+        ab_hz_tables(inv_table) } else { core::ptr::null()
     };
-    for (i, out_outer) in out_unit.chunks_exact_mut(16 * 64).enumerate() {
-        let w = (x_outer + i) & window_mask;
-        let chunk_byte_base = chunk_byte_base + i * 16 * 64;
-        assert!(w <= 1);
-        let partials = partials[w];
-        if HOIST {
-            let end = chunk_byte_base + BSTATIC_HORNER_WINDOW_ROWS[w].1 * N_CHUNKS * 8;
-            assert!(end <= a_packed.len() && end <= b_packed.len());
-        }
-        let out = out_outer.as_mut_ptr();
-        macro_rules! rows {
-            ($($blk:literal),*) => {{
-                $(
-                    // SAFETY: `$blk % 16 < 16` and `out_outer` holds 16 rows of 64 bytes.
-                    let dst = unsafe { &mut *out.add(($blk % 16) * 64).cast::<[u8; 64]>() };
-                    if V & ABV_INLINE_WINDOW != 0 {
-                        bstatic_horner_blk_body::<$blk, V, HOIST>(
-                            a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, NT,
-                        );
-                    } else {
-                        bstatic_horner_blk::<$blk, V>(a_packed, b_packed, inv_table, chunk_byte_base, partials, kara, dst, NT);
-                    }
-                )*
-            }};
-        }
-        if w == 0 {
-            rows!(3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-        } else {
-            rows!(16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28);
-        }
-    }
+    let _ = HOIST;
+    bstatic_horner_window_half_nt::<V, NT, 0>(x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials[0], kara, out_unit);
+    bstatic_horner_window_half_nt::<V, NT, 1>(x_outer, window_mask, a_packed, b_packed, inv_table, chunk_byte_base, partials[1], kara, out_unit);
 }
 
 /// [`bstatic_horner_window_unit_nt`] writes the bytes of

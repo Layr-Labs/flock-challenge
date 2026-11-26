@@ -554,14 +554,8 @@ unsafe fn ab_row_pair<const B: usize>(mid: *const u8) -> (usize, usize) {
 /// [`accumulate_convert_ab_nomul_seeded`] for a span of exactly fourteen rows
 /// (`first_b_med..first_b_med + 14`: seven pairs, no odd row).
 ///
-/// Sixteen lanes per pass instead of eight: sixteen accumulators, and each
-/// row's 16 bytes for the pass come from one paired load, so a call issues
-/// 4 x 14 row loads instead of 8 x 14. The seven pairs are unrolled and the
-/// fourteen table bases are formed once per call, so no pair counter, pointer
-/// bump or odd-row test remains.
-///
-/// Bit-exactness: every lane XORs the same `ab_ld` entries (same table, same
-/// row byte) into the same bank slot, grouped in the same row pairs.
+/// Sixteen lanes per pass with two rolling table pointers (`te`, `to`) and
+/// paired `ldp`/`stp` bank transfers, avoiding fourteen-base GPR pressure.
 #[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
@@ -569,39 +563,57 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
     convert: &[F128],
     bank: &mut [F128; 64],
 ) {
-    use core::arch::aarch64::*;
+    use core::arch::aarch64::uint8x16_t;
 
     debug_assert!(first_b_med + 14 <= 16);
     debug_assert_eq!(convert.len(), 16 * 256);
 
-    // SAFETY: caller guarantees fixed input sizes and aarch64 provides NEON.
-    // Rows `first_b_med..first_b_med + 14` and their 4 KiB tables are in
-    // bounds; each pass reads 16 bytes per row at lane offset 0, 16, 32 or 48
-    // and writes sixteen 16-byte bank slots.
+    // SAFETY: fixed sizes cover all 14 rows, 4 KiB tables, and 64 bank slots.
     unsafe {
-        let t0 = (convert.as_ptr() as *const u8).add(first_b_med * 256 * 16);
-        let t: [*const u8; 14] = core::array::from_fn(|b| t0.add(b * 256 * 16));
+        let mut te = (convert.as_ptr() as *const u8).add(first_b_med * 256 * 16);
+        let mut to = te.add(4096);
         let mut mid = (chunk_ab_bytes.as_ptr() as *const u8).add((first_b_med + 7) * 64);
         let mut slot = bank.as_mut_ptr() as *mut u8;
+        macro_rules! ldp_q {
+            ($off:literal) => {{
+                let (a, b): (uint8x16_t, uint8x16_t);
+                core::arch::asm!(
+                    "ldp {a:q}, {b:q}, [{p}, #{off}]",
+                    off = const $off, p = in(reg) slot, a = out(vreg) a, b = out(vreg) b,
+                    options(readonly, nostack, preserves_flags),
+                );
+                (a, b)
+            }};
+        }
+        macro_rules! stp_q {
+            ($off:literal, $a:ident, $b:ident) => {
+                core::arch::asm!(
+                    "stp {a:q}, {b:q}, [{p}, #{off}]",
+                    off = const $off, p = in(reg) slot, a = in(vreg) $a, b = in(vreg) $b,
+                    options(nostack, preserves_flags),
+                );
+            };
+        }
+        macro_rules! step_ptrs {
+            ($op:literal, $d:literal) => {
+                // Omitting `pure` keeps two rolling GPRs instead of 14 LICM bases.
+                core::arch::asm!(
+                    concat!($op, " {te}, {te}, #{d}\n", $op, " {to}, {to}, #{d}"),
+                    d = const $d, te = inout(reg) te, to = inout(reg) to,
+                    options(nomem, nostack, preserves_flags),
+                );
+            };
+        }
         for _ in 0..4 {
-            let mut a0 = vld1q_u8(slot);
-            let mut a1 = vld1q_u8(slot.add(16));
-            let mut a2 = vld1q_u8(slot.add(32));
-            let mut a3 = vld1q_u8(slot.add(48));
-            let mut a4 = vld1q_u8(slot.add(64));
-            let mut a5 = vld1q_u8(slot.add(80));
-            let mut a6 = vld1q_u8(slot.add(96));
-            let mut a7 = vld1q_u8(slot.add(112));
-            let mut a8 = vld1q_u8(slot.add(128));
-            let mut a9 = vld1q_u8(slot.add(144));
-            let mut a10 = vld1q_u8(slot.add(160));
-            let mut a11 = vld1q_u8(slot.add(176));
-            let mut a12 = vld1q_u8(slot.add(192));
-            let mut a13 = vld1q_u8(slot.add(208));
-            let mut a14 = vld1q_u8(slot.add(224));
-            let mut a15 = vld1q_u8(slot.add(240));
+            let (mut a0, mut a1) = ldp_q!(0);
+            let (mut a2, mut a3) = ldp_q!(32);
+            let (mut a4, mut a5) = ldp_q!(64);
+            let (mut a6, mut a7) = ldp_q!(96);
+            let (mut a8, mut a9) = ldp_q!(128);
+            let (mut a10, mut a11) = ldp_q!(160);
+            let (mut a12, mut a13) = ldp_q!(192);
+            let (mut a14, mut a15) = ldp_q!(224);
 
-            // One word of an (even, odd) row pair into eight accumulators.
             macro_rules! fold8 {
                 ($te:expr, $to:expr, $we:expr, $wo:expr,
                  $x0:ident, $x1:ident, $x2:ident, $x3:ident,
@@ -616,40 +628,34 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
                     $x7 = xor3_u8($x7, ab_ld::<U, 56>($te, $we), ab_ld::<U, 56>($to, $wo));
                 };
             }
-            // Rows `$e` and `$o` of the span: low word to lanes 0..8 of the
-            // pass, high word to lanes 8..16.
             macro_rules! pair {
-                ($e:literal, $o:literal) => {{
+                ($e:literal, $o:literal, $adv:literal) => {{
                     let (e0, e1) = ab_row_pair::<$e>(mid);
                     let (o0, o1) = ab_row_pair::<$o>(mid);
-                    fold8!(t[$e], t[$o], e0, o0, a0, a1, a2, a3, a4, a5, a6, a7);
-                    fold8!(t[$e], t[$o], e1, o1, a8, a9, a10, a11, a12, a13, a14, a15);
+                    fold8!(te, to, e0, o0, a0, a1, a2, a3, a4, a5, a6, a7);
+                    fold8!(te, to, e1, o1, a8, a9, a10, a11, a12, a13, a14, a15);
+                    if $adv {
+                        step_ptrs!("add", 8192usize);
+                    }
                 }};
             }
-            pair!(0, 1);
-            pair!(2, 3);
-            pair!(4, 5);
-            pair!(6, 7);
-            pair!(8, 9);
-            pair!(10, 11);
-            pair!(12, 13);
+            pair!(0, 1, true);
+            pair!(2, 3, true);
+            pair!(4, 5, true);
+            pair!(6, 7, true);
+            pair!(8, 9, true);
+            pair!(10, 11, true);
+            pair!(12, 13, false);
+            step_ptrs!("sub", 49152usize);
 
-            vst1q_u8(slot, a0);
-            vst1q_u8(slot.add(16), a1);
-            vst1q_u8(slot.add(32), a2);
-            vst1q_u8(slot.add(48), a3);
-            vst1q_u8(slot.add(64), a4);
-            vst1q_u8(slot.add(80), a5);
-            vst1q_u8(slot.add(96), a6);
-            vst1q_u8(slot.add(112), a7);
-            vst1q_u8(slot.add(128), a8);
-            vst1q_u8(slot.add(144), a9);
-            vst1q_u8(slot.add(160), a10);
-            vst1q_u8(slot.add(176), a11);
-            vst1q_u8(slot.add(192), a12);
-            vst1q_u8(slot.add(208), a13);
-            vst1q_u8(slot.add(224), a14);
-            vst1q_u8(slot.add(240), a15);
+            stp_q!(0, a0, a1);
+            stp_q!(32, a2, a3);
+            stp_q!(64, a4, a5);
+            stp_q!(96, a6, a7);
+            stp_q!(128, a8, a9);
+            stp_q!(160, a10, a11);
+            stp_q!(192, a12, a13);
+            stp_q!(224, a14, a15);
             mid = mid.add(16);
             slot = slot.add(256);
         }

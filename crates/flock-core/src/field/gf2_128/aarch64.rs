@@ -459,9 +459,76 @@ unsafe fn fold_lm(l: uint64x2_t, m: uint64x2_t) -> uint64x2_t {
 }
 
 /// `x * t` for the prepared constant `p = const_prep(t)`, fully reduced.
+/// Computing `M` first lets `s = (M.hi, M.lo)` seed `pmull_pair_acc(s, x, p.0)`:
+/// `M.hi` in lane 0 supplies the `+ 1` of `0x87 = 0x86 ^ 1`, `M.lo` in lane 1
+/// supplies `x^64 * M.lo`, and `pmull2(M, 0x86) ^ l` finishes in 6 SIMD slots.
 #[inline(always)]
 pub(crate) unsafe fn mul_const_prep(p: ConstPrep, x: uint64x2_t) -> uint64x2_t {
-    unsafe { fold_lm(pmull_pair_sum(x, p.0), pmull_pair_sum(x, p.1)) }
+    unsafe {
+        let m = pmull_pair_sum(x, p.1);
+        let l = pmull_pair_acc(vextq_u64::<1>(m, m), x, p.0);
+        let out: uint64x2_t;
+        core::arch::asm!(
+            "pmull2 {o:v}.1q, {m:v}.2d, {k:v}.2d",
+            "eor {o:v}.16b, {o:v}.16b, {l:v}.16b",
+            m = in(vreg) m, k = in(vreg) vdupq_n_u64(0x86), l = in(vreg) l, o = out(vreg) out,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        out
+    }
+}
+
+/// Unreduced schoolbook product accumulator `(ll, cross, hh)` updated with
+/// macro-fused `pmull+eor` / `pmull2+eor` pairs and reduced once per chunk.
+#[derive(Clone, Copy)]
+pub(crate) struct TriNeon {
+    ll: uint64x2_t,
+    cross: uint64x2_t,
+    hh: uint64x2_t,
+}
+
+impl TriNeon {
+    #[inline(always)]
+    pub(crate) unsafe fn zero() -> Self {
+        let z = unsafe { vdupq_n_u64(0) };
+        Self { ll: z, cross: z, hh: z }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn acc_q(&mut self, a: uint64x2_t, b: uint64x2_t) {
+        unsafe {
+            let a_sw = vextq_u64::<1>(a, a);
+            let (ll, hh): (uint64x2_t, uint64x2_t);
+            core::arch::asm!(
+                "pmull {o:v}.1q, {a:v}.1d, {b:v}.1d",
+                "eor {o:v}.16b, {o:v}.16b, {c:v}.16b",
+                a = in(vreg) a, b = in(vreg) b, c = in(vreg) self.ll, o = out(vreg) ll,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            core::arch::asm!(
+                "pmull2 {o:v}.1q, {a:v}.2d, {b:v}.2d",
+                "eor {o:v}.16b, {o:v}.16b, {c:v}.16b",
+                a = in(vreg) a, b = in(vreg) b, c = in(vreg) self.hh, o = out(vreg) hh,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            self.ll = ll;
+            self.hh = hh;
+            self.cross = pmull_pair_acc(self.cross, a_sw, b);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn reduce(self) -> F128 {
+        unsafe {
+            let z = vdupq_n_u64(0);
+            let lo = veorq_u64(self.ll, vextq_u64::<1>(z, self.cross));
+            let hi = veorq_u64(self.hh, vextq_u64::<1>(self.cross, z));
+            ghash_reduce(
+                vgetq_lane_u64::<0>(lo), vgetq_lane_u64::<1>(lo),
+                vgetq_lane_u64::<0>(hi), vgetq_lane_u64::<1>(hi),
+            )
+        }
+    }
 }
 
 /// `acc ^ (x * t)` for the prepared constant `p = const_prep(t)`, fully reduced.
@@ -479,6 +546,7 @@ pub(crate) unsafe fn mul_const_prep_xor(
 
 /// Two independent prepared products, folding each high limb with PMULL.
 /// This avoids the paired ZIP/shift network when that network limits throughput.
+#[cfg(test)]
 #[inline(always)]
 pub(crate) unsafe fn mul_const_pair_prep_pmull(
     p0: ConstPrep,

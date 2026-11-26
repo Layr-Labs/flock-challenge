@@ -248,6 +248,10 @@ pub(crate) struct DeferredAb<'a> {
     /// The buffers already hold every row (no deferral): the handle only
     /// rebuilds rows into round two's scratch (round-two A/B rebuild).
     rebuild_only: bool,
+    /// Hoisted once at handle construction so the per-quad hot path skips
+    /// per-call `OnceLock` acquire loads.
+    ab_rebuild: bool,
+    wide_stores: bool,
 }
 
 // SAFETY: `fill_quad` writes only the four blocks of its own quad; distinct
@@ -325,6 +329,9 @@ impl DeferredAb<'_> {
                     );
                 } else {
                     match (primed, self.copy_drain) {
+                        (true, true) if self.input_mem && self.ab_rebuild && self.wide_stores => {
+                            witgen_simd::build_quad_split_neon_mem_primed_wide(input, a, b, sa, sb)
+                        }
                         (true, true) if self.input_mem => {
                             witgen_simd::build_quad_split_neon_mem::<true>(input, a, b, sa, sb)
                         }
@@ -3278,7 +3285,7 @@ pub(crate) mod witgen_simd {
 
     /// Paired a/b bit-stream writer: the [`W32::push`] contract applied to
     /// both streams at once (their field boundaries are identical).
-    struct W32Pair {
+    struct W32Pair<const PAIRED: bool, const DIRECT: bool, const PRIMED: bool, const WIDE: bool> {
         pa: V4,
         pb: V4,
         sa: *mut V4,
@@ -3286,28 +3293,25 @@ pub(crate) mod witgen_simd {
         // Compile-time fixed by the caller. No primed/no-scratch drain reads
         // B's final identity-only words; cold scratch still needs them.
         b_end: usize,
-        paired: bool,
         even_a: V4,
         even_b: V4,
-        direct: bool,
-        primed_boundaries: bool,
-        // Primed direct groups as paired rows ([`store_group_rows`]).
-        wide: bool,
         da: *mut u32,
         db: *mut u32,
         qa: [V4; 3],
         qb: [V4; 3],
     }
 
-    impl W32Pair {
+    impl<const PAIRED: bool, const DIRECT: bool, const PRIMED: bool, const WIDE: bool>
+        W32Pair<PAIRED, DIRECT, PRIMED, WIDE>
+    {
         #[inline(always)]
         unsafe fn emit<const WORD: usize>(&mut self, va: V4, vb: V4) {
             unsafe {
-                if self.primed_boundaries && WORD >= 36 && WORD < 480 {
+                if DIRECT && PRIMED && WORD >= 36 && WORD < 480 {
                     if WORD % 4 < 3 {
                         self.qa[WORD % 4] = va;
                         if WORD < 472 { self.qb[WORD % 4] = vb; }
-                    } else if self.wide {
+                    } else if WIDE {
                         store_group_rows::<WORD>(self.da, self.qa[0], self.qa[1], self.qa[2], va);
                         if WORD < 472 {
                             store_group_rows::<WORD>(self.db, self.qb[0], self.qb[1], self.qb[2], vb);
@@ -3327,7 +3331,7 @@ pub(crate) mod witgen_simd {
                             vst4q_lane_u32::<3>(self.db.add(3 * U32_PER_BLOCK + start), bb);
                         }
                     }
-                } else if self.primed_boundaries && WORD >= 480 {
+                } else if DIRECT && PRIMED && WORD >= 480 {
                     if WORD == 480 {
                         self.even_a = va;
                     } else {
@@ -3338,7 +3342,7 @@ pub(crate) mod witgen_simd {
                         vst2q_lane_u32::<2>(self.da.add(2 * U32_PER_BLOCK + 480), aa);
                         vst2q_lane_u32::<3>(self.da.add(3 * U32_PER_BLOCK + 480), aa);
                     }
-                } else if self.direct && WORD >= 40 && WORD < 472 {
+                } else if DIRECT && WORD >= 40 && WORD < 472 {
                     if WORD % 4 < 3 {
                         self.qa[WORD % 4] = va;
                         self.qb[WORD % 4] = vb;
@@ -3355,7 +3359,7 @@ pub(crate) mod witgen_simd {
                         vst4q_lane_u32::<2>(self.db.add(2 * U32_PER_BLOCK + start), bb);
                         vst4q_lane_u32::<3>(self.db.add(3 * U32_PER_BLOCK + start), bb);
                     }
-                } else if self.paired {
+                } else if PAIRED {
                     if WORD % 2 == 0 {
                         self.even_a = va;
                         if WORD < self.b_end { self.even_b = vb; }
@@ -3644,25 +3648,34 @@ pub(crate) mod witgen_simd {
     /// selected form writes; the skipped constant chunks of those buffers
     /// must already hold the per-block constants (token-certified).
     /// `sa` / `sb` must each be valid for `4 * U32_PER_BLOCK` words when
+    /// Leaf fast path for `build_quad_split_neon::<true, false, false, false>`.
+    #[inline(never)]
+    pub(crate) unsafe fn build_quad_split_neon_z_fast(inputs: QuadInput<'_>, z: *mut u32) {
+        let null = core::ptr::null_mut();
+        unsafe { build_quad_split_neon_impl::<true, false, false, false, true, true, true, false, false, false, { RANKED_SPARSE_TAIL_WORD + 4 }, 0>(inputs, z, null, null, null, null) }
+    }
+
+    #[cold]
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn build_quad_split_neon<
-        const WZ: bool,
-        const SCRATCH: bool,
-        const PRIMED: bool,
-        const COPY: bool,
-    >(
-        inputs: QuadInput<'_>,
-        z: *mut u32,
-        a: *mut u32,
-        b: *mut u32,
-        sa: *mut u32,
-        sb: *mut u32,
+    unsafe fn build_quad_split_neon_fallback<const WZ: bool, const SCRATCH: bool, const PRIMED: bool, const COPY: bool>(
+        inputs: QuadInput<'_>, z: *mut u32, a: *mut u32, b: *mut u32, sa: *mut u32, sb: *mut u32,
+    ) {
+        unsafe { build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false, false, U32_PER_BLOCK, U32_PER_BLOCK>(inputs, z, a, b, sa, sb) }
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build_quad_split_neon<const WZ: bool, const SCRATCH: bool, const PRIMED: bool, const COPY: bool>(
+        inputs: QuadInput<'_>, z: *mut u32, a: *mut u32, b: *mut u32, sa: *mut u32, sb: *mut u32,
     ) {
         unsafe {
             if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, WZ, true, true, false, false, false>(inputs, z, a, b, sa, sb)
+                if WZ { build_quad_split_neon_z_fast(inputs, z) } else {
+                    build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, WZ, true, true, false, false, false, U32_PER_BLOCK, U32_PER_BLOCK>(inputs, z, a, b, sa, sb)
+                }
             } else {
-                build_quad_split_neon_impl::<WZ, SCRATCH, PRIMED, COPY, false, false, false, false, false, false>(inputs, z, a, b, sa, sb)
+                build_quad_split_neon_fallback::<WZ, SCRATCH, PRIMED, COPY>(inputs, z, a, b, sa, sb)
             }
         }
     }
@@ -3673,7 +3686,7 @@ pub(crate) mod witgen_simd {
     /// from the G stream): any value of `FLOCK_NO_WITGEN_AB_REBUILD` keeps
     /// the incumbent per-word stage stores and the full scratch copy. Read
     /// once per process. Same z, a, b and scratch bytes either way.
-    fn ab_rebuild_enabled() -> bool {
+    pub(super) fn ab_rebuild_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_AB_REBUILD").is_none())
     }
@@ -3683,9 +3696,33 @@ pub(crate) mod witgen_simd {
     /// `FLOCK_NO_WITGEN_WIDE_STORES` keeps the four single-lane `ST4`
     /// stores per word group. Read once per process. Same scratch, a and b
     /// bytes either way.
-    fn wide_stores_enabled() -> bool {
+    pub(super) fn wide_stores_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("FLOCK_NO_WITGEN_WIDE_STORES").is_none())
+    }
+
+    /// Leaf fast path for `build_quad_split_neon_mem::<true>` with wide stores.
+    #[inline(never)]
+    pub(crate) unsafe fn build_quad_split_neon_mem_primed_wide(
+        inputs: QuadInput<'_>, a: *mut u32, b: *mut u32, sa: *mut u32, sb: *mut u32,
+    ) {
+        unsafe { build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, true, 36, 0>(inputs, core::ptr::null_mut(), a, b, sa, sb) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn build_quad_split_neon_mem_no_wide(
+        inputs: QuadInput<'_>, a: *mut u32, b: *mut u32, sa: *mut u32, sb: *mut u32,
+    ) {
+        unsafe { build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, false, 36, 0>(inputs, core::ptr::null_mut(), a, b, sa, sb) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn build_quad_split_neon_mem_fallback<const PRIMED: bool>(
+        inputs: QuadInput<'_>, a: *mut u32, b: *mut u32, sa: *mut u32, sb: *mut u32,
+    ) {
+        unsafe { build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false, false, U32_PER_BLOCK, U32_PER_BLOCK>(inputs, core::ptr::null_mut(), a, b, sa, sb) }
     }
 
     /// The copy-drain a/b form of [`build_quad_split_neon`]
@@ -3702,41 +3739,22 @@ pub(crate) mod witgen_simd {
     /// # Safety
     /// As [`build_quad_split_neon`] for the `<false, true, PRIMED, true>`
     /// form.
+    #[inline(never)]
     pub(crate) unsafe fn build_quad_split_neon_mem<const PRIMED: bool>(
-        inputs: QuadInput<'_>,
-        a: *mut u32,
-        b: *mut u32,
-        sa: *mut u32,
-        sb: *mut u32,
+        inputs: QuadInput<'_>, a: *mut u32, b: *mut u32, sa: *mut u32, sb: *mut u32,
     ) {
         unsafe {
-            if PRIMED && ab_rebuild_enabled() && wide_stores_enabled() {
-                build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, true>(
-                    inputs,
-                    core::ptr::null_mut(),
-                    a,
-                    b,
-                    sa,
-                    sb,
-                )
+            if PRIMED {
+                if ab_rebuild_enabled() {
+                    if wide_stores_enabled() { build_quad_split_neon_mem_primed_wide(inputs, a, b, sa, sb) }
+                    else { build_quad_split_neon_mem_no_wide(inputs, a, b, sa, sb) }
+                } else {
+                    build_quad_split_neon_mem_fallback::<true>(inputs, a, b, sa, sb)
+                }
             } else if ab_rebuild_enabled() {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, true, false, false>(
-                    inputs,
-                    core::ptr::null_mut(),
-                    a,
-                    b,
-                    sa,
-                    sb,
-                )
+                build_quad_split_neon_impl::<false, true, false, true, true, true, true, true, false, false, U32_PER_BLOCK, U32_PER_BLOCK>(inputs, core::ptr::null_mut(), a, b, sa, sb)
             } else {
-                build_quad_split_neon_impl::<false, true, PRIMED, true, true, false, false, false, false, false>(
-                    inputs,
-                    core::ptr::null_mut(),
-                    a,
-                    b,
-                    sa,
-                    sb,
-                )
+                build_quad_split_neon_mem_fallback::<false>(inputs, a, b, sa, sb)
             }
         }
     }
@@ -3753,7 +3771,7 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, WIDE>(
+            build_quad_split_neon_impl::<false, true, true, true, true, true, true, true, false, WIDE, 36, 0>(
                 inputs, core::ptr::null_mut(), a, b, sa, sb,
             )
         }
@@ -3775,7 +3793,7 @@ pub(crate) mod witgen_simd {
         sb: *mut u32,
     ) {
         unsafe {
-            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false, false, false>(
+            build_quad_split_neon_impl::<false, true, PRIMED, true, true, true, true, false, false, false, U32_PER_BLOCK, U32_PER_BLOCK>(
                 inputs, core::ptr::null_mut(), a, b, sa, sb,
             )
         }
@@ -3795,7 +3813,7 @@ pub(crate) mod witgen_simd {
     /// `zs` is valid for `4 * U32_PER_BLOCK` u32 writes.
     pub(crate) unsafe fn build_quad_z_rows_plain(inputs: QuadInput<'_>, zs: *mut u32) {
         unsafe {
-            build_quad_split_neon_impl::<true, false, false, false, true, false, true, false, true, false>(
+            build_quad_split_neon_impl::<true, false, false, false, true, false, true, false, true, false, { 8 * ELIDE_ZERO_CHUNK }, 0>(
                 inputs,
                 zs,
                 core::ptr::null_mut(),
@@ -3839,6 +3857,8 @@ pub(crate) mod witgen_simd {
         const DIRECT_SCRATCH: bool,
         const ZPLAIN: bool,
         const WIDE_STORES: bool,
+        const ZA_LEN: usize,
+        const BS_LEN: usize,
     >(
         inputs: QuadInput<'_>,
         z: *mut u32,
@@ -3858,6 +3878,8 @@ pub(crate) mod witgen_simd {
             assert!(RANKED_SPARSE_TAIL_CHUNK.is_multiple_of(2));
             assert!(ELIDE_B_PREFIX_CHUNKS.is_multiple_of(2));
             assert!(RANKED_SPARSE_TAIL_CHUNK + 1 == ELIDE_ZERO_CHUNK);
+            assert!(ZA_LEN >= if DIRECT_SCRATCH && PRIMED { 36 } else if WZ && ZPLAIN { 8 * ELIDE_ZERO_CHUNK } else if WZ { RANKED_SPARSE_TAIL_WORD + 4 } else { U32_PER_BLOCK });
+            assert!(BS_LEN >= if WZ || (DIRECT_SCRATCH && PRIMED) { 0 } else { U32_PER_BLOCK });
         }
         let full_scratch = SCRATCH && !PRIMED;
         unsafe {
@@ -4003,8 +4025,8 @@ pub(crate) mod witgen_simd {
             let zero = vdupq_n_u32(0);
             let maxv = vdupq_n_u32(u32::MAX);
             let one = vdupq_n_u32(1);
-            let mut za = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
-            let mut bs = core::mem::MaybeUninit::<[V4; U32_PER_BLOCK]>::uninit();
+            let mut za = core::mem::MaybeUninit::<[V4; ZA_LEN]>::uninit();
+            let mut bs = core::mem::MaybeUninit::<[V4; BS_LEN]>::uninit();
             let za = za.as_mut_ptr().cast::<V4>();
             let bs = bs.as_mut_ptr().cast::<V4>();
 
@@ -4053,17 +4075,13 @@ pub(crate) mod witgen_simd {
             // ---- G stream ----
             let pending_bit = vshrq_n_u32::<31>(flags);
             let mut wz = W32::at_paired(za, pending_bit, PAIR_STAGE_STORES);
-            let mut wab = W32Pair {
+            let mut wab = W32Pair::<PAIR_STAGE_STORES, DIRECT_SCRATCH, PRIMED, WIDE_STORES> {
                 pa: pending_bit,
                 pb: one,
                 sa: za,
                 sb: bs,
-                paired: PAIR_STAGE_STORES,
                 even_a: zero,
                 even_b: zero,
-                direct: DIRECT_SCRATCH,
-                primed_boundaries: DIRECT_SCRATCH && PRIMED,
-                wide: WIDE_STORES,
                 da: sa,
                 db: sb,
                 qa: [zero; 3],
@@ -4400,20 +4418,25 @@ pub(crate) mod witgen_simd {
         // (all tokens, NT stores, live stream, deferred stripe, complete
         // shape) is exactly what the split kernels assume.
         let defer_ab = allow_defer_ab && ranked_dead_stage && defer_ab_enabled();
+        let ab_rebuild = ab_rebuild_enabled();
         debug_assert!(!defer_ab || (stripe_base.is_none() && n_blocks == n_total));
         // One quad through the selected kernel.
         let emit_quad = |input: QuadInput<'_>, z: *mut u32, a: *mut u32, b: *mut u32| {
             // SAFETY: the caller passes its own quad's block slots.
             unsafe {
                 if defer_ab {
-                    build_quad_split_neon::<true, false, false, false>(
-                        input,
-                        z,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    );
+                    if ab_rebuild {
+                        build_quad_split_neon_z_fast(input, z);
+                    } else {
+                        build_quad_split_neon_fallback::<true, false, false, false>(
+                            input,
+                            z,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        );
+                    }
                 } else {
                     build_quad_witness_ab_stream_neon_elide(
                         input,
@@ -4847,6 +4870,8 @@ pub(crate) mod witgen_simd {
             input_mem: ab_input_mem_enabled(),
             seed_in_place,
             rebuild_only,
+            ab_rebuild,
+            wide_stores: wide_stores_enabled(),
         });
         (z, a, b, z_lincheck, stream, deferred)
     }
@@ -7611,6 +7636,8 @@ mod tests {
                 input_mem,
                 seed_in_place: true,
                 rebuild_only: false,
+                ab_rebuild: true,
+                wide_stores: true,
             };
             for q in 0..n_quads {
                 let sa = scratch.as_mut_ptr().cast::<u8>();
@@ -7656,6 +7683,8 @@ mod tests {
                 input_mem,
                 seed_in_place: in_place,
                 rebuild_only: false,
+                ab_rebuild: true,
+                wide_stores: true,
             };
             for q in 0..n_quads {
                 if scratch_mode == 0 {
@@ -7766,6 +7795,8 @@ mod tests {
                     input_mem: true,
                     seed_in_place,
                     rebuild_only: false,
+                    ab_rebuild: true,
+                    wide_stores: true,
                 };
                 for q in 0..N_QUADS {
                     let mut zs = vec![0xA5A5_A5A5u32; U32S];
@@ -7832,6 +7863,8 @@ mod tests {
             input_mem,
             seed_in_place: true,
             rebuild_only: false,
+            ab_rebuild: true,
+            wide_stores: true,
         };
         let mut checked = 0usize;
         for (case, init) in [0u64, 0x0123_4567_89ab_cdef, 0x9e37_79b9_7f4a_7c15].into_iter().enumerate() {

@@ -599,14 +599,12 @@ pub(crate) fn hash_ranked_blake3_parent_chunk(read: &[Hash], write: &mut [Hash])
 const BLAKE3_LEAF_QUEUE_CHUNK: usize = 240;
 
 /// Parents per queue chunk in the batched BLAKE3 parent path (see `epool`).
-/// Must be a multiple of 12 so every full group runs entirely through the
-/// twelve-way parent kernel (`hash_complete_parent_groups`) with no 4-wide
-/// tail. The previous static-rayon group size of 1024 = 12·85 + 4 dropped a
-/// 4-node remainder onto the slower path in *every* task; 1020 = 12·85
-/// eliminates that remainder. A full chunk is 1020 nodes × 64 B of children
-/// ≈ 64 KiB of input — one atomic claim amortises cleanly and an E-core tail
-/// is still sub-millisecond.
-const BLAKE3_PARENT_QUEUE_CHUNK: usize = 1020;
+/// Multiple of 8 so every full chunk runs entirely through the eight-way
+/// parent kernel (`hash_complete_parent_groups`) with zero remainder, and an
+/// exact divisor of every power-of-two level above the serial cutoff so the
+/// final chunk has no tail either. A full chunk is 1024 nodes × 64 B of
+/// children = 64 KiB of input.
+const BLAKE3_PARENT_QUEUE_CHUNK: usize = 1024;
 
 /// Hash one internal level: `write[i] = hash_pair(read[2i], read[2i+1])`.
 ///
