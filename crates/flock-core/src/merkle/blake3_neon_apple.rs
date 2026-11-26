@@ -497,6 +497,17 @@ unsafe fn g3s_c_only(
     }
 }
 
+/// Kill switch for the 32-bit zero-high-nonce specialization in
+/// [`pow_scan_reg`] (`FLOCK_NO_POW_ZERO_HI`, any value restores the full
+/// 64-bit nonce path on every scan). Read once per process.
+pub const ENV_NO_POW_ZERO_HI: &str = "FLOCK_NO_POW_ZERO_HI";
+
+#[inline]
+fn pow_zero_hi_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(ENV_NO_POW_ZERO_HI).is_none())
+}
+
 /// Smallest nonce in `start .. start + len` whose BLAKE3 PoW hash has `bits`
 /// leading zero bits, or `None` — the register-resident specialization of
 /// `blake3_pow_scan` for `1 <= bits <= 32`. Byte-exact against `blake3::hash`
@@ -513,10 +524,20 @@ pub(crate) fn pow_scan_reg(
     debug_assert!((1..=32).contains(&bits));
     let fx = pow_fixed(state_digest);
     let mask = word0_mask(bits);
-    unsafe { pow_scan_reg_inner(&fx, start, len, mask) }
+    let end = start.saturating_add(len);
+    if pow_zero_hi_enabled() && end <= (u32::MAX as u64) + 1 {
+        unsafe { pow_scan_reg_inner::<true>(&fx, start, len, mask) }
+    } else {
+        unsafe { pow_scan_reg_inner::<false>(&fx, start, len, mask) }
+    }
 }
 
-unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> Option<u64> {
+unsafe fn pow_scan_reg_inner<const ZERO_HI: bool>(
+    fx: &PowFixed,
+    start: u64,
+    len: u64,
+    mask: u32,
+) -> Option<u64> {
     unsafe {
         // Broadcast the grind-invariant state once; these stay live across
         // every attempt in the scan.
@@ -531,25 +552,42 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             #[cfg(feature = "hash-count")]
             crate::challenger::fs_count::POW_SHA256
                 .fetch_add(12, std::sync::atomic::Ordering::Relaxed);
-            // Nonce lanes: scalar build handles the (astronomically rare)
-            // 32-bit carry between lanes for free.
-            let mut lo = [[0u32; 4]; 3];
-            let mut hi = [[0u32; 4]; 3];
-            for i in 0..12 {
-                let n = base + i as u64;
-                lo[i / 4][i % 4] = n as u32;
-                hi[i / 4][i % 4] = (n >> 32) as u32;
-            }
-            let n8 = [
-                vld1q_u32(lo[0].as_ptr()),
-                vld1q_u32(lo[1].as_ptr()),
-                vld1q_u32(lo[2].as_ptr()),
-            ];
-            let n9 = [
-                vld1q_u32(hi[0].as_ptr()),
-                vld1q_u32(hi[1].as_ptr()),
-                vld1q_u32(hi[2].as_ptr()),
-            ];
+            // When ZERO_HI holds, `end <= 2^32`, so every nonce's high word
+            // (`m[9]`) is identically zero and `n8` is formed directly from
+            // `base as u32` without a 12-word scalar stack build.
+            let (n8, n9_msg) = if ZERO_HI {
+                const OFF0: [u32; 4] = [0, 1, 2, 3];
+                const OFF1: [u32; 4] = [4, 5, 6, 7];
+                const OFF2: [u32; 4] = [8, 9, 10, 11];
+                let bv = vdupq_n_u32(base as u32);
+                let n8 = [
+                    vaddq_u32(bv, vld1q_u32(OFF0.as_ptr())),
+                    vaddq_u32(bv, vld1q_u32(OFF1.as_ptr())),
+                    vaddq_u32(bv, vld1q_u32(OFF2.as_ptr())),
+                ];
+                (n8, Msg3::Z)
+            } else {
+                // Nonce lanes: scalar build handles the (astronomically rare)
+                // 32-bit carry between lanes for free.
+                let mut lo = [[0u32; 4]; 3];
+                let mut hi = [[0u32; 4]; 3];
+                for i in 0..12 {
+                    let n = base + i as u64;
+                    lo[i / 4][i % 4] = n as u32;
+                    hi[i / 4][i % 4] = (n >> 32) as u32;
+                }
+                let n8 = [
+                    vld1q_u32(lo[0].as_ptr()),
+                    vld1q_u32(lo[1].as_ptr()),
+                    vld1q_u32(lo[2].as_ptr()),
+                ];
+                let n9 = [
+                    vld1q_u32(hi[0].as_ptr()),
+                    vld1q_u32(hi[1].as_ptr()),
+                    vld1q_u32(hi[2].as_ptr()),
+                ];
+                (n8, Msg3::P(n9))
+            };
 
             // Round 1 = just the nonce G at (0,5,10,15), from precomputed
             // column-half inputs; all other words come in as constants.
@@ -561,7 +599,10 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
                 let mut d = rotate16(veorq_u32(cb[15], a));
                 let mut c = vaddq_u32(cb[10], d);
                 let mut b = rotate12(veorq_u32(cb[5], c));
-                a = vaddq_u32(vaddq_u32(a, b), n9[k]);
+                a = vaddq_u32(a, b);
+                if let Msg3::P(n9) = n9_msg {
+                    a = vaddq_u32(a, n9[k]);
+                }
                 d = rotate8(veorq_u32(d, a));
                 c = vaddq_u32(c, d);
                 b = rotate7(veorq_u32(b, c));
@@ -579,7 +620,7 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::S(dv[4]), Msg3::Z);
             g3s(v0, v1, v2, 0, 5, 10, 15, Msg3::S(dv[1]), Msg3::Z);
             g3s(v0, v1, v2, 1, 6, 11, 12, Msg3::Z, Msg3::S(dv[5]));
-            g3s(v0, v1, v2, 2, 7, 8, 13, Msg3::P(n9), Msg3::Z);
+            g3s(v0, v1, v2, 2, 7, 8, 13, n9_msg, Msg3::Z);
             g3s(v0, v1, v2, 3, 4, 9, 14, Msg3::Z, Msg3::P(n8));
 
             // round 3 (schedule row 2)
@@ -588,13 +629,13 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::Z, Msg3::S(dv[2]));
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::S(dv[7]), Msg3::Z);
             g3s(v0, v1, v2, 0, 5, 10, 15, Msg3::S(dv[6]), Msg3::S(dv[5]));
-            g3s(v0, v1, v2, 1, 6, 11, 12, Msg3::P(n9), Msg3::S(dv[0]));
+            g3s(v0, v1, v2, 1, 6, 11, 12, n9_msg, Msg3::S(dv[0]));
             g3s(v0, v1, v2, 2, 7, 8, 13, Msg3::Z, Msg3::Z);
             g3s(v0, v1, v2, 3, 4, 9, 14, Msg3::P(n8), Msg3::S(dv[1]));
 
             // round 4 (schedule row 3)
             g3s(v0, v1, v2, 0, 4, 8, 12, Msg3::Z, Msg3::S(dv[7]));
-            g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::Z, Msg3::P(n9));
+            g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::Z, n9_msg);
             g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::Z, Msg3::S(dv[3]));
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::Z, Msg3::Z);
             g3s(v0, v1, v2, 0, 5, 10, 15, Msg3::S(dv[4]), Msg3::S(dv[0]));
@@ -604,7 +645,7 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
 
             // round 5 (schedule row 4)
             g3s(v0, v1, v2, 0, 4, 8, 12, Msg3::Z, Msg3::Z);
-            g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::P(n9), Msg3::Z);
+            g3s(v0, v1, v2, 1, 5, 9, 13, n9_msg, Msg3::Z);
             g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::Z, Msg3::Z);
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::Z, Msg3::P(n8));
             g3s(v0, v1, v2, 0, 5, 10, 15, Msg3::S(dv[7]), Msg3::S(dv[2]));
@@ -613,7 +654,7 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             g3s(v0, v1, v2, 3, 4, 9, 14, Msg3::S(dv[6]), Msg3::S(dv[4]));
 
             // round 6 (schedule row 5)
-            g3s(v0, v1, v2, 0, 4, 8, 12, Msg3::P(n9), Msg3::Z);
+            g3s(v0, v1, v2, 0, 4, 8, 12, n9_msg, Msg3::Z);
             g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::Z, Msg3::S(dv[5]));
             g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::P(n8), Msg3::Z);
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::Z, Msg3::S(dv[1]));
@@ -628,7 +669,7 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
             // nor word 8 and are dropped.
             g3s(v0, v1, v2, 0, 4, 8, 12, Msg3::Z, Msg3::Z);
             g3s(v0, v1, v2, 1, 5, 9, 13, Msg3::S(dv[5]), Msg3::S(dv[0]));
-            g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::S(dv[1]), Msg3::P(n9));
+            g3s(v0, v1, v2, 2, 6, 10, 14, Msg3::S(dv[1]), n9_msg);
             g3s(v0, v1, v2, 3, 7, 11, 15, Msg3::P(n8), Msg3::S(dv[6]));
             g3s_a_only(v0, v1, v2, 0, 5, 10, 15, Msg3::Z, Msg3::Z);
             g3s_c_only(v0, v1, v2, 2, 7, 8, 13, Msg3::S(dv[3]), Msg3::S(dv[4]));
@@ -677,7 +718,11 @@ unsafe fn pow_scan_reg_inner(fx: &PowFixed, start: u64, len: u64, mask: u32) -> 
 /// them into word-major lanes (lane `j` = block `j`), exactly as
 /// [`transpose_parent4`] does for contiguous blocks.
 #[inline(always)]
-unsafe fn transpose_block4_strided(base: *const u8, stride: usize, out: &mut [uint32x4_t; 16]) {
+unsafe fn transpose_block4_strided(
+    base: *const u8,
+    stride: usize,
+    out: &mut [uint32x4_t; 16],
+) {
     unsafe {
         for word_vec in 0..4 {
             let word_offset = word_vec * 16;

@@ -168,6 +168,70 @@ pub(crate) fn fold_banked_slots2<const BANKS: usize>(
     }
 }
 
+/// Fold two disjoint `BANKS`-element slices against one shared `weight`.
+/// Bit-identical to `[fold_banked_slot(weight, a), fold_banked_slot(weight, b)]`.
+#[inline]
+pub(crate) fn fold_banked_pair_disjoint<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    a: &[F128],
+    b: &[F128],
+) -> [F128; 2] {
+    debug_assert!(a.len() >= BANKS && b.len() >= BANKS);
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; callers guarantee
+        // at least `BANKS` readable elements in both `a` and `b`.
+        unsafe { aarch64::fold_banked_pair_disjoint::<BANKS>(weight, a, b) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut first = super::F256Unreduced::ZERO;
+        let mut second = super::F256Unreduced::ZERO;
+        for (bank, w) in weight.iter().enumerate() {
+            first ^= w.mul_unreduced(a[bank]);
+            second ^= w.mul_unreduced(b[bank]);
+        }
+        [first.reduce(), second.reduce()]
+    }
+}
+
+/// Fold four disjoint `BANKS`-element slices against one shared `weight`.
+/// Bit-identical to four independent [`fold_banked_slot`] calls.
+#[inline]
+pub(crate) fn fold_banked_quad_disjoint<const BANKS: usize>(
+    weight: &[F128; BANKS],
+    r0: &[F128],
+    r1: &[F128],
+    r2: &[F128],
+    r3: &[F128],
+) -> [F128; 4] {
+    debug_assert!(
+        r0.len() >= BANKS && r1.len() >= BANKS && r2.len() >= BANKS && r3.len() >= BANKS
+    );
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: the cfg gate supplies PMULL through `aes`; callers guarantee
+        // at least `BANKS` readable elements in each of `r0..r3`.
+        unsafe { aarch64::fold_banked_quad_disjoint::<BANKS>(weight, r0, r1, r2, r3) }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut acc = [super::F256Unreduced::ZERO; 4];
+        for (bank, w) in weight.iter().enumerate() {
+            acc[0] ^= w.mul_unreduced(r0[bank]);
+            acc[1] ^= w.mul_unreduced(r1[bank]);
+            acc[2] ^= w.mul_unreduced(r2[bank]);
+            acc[3] ^= w.mul_unreduced(r3[bank]);
+        }
+        [
+            acc[0].reduce(),
+            acc[1].reduce(),
+            acc[2].reduce(),
+            acc[3].reduce(),
+        ]
+    }
+}
+
 /// once. Each output remains an independent deferred-reduction sum, so the
 #[inline]
 pub(crate) fn fold_banked_slots4<const BANKS: usize>(
