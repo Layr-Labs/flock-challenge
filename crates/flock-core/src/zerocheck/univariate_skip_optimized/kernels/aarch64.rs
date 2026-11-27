@@ -2497,6 +2497,70 @@ fn static_a_k1_partial(inv_table: &InvNttTableByteSingleGf8) -> &'static [u8; 64
 #[cfg(target_arch = "aarch64")]
 const ABV_OMIT_MIXED_ONES: u32 = 1 << 21;
 
+#[cfg(target_arch = "aarch64")]
+const ABV_RESIDUAL_B_SPARSE: u32 = 1 << 22;
+
+/// The B image for a residual term. The unit dispatcher certifies the low
+/// bits of both boundary words before enabling the sparse variant.
+/// T(all ones) is constant one, and byte b permutes the output index by XOR (8 * b).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mixed_residual_b_img<const V: u32, const ONE_MASK: u8, const K: usize>(
+    plain: *const u8,
+    plain_sw: *const u8,
+    kplain: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        if V & ABV_RESIDUAL_B_SPARSE != 0 {
+            if ONE_MASK == 0x03 && K == 5 {
+                // Medium row 2, K5. The only varying byte is at position 7,
+                // so reverse the four vectors and exchange their two halves.
+                let row = plain.add(ab_z_idx::<7, 6>(!w));
+                let one = vdupq_n_u8(1);
+                let lane = |off| {
+                    let v = vld1q_u8(row.add(off));
+                    veorq_u8(vextq_u8::<8>(v, v), one)
+                };
+                return (lane(48), lane(32), lane(16), lane(0));
+            }
+            if ONE_MASK == 0xf0 && K == 0 {
+                // Medium row 29, K0. First form the low-pair image of the
+                // complemented varying bytes. Positions 6 and 7 then reverse
+                // the four vectors (XOR 48), with no half exchange.
+                let v = !w >> 48;
+                let row = plain.add(ab_z_idx::<0, 6>(v ^ (v >> 8)));
+                // Both existing tables store the four 8-byte halves of the
+                // same sigma row. They differ only in record stride/offset.
+                let sigma = if V & ABV_HZ != 0 {
+                    kplain.add(ab_z_idx::<1, 5>(v))
+                } else {
+                    kplain.add(2 * AB_KARA_IMAGE_BYTES + AB_Z_REC + 64 + ab_z_idx::<1, 7>(v))
+                };
+                let p = vreinterpretq_u64_u8(vld1q_u8(sigma));
+                let q = vreinterpretq_u64_u8(vld1q_u8(sigma.add(16)));
+                let one = vdupq_n_u8(1);
+                let lane = |off, half| {
+                    xor3_u8(vld1q_u8(row.add(off)), vreinterpretq_u8_u64(half), one)
+                };
+                return (
+                    lane(48, vzip2q_u64(q, q)),
+                    lane(32, vzip1q_u64(q, q)),
+                    lane(16, vzip2q_u64(p, p)),
+                    lane(0, vzip1q_u64(p, p)),
+                );
+            }
+        }
+        apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, w)
+    }
+}
+
 /// Horner / scaled-table twin of [`shift_reduce_inner_mixed_const_b`]. Rows
 /// selected by `ONE_MASK` have B = 1 and therefore widen the transformed A
 /// bytes directly; all other rows form the same raw PMULL products as the h4
@@ -2523,6 +2587,14 @@ fn shift_reduce_inner_mixed_const_b_h4<
     use core::arch::aarch64::*;
 
     const { assert!(V & ABV_OMIT_MIXED_ONES == 0 || ONE_MASK == 0x03 || ONE_MASK == 0xf0) };
+    const {
+        const Z_TABLE: u32 = ABV_KARA | ABV_Z | ABV_Z_REC;
+        assert!(
+            V & ABV_RESIDUAL_B_SPARSE == 0
+                || (V & ABV_OMIT_MIXED_ONES != 0
+                    && (V & (ABV_KARA | ABV_HZ) == ABV_HZ || V & (Z_TABLE | ABV_HZ) == Z_TABLE))
+        );
+    };
     let plain = inv_table.data_ptr();
     let plain_sw = inv_table.half_swapped_data_ptr();
     let scaled = inv_table.scaled_x4_data_ptr();
@@ -2622,7 +2694,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                     let bw = u64::from_le(core::ptr::read_unaligned(
                         b_base.add($k * N_CHUNKS).cast::<u64>(),
                     ));
-                    let (db0, db1, db2, db3) = apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw);
+                    let (db0, db1, db2, db3) = mixed_residual_b_img::<V, ONE_MASK, $k>(plain, plain_sw, kplain, bw);
                     [
                         pmull_lo_u16(da0, db0),
                         pmull_hi_u16(da0, db0),
@@ -2654,7 +2726,7 @@ fn shift_reduce_inner_mixed_const_b_h4<
                         let bw = u64::from_le(core::ptr::read_unaligned(
                             b_base.add($k * N_CHUNKS).cast::<u64>(),
                         ));
-                        let (db0, db1, db2, db3) = apply_word_into_4_regs_v::<V, false>(plain, plain_sw, kplain, bw);
+                        let (db0, db1, db2, db3) = mixed_residual_b_img::<V, ONE_MASK, $k>(plain, plain_sw, kplain, bw);
                         [db0, db1, db2, db3]
                     };
                     ([da0, da1, da2, da3], db)
@@ -6164,24 +6236,46 @@ pub(crate) fn ab_mixed_rows_residual_unit(
 ) {
     const MAIN: u32 = AB_MIXED_H2_VARIANT | ABV_FUSE | ABV_KARA_LANEZ | ABV_OMIT_MIXED_ONES;
     const HELPER: u32 = ABV_HZ | ABV_OMIT_MIXED_ONES;
+    const MAIN_SPARSE: u32 = MAIN | ABV_RESIDUAL_B_SPARSE;
+    const HELPER_SPARSE: u32 = HELPER | ABV_RESIDUAL_B_SPARSE;
     const ROW_BYTES: usize = N_CHUNKS * 8;
     const OUTER_BYTES: usize = 16 * ROW_BYTES;
+    const EVEN_ROW: usize = 2 * ROW_BYTES;
+    const ODD_ROW: usize = 13 * ROW_BYTES;
+    const LOW56: u64 = 0x00ff_ffff_ffff_ffff;
+    const LOW48: u64 = 0x0000_ffff_ffff_ffff;
     if unit_chunks == 0 {
         return;
     }
     assert!(unit_chunks.is_multiple_of(2));
-    assert!(out_unit.len() >= unit_chunks * OUTER_BYTES);
+    assert!(unit_chunks <= out_unit.len() / OUTER_BYTES);
     let last_end = chunk_byte_base
-        .checked_add((unit_chunks - 1) * OUTER_BYTES + 14 * ROW_BYTES)
+        .checked_add((unit_chunks - 1) * OUTER_BYTES + ODD_ROW + ROW_BYTES)
         .expect("residual unit byte offset overflow");
     assert!(last_end <= a_packed.len().min(b_packed.len()));
+
+    // Check both B words in every pair before choosing a noinline leaf.
+    // One miss keeps the entire unit on the stock residual. The leaf reads
+    // the same immutable input and needs no dynamic guard in its NEON body.
+    let sparse = (0..unit_chunks).step_by(2).all(|local| {
+        let k5 = chunk_byte_base + local * OUTER_BYTES + EVEN_ROW + 5 * N_CHUNKS;
+        let k0 = chunk_byte_base + (local + 1) * OUTER_BYTES + ODD_ROW;
+        // SAFETY: both eight-byte words end at or before last_end.
+        unsafe {
+            let base = b_packed.as_ptr();
+            let k5 = u64::from_le(core::ptr::read_unaligned(base.add(k5).cast::<u64>()));
+            let k0 = u64::from_le(core::ptr::read_unaligned(base.add(k0).cast::<u64>()));
+            k5 & LOW56 == LOW56 && k0 & LOW48 == LOW48
+        }
+    });
+
     let out_ptr = out_unit.as_mut_ptr();
     macro_rules! run_unit {
-        ($variant:ident) => {
+        ($variant:ident) => {{
             let mut local = 0usize;
             while local < unit_chunks {
-                let even_off = local * OUTER_BYTES + 2 * ROW_BYTES;
-                let odd_off = (local + 1) * OUTER_BYTES + 13 * ROW_BYTES;
+                let even_off = local * OUTER_BYTES + EVEN_ROW;
+                let odd_off = (local + 1) * OUTER_BYTES + ODD_ROW;
                 // SAFETY: `local + 1 < unit_chunks`, both 64-byte rows lie inside `out_unit`.
                 let even_dst = unsafe { &mut *out_ptr.add(even_off).cast::<[u8; 64]>() };
                 let odd_dst = unsafe { &mut *out_ptr.add(odd_off).cast::<[u8; 64]>() };
@@ -6193,12 +6287,13 @@ pub(crate) fn ab_mixed_rows_residual_unit(
                 );
                 local += 2;
             }
-        };
+        }};
     }
-    if ab_kara_enabled() {
-        run_unit!(MAIN);
-    } else {
-        run_unit!(HELPER);
+    match (ab_kara_enabled(), sparse) {
+        (true, true) => run_unit!(MAIN_SPARSE),
+        (true, false) => run_unit!(MAIN),
+        (false, true) => run_unit!(HELPER_SPARSE),
+        (false, false) => run_unit!(HELPER),
     }
 }
 
