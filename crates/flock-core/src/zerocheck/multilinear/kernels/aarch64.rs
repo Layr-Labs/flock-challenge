@@ -501,6 +501,13 @@ unsafe fn wide_xor(acc: &mut WideNeon, value: WideNeon) {
 #[inline(always)]
 unsafe fn reduce_wide_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
     use core::arch::aarch64::*;
+    #[cfg(target_feature = "aes")]
+    unsafe {
+        let c87 = vdupq_n_u64(0x87);
+        let t1 = fold86_add_q(value.hi, c87, vextq_u64::<1>(value.lo, value.hi));
+        fold86_add_q(t1, c87, vzip1q_u64(value.lo, t1))
+    }
+    #[cfg(not(target_feature = "aes"))]
     unsafe {
         let zero = vdupq_n_u64(0);
         let r3 = vextq_u64::<1>(value.hi, zero);
@@ -522,8 +529,7 @@ unsafe fn reduce_wide_q(value: WideNeon) -> core::arch::aarch64::uint64x2_t {
             vshlq_n_u64::<7>(hi),
             vextq_u64::<1>(zero, vshrq_n_u64::<57>(hi)),
         );
-        let folded = xor3_u64(hi, shift1, veorq_u64(shift2, shift7));
-        veorq_u64(value.lo, folded)
+        xor3_u64(xor3_u64(value.lo, hi, shift1), shift2, shift7)
     }
 }
 

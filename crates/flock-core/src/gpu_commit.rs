@@ -29382,15 +29382,33 @@ kernel void zc_ab_finish(
                 }
             }
             if ZC_K_V2_ACTIVE.load(Ordering::Relaxed) {
-                // rho2 * (v << 4k) for the 32 nibbles k of the other factor.
+                // rho2 * (v << 4k) for the 32 nibbles k of the other factor:
+                // expand each 16-entry nibble table from its 4 basis bits via
+                // multiply-by-x shifts and XORs (0 full F128 multiplications).
+                let mul_x = |v: F128| -> F128 {
+                    let red = (v.hi >> 63).wrapping_neg() & 0x87;
+                    F128::new((v.lo << 1) ^ red, (v.hi << 1) | (v.lo >> 63))
+                };
+                let mut cur = rho2;
                 for k in 0..32usize {
-                    for v in 0..16u64 {
-                        let x = if k < 16 {
-                            F128::new(v << (4 * k), 0)
-                        } else {
-                            F128::new(0, v << (4 * (k - 16)))
-                        };
-                        *nib.add(256 + 16 * k + v as usize) = rho2 * x;
+                    let b0 = cur;
+                    cur = mul_x(cur);
+                    let b1 = cur;
+                    cur = mul_x(cur);
+                    let b2 = cur;
+                    cur = mul_x(cur);
+                    let b3 = cur;
+                    cur = mul_x(cur);
+                    let base = nib.add(256 + 16 * k);
+                    *base = F128::ZERO;
+                    *base.add(1) = b0;
+                    *base.add(2) = b1;
+                    *base.add(3) = b0 + b1;
+                    for i in 0..4usize {
+                        *base.add(4 + i) = *base.add(i) + b2;
+                    }
+                    for i in 0..8usize {
+                        *base.add(8 + i) = *base.add(i) + b3;
                     }
                 }
             }
