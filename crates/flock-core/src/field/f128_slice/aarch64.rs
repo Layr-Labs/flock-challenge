@@ -8,6 +8,7 @@ use crate::field::gf2_128::aarch64::mul_two_const_sum_prep;
 use core::arch::aarch64::*;
 use core::mem::transmute;
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct WideNeon {
     lo: uint64x2_t,
@@ -61,6 +62,7 @@ impl KaraNeon {
     }
 }
 
+#[cfg(test)]
 #[inline(always)]
 unsafe fn tri_to_wide(value: TriNeon) -> WideNeon {
     unsafe {
@@ -72,6 +74,7 @@ unsafe fn tri_to_wide(value: TriNeon) -> WideNeon {
     }
 }
 
+#[cfg(test)]
 #[inline(always)]
 unsafe fn kara_to_wide(value: KaraNeon) -> WideNeon {
     unsafe {
@@ -266,10 +269,8 @@ unsafe fn mul_const_vec2(r: uint64x2_t, x0: uint64x2_t, x1: uint64x2_t) -> [uint
         let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
         let s7_lo = vshlq_n_u64::<7>(r2);
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let out_lo = veorq_u64(r0, t_lo);
-        let out_hi = veorq_u64(r1, t_hi);
+        let out_lo = xor3_u64(xor3_u64(r0, r2, s1_lo), s2_lo, s7_lo);
+        let out_hi = xor3_u64(xor3_u64(r1, r3, s1_hi), s2_hi, s7_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
 }
@@ -333,14 +334,13 @@ unsafe fn mul_two_const_sum_vec2(
         let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
         let s7_lo = vshlq_n_u64::<7>(r2);
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let out_lo = veorq_u64(r0, t_lo);
-        let out_hi = veorq_u64(r1, t_hi);
+        let out_lo = xor3_u64(xor3_u64(r0, r2, s1_lo), s2_lo, s7_lo);
+        let out_hi = xor3_u64(xor3_u64(r1, r3, s1_hi), s2_hi, s7_hi);
         [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
     }
 }
 
+#[cfg(test)]
 #[inline(always)]
 unsafe fn xor_wide(acc: &mut WideNeon, value: WideNeon) {
     unsafe {
@@ -360,48 +360,46 @@ unsafe fn r3_overflow(r3: uint64x2_t) -> uint64x2_t {
     }
 }
 
+#[cfg(test)]
 #[inline(always)]
 unsafe fn reduce_wide(value: WideNeon) -> uint64x2_t {
     unsafe {
-        let zero = vdupq_n_u64(0);
-        let high = veorq_u64(value.hi, r3_overflow(vextq_u64::<1>(value.hi, zero)));
-        let shift1 = veorq_u64(
-            vshlq_n_u64::<1>(high),
-            vextq_u64::<1>(zero, vshrq_n_u64::<63>(high)),
+        let c87 = vdupq_n_u64(0x87);
+        let t1 = fused_pmull_hi_acc(vextq_u64::<1>(value.lo, value.hi), value.hi, c87);
+        fused_pmull_hi_acc(vzip1q_u64(value.lo, t1), t1, c87)
+    }
+}
+
+#[cfg(test)]
+#[inline(always)]
+unsafe fn reduce_wide_pair(first: WideNeon, second: WideNeon) -> [uint64x2_t; 2] {
+    unsafe { [reduce_wide(first), reduce_wide(second)] }
+}
+
+#[inline(always)]
+unsafe fn reduce_tri(value: TriNeon) -> uint64x2_t {
+    unsafe {
+        let c87 = vdupq_n_u64(0x87);
+        let t1 = fused_pmull_hi_acc(
+            veorq_u64(vextq_u64::<1>(value.ll, value.hh), value.cross),
+            value.hh,
+            c87,
         );
-        let shift2 = veorq_u64(
-            vshlq_n_u64::<2>(high),
-            vextq_u64::<1>(zero, vshrq_n_u64::<62>(high)),
-        );
-        let shift7 = veorq_u64(
-            vshlq_n_u64::<7>(high),
-            vextq_u64::<1>(zero, vshrq_n_u64::<57>(high)),
-        );
-        let folded = xor3_u64(high, shift1, veorq_u64(shift2, shift7));
-        veorq_u64(value.lo, folded)
+        fused_pmull_hi_acc(vzip1q_u64(value.ll, t1), t1, c87)
     }
 }
 
 #[inline(always)]
-unsafe fn reduce_wide_pair(first: WideNeon, second: WideNeon) -> [uint64x2_t; 2] {
+unsafe fn reduce_kara(value: KaraNeon) -> uint64x2_t {
     unsafe {
-        let r0 = vzip1q_u64(first.lo, second.lo);
-        let r1 = vzip2q_u64(first.lo, second.lo);
-        let r2 = vzip1q_u64(first.hi, second.hi);
-        let r3 = vzip2q_u64(first.hi, second.hi);
-
-        let r2 = veorq_u64(r2, r3_overflow(r3));
-        let s1_lo = vshlq_n_u64::<1>(r2);
-        let s1_hi = veorq_u64(vshlq_n_u64::<1>(r3), vshrq_n_u64::<63>(r2));
-        let s2_lo = vshlq_n_u64::<2>(r2);
-        let s2_hi = veorq_u64(vshlq_n_u64::<2>(r3), vshrq_n_u64::<62>(r2));
-        let s7_lo = vshlq_n_u64::<7>(r2);
-        let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-        let out_lo = veorq_u64(r0, t_lo);
-        let out_hi = veorq_u64(r1, t_hi);
-        [vzip1q_u64(out_lo, out_hi), vzip2q_u64(out_lo, out_hi)]
+        let c87 = vdupq_n_u64(0x87);
+        let cross = xor3_u64(value.mm, value.ll, value.hh);
+        let t1 = fused_pmull_hi_acc(
+            veorq_u64(vextq_u64::<1>(value.ll, value.hh), cross),
+            value.hh,
+            c87,
+        );
+        fused_pmull_hi_acc(vzip1q_u64(value.ll, t1), t1, c87)
     }
 }
 
@@ -468,15 +466,15 @@ pub(super) unsafe fn round0_and_round1_lookahead(
             i += 4;
         }
 
-        let red = |value: WideNeon| transmute::<uint64x2_t, F128>(reduce_wide(value));
-        let c0 = red(tri_to_wide(a_c0));
-        let c2 = red(tri_to_wide(a_c2));
-        let c3 = red(tri_to_wide(a_c3));
-        let c5 = red(tri_to_wide(a_c5));
-        let c1 = red(tri_to_wide(a_c1_endpoint)) + c0 + c2;
-        let c4 = red(tri_to_wide(a_c4_endpoint)) + c3 + c5;
-        let u0 = c0 + red(tri_to_wide(a_u0_second));
-        let u2 = c2 + red(tri_to_wide(a_u2_second));
+        let red = |value: TriNeon| transmute::<uint64x2_t, F128>(reduce_tri(value));
+        let c0 = red(a_c0);
+        let c2 = red(a_c2);
+        let c3 = red(a_c3);
+        let c5 = red(a_c5);
+        let c1 = red(a_c1_endpoint) + c0 + c2;
+        let c4 = red(a_c4_endpoint) + c3 + c5;
+        let u0 = c0 + red(a_u0_second);
+        let u2 = c2 + red(a_u2_second);
         ((u0, u2), [c0, c1, c2, c3, c4, c5])
     }
 }
@@ -528,11 +526,12 @@ pub(super) unsafe fn fold_banked_slot<const BANKS: usize>(
             k += 1;
         }
 
-        let mut wide = tri_to_wide(a0);
-        xor_wide(&mut wide, tri_to_wide(a1));
-        xor_wide(&mut wide, tri_to_wide(a2));
-        xor_wide(&mut wide, tri_to_wide(a3));
-        transmute::<uint64x2_t, F128>(reduce_wide(wide))
+        let sum = TriNeon {
+            ll: veorq_u64(veorq_u64(a0.ll, a1.ll), veorq_u64(a2.ll, a3.ll)),
+            cross: veorq_u64(veorq_u64(a0.cross, a1.cross), veorq_u64(a2.cross, a3.cross)),
+            hh: veorq_u64(veorq_u64(a0.hh, a1.hh), veorq_u64(a2.hh, a3.hh)),
+        };
+        transmute::<uint64x2_t, F128>(reduce_tri(sum))
     }
 }
 
@@ -603,7 +602,7 @@ pub(super) unsafe fn fold_banked_slots2<const BANKS: usize>(
         second0.ll = veorq_u64(second0.ll, second1.ll);
         second0.hh = veorq_u64(second0.hh, second1.hh);
         second0.mm = veorq_u64(second0.mm, second1.mm);
-        let reduced = reduce_wide_pair(kara_to_wide(first0), kara_to_wide(second0));
+        let reduced = [reduce_kara(first0), reduce_kara(second0)];
         [
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -640,8 +639,8 @@ pub(super) unsafe fn fold_banked_slots4<const BANKS: usize>(
             bank += 1;
         }
 
-        let low = reduce_wide_pair(tri_to_wide(acc[0]), tri_to_wide(acc[1]));
-        let high = reduce_wide_pair(tri_to_wide(acc[2]), tri_to_wide(acc[3]));
+        let low = [reduce_tri(acc[0]), reduce_tri(acc[1])];
+        let high = [reduce_tri(acc[2]), reduce_tri(acc[3])];
         [
             transmute::<uint64x2_t, F128>(low[0]),
             transmute::<uint64x2_t, F128>(low[1]),
@@ -695,8 +694,8 @@ unsafe fn fold_banked_slots4_schoolbook<const BANKS: usize>(
             bank += 2;
         }
 
-        let low = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
-        let high = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
+        let low = [reduce_kara(acc[0]), reduce_kara(acc[1])];
+        let high = [reduce_kara(acc[2]), reduce_kara(acc[3])];
         [
             transmute::<uint64x2_t, F128>(low[0]),
             transmute::<uint64x2_t, F128>(low[1]),
@@ -842,13 +841,11 @@ pub(super) unsafe fn fold_banked_slots4_whole_into<const BANKS: usize>(
             bank += 2;
         }
 
-        let low = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
-        let high = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
-        let o = out.as_mut_ptr().cast::<u64>();
-        vst1q_u64(o, low[0]);
-        vst1q_u64(o.add(2), low[1]);
-        vst1q_u64(o.add(4), high[0]);
-        vst1q_u64(o.add(6), high[1]);
+        let low = [reduce_kara(acc[0]), reduce_kara(acc[1])];
+        let high = [reduce_kara(acc[2]), reduce_kara(acc[3])];
+        let o = out.as_mut_ptr();
+        store_pair_whole(o, low[0], low[1]);
+        store_pair_whole(o.add(2), high[0], high[1]);
     }
 }
 
@@ -894,12 +891,10 @@ pub(super) unsafe fn fold_bank_major_128x64_rows2(
                 row = row.add(128);
             }
 
-            let lo = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
-            let hi = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
-            vst1q_u64(out.add(lane).cast::<u64>(), lo[0]);
-            vst1q_u64(out.add(lane + 1).cast::<u64>(), lo[1]);
-            vst1q_u64(out.add(lane + 2).cast::<u64>(), hi[0]);
-            vst1q_u64(out.add(lane + 3).cast::<u64>(), hi[1]);
+            let lo = [reduce_kara(acc[0]), reduce_kara(acc[1])];
+            let hi = [reduce_kara(acc[2]), reduce_kara(acc[3])];
+            store_pair_whole(out.add(lane), lo[0], lo[1]);
+            store_pair_whole(out.add(lane + 2), hi[0], hi[1]);
             lane += 4;
         }
     }
@@ -947,12 +942,10 @@ pub(super) unsafe fn fold_bank_major_64x128_rows2(
                 row = row.add(256);
             }
 
-            let lo = reduce_wide_pair(kara_to_wide(acc[0]), kara_to_wide(acc[1]));
-            let hi = reduce_wide_pair(kara_to_wide(acc[2]), kara_to_wide(acc[3]));
-            vst1q_u64(out.add(lane).cast::<u64>(), lo[0]);
-            vst1q_u64(out.add(lane + 1).cast::<u64>(), lo[1]);
-            vst1q_u64(out.add(lane + 2).cast::<u64>(), hi[0]);
-            vst1q_u64(out.add(lane + 3).cast::<u64>(), hi[1]);
+            let lo = [reduce_kara(acc[0]), reduce_kara(acc[1])];
+            let hi = [reduce_kara(acc[2]), reduce_kara(acc[3])];
+            store_pair_whole(out.add(lane), lo[0], lo[1]);
+            store_pair_whole(out.add(lane + 2), hi[0], hi[1]);
             lane += 4;
         }
     }
@@ -1007,7 +1000,7 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
             left.hh = veorq_u64(left.hh, right.hh);
             left.cross = veorq_u64(left.cross, right.cross);
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0_a), tri_to_wide(u2_a));
+        let reduced = [reduce_tri(u0_a), reduce_tri(u2_a)];
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1076,7 +1069,7 @@ pub(super) unsafe fn round0_add_basis<D: FnMut(usize) -> F128>(
             left.hh = veorq_u64(left.hh, right.hh);
             left.cross = veorq_u64(left.cross, right.cross);
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0_a), tri_to_wide(u2_a));
+        let reduced = [reduce_tri(u0_a), reduce_tri(u2_a)];
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1148,7 +1141,7 @@ pub(super) unsafe fn round0_factorized_eq(f: &[F128], eq_tail: &[F128]) -> (F128
         o0.ll = veorq_u64(o0.ll, o1.ll);
         o0.hh = veorq_u64(o0.hh, o1.hh);
         o0.mm = veorq_u64(o0.mm, o1.mm);
-        let reduced = reduce_wide_pair(kara_to_wide(a0), kara_to_wide(o0));
+        let reduced = [reduce_kara(a0), reduce_kara(o0)];
         let s_reduced = veorq_u64(reduced[0], reduced[1]);
         (transmute(reduced[0]), transmute(s_reduced))
     }
@@ -1351,16 +1344,14 @@ unsafe fn fold_two_and_msg_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+            store_pair_whole(nf.as_mut_ptr().add(t), f0, f1);
+            store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
 
             tri_acc_q(&mut u0, f0, b0);
             tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
+        let reduced = [reduce_tri(u0), reduce_tri(u2)];
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1449,16 +1440,14 @@ unsafe fn fold_two_and_msg_in_place_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(f_ptr.add(t).cast::<u64>(), f0);
-            vst1q_u64(f_ptr.add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(b_ptr.add(t).cast::<u64>(), b0);
-            vst1q_u64(b_ptr.add(t + 1).cast::<u64>(), b1);
+            store_pair_whole(f_ptr.add(t), f0, f1);
+            store_pair_whole(b_ptr.add(t), b0, b1);
 
             tri_acc_q(&mut u0, f0, b0);
             tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
+        let reduced = [reduce_tri(u0), reduce_tri(u2)];
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1572,16 +1561,14 @@ unsafe fn fold_two_and_msg_with_scaled_basis_addend_impl<const PREP: bool>(
                 )
             };
 
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
-            vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-            vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+            store_pair_whole(nf.as_mut_ptr().add(t), f0, f1);
+            store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
 
             tri_acc_q(&mut u0, f0, b0);
             tri_acc_q(&mut u2, veorq_u64(f0, f1), veorq_u64(b0, b1));
             t += 2;
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0), tri_to_wide(u2));
+        let reduced = [reduce_tri(u0), reduce_tri(u2)];
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1666,8 +1653,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                     veorq_u64(f_even1, folded_f[1]),
                 )
             };
-            vst1q_u64(nf.as_mut_ptr().add(t).cast::<u64>(), f0);
-            vst1q_u64(nf.as_mut_ptr().add(t + 1).cast::<u64>(), f1);
+            store_pair_whole(nf.as_mut_ptr().add(t), f0, f1);
             t += 2;
         }
 
@@ -1708,8 +1694,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                     addend1,
                     b_even1,
                 );
-                vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-                vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+                store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
                 t += 2;
             }
         } else {
@@ -1749,8 +1734,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
                 );
                 let b0 = veorq_u64(partial_b0, deferred_delta_and_addend[0]);
                 let b1 = veorq_u64(partial_b1, deferred_delta_and_addend[1]);
-                vst1q_u64(nb.as_mut_ptr().add(t).cast::<u64>(), b0);
-                vst1q_u64(nb.as_mut_ptr().add(t + 1).cast::<u64>(), b1);
+                store_pair_whole(nb.as_mut_ptr().add(t), b0, b1);
                 t += 2;
             }
         }
@@ -1784,7 +1768,7 @@ unsafe fn fold_two_and_msg_with_deferred_basis_and_scaled_local_addend_impl<cons
             left.hh = veorq_u64(left.hh, right.hh);
             left.cross = veorq_u64(left.cross, right.cross);
         }
-        let reduced = reduce_wide_pair(tri_to_wide(u0_a), tri_to_wide(u2_a));
+        let reduced = [reduce_tri(u0_a), reduce_tri(u2_a)];
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),
@@ -1888,10 +1872,6 @@ unsafe fn fold2_two_and_msgs_impl(
                     let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                     (veorq_u64(vf0, pw[0]), veorq_u64(vb0, pw[1]))
                 };
-                if !nt_stores {
-                    vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
-                    vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
-                }
                 w_regs_f[q] = wq_f;
                 w_regs_b[q] = wq_b;
             }
@@ -1900,6 +1880,11 @@ unsafe fn fold2_two_and_msgs_impl(
                 store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
                 store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
                 store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
+            } else {
+                store_pair_whole(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
+                store_pair_whole(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
+                store_pair_whole(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
+                store_pair_whole(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
             }
             let s0f = veorq_u64(w_regs_f[0], w_regs_f[1]);
             let s0b = veorq_u64(w_regs_b[0], w_regs_b[1]);
@@ -1921,7 +1906,7 @@ unsafe fn fold2_two_and_msgs_impl(
             tri_acc_q(&mut a_c5, se_f, se_b);
             t += 4;
         }
-        let red = |w: TriNeon| transmute::<uint64x2_t, F128>(reduce_wide(tri_to_wide(w)));
+        let red = |w: TriNeon| transmute::<uint64x2_t, F128>(reduce_tri(w));
         let c0 = red(a_u0a);
         let c2v = red(a_u2a);
         let c1 = red(a_c1) + c0 + c2v;
@@ -2025,10 +2010,6 @@ unsafe fn fold2_two_and_msg_impl(
                     let pw = mul_const_vec2(rb_q, veorq_u64(vf0, vf1), veorq_u64(vb0, vb1));
                     (veorq_u64(vf0, pw[0]), veorq_u64(vb0, pw[1]))
                 };
-                if !nt_stores {
-                    vst1q_u64(wf.as_mut_ptr().add(t + q).cast::<u64>(), wq_f);
-                    vst1q_u64(wb.as_mut_ptr().add(t + q).cast::<u64>(), wq_b);
-                }
                 w_regs_f[q] = wq_f;
                 w_regs_b[q] = wq_b;
             }
@@ -2037,6 +2018,11 @@ unsafe fn fold2_two_and_msg_impl(
                 store_pair_nt(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
                 store_pair_nt(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
                 store_pair_nt(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
+            } else {
+                store_pair_whole(wf.as_mut_ptr().add(t), w_regs_f[0], w_regs_f[1]);
+                store_pair_whole(wf.as_mut_ptr().add(t + 2), w_regs_f[2], w_regs_f[3]);
+                store_pair_whole(wb.as_mut_ptr().add(t), w_regs_b[0], w_regs_b[1]);
+                store_pair_whole(wb.as_mut_ptr().add(t + 2), w_regs_b[2], w_regs_b[3]);
             }
 
             let s0f = veorq_u64(w_regs_f[0], w_regs_f[1]);
@@ -2055,7 +2041,7 @@ unsafe fn fold2_two_and_msg_impl(
             left.hh = veorq_u64(left.hh, right.hh);
             left.cross = veorq_u64(left.cross, right.cross);
         }
-        let reduced = reduce_wide_pair(tri_to_wide(a_u0a), tri_to_wide(a_u2a));
+        let reduced = [reduce_tri(a_u0a), reduce_tri(a_u2a)];
         (
             transmute::<uint64x2_t, F128>(reduced[0]),
             transmute::<uint64x2_t, F128>(reduced[1]),

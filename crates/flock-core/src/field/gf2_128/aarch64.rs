@@ -284,11 +284,8 @@ pub unsafe fn ghash_mul_vec2_neon(a: [F128; 2], b: [F128; 2]) -> [F128; 2] {
         let s7_lo = vshlq_n_u64::<7>(r2);
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
 
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-
-        let final_lo = veorq_u64(r0, t_lo);
-        let final_hi = veorq_u64(r1, t_hi);
+        let final_lo = xor3_u64(xor3_u64(r0, r2, s1_lo), s2_lo, s7_lo);
+        let final_hi = xor3_u64(xor3_u64(r1, r3, s1_hi), s2_hi, s7_hi);
 
         // Unpack: lane 0 → mul0, lane 1 → mul1.
         [
@@ -343,13 +340,12 @@ pub unsafe fn ghash_mul_low_constants_vec2_neon(
         let s1_lo = vshlq_n_u64::<1>(r2);
         let s2_lo = vshlq_n_u64::<2>(r2);
         let s7_lo = vshlq_n_u64::<7>(r2);
-        let folded_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
+        let out_lo = xor3_u64(xor3_u64(r0, r2, s1_lo), s2_lo, s7_lo);
         let folded_hi = xor3_u64(
             vshrq_n_u64::<63>(r2),
             vshrq_n_u64::<62>(r2),
             vshrq_n_u64::<57>(r2),
         );
-        let out_lo = veorq_u64(r0, folded_lo);
         let out_hi = veorq_u64(r1, folded_hi);
 
         [
@@ -728,11 +724,8 @@ unsafe fn ghash_mul_const_vec2_karatsuba(c: F128, b: [F128; 2]) -> [F128; 2] {
         let s7_lo = vshlq_n_u64::<7>(r2);
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
 
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-
-        let final_lo = veorq_u64(r0, t_lo);
-        let final_hi = veorq_u64(r1, t_hi);
+        let final_lo = xor3_u64(xor3_u64(r0, r2, s1_lo), s2_lo, s7_lo);
+        let final_hi = xor3_u64(xor3_u64(r1, r3, s1_hi), s2_hi, s7_hi);
 
         // Unpack: lane 0 → mul0, lane 1 → mul1.
         [
@@ -806,11 +799,8 @@ pub(crate) unsafe fn ghash_mul_const_vec2_neon_vectors(
         let s7_lo = vshlq_n_u64::<7>(r2);
         let s7_hi = veorq_u64(vshlq_n_u64::<7>(r3), vshrq_n_u64::<57>(r2));
 
-        let t_lo = xor3_u64(r2, s1_lo, veorq_u64(s2_lo, s7_lo));
-        let t_hi = xor3_u64(r3, s1_hi, veorq_u64(s2_hi, s7_hi));
-
-        let final_lo = veorq_u64(r0, t_lo);
-        let final_hi = veorq_u64(r1, t_hi);
+        let final_lo = xor3_u64(xor3_u64(r0, r2, s1_lo), s2_lo, s7_lo);
+        let final_hi = xor3_u64(xor3_u64(r1, r3, s1_hi), s2_hi, s7_hi);
 
         [final_lo, final_hi]
     }
