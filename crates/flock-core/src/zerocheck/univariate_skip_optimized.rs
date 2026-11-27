@@ -1520,7 +1520,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         assert_eq!(padding.useful_bits_per_block, 15_409);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let mixed_residual_enabled = kernels::aarch64::ab_mixed_row_residual_enabled()
-            && std::env::var_os("FLOCK_NO_ZC_AB_C_MIXED_RECOVERY").is_none();
+            && crate::hot_env_once!(bool, std::env::var_os("FLOCK_NO_ZC_AB_C_MIXED_RECOVERY").is_none());
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let mixed_residual_enabled = false;
         if mixed_residual_enabled
@@ -1580,7 +1580,7 @@ fn precompute_round1_ab_inner_packed_padded_body(
         // `total_bytes`; zero is a valid object representation for F128.
         unsafe { core::ptr::write_bytes(storage.as_mut_ptr().cast::<u8>(), 0, total_bytes) };
     }
-    if use_provenance && std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+    if use_provenance && crate::zc_timing_env_on() {
         let (hits, misses) = ab_compact_backing_token_counts();
         eprintln!("[ab-compact-provenance] token_hit={token_hit} totals(hit={hits},miss={misses})");
     }
@@ -1760,8 +1760,7 @@ fn ranked_ab_pre_fast_policy_hoist_shape(
 pub const ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST: &str = "FLOCK_NO_ZC_AB_PRE_FAST_POLICY_HOIST";
 
 fn zc_ab_pre_fast_policy_hoist_enabled() -> bool {
-    std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref()
-        != Some(std::ffi::OsStr::new("1"))
+    crate::hot_env_once!(bool, std::env::var_os(ENV_NO_ZC_AB_PRE_FAST_POLICY_HOIST).as_deref() != Some(std::ffi::OsStr::new("1")))
 }
 
 /// Compile-time default for the QS5 hetero AB-precompute drain (the ranked
@@ -1820,8 +1819,7 @@ fn precompute_ab_hetero<const FAST_POLICY: u8, const FORCE_DIRECT: bool>(
     let chunks_per_job = ab_pre_chunks_per_job(n_chunks);
     let out_base = crate::epool::SyncPtr(out_bytes.as_mut_ptr());
     // Resolve the rollback once before worker/row dispatch; no table setup.
-    let transform_trim = std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref()
-        != Some(std::ffi::OsStr::new("1"));
+    let transform_trim = crate::hot_env_once!(bool, std::env::var_os("FLOCK_NO_TRANSFORM_TRIM").as_deref() != Some(std::ffi::OsStr::new("1")));
     if let Some(producer) = producer {
         // Deferred A/B rows: each job produces its units one at a time into
         // a worker-local scratch and transforms them from there, so the
@@ -3483,7 +3481,7 @@ fn ab_eq_fold_from_env() -> AbEqFold {
 }
 
 fn zc_ab_bank_deferred_enabled() -> bool {
-    zc_ab_bank_deferred_enabled_from_value(std::env::var_os(ENV_NO_ZC_AB_BANK_DEFERRED).as_deref())
+    crate::hot_env_once!(bool, zc_ab_bank_deferred_enabled_from_value(std::env::var_os(ENV_NO_ZC_AB_BANK_DEFERRED).as_deref()))
 }
 
 fn zc_ab_bank_deferred_enabled_from_value(value: Option<&std::ffi::OsStr>) -> bool {
@@ -4265,7 +4263,7 @@ pub(crate) fn ab_completion_convert_basis() -> Option<&'static [F128; 128]> {
 pub fn ab_completion_gpu_prewarm() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        let ab = std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1"))
+        let ab = crate::hot_env_once!(bool, std::env::var_os("FLOCK_NO_ZC_AB_PREWARM").as_deref() != Some(std::ffi::OsStr::new("1")))
             && crate::gpu_commit::gpu_zc_ab_completion_share() != 0;
         let k = crate::gpu_commit::zc_k_prewarm_wanted();
         let tail = crate::gpu_commit::pow_race_tail_wanted();
@@ -4769,7 +4767,7 @@ pub(crate) fn round1_c_prelude(
             if let Some((eq_outer, job, submitted)) =
                 crate::gpu_commit::adopt_staged_zc_fold(c_lincheck, r)
             {
-                if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+                if crate::zc_timing_env_on() {
                     eprintln!("[commit-tail-fill] staged C prelude adopted");
                 }
                 return Round1CPrelude {
@@ -5849,9 +5847,9 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
     let eq_hi = &eq.hi;
     let (within_outer_mask, b_med_counts) = build_b_med_counts(padding);
     let ab_inner_bytes = ab_inner.as_bytes();
-    let split_ab_c = std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none();
-    let direct_ab_rows = std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none();
-    let c_drain4 = std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none();
+    let split_ab_c = crate::hot_env_once!(bool, std::env::var_os("FLOCK_NO_ZC_SPLIT_AB_C").is_none());
+    let direct_ab_rows = crate::hot_env_once!(bool, std::env::var_os("FLOCK_NO_ZC_DIRECT_AB_ROWS").is_none());
+    let c_drain4 = crate::hot_env_once!(bool, std::env::var_os("FLOCK_NO_ZC_C_DRAIN4").is_none());
 
     // The challenge-independent AB transform finishes while the commitment is
     // still running. Its challenge-weighted completion is therefore a live
@@ -5913,7 +5911,7 @@ pub fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab(
 /// Resolve the Fold4-only lo/hi split tuning seam. Invalid values fail loudly:
 /// silently accepting a typo would make component profiles incomparable.
 fn fold4_n_hi_from_env() -> usize {
-    match std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_N_HI") {
+    crate::hot_env_once!(usize, match std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_N_HI") {
         None => 7,
         Some(value) => match value.to_str() {
             Some("5") => 5,
@@ -5921,7 +5919,7 @@ fn fold4_n_hi_from_env() -> usize {
             Some("7") => 7,
             _ => panic!("FLOCK_EXPERIMENTAL_FOLD4_N_HI must be exactly 5, 6, or 7"),
         },
-    }
+    })
 }
 
 /// Second-stage producer A/B seam. Pair fusion stays active on both arms;
@@ -5932,8 +5930,7 @@ fn fold4_q_partition_from_value(value: Option<&std::ffi::OsStr>) -> bool {
 }
 
 fn fold4_q_partition_from_env() -> bool {
-    let value = std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_Q_PARTITION");
-    fold4_q_partition_from_value(value.as_deref())
+    crate::hot_env_once!(bool, fold4_q_partition_from_value(std::env::var_os("FLOCK_EXPERIMENTAL_FOLD4_Q_PARTITION").as_deref()))
 }
 
 /// Monolithic producer follow-on. By default, fuse four adjacent low slots
@@ -5944,8 +5941,7 @@ fn fold4_pair4_from_kill_value(value: Option<&std::ffi::OsStr>) -> bool {
 }
 
 fn fold4_pair4_from_env() -> bool {
-    let value = std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD4_PAIR4");
-    fold4_pair4_from_kill_value(value.as_deref())
+    crate::hot_env_once!(bool, fold4_pair4_from_kill_value(std::env::var_os("FLOCK_NO_OPEN_DIRECT_FOLD4_PAIR4").as_deref()))
 }
 
 /// Experimental direct-fold4 counterpart of
@@ -5991,8 +5987,7 @@ fn round1_shift_reduce_extract_c_packed_padded_with_precomputed_ab_fold4_n_hi(
     pair4: bool,
 ) -> (Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>, Vec<F128>) {
     ab_inner.assert_complete("combined round-one Fold4 AB/C completion");
-    let profile =
-        std::env::var_os("FLOCK_FOLD4_TIMING").as_deref() == Some(std::ffi::OsStr::new("1"));
+    let profile = crate::hot_env_once!(bool, std::env::var_os("FLOCK_FOLD4_TIMING").as_deref() == Some(std::ffi::OsStr::new("1")));
     let t_total = std::time::Instant::now();
     assert!((5..=7).contains(&fold4_n_hi));
     assert!(
