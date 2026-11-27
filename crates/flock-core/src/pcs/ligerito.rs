@@ -4942,6 +4942,107 @@ fn transpose_forward_ntt_final_5layer_low_eighth_direct(
     retained
 }
 
+/// Keep all four quarters of each coset through two reverse layers, then
+/// XOR matching quarters. The lower `log2(COSETS)` layers are top-only.
+#[inline(never)]
+fn transpose_forward_ntt_final_two_layers_xor_cosets<const COSETS: usize>(
+    ntt: &AdditiveNttF128,
+    data: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    const { assert!(COSETS == 4 || COSETS == 8) };
+    const QUARTERS: usize = 4;
+    const ROW_TILE: usize = 64;
+    let drop_log = COSETS.trailing_zeros() as usize;
+    let keep = data.len() / COSETS;
+    let quarter = keep / QUARTERS;
+    assert!(quarter > 0 && data.len().is_multiple_of(COSETS * QUARTERS * ROW_TILE));
+
+    let pair_twiddles: [[F128; 2]; COSETS] = core::array::from_fn(|coset| {
+        [ntt.twiddle(drop_log + 1, 2 * coset), ntt.twiddle(drop_log + 1, 2 * coset + 1)]
+    });
+    let cross_twiddles: [F128; COSETS] =
+        core::array::from_fn(|coset| ntt.twiddle(drop_log, coset));
+    let data_ptr = data.as_ptr() as usize;
+    let mut retained = Vec::<F128>::with_capacity(keep);
+    let retained_ptr = retained.as_mut_ptr() as usize;
+
+    (0..quarter / ROW_TILE)
+        .into_par_iter()
+        .for_each(|tile| {
+            let row_start = tile * ROW_TILE;
+            // Keep one 4 KiB tile-local accumulator. `coset` is deliberately
+            // outside `row`: each arithmetic pass then has four sequential
+            // input streams plus this accumulator, instead of interleaving 32
+            // power-of-two-strided streams that alias the same L1D sets.
+            let mut outputs =
+                [core::mem::MaybeUninit::<[F128; QUARTERS]>::uninit(); ROW_TILE];
+            for coset in 0..COSETS {
+                for local_row in 0..ROW_TILE {
+                    let row = row_start + local_row;
+                    let base = coset * keep + row;
+                    // SAFETY: `coset < COSETS`, `quarter = keep/4`, and `row < quarter`,
+                    // so all four quarter loads lie in the immutable `N`-field
+                    // input. No output aliases this separately allocated vector.
+                    let (x0, x1, x2, x3) = unsafe {
+                        let ptr = data_ptr as *const F128;
+                        (
+                            *ptr.add(base),
+                            *ptr.add(base + quarter),
+                            *ptr.add(base + 2 * quarter),
+                            *ptr.add(base + 3 * quarter),
+                        )
+                    };
+
+                    let top01 = x0 + x1;
+                    let bottom01 = pair_twiddles[coset][0] * top01 + x1;
+                    let top23 = x2 + x3;
+                    let bottom23 = pair_twiddles[coset][1] * top23 + x3;
+                    let top0 = top01 + top23;
+                    let top1 = bottom01 + bottom23;
+                    let values = [
+                        top0,
+                        top1,
+                        cross_twiddles[coset] * top0 + top23,
+                        cross_twiddles[coset] * top1 + bottom23,
+                    ];
+                    if coset == 0 {
+                        outputs[local_row].write(values);
+                    } else {
+                        // SAFETY: the complete `coset == 0` row pass finishes
+                        // before any later coset begins, initializing every
+                        // tile-local accumulator exactly once.
+                        let row_outputs = unsafe { outputs[local_row].assume_init_mut() };
+                        for output in 0..QUARTERS {
+                            row_outputs[output] += values[output];
+                        }
+                    }
+                }
+            }
+
+            for (local_row, row_outputs) in outputs.iter().enumerate() {
+                let row = row_start + local_row;
+                // SAFETY: all coset passes finished on this thread and the
+                // first pass initialized every row before this readback loop.
+                let row_outputs = unsafe { row_outputs.assume_init_ref() };
+                // SAFETY: each tile owns the same disjoint `ROW_TILE` rows in
+                // all four output quarters. The parallel join completes every
+                // write before the vector length becomes observable below.
+                unsafe {
+                    let ptr = retained_ptr as *mut F128;
+                    for output in 0..QUARTERS {
+                        ptr.add(output * quarter + row).write(row_outputs[output]);
+                    }
+                }
+            }
+        });
+
+    // SAFETY: the disjoint tiles cover each of the four retained quarters.
+    unsafe { retained.set_len(keep) };
+    retained
+}
+
 #[derive(Clone, Copy)]
 struct L2FactoredFinal5Constants {
     delta: F128,
@@ -5584,6 +5685,12 @@ fn transpose_forward_ntt_sparse_retained_with(
     while remaining >= drop_log + 3 {
         remaining -= 3;
         transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, remaining);
+    }
+    // Ranked deep L2 retains eight cosets after these two reverse layers.
+    if lean && ntt.log_domain_size() == 16 && log_d == 13 && drop_log == 3 && remaining == 5 {
+        let retained = transpose_forward_ntt_final_two_layers_xor_cosets::<8>(ntt, &data);
+        crate::scratch::give_sparse_ntt_data(data);
+        return Some(retained);
     }
     for layer in (drop_log..remaining).rev() {
         transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, layer);
