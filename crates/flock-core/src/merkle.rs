@@ -1139,7 +1139,7 @@ fn multi_proof_from_active(tree: &[Hash], num_leaves: usize, mut active: Vec<usi
     let mut level_len = num_leaves;
 
     if frontier_cap {
-        // In-place frontier: the parent list is written over the child list.
+        // In-place frontier. The parent list is written over the child list.
         // Write index `w` never passes read index `i` (each step reads at
         // least one entry and writes exactly one), so every entry is read
         // before it can be overwritten. Same parents in the same order.
