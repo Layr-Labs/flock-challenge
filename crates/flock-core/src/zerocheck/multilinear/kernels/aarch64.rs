@@ -2177,6 +2177,72 @@ unsafe fn r2_pair_fold_and_store_off<const F7: bool, const CODE: usize, const AN
     }
 }
 
+/// Regular-store anchor pair at constant offset (variant of the `stnp` form).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_anchor_pair_reg_off<const OFF: usize>(
+    dst: *mut F128,
+    a: core::arch::aarch64::uint64x2_t,
+    b: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a:q}, {b:q}, [{dst}, #{off}]",
+            dst = in(reg) dst,
+            off = const OFF,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// [`r2_pair_fold_and_store_off`] with `REG`: anchors by `stp` (and, from the
+/// caller's `nt_deltas = false`, deltas by `stp`) instead of `stnp`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn r2_pair_fold_and_store_off_v<const F7: bool, const CODE: usize, const ANC: usize>(
+    reg: bool,
+    table_data: *const u8,
+    a_row: *const u8,
+    b_row: *const u8,
+    anchors: *mut F128,
+    deltas: *mut u8,
+    degen: bool,
+    b_ones: core::arch::aarch64::uint64x2_t,
+    nt_deltas: bool,
+) -> (
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    core::arch::aarch64::uint64x2_t,
+    bool,
+) {
+    unsafe {
+        if !reg {
+            return r2_pair_fold_and_store_off::<F7, CODE, ANC>(
+                table_data, a_row, b_row, anchors, deltas, degen, b_ones, nt_deltas,
+            );
+        }
+        let a0_code = u64::from_le(core::ptr::read_unaligned(a_row.add(CODE).cast::<u64>()));
+        let a1_code = u64::from_le(core::ptr::read_unaligned(a_row.add(CODE + 8).cast::<u64>()));
+        let b0_code = u64::from_le(core::ptr::read_unaligned(b_row.add(CODE).cast::<u64>()));
+        let b1_code = u64::from_le(core::ptr::read_unaligned(b_row.add(CODE + 8).cast::<u64>()));
+
+        if degen && (b0_code & b1_code) == u64::MAX {
+            let (a0, a1) = fold_two_rows_g::<F7>(table_data, a0_code, a1_code);
+            store_anchor_pair_reg_off::<ANC>(anchors, a0, b_ones);
+            store_delta_a_only_gpr_off::<CODE>(deltas, a0_code, a1_code);
+            return (a0, a1, b_ones, b_ones, true);
+        }
+        let (a0, a1, b0, b1) =
+            fold_four_rows_g::<F7>(table_data, a0_code, a1_code, b0_code, b1_code);
+        store_anchor_pair_reg_off::<ANC>(anchors, a0, b0);
+        store_delta_pair_gpr_off::<CODE>(deltas, a0_code, a1_code, b0_code, b1_code);
+        (a0, a1, b0, b1, false)
+    }
+}
+
 /// `x * t` in the field for a weight `t` given as its prepared pair
 /// `(p0, p1) = const_prep(t)` (`p0 = (t.lo, R.lo)`, `p1 = (t.hi, t.lo ^ R.hi)`,
 /// `R = t.hi * 0x87`): `x * t = L + x^64 * M` with `L = x.lo*p0.lo +
@@ -3107,7 +3173,7 @@ pub(crate) fn r2_full_xb_rho_prep(eq_lo: &[F128]) -> Option<Vec<F128>> {
 #[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
 #[target_feature(enable = "aes")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
+unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool, const REG: bool>(
     table_data: *const u8,
     a_packed: *const u8,
     b_packed: *const u8,
@@ -3132,7 +3198,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
         assert!(!head || tail_compact);
         assert!(lo_size.is_multiple_of(128));
         let head_inline = head && r2_head_inline_enabled();
-        let nt_deltas = tail_compact && r2_nt_deltas_enabled();
+        let nt_deltas = tail_compact && r2_nt_deltas_enabled() && !REG;
         let mut head_ok = true;
         let zero = vdupq_n_u64(0);
         let tri_zero = TriNeon {
@@ -3257,7 +3323,7 @@ unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb_impl<const F7: bool>(
                 }
                 macro_rules! pair_off {
                     ($c:literal, $n:literal) => {
-                        r2_pair_fold_and_store_off::<F7, $c, $n>(table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas)
+                        r2_pair_fold_and_store_off_v::<F7, $c, $n>(REG, table_data, pa, pb, pn, pd, degen, b_ones, nt_deltas)
                     };
                 }
                 macro_rules! step_ptrs {
@@ -3387,18 +3453,30 @@ pub(crate) unsafe fn fold_round2_compact_chunk_neon_lookahead_8_xb(
     out: *mut F128,
 ) {
     unsafe {
-        if table7.is_null() {
-            fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<false>(
-                table_data, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
-                head_fail, skip_pure, out,
-            )
-        } else {
-            fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<true>(
-                table7, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen, tail_compact,
-                head_fail, skip_pure, out,
-            )
+        macro_rules! go {
+            ($f7:literal, $reg:literal, $t:expr) => {
+                fold_round2_compact_chunk_neon_lookahead_8_xb_impl::<$f7, $reg>(
+                    $t, a_packed, b_packed, anchors, deltas, eq_lo, rho_prep, lo_size, degen,
+                    tail_compact, head_fail, skip_pure, out,
+                )
+            };
+        }
+        match (table7.is_null(), r2_xb_reg_stores_enabled()) {
+            (true, true) => go!(false, true, table_data),
+            (true, false) => go!(false, false, table_data),
+            (false, true) => go!(true, true, table7),
+            (false, false) => go!(true, false, table7),
         }
     }
+}
+
+/// Whether the window-scaled round-two walk writes its anchors and deltas
+/// with plain `stp` rather than non-temporal `stnp` (`FLOCK_NO_R2_XB_REG_STORES`,
+/// any value, restores `stnp`). Same bytes either way; read once per process.
+#[cfg(all(target_arch = "aarch64", target_feature = "sha3"))]
+fn r2_xb_reg_stores_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLOCK_NO_R2_XB_REG_STORES").is_none())
 }
 
 /// Kill switch for the unreduced window sums of the pre-scaled round-two W
