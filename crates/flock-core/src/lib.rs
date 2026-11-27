@@ -53,6 +53,62 @@ pub mod zerocheck;
 /// purely for screening/rollback — mirrors `FLOCK_NO_AB_COMPACT_STORE`.
 pub const ENV_NO_MICRO_STACK: &str = "FLOCK_NO_MICRO_STACK";
 
+/// Kill switch for keeping the timing-trace environment reads once per
+/// process (`FLOCK_NO_TRACE_ENV_ONCE`, any value: [`phase_timing_env_on`] and
+/// [`zc_timing_env_on`] read their variable from the process environment on
+/// every call, as before). Read once per process.
+pub const ENV_NO_TRACE_ENV_ONCE: &str = "FLOCK_NO_TRACE_ENV_ONCE";
+
+/// Kill switch for latching remaining per-prove hot-path env/argv probes once
+/// per process (`FLOCK_NO_HOT_ENV_ONCE`, any value restores per-call reads).
+pub const ENV_NO_HOT_ENV_ONCE: &str = "FLOCK_NO_HOT_ENV_ONCE";
+
+pub fn hot_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_HOT_ENV_ONCE).is_none());
+    *ON
+}
+
+#[macro_export]
+macro_rules! hot_env_once {
+    ($ty:ty, $init:expr) => {{
+        if $crate::hot_env_once_enabled() {
+            static V: std::sync::LazyLock<$ty> = std::sync::LazyLock::new(|| $init);
+            *V
+        } else {
+            $init
+        }
+    }};
+}
+
+fn trace_env_once_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os(ENV_NO_TRACE_ENV_ONCE).is_none());
+    *ON
+}
+
+/// `FLOCK_PHASE_TIMING` set (the prover's phase-timing trace). The process
+/// environment does not change while a worker runs, so the first answer is
+/// kept; [`ENV_NO_TRACE_ENV_ONCE`] restores the per-call lookup.
+pub fn phase_timing_env_on() -> bool {
+    if trace_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_PHASE_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_PHASE_TIMING").is_some()
+}
+
+/// `FLOCK_ZC_TIMING` set (the zerocheck's timing trace), kept the same way.
+pub fn zc_timing_env_on() -> bool {
+    if trace_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("FLOCK_ZC_TIMING").is_some());
+        return *ON;
+    }
+    std::env::var_os("FLOCK_ZC_TIMING").is_some()
+}
+
 /// Publish-path warm-up hook (port of the x86 track's rename warm-up, e-man07
 /// fd1b67de item 20). The ranked worker's publisher installs it during the
 /// untimed gap; the PCS open fires it once, two recursive levels before the
@@ -102,11 +158,17 @@ pub(crate) fn recompute_cache_enabled() -> bool {
     *ON
 }
 
-/// Unlike `ab_compact_store_enabled` this does **not** latch the first read
-/// in a `OnceLock`: every gated call site runs O(10) times per prove, so the
-/// per-call `var_os` read is noise, and re-reading keeps same-process A/B
-/// tests (set var → prove → unset → prove) possible.
+/// Unlike `ab_compact_store_enabled`, non-ranked callers do **not** latch the
+/// first read so same-process A/B tests (set var → prove → unset → prove) keep
+/// working; inside the ranked worker (`FLOCK_NO_HOT_ENV_ONCE` restores per-call
+/// reads), the cleared environment is latched once per process.
 pub fn micro_stack_enabled() -> bool {
+    if is_ranked_worker_process() && hot_env_once_enabled() {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os(ENV_NO_MICRO_STACK).as_deref() != Some(std::ffi::OsStr::new("1"))
+        });
+        return *ON;
+    }
     std::env::var_os(ENV_NO_MICRO_STACK).as_deref() != Some(std::ffi::OsStr::new("1"))
 }
 
@@ -184,18 +246,18 @@ fn ranked_start_pause_for(
     (ranked_worker && kill != Some(std::ffi::OsStr::new("1"))).then_some(RANKED_START_PAUSE)
 }
 
-/// `flock-benchmark-worker LOG2 READY PROOF`: the same test the prover crate
-/// uses to arm its ranked-only paths (executable name and argument count).
-fn is_ranked_worker_process() -> bool {
-    let mut args = std::env::args_os();
-    let Some(exe) = args.next() else {
-        return false;
-    };
-    args.len() == 3
-        && std::path::Path::new(&exe)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+/// `flock-benchmark-worker LOG2 READY PROOF`: executable name and arg count.
+pub fn is_ranked_worker_process() -> bool {
+    crate::hot_env_once!(bool, {
+        let mut args = std::env::args_os();
+        args.next().is_some_and(|exe| {
+            args.len() == 3
+                && std::path::Path::new(&exe)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("flock-benchmark-worker"))
+        })
+    })
 }
 
 /// Sleep [`RANKED_START_PAUSE`] once per ranked worker process.
