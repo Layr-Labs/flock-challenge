@@ -410,6 +410,9 @@ pub(super) fn vector_resident_rows() -> bool {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+pub(super) use aarch64::{butterfly_l1_shared_head, l1_shared_head_twiddles};
+
 /// Rate-1/2 first-pass row kernel: one load of the radix-8 row group from
 /// `src`, two fused-3 evaluations — zero-root set to `dst0`, general set to
 /// `dst1`. The AArch64 arm stages outputs in L1 and emits each destination

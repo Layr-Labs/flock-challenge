@@ -622,6 +622,115 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
     }
 }
 
+/// Check the actual L1 twiddles before using cross-coset products.
+#[cfg(target_os = "macos")]
+pub(in super::super) fn l1_shared_head_twiddles(twiddles: &[[F128; 7]]) -> Option<(&[[F128; 7]; 4], F128)> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("FLOCK_NO_RECURSIVE_L1_SHARED_HEAD").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    }) || !super::vector_resident_rows() || !use_const_ext()
+    {
+        return None;
+    }
+    let t: &[[F128; 7]; 4] = twiddles.try_into().ok()?;
+    let a = t[1][0];
+    let b = t[2][0];
+    if t[0][0] != F128::ZERO || t[0][1] != F128::ZERO || t[0][3] != F128::ZERO
+        || t[3][0] != a + b
+    {
+        return None;
+    }
+    let c = t[1][1];
+    let d = t[2][1];
+    if (0..2).any(|s| {
+        let base = t[0][1 + s];
+        t[1][1 + s] != base + c || t[2][1 + s] != base + d || t[3][1 + s] != base + c + d
+    }) {
+        return None;
+    }
+    // The fourth coset's layer-3 correction is the mixed coefficient of
+    // the two coset bits in (C*u + D*v) * (A*u + B*v).
+    Some((t, c * b + d * a))
+}
+
+/// Evaluate all four L1 replicas from the common 32-row tile.
+/// Each tile shares input loads and writes disjoint output rows.
+///
+/// # Safety
+/// The source covers 64*eighth elements, initialized and disjoint from the
+/// four contiguous destination blocks of the same size. This job owns
+/// rows row_start..row_end in each segment of each block.
+#[cfg(target_os = "macos")]
+#[target_feature(enable = "aes")]
+#[inline(never)]
+pub(in super::super) unsafe fn butterfly_l1_shared_head(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[[F128; 7]; 4],
+    correction: F128,
+) {
+    use core::arch::aarch64::*;
+
+    debug_assert!(row_start <= row_end && row_end <= eighth);
+    debug_assert_eq!(twiddles[0][0], F128::ZERO);
+    debug_assert_eq!(twiddles[0][1], F128::ZERO);
+    debug_assert_eq!(twiddles[0][3], F128::ZERO);
+    debug_assert_eq!(twiddles[3][0], twiddles[1][0] + twiddles[2][0]);
+
+    unsafe {
+        let prep = twiddles.map(|table| {
+            table.map(|t| three_coeffs(core::mem::transmute::<F128, uint64x2_t>(t)))
+        });
+        let correction = three_coeffs(core::mem::transmute::<F128, uint64x2_t>(correction));
+        let mut stage = [[core::mem::MaybeUninit::<F128>::uninit(); 64]; 4];
+        let step = eighth * 8;
+        let block_elems = 8 * step;
+
+        for row in row_start..row_end {
+            let off = row * 8;
+            for lane in 0..8 {
+                let loaded: [uint64x2_t; 8] = core::array::from_fn(|i| {
+                    vld1q_u64(src.add(off + lane + i * step).cast::<u64>())
+                });
+                l1_shared_head_lane(loaded, &prep, correction, &mut stage, lane);
+            }
+            for (replica, staged) in stage.iter().enumerate() {
+                for i in 0..8 {
+                    let src_row = staged.as_ptr().add(8 * i);
+                    let dst_row = dst.add(replica * block_elems + off + i * step);
+                    for lane in (0..8).step_by(2) {
+                        let x = vld1q_u64(src_row.add(lane).cast::<u64>());
+                        let y = vld1q_u64(src_row.add(lane + 1).cast::<u64>());
+                        store_recursive_pair_nt(dst_row.add(lane), x, y);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[inline(always)]
+unsafe fn store_recursive_pair_nt(
+    dst: *mut F128,
+    x: core::arch::aarch64::uint64x2_t,
+    y: core::arch::aarch64::uint64x2_t,
+) {
+    unsafe {
+        core::arch::asm!(
+            "stnp {x:q}, {y:q}, [{dst}]",
+            dst = in(reg) dst,
+            x = in(vreg) x,
+            y = in(vreg) y,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Out-of-place radix-8 tile used by recursive from-message commitments.
 /// Values are staged as one contiguous lane run per output row before the
 /// non-temporal stores, avoiding a read-for-ownership of the stale codeword.
@@ -939,6 +1048,151 @@ unsafe fn fused3_prepared_q(
             let (a, b) = three_fold(v[2 * s], v[2 * s + 1], t[3 + s], pending);
             v[2 * s] = a;
             v[2 * s + 1] = b;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+use core::arch::aarch64::uint64x2_t as L1Q;
+
+/// Prepared layer 3. Even physical rows each carry a shared pending half
+/// within their four-row group. Odd physical rows are already canonical.
+#[cfg(target_os = "macos")]
+#[inline(always)]
+unsafe fn l1_shared_layer3(
+    v: &mut [L1Q; 8], t: &[Prep; 7], [p0, p1]: [L1Q; 2],
+) -> [L1Q; 2] {
+    unsafe {
+        let (a, b, q0) = three_lazy(v[0], v[2], t[1], p0);
+        v[0] = a;
+        v[2] = b;
+        let (a, b) = three_fold(v[1], v[3], t[1], p1);
+        v[1] = a;
+        v[3] = b;
+        let (a, b, q4) = three_lazy(v[4], v[6], t[2], p0);
+        v[4] = a;
+        v[6] = b;
+        let (a, b) = three_fold(v[5], v[7], t[2], p1);
+        v[5] = a;
+        v[7] = b;
+        [q0, q4]
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[inline(always)]
+unsafe fn l1_shared_layer4<const ZERO_ROOT: bool>(
+    v: &mut [L1Q; 8], t: &[Prep; 7], [q0, q4]: [L1Q; 2],
+) {
+    unsafe {
+        for (s, pending) in [q0, q0, q4, q4].into_iter().enumerate() {
+            let i = 2 * s;
+            let (a, b) = if ZERO_ROOT && s == 0 {
+                (v[0], butterfly_zero_q(v[0], v[1]))
+            } else if ZERO_ROOT && s == 1 {
+                three_fold_zero(v[2], v[3], t[4])
+            } else {
+                three_fold(v[i], v[i + 1], t[3 + s], pending)
+            };
+            v[i] = a;
+            v[i + 1] = b;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[inline(always)]
+unsafe fn l1_shared_layer23<const ZERO_ROOT: bool>(
+    v: &mut [L1Q; 8], t: &[Prep; 7],
+) -> [L1Q; 2] {
+    use core::arch::aarch64::*;
+    unsafe {
+        if ZERO_ROOT {
+            for i in 0..4 {
+                v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
+            }
+            for i in 0..2 {
+                v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+            }
+            let (a, b, q4) = three_lazy_zero(v[4], v[6], t[2]);
+            v[4] = a;
+            v[6] = b;
+            let (a, b) = three_fold_zero(v[5], v[7], t[2]);
+            v[5] = a;
+            v[7] = b;
+            return [vdupq_n_u64(0), q4];
+        }
+        let (a, b, p0) = three_lazy_zero(v[0], v[4], t[0]);
+        v[0] = a;
+        v[4] = b;
+        let (a, b, p1) = three_lazy_zero(v[1], v[5], t[0]);
+        v[1] = a;
+        v[5] = b;
+        for i in 2..4 {
+            let (a, b) = three_fold_zero(v[i], v[i + 4], t[0]);
+            v[i] = a;
+            v[i + 4] = b;
+        }
+        l1_shared_layer3(v, t, [p0, p1])
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[inline(always)]
+unsafe fn l1_shared_head_lane(
+    loaded: [L1Q; 8],
+    prep: &[[Prep; 7]; 4],
+    correction: Prep,
+    stage: &mut [[core::mem::MaybeUninit<F128>; 64]; 4],
+    lane: usize,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        // Keep only one layer-3 replica and an XOR debt. Finalized values
+        // go to the same row-major stage as the original shared body.
+        let mut v = loaded;
+        let mut pending_sum = l1_shared_layer23::<true>(&mut v, &prep[0]);
+        let mut sum = v;
+        l1_shared_layer4::<true>(&mut v, &prep[0], pending_sum);
+        for (i, value) in v.into_iter().enumerate() {
+            vst1q_u64(stage[0].as_mut_ptr().add(8 * i + lane).cast::<u64>(), value);
+        }
+        // Literal replica indices let the register allocator see each
+        // value's last use. No loop carries multiple live layer-3 replicas.
+        macro_rules! general {
+            ($replica:literal, $last:literal) => {{
+                let mut v = loaded;
+                let p = l1_shared_layer23::<false>(&mut v, &prep[$replica]);
+                pending_sum = [
+                    veorq_u64(pending_sum[0], p[0]),
+                    veorq_u64(pending_sum[1], p[1]),
+                ];
+                if $last {
+                    // Both corrections are canonical. XOR them into the low
+                    // vectors while keeping the accumulated pending halves.
+                    let zero = vdupq_n_u64(0);
+                    let even = three_fold_zero(zero, loaded[6], correction).0;
+                    let odd = three_fold_zero(zero, loaded[7], correction).0;
+                    for i in 0..4 {
+                        sum[2 * i] = xor3(sum[2 * i], v[2 * i], even);
+                        sum[2 * i + 1] = xor3(sum[2 * i + 1], v[2 * i + 1], odd);
+                    }
+                } else {
+                    for i in 0..8 {
+                        sum[i] = veorq_u64(sum[i], v[i]);
+                    }
+                }
+                l1_shared_layer4::<false>(&mut v, &prep[$replica], p);
+                for (i, value) in v.into_iter().enumerate() {
+                    vst1q_u64(stage[$replica].as_mut_ptr().add(8 * i + lane).cast::<u64>(), value);
+                }
+            }};
+        }
+        general!(1, false);
+        general!(2, true);
+        l1_shared_layer4::<false>(&mut sum, &prep[3], pending_sum);
+        for (i, value) in sum.into_iter().enumerate() {
+            vst1q_u64(stage[3].as_mut_ptr().add(8 * i + lane).cast::<u64>(), value);
         }
     }
 }

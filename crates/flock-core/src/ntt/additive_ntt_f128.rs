@@ -1093,20 +1093,50 @@ impl AdditiveNttF128 {
         debug_assert_eq!(twiddles[0][1], F128::ZERO);
         debug_assert_eq!(twiddles[0][3], F128::ZERO);
 
-        const ROWS_PER_TILE: usize = 128;
-        let tiles_per_block = eighth.div_ceil(ROWS_PER_TILE);
+        let top_hetero = recursive_l1_helper.is_some() && recursive_top_hetero_enabled();
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        let shared = if top_hetero
+            && is_recursive_l1_ntt_epool_shape(log_d, num_ntts, start_layer)
+            && self.shared_standard_dim() == Some(18)
+        {
+            kernels::l1_shared_head_twiddles(&twiddles)
+        } else {
+            None
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        let rows_per_tile = if shared.is_some() { 32 } else { 128 };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+        let rows_per_tile = 128;
+        let tiles_per_block = eighth.div_ceil(rows_per_tile);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        let top_jobs = if shared.is_some() {
+            tiles_per_block
+        } else {
+            num_blocks * tiles_per_block
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+        let top_jobs = num_blocks * tiles_per_block;
         let src = msg.as_ptr() as usize;
         let dst = data.as_mut_ptr() as usize;
         let top = |job: usize| {
             let block = job / tiles_per_block;
             let tile = job % tiles_per_block;
-            let row_start = tile * ROWS_PER_TILE;
-            let row_end = (row_start + ROWS_PER_TILE).min(eighth);
+            let row_start = tile * rows_per_tile;
+            let row_end = (row_start + rows_per_tile).min(eighth);
             // SAFETY: each `(block, tile)` job owns all eight destination
             // rows for one disjoint row interval. `msg` is immutable and
             // has one complete layer-start block; every derived address
             // is in the validated source/destination geometry.
             unsafe {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                if let Some((twiddles, correction)) = shared {
+                    // A shared tile owns this disjoint row range in all four replicas.
+                    kernels::butterfly_l1_shared_head(
+                        src as *const F128, dst as *mut F128, eighth, row_start, row_end,
+                        twiddles, correction,
+                    );
+                    return;
+                }
                 let dst_block = (dst as *mut F128).add(block * block_elems);
                 if block == 0 {
                     kernels::butterfly_fused_3layer_zero_root_from_src_rows(
@@ -1131,7 +1161,7 @@ impl AdditiveNttF128 {
                 }
             }
         };
-        if recursive_l1_helper.is_some() && recursive_top_hetero_enabled() {
+        if top_hetero {
             // Heterogeneous claim queue for the radix-8 producer: the ranked
             // L0 top already proves this pattern at the exact 1 GiB codeword
             // (`is_ranked_top_hetero_fused3_pass`), where the shared atomic
@@ -1143,9 +1173,9 @@ impl AdditiveNttF128 {
             // the helper pool exactly as before. Output is bit-identical: the
             // same per-tile kernel runs on either pool and every (block,
             // tile) job owns disjoint destination rows.
-            crate::epool::run_hetero_chunks(num_blocks * tiles_per_block, top);
+            crate::epool::run_hetero_chunks(top_jobs, top);
         } else {
-            (0..num_blocks * tiles_per_block)
+            (0..top_jobs)
                 .into_par_iter()
                 .for_each(top);
         }
@@ -1185,12 +1215,22 @@ impl AdditiveNttF128 {
         if let (Some((top_ms, top_claims, top_broadcasts)), Some((started, claims, broadcasts))) =
             (top_trace, deep_trace)
         {
+            let deep_ms = started.elapsed().as_secs_f64() * 1e3;
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+            let head = if !is_recursive_l1_ntt_epool_shape(log_d, num_ntts, start_layer) {
+                ""
+            } else if shared.is_some() {
+                " head=shared23"
+            } else {
+                " head=stock"
+            };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+            let head = "";
             eprintln!(
                 "[recursive-l1-ntt-epool] helper={} top_ms={top_ms:.3} \
-                 top_claims={top_claims} top_broadcasts={top_broadcasts} deep_ms={:.3} \
-                 deep_claims={} deep_broadcasts={} radix8_leads={}",
+                 top_claims={top_claims} top_broadcasts={top_broadcasts} deep_ms={deep_ms:.3} \
+                 deep_claims={} deep_broadcasts={} radix8_leads={}{head}",
                 recursive_l1_helper.is_some(),
-                started.elapsed().as_secs_f64() * 1e3,
                 crate::epool::helper_chunks_claimed().wrapping_sub(claims),
                 crate::epool::helper_broadcasts_issued().wrapping_sub(broadcasts),
                 DEEP_RADIX8_LEADS
