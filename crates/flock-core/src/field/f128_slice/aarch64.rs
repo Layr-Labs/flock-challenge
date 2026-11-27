@@ -1022,12 +1022,14 @@ pub(super) unsafe fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
 ///
 /// # Safety
 /// Requires the `aes` target feature (PMULL). `witness` and `basis` must have
-/// equal lengths divisible by two.
+/// equal lengths divisible by two. With `COPY`, `dst` must be writable for
+/// `witness.len()` elements and disjoint from both slices.
 #[target_feature(enable = "aes")]
-pub(super) unsafe fn round0_add_basis<D: FnMut(usize) -> F128>(
+pub(super) unsafe fn round0_add_basis<D: FnMut(usize) -> F128, const COPY: bool>(
     witness: &[F128],
     basis: &mut [F128],
     mut delta: D,
+    dst: *mut F128,
 ) -> (F128, F128) {
     unsafe {
         debug_assert_eq!(witness.len(), basis.len());
@@ -1052,6 +1054,10 @@ pub(super) unsafe fn round0_add_basis<D: FnMut(usize) -> F128>(
         while i < main {
             let (a0, a1) = load_pair_whole(wp.add(i));
             let (a2, a3) = load_pair_whole(wp.add(i + 2));
+            if COPY {
+                store_pair_whole(dst.add(i), a0, a1);
+                store_pair_whole(dst.add(i + 2), a2, a3);
+            }
             let b0 = update(i);
             let b1 = update(i + 1);
             let b2 = update(i + 2);
@@ -1064,6 +1070,9 @@ pub(super) unsafe fn round0_add_basis<D: FnMut(usize) -> F128>(
         }
         while i < n {
             let (a0, a1) = load_pair_whole(wp.add(i));
+            if COPY {
+                store_pair_whole(dst.add(i), a0, a1);
+            }
             let b0 = update(i);
             let b1 = update(i + 1);
             tri_acc_q(&mut u0_a, a0, b0);

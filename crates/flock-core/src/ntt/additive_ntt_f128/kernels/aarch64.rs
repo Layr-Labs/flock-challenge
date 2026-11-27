@@ -634,7 +634,7 @@ pub(super) unsafe fn butterfly_fused_3layer_dual_from_src_row(
 /// own every selected destination row until this call returns. For the
 /// zero-root form, twiddles 0, 1 and 3 must be zero.
 #[target_feature(enable = "aes")]
-unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
+unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool, const EARLY: bool>(
     src: *const F128,
     dst: *mut F128,
     eighth: usize,
@@ -642,6 +642,7 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
     row_start: usize,
     row_end: usize,
     twiddles: &[F128; 7],
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))] early_complete: u8,
 ) {
     use core::arch::aarch64::*;
 
@@ -671,6 +672,7 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
         let t: [uint64x2_t; 7] =
             core::array::from_fn(|i| vld1q_u64((&raw const twiddles[i]).cast::<u64>()));
         let ext = use_const_ext();
+        debug_assert!(!EARLY || (ZERO_ROOT && ext));
         let prep: [Prep; 7] = core::array::from_fn(|i| three_coeffs(t[i]));
         let mut stage = [core::mem::MaybeUninit::<F128>::uninit(); 64];
         let step = eighth * num_ntts;
@@ -684,6 +686,15 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
 
                 if ext {
                     if ZERO_ROOT {
+                        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                        if EARLY {
+                            fused3_zero_root_prepared_q_except(
+                                &mut v, prep[2], prep[4], prep[5], prep[6], early_complete,
+                            );
+                        } else {
+                            fused3_zero_root_prepared_q(&mut v, prep[2], prep[4], prep[5], prep[6]);
+                        }
+                        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
                         fused3_zero_root_prepared_q(&mut v, prep[2], prep[4], prep[5], prep[6]);
                     } else {
                         fused3_prepared_q(&mut v, &prep);
@@ -695,6 +706,8 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
                 }
 
                 for (i, value) in v.iter().enumerate() {
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                    if EARLY && early_complete & (1 << i) != 0 { continue; }
                     vst1q_u64(
                         stage.as_mut_ptr().add(i * num_ntts + lane).cast::<u64>(),
                         *value,
@@ -702,9 +715,11 @@ unsafe fn butterfly_fused_3layer_from_src_rows_impl<const ZERO_ROOT: bool>(
                 }
             }
 
-            // All 64 stage values are initialized above before this drain.
-            // Drain each 128 B row before the next group reuses the stage.
+            // Each selected row is initialized above before this drain.
+            // Masked rows already hold their final codeword in dst.
             for i in 0..8 {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                if EARLY && early_complete & (1 << i) != 0 { continue; }
                 let src_row = stage.as_ptr().add(i * num_ntts);
                 let dst_row = dst.add(off + i * step);
                 let mut lane = 0;
@@ -730,7 +745,7 @@ pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
     twiddles: &[F128; 7],
 ) {
     unsafe {
-        butterfly_fused_3layer_from_src_rows_impl::<false>(
+        butterfly_fused_3layer_from_src_rows_impl::<false, false>(
             src,
             dst,
             eighth,
@@ -738,6 +753,8 @@ pub(super) unsafe fn butterfly_fused_3layer_from_src_row(
             r,
             r + 1,
             twiddles,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+            0,
         );
     }
 }
@@ -753,7 +770,7 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
     twiddles: &[F128; 7],
 ) {
     unsafe {
-        butterfly_fused_3layer_from_src_rows_impl::<true>(
+        butterfly_fused_3layer_from_src_rows_impl::<true, false>(
             src,
             dst,
             eighth,
@@ -761,6 +778,8 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_row(
             r,
             r + 1,
             twiddles,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+            0,
         );
     }
 }
@@ -776,8 +795,9 @@ pub(super) unsafe fn butterfly_fused_3layer_from_src_rows(
     twiddles: &[F128; 7],
 ) {
     unsafe {
-        butterfly_fused_3layer_from_src_rows_impl::<false>(
+        butterfly_fused_3layer_from_src_rows_impl::<false, false>(
             src, dst, eighth, num_ntts, row_start, row_end, twiddles,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))] 0,
         );
     }
 }
@@ -793,8 +813,33 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_rows(
     twiddles: &[F128; 7],
 ) {
     unsafe {
-        butterfly_fused_3layer_from_src_rows_impl::<true>(
+        butterfly_fused_3layer_from_src_rows_impl::<true, false>(
             src, dst, eighth, num_ntts, row_start, row_end, twiddles,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))] 0,
+        );
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+pub(super) fn early_l1_const_ext_available() -> bool {
+    use_const_ext()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn butterfly_fused_3layer_early_l1_from_src_rows(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[F128; 7],
+    complete: u8,
+) {
+    unsafe {
+        butterfly_fused_3layer_from_src_rows_impl::<true, true>(
+            src, dst, eighth, num_ntts, row_start, row_end, twiddles, complete,
         );
     }
 }
@@ -1057,13 +1102,27 @@ unsafe fn fused3_zero_root_prepared_q(
     t5: Prep,
     t6: Prep,
 ) {
+    unsafe { fused3_zero_root_prepared_q_except(v, t2, t4, t5, t6, 0) }
+}
+
+#[inline(always)]
+unsafe fn fused3_zero_root_prepared_q_except(
+    v: &mut [core::arch::aarch64::uint64x2_t; 8],
+    t2: Prep,
+    t4: Prep,
+    t5: Prep,
+    t6: Prep,
+    complete: u8,
+) {
     unsafe {
         use core::arch::aarch64::*;
         for i in 0..4 {
             v[i + 4] = butterfly_zero_q(v[i], v[i + 4]);
         }
-        for i in 0..2 {
-            v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+        if complete & 12 == 0 {
+            for i in 0..2 {
+                v[i + 2] = butterfly_zero_q(v[i], v[i + 2]);
+            }
         }
         let (a, b, p4) = three_lazy_zero(v[4], v[6], t2);
         v[4] = a;
@@ -1071,10 +1130,14 @@ unsafe fn fused3_zero_root_prepared_q(
         let (a, b) = three_fold_zero(v[5], v[7], t2);
         v[5] = a;
         v[7] = b;
-        v[1] = butterfly_zero_q(v[0], v[1]);
-        let (a, b) = three_fold_zero(v[2], v[3], t4);
-        v[2] = a;
-        v[3] = b;
+        if complete & 2 == 0 {
+            v[1] = butterfly_zero_q(v[0], v[1]);
+        }
+        if complete & 12 == 0 {
+            let (a, b) = three_fold_zero(v[2], v[3], t4);
+            v[2] = a;
+            v[3] = b;
+        }
         let (a, b) = three_fold(v[4], v[5], t5, p4);
         v[4] = a;
         v[5] = b;

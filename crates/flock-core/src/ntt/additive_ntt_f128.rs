@@ -1017,6 +1017,72 @@ impl AdditiveNttF128 {
             log_d,
             recursive_l1_helper,
             finish_chunk,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+            0,
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    pub(crate) fn early_l1_helper() -> Option<&'static rayon::ThreadPool> {
+        if !use_recursive_ntt_epool(18, 8, 2)
+            || l1_tail_split_count(18, 5, 32) > 28
+            || !kernels::early_l1_head_available()
+        {
+            return None;
+        }
+        crate::epool::helper_pool()
+    }
+
+    // Each call owns exactly one independently completed output range.
+    // The sibling pair 2/3 stays together through their shared butterfly.
+    // SAFETY: out names the exclusive one- or two-subtree output range,
+    // which may hold uninitialized scratch values, and does not alias prefix.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    pub(crate) unsafe fn early_l1_zero_root_subtrees(&self, prefix: &[F128], out: *mut F128, sub: usize) {
+        const SUB: usize = 8192 * 8;
+        assert_eq!(prefix.len(), 4 * SUB);
+        assert!(self.log_domain_size() == 18 && matches!(sub, 0..=2));
+        unsafe {
+            match sub {
+                0 => core::ptr::copy_nonoverlapping(prefix.as_ptr(), out, SUB),
+                1 => {
+                    for i in 0..SUB { out.add(i).write(prefix[i] + prefix[SUB + i]); }
+                }
+                _ => {
+                    for i in 0..SUB {
+                        out.add(i).write(prefix[i] + prefix[2 * SUB + i]);
+                        out.add(SUB + i).write(prefix[SUB + i] + prefix[3 * SUB + i]);
+                    }
+                }
+            }
+            let out = core::slice::from_raw_parts_mut(out, if sub == 2 { 2 * SUB } else { SUB });
+            if sub == 2 {
+                butterfly_interleaved_block(out, self.twiddle(4, 1), SUB / 8, 8);
+            }
+            for (i, part) in out.chunks_exact_mut(SUB).enumerate() {
+                self.forward_transform_interleaved_deep_subtree(part, 8, 5, 5, 18, sub + i);
+            }
+        }
+    }
+
+    /// Resume the ordinary ranked transform over a matrix whose indicated
+    /// zero-root subtrees already contain their final canonical rows.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    pub(crate) fn forward_transform_interleaved_early_l1_and_then<F>(
+        &self,
+        msg: &[F128],
+        data: &mut [F128],
+        complete: u8,
+        helper: &rayon::ThreadPool,
+        finish_chunk: F,
+    ) where
+        F: Fn(usize, &[F128]) + Sync + Send,
+    {
+        assert_eq!(data.len(), 1 << 21);
+        assert_eq!(self.log_domain_size(), 18);
+        assert!(complete & !15 == 0 && matches!(complete & 12, 0 | 12));
+        self.forward_transform_interleaved_from_message_fused3_with_helper_and_then(
+            msg, data, 8, 2, 18, Some(helper), finish_chunk, complete,
         );
     }
 
@@ -1037,6 +1103,8 @@ impl AdditiveNttF128 {
             log_d,
             recursive_l1_helper,
             |_, _| {},
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+            0,
         );
     }
 
@@ -1049,6 +1117,7 @@ impl AdditiveNttF128 {
         log_d: usize,
         recursive_l1_helper: Option<&rayon::ThreadPool>,
         finish_chunk: F,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))] early_complete: u8,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
@@ -1109,6 +1178,14 @@ impl AdditiveNttF128 {
             unsafe {
                 let dst_block = (dst as *mut F128).add(block * block_elems);
                 if block == 0 {
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                    if early_complete != 0 {
+                        kernels::butterfly_fused_3layer_early_l1_from_src_rows(
+                            src as *const F128, dst_block, eighth, num_ntts,
+                            row_start, row_end, &twiddles[block], early_complete,
+                        );
+                        return;
+                    }
                     kernels::butterfly_fused_3layer_zero_root_from_src_rows(
                         src as *const F128,
                         dst_block,
@@ -1173,6 +1250,8 @@ impl AdditiveNttF128 {
                 start_layer + 3,
                 helper,
                 &finish_chunk,
+                #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                early_complete,
             );
         } else {
             self.forward_transform_interleaved_from_layer_and_then(
@@ -2109,6 +2188,7 @@ impl AdditiveNttF128 {
         start_layer: usize,
         helper: &rayon::ThreadPool,
         finish_chunk: &F,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))] early_complete: u8,
     ) where
         F: Fn(usize, &[F128]) + Sync + Send,
     {
@@ -2125,6 +2205,8 @@ impl AdditiveNttF128 {
         debug_assert_eq!(data.len(), num_subs * sub_bytes);
 
         let base = crate::epool::SyncPtr(data.as_mut_ptr());
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        let already_done = |sub: usize| sub < 4 && early_complete & (1 << sub) != 0;
         // Ragged-tail split (L1 only: 13 deep layers, the first one alone).
         // The last `n_split` subtrees run as two claims each: claim A does
         // the subtree's lone first layer (the only butterfly that couples its
@@ -2149,6 +2231,11 @@ impl AdditiveNttF128 {
                     let sub_data = unsafe {
                         std::slice::from_raw_parts_mut(base.ptr().add(job * sub_bytes), sub_bytes)
                     };
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                    if already_done(job) {
+                        finish_chunk(job * sub_bytes, sub_data);
+                        return;
+                    }
                     self.forward_transform_interleaved_deep_subtree(
                         sub_data, num_ntts, start_layer, N_TOP, log_d, job,
                     );
@@ -2217,6 +2304,11 @@ impl AdditiveNttF128 {
             let sub_data = unsafe {
                 std::slice::from_raw_parts_mut(base.ptr().add(sub_idx * sub_bytes), sub_bytes)
             };
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+            if already_done(sub_idx) {
+                finish_chunk(sub_idx * sub_bytes, sub_data);
+                return;
+            }
             self.forward_transform_interleaved_deep_subtree(
                 sub_data,
                 num_ntts,
@@ -4501,6 +4593,8 @@ mod tests {
                     LOG_D,
                     Some(&helper),
                     |off, chunk| covered.lock().unwrap().push((off, chunk.len())),
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                    0,
                 );
             });
             L1_TAIL_SPLIT_OVERRIDE.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);

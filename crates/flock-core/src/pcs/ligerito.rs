@@ -5891,6 +5891,8 @@ pub(crate) fn ligero_commit(
         ntt,
         kind,
         false,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        None,
     )
 }
 
@@ -5903,6 +5905,8 @@ fn ligero_commit_select(
     ntt: &AdditiveNttF128,
     kind: HashKind,
     allow_tree_view: bool,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    early_mat: Option<fold8_l1_early::Prepared>,
 ) -> LigeroWitness {
     let level_opt_out = match (log_msg_cols, log_num_interleaved, log_inv_rate) {
         (16, 3, 2) => Some("FLOCK_NO_RECURSIVE_FROM_MESSAGE_L1"),
@@ -5927,6 +5931,8 @@ fn ligero_commit_select(
         kind,
         fuse_from_message,
         allow_tree_view,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        early_mat,
     )
 }
 
@@ -5967,6 +5973,8 @@ pub(crate) fn ligero_commit_with_tree_view(
         ntt,
         kind,
         l1_tree_view_env_on(),
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        None,
     )
 }
 
@@ -5992,6 +6000,8 @@ fn ligero_commit_impl(
         kind,
         fuse_from_message,
         false,
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        None,
     )
 }
 
@@ -6005,6 +6015,8 @@ fn ligero_commit_impl_view(
     kind: HashKind,
     fuse_from_message: bool,
     allow_tree_view: bool,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    early_mat: Option<fold8_l1_early::Prepared>,
 ) -> LigeroWitness {
     let msg_cols = 1usize << log_msg_cols;
     let num_interleaved = 1usize << log_num_interleaved;
@@ -6022,7 +6034,16 @@ fn ligero_commit_impl_view(
     // recursive shapes fuse that logical state into their first radix-8 pass.
     let codeword_len = block_len * num_interleaved;
     let alloc_start = timing.then(std::time::Instant::now);
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
     let mut mat = crate::scratch::take_f128(codeword_len);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    let (mut mat, early) = match early_mat {
+        Some(early) => (
+            early.mat,
+            (early.complete != 0).then_some((early.complete, early.helper)),
+        ),
+        None => (crate::scratch::take_f128(codeword_len), None),
+    };
     let alloc_elapsed = alloc_start.map_or(std::time::Duration::ZERO, |t| t.elapsed());
     let mut fill_elapsed = std::time::Duration::ZERO;
     // L1 NTT/Merkle-leaf overlap: the transform fires a per-finalized-chunk
@@ -6066,25 +6087,41 @@ fn ligero_commit_impl_view(
             race_ran = true;
         }
         Some(session) => {
-            ntt.forward_transform_interleaved_from_message_fused3_and_then(
-                poly,
-                &mut mat,
-                num_interleaved,
-                log_inv_rate,
-                |offset, chunk| session.chunk_ready(offset, chunk.len()),
-            );
+            let finish = |offset, chunk: &[F128]| session.chunk_ready(offset, chunk.len());
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+            let resumed = if let Some((early_mask, helper)) = early {
+                ntt.forward_transform_interleaved_early_l1_and_then(
+                    poly, &mut mat, early_mask, helper, finish,
+                );
+                true
+            } else { false };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+            let resumed = false;
+            if !resumed {
+                ntt.forward_transform_interleaved_from_message_fused3_and_then(
+                    poly, &mut mat, num_interleaved, log_inv_rate, finish,
+                );
+            }
             overlap_session = Some(session);
         }
         None if fuse_from_message => {
             // Write the first nontrivial radix-8 result straight from the
             // compact message into stale codeword storage. This deletes the
             // full replica fill and the first pass's destination reads/RFOs.
-            ntt.forward_transform_interleaved_from_message_fused3(
-                poly,
-                &mut mat,
-                num_interleaved,
-                log_inv_rate,
-            );
+            #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+            let resumed = if let Some((early_mask, helper)) = early {
+                ntt.forward_transform_interleaved_early_l1_and_then(
+                    poly, &mut mat, early_mask, helper, |_, _| {},
+                );
+                true
+            } else { false };
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+            let resumed = false;
+            if !resumed {
+                ntt.forward_transform_interleaved_from_message_fused3(
+                    poly, &mut mat, num_interleaved, log_inv_rate,
+                );
+            }
         }
         None => {
             let fill_start = timing.then(std::time::Instant::now);
@@ -8176,6 +8213,7 @@ fn round0_basis_fusion_enabled() -> bool {
 /// (`f128_slice::round0_add_basis`), so the completed basis is not re-read;
 /// every other configuration runs the separate loops and
 /// [`super::round0_deferred`]. Both write the same `b_out` and partial.
+/// A completed GPU block also copies its witness from the message's loads.
 #[inline(always)]
 fn direct_fold8_rest_claims_round0(
     rest_claims: &[super::ring_switch::DirectFold8Factors],
@@ -8183,7 +8221,8 @@ fn direct_fold8_rest_claims_round0(
     block: usize,
     scratch: &mut Vec<F128>,
     b_out: &mut [F128],
-    f_out: &[F128],
+    f_out: &mut [F128],
+    gpu_witness: Option<&[F128]>,
 ) -> (F128, F128) {
     assert_eq!(f_out.len(), b_out.len());
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -8208,9 +8247,12 @@ fn direct_fold8_rest_claims_round0(
         );
         let tables: &[F128] = scratch;
         let eq_lo: &[F128] = &last_claim.eq_lo;
-        return crate::field::f128_slice::round0_add_basis(f_out, b_out, |slot| {
-            super::ring_switch::fold_one_slot(eq_lo[slot], tables)
-        });
+        let delta = |slot: usize| super::ring_switch::fold_one_slot(eq_lo[slot], tables);
+        use crate::field::f128_slice::round0_add_basis;
+        return match gpu_witness {
+            Some(src) => round0_add_basis(src, b_out, delta, Some(f_out)),
+            None => round0_add_basis(f_out, b_out, delta, None),
+        };
     }
     for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
         super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
@@ -8218,8 +8260,14 @@ fn direct_fold8_rest_claims_round0(
             *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
         }
     }
+    if let Some(src) = gpu_witness {
+        f_out.copy_from_slice(src);
+    }
     super::round0_deferred(f_out, b_out)
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+mod fold8_l1_early;
 
 /// Sixty-four-bank materializer. Six challenges are sampled from the direct
 /// factor state before this function binds the witness and combined basis in
@@ -8232,6 +8280,8 @@ fn materialize_direct_fold8(
     ordinary_basis: Vec<F128>,
     claims: &[super::ring_switch::DirectFold8Factors],
     challenges: [F128; 6],
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    early_l1: Option<&mut fold8_l1_early::Early>,
 ) -> (Vec<F128>, Vec<F128>, SumcheckMessage) {
     use rayon::prelude::*;
 
@@ -8440,7 +8490,7 @@ fn materialize_direct_fold8(
             };
             slot += 1;
         }
-        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
+        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out, None)
     }
         };
     }
@@ -8524,7 +8574,7 @@ fn materialize_direct_fold8(
                 slot += 4;
             }
         }
-        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
+        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out, None)
     };
     // A CPU-folded block: rebuilt rows when registered (and, under the
     // P-only knob, on a main-pool worker), else read from the buffer.
@@ -8549,15 +8599,15 @@ fn materialize_direct_fold8(
         }
         fold8_block(&mut st.0, block, b_out, f_out)
     };
-    // The same block body when `f_out` already holds the GPU's witness fold
-    // (an exact field sum, bit-identical to the banked CPU fold): only the
-    // direct basis part and the round-0 partial remain. Ranked shape only
-    // (no ordinary basis), where `fold8_block` writes b = direct parts.
+    // The GPU has already folded this witness block. Copy its immutable
+    // result into the host output while producing the round-0 partial.
+    // Ranked shape only (no ordinary basis), where b = direct parts.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let fold8_b_only = |scratch: &mut Vec<F128>,
                         block: usize,
                         b_out: &mut [F128],
-                        f_out: &[F128]|
+                        f_out: &mut [F128],
+                        gpu_witness: &[F128]|
      -> (F128, F128) {
         debug_assert!(!has_ordinary);
         let (first_claim, rest_claims) = claims.split_first().unwrap();
@@ -8570,7 +8620,7 @@ fn materialize_direct_fold8(
         for (slot, out) in b_out.iter_mut().enumerate() {
             *out = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
         }
-        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
+        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out, Some(gpu_witness))
     };
 
     let mut folded_f = crate::scratch::take_f128(out_len);
@@ -8594,6 +8644,10 @@ fn materialize_direct_fold8(
         let f_base = crate::epool::SyncPtr(folded_f.as_mut_ptr());
         let b_base = crate::epool::SyncPtr(folded_b.as_mut_ptr());
         let partials_base = crate::epool::SyncPtr(partials.as_mut_ptr());
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        let early = early_l1
+            .filter(|_| n_blocks == 256 && block_len == 2048)
+            .map(|early| early.lease(f_base));
         // GPU arm claim state: `(lo, hi, from_gpu)`. Blocks `[lo, hi)` are
         // unclaimed; a claim takes `lo` when its GPU chunk has completed,
         // otherwise steals `hi - 1` for a full CPU fold. Each of the queue's
@@ -8614,10 +8668,8 @@ fn materialize_direct_fold8(
         let zf_launch_ns = std::sync::atomic::AtomicU64::new(0);
         let zf_t_drain = std::time::Instant::now();
         let zf_setup_ms = zf_t0.elapsed().as_secs_f64() * 1e3;
-        crate::epool::run_hetero_chunks_stateful(
-            n_blocks,
-            || (crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN), Vec::new()),
-            |st: &mut (Vec<F128>, Vec<F128>), block| {
+        let init_worker = || (crate::alloc_uninit_f128_vec(super::ring_switch::FOLD_TABLE_LEN), Vec::new());
+        let fold_block = |st: &mut (Vec<F128>, Vec<F128>), block: usize| {
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 if zf_want {
                     if !zf_launch_claimed.load(std::sync::atomic::Ordering::Relaxed)
@@ -8667,8 +8719,7 @@ fn materialize_direct_fold8(
                         );
                         let tb = zfold_debug_any().then(std::time::Instant::now);
                         let partial = if let (true, Some(job)) = (from_gpu, job) {
-                            f_out.copy_from_slice(job.block_out(block));
-                            fold8_b_only(&mut st.0, block, b_out, f_out)
+                            fold8_b_only(&mut st.0, block, b_out, f_out, job.block_out(block))
                         } else {
                             fold8_cpu(st, block, b_out, f_out)
                         };
@@ -8679,6 +8730,8 @@ fn materialize_direct_fold8(
                         }
                         partials_base.ptr().add(block).write(partial);
                     }
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                    if let Some(early) = &early { early.block_done(block); }
                     return;
                 }
                 // SAFETY: the queue hands out each `block` exactly once; it
@@ -8706,8 +8759,26 @@ fn materialize_direct_fold8(
                         );
                     }
                 }
-            },
-        );
+                #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                if let Some(early) = &early { early.block_done(block); }
+        };
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+        if let Some(early) = &early {
+            crate::epool::run_hetero_chunks_stateful_with_tail(
+                n_blocks,
+                init_worker,
+                fold_block,
+                Some(&|| {
+                    if zf_cell.get().is_some_and(Option::is_some) {
+                        early.try_tail();
+                    }
+                }),
+            );
+        } else {
+            crate::epool::run_hetero_chunks_stateful(n_blocks, init_worker, fold_block);
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
+        crate::epool::run_hetero_chunks_stateful(n_blocks, init_worker, fold_block);
         let zf_drain_ms = zf_t_drain.elapsed().as_secs_f64() * 1e3;
         let mut zf_used = 0usize;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -10304,6 +10375,14 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     let log_n = packed_witness.len().trailing_zeros() as usize;
     let r = config.recursive_steps;
     let initial_k = config.initial_k;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    let ranked_early_l1 = log_n == 25
+        && initial_k == 6
+        && config.recursive_ks.first() == Some(&3)
+        && config.log_inv_rates.get(1) == Some(&2)
+        && config.merkle_hash == HashKind::Blake3;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    let mut early_l1 = None;
 
     assert_eq!(packed_witness.len(), 1usize << log_n);
     assert!(
@@ -10470,6 +10549,10 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                     // path does zero extra work — and mirrors the counter's
                     // documented "prove E-core engagement for that window" use.
                     let helper_before = trace.then(crate::epool::helper_chunks_claimed);
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                    {
+                        early_l1 = fold8_l1_early::Early::new(ranked_early_l1);
+                    }
                     let (f8, b8, msg) = materialize_direct_fold8(
                         packed_witness.take().unwrap(),
                         b_initial.take().unwrap(),
@@ -10482,6 +10565,8 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
                             fold4_challenges[4],
                             r,
                         ],
+                        #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+                        early_l1.as_mut(),
                     );
                     if let Some(before) = helper_before {
                         eprintln!(
@@ -10657,6 +10742,21 @@ fn recursive_prover_with_basis_impl<Ch: Challenger>(
     // previous `sc_prover.f().to_vec()` materialized a second 2^(n1) copy
     // (8 MiB at the ranked shape) on the timed path only to drop it after
     // the commit.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    let early_mat = early_l1.map(fold8_l1_early::Early::finish);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+    let wtns_1 = if let Some(mat) = early_mat {
+        ligero_commit_select(
+            sc_prover.f(), log_msg_cols_1, log_num_interleaved_1, log_inv_rate_1, &ntt_1,
+            config.merkle_hash, l1_tree_view_env_on(), Some(mat),
+        )
+    } else {
+        ligero_commit_with_tree_view(
+            sc_prover.f(), log_msg_cols_1, log_num_interleaved_1, log_inv_rate_1, &ntt_1,
+            config.merkle_hash,
+        )
+    };
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes")))]
     let wtns_1 = ligero_commit_with_tree_view(
         sc_prover.f(),
         log_msg_cols_1,

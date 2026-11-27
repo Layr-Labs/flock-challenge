@@ -48,19 +48,27 @@ pub(crate) fn round0(witness: &[F128], basis: &[F128]) -> (F128, F128) {
 /// (called once per slot, in slot order) and returns the round-zero message
 /// of the updated basis from the same deferred-reduction streams, without a
 /// second pass over the completed basis. Bit-identical to the update loop
-/// followed by [`round0`].
+/// followed by [`round0`]. If `copy_to` is present, also copy `witness` to it
+/// from the same loads that feed the round message.
 #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
 #[inline]
 pub(crate) fn round0_add_basis<D: FnMut(usize) -> F128>(
     witness: &[F128],
     basis: &mut [F128],
     delta: D,
+    copy_to: Option<&mut [F128]>,
 ) -> (F128, F128) {
     assert_eq!(witness.len(), basis.len());
     assert!(witness.len().is_multiple_of(2));
-    // SAFETY: the cfg gate supplies PMULL through `aes`; the checks above are
-    // the complete slice-shape contract of the architecture kernel.
-    unsafe { aarch64::round0_add_basis(witness, basis, delta) }
+    if let Some(dst) = copy_to {
+        assert_eq!(witness.len(), dst.len());
+        // SAFETY: AES and the slice lengths meet the kernel's contract.
+        // The destination is distinct from both input and basis by borrowing.
+        unsafe { aarch64::round0_add_basis::<_, true>(witness, basis, delta, dst.as_mut_ptr()) }
+    } else {
+        // SAFETY: AES and the slice lengths meet the kernel's contract.
+        unsafe { aarch64::round0_add_basis::<_, false>(witness, basis, delta, core::ptr::null_mut()) }
+    }
 }
 
 /// Accumulate the two sufficient statistics for a factorized LSB equality
@@ -1430,7 +1438,7 @@ mod tests {
         for trial in 0..64 {
             // Even lengths only; include a non-multiple-of-4 length so the
             // kernel's two-slot tail is exercised.
-            let n = 2 * (1 + trial % 17);
+            let n = if trial == 63 { 2048 } else { 2 * (1 + trial % 17) };
             let f: Vec<F128> = (0..n).map(|_| F128::new(next(), next())).collect();
             let b: Vec<F128> = (0..n).map(|_| F128::new(next(), next())).collect();
             let mut want_u0 = F128::ZERO;
@@ -1440,6 +1448,15 @@ mod tests {
                 want_u2 += (f[k] + f[k + 1]) * (b[k] + b[k + 1]);
             }
             assert_eq!(round0(&f, &b), (want_u0, want_u2), "n={n} trial={trial}");
+            let delta: Vec<F128> = (0..n).map(|_| F128::new(next(), next())).collect();
+            let mut basis: Vec<F128> = b.iter().zip(&delta).map(|(&x, &y)| x + y).collect();
+            let guard = F128::new(123, 456);
+            let mut copied = vec![guard; n + 2];
+            let msg = round0_add_basis(&f, &mut basis, |i| delta[i], Some(&mut copied[1..=n]));
+            assert_eq!(msg, (want_u0, want_u2), "n={n} trial={trial}");
+            assert_eq!(basis, b);
+            assert_eq!(&copied[1..=n], f.as_slice());
+            assert_eq!([copied[0], copied[n + 1]], [guard; 2]);
         }
     }
 }
