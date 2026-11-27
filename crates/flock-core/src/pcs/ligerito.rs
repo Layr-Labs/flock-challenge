@@ -4942,6 +4942,107 @@ fn transpose_forward_ntt_final_5layer_low_eighth_direct(
     retained
 }
 
+/// Keep all four quarters of each coset through two reverse layers, then
+/// XOR matching quarters. The lower `log2(COSETS)` layers are top-only.
+#[inline(never)]
+fn transpose_forward_ntt_final_two_layers_xor_cosets<const COSETS: usize>(
+    ntt: &AdditiveNttF128,
+    data: &[F128],
+) -> Vec<F128> {
+    use rayon::prelude::*;
+
+    const { assert!(COSETS == 4 || COSETS == 8) };
+    const QUARTERS: usize = 4;
+    const ROW_TILE: usize = 64;
+    let drop_log = COSETS.trailing_zeros() as usize;
+    let keep = data.len() / COSETS;
+    let quarter = keep / QUARTERS;
+    assert!(quarter > 0 && data.len().is_multiple_of(COSETS * QUARTERS * ROW_TILE));
+
+    let pair_twiddles: [[F128; 2]; COSETS] = core::array::from_fn(|coset| {
+        [ntt.twiddle(drop_log + 1, 2 * coset), ntt.twiddle(drop_log + 1, 2 * coset + 1)]
+    });
+    let cross_twiddles: [F128; COSETS] =
+        core::array::from_fn(|coset| ntt.twiddle(drop_log, coset));
+    let data_ptr = data.as_ptr() as usize;
+    let mut retained = Vec::<F128>::with_capacity(keep);
+    let retained_ptr = retained.as_mut_ptr() as usize;
+
+    (0..quarter / ROW_TILE)
+        .into_par_iter()
+        .for_each(|tile| {
+            let row_start = tile * ROW_TILE;
+            // Keep one 4 KiB tile-local accumulator. `coset` is deliberately
+            // outside `row`: each arithmetic pass then has four sequential
+            // input streams plus this accumulator, instead of interleaving 32
+            // power-of-two-strided streams that alias the same L1D sets.
+            let mut outputs =
+                [core::mem::MaybeUninit::<[F128; QUARTERS]>::uninit(); ROW_TILE];
+            for coset in 0..COSETS {
+                for local_row in 0..ROW_TILE {
+                    let row = row_start + local_row;
+                    let base = coset * keep + row;
+                    // SAFETY: `coset < COSETS`, `quarter = keep/4`, and `row < quarter`,
+                    // so all four quarter loads lie in the immutable `N`-field
+                    // input. No output aliases this separately allocated vector.
+                    let (x0, x1, x2, x3) = unsafe {
+                        let ptr = data_ptr as *const F128;
+                        (
+                            *ptr.add(base),
+                            *ptr.add(base + quarter),
+                            *ptr.add(base + 2 * quarter),
+                            *ptr.add(base + 3 * quarter),
+                        )
+                    };
+
+                    let top01 = x0 + x1;
+                    let bottom01 = pair_twiddles[coset][0] * top01 + x1;
+                    let top23 = x2 + x3;
+                    let bottom23 = pair_twiddles[coset][1] * top23 + x3;
+                    let top0 = top01 + top23;
+                    let top1 = bottom01 + bottom23;
+                    let values = [
+                        top0,
+                        top1,
+                        cross_twiddles[coset] * top0 + top23,
+                        cross_twiddles[coset] * top1 + bottom23,
+                    ];
+                    if coset == 0 {
+                        outputs[local_row].write(values);
+                    } else {
+                        // SAFETY: the complete `coset == 0` row pass finishes
+                        // before any later coset begins, initializing every
+                        // tile-local accumulator exactly once.
+                        let row_outputs = unsafe { outputs[local_row].assume_init_mut() };
+                        for output in 0..QUARTERS {
+                            row_outputs[output] += values[output];
+                        }
+                    }
+                }
+            }
+
+            for (local_row, row_outputs) in outputs.iter().enumerate() {
+                let row = row_start + local_row;
+                // SAFETY: all coset passes finished on this thread and the
+                // first pass initialized every row before this readback loop.
+                let row_outputs = unsafe { row_outputs.assume_init_ref() };
+                // SAFETY: each tile owns the same disjoint `ROW_TILE` rows in
+                // all four output quarters. The parallel join completes every
+                // write before the vector length becomes observable below.
+                unsafe {
+                    let ptr = retained_ptr as *mut F128;
+                    for output in 0..QUARTERS {
+                        ptr.add(output * quarter + row).write(row_outputs[output]);
+                    }
+                }
+            }
+        });
+
+    // SAFETY: the disjoint tiles cover each of the four retained quarters.
+    unsafe { retained.set_len(keep) };
+    retained
+}
+
 #[derive(Clone, Copy)]
 struct L2FactoredFinal5Constants {
     delta: F128,
@@ -5584,6 +5685,12 @@ fn transpose_forward_ntt_sparse_retained_with(
     while remaining >= drop_log + 3 {
         remaining -= 3;
         transpose_forward_ntt_fused_3layer(ntt, &mut data, log_d, remaining);
+    }
+    // Ranked deep L2 retains eight cosets after these two reverse layers.
+    if lean && ntt.log_domain_size() == 16 && log_d == 13 && drop_log == 3 && remaining == 5 {
+        let retained = transpose_forward_ntt_final_two_layers_xor_cosets::<8>(ntt, &data);
+        crate::scratch::give_sparse_ntt_data(data);
+        return Some(retained);
     }
     for layer in (drop_log..remaining).rev() {
         transpose_forward_ntt_single_layer_flat(ntt, &mut data, log_d, layer);
@@ -8176,6 +8283,7 @@ fn round0_basis_fusion_enabled() -> bool {
 /// (`f128_slice::round0_add_basis`), so the completed basis is not re-read;
 /// every other configuration runs the separate loops and
 /// [`super::round0_deferred`]. Both write the same `b_out` and partial.
+/// A completed GPU block also copies its witness from the message's loads.
 #[inline(always)]
 fn direct_fold8_rest_claims_round0(
     rest_claims: &[super::ring_switch::DirectFold8Factors],
@@ -8183,7 +8291,8 @@ fn direct_fold8_rest_claims_round0(
     block: usize,
     scratch: &mut Vec<F128>,
     b_out: &mut [F128],
-    f_out: &[F128],
+    f_out: &mut [F128],
+    gpu_witness: Option<&[F128]>,
 ) -> (F128, F128) {
     assert_eq!(f_out.len(), b_out.len());
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
@@ -8208,15 +8317,21 @@ fn direct_fold8_rest_claims_round0(
         );
         let tables: &[F128] = scratch;
         let eq_lo: &[F128] = &last_claim.eq_lo;
-        return crate::field::f128_slice::round0_add_basis(f_out, b_out, |slot| {
-            super::ring_switch::fold_one_slot(eq_lo[slot], tables)
-        });
+        let delta = |slot: usize| super::ring_switch::fold_one_slot(eq_lo[slot], tables);
+        use crate::field::f128_slice::round0_add_basis;
+        return match gpu_witness {
+            Some(src) => round0_add_basis(src, b_out, delta, Some(f_out)),
+            None => round0_add_basis(f_out, b_out, delta, None),
+        };
     }
     for (claim, table) in rest_claims.iter().zip(rest_tables.iter()) {
         super::ring_switch::compose_fold_byte_table_into(claim.eq_hi[block], table, scratch);
         for (slot, out) in b_out.iter_mut().enumerate() {
             *out += super::ring_switch::fold_one_slot(claim.eq_lo[slot], scratch);
         }
+    }
+    if let Some(src) = gpu_witness {
+        f_out.copy_from_slice(src);
     }
     super::round0_deferred(f_out, b_out)
 }
@@ -8440,7 +8555,7 @@ fn materialize_direct_fold8(
             };
             slot += 1;
         }
-        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
+        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out, None)
     }
         };
     }
@@ -8524,7 +8639,7 @@ fn materialize_direct_fold8(
                 slot += 4;
             }
         }
-        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
+        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out, None)
     };
     // A CPU-folded block: rebuilt rows when registered (and, under the
     // P-only knob, on a main-pool worker), else read from the buffer.
@@ -8549,15 +8664,15 @@ fn materialize_direct_fold8(
         }
         fold8_block(&mut st.0, block, b_out, f_out)
     };
-    // The same block body when `f_out` already holds the GPU's witness fold
-    // (an exact field sum, bit-identical to the banked CPU fold): only the
-    // direct basis part and the round-0 partial remain. Ranked shape only
-    // (no ordinary basis), where `fold8_block` writes b = direct parts.
+    // The GPU has already folded this witness block. Copy its immutable
+    // result into the host output while producing the round-0 partial.
+    // Ranked shape only (no ordinary basis), where b = direct parts.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     let fold8_b_only = |scratch: &mut Vec<F128>,
                         block: usize,
                         b_out: &mut [F128],
-                        f_out: &[F128]|
+                        f_out: &mut [F128],
+                        gpu_witness: &[F128]|
      -> (F128, F128) {
         debug_assert!(!has_ordinary);
         let (first_claim, rest_claims) = claims.split_first().unwrap();
@@ -8570,7 +8685,7 @@ fn materialize_direct_fold8(
         for (slot, out) in b_out.iter_mut().enumerate() {
             *out = super::ring_switch::fold_one_slot(first_claim.eq_lo[slot], scratch);
         }
-        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out)
+        direct_fold8_rest_claims_round0(rest_claims, rest_tables, block, scratch, b_out, f_out, Some(gpu_witness))
     };
 
     let mut folded_f = crate::scratch::take_f128(out_len);
@@ -8667,8 +8782,7 @@ fn materialize_direct_fold8(
                         );
                         let tb = zfold_debug_any().then(std::time::Instant::now);
                         let partial = if let (true, Some(job)) = (from_gpu, job) {
-                            f_out.copy_from_slice(job.block_out(block));
-                            fold8_b_only(&mut st.0, block, b_out, f_out)
+                            fold8_b_only(&mut st.0, block, b_out, f_out, job.block_out(block))
                         } else {
                             fold8_cpu(st, block, b_out, f_out)
                         };

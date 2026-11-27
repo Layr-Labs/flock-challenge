@@ -256,6 +256,54 @@ pub(crate) struct DeferredAb<'a> {
 unsafe impl Send for DeferredAb<'_> {}
 unsafe impl Sync for DeferredAb<'_> {}
 
+/// Optional R1 input for the exact completed witness and deferred writer.
+/// Binding borrows the Vec's contents after ownership moves into the prover.
+pub(crate) struct R1CanonicalAb<'a> {
+    deferred: &'a DeferredAb<'a>,
+    z_addr: usize,
+    published_quads: usize,
+}
+
+impl R1CanonicalAb<'_> {
+    pub(crate) fn bind<'a>(
+        &'a self,
+        z: &'a [F128],
+    ) -> Option<impl Fn(usize, *mut u8, *mut u8, bool) + Sync + 'a> {
+        const FIELDS_PER_QUAD: usize = 4 * (K / 128);
+        if z.as_ptr() as usize != self.z_addr || z.len() != self.deferred.n_quads * FIELDS_PER_QUAD {
+            return None;
+        }
+        Some(move |q: usize, a_scratch: *mut u8, b_scratch: *mut u8, primed: bool| {
+            let publish = q < self.published_quads;
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            if !a_scratch.is_null() && !b_scratch.is_null() {
+                let first = q * FIELDS_PER_QUAD;
+                let quad = z[first..first + FIELDS_PER_QUAD].try_into().expect("complete Z quad");
+                let mut slot = std::mem::MaybeUninit::uninit();
+                let input = witgen_simd::QuadInput::Seeded(witgen_simd::decode_packed_z_quad(quad, &mut slot));
+                // SAFETY: the fused R1 caller owns this quad's A/B outputs
+                // and both scratch buffers. The bound Z is a separate,
+                // completed, read-only allocation. Publication is unchanged.
+                unsafe {
+                    let (a, b) = if publish {
+                        let words = q * DeferredAb::UNIT_BYTES / 4;
+                        (self.deferred.a.add(words), self.deferred.b.add(words))
+                    } else {
+                        (core::ptr::null_mut(), core::ptr::null_mut())
+                    };
+                    if primed {
+                        witgen_simd::build_quad_split_neon_mem::<true>(input, a, b, a_scratch.cast(), b_scratch.cast());
+                    } else {
+                        witgen_simd::build_quad_split_neon_mem::<false>(input, a, b, a_scratch.cast(), b_scratch.cast());
+                    }
+                }
+                return;
+            }
+            self.deferred.fill_quad_to(q, a_scratch, b_scratch, primed, publish);
+        })
+    }
+}
+
 impl DeferredAb<'_> {
     /// Bytes of a (and of b) per quad.
     pub(crate) const UNIT_BYTES: usize = 4 * (K / 8);
@@ -2505,6 +2553,53 @@ pub(crate) mod witgen_simd {
                 )),
             )
         }
+    }
+
+    /// Recover the original word-major inputs from a complete canonical Z quad.
+    #[cfg(target_endian = "little")]
+    #[inline(always)]
+    pub(super) fn decode_packed_z_quad<'a>(
+        z: &[F128; 4 * F128_PER_BLOCK],
+        dst: &'a mut core::mem::MaybeUninit<CompressionQuadSoa>,
+    ) -> &'a CompressionQuadSoa {
+        use super::{CV_BASE, M_BASE, T_LO_BASE};
+        const { assert!(CV_BASE == 0 && M_BASE == 513 && T_LO_BASE == 1025) };
+        const { assert!(core::mem::size_of::<F128>() == 16 && core::mem::align_of::<F128>() == 16) };
+        let transpose = |rows: [V4; 4]| {
+            let (a, b, c, d) = tr4(rows[0], rows[1], rows[2], rows[3]);
+            // SAFETY: each vector is four u32 lanes in native order.
+            unsafe { core::mem::transmute::<[V4; 4], [[u32; 4]; 4]>([a, b, c, d]) }
+        };
+        let base = z.as_ptr().cast::<u32>();
+        let load = |word: usize| {
+            // SAFETY: the aligned loads cover words 0..8 and 16..40 in
+            // each block. F128 is two initialized little-endian u64 halves.
+            std::array::from_fn(|lane| unsafe {
+                vld1q_u32(base.add(lane * U32_PER_BLOCK + word))
+            })
+        };
+        let cv0 = transpose(load(0));
+        let cv1 = transpose(load(4));
+        let mut words = [[0; 4]; 20];
+        let mut raw = load(M_BASE / 32);
+        for (i, group) in words.chunks_exact_mut(4).enumerate() {
+            let next = load(M_BASE / 32 + 4 * (i + 1));
+            // The message and following words start at bit one.
+            let shifted = std::array::from_fn(|lane| unsafe {
+                let following = vextq_u32::<1>(raw[lane], next[lane]);
+                vsriq_n_u32(vshlq_n_u32::<31>(following), raw[lane], 1)
+            });
+            group.copy_from_slice(&transpose(shifted));
+            raw = next;
+        }
+        dst.write(CompressionQuadSoa {
+            cv: [cv0[0], cv0[1], cv0[2], cv0[3], cv1[0], cv1[1], cv1[2], cv1[3]],
+            message: words[..16].try_into().unwrap(),
+            counter_lo: words[16],
+            counter_hi: words[17],
+            block_len: words[18],
+            flags: words[19],
+        })
     }
 
     /// NT 32-byte store pair (a/b pass the failed.md §14 never-read test:
@@ -5741,6 +5836,25 @@ impl Blake3Setup {
                     }
                     None => None,
                 };
+                // Only the timed, seeded, memory copy-drain producer may
+                // substitute the completed Z for input generation in R1.
+                let r1_canonical_ab = deferred_ab.as_ref().and_then(|deferred| {
+                    (cfg!(all(target_arch = "aarch64", target_endian = "little"))
+                        && ab_producer.is_some()
+                        && deferred.spec_init.is_some()
+                        && deferred.gen_ilp
+                        && deferred.seed_in_place
+                        && deferred.input_mem
+                        && deferred.copy_drain
+                        && deferred.primed_scratch
+                        && r2_published_quads < deferred.n_quads
+                        && z_packed.len() == deferred.n_quads * 4 * (K / 128))
+                        .then_some(R1CanonicalAb {
+                            deferred,
+                            z_addr: z_packed.as_ptr() as usize,
+                            published_quads: r2_published_quads,
+                        })
+                });
                 // Complete rows: round two rebuilds the same chunks from the
                 // rebuild-only handle (scratch only; a null scratch would
                 // rewrite identical rows).
@@ -5887,6 +6001,7 @@ impl Blake3Setup {
                             stream,
                             identity_prefix_witness,
                             ab_producer,
+                            r1_canonical_ab,
                             challenger,
                         ),
                     };

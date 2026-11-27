@@ -32,7 +32,7 @@ use flock_core::pcs::{self, Commitment, PcsParams};
 use flock_core::proof::{R1csClaim, R1csProofLigerito, ZClaim, bind_statement};
 use flock_core::r1cs::{BlockR1cs, Round1PinnedOnePrefixStatement};
 use flock_core::zerocheck;
-use crate::r1cs_hashes::blake3::Blake3IdentityPrefixWitness;
+use crate::r1cs_hashes::blake3::{Blake3IdentityPrefixWitness, R1CanonicalAb};
 
 /// Exact rollback for C1. A cleared ranked-worker environment selects the
 /// structurally guarded omission; literal `1` retains the complete AB
@@ -616,6 +616,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
     stream: flock_core::gpu_commit::FromZFirstPassStream,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
     ab_producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
+    r1_canonical_ab: Option<R1CanonicalAb<'_>>,
     challenger: &mut Ch,
 ) -> (R1csProofLigerito, Commitment, R1csClaim) {
     prove_fast_ligerito_from_witness_with_commit_codeword(
@@ -624,7 +625,7 @@ pub(crate) fn prove_fast_ligerito_from_streamed_first_pass_deferred_stripe<Ch: C
         z_packed,
         a_packed_f128,
         b_packed_f128,
-        LincheckStripeInput::DeferredRanked,
+        LincheckStripeInput::DeferredRanked(r1_canonical_ab),
         lincheck_circuit,
         CommitCodeword::StreamedFirstPass(codeword, stream),
         identity_prefix_witness,
@@ -640,7 +641,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: LincheckStripeInput,
+    z_packed_lincheck: LincheckStripeInput<'_>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
@@ -824,9 +825,9 @@ enum CommitCodeword {
 /// Lincheck stripe ownership at the commit boundary. `DeferredRanked` is
 /// constructed only by the exact BLAKE3 streamed-GPU selector; all generic
 /// and fallback paths carry the already-materialized byte stripe.
-enum LincheckStripeInput {
+enum LincheckStripeInput<'a> {
     Ready(Vec<u8>),
-    DeferredRanked,
+    DeferredRanked(Option<R1CanonicalAb<'a>>),
 }
 
 const DEFERRED_STRIPE_GROUPS_PER_JOB: usize = 16;
@@ -3148,7 +3149,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     z_packed: Vec<F128>,
     a_packed_f128: Vec<F128>,
     b_packed_f128: Vec<F128>,
-    z_packed_lincheck: LincheckStripeInput,
+    z_packed_lincheck: LincheckStripeInput<'_>,
     lincheck_circuit: &dyn lincheck::LincheckCircuit,
     commit_codeword: CommitCodeword,
     identity_prefix_witness: Option<Blake3IdentityPrefixWitness>,
@@ -3222,7 +3223,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             );
             (run_commit(hook, None, ab_producer, None), stripe)
         }
-        LincheckStripeInput::DeferredRanked => {
+        LincheckStripeInput::DeferredRanked(r1_canonical_ab) => {
             assert_eq!(r1cs.m, 32);
             assert_eq!(r1cs.k_log, 14);
             assert_eq!(r1cs.useful_bits, 15_409);
@@ -3328,6 +3329,14 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 && std::env::var_os("FLOCK_NO_STRIPE_IN_AB").is_none();
             let pre = if stripe_in_ab {
                 let base = ab_producer.expect("checked above");
+                let from_z = r1_canonical_ab.as_ref().and_then(|producer| producer.bind(&z_packed));
+                let fill: &(dyn Fn(usize, *mut u8, *mut u8, bool) + Sync) = match &from_z {
+                    Some(producer) => producer,
+                    None => base.produce,
+                };
+                if phase_timing {
+                    eprintln!("[phase-timing] r1 A/B input: canonical-z={}", from_z.is_some());
+                }
                 let emitter = AbStripeEmitter::new(
                     flock_core::epool::SyncPtr(stripe_ptr as *mut u8),
                     stripe_len,
@@ -3341,7 +3350,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 // place.  Either way the pair holds the unit's complete a and
                 // b blocks when `emit` reads it.
                 let produce = |unit: usize, a: *mut u8, b: *mut u8, primed: bool| {
-                    (base.produce)(unit, a, b, primed);
+                    fill(unit, a, b, primed);
                     emitter.emit(unit, a, b);
                 };
                 let finish = || {
