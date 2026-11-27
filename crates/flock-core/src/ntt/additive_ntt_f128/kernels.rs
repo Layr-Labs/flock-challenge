@@ -521,6 +521,29 @@ pub(super) unsafe fn butterfly_fused_3layer_zero_root_from_src_rows(
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+pub(super) fn early_l1_head_available() -> bool {
+    vector_resident_rows() && aarch64::early_l1_const_ext_available()
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "aes"))]
+pub(super) unsafe fn butterfly_fused_3layer_early_l1_from_src_rows(
+    src: *const F128,
+    dst: *mut F128,
+    eighth: usize,
+    num_ntts: usize,
+    row_start: usize,
+    row_end: usize,
+    twiddles: &[F128; 7],
+    complete: u8,
+) {
+    unsafe {
+        aarch64::butterfly_fused_3layer_early_l1_from_src_rows(
+            src, dst, eighth, num_ntts, row_start, row_end, twiddles, complete,
+        );
+    }
+}
+
 /// Root-block specialization of [`butterfly_fused_3layer_row`].
 ///
 /// # Safety
