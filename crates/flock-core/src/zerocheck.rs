@@ -75,7 +75,7 @@ fn lookahead_off() -> bool {
     if ZC_LOOKAHEAD_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some()
+    crate::hot_env_once!(bool, std::env::var_os("FLOCK_NO_ZC_LOOKAHEAD").is_some())
 }
 
 /// Test-only forced-off latch for the second-level cascade (rounds 5+6),
@@ -96,7 +96,7 @@ fn cascade2_off() -> bool {
     if ZC_CASCADE2_FORCED_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1")
+    crate::hot_env_once!(bool, std::env::var_os("FLOCK_NO_ZC_CASCADE2").is_some_and(|v| v == *"1"))
 }
 
 /// Test-only forced-off latch for the third-level cascade (rounds 7+8),
@@ -173,6 +173,172 @@ fn cascade5_off() -> bool {
     }
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FLOCK_NO_ZC_CASCADE5").is_some_and(|v| v == *"1"))
+}
+
+pub const ENV_NO_ZC_TAIL_NEON: &str = "FLOCK_NO_ZC_TAIL_NEON";
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline]
+fn zc_tail_neon_enabled() -> bool {
+    crate::hot_env_once!(bool, std::env::var_os(ENV_NO_ZC_TAIL_NEON).as_deref() != Some(std::ffi::OsStr::new("1")))
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline]
+fn eq_drop_first_in_place(eq: &mut Vec<F128>) {
+    use core::arch::aarch64::{veorq_u64, vld1q_u64, vst1q_u64};
+    let half = eq.len() / 2;
+    let p = eq.as_mut_ptr().cast::<u64>();
+    // SAFETY: `2 * half <= eq.len()`, `p.add(2*j)` never overwrites unread `p.add(4*j..)`.
+    unsafe {
+        for j in 0..half {
+            let e0 = vld1q_u64(p.add(4 * j));
+            let e1 = vld1q_u64(p.add(4 * j + 2));
+            vst1q_u64(p.add(2 * j), veorq_u64(e0, e1));
+        }
+    }
+    eq.truncate(half);
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+#[inline(never)]
+fn fold_in_place_and_round_pair_with_eq_neon(
+    a: &mut Vec<F128>,
+    b: &mut Vec<F128>,
+    challenge: F128,
+    r_0: F128,
+    eq_remaining: &[F128],
+) -> (F128, F128) {
+    use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64, vextq_u64, vld1q_u64, vst1q_u64, vzip1q_u64};
+    use crate::field::gf2_128::aarch64::{const_prep, mul_const_prep_xor};
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert!(n.is_power_of_two() && n >= 4);
+    let quarter = n / 4;
+    assert_eq!(eq_remaining.len(), quarter);
+
+    #[inline(always)]
+    unsafe fn mul_q(x: uint64x2_t, y: uint64x2_t, k87: uint64x2_t) -> uint64x2_t {
+        unsafe {
+            let (ll, hh, p01, p10): (uint64x2_t, uint64x2_t, uint64x2_t, uint64x2_t);
+            let y_sw = vextq_u64::<1>(y, y);
+            core::arch::asm!(
+                "pmull {ll:v}.1q, {a:v}.1d, {b:v}.1d",
+                "pmull2 {hh:v}.1q, {a:v}.2d, {b:v}.2d",
+                "pmull {p01:v}.1q, {a:v}.1d, {bsw:v}.1d",
+                "pmull2 {p10:v}.1q, {a:v}.2d, {bsw:v}.2d",
+                a = in(vreg) x, b = in(vreg) y, bsw = in(vreg) y_sw,
+                ll = out(vreg) ll, hh = out(vreg) hh, p01 = out(vreg) p01, p10 = out(vreg) p10,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            let s1 = veorq_u64(vextq_u64::<1>(ll, hh), veorq_u64(p01, p10));
+            let t1: uint64x2_t;
+            core::arch::asm!(
+                "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+                "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+                m = in(vreg) hh, c = in(vreg) k87, s = in(vreg) s1, o = out(vreg) t1,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            let out: uint64x2_t;
+            core::arch::asm!(
+                "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+                "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+                m = in(vreg) t1, c = in(vreg) k87, s = in(vreg) vzip1q_u64(ll, t1), o = out(vreg) out,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            out
+        }
+    }
+    #[inline(always)]
+    unsafe fn tri_acc(ll: &mut uint64x2_t, cr: &mut uint64x2_t, hh: &mut uint64x2_t, x: uint64x2_t, y: uint64x2_t) {
+        unsafe {
+            let y_sw = vextq_u64::<1>(y, y);
+            let (mut l, mut c, mut h) = (*ll, *cr, *hh);
+            core::arch::asm!(
+                "pmull {t:v}.1q, {a:v}.1d, {b:v}.1d",
+                "eor {l:v}.16b, {l:v}.16b, {t:v}.16b",
+                "pmull2 {t:v}.1q, {a:v}.2d, {b:v}.2d",
+                "eor {h:v}.16b, {h:v}.16b, {t:v}.16b",
+                "pmull {t:v}.1q, {a:v}.1d, {bsw:v}.1d",
+                "eor {c:v}.16b, {c:v}.16b, {t:v}.16b",
+                "pmull2 {t:v}.1q, {a:v}.2d, {bsw:v}.2d",
+                "eor {c:v}.16b, {c:v}.16b, {t:v}.16b",
+                a = in(vreg) x, b = in(vreg) y, bsw = in(vreg) y_sw,
+                t = out(vreg) _, l = inout(vreg) l, h = inout(vreg) h, c = inout(vreg) c,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            (*ll, *cr, *hh) = (l, c, h);
+        }
+    }
+    #[inline(always)]
+    unsafe fn red_tri(ll: uint64x2_t, cr: uint64x2_t, hh: uint64x2_t, k87: uint64x2_t) -> F128 {
+        unsafe {
+            let s1 = veorq_u64(vextq_u64::<1>(ll, hh), cr);
+            let t1: uint64x2_t;
+            core::arch::asm!(
+                "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+                "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+                m = in(vreg) hh, c = in(vreg) k87, s = in(vreg) s1, o = out(vreg) t1,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            let out: uint64x2_t;
+            core::arch::asm!(
+                "pmull2 {o:v}.1q, {m:v}.2d, {c:v}.2d",
+                "eor {o:v}.16b, {o:v}.16b, {s:v}.16b",
+                m = in(vreg) t1, c = in(vreg) k87, s = in(vreg) vzip1q_u64(ll, t1), o = out(vreg) out,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            core::mem::transmute::<uint64x2_t, F128>(out)
+        }
+    }
+    // SAFETY: AES and little-endian F128 layout hold by cfg; lengths checked above.
+    let (g1, gi) = unsafe {
+        let zero = vdupq_n_u64(0);
+        let k87 = vdupq_n_u64(0x87);
+        let chal_p = const_prep(core::mem::transmute::<F128, uint64x2_t>(challenge));
+        let (mut g1l0, mut g1c0, mut g1h0) = (zero, zero, zero);
+        let (mut g1l1, mut g1c1, mut g1h1) = (zero, zero, zero);
+        let (mut gil0, mut gic0, mut gih0) = (zero, zero, zero);
+        let (mut gil1, mut gic1, mut gih1) = (zero, zero, zero);
+        let ap = a.as_mut_ptr().cast::<u64>();
+        let bp = b.as_mut_ptr().cast::<u64>();
+        let ep = eq_remaining.as_ptr().cast::<u64>();
+        macro_rules! step {
+            ($x:expr, $gl:ident, $gc:ident, $gh:ident, $il:ident, $ic:ident, $ih:ident) => {{
+                let ia = ap.add(8 * ($x));
+                let ib = bp.add(8 * ($x));
+                let (ae0, ao0, ae1, ao1) = (vld1q_u64(ia), vld1q_u64(ia.add(2)), vld1q_u64(ia.add(4)), vld1q_u64(ia.add(6)));
+                let (be0, bo0, be1, bo1) = (vld1q_u64(ib), vld1q_u64(ib.add(2)), vld1q_u64(ib.add(4)), vld1q_u64(ib.add(6)));
+                let a0 = mul_const_prep_xor(chal_p, veorq_u64(ae0, ao0), ae0);
+                let a1 = mul_const_prep_xor(chal_p, veorq_u64(ae1, ao1), ae1);
+                let b0 = mul_const_prep_xor(chal_p, veorq_u64(be0, bo0), be0);
+                let b1 = mul_const_prep_xor(chal_p, veorq_u64(be1, bo1), be1);
+                let (oa, ob) = (ap.add(4 * ($x)), bp.add(4 * ($x)));
+                vst1q_u64(oa, a0); vst1q_u64(oa.add(2), a1);
+                vst1q_u64(ob, b0); vst1q_u64(ob.add(2), b1);
+                let ex = vld1q_u64(ep.add(2 * ($x)));
+                tri_acc(&mut $gl, &mut $gc, &mut $gh, ex, mul_q(a1, b1, k87));
+                tri_acc(&mut $il, &mut $ic, &mut $ih, ex, mul_q(veorq_u64(a0, a1), veorq_u64(b0, b1), k87));
+            }};
+        }
+        let mut xp = 0usize;
+        while xp + 2 <= quarter {
+            step!(xp, g1l0, g1c0, g1h0, gil0, gic0, gih0);
+            step!(xp + 1, g1l1, g1c1, g1h1, gil1, gic1, gih1);
+            xp += 2;
+        }
+        while xp < quarter {
+            step!(xp, g1l0, g1c0, g1h0, gil0, gic0, gih0);
+            xp += 1;
+        }
+        (
+            red_tri(veorq_u64(g1l0, g1l1), veorq_u64(g1c0, g1c1), veorq_u64(g1h0, g1h1), k87),
+            red_tri(veorq_u64(gil0, gil1), veorq_u64(gic0, gic1), veorq_u64(gih0, gih1), k87),
+        )
+    };
+    a.truncate(2 * quarter);
+    b.truncate(2 * quarter);
+    (if r_0 == F128::ONE { g1 } else { r_0 * g1 }, gi)
 }
 
 /// Number of variables folded in round 1 via the additive-NTT univariate skip.
@@ -504,7 +670,7 @@ pub fn stage_commit_tail_fill<C: Challenger>(
             padding.useful_bits_per_block,
             &r,
         );
-        if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+        if crate::zc_timing_env_on() {
             eprintln!(
                 "[commit-tail-fill] stage at graph completion: staged={staged} {:.2} ms",
                 t_stage.elapsed().as_secs_f64() * 1e3
@@ -591,7 +757,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // C_s factor analysis in `univariate_skip_optimized`). The wire format
     // must be in "naive" convention so the verifier doesn't need to know
     // about this internal optimization; we restore the C_s factor here.
-    let zc_timing = std::env::var_os("FLOCK_ZC_TIMING").is_some();
+    let zc_timing = crate::zc_timing_env_on();
     let cpu_r1 = crate::pcs::commit::commit_cpu_ms();
     let t_round1 = std::time::Instant::now();
     debug_assert_eq!(k_skip, 6, "ranked protocol fixes k_skip=6");
@@ -970,7 +1136,7 @@ fn prove_packed_padded_inner<C: Challenger>(
     // table removes the two field multiplications per output that the generic
     // pair fold would require, while materializing exactly the ordinary
     // post-fold tables expected by all subsequent rounds.
-    let tail_round_timing = std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some();
+    let tail_round_timing = crate::hot_env_once!(bool, std::env::var_os("FLOCK_ZC_TAIL_ROUND_TIMING").is_some());
 
     // Cascade the lookahead one level deeper (rounds 5+6, see
     // `fold2_compact_and_round45_into`): the K pass materializes each round-4
@@ -1580,7 +1746,7 @@ fn prove_packed_padded_inner<C: Challenger>(
 
     // H2 engagement evidence: E-core chunks claimed across the loop rounds
     // (T3's hetero drain is already behind us, so the delta is loop-only).
-    let hetero_trace = std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some();
+    let hetero_trace = crate::hot_env_once!(bool, std::env::var_os("FLOCK_ZC_TAIL_HETERO_TRACE").is_some());
     let hetero_claimed_before = crate::epool::helper_chunks_claimed();
     // The serial rounds' equality tables: each round's suffix is the previous
     // round's minus its first challenge, so after the first serial round the
@@ -1593,13 +1759,12 @@ fn prove_packed_padded_inner<C: Challenger>(
         let rho_prev = mlv_rhos[i];
         let log_n_before = a_mlv.len().trailing_zeros() as usize;
 
-        // r_next for the next round's message: length log_n_before - 1.
-        // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
-        // weights for the remaining variables = r[k_skip + i + 2..m].
-        let mut r_next = vec![F128::ONE; log_n_before - 1];
-        r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
-
         let (m1, mi) = if log_n_before >= 15 {
+            // r_next for the next round's message: length log_n_before - 1.
+            // r_next[0] = ONE (Convention A factor); r_next[1..] are the eq
+            // weights for the remaining variables = r[k_skip + i + 2..m].
+            let mut r_next = vec![F128::ONE; log_n_before - 1];
+            r_next[1..].copy_from_slice(&r[k_skip + i + 2..]);
             let half = a_mlv.len() / 2;
             let (m1, mi) = fold_and_compute_round_pair_into(
                 &a_mlv,
@@ -1620,22 +1785,56 @@ fn prove_packed_padded_inner<C: Challenger>(
             (m1, mi)
         } else {
             let want = a_mlv.len() / 4;
-            tail_eq = if tail_eq_reuse && tail_eq.len() == 2 * want {
-                eq_drop_first(&tail_eq)
+            #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+            let tail_neon = zc_tail_neon_enabled();
+            #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+            let tail_neon = false;
+            if tail_eq_reuse && tail_eq.len() == 2 * want {
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+                if tail_neon {
+                    eq_drop_first_in_place(&mut tail_eq);
+                } else {
+                    tail_eq = eq_drop_first(&tail_eq);
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+                {
+                    tail_eq = eq_drop_first(&tail_eq);
+                }
             } else {
-                univariate_skip::build_eq(&r_next[1..])
-            };
+                tail_eq = univariate_skip::build_eq(&r[k_skip + i + 2..]);
+            }
             if zc_tail_fused_fold_enabled() {
-                fold_in_place_and_round_pair_with_eq(
-                    &mut a_mlv,
-                    &mut b_mlv,
-                    rho_prev,
-                    r_next[0],
-                    &tail_eq,
-                )
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little"))]
+                if tail_neon {
+                    fold_in_place_and_round_pair_with_eq_neon(
+                        &mut a_mlv,
+                        &mut b_mlv,
+                        rho_prev,
+                        F128::ONE,
+                        &tail_eq,
+                    )
+                } else {
+                    fold_in_place_and_round_pair_with_eq(
+                        &mut a_mlv,
+                        &mut b_mlv,
+                        rho_prev,
+                        F128::ONE,
+                        &tail_eq,
+                    )
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_feature = "aes", target_endian = "little")))]
+                {
+                    fold_in_place_and_round_pair_with_eq(
+                        &mut a_mlv,
+                        &mut b_mlv,
+                        rho_prev,
+                        F128::ONE,
+                        &tail_eq,
+                    )
+                }
             } else {
                 fold_in_place_pair(&mut a_mlv, &mut b_mlv, rho_prev);
-                round_pair_naive_with_eq(&a_mlv, &b_mlv, r_next[0], &tail_eq)
+                round_pair_naive_with_eq(&a_mlv, &b_mlv, F128::ONE, &tail_eq)
             }
         };
 

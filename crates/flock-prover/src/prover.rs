@@ -145,9 +145,12 @@ fn ranked_identity_prefix_omission_contract(
     b: &[F128],
 ) -> Option<Round1PinnedOnePrefixStatement> {
     let witness = witness?;
+    let identity_prefix_killed = flock_core::hot_env_once!(
+        bool,
+        std::env::var_os(ENV_NO_ZC_AB_IDENTITY_PREFIX_OMIT).as_deref() == Some(std::ffi::OsStr::new("1"))
+    );
     if !ranked_lincheck_c_reuse_enabled(r1cs)
-        || std::env::var_os(ENV_NO_ZC_AB_IDENTITY_PREFIX_OMIT).as_deref()
-            == Some(std::ffi::OsStr::new("1"))
+        || identity_prefix_killed
         || !witness.matches(z, a, b)
         || z.len() != 1usize << (r1cs.m - 7)
     {
@@ -156,8 +159,11 @@ fn ranked_identity_prefix_omission_contract(
     // The gate above already holds `r1cs.c0_is_identity()`; the statement
     // checks reuse it instead of rescanning C (`FLOCK_NO_PINNED_STMT_CACHED_ID`).
     let cached = pinned_stmt_cached_identity_enabled();
-    if std::env::var_os(ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT).as_deref()
-        != Some(std::ffi::OsStr::new("1"))
+    let output_window_enabled = flock_core::hot_env_once!(
+        bool,
+        std::env::var_os(ENV_NO_ZC_AB_OUTPUT_WINDOW_OMIT).as_deref() != Some(std::ffi::OsStr::new("1"))
+    );
+    if output_window_enabled
         && let Some(statement) = if cached {
             r1cs.round1_pinned_one_prefix_and_output_statement_cached_identity()
         } else {
@@ -693,7 +699,7 @@ fn prove_fast_ligerito_from_witness_with_commit_codeword<Ch: Challenger>(
             }
             _ => false,
         };
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = flock_core::phase_timing_env_on();
     flock_core::tmark::mark("open start");
     let cpu_open0 = phase_timing.then(process_cpu_ms);
     let t_open = std::time::Instant::now();
@@ -2864,7 +2870,7 @@ where
             // The stripe fill lost the race to the graph; staging would
             // read torn bytes. Skip — the incumbent zerocheck-entry
             // submit runs.
-            if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
+            if flock_core::zc_timing_env_on() {
                 eprintln!("[commit-tail-fill] skipped: stripe not ready");
             }
             return;
@@ -3046,7 +3052,7 @@ fn commit_with_round1_ab_precompute(
             flock_core::tmark::mark("ab arm end");
             flock_core::gpu_commit::note_ab_arm_running(false);
             flock_core::gpu_commit::note_precompute_branch_wall_ms(wall_ms);
-            if std::env::var_os("FLOCK_PHASE_TIMING").is_some() {
+            if flock_core::phase_timing_env_on() {
                 eprintln!("[phase-timing] ab-precompute branch wall: {wall_ms:.2} ms");
             }
             r
@@ -3057,7 +3063,7 @@ fn commit_with_round1_ab_precompute(
     // The reserved workers join the spin from here (`FLOCK_NO_RESV_HOT`).
     flock_core::cpu_keepalive::pool_spin_commit_done();
     if run_ranked_exact_tune {
-        if std::env::var_os("FLOCK_NO_TUNE_REPLAY_BACKING").is_none() {
+        if flock_core::hot_env_once!(bool, std::env::var_os("FLOCK_NO_TUNE_REPLAY_BACKING").is_none()) {
             *replay_backing.lock().unwrap() = Some(
                 zerocheck::univariate_skip_optimized::ExactTuneBacking::zeroed(pcs_params.m),
             );
@@ -3160,7 +3166,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
-    let phase_timing = std::env::var_os("FLOCK_PHASE_TIMING").is_some();
+    let phase_timing = flock_core::phase_timing_env_on();
     let run_commit = |tail_fill: Option<CommitTailFillHook<'_>>,
                       stripe_help: Option<&(dyn Fn() + Sync)>,
                       producer: Option<zerocheck::univariate_skip_optimized::Round1AbProducer<'_>>,
@@ -3263,10 +3269,13 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             // 1..=4 override stays for controlled same-binary diagnostics
             // (E3 = the prior shipped behavior).
             const DEFER_STRIPE_EPOOL_THREADS_DEFAULT: usize = 4;
-            let epool_workers = std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
-                .and_then(|value| value.to_str()?.parse::<usize>().ok())
-                .filter(|workers| (1..=4).contains(workers))
-                .unwrap_or(DEFER_STRIPE_EPOOL_THREADS_DEFAULT);
+            let epool_workers = flock_core::hot_env_once!(
+                usize,
+                std::env::var_os("FLOCK_DEFER_STRIPE_EPOOL_THREADS")
+                    .and_then(|value| value.to_str()?.parse::<usize>().ok())
+                    .filter(|workers| (1..=4).contains(workers))
+                    .unwrap_or(DEFER_STRIPE_EPOOL_THREADS_DEFAULT)
+            );
             // Commit-tail fill (`FLOCK_NO_COMMIT_TAIL_FILL=1` kills): the
             // hook stages only after acquiring `stripe_ready`, whose paired
             // release follows the last stripe write by any thread (see
@@ -3325,7 +3334,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             let stripe_in_ab = root_rows.is_some()
                 && ab_producer.is_some()
                 && zerocheck::univariate_skip_optimized::zc_ab_producer_fused_active()
-                && std::env::var_os("FLOCK_NO_STRIPE_IN_AB").is_none();
+                && flock_core::hot_env_once!(bool, std::env::var_os("FLOCK_NO_STRIPE_IN_AB").is_none());
             let pre = if stripe_in_ab {
                 let base = ab_producer.expect("checked above");
                 let emitter = AbStripeEmitter::new(
@@ -3475,7 +3484,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     // short serial steps. Zerocheck's long bandwidth-bound kernels measured
     // neutral-to-worse with it, so it stays off there unless
     // `FLOCK_EPOOL_LINGER_ZC=1`.
-    if std::env::var("FLOCK_EPOOL_LINGER_ZC").is_ok_and(|v| v == "1") {
+    if flock_core::hot_env_once!(bool, std::env::var("FLOCK_EPOOL_LINGER_ZC").is_ok_and(|v| v == "1")) {
         flock_core::epool::set_linger_phase(true);
     }
     let cpu_zc0 = phase_timing.then(process_cpu_ms);
