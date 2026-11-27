@@ -4084,51 +4084,92 @@ fn fold2_compact_and_round45_into_packed_b(
     };
     crate::epool::run_hetero_chunks(hi_size - cpu_base, |i| chunk_body(cpu_base + i));
 
-    // Join the GPU prefix (it was submitted first and is normally done).
+    // Join the GPU prefix (with late-GPU work stealing on timed v2 launches).
     #[allow(unused_mut)]
     let mut gpu_prefix: Option<KGpuPrefix> = None;
     #[cfg(all(target_os = "macos", target_arch = "aarch64", target_feature = "sha3"))]
     if let Some(job) = gpu_job {
-        let calibration = job.calibration();
-        let chunks = job.chunks();
-        match crate::gpu_commit::zc_k_wait(job, hi_size) {
-            crate::gpu_commit::ZcKResult::Prefix { parts, a, b, len_a, len_b, b_ones } => {
-                if !b_ones {
-                    // A b output of the GPU's chunks that the pack skips is
-                    // not one: the pass reruns without the b-one pack, as
-                    // for the CPU's chunks.
-                    b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                } else if calibration {
-                    // Oracle probe: the CPU folded every chunk; the GPU's
-                    // outputs and weighted sums must equal the CPU's.
-                    if !b_failed.load(std::sync::atomic::Ordering::Relaxed) {
-                        // SAFETY: the joined job's buffers hold `len_a` / `len_b` entries.
-                        let (ga, gb) = unsafe {
-                            (std::slice::from_raw_parts(a, len_a), std::slice::from_raw_parts(b, len_b))
-                        };
-                        let equal = len_a <= a_out.len()
-                            && len_b <= b_out.len()
-                            && ga == &a_out[..len_a]
-                            && gb == &b_out[..len_b]
-                            && parts.as_slice() == &partials[..chunks];
-                        crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
-                        // With the 5+6 GPU arm on, an admitted probe hands its
-                        // buffers (byte-equal to the CPU's outputs above) to
-                        // the 5+6 pass, so that arm's own first launch, its
-                        // oracle, chains on them in this prove too.
-                        if equal && crate::gpu_commit::gpu_zc_t56_enabled() {
-                            gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
+        if job.steal_enabled() {
+            let mut lo = cpu_base;
+            let mut gpu_done = job.done();
+            if !gpu_done {
+                let claims = std::sync::Mutex::new((cpu_base, false));
+                crate::epool::run_hetero_chunks(cpu_base, |_| {
+                    let x_hi = {
+                        let mut g = claims.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.1 || g.0 == 0 {
+                            return;
                         }
+                        if job.done() {
+                            g.1 = true;
+                            return;
+                        }
+                        job.set_cut(g.0 - 1);
+                        g.0 -= 1;
+                        g.0
+                    };
+                    chunk_body(x_hi);
+                });
+                (lo, gpu_done) = claims.into_inner().unwrap_or_else(|e| e.into_inner());
+                assert!(gpu_done || lo == 0, "zc-k steal ended early");
+            }
+            match crate::gpu_commit::zc_k_wait_stolen(job, lo, gpu_done, hi_size) {
+                crate::gpu_commit::ZcKResult::Prefix { parts, a, b, len_a, len_b, b_ones } => {
+                    if !b_ones {
+                        b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else if !parts.is_empty() {
+                        partials[..parts.len()].copy_from_slice(&parts);
+                        gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
                     }
-                } else {
-                    partials[..chunks].copy_from_slice(&parts);
-                    gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
+                }
+                crate::gpu_commit::ZcKResult::Failed => {
+                    if lo > 0 {
+                        crate::epool::run_hetero_chunks(lo, &chunk_body);
+                    }
                 }
             }
-            crate::gpu_commit::ZcKResult::Failed => {
-                // The GPU failed after admission: the CPU folds the prefix
-                // chunks with the same kernel (the arm is now disabled).
-                crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
+        } else {
+            let calibration = job.calibration();
+            let chunks = job.chunks();
+            match crate::gpu_commit::zc_k_wait(job, hi_size) {
+                crate::gpu_commit::ZcKResult::Prefix { parts, a, b, len_a, len_b, b_ones } => {
+                    if !b_ones {
+                        // A b output of the GPU's chunks that the pack skips is
+                        // not one: the pass reruns without the b-one pack, as
+                        // for the CPU's chunks.
+                        b_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else if calibration {
+                        // Oracle probe: the CPU folded every chunk; the GPU's
+                        // outputs and weighted sums must equal the CPU's.
+                        if !b_failed.load(std::sync::atomic::Ordering::Relaxed) {
+                            // SAFETY: the joined job's buffers hold `len_a` / `len_b` entries.
+                            let (ga, gb) = unsafe {
+                                (std::slice::from_raw_parts(a, len_a), std::slice::from_raw_parts(b, len_b))
+                            };
+                            let equal = len_a <= a_out.len()
+                                && len_b <= b_out.len()
+                                && ga == &a_out[..len_a]
+                                && gb == &b_out[..len_b]
+                                && parts.as_slice() == &partials[..chunks];
+                            crate::gpu_commit::zc_k_verdict(equal, chunks, hi_size);
+                            // With the 5+6 GPU arm on, an admitted probe hands its
+                            // buffers (byte-equal to the CPU's outputs above) to
+                            // the 5+6 pass, so that arm's own first launch, its
+                            // oracle, chains on them in this prove too.
+                            if equal && crate::gpu_commit::gpu_zc_t56_enabled() {
+                                gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
+                            }
+                        }
+                    } else {
+                        partials[..chunks].copy_from_slice(&parts);
+                        gpu_prefix = Some(KGpuPrefix { a, b, len_a, len_b });
+                    }
+                }
+                crate::gpu_commit::ZcKResult::Failed => {
+                    // The GPU failed after admission: the CPU folds the prefix
+                    // chunks with the same kernel (the arm is now disabled).
+                    crate::epool::run_hetero_chunks(cpu_base, &chunk_body);
+                }
             }
         }
     }

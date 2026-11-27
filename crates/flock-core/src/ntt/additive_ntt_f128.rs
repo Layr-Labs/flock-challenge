@@ -3372,8 +3372,15 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
     };
     // Empty ranges do not read or initialize the process row policy.
     let use_neon = n_jobs != 0 && kernels::vector_resident_rows();
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let tw_prep = (use_neon && kernels::use_prepared_3layer_absorb()).then(|| unsafe {
+        twiddles
+            .iter()
+            .map(|t| kernels::prepare_3layer(t))
+            .collect::<Vec<_>>()
+    });
     let base = data.as_mut_ptr() as usize;
-    let job = move |job: usize| {
+    let job = |job: usize| {
         let block = job >> block_shift;
         let r = job & row_mask;
         let lanes = if r & 1 == 1 {
@@ -3396,6 +3403,18 @@ fn butterfly_interleaved_fused_3layer_range_par_rows(
                     use_neon,
                 )
             } else {
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                if let Some(ref prep) = tw_prep {
+                    kernels::butterfly_fused_3layer_row_with_const_q::<true>(
+                        block_base,
+                        eighth,
+                        num_ntts,
+                        lanes,
+                        r,
+                        &prep[block],
+                    );
+                    return;
+                }
                 kernels::butterfly_fused_3layer_row_with_policy(
                     block_base,
                     eighth,
@@ -3442,6 +3461,14 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
     let base = data.as_mut_ptr() as usize;
     let eighth_log = eighth.trailing_zeros() as usize;
     let eighth_mask = eighth - 1;
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    let tw_prep = (kernels::vector_resident_rows() && kernels::use_prepared_3layer_absorb())
+        .then(|| unsafe {
+            twiddles
+                .iter()
+                .map(|t| kernels::prepare_3layer(t))
+                .collect::<Vec<_>>()
+        });
     (0..num_blocks * eighth).into_par_iter().for_each(|job| {
         let block = job >> eighth_log;
         let row = job & eighth_mask;
@@ -3460,6 +3487,18 @@ fn butterfly_interleaved_fused_3layer_all_blocks_par_rows(
                     &twiddles[block],
                 )
             } else {
+                #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+                if let Some(ref prep) = tw_prep {
+                    kernels::butterfly_fused_3layer_row_with_const_q::<true>(
+                        block_base,
+                        eighth,
+                        num_ntts,
+                        num_ntts,
+                        row,
+                        &prep[block],
+                    );
+                    return;
+                }
                 kernels::butterfly_fused_3layer_row(
                     block_base,
                     eighth,

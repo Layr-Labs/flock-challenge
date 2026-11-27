@@ -472,6 +472,22 @@ pub fn stage_commit_tail_fill<C: Challenger>(
     c_lincheck: &[u8],
     padding: &PaddingSpec,
 ) {
+    stage_commit_tail_fill_capped(forked, r1cs, commitment, c_lincheck, padding, None);
+}
+
+/// [`stage_commit_tail_fill`] with an optional contiguous ready-stripe prefix
+/// bound `max_stripes`. When `Some(ready)` is passed, the caller guarantees
+/// that the first `ready` stripes of `c_lincheck` are fully written (release/
+/// acquire) and immutable for the rest of the prove (or abandoned before any
+/// fallback overwrite).
+pub fn stage_commit_tail_fill_capped<C: Challenger>(
+    forked: C,
+    r1cs: &crate::r1cs::BlockR1cs,
+    commitment: &crate::pcs::Commitment,
+    c_lincheck: &[u8],
+    padding: &PaddingSpec,
+    max_stripes: Option<usize>,
+) {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         let mut forked = forked;
@@ -497,23 +513,24 @@ pub fn stage_commit_tail_fill<C: Challenger>(
             r[k_skip + 3 + i] = *val;
         }
         r[k_skip + N_INNER..].copy_from_slice(&r_outer);
-        let staged = univariate_skip_optimized::stage_c_prelude_for_tail_fill(
+        let staged = univariate_skip_optimized::stage_c_prelude_for_tail_fill_capped(
             c_lincheck,
             m,
             padding.k_log,
             padding.useful_bits_per_block,
             &r,
+            max_stripes,
         );
         if std::env::var_os("FLOCK_ZC_TIMING").is_some() {
             eprintln!(
-                "[commit-tail-fill] stage at graph completion: staged={staged} {:.2} ms",
+                "[commit-tail-fill] stage at graph completion: staged={staged} cap={max_stripes:?} {:.2} ms",
                 t_stage.elapsed().as_secs_f64() * 1e3
             );
         }
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
-        let _ = (forked, r1cs, commitment, c_lincheck, padding);
+        let _ = (forked, r1cs, commitment, c_lincheck, padding, max_stripes);
     }
 }
 

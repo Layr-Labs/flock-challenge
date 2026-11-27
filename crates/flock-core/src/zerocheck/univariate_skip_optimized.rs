@@ -4720,6 +4720,7 @@ impl Round1CPrelude {
 /// GPU prefix now — at commit-graph completion, from a forked challenger's
 /// challenge vector — and park it in the fold state for adoption by
 /// [`round1_c_prelude`] at zerocheck entry. No-op off the ranked arm shape.
+#[allow(dead_code)]
 pub(crate) fn stage_c_prelude_for_tail_fill(
     c_lincheck: &[u8],
     m: usize,
@@ -4727,17 +4728,35 @@ pub(crate) fn stage_c_prelude_for_tail_fill(
     useful_bits: usize,
     r: &[F128],
 ) -> bool {
+    stage_c_prelude_for_tail_fill_capped(c_lincheck, m, k_log, useful_bits, r, None)
+}
+
+pub(crate) fn stage_c_prelude_for_tail_fill_capped(
+    c_lincheck: &[u8],
+    m: usize,
+    k_log: usize,
+    useful_bits: usize,
+    r: &[F128],
+    max_stripes: Option<usize>,
+) -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         if !ranked_c_fold_shape(m, k_log) {
             return false;
         }
         let (useful_bits, _) = crate::lincheck::stripe_fold_useful(c_lincheck, useful_bits);
-        crate::gpu_commit::stage_zerocheck_c_fold_prefix(c_lincheck, m, k_log, useful_bits, r)
+        crate::gpu_commit::stage_zerocheck_c_fold_prefix_capped(
+            c_lincheck,
+            m,
+            k_log,
+            useful_bits,
+            r,
+            max_stripes,
+        )
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
-        let _ = (c_lincheck, m, k_log, useful_bits, r);
+        let _ = (c_lincheck, m, k_log, useful_bits, r, max_stripes);
         false
     }
 }

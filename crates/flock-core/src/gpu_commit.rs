@@ -1203,7 +1203,7 @@ pub(crate) fn gpu_zc_k_premap_enabled() -> bool {
 const ZC_K_GPU_V2_DEFAULT_CHUNKS: usize = 1024;
 
 pub const ENV_NO_ZC_K_SHARE800: &str = "FLOCK_NO_ZC_K_SHARE800";
-const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 800;
+const ZC_K_GPU_V2_RUNNER_CHUNKS: usize = 1280;
 
 /// Kill switch for the K arm's faster fold kernel (`FLOCK_NO_ZC_K_V2`, any
 /// value): the embedded `zc_k_fold` and the record's share
@@ -1286,7 +1286,7 @@ pub const ENV_ZC_T56_GPU_CHUNKS: &str = "FLOCK_ZC_T56_GPU_CHUNKS";
 
 /// The 5+6 arm's default share, in 5+6 chunks (of 512), when
 /// `FLOCK_ZC_T56_GPU_CHUNKS` is unset.
-pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 160;
+pub const ZC_T56_GPU_DEFAULT_CHUNKS: usize = 320;
 
 /// Kill switch for the 5+6 arm's late-GPU steal (`FLOCK_NO_ZC_T56_LOOP=1`:
 /// the record's join, where the CPU queue, having folded the chunks after the
@@ -5789,52 +5789,24 @@ using namespace metal;
 // factor split by bit position mod 3, so a product of two masked parts has at
 // most 6 overlapping terms per result bit (16 bits / spacing 3) and its sums
 // stay below the next same-residue bit (no carry crosses into a kept bit).
-static inline uint zck_clmul16(uint a, uint b) {
-    // 16-bit masks: the ushort parts hold the same values, and
-    // uint(ushort) products can lower to native 16x16->32 multiplies.
-    const uint m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
-    ushort a0 = ushort(a & m0), a1 = ushort(a & m1), a2 = ushort(a & m2);
-    ushort b0 = ushort(b & m0), b1 = ushort(b & m1), b2 = ushort(b & m2);
+static inline uint zck_clmul16_m3(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
     uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
     uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
     uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
     return r0 | r1 | r2;
 }
 
-// 32x32 by one Karatsuba step over 16-bit halves (27 32-bit products instead
-// of the embedded kernel's 16 64-bit ones).
-static inline ulong zck_clmul32(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zck_clmul16(al, bl);
-    uint hi = zck_clmul16(ah, bh);
-    uint mid = zck_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
-    return ulong(lo) ^ (ulong(mid) << 16) ^ (ulong(hi) << 32);
-}
-
-struct ZckU128 { ulong lo; ulong hi; };
-
-static inline ZckU128 zck_clmul64(ulong a, ulong b) {
-    uint al = uint(a), ah = uint(a >> 32);
-    uint bl = uint(b), bh = uint(b >> 32);
-    ulong p_lo = zck_clmul32(al, bl);
-    ulong p_hi = zck_clmul32(ah, bh);
-    ulong p_mid = zck_clmul32(al ^ ah, bl ^ bh) ^ p_lo ^ p_hi;
-    ZckU128 r;
-    r.lo = p_lo ^ (p_mid << 32);
-    r.hi = p_hi ^ (p_mid >> 32);
-    return r;
-}
-
-// a * b mod x^128 + x^7 + x^2 + x + 1 (Karatsuba product, then reduction).
-// The Karatsuba levels on 32-bit lanes (a 64-bit v is uint2(v, v >> 32)):
-// lo ^ (mid << 16) ^ (hi << 32) is uint2(lo ^ (mid << 16), hi ^ (mid >> 16)),
-// and p_lo ^ (p_mid << 32), p_hi ^ (p_mid >> 32) are the uint4 words below,
-// so r0, r1, h0, h1 are the same limbs and the reduction is unchanged.
 static inline uint2 zck_clmul32_u(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zck_clmul16(al, bl);
-    uint hi = zck_clmul16(ah, bh);
-    uint mid = zck_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = zck_clmul16_m3(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = zck_clmul16_m3(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = zck_clmul16_m3(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
     return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
 }
 
@@ -5849,17 +5821,21 @@ static inline uint4 zck_mul(uint4 a, uint4 b) {
     uint4 p0 = zck_clmul64_u(a.xy, b.xy);
     uint4 p2 = zck_clmul64_u(a.zw, b.zw);
     uint4 pm = zck_clmul64_u(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
-    ulong r0 = (ulong(p0.y) << 32) | p0.x;
-    ulong r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
-    ulong h0 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
-    ulong h1 = (ulong(p2.w) << 32) | p2.z;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = r0 ^ t0, l1 = r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+    uint r0 = p0.x;
+    uint r1 = p0.y;
+    uint r2 = p0.z ^ pm.x;
+    uint r3 = p0.w ^ pm.y;
+    uint h0 = p2.x ^ pm.z;
+    uint h1 = p2.y ^ pm.w;
+    uint h2 = p2.z;
+    uint h3 = p2.w;
+    uint ov = (h3 >> 31) ^ (h3 >> 30) ^ (h3 >> 25);
+    h0 ^= ov;
+    uint t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
+    uint t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7) ^ (h0 >> 31) ^ (h0 >> 30) ^ (h0 >> 25);
+    uint t2 = h2 ^ (h2 << 1) ^ (h2 << 2) ^ (h2 << 7) ^ (h1 >> 31) ^ (h1 >> 30) ^ (h1 >> 25);
+    uint t3 = h3 ^ (h3 << 1) ^ (h3 << 2) ^ (h3 << 7) ^ (h2 >> 31) ^ (h2 >> 30) ^ (h2 >> 25);
+    return uint4(r0 ^ t0, r1 ^ t1, r2 ^ t2, r3 ^ t3);
 }
 
 // T(code) for one 8-byte delta code (lo = bytes 0..3, hi = bytes 4..7).
@@ -5876,18 +5852,23 @@ static inline uint4 zck_fold8(uint lo, uint hi, threadgroup const uint4* nib) {
     return acc;
 }
 
-// x * rho2 for the pass's fixed rho2: rho2 * x is F2-linear in x, so it is
-// the XOR over the 32 nibbles of x of the precomputed rho2 * (v << 4k)
-// (`rt[16k + v]`, built on the host per prove, 8 KiB in threadgroup memory).
+static inline uint4 zck_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    return uint4((a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h),
+                 (a.y << 16) | (a.x >> 16), (a.z << 16) | (a.y >> 16), (a.w << 16) | (a.z >> 16));
+}
+
+// x * rho2 via 2 byte tables (byte-16 Horner, 16 SRAM loads vs 32, 8 KiB TG
+// memory so nib[256] + rtab[512] + sred = 13 KiB keeps 2 TGs/core occupancy).
 static inline uint4 zck_mulc(uint4 x, threadgroup const uint4* rt) {
-    uint4 acc = uint4(0u);
-    for (uint w = 0u; w < 4u; w++) {
+    uint4 a = uint4(0u);
+    #pragma clang loop unroll(disable)
+    for (int w = 3; w >= 0; w--) {
         uint v = x[w];
-        for (uint j = 0u; j < 8u; j++) {
-            acc ^= rt[(w * 8u + j) * 16u + ((v >> (4u * j)) & 15u)];
-        }
+        a = zck_shl16(a) ^ rt[(v >> 16) & 255u] ^ rt[256u + (v >> 24)];
+        a = zck_shl16(a) ^ rt[v & 255u] ^ rt[256u + ((v >> 8) & 255u)];
     }
-    return acc;
+    return a;
 }
 
 struct ZcKParams {
@@ -5921,6 +5902,7 @@ struct ZcKParams {
 // each must be one, and any that is not sets `flag`. `consts[0]` = rho2,
 // `consts[1]` = head_b, `consts[2 + t]` = w_t = eq_lo[2t + 1],
 // `consts[eq_hi_off + c]` = eq_hi[c].
+#pragma METAL internals : enable
 kernel void zc_k_fold_v2(
     device const uint4* anchors [[buffer(0)]],
     device const uint4* deltas  [[buffer(1)]],
@@ -5931,17 +5913,27 @@ kernel void zc_k_fold_v2(
     device uint4*       tg_part [[buffer(6)]],
     constant ZcKParams& p       [[buffer(7)]],
     device atomic_uint* flag    [[buffer(8)]],
+    volatile coherent(system) device const uint* cut [[buffer(9)]],
     uint tg  [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     ushort sl [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]])
 {
+    threadgroup uint cut_tg;
+    if (lid == 0u) { cut_tg = cut[0]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((tg / p.sb_per_chunk) >= cut_tg) { return; }
+
     threadgroup uint4 nib[256];
     threadgroup uint4 rtab[512];
     threadgroup uint4 sred[8][8];
     nib[lid] = nib_dev[lid];
-    rtab[lid] = nib_dev[256u + lid];
-    rtab[256u + lid] = nib_dev[512u + lid];
+    {
+        const uint lo = lid & 15u;
+        const uint hi = lid >> 4u;
+        rtab[lid]        = nib_dev[256u + lo] ^ nib_dev[272u + hi];
+        rtab[256u + lid] = nib_dev[288u + lo] ^ nib_dev[304u + hi];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint i = lid & 63u;
@@ -5974,7 +5966,8 @@ kernel void zc_k_fold_v2(
             }
         }
         a = xa0 ^ zck_mulc(xa0 ^ xa1, rtab);
-        b = xb0 ^ zck_mulc(xb0 ^ xb1, rtab);
+        uint4 dbv = xb0 ^ xb1;
+        b = any(dbv != 0u) ? (xb0 ^ zck_mulc(dbv, rtab)) : xb0;
         out_a[ulong(tg) * 244ul + ulong(i < 60u ? 60u * k + i : 240u + k)] = a;
         if (i < 4u || i == 59u) {
             if (any(b != uint4(1u, 0u, 0u, 0u))) {
@@ -5985,7 +5978,7 @@ kernel void zc_k_fold_v2(
         }
     }
     uint t = ((tg % p.sb_per_chunk) * 256u + lid) >> 2u;
-    uint4 aw = zck_mul(consts[2u + t], a);
+    uint4 aw = (i <= 60u) ? zck_mul(consts[2u + t], a) : uint4(0u);
     ushort qb = sl & ushort(0xFFFC);
     uint4 aw0 = simd_shuffle(aw, qb);
     uint4 aw1 = simd_shuffle(aw, ushort(qb + 1));
@@ -6008,8 +6001,8 @@ kernel void zc_k_fold_v2(
         x0 = aw1 ^ aw3; y0 = b1 ^ b3;
         x1 = aw0 ^ aw1 ^ aw2 ^ aw3; y1 = b0 ^ b1 ^ b2 ^ b3;
     }
-    uint4 r0 = zck_mul(x0, y0);
-    uint4 r1 = zck_mul(x1, y1);
+    uint4 r0 = (any(x0 != 0u) && any(y0 != 0u)) ? zck_mul(x0, y0) : uint4(0u);
+    uint4 r1 = (any(x1 != 0u) && any(y1 != 0u)) ? zck_mul(x1, y1) : uint4(0u);
     for (ushort off = 4; off < 32; off <<= 1) {
         r0 ^= simd_shuffle_xor(r0, off);
         r1 ^= simd_shuffle_xor(r1, off);
@@ -6372,7 +6365,7 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
         b3_load_block4(children + id * 4u, block);
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
-        b3_compress(cv, block, 64u, B3_PARENT);
+        b3_compress_straight(cv, block, 64u, B3_PARENT);
         const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
         const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
         parents1[id * 2u + 0u] = lo;
@@ -6395,7 +6388,7 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
         }
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
-        b3_compress(cv, block, 64u, B3_PARENT);
+        b3_compress_straight(cv, block, 64u, B3_PARENT);
         const uint id = tgid * 64u + lid;
         const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);
         const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);
@@ -6419,7 +6412,7 @@ kernel void parent_hash3_v4(device const uint4* children [[buffer(0)]],
         }
         uint cv[8];
         for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];
-        b3_compress(cv, block, 64u, B3_PARENT);
+        b3_compress_straight(cv, block, 64u, B3_PARENT);
         const uint id = tgid * 32u + lid;
         parents3[id * 2u + 0u] = uint4(cv[0], cv[1], cv[2], cv[3]);
         parents3[id * 2u + 1u] = uint4(cv[4], cv[5], cv[6], cv[7]);
@@ -9613,10 +9606,179 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
         Some(src.replacen(calls, L17_SIBLING_CALL, 1).replacen(entry, &format!("{L17_SIBLING_FNS}{entry}"), 1))
     }
 
+    const T3_BYTETAB3_BUILD_FAST: &str = "    threadgroup uint* tab3 = (threadgroup uint*)tabB;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    const uint cc = lid >> 3;
+    const uint base = (lid & 7u) * 32u;
+    const uint tw3 = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cc].x;
+    uint hb = 0u;
+    if (base & 32u)  { hb ^= tw3 << 5; }
+    if (base & 64u)  { hb ^= tw3 << 6; }
+    if (base & 128u) { hb ^= tw3 << 7; }
+    const uint t0 = tw3, t1 = tw3 << 1, t2 = tw3 << 2, t3 = tw3 << 3, t4 = tw3 << 4;
+    threadgroup uint* dst = &tab3[cc * 256u + base];
+    const uint v0 = hb, v1 = hb ^ t0, v2 = hb ^ t1, v3 = v1 ^ t1;
+    const uint v4 = v0 ^ t2, v5 = v1 ^ t2, v6 = v2 ^ t2, v7 = v3 ^ t2;
+    dst[0]  = v0;      dst[1]  = v1;      dst[2]  = v2;      dst[3]  = v3;
+    dst[4]  = v4;      dst[5]  = v5;      dst[6]  = v6;      dst[7]  = v7;
+    dst[8]  = v0 ^ t3; dst[9]  = v1 ^ t3; dst[10] = v2 ^ t3; dst[11] = v3 ^ t3;
+    dst[12] = v4 ^ t3; dst[13] = v5 ^ t3; dst[14] = v6 ^ t3; dst[15] = v7 ^ t3;
+    const uint h4 = hb ^ t4;
+    const uint w0 = h4, w1 = h4 ^ t0, w2 = h4 ^ t1, w3 = w1 ^ t1;
+    const uint w4 = w0 ^ t2, w5 = w1 ^ t2, w6 = w2 ^ t2, w7 = w3 ^ t2;
+    dst[16] = w0;      dst[17] = w1;      dst[18] = w2;      dst[19] = w3;
+    dst[20] = w4;      dst[21] = w5;      dst[22] = w6;      dst[23] = w7;
+    dst[24] = w0 ^ t3; dst[25] = w1 ^ t3; dst[26] = w2 ^ t3; dst[27] = w3 ^ t3;
+    dst[28] = w4 ^ t3; dst[29] = w5 ^ t3; dst[30] = w6 ^ t3; dst[31] = w7 ^ t3;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+    constexpr uint j = 3u;
+";
+
+    const T3_BYTETAB2_BUILD_OLD: &str = "        ulong hb = 0ul;
+        for (uint k = 4u; k < 8u; k++) { if ((base >> k) & 1u) { hb ^= t << k; } }
+        for (uint i = 0u; i < 16u; i++) {
+            ulong v = hb;
+            for (uint k = 0u; k < 4u; k++) { if ((i >> k) & 1u) { v ^= t << k; } }
+            tab64[cc * 256u + base + i] = v;
+        }";
+    const T3_BYTETAB2_BUILD_FAST: &str = "        ulong hb = 0ul;
+        if (base & 16u)  { hb ^= t << 4; }
+        if (base & 32u)  { hb ^= t << 5; }
+        if (base & 64u)  { hb ^= t << 6; }
+        if (base & 128u) { hb ^= t << 7; }
+        const ulong t0 = t, t1 = t << 1, t2 = t << 2, t3 = t << 3;
+        threadgroup ulong* dst = &tab64[cc * 256u + base];
+        const ulong v0 = hb, v1 = hb ^ t0, v2 = hb ^ t1, v3 = v1 ^ t1;
+        const ulong v4 = v0 ^ t2, v5 = v1 ^ t2, v6 = v2 ^ t2, v7 = v3 ^ t2;
+        dst[0]  = v0;      dst[1]  = v1;      dst[2]  = v2;      dst[3]  = v3;
+        dst[4]  = v4;      dst[5]  = v5;      dst[6]  = v6;      dst[7]  = v7;
+        dst[8]  = v0 ^ t3; dst[9]  = v1 ^ t3; dst[10] = v2 ^ t3; dst[11] = v3 ^ t3;
+        dst[12] = v4 ^ t3; dst[13] = v5 ^ t3; dst[14] = v6 ^ t3; dst[15] = v7 ^ t3;";
+
+    const T3_BYTETAB2_MUL_OLD: &str = "    {
+        threadgroup const ulong* tab64 = (threadgroup const ulong*)tabB;
+        for (uint b = 0; b < 8u; b++) {
+            const uint eu = ((b >> 1) << 2) | (b & 1u);
+            const uint ev = eu | 2u;
+            threadgroup const ulong* T = tab64 + (b >> 1) * 256u;
+            const uint4 V = elems[ev];
+            ulong a0 = 0ul, a1 = 0ul, a2 = 0ul;
+            #define BT2(W, SH, LO, HI) { \\
+                const ulong e = T[extract_bits((W), (SH) & 31u, 8)]; \\
+                LO ^= e << (SH); if ((SH) != 0u) { HI ^= e >> (64u - (SH)); } }
+            BT2(V.x, 0u, a0, a1) BT2(V.x, 8u, a0, a1) BT2(V.x, 16u, a0, a1) BT2(V.x, 24u, a0, a1)
+            BT2(V.y, 32u, a0, a1) BT2(V.y, 40u, a0, a1) BT2(V.y, 48u, a0, a1) BT2(V.y, 56u, a0, a1)
+            BT2(V.z, 0u, a1, a2) BT2(V.z, 8u, a1, a2) BT2(V.z, 16u, a1, a2) BT2(V.z, 24u, a1, a2)
+            BT2(V.w, 32u, a1, a2) BT2(V.w, 40u, a1, a2) BT2(V.w, 48u, a1, a2) BT2(V.w, 56u, a1, a2)
+            #undef BT2
+            a0 ^= a2 ^ (a2 << 1) ^ (a2 << 2) ^ (a2 << 7);
+            const uint4 pr = uint4(uint(a0), uint(a0 >> 32), uint(a1), uint(a1 >> 32));
+            const uint4 nu = elems[eu] ^ pr;
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }";
+    const T3_BYTETAB2_MUL_FAST: &str = "    {
+        threadgroup const uint2* tab32 = (threadgroup const uint2*)tabB;
+        for (uint b = 0; b < 8u; b++) {
+            const uint eu = ((b >> 1) << 2) | (b & 1u);
+            const uint ev = eu | 2u;
+            threadgroup const uint2* T = tab32 + (b >> 1) * 256u;
+            const uint4 V = elems[ev];
+            uint r0, r1, r2, r3, r4, r5;
+            {
+                const uint2 e0 = T[V.x & 255u], e1 = T[V.y & 255u], e2 = T[V.z & 255u], e3 = T[V.w & 255u];
+                r0 = e0.x; r1 = e0.y ^ e1.x; r2 = e1.y ^ e2.x; r3 = e2.y ^ e3.x; r4 = e3.y;
+            }
+            {
+                const uint2 e0 = T[extract_bits(V.x, 8, 8)], e1 = T[extract_bits(V.y, 8, 8)];
+                const uint2 e2 = T[extract_bits(V.z, 8, 8)], e3 = T[extract_bits(V.w, 8, 8)];
+                const uint u0 = e0.x, u1 = e0.y ^ e1.x, u2 = e1.y ^ e2.x, u3 = e2.y ^ e3.x, u4 = e3.y;
+                r0 ^= u0 << 8; r1 ^= (u0 >> 24) ^ (u1 << 8); r2 ^= (u1 >> 24) ^ (u2 << 8);
+                r3 ^= (u2 >> 24) ^ (u3 << 8); r4 ^= (u3 >> 24) ^ (u4 << 8);
+            }
+            {
+                const uint2 e0 = T[extract_bits(V.x, 16, 8)], e1 = T[extract_bits(V.y, 16, 8)];
+                const uint2 e2 = T[extract_bits(V.z, 16, 8)], e3 = T[extract_bits(V.w, 16, 8)];
+                const uint u0 = e0.x, u1 = e0.y ^ e1.x, u2 = e1.y ^ e2.x, u3 = e2.y ^ e3.x, u4 = e3.y;
+                r0 ^= u0 << 16; r1 ^= (u0 >> 16) ^ (u1 << 16); r2 ^= (u1 >> 16) ^ (u2 << 16);
+                r3 ^= (u2 >> 16) ^ (u3 << 16); r4 ^= (u3 >> 16) ^ (u4 << 16);
+            }
+            {
+                const uint2 e0 = T[V.x >> 24], e1 = T[V.y >> 24], e2 = T[V.z >> 24], e3 = T[V.w >> 24];
+                const uint u0 = e0.x, u1 = e0.y ^ e1.x, u2 = e1.y ^ e2.x, u3 = e2.y ^ e3.x, u4 = e3.y;
+                r0 ^= u0 << 24; r1 ^= (u0 >> 8) ^ (u1 << 24); r2 ^= (u1 >> 8) ^ (u2 << 24);
+                r3 ^= (u2 >> 8) ^ (u3 << 24); r4 ^= (u3 >> 8) ^ (u4 << 24); r5 = u4 >> 8;
+            }
+            r0 ^= r4 ^ (r4 << 1) ^ (r4 << 2) ^ (r4 << 7);
+            r1 ^= r5 ^ (r5 << 1) ^ (r5 << 2) ^ (r5 << 7) ^ (r4 >> 31) ^ (r4 >> 30) ^ (r4 >> 25);
+            const uint4 nu = elems[eu] ^ uint4(r0, r1, r2, r3);
+            elems[eu] = nu;
+            elems[ev] ^= nu;
+        }
+    }";
+
+    /// Replace the looped `b3_compress` in `NTT_FINAL_LEAF_EXTRA_MSL` with
+    /// [`LEAF_STRAIGHT_COMPRESS`] (static 7-round message schedule + hardware
+    /// `rotate`/`ushort2.yx`), strip the dead `nibB` device loads and extra
+    /// per-tile barriers when sub-layer 3 uses `T3_BYTETAB3`, and swap in
+    /// branch-free XOR-tree table builders + pure 32-bit 4-bucket sub-layer 2.
+    fn with_final_leaf_opt(src: &str, bytetab3_active: bool) -> String {
+        let mut s = src.to_string();
+        const START: &str = "static void b3_compress(thread uint* cv, thread const uint* m_in,";
+        const END: &str = "    for (int i = 0; i < 8; i++) cv[i] = v[i] ^ v[8 + i];\n}\n";
+        if super::leaf_straight_enabled()
+            && s.matches(START).count() == 1
+            && s.matches(END).count() == 1
+        {
+            if let (Some(a), Some(b_rel)) = (s.find(START), s.find(END)) {
+                let b = b_rel + END.len();
+                if b > a {
+                    s = format!("{}{LEAF_STRAIGHT_COMPRESS}{}", &s[..a], &s[b..]);
+                }
+            }
+        }
+        if bytetab3_active {
+            const DEAD_NIB_DECL: &str = "    constexpr uint NNIB = 5u;\n    threadgroup uint4 tabB[512u];\n    threadgroup uint  nibB[8u * NNIB];\n";
+            const LIVE_NIB_DECL: &str = "    threadgroup uint4 tabB[512u];\n";
+            const DEAD_NIB_LOAD: &str = "        // The previous tile's sub-layer 3 still reads nibB.\n        if (tt != 0u) { threadgroup_barrier(mem_flags::mem_threadgroup); }\n        if (lid < 8u * NNIB) {\n            uint cB = lid / NNIB, qB = lid % NNIB;\n            uint4 twB = twiddles[(1u << (P.l + 3u)) - 1u + (B << 3) + cB];\n            nibB[lid] = (twB[qB >> 3] >> ((qB & 7u) * 4u)) & 15u;\n        }\n";
+            if s.matches(DEAD_NIB_DECL).count() == 1 && s.matches(DEAD_NIB_LOAD).count() == 1 {
+                s = s.replacen(DEAD_NIB_DECL, LIVE_NIB_DECL, 1).replacen(DEAD_NIB_LOAD, "", 1);
+            }
+            if s.matches(T3_BYTETAB3_BUILD).count() == 1 {
+                s = s.replacen(T3_BYTETAB3_BUILD, T3_BYTETAB3_BUILD_FAST, 1);
+            }
+        }
+        if s.matches(T3_BYTETAB2_BUILD_OLD).count() == 1 {
+            s = s.replacen(T3_BYTETAB2_BUILD_OLD, T3_BYTETAB2_BUILD_FAST, 1);
+        }
+        if s.matches(T3_BYTETAB2_MUL_OLD).count() == 1 {
+            s = s.replacen(T3_BYTETAB2_MUL_OLD, T3_BYTETAB2_MUL_FAST, 1);
+        }
+        const LEAF_STORE_OLD: &str = "        for (uint i = 0u; i < 8u; i++) {\n            leaves[id * 8u + i] = cv[i];\n            level0[n * 8u + i] = cv[i];\n        }\n";
+        const LEAF_STORE_FAST: &str = "        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);\n        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);\n        reinterpret_cast<device uint4*>(leaves)[id * 2u] = lo;\n        reinterpret_cast<device uint4*>(leaves)[id * 2u + 1u] = hi;\n        reinterpret_cast<threadgroup uint4*>(level0)[n * 2u] = lo;\n        reinterpret_cast<threadgroup uint4*>(level0)[n * 2u + 1u] = hi;\n";
+        const PARENT_OLD: &str = "        for (uint i = 0u; i < 8u; i++) {                                       \\\n            block[i] = SRC[(2u * n) * 8u + i];                                 \\\n            block[8u + i] = SRC[(2u * n + 1u) * 8u + i];                       \\\n        }                                                                      \\\n        uint cv[8];                                                            \\\n        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \\\n        b3_compress(cv, block, 64u, B3_PARENT);                                \\\n        const uint id = tgid * (CNT) + n;                                      \\\n        for (uint i = 0u; i < 8u; i++) {                                       \\\n            OUT[id * 8u + i] = cv[i];                                          \\\n            DST[n * 8u + i] = cv[i];                                           \\\n        }                                                                      \\\n";
+        const PARENT_FAST: &str = "        threadgroup const uint4* s4 = reinterpret_cast<threadgroup const uint4*>(SRC); \\\n        const uint4 w0 = s4[n * 4u], w1 = s4[n * 4u + 1u], w2 = s4[n * 4u + 2u], w3 = s4[n * 4u + 3u]; \\\n        block[0] = w0.x; block[1] = w0.y; block[2] = w0.z; block[3] = w0.w;    \\\n        block[4] = w1.x; block[5] = w1.y; block[6] = w1.z; block[7] = w1.w;    \\\n        block[8] = w2.x; block[9] = w2.y; block[10] = w2.z; block[11] = w2.w;  \\\n        block[12] = w3.x; block[13] = w3.y; block[14] = w3.z; block[15] = w3.w;\\\n        uint cv[8];                                                            \\\n        for (uint i = 0u; i < 8u; i++) cv[i] = B3_IV[i];                       \\\n        b3_compress(cv, block, 64u, B3_PARENT);                                \\\n        const uint id = tgid * (CNT) + n;                                      \\\n        const uint4 lo = uint4(cv[0], cv[1], cv[2], cv[3]);                    \\\n        const uint4 hi = uint4(cv[4], cv[5], cv[6], cv[7]);                    \\\n        reinterpret_cast<device uint4*>(OUT)[id * 2u] = lo;                    \\\n        reinterpret_cast<device uint4*>(OUT)[id * 2u + 1u] = hi;               \\\n        reinterpret_cast<threadgroup uint4*>(DST)[n * 2u] = lo;                \\\n        reinterpret_cast<threadgroup uint4*>(DST)[n * 2u + 1u] = hi;           \\\n";
+        if s.matches(LEAF_STORE_OLD).count() == 1 && s.matches(PARENT_OLD).count() == 1 {
+            s = s.replacen(LEAF_STORE_OLD, LEAF_STORE_FAST, 1).replacen(PARENT_OLD, PARENT_FAST, 1);
+        }
+        s
+    }
+
     pub(crate) fn final_leaf_msl_source() -> String {
         let extra: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(NTT_FINAL_LEAF_EXTRA_MSL);
+        let mut bytetab3_active = false;
         let extra = if super::gpu_t3_bytetab_enabled() {
-            with_fused_bytetab3(&extra).unwrap_or(extra.into_owned()).into()
+            match with_fused_bytetab3(&extra) {
+                Some(s) => {
+                    bytetab3_active = true;
+                    std::borrow::Cow::Owned(s)
+                }
+                None => extra,
+            }
         } else {
             extra
         };
@@ -9628,6 +9790,11 @@ static inline uint4 l17_mul(uint4 v, threadgroup const uint4* tab) {
         };
         let extra: std::borrow::Cow<'static, str> = if super::gpu_l17_sibling_enabled() {
             with_l17_sibling(&extra).map_or(extra, Into::into)
+        } else {
+            extra
+        };
+        let extra: std::borrow::Cow<'static, str> = if std::env::var_os("FLOCK_NO_FINAL_LEAF_OPT").is_none() {
+            std::borrow::Cow::Owned(with_final_leaf_opt(&extra, bytetab3_active))
         } else {
             extra
         };
@@ -22662,12 +22829,29 @@ kernel void zc_eq_rows(
     /// job in the fold state (guard released) instead of returning it — the
     /// staging thread is a rayon pool worker inside the commit join, not the
     /// thread that runs zerocheck. Returns whether a prefix was parked.
+    #[allow(dead_code)]
     pub(crate) fn stage_zerocheck_c_fold_prefix(
         z_packed: &[u8],
         m: usize,
         k_log: usize,
         useful_bits: usize,
         r: &[F128],
+    ) -> bool {
+        stage_zerocheck_c_fold_prefix_capped(z_packed, m, k_log, useful_bits, r, None)
+    }
+
+    /// Commit-tail fill staging with an optional ready-stripe prefix bound
+    /// `max_stripes`. When `Some(max_s)` is passed (e.g. from `AbStripeEmitter`
+    /// when the GPU commit graph finishes before `ab-precompute` on wide GPUs),
+    /// the GPU prefix is clamped to `max_s` stripes (already emitted and frozen)
+    /// once warmup split calibration has settled.
+    pub(crate) fn stage_zerocheck_c_fold_prefix_capped(
+        z_packed: &[u8],
+        m: usize,
+        k_log: usize,
+        useful_bits: usize,
+        r: &[F128],
+        max_stripes: Option<usize>,
     ) -> bool {
         if !super::gpu_zerocheck_enabled() {
             return false;
@@ -22688,6 +22872,7 @@ kernel void zc_eq_rows(
                 k_log,
                 useful_bits,
                 EqSrc::GpuRows(&r[k_log..]),
+                max_stripes,
             ) else {
                 return false;
             };
@@ -22706,13 +22891,14 @@ kernel void zc_eq_rows(
             launched
         } else {
             let eq_outer = zc_fold_eq_table(&r[k_log..]);
-            let Some(job) = launch_fold_prefix(
+            let Some((job, _)) = launch_fold_prefix_src(
                 FoldArm::Zc,
                 z_packed,
                 m,
                 k_log,
                 useful_bits,
-                eq_outer.as_slice(),
+                EqSrc::Table(eq_outer.as_slice()),
+                max_stripes,
             ) else {
                 return false;
             };
@@ -22948,6 +23134,25 @@ kernel void zc_eq_rows(
         GpuRows(&'a [F128]),
     }
 
+    /// Retire any parked commit-tail-fill prefix (waiting out its command
+    /// buffer and releasing it). Called before any fallback path that would
+    /// rewrite `c_lincheck` after partial-prefix staging.
+    pub(crate) fn abandon_staged_zc_fold() {
+        let mut guard = match ZC_FOLD.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                ZC_FOLD.clear_poison();
+                note_poisoned_lock("zc-fold", true);
+                let mut g = poisoned.into_inner();
+                *g = None;
+                g
+            }
+        };
+        if let Some(Ok(state)) = guard.as_mut() {
+            unsafe { abandon_staged_prefix(state) };
+        }
+    }
+
     fn launch_fold_prefix(
         arm: FoldArm,
         z_packed: &[u8],
@@ -22956,8 +23161,16 @@ kernel void zc_eq_rows(
         useful_bits: usize,
         eq_outer: &[F128],
     ) -> Option<ZcFoldJob> {
-        launch_fold_prefix_src(arm, z_packed, m, k_log, useful_bits, EqSrc::Table(eq_outer))
-            .map(|(job, _)| job)
+        launch_fold_prefix_src(
+            arm,
+            z_packed,
+            m,
+            k_log,
+            useful_bits,
+            EqSrc::Table(eq_outer),
+            None,
+        )
+        .map(|(job, _)| job)
     }
 
     /// [`launch_fold_prefix`] with the eq source spelled out. With
@@ -22971,13 +23184,28 @@ kernel void zc_eq_rows(
         k_log: usize,
         useful_bits: usize,
         eq: EqSrc<'_>,
+        max_stripes: Option<usize>,
     ) -> Option<(ZcFoldJob, Option<GpuEqRows>)> {
         let k = 1usize << k_log;
         if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) || m <= k_log + 3 {
             return None;
         }
         let n_claims = crate::lincheck::oblock_claim_count(m, k_log);
-        let claim_lo = arm.claims_for(n_claims);
+        let orig_claim_lo = arm.claims_for(n_claims);
+        let mut claim_lo = orig_claim_lo;
+        if let Some(max_s) = max_stripes {
+            if arm.tuned().load(std::sync::atomic::Ordering::Relaxed) == usize::MAX {
+                return None;
+            }
+            let per_claim = crate::lincheck::oblock_claim_stripe_base(1);
+            if per_claim == 0 {
+                return None;
+            }
+            claim_lo = claim_lo.min(max_s / per_claim);
+            if claim_lo == 0 || claim_lo * 4 < orig_claim_lo * 3 {
+                return None;
+            }
+        }
         if claim_lo == 0 || claim_lo > n_claims {
             return None;
         }
@@ -28612,6 +28840,8 @@ kernel void zc_ab_finish(
         flag_buf: Id,
         /// Scratch output of the round-two premap touch dispatch.
         touch_buf: Id,
+        /// Late-GPU steal boundary (one u32; `u32::MAX` = no skips).
+        cut_buf: Id,
         chunks: usize,
         per_chunk_a: usize,
         per_chunk_b: usize,
@@ -28873,7 +29103,7 @@ kernel void zc_ab_finish(
             if super::gpu_zc_k_debug() {
                 eprintln!("[zc-k-gpu] pipelines: {how} (joined after {wait_ms:.2} ms)");
             }
-            let mut made: Vec<Id> = Vec::with_capacity(8);
+            let mut made: Vec<Id> = Vec::with_capacity(9);
             for len in [
                 (256 + 512) * 16,
                 (2 + n_weights + chunks) * 16,
@@ -28883,6 +29113,7 @@ kernel void zc_ab_finish(
                 chunks * 8 * 16,
                 16,
                 8 * 16,
+                16,
             ] {
                 match gpu.new_buffer(len) {
                     Ok(b) => made.push(b),
@@ -28907,6 +29138,7 @@ kernel void zc_ab_finish(
                 part_buf: made[5],
                 flag_buf: made[6],
                 touch_buf: made[7],
+                cut_buf: made[8],
                 chunks,
                 per_chunk_a,
                 per_chunk_b,
@@ -28918,12 +29150,15 @@ kernel void zc_ab_finish(
 
     /// An in-flight K pass GPU prefix.
     pub(crate) struct ZcKJob {
+        gpu: &'static Gpu,
         cb: Id,
         /// `cb`'s completion signal (`super::ENV_NO_JOIN_SIGNAL`).
         sig: Option<DoneSig>,
         /// Views released at the join (the deltas one may be the round-one
         /// arm's retained view).
         views: [Id; 2],
+        /// Late-GPU steal boundary word (`null` when embedded v1 kernel runs).
+        cut: *mut u32,
         chunks: usize,
         per_chunk_a: usize,
         per_chunk_b: usize,
@@ -28932,8 +29167,10 @@ kernel void zc_ab_finish(
     }
 
     // SAFETY: the handles are only waited/released by the launching thread;
-    // Metal objects are themselves thread-safe.
+    // Metal objects are themselves thread-safe and `cut` is accessed only via
+    // volatile stores under the caller's claim lock.
     unsafe impl Send for ZcKJob {}
+    unsafe impl Sync for ZcKJob {}
 
     impl ZcKJob {
         /// First chunk the CPU queue folds: zero during the oracle probe (the
@@ -28949,6 +29186,35 @@ kernel void zc_ab_finish(
         /// GPU prefix length in chunks.
         pub(crate) fn chunks(&self) -> usize {
             self.chunks
+        }
+
+        /// Whether late-GPU stealing is active for this job (timed launch on
+        /// `zc_k_fold_v2` unless disabled by `FLOCK_NO_ZC_K_STEAL`).
+        pub(crate) fn steal_enabled(&self) -> bool {
+            !self.calibration
+                && !self.cut.is_null()
+                && std::env::var_os("FLOCK_NO_ZC_K_STEAL").is_none()
+        }
+
+        /// Non-blocking completion poll: true once the GPU has completed both
+        /// fold and finish encoders and its shared-storage writes are visible.
+        pub(crate) fn done(&self) -> bool {
+            let done = if let Some(ref sig) = self.sig {
+                unsafe { self.gpu.done_signaled(sig) }
+            } else {
+                unsafe { self.gpu.cb_status(self.cb) >= 4 }
+            };
+            if done {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            }
+            done
+        }
+
+        /// Publish the CPU's steal boundary: the GPU skips chunks `>= hi`.
+        pub(crate) fn set_cut(&self, hi: usize) {
+            if !self.cut.is_null() {
+                unsafe { self.cut.write_volatile(hi as u32) };
+            }
         }
     }
 
@@ -29381,19 +29647,45 @@ kernel void zc_ab_finish(
                     *nib.add(j * 32 + 16 + n) = table[j * 256 + (n << 4)];
                 }
             }
-            if ZC_K_V2_ACTIVE.load(Ordering::Relaxed) {
-                // rho2 * (v << 4k) for the 32 nibbles k of the other factor.
-                for k in 0..32usize {
-                    for v in 0..16u64 {
-                        let x = if k < 16 {
-                            F128::new(v << (4 * k), 0)
-                        } else {
-                            F128::new(0, v << (4 * (k - 16)))
-                        };
-                        *nib.add(256 + 16 * k + v as usize) = rho2 * x;
+            let v2_active = ZC_K_V2_ACTIVE.load(Ordering::Relaxed);
+            if v2_active {
+                // rho2 * (v << 4k) for the low 4 nibbles (2 bytes) expanded on
+                // GPU into the 2 byte tables used by byte-16 Horner `zck_mulc`.
+                let mul_x = |v: F128| -> F128 {
+                    let red = (v.hi >> 63).wrapping_neg() & 0x87;
+                    F128::new((v.lo << 1) ^ red, (v.hi << 1) | (v.lo >> 63))
+                };
+                let mut cur = rho2;
+                for k in 0..4usize {
+                    let b0 = cur;
+                    cur = mul_x(cur);
+                    let b1 = cur;
+                    cur = mul_x(cur);
+                    let b2 = cur;
+                    cur = mul_x(cur);
+                    let b3 = cur;
+                    cur = mul_x(cur);
+                    let base = nib.add(256 + 16 * k);
+                    *base = F128::ZERO;
+                    *base.add(1) = b0;
+                    *base.add(2) = b1;
+                    *base.add(3) = b0 + b1;
+                    for i in 0..4usize {
+                        *base.add(4 + i) = *base.add(i) + b2;
+                    }
+                    for i in 0..8usize {
+                        *base.add(8 + i) = *base.add(i) + b3;
                     }
                 }
             }
+            let calibration = mode == ZC_K_UNCALIBRATED;
+            let cut_ptr = if v2_active {
+                let p = gpu.buffer_contents(state.cut_buf).cast::<u32>();
+                p.write_volatile(if calibration { u32::MAX } else { chunks as u32 });
+                p
+            } else {
+                std::ptr::null_mut()
+            };
             let consts = gpu.buffer_contents(state.consts_buf).cast::<F128>();
             *consts = rho2;
             *consts.add(1) = head_b;
@@ -29442,6 +29734,9 @@ kernel void zc_ab_finish(
                 gpu.set_buffer(enc, state.tgp_buf, 0, 6);
                 gpu.set_bytes(enc, pb, 7);
                 gpu.set_buffer(enc, state.flag_buf, 0, 8);
+                if v2_active {
+                    gpu.set_buffer(enc, state.cut_buf, 0, 9);
+                }
                 gpu.dispatch(enc, (chunks * sb_per_chunk) as u64, 256);
                 // Serial dispatches of one encoder: the finish reads the
                 // superblock sums the fold wrote.
@@ -29462,13 +29757,15 @@ kernel void zc_ab_finish(
             gpu.pool_pop(pool);
             match submitted {
                 Ok((cb, sig)) => Some(ZcKJob {
+                    gpu,
                     cb,
                     sig,
                     views: [a_view, d_view],
+                    cut: cut_ptr,
                     chunks,
                     per_chunk_a,
                     per_chunk_b,
-                    calibration: mode == ZC_K_UNCALIBRATED,
+                    calibration,
                     submitted: std::time::Instant::now(),
                 }),
                 Err(e) => {
@@ -29559,6 +29856,95 @@ kernel void zc_ab_finish(
                 b,
                 len_a: job.chunks * job.per_chunk_a,
                 len_b: job.chunks * job.per_chunk_b,
+                b_ones,
+            }
+        }
+    }
+
+    /// Join a K pass GPU prefix after the late-GPU steal loop.
+    /// `lo` is the leading prefix `[0..lo)` left to the GPU; `gpu_done` is
+    /// whether the GPU completion signal/status was already observed.
+    pub(crate) fn zc_k_wait_stolen(
+        job: ZcKJob,
+        lo: usize,
+        gpu_done: bool,
+        hi_size: usize,
+    ) -> ZcKResult {
+        use std::sync::atomic::Ordering;
+        let debug = super::gpu_zc_k_debug();
+        let gpu = job.gpu;
+        unsafe {
+            let waited = std::time::Instant::now();
+            let ok = if gpu_done {
+                if gpu.cb_status(job.cb) == 5 {
+                    Err("command buffer status 5 (zc-k steal)".to_string())
+                } else {
+                    Ok(())
+                }
+            } else {
+                // CPU stole all offered chunks (lo == 0): stop any remaining
+                // threadgroups and drain cb before releasing input views.
+                job.set_cut(0);
+                gpu.spin_wait_cb(job.cb, 2.0)
+            };
+            if ok.is_ok() {
+                Gpu::recycle_done(job.sig);
+            }
+            let wait_ms = waited.elapsed().as_secs_f64() * 1e3;
+            let gpu_ms = if ok.is_ok() { zc_fold_gpu_wall_ms(gpu, job.cb) } else { 0.0 };
+            gpu.release(job.cb);
+            for v in job.views {
+                gpu.release(v);
+            }
+            if let Err(e) = ok {
+                ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                if debug {
+                    eprintln!("[zc-k-gpu] command buffer failed ({e}); arm disabled, CPU folds {lo} chunks");
+                }
+                return ZcKResult::Failed;
+            }
+            let Some(state_mutex) = ZC_K_STATE.get().and_then(|s| s.as_ref()) else {
+                ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                return ZcKResult::Failed;
+            };
+            let state = match state_mutex.lock() {
+                Ok(s) => s,
+                Err(_) => {
+                    note_poisoned_lock("zc-k wait_stolen", false);
+                    ZC_K_MODE.store(ZC_K_DISABLED, Ordering::Relaxed);
+                    return ZcKResult::Failed;
+                }
+            };
+            let parts = if lo > 0 {
+                let ptr = gpu.buffer_contents(state.part_buf).cast::<[F128; 8]>();
+                std::slice::from_raw_parts(ptr, lo).to_vec()
+            } else {
+                Vec::new()
+            };
+            let a = gpu.buffer_contents(state.out_a).cast::<F128>().cast_const();
+            let b = gpu.buffer_contents(state.out_b).cast::<F128>().cast_const();
+            let b_ones = if lo > 0 {
+                *gpu.buffer_contents(state.flag_buf).cast::<u32>() == 0
+            } else {
+                true
+            };
+            drop(state);
+            if debug {
+                let fired = ZC_K_FIRED.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "[zc-k-gpu] steal fired: GPU {lo}/{hi_size} K chunks (offered {}, stolen {}), gpu={gpu_ms:.2}ms \
+                     submit-to-drain={:.2}ms wait={wait_ms:.3}ms fired_proves={fired}",
+                    job.chunks,
+                    job.chunks.saturating_sub(lo),
+                    job.submitted.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            ZcKResult::Prefix {
+                parts,
+                a,
+                b,
+                len_a: lo * job.per_chunk_a,
+                len_b: lo * job.per_chunk_b,
                 b_ones,
             }
         }
@@ -31709,7 +32095,15 @@ pub(crate) use imp::zc_fold_prewarm;
 /// `ENV_NO_COMMIT_TAIL_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix};
+pub(crate) use imp::{
+    adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix, stage_zerocheck_c_fold_prefix_capped,
+};
+
+/// Retire any parked commit-tail-fill prefix before rewriting `c_lincheck`.
+pub fn abandon_staged_zc_fold() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    imp::abandon_staged_zc_fold();
+}
 
 /// Round-one C fold tune fix: warm-up input hooks (see
 /// `ENV_NO_ZC_FOLD_TUNE_FIX`).
@@ -31747,7 +32141,7 @@ pub(crate) use imp::{ZcAbJob, ZcAbResult, launch_zc_ab_completion, zc_ab_prewarm
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use imp::{
     ZcKJob, ZcKLayout, ZcKResult, launch_zc_k_prefix, zc_k_launch_share, zc_k_premap, zc_k_prewarm,
-    zc_k_prewarm_wanted, zc_k_verdict, zc_k_wait,
+    zc_k_prewarm_wanted, zc_k_verdict, zc_k_wait, zc_k_wait_stolen,
 };
 
 /// Tri pass 0 GPU arm (see `ENV_NO_ZC_T0_GPU`).
