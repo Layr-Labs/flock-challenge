@@ -1773,25 +1773,39 @@ pub(super) unsafe fn butterfly_fused_2layer_low_inner_rows(
         let (top_half, bot_half) = block.split_at_mut(2 * stride);
         let (q1, q2) = top_half.split_at_mut(stride);
         let (q3, q4) = bot_half.split_at_mut(stride);
-        for (((a, b), c), d) in q1
-            .iter_mut()
-            .zip(q2.iter_mut())
-            .zip(q3.iter_mut())
-            .zip(q4.iter_mut())
-        {
-            let xa = vld1q_u64((&raw const *a).cast::<u64>());
-            let xb = vld1q_u64((&raw const *b).cast::<u64>());
-            let xc = vld1q_u64((&raw const *c).cast::<u64>());
-            let xd = vld1q_u64((&raw const *d).cast::<u64>());
-            let (na, nc, p) = const_lazy_zero(xa, xc, to);
+        let [mut pa, mut pb, mut pc, mut pd] = row_ptrs([q1, q2, q3, q4]);
+        let mut pairs = stride >> 1;
+        while pairs != 0 {
+            let ((xa0, xa1), (xc0, xc1)) = (load_pair_q(pa), load_pair_q(pc));
+            let na0 = fused_pmull_hi_acc(fused_pmull_lo_acc(xa0, xc0, to.0), xc0, to.0);
+            let p0 = cross_sum_q(xc0, to.1);
+            let na1 = fused_pmull_hi_acc(fused_pmull_lo_acc(xa1, xc1, to.0), xc1, to.0);
+            let p1 = cross_sum_q(xc1, to.1);
+            let ((xb0, xb1), (xd0, xd1)) = (load_pair_q(pb), load_pair_q(pd));
+            let ((nb0, nd0), (nb1, nd1)) = (const_fold_zero(xb0, xd0, to), const_fold_zero(xb1, xd1, to));
+            let ((fa0, fb0), (fa1, fb1)) = (butterfly_low_fold_q(na0, nb0, ta, p0), butterfly_low_fold_q(na1, nb1, ta, p1));
+            store_pair_q_adv(&mut pa, fa0, fa1);
+            store_pair_q_adv(&mut pb, fb0, fb1);
+            let fc0 = fold_x64_plus_into(fused_pmull_lo_acc(na0, nd0, tb), fused_pmull_hi_acc(p0, nd0, tb), xc0);
+            let fc1 = fold_x64_plus_into(fused_pmull_lo_acc(na1, nd1, tb), fused_pmull_hi_acc(p1, nd1, tb), xc1);
+            store_pair_q_adv(&mut pc, fc0, fc1);
+            store_pair_q_adv(&mut pd, veorq_u64(nd0, fc0), veorq_u64(nd1, fc1));
+            pairs -= 1;
+        }
+        if stride & 1 != 0 {
+            let xa = vld1q_u64(pa.cast::<u64>());
+            let xb = vld1q_u64(pb.cast::<u64>());
+            let xc = vld1q_u64(pc.cast::<u64>());
+            let xd = vld1q_u64(pd.cast::<u64>());
+            let na = fused_pmull_hi_acc(fused_pmull_lo_acc(xa, xc, to.0), xc, to.0);
+            let p = cross_sum_q(xc, to.1);
             let (nb, nd) = const_fold_zero(xb, xd, to);
-            // Layer L+1: (a,b) under t_inner_a, (c,d) under t_inner_b.
             let (fa, fb) = butterfly_low_fold_q(na, nb, ta, p);
-            let (fc, fd) = butterfly_low_fold_q(nc, nd, tb, p);
-            vst1q_u64((&raw mut *a).cast::<u64>(), fa);
-            vst1q_u64((&raw mut *b).cast::<u64>(), fb);
-            vst1q_u64((&raw mut *c).cast::<u64>(), fc);
-            vst1q_u64((&raw mut *d).cast::<u64>(), fd);
+            let fc = fold_x64_plus_into(fused_pmull_lo_acc(na, nd, tb), fused_pmull_hi_acc(p, nd, tb), xc);
+            vst1q_u64(pa.cast::<u64>(), fa);
+            vst1q_u64(pb.cast::<u64>(), fb);
+            vst1q_u64(pc.cast::<u64>(), fc);
+            vst1q_u64(pd.cast::<u64>(), veorq_u64(nd, fc));
         }
     }
 }
@@ -1811,13 +1825,26 @@ pub(super) unsafe fn butterfly_block(chunk: &mut [F128], twiddle: F128, half: us
         unsafe {
             let t = vld1q_u64((&raw const twiddle).cast::<u64>());
             let prep = three_coeffs(t);
-            let base = chunk.as_mut_ptr();
-            for idx0 in 0..half {
-                let pu = base.add(idx0).cast::<u64>();
-                let pv = base.add(idx0 + half).cast::<u64>();
-                let (nu, nv) = three_fold_zero(vld1q_u64(pu), vld1q_u64(pv), prep);
-                vst1q_u64(pu, nu);
-                vst1q_u64(pv, nv);
+            let mut pu = chunk.as_mut_ptr();
+            let mut pv = pu.add(half);
+            let mut pairs = half >> 1;
+            while pairs != 0 {
+                let (u0, u1) = load_pair_q(pu);
+                let (v0, v1) = load_pair_q(pv);
+                let (nu0, nv0) = three_fold_zero(u0, v0, prep);
+                let (nu1, nv1) = three_fold_zero(u1, v1, prep);
+                store_pair_q_adv(&mut pu, nu0, nu1);
+                store_pair_q_adv(&mut pv, nv0, nv1);
+                pairs -= 1;
+            }
+            if half & 1 != 0 {
+                let (nu, nv) = three_fold_zero(
+                    vld1q_u64(pu.cast::<u64>()),
+                    vld1q_u64(pv.cast::<u64>()),
+                    prep,
+                );
+                vst1q_u64(pu.cast::<u64>(), nu);
+                vst1q_u64(pv.cast::<u64>(), nv);
             }
         }
         return;
