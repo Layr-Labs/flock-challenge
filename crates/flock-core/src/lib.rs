@@ -174,7 +174,7 @@ pub const ENV_NO_READY_PAUSE: &str = "FLOCK_NO_READY_PAUSE";
 /// proof through readiness to the timed proof runs exactly as it did, so the
 /// pause cannot reach the timed proof. It is a plain sleep, the same in every
 /// worker, and reads nothing but the executable name and the argument count.
-const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(2400);
+const RANKED_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(2250);
 
 /// Pure selector: the pause a process takes at start-up, if any.
 fn ranked_start_pause_for(
