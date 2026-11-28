@@ -81,29 +81,27 @@ static inline uint4 clmul64_u16(uint2 a, uint2 b) {
     return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
 }
 
-struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+struct U256u { uint4 lo; uint4 hi; };
 
-static inline U256k clmul128(uint4 a, uint4 b) {
+static inline U256u clmul128(uint4 a, uint4 b) {
     uint4 p0 = clmul64_u16(a.xy, b.xy);
     uint4 p2 = clmul64_u16(a.zw, b.zw);
     uint4 pm = clmul64_u16(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
-    U256k r;
-    r.r0 = (ulong(p0.y) << 32) | p0.x;
-    r.r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
-    r.r2 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
-    r.r3 = (ulong(p2.w) << 32) | p2.z;
+    U256u r;
+    r.lo = uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y);
+    r.hi = uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w);
     return r;
 }
 
-static inline uint4 gf_reduce(U256k p) {
-    ulong h0 = p.r2, h1 = p.r3;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+static inline uint4 gf_reduce(U256u p) {
+    uint4 t = p.hi ^ (p.hi << 1) ^ (p.hi << 2) ^ (p.hi << 7);
+    uint4 c = (p.hi >> 31) ^ (p.hi >> 30) ^ (p.hi >> 25);
+    t.y ^= c.x;
+    t.z ^= c.y;
+    t.w ^= c.z;
+    uint ov = c.w;
+    t.x ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    return p.lo ^ t;
 }
 
 static inline uint4 gf_shl16(uint4 a) {
@@ -144,22 +142,17 @@ static inline uint4 mul_w32(uint4 v, threadgroup const uint4* tab) {
     return a;
 }
 
-static inline ulong4 acc_mul(ulong4 acc, uint4 x, uint4 y) {
-    U256k p = clmul128(x, y);
-    return acc ^ ulong4(p.r0, p.r1, p.r2, p.r3);
+static inline U256u acc_mul(U256u acc, uint4 x, uint4 y) {
+    U256u p = clmul128(x, y);
+    return U256u { acc.lo ^ p.lo, acc.hi ^ p.hi };
 }
 
 static inline uint4 xor_lanes(uint4 v, ushort m) {
     return v ^ simd_shuffle_xor(v, m);
 }
 
-static inline ulong4 xor_lanes4(ulong4 v, ushort m) {
-    uint4 lo = uint4(uint(v.x), uint(v.y), uint(v.z), uint(v.w));
-    uint4 hi = uint4(uint(v.x >> 32), uint(v.y >> 32), uint(v.z >> 32), uint(v.w >> 32));
-    lo = simd_shuffle_xor(lo, m);
-    hi = simd_shuffle_xor(hi, m);
-    return v ^ ulong4(ulong(lo.x) | (ulong(hi.x) << 32), ulong(lo.y) | (ulong(hi.y) << 32),
-                      ulong(lo.z) | (ulong(hi.z) << 32), ulong(lo.w) | (ulong(hi.w) << 32));
+static inline U256u xor_lanes4(U256u v, ushort m) {
+    return U256u { v.lo ^ simd_shuffle_xor(v.lo, m), v.hi ^ simd_shuffle_xor(v.hi, m) };
 }
 
 // Three-level fold of eight consecutive inputs: word32 (4x256) for rho0,
@@ -184,21 +177,21 @@ kernel void zc_t0_fold(
     device uint4*       a_out  [[buffer(2)]],
     device uint4*       b_out  [[buffer(3)]],
     device const uint4* consts [[buffer(4)]],
-    device ulong4*      banks  [[buffer(5)]],
+    device uint4*       banks  [[buffer(5)]],
     device const uint*  ctl    [[buffer(6)]],
     constant uint&      tg_base [[buffer(7)]],
     uint tg_rel [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]])
 {
     threadgroup uint4 nib[2048];
-    threadgroup ulong4* red = reinterpret_cast<threadgroup ulong4*>(nib);
+    threadgroup U256u* red = reinterpret_cast<threadgroup U256u*>(nib);
     const uint chunk = tg_base + tg_rel;
     if (lid == 0u) {
         const uint lim = min(ctl[0], ctl[1]);
-        red[0] = ulong4(chunk >= lim ? 1ul : 0ul, 0ul, 0ul, 0ul);
+        nib[0] = uint4(chunk >= lim ? 1u : 0u, 0u, 0u, 0u);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const bool skip = red[0].x != 0ul;
+    const bool skip = nib[0].x != 0u;
     if (skip) { return; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
@@ -220,7 +213,10 @@ kernel void zc_t0_fold(
     device uint4* ao = a_out + ulong(chunk) * T0_OUT;
     device uint4* bo = b_out + ulong(chunk) * T0_OUT;
     device const uint4* eq_odd = consts + 1536u;
-    ulong4 acc_a = ulong4(0ul), acc_b = ulong4(0ul), acc_c = ulong4(0ul), acc_d = ulong4(0ul);
+    U256u acc_a = U256u { uint4(0u), uint4(0u) };
+    U256u acc_b = U256u { uint4(0u), uint4(0u) };
+    U256u acc_c = U256u { uint4(0u), uint4(0u) };
+    U256u acc_d = U256u { uint4(0u), uint4(0u) };
     uint4 qa = uint4(0u), qb = uint4(0u);
     for (uint j = 0u; j < 4u; j++) {
         const uint o = (j << 8) + lid;
@@ -263,9 +259,14 @@ kernel void zc_t0_fold(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid < 32u) {
-        ulong4 s = red[lid];
-        for (uint k = 1u; k < 8u; k++) { s ^= red[(k << 5) + lid]; }
-        banks[(ulong(chunk) << 5) + lid] = s;
+        U256u s = red[lid];
+        for (uint k = 1u; k < 8u; k++) {
+            s.lo ^= red[(k << 5) + lid].lo;
+            s.hi ^= red[(k << 5) + lid].hi;
+        }
+        const ulong idx = ((ulong(chunk) << 5) + lid) * 2ul;
+        banks[idx] = s.lo;
+        banks[idx + 1ul] = s.hi;
     }
 }
 "#;

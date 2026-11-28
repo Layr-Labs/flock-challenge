@@ -563,6 +563,34 @@ unsafe fn ab_row_pair<const B: usize>(mid: *const u8) -> (usize, usize) {
 /// Bit-exactness: every lane XORs the same `ab_ld` entries (same table, same
 /// row byte) into the same bank slot, grouped in the same row pairs.
 #[inline(always)]
+unsafe fn load_pair_u8(p: *const u8) -> (core::arch::aarch64::uint8x16_t, core::arch::aarch64::uint8x16_t) {
+    let (a, b);
+    unsafe {
+        core::arch::asm!(
+            "ldp {a:q}, {b:q}, [{p}]",
+            p = in(reg) p,
+            a = out(vreg) a,
+            b = out(vreg) b,
+            options(pure, readonly, nostack, preserves_flags),
+        );
+    }
+    (a, b)
+}
+
+#[inline(always)]
+unsafe fn store_pair_u8(p: *mut u8, a: core::arch::aarch64::uint8x16_t, b: core::arch::aarch64::uint8x16_t) {
+    unsafe {
+        core::arch::asm!(
+            "stp {a:q}, {b:q}, [{p}]",
+            p = in(reg) p,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+#[inline(always)]
 pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
     chunk_ab_bytes: &[[u8; 64]; 16],
     first_b_med: usize,
@@ -584,22 +612,14 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
         let mut mid = (chunk_ab_bytes.as_ptr() as *const u8).add((first_b_med + 7) * 64);
         let mut slot = bank.as_mut_ptr() as *mut u8;
         for _ in 0..4 {
-            let mut a0 = vld1q_u8(slot);
-            let mut a1 = vld1q_u8(slot.add(16));
-            let mut a2 = vld1q_u8(slot.add(32));
-            let mut a3 = vld1q_u8(slot.add(48));
-            let mut a4 = vld1q_u8(slot.add(64));
-            let mut a5 = vld1q_u8(slot.add(80));
-            let mut a6 = vld1q_u8(slot.add(96));
-            let mut a7 = vld1q_u8(slot.add(112));
-            let mut a8 = vld1q_u8(slot.add(128));
-            let mut a9 = vld1q_u8(slot.add(144));
-            let mut a10 = vld1q_u8(slot.add(160));
-            let mut a11 = vld1q_u8(slot.add(176));
-            let mut a12 = vld1q_u8(slot.add(192));
-            let mut a13 = vld1q_u8(slot.add(208));
-            let mut a14 = vld1q_u8(slot.add(224));
-            let mut a15 = vld1q_u8(slot.add(240));
+            let (mut a0, mut a1) = load_pair_u8(slot);
+            let (mut a2, mut a3) = load_pair_u8(slot.add(32));
+            let (mut a4, mut a5) = load_pair_u8(slot.add(64));
+            let (mut a6, mut a7) = load_pair_u8(slot.add(96));
+            let (mut a8, mut a9) = load_pair_u8(slot.add(128));
+            let (mut a10, mut a11) = load_pair_u8(slot.add(160));
+            let (mut a12, mut a13) = load_pair_u8(slot.add(192));
+            let (mut a14, mut a15) = load_pair_u8(slot.add(224));
 
             // One word of an (even, odd) row pair into eight accumulators.
             macro_rules! fold8 {
@@ -634,22 +654,14 @@ pub(crate) unsafe fn accumulate_convert_ab_nomul_seeded_pair16<const U: bool>(
             pair!(10, 11);
             pair!(12, 13);
 
-            vst1q_u8(slot, a0);
-            vst1q_u8(slot.add(16), a1);
-            vst1q_u8(slot.add(32), a2);
-            vst1q_u8(slot.add(48), a3);
-            vst1q_u8(slot.add(64), a4);
-            vst1q_u8(slot.add(80), a5);
-            vst1q_u8(slot.add(96), a6);
-            vst1q_u8(slot.add(112), a7);
-            vst1q_u8(slot.add(128), a8);
-            vst1q_u8(slot.add(144), a9);
-            vst1q_u8(slot.add(160), a10);
-            vst1q_u8(slot.add(176), a11);
-            vst1q_u8(slot.add(192), a12);
-            vst1q_u8(slot.add(208), a13);
-            vst1q_u8(slot.add(224), a14);
-            vst1q_u8(slot.add(240), a15);
+            store_pair_u8(slot, a0, a1);
+            store_pair_u8(slot.add(32), a2, a3);
+            store_pair_u8(slot.add(64), a4, a5);
+            store_pair_u8(slot.add(96), a6, a7);
+            store_pair_u8(slot.add(128), a8, a9);
+            store_pair_u8(slot.add(160), a10, a11);
+            store_pair_u8(slot.add(192), a12, a13);
+            store_pair_u8(slot.add(224), a14, a15);
             mid = mid.add(16);
             slot = slot.add(256);
         }
@@ -1214,13 +1226,13 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
     // live rows and four zero rows, so masks remain nibbles; concatenating two
     // masks therefore indexes exactly one of 256 fixed table entries.
     unsafe {
-        macro_rules! transpose8 {
-            ($x:expr, $m33:expr, $m55:expr) => {{
-                let x: [uint8x16_t; 8] = $x;
+        macro_rules! transpose4 {
+            ($x0:expr, $x1:expr, $x2:expr, $x3:expr, $m0f:expr, $m33:expr, $m55:expr) => {{
+                let x = [$x0, $x1, $x2, $x3];
                 let mut a = [vdupq_n_u8(0); 8];
                 for b in 0..4 {
-                    a[b] = vsliq_n_u8::<4>(x[b], x[b + 4]);
-                    a[b + 4] = vsriq_n_u8::<4>(x[b + 4], x[b]);
+                    a[b] = vandq_u8(x[b], $m0f);
+                    a[b + 4] = vshrq_n_u8::<4>(x[b]);
                 }
                 let mut c = [vdupq_n_u8(0); 8];
                 for block in 0..2 {
@@ -1268,6 +1280,7 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
         // instead of retaining all four q groups for all four witness blocks.
         let mut masks = [[[0u8; 64]; 8]; 4];
         let sources = c_blocks.map(|block| block.as_ptr());
+        let m0f = vdupq_n_u8(0x0f);
         let m33 = vdupq_n_u8(0x33);
         let m55 = vdupq_n_u8(0x55);
         let zero = vdupq_n_u8(0);
@@ -1287,20 +1300,7 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
                             zero
                         }
                     };
-                    let t = transpose8!(
-                        [
-                            row(q),
-                            row(q + 4),
-                            row(q + 8),
-                            row(q + 12),
-                            zero,
-                            zero,
-                            zero,
-                            zero,
-                        ],
-                        m33,
-                        m55
-                    );
+                    let t = transpose4!(row(q), row(q + 4), row(q + 8), row(q + 12), m0f, m33, m55);
                     let interleaved = interleave8!(t);
                     let dst = masks[side].as_mut_ptr() as *mut u8;
                     for (i, value) in interleaved.into_iter().enumerate() {
@@ -1316,98 +1316,26 @@ pub(crate) unsafe fn accumulate_c_fold4_four_banks(
                     let m1 = (masks[1][k].as_ptr().add(lane) as *const u64).read_unaligned();
                     let m2 = (masks[2][k].as_ptr().add(lane) as *const u64).read_unaligned();
                     let m3 = (masks[3][k].as_ptr().add(lane) as *const u64).read_unaligned();
-                    let indices01 = m0 | (m1 << 4);
-                    let indices23 = m2 | (m3 << 4);
+                    let i01 = (m0 | (m1 << 4)) as usize;
+                    let i23 = (m2 | (m3 << 4)) as usize;
 
-                    let i010 = usize::from((indices01 & 0xff) as u8);
-                    let i011 = usize::from(((indices01 >> 8) & 0xff) as u8);
-                    let i012 = usize::from(((indices01 >> 16) & 0xff) as u8);
-                    let i013 = usize::from(((indices01 >> 24) & 0xff) as u8);
-                    let i014 = usize::from(((indices01 >> 32) & 0xff) as u8);
-                    let i015 = usize::from(((indices01 >> 40) & 0xff) as u8);
-                    let i016 = usize::from(((indices01 >> 48) & 0xff) as u8);
-                    let i017 = usize::from((indices01 >> 56) as u8);
-                    let i230 = usize::from((indices23 & 0xff) as u8);
-                    let i231 = usize::from(((indices23 >> 8) & 0xff) as u8);
-                    let i232 = usize::from(((indices23 >> 16) & 0xff) as u8);
-                    let i233 = usize::from(((indices23 >> 24) & 0xff) as u8);
-                    let i234 = usize::from(((indices23 >> 32) & 0xff) as u8);
-                    let i235 = usize::from(((indices23 >> 40) & 0xff) as u8);
-                    let i236 = usize::from(((indices23 >> 48) & 0xff) as u8);
-                    let i237 = usize::from((indices23 >> 56) as u8);
-
-                    let p0 = bank.add(lane * 16);
-                    let p1 = p0.add(16);
-                    let p2 = p1.add(16);
-                    let p3 = p2.add(16);
-                    let p4 = p3.add(16);
-                    let p5 = p4.add(16);
-                    let p6 = p5.add(16);
-                    let p7 = p6.add(16);
-                    vst1q_u8(
-                        p0,
-                        xor3_u8(
-                            vld1q_u8(p0),
-                            vld1q_u8(table01.add(i010 * 16)),
-                            vld1q_u8(table23.add(i230 * 16)),
-                        ),
-                    );
-                    vst1q_u8(
-                        p1,
-                        xor3_u8(
-                            vld1q_u8(p1),
-                            vld1q_u8(table01.add(i011 * 16)),
-                            vld1q_u8(table23.add(i231 * 16)),
-                        ),
-                    );
-                    vst1q_u8(
-                        p2,
-                        xor3_u8(
-                            vld1q_u8(p2),
-                            vld1q_u8(table01.add(i012 * 16)),
-                            vld1q_u8(table23.add(i232 * 16)),
-                        ),
-                    );
-                    vst1q_u8(
-                        p3,
-                        xor3_u8(
-                            vld1q_u8(p3),
-                            vld1q_u8(table01.add(i013 * 16)),
-                            vld1q_u8(table23.add(i233 * 16)),
-                        ),
-                    );
-                    vst1q_u8(
-                        p4,
-                        xor3_u8(
-                            vld1q_u8(p4),
-                            vld1q_u8(table01.add(i014 * 16)),
-                            vld1q_u8(table23.add(i234 * 16)),
-                        ),
-                    );
-                    vst1q_u8(
-                        p5,
-                        xor3_u8(
-                            vld1q_u8(p5),
-                            vld1q_u8(table01.add(i015 * 16)),
-                            vld1q_u8(table23.add(i235 * 16)),
-                        ),
-                    );
-                    vst1q_u8(
-                        p6,
-                        xor3_u8(
-                            vld1q_u8(p6),
-                            vld1q_u8(table01.add(i016 * 16)),
-                            vld1q_u8(table23.add(i236 * 16)),
-                        ),
-                    );
-                    vst1q_u8(
-                        p7,
-                        xor3_u8(
-                            vld1q_u8(p7),
-                            vld1q_u8(table01.add(i017 * 16)),
-                            vld1q_u8(table23.add(i237 * 16)),
-                        ),
-                    );
+                    let p = bank.add(lane * 16);
+                    let (mut c0, mut c1) = load_pair_u8(p);
+                    let (mut c2, mut c3) = load_pair_u8(p.add(32));
+                    let (mut c4, mut c5) = load_pair_u8(p.add(64));
+                    let (mut c6, mut c7) = load_pair_u8(p.add(96));
+                    c0 = xor3_u8(c0, ab_ld::<true, 0>(table01, i01), ab_ld::<true, 0>(table23, i23));
+                    c1 = xor3_u8(c1, ab_ld::<true, 8>(table01, i01), ab_ld::<true, 8>(table23, i23));
+                    c2 = xor3_u8(c2, ab_ld::<true, 16>(table01, i01), ab_ld::<true, 16>(table23, i23));
+                    c3 = xor3_u8(c3, ab_ld::<true, 24>(table01, i01), ab_ld::<true, 24>(table23, i23));
+                    c4 = xor3_u8(c4, ab_ld::<true, 32>(table01, i01), ab_ld::<true, 32>(table23, i23));
+                    c5 = xor3_u8(c5, ab_ld::<true, 40>(table01, i01), ab_ld::<true, 40>(table23, i23));
+                    c6 = xor3_u8(c6, ab_ld::<true, 48>(table01, i01), ab_ld::<true, 48>(table23, i23));
+                    c7 = xor3_u8(c7, ab_ld::<true, 56>(table01, i01), ab_ld::<true, 56>(table23, i23));
+                    store_pair_u8(p, c0, c1);
+                    store_pair_u8(p.add(32), c2, c3);
+                    store_pair_u8(p.add(64), c4, c5);
+                    store_pair_u8(p.add(96), c6, c7);
                 }
             }
         }
@@ -4527,7 +4455,7 @@ pub(crate) fn ab_bstatic_z_enabled() -> bool {
 /// image, `kara` its [`ab_kara_tables`] base.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn apply_word_z_low<const NB: u32>(
+unsafe fn apply_word_z_low_x<const NB: u32, const XOR_ONE: bool>(
     t0: *const u8,
     kara: *const u8,
     w: u64,
@@ -4571,12 +4499,35 @@ unsafe fn apply_word_z_low<const NB: u32>(
         if NB >= 3 {
             // {2,3,6,7}: bytes 2 ^ 3.
             let a = rec(ab_z_idx::<2, 7>(ys));
-            let (m0, m2) = (ld(a, 0), ld(a, 16));
+            let (mut m0, mut m2) = (ld(a, 0), ld(a, 16));
+            if XOR_ONE {
+                let one = vdupq_n_u8(1);
+                m0 = veorq_u8(m0, one);
+                m2 = veorq_u8(m2, one);
+            }
             (xor3_u8(l0, m0, b0), xor3_u8(l1, m0, b1), xor3_u8(l2, m2, b2), xor3_u8(l3, m2, b3))
+        } else if XOR_ONE {
+            let one = vdupq_n_u8(1);
+            (xor3_u8(one, l0, b0), xor3_u8(one, l1, b1), xor3_u8(one, l2, b2), xor3_u8(one, l3, b3))
         } else {
             (veorq_u8(l0, b0), veorq_u8(l1, b1), veorq_u8(l2, b2), veorq_u8(l3, b3))
         }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn apply_word_z_low<const NB: u32>(
+    t0: *const u8,
+    kara: *const u8,
+    w: u64,
+) -> (
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+    core::arch::aarch64::uint8x16_t,
+) {
+    unsafe { apply_word_z_low_x::<NB, false>(t0, kara, w) }
 }
 
 /// Row-body variant bit (with [`ABV_TRANSFORM_TRIM`], [`ABV_FUSE`] and the
@@ -4663,21 +4614,11 @@ unsafe fn apply_word_sparse_x4<const NB: u32, const HIGH: bool>(
         };
         let z = vdupq_n_u8(0);
         let a = at(ab_z_idx::<0, 7>(v));
-        let (mut e0, mut e1, mut e2, mut e3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
+        let (e0, e1, e2, e3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
         let (mut o0, mut o1, mut o2, mut o3) = (z, z, z, z);
         if NB >= 2 {
             let a = at(ab_z_idx::<1, 7>(v));
             (o0, o1, o2, o3) = (ld(a, 0), ld(a, 16), ld(a, 32), ld(a, 48));
-        }
-        if NB >= 3 {
-            let a = at(ab_z_idx::<2, 7>(w));
-            let (m01, m23) = (ld(a, 64), ld(a, 80));
-            (e0, e1, e2, e3) = (veorq_u8(e0, m01), veorq_u8(e1, m01), veorq_u8(e2, m23), veorq_u8(e3, m23));
-        }
-        if NB >= 4 {
-            let a = at(ab_z_idx::<3, 7>(w));
-            let (m01, m23) = (ld(a, 64), ld(a, 80));
-            (o0, o1, o2, o3) = (veorq_u8(o0, m01), veorq_u8(o1, m01), veorq_u8(o2, m23), veorq_u8(o3, m23));
         }
         // x^4 · 1 in GF(2^8).
         let c = vdupq_n_u8(0x10);
@@ -4687,6 +4628,24 @@ unsafe fn apply_word_sparse_x4<const NB: u32, const HIGH: bool>(
                 (veorq_u8(c, sw(e3)), veorq_u8(c, sw(e2)), veorq_u8(c, sw(e1)), veorq_u8(c, sw(e0)))
             } else {
                 (veorq_u8(c, e0), veorq_u8(c, e1), veorq_u8(c, e2), veorq_u8(c, e3))
+            };
+        }
+        if NB >= 4 {
+            let a = at(ab_z_idx::<3, 7>(w));
+            let (m01, m23) = (ld(a, 64), ld(a, 80));
+            (o0, o1, o2, o3) = (veorq_u8(o0, m01), veorq_u8(o1, m01), veorq_u8(o2, m23), veorq_u8(o3, m23));
+        }
+        if NB >= 3 {
+            let a = at(ab_z_idx::<2, 7>(w));
+            let (m01, m23) = (ld(a, 64), ld(a, 80));
+            return if HIGH {
+                let m01_c = veorq_u8(c, sw(m01));
+                let m23_c = veorq_u8(c, sw(m23));
+                (xor3_u8(o3, m23_c, sw(e3)), xor3_u8(o2, m23_c, sw(e2)), xor3_u8(o1, m01_c, sw(e1)), xor3_u8(o0, m01_c, sw(e0)))
+            } else {
+                let m01_c = veorq_u8(c, m01);
+                let m23_c = veorq_u8(c, m23);
+                (xor3_u8(e0, m01_c, sw(o0)), xor3_u8(e1, m01_c, sw(o1)), xor3_u8(e2, m23_c, sw(o2)), xor3_u8(e3, m23_c, sw(o3)))
             };
         }
         if HIGH {

@@ -59,30 +59,28 @@ static inline uint4 clmul64_u16(uint2 a, uint2 b) {
     return uint4(p0.x, p0.y ^ pm.x, p2.x ^ pm.y, p2.y);
 }
 
-struct U256k { ulong r0; ulong r1; ulong r2; ulong r3; };
+struct U256u { uint4 lo; uint4 hi; };
 
-static inline U256k clmul128(uint4 a, uint4 b) {
+static inline U256u clmul128(uint4 a, uint4 b) {
     uint4 p0 = clmul64_u16(a.xy, b.xy);
     uint4 p2 = clmul64_u16(a.zw, b.zw);
     uint4 pm = clmul64_u16(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
-    U256k r;
-    r.r0 = (ulong(p0.y) << 32) | p0.x;
-    r.r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
-    r.r2 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
-    r.r3 = (ulong(p2.w) << 32) | p2.z;
+    U256u r;
+    r.lo = uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y);
+    r.hi = uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w);
     return r;
 }
 
-// Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1.
-static inline uint4 gf_reduce(U256k p) {
-    ulong h0 = p.r2, h1 = p.r3;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = p.r0 ^ t0, l1 = p.r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+// Reduce a 255-bit product mod x^128 + x^7 + x^2 + x + 1 in native 32-bit lanes.
+static inline uint4 gf_reduce(U256u p) {
+    uint4 t = p.hi ^ (p.hi << 1) ^ (p.hi << 2) ^ (p.hi << 7);
+    uint4 c = (p.hi >> 31) ^ (p.hi >> 30) ^ (p.hi >> 25);
+    t.y ^= c.x;
+    t.z ^= c.y;
+    t.w ^= c.z;
+    uint ov = c.w;
+    t.x ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    return p.lo ^ t;
 }
 
 // Multiply a 16-byte value by a challenge through its 16 byte-bank nibble
@@ -129,9 +127,9 @@ static inline uint4 mul_rho16b(uint4 x, threadgroup const uint4* tab) {
     return a;
 }
 
-static inline ulong4 acc_mul(ulong4 acc, uint4 x, uint4 y) {
-    U256k p = clmul128(x, y);
-    return acc ^ ulong4(p.r0, p.r1, p.r2, p.r3);
+static inline U256u acc_mul(U256u acc, uint4 x, uint4 y) {
+    U256u p = clmul128(x, y);
+    return U256u { acc.lo ^ p.lo, acc.hi ^ p.hi };
 }
 
 // v ^ v of lane (lane ^ m) of the simdgroup.
@@ -139,13 +137,8 @@ static inline uint4 xor_lanes(uint4 v, ushort m) {
     return v ^ simd_shuffle_xor(v, m);
 }
 
-static inline ulong4 xor_lanes4(ulong4 v, ushort m) {
-    uint4 lo = uint4(uint(v.x), uint(v.y), uint(v.z), uint(v.w));
-    uint4 hi = uint4(uint(v.x >> 32), uint(v.y >> 32), uint(v.z >> 32), uint(v.w >> 32));
-    lo = simd_shuffle_xor(lo, m);
-    hi = simd_shuffle_xor(hi, m);
-    return v ^ ulong4(ulong(lo.x) | (ulong(hi.x) << 32), ulong(lo.y) | (ulong(hi.y) << 32),
-                      ulong(lo.z) | (ulong(hi.z) << 32), ulong(lo.w) | (ulong(hi.w) << 32));
+static inline U256u xor_lanes4(U256u v, ushort m) {
+    return U256u { v.lo ^ simd_shuffle_xor(v.lo, m), v.hi ^ simd_shuffle_xor(v.hi, m) };
 }
 
 // Ranked chunk geometry: 128 packed superblocks of 244 a entries and 512
@@ -162,7 +155,7 @@ kernel void zc_t56_fold(
     device uint4*       a_out  [[buffer(2)]],
     device uint4*       b_out  [[buffer(3)]],
     device const uint4* consts [[buffer(4)]],
-    device ulong4*      banks  [[buffer(5)]],
+    device uint4*       banks  [[buffer(5)]],
     constant T56Params& p      [[buffer(6)]],
     device const uint*  cut    [[buffer(7)]],
     uint tg_rel [[threadgroup_position_in_grid]],
@@ -200,7 +193,10 @@ kernel void zc_t56_fold(
     device uint4* ao = a_out + ulong(chunk) * T56_OUT;
     device uint4* bo = b_out + ulong(chunk) * T56_OUT;
     device const uint4* eq_odd = consts + 1024u;
-    ulong4 acc_a = ulong4(0ul), acc_b = ulong4(0ul), acc_c = ulong4(0ul), acc_d = ulong4(0ul);
+    U256u acc_a = U256u { uint4(0u), uint4(0u) };
+    U256u acc_b = U256u { uint4(0u), uint4(0u) };
+    U256u acc_c = U256u { uint4(0u), uint4(0u) };
+    U256u acc_d = U256u { uint4(0u), uint4(0u) };
     uint4 qa = uint4(0u), qb = uint4(0u);
     for (uint j = 0u; j < 8u; j++) {
         const uint o = (quarter << 11) + (j << 8) + lid;
@@ -209,34 +205,31 @@ kernel void zc_t56_fold(
         const uint hsel = y & 1u;
         const bool tail = (hsel != 0u) && (l == 7u);
         const uint sup = (blk >> 2) * 244u;
-        uint4 a0, a1, a2, a3;
+        uint4 fa, fb;
         if (tail) {
-            a0 = ai[sup + 240u + (blk & 3u)];
-            a1 = uint4(0u); a2 = uint4(0u); a3 = uint4(0u);
+            const uint4 a0 = ai[sup + 240u + (blk & 3u)];
+            const uint4 fa0 = a0 ^ mul_rho32(a0, tab);
+            fa = fa0 ^ mul_rho16b(fa0, tab + 1024);
+            const uint4 b0 = bi[blk * 56u + 55u];
+            const uint4 fb0 = b0 ^ mul_rho32(b0, tab);
+            fb = fb0 ^ mul_rho16b(fb0, tab + 1024);
         } else {
             const uint p = sup + 60u * (blk & 3u) + (hsel << 5) + (l << 2);
-            a0 = ai[p]; a1 = ai[p + 1u]; a2 = ai[p + 2u]; a3 = ai[p + 3u];
+            const uint4 a0 = ai[p], a1 = ai[p + 1u], a2 = ai[p + 2u], a3 = ai[p + 3u];
+            const uint4 fa0 = a0 ^ mul_rho32(a0 ^ a1, tab);
+            const uint4 fa1 = a2 ^ mul_rho32(a2 ^ a3, tab);
+            fa = fa0 ^ mul_rho16b(fa0 ^ fa1, tab + 1024);
+            if (hsel == 0u && l == 0u) {
+                fb = one;
+            } else {
+                const uint q = blk * 56u + (hsel << 5) + (l << 2) - 4u;
+                const uint4 b0 = bi[q], b1 = bi[q + 1u], b2 = bi[q + 2u];
+                const uint4 b3 = (hsel != 0u && l == 6u) ? one : bi[q + 3u];
+                const uint4 fb0 = b0 ^ mul_rho32(b0 ^ b1, tab);
+                const uint4 fb1 = b2 ^ mul_rho32(b2 ^ b3, tab);
+                fb = fb0 ^ mul_rho16b(fb0 ^ fb1, tab + 1024);
+            }
         }
-        // b-one-packed: block blk's inputs 4..58 at 56 blk + 0..54 and its
-        // input 60 at 56 blk + 55; inputs 0..3 and 59 are one, 61..63 zero.
-        const uint bm = blk * 56u;
-        uint4 b0, b1, b2, b3;
-        if (hsel == 0u && l == 0u) {
-            b0 = one; b1 = one; b2 = one; b3 = one;
-        } else if (tail) {
-            b0 = bi[bm + 55u];
-            b1 = uint4(0u); b2 = uint4(0u); b3 = uint4(0u);
-        } else {
-            const uint q = bm + (hsel << 5) + (l << 2) - 4u;
-            b0 = bi[q]; b1 = bi[q + 1u]; b2 = bi[q + 2u];
-            if (hsel != 0u && l == 6u) { b3 = one; } else { b3 = bi[q + 3u]; }
-        }
-        const uint4 fa0 = a0 ^ mul_rho32(a0 ^ a1, tab);
-        const uint4 fa1 = a2 ^ mul_rho32(a2 ^ a3, tab);
-        const uint4 fa = fa0 ^ mul_rho16b(fa0 ^ fa1, tab + 1024);
-        const uint4 fb0 = b0 ^ mul_rho32(b0 ^ b1, tab);
-        const uint4 fb1 = b2 ^ mul_rho32(b2 ^ b3, tab);
-        const uint4 fb = fb0 ^ mul_rho16b(fb0 ^ fb1, tab + 1024);
         ao[o] = fa;
         bo[o] = fb;
         const uint4 wa = gf_reduce(clmul128(eq_odd[y], fa));
@@ -265,7 +258,7 @@ kernel void zc_t56_fold(
     acc_d = xor_lanes4(acc_d, ushort(16));
     // Retire every table reader before reusing `tab` as the 8 KiB reduction buffer.
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    threadgroup ulong4* red = reinterpret_cast<threadgroup ulong4*>(tab);
+    threadgroup U256u* red = reinterpret_cast<threadgroup U256u*>(tab);
     if ((lid & 31u) < 8u) {
         const uint base = (lid >> 5) * 32u + l;
         red[base] = acc_a;
@@ -275,9 +268,14 @@ kernel void zc_t56_fold(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid < 32u) {
-        ulong4 s = red[lid];
-        for (uint k = 1u; k < 8u; k++) { s ^= red[(k << 5) + lid]; }
-        banks[(ulong(tg) << 5) + lid] = s;
+        U256u s = red[lid];
+        for (uint k = 1u; k < 8u; k++) {
+            s.lo ^= red[(k << 5) + lid].lo;
+            s.hi ^= red[(k << 5) + lid].hi;
+        }
+        const ulong idx = ((ulong(tg) << 5) + lid) * 2ul;
+        banks[idx] = s.lo;
+        banks[idx + 1ul] = s.hi;
     }
 }
 "#;

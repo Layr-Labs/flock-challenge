@@ -838,12 +838,15 @@ pub(crate) fn drain_hetero(
 /// same atomic cursor (the main workers drain to the end), and `f(i)` does not
 /// depend on which thread runs it, so outputs are byte-identical.
 /// `FLOCK_NO_EPOOL_TAIL_GUARD=1` restores unconditional helper claims.
+#[repr(align(128))]
 struct TailGuard {
     on: bool,
     main_threads: u64,
     main_ns: AtomicU64,
     main_cnt: AtomicU64,
 }
+
+const TAIL_GUARD_MAX_SAMPLES: u64 = 64;
 
 fn tail_guard_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -862,10 +865,11 @@ impl TailGuard {
         }
     }
 
-    /// Run main-pool chunk `i`, publishing its duration.
+    /// Run main-pool chunk `i`, publishing its duration until enough samples
+    /// have converged to avoid per-chunk timer and shared-atomic overhead.
     #[inline]
     fn main_run(&self, run: impl FnOnce()) {
-        if !self.on {
+        if !self.on || self.main_cnt.load(Ordering::Relaxed) >= TAIL_GUARD_MAX_SAMPLES {
             run();
             return;
         }
@@ -1440,6 +1444,7 @@ fn run_chunks_with_helper_arm_after(
             EPOOL_BROADCASTS.fetch_add(1, Ordering::Relaxed);
             let helper_body = || {
                 let mut own_ns = 0u64;
+                let mut ran = 0usize;
                 loop {
                     if !guard.helper_may_claim(own_ns, next.load(Ordering::Relaxed), n_chunks) {
                         break;
@@ -1448,8 +1453,11 @@ fn run_chunks_with_helper_arm_after(
                     if i >= n_chunks {
                         break;
                     }
-                    EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                    ran += 1;
                     guard.helper_run(&mut own_ns, || f(i));
+                }
+                if ran != 0 {
+                    EPOOL_HELPER_CHUNKS.fetch_add(ran, Ordering::Relaxed);
                 }
             };
             with_linger_slot(&linger_guest, || {
@@ -1586,6 +1594,7 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
             let helper_body = || {
                 let mut state = init();
                 let mut own_ns = 0u64;
+                let mut ran = 0usize;
                 loop {
                     if !guard.helper_may_claim(own_ns, next.load(Ordering::Relaxed), n_chunks) {
                         break;
@@ -1594,8 +1603,11 @@ fn run_chunks_with_helper_stateful_arm_tail<S, I, F>(
                     if i >= n_chunks {
                         break;
                     }
-                    EPOOL_HELPER_CHUNKS.fetch_add(1, Ordering::Relaxed);
+                    ran += 1;
                     guard.helper_run(&mut own_ns, || f(&mut state, i));
+                }
+                if ran != 0 {
+                    EPOOL_HELPER_CHUNKS.fetch_add(ran, Ordering::Relaxed);
                 }
             };
             drain_hetero(main_threads, &worker, ep, &helper_body, detached);

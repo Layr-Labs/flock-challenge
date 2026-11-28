@@ -5825,16 +5825,25 @@ static inline ZckU128 zck_clmul64(ulong a, ulong b) {
     return r;
 }
 
-// a * b mod x^128 + x^7 + x^2 + x + 1 (Karatsuba product, then reduction).
-// The Karatsuba levels on 32-bit lanes (a 64-bit v is uint2(v, v >> 32)):
-// lo ^ (mid << 16) ^ (hi << 32) is uint2(lo ^ (mid << 16), hi ^ (mid >> 16)),
-// and p_lo ^ (p_mid << 32), p_hi ^ (p_mid >> 32) are the uint4 words below,
-// so r0, r1, h0, h1 are the same limbs and the reduction is unchanged.
+// 16x16 carry-less product via native ushort 16x16->32 imad on Apple Silicon GPUs.
+static inline uint zck_clmul16_m3_u16(ushort a0, ushort a1, ushort a2, ushort b0, ushort b1, ushort b2) {
+    uint r0 = (uint(a0) * uint(b0) ^ uint(a1) * uint(b2) ^ uint(a2) * uint(b1)) & 0x49249249u;
+    uint r1 = (uint(a0) * uint(b1) ^ uint(a1) * uint(b0) ^ uint(a2) * uint(b2)) & 0x92492492u;
+    uint r2 = (uint(a0) * uint(b2) ^ uint(a1) * uint(b1) ^ uint(a2) * uint(b0)) & 0x24924924u;
+    return r0 | r1 | r2;
+}
+
 static inline uint2 zck_clmul32_u(uint a, uint b) {
-    uint al = a & 0xffffu, ah = a >> 16, bl = b & 0xffffu, bh = b >> 16;
-    uint lo = zck_clmul16(al, bl);
-    uint hi = zck_clmul16(ah, bh);
-    uint mid = zck_clmul16(al ^ ah, bl ^ bh) ^ lo ^ hi;
+    const ushort m0 = 0x9249u, m1 = 0x2492u, m2 = 0x4924u;
+    ushort al = ushort(a), ah = ushort(a >> 16);
+    ushort bl = ushort(b), bh = ushort(b >> 16);
+    ushort al0 = al & m0, al1 = al & m1, al2 = al & m2;
+    ushort ah0 = ah & m0, ah1 = ah & m1, ah2 = ah & m2;
+    ushort bl0 = bl & m0, bl1 = bl & m1, bl2 = bl & m2;
+    ushort bh0 = bh & m0, bh1 = bh & m1, bh2 = bh & m2;
+    uint lo = zck_clmul16_m3_u16(al0, al1, al2, bl0, bl1, bl2);
+    uint hi = zck_clmul16_m3_u16(ah0, ah1, ah2, bh0, bh1, bh2);
+    uint mid = zck_clmul16_m3_u16(al0 ^ ah0, al1 ^ ah1, al2 ^ ah2, bl0 ^ bh0, bl1 ^ bh1, bl2 ^ bh2) ^ lo ^ hi;
     return uint2(lo ^ (mid << 16), hi ^ (mid >> 16));
 }
 
@@ -5849,45 +5858,51 @@ static inline uint4 zck_mul(uint4 a, uint4 b) {
     uint4 p0 = zck_clmul64_u(a.xy, b.xy);
     uint4 p2 = zck_clmul64_u(a.zw, b.zw);
     uint4 pm = zck_clmul64_u(a.xy ^ a.zw, b.xy ^ b.zw) ^ p0 ^ p2;
-    ulong r0 = (ulong(p0.y) << 32) | p0.x;
-    ulong r1 = (ulong(p0.w ^ pm.y) << 32) | (p0.z ^ pm.x);
-    ulong h0 = (ulong(p2.y ^ pm.w) << 32) | (p2.x ^ pm.z);
-    ulong h1 = (ulong(p2.w) << 32) | p2.z;
-    ulong t0 = h0 ^ (h0 << 1) ^ (h0 << 2) ^ (h0 << 7);
-    ulong t1 = h1 ^ (h1 << 1) ^ (h1 << 2) ^ (h1 << 7)
-             ^ (h0 >> 63) ^ (h0 >> 62) ^ (h0 >> 57);
-    ulong ov = (h1 >> 63) ^ (h1 >> 62) ^ (h1 >> 57);
-    t0 ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
-    ulong l0 = r0 ^ t0, l1 = r1 ^ t1;
-    return uint4(uint(l0), uint(l0 >> 32), uint(l1), uint(l1 >> 32));
+    uint4 lo = uint4(p0.x, p0.y, p0.z ^ pm.x, p0.w ^ pm.y);
+    uint4 hi = uint4(p2.x ^ pm.z, p2.y ^ pm.w, p2.z, p2.w);
+    uint4 t = hi ^ (hi << 1) ^ (hi << 2) ^ (hi << 7);
+    uint4 c = (hi >> 31) ^ (hi >> 30) ^ (hi >> 25);
+    t.y ^= c.x;
+    t.z ^= c.y;
+    t.w ^= c.z;
+    uint ov = c.w;
+    t.x ^= ov ^ (ov << 1) ^ (ov << 2) ^ (ov << 7);
+    return lo ^ t;
 }
 
-// T(code) for one 8-byte delta code (lo = bytes 0..3, hi = bytes 4..7).
-static inline uint4 zck_fold8(uint lo, uint hi, threadgroup const uint4* nib) {
-    uint4 acc = uint4(0u);
-    for (uint j = 0u; j < 4u; j++) {
-        uint v = (lo >> (8u * j)) & 0xffu;
-        acc ^= nib[j * 32u + (v & 15u)] ^ nib[j * 32u + 16u + (v >> 4u)];
-    }
-    for (uint j = 0u; j < 4u; j++) {
-        uint v = (hi >> (8u * j)) & 0xffu;
-        acc ^= nib[(j + 4u) * 32u + (v & 15u)] ^ nib[(j + 4u) * 32u + 16u + (v >> 4u)];
-    }
+static inline uint4 zck_gf_shl16(uint4 a) {
+    uint h = a.w >> 16;
+    return uint4((a.x << 16) ^ ((h << 7) ^ (h << 2) ^ (h << 1) ^ h),
+                 (a.y << 16) | (a.x >> 16), (a.z << 16) | (a.y >> 16), (a.w << 16) | (a.z >> 16));
+}
+
+// T(code) for one 8-byte delta code: 5 full byte tables (bytes 0..4) + 3 nibble-pair tables (bytes 5..7)
+// -> 11 SRAM loads instead of 16.
+static inline uint4 zck_fold8(uint lo, uint hi, threadgroup const uint4* btab, threadgroup const uint4* ntab) {
+    uchar4 b0 = as_type<uchar4>(lo);
+    uchar4 b1 = as_type<uchar4>(hi);
+    uint4 acc = btab[b0.x] ^ btab[256u + b0.y] ^ btab[512u + b0.z] ^ btab[768u + b0.w] ^ btab[1024u + b1.x];
+    acc ^= ntab[b1.y & 15u] ^ ntab[16u + (b1.y >> 4u)];
+    acc ^= ntab[32u + (b1.z & 15u)] ^ ntab[48u + (b1.z >> 4u)];
+    acc ^= ntab[64u + (b1.w & 15u)] ^ ntab[80u + (b1.w >> 4u)];
     return acc;
 }
 
-// x * rho2 for the pass's fixed rho2: rho2 * x is F2-linear in x, so it is
-// the XOR over the 32 nibbles of x of the precomputed rho2 * (v << 4k)
-// (`rt[16k + v]`, built on the host per prove, 8 KiB in threadgroup memory).
+// Multiply by rho2 via 2 byte tables (byte-16 Horner: 16 SRAM loads vs 32, same 8 KiB rtab[512]).
 static inline uint4 zck_mulc(uint4 x, threadgroup const uint4* rt) {
-    uint4 acc = uint4(0u);
-    for (uint w = 0u; w < 4u; w++) {
-        uint v = x[w];
-        for (uint j = 0u; j < 8u; j++) {
-            acc ^= rt[(w * 8u + j) * 16u + ((v >> (4u * j)) & 15u)];
-        }
-    }
-    return acc;
+    uchar4 b3 = as_type<uchar4>(x.w);
+    uint4 a = rt[b3.z] ^ rt[256u + b3.w];
+    a = zck_gf_shl16(a) ^ rt[b3.x] ^ rt[256u + b3.y];
+    uchar4 b2 = as_type<uchar4>(x.z);
+    a = zck_gf_shl16(a) ^ rt[b2.z] ^ rt[256u + b2.w];
+    a = zck_gf_shl16(a) ^ rt[b2.x] ^ rt[256u + b2.y];
+    uchar4 b1 = as_type<uchar4>(x.y);
+    a = zck_gf_shl16(a) ^ rt[b1.z] ^ rt[256u + b1.w];
+    a = zck_gf_shl16(a) ^ rt[b1.x] ^ rt[256u + b1.y];
+    uchar4 b0 = as_type<uchar4>(x.x);
+    a = zck_gf_shl16(a) ^ rt[b0.z] ^ rt[256u + b0.w];
+    a = zck_gf_shl16(a) ^ rt[b0.x] ^ rt[256u + b0.y];
+    return a;
 }
 
 struct ZcKParams {
@@ -5936,12 +5951,19 @@ kernel void zc_k_fold_v2(
     ushort sl [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]])
 {
-    threadgroup uint4 nib[256];
+    // 29.5 KiB total SRAM (< 32 KiB): btab[1280] (20 KiB, aliased as sred[8][8] at end),
+    // ntab[96] (1.5 KiB), rtab[512] (8 KiB).
+    threadgroup uint4 btab[1280];
+    threadgroup uint4 ntab[96];
     threadgroup uint4 rtab[512];
-    threadgroup uint4 sred[8][8];
-    nib[lid] = nib_dev[lid];
-    rtab[lid] = nib_dev[256u + lid];
-    rtab[256u + lid] = nib_dev[512u + lid];
+    const uint lo4 = lid & 15u;
+    const uint hi4 = lid >> 4u;
+    for (uint j = 0u; j < 5u; j++) {
+        btab[j * 256u + lid] = nib_dev[j * 32u + lo4] ^ nib_dev[j * 32u + 16u + hi4];
+    }
+    if (lid < 96u) { ntab[lid] = nib_dev[160u + lid]; }
+    rtab[lid]        = nib_dev[256u + lo4] ^ nib_dev[272u + hi4];
+    rtab[256u + lid] = nib_dev[288u + lo4] ^ nib_dev[304u + hi4];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     uint i = lid & 63u;
@@ -5957,24 +5979,24 @@ kernel void zc_k_fold_v2(
         ulong db = ulong(p.d_base) + blk * ulong(p.d_stride);
         if (p.hc != 0u && i < 4u) {
             uint4 dd = deltas[db + ulong(i)];
-            xa0 = anchors[ab + 2ul * ulong(i)] ^ zck_fold8(dd.x, dd.y, nib);
-            xa1 = anchors[ab + 2ul * ulong(i) + 1ul] ^ zck_fold8(dd.z, dd.w, nib);
-            xb0 = consts[1];
-            xb1 = consts[1];
+            xa0 = anchors[ab + 2ul * ulong(i)] ^ zck_fold8(dd.x, dd.y, btab, ntab);
+            xa1 = anchors[ab + 2ul * ulong(i) + 1ul] ^ zck_fold8(dd.z, dd.w, btab, ntab);
+            a = xa0 ^ zck_mulc(xa0 ^ xa1, rtab);
+            b = consts[1];
         } else {
             ab += 4ul * ulong(i) - ulong(p.a_shift);
             db += 2ul * ulong(i) - ulong(p.d_shift);
             uint4 d0 = deltas[db];
-            xa0 = anchors[ab] ^ zck_fold8(d0.x, d0.y, nib);
-            xb0 = anchors[ab + 1ul] ^ zck_fold8(d0.z, d0.w, nib);
+            xa0 = anchors[ab] ^ zck_fold8(d0.x, d0.y, btab, ntab);
+            xb0 = anchors[ab + 1ul] ^ zck_fold8(d0.z, d0.w, btab, ntab);
             if (i < 60u) {
                 uint4 d1 = deltas[db + 1ul];
-                xa1 = anchors[ab + 2ul] ^ zck_fold8(d1.x, d1.y, nib);
-                xb1 = anchors[ab + 3ul] ^ zck_fold8(d1.z, d1.w, nib);
+                xa1 = anchors[ab + 2ul] ^ zck_fold8(d1.x, d1.y, btab, ntab);
+                xb1 = anchors[ab + 3ul] ^ zck_fold8(d1.z, d1.w, btab, ntab);
             }
+            a = xa0 ^ zck_mulc(xa0 ^ xa1, rtab);
+            b = xb0 ^ zck_mulc(xb0 ^ xb1, rtab);
         }
-        a = xa0 ^ zck_mulc(xa0 ^ xa1, rtab);
-        b = xb0 ^ zck_mulc(xb0 ^ xb1, rtab);
         out_a[ulong(tg) * 244ul + ulong(i < 60u ? 60u * k + i : 240u + k)] = a;
         if (i < 4u || i == 59u) {
             if (any(b != uint4(1u, 0u, 0u, 0u))) {
@@ -6014,14 +6036,16 @@ kernel void zc_k_fold_v2(
         r0 ^= simd_shuffle_xor(r0, off);
         r1 ^= simd_shuffle_xor(r1, off);
     }
+    // Retire all btab readers before reusing btab[0..64] as sred[8][8].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sl < 4) {
-        sred[sg][2u * uint(sl)] = r0;
-        sred[sg][2u * uint(sl) + 1u] = r1;
+        btab[uint(sg) * 8u + 2u * uint(sl)] = r0;
+        btab[uint(sg) * 8u + 2u * uint(sl) + 1u] = r1;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid < 8u) {
         uint4 s = uint4(0u);
-        for (uint j = 0u; j < 8u; j++) { s ^= sred[j][lid]; }
+        for (uint j = 0u; j < 8u; j++) { s ^= btab[j * 8u + lid]; }
         tg_part[ulong(tg) * 8ul + ulong(lid)] = s;
     }
 }

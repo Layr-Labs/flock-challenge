@@ -194,7 +194,30 @@ pub mod neon {
             let cl = vuzp1q_u8(c0, c1); // low bytes of all 16 products
             let ch = vuzp2q_u8(c0, c1); // high bytes of all 16 products
 
-            veorq_u8(cl, gf8_fold_high_bytes_vec16(ch))
+            #[cfg(target_feature = "sha3")]
+            {
+                const RED_LO: [u8; 16] = [
+                    0x00, 0x1b, 0x36, 0x2d, 0x6c, 0x77, 0x5a, 0x41, 0xd8, 0xc3, 0xee, 0xf5, 0xb4,
+                    0xaf, 0x82, 0x99,
+                ];
+                const RED_HI: [u8; 16] = [
+                    0x00, 0xab, 0x4d, 0xe6, 0x9a, 0x31, 0xd7, 0x7c, 0x2f, 0x84, 0x62, 0xc9, 0xb5,
+                    0x1e, 0xf8, 0x53,
+                ];
+                let lo_nibble = vandq_u8(ch, vdupq_n_u8(0x0f));
+                let hi_nibble = vshrq_n_u8::<4>(ch);
+                let red_lo = vld1q_u8(RED_LO.as_ptr());
+                let red_hi = vld1q_u8(RED_HI.as_ptr());
+                veor3q_u8(
+                    cl,
+                    vqtbl1q_u8(red_lo, lo_nibble),
+                    vqtbl1q_u8(red_hi, hi_nibble),
+                )
+            }
+            #[cfg(not(target_feature = "sha3"))]
+            {
+                veorq_u8(cl, gf8_fold_high_bytes_vec16(ch))
+            }
         }
     }
 
