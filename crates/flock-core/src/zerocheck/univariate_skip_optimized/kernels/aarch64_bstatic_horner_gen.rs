@@ -143,17 +143,23 @@ fn bstatic_horner_blk_body<const BLK: usize, const V: u32, const HOIST: bool>(
         macro_rules! bimg_lz {
             ($blk:literal, $k:literal, $nb:literal, $inc:expr) => {{
                 if V & ABV_BSTATIC_Z != 0 {
-                    let pp = pbase.add(($blk * 8 + $k) * 64);
-                    let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(
-                        plain, kplain, transform_partial_word::<V>(bw!($k)),
-                    );
-                    let (d0, d1, d2, d3) = transform_partial_seed::<V>(pp);
-                    (
-                        veorq_u8(d0, z0),
-                        veorq_u8(d1, z1),
-                        veorq_u8(d2, z2),
-                        veorq_u8(d3, z3),
-                    )
+                    if V & ABV_TRANSFORM_TRIM != 0 {
+                        apply_word_z_low_x::<$nb, true>(
+                            plain, kplain, transform_partial_word::<V>(bw!($k)),
+                        )
+                    } else {
+                        let pp = pbase.add(($blk * 8 + $k) * 64);
+                        let (z0, z1, z2, z3) = apply_word_z_low::<$nb>(
+                            plain, kplain, transform_partial_word::<V>(bw!($k)),
+                        );
+                        let (d0, d1, d2, d3) = transform_partial_seed::<V>(pp);
+                        (
+                            veorq_u8(d0, z0),
+                            veorq_u8(d1, z1),
+                            veorq_u8(d2, z2),
+                            veorq_u8(d3, z3),
+                        )
+                    }
                 } else {
                     $inc
                 }

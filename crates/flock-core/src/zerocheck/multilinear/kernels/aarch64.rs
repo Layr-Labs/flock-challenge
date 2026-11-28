@@ -5880,6 +5880,38 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
     use core::arch::aarch64::*;
 
     #[inline(always)]
+    unsafe fn load_pair_q_off<const OFF: usize>(src: *const F128) -> (uint64x2_t, uint64x2_t) {
+        let (x, y);
+        unsafe {
+            core::arch::asm!(
+                "ldp {x:q}, {y:q}, [{src}, #{off}]",
+                src = in(reg) src,
+                x = out(vreg) x,
+                y = out(vreg) y,
+                off = const OFF,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+        (x, y)
+    }
+
+    #[inline(always)]
+    unsafe fn load_pair_u64_off<const OFF: usize>(src: *const u8) -> (u64, u64) {
+        let (x, y): (u64, u64);
+        unsafe {
+            core::arch::asm!(
+                "ldp {x}, {y}, [{src}, #{off}]",
+                src = in(reg) src,
+                x = out(reg) x,
+                y = out(reg) y,
+                off = const OFF,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+        }
+        (u64::from_le(x), u64::from_le(y))
+    }
+
+    #[inline(always)]
     unsafe fn store_pair_nt_off<const OFF: usize>(dst: *mut F128, x: uint64x2_t, y: uint64x2_t) {
         unsafe {
             core::arch::asm!(
@@ -5890,6 +5922,47 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 off = const OFF,
                 options(nostack, preserves_flags),
             );
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Kp {
+        lo: uint64x2_t,
+        hi: uint64x2_t,
+        mid: uint64x2_t,
+    }
+    #[inline(always)]
+    unsafe fn kp_new(a: uint64x2_t, b: uint64x2_t) -> Kp {
+        unsafe {
+            let (lo, hi) = (vuzp1q_u64(a, b), vuzp2q_u64(a, b));
+            Kp { lo, hi, mid: veorq_u64(lo, hi) }
+        }
+    }
+    #[inline(always)]
+    unsafe fn kp_xor(a: Kp, b: Kp) -> Kp {
+        unsafe {
+            Kp {
+                lo: veorq_u64(a.lo, b.lo),
+                hi: veorq_u64(a.hi, b.hi),
+                mid: veorq_u64(a.mid, b.mid),
+            }
+        }
+    }
+    #[inline(always)]
+    unsafe fn kp_acc(acc: &mut TriNeon, a: Kp, b: Kp) {
+        unsafe {
+            #[cfg(target_feature = "sha3")]
+            {
+                acc.ll = fused_cross_acc(acc.ll, a.lo, b.lo);
+                acc.hh = fused_cross_acc(acc.hh, a.hi, b.hi);
+                acc.cross = fused_cross_acc(acc.cross, a.mid, b.mid);
+            }
+            #[cfg(not(target_feature = "sha3"))]
+            {
+                acc.ll = veorq_u64(acc.ll, cross_sum_q(a.lo, b.lo));
+                acc.hh = veorq_u64(acc.hh, cross_sum_q(a.hi, b.hi));
+                acc.cross = veorq_u64(acc.cross, cross_sum_q(a.mid, b.mid));
+            }
         }
     }
 
@@ -5905,6 +5978,7 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
         // Slots: p1_even, pinf_even, p1_odd, pinf_odd, W0', W3', W4', W5'.
         let mut acc = LookaheadTriAcc::zero();
         let mut wacc = LookaheadTriAcc::zero();
+        let mut kwacc = LookaheadTriAcc::zero();
         let mut sums = LookaheadTriAcc::zero();
         let mut xb_q = vdupq_n_u64(1);
         let mut win_first = 0usize;
@@ -5914,10 +5988,14 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
             ($wf:expr) => {{
                 let lambda = vld1q_u64(eq_prep.add(2 * ($wf) + 1).cast::<u64>());
                 let lambda_sw = swap_halves_q(lambda);
-                for (sum, w) in sums.0.iter_mut().zip(wacc.0.iter()) {
-                    let v = reduce_tri_binius_xor_q(w.ll, w.cross, w.hh, zero);
+                for ((sum, w), kw) in sums.0.iter_mut().zip(wacc.0.iter()).zip(kwacc.0.iter()) {
+                    let ll = veorq_u64(w.ll, kw.ll);
+                    let hh = veorq_u64(w.hh, kw.hh);
+                    let cross = veorq_u64(w.cross, xor3_u64(kw.cross, kw.ll, kw.hh));
+                    let v = reduce_tri_binius_xor_q(ll, cross, hh, zero);
                     tri_acc_sw(sum, lambda, lambda_sw, v);
                 }
+                kwacc = LookaheadTriAcc::zero();
                 xb_q = vdupq_n_u64(1);
             }};
         }
@@ -5965,31 +6043,17 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                 let (anc_a0, anc_b0, anc_a1, anc_b1, da0, db0, da1, db1) = if $is_head {
                     // Head lane `g % 64` (pairs `2 (g % 64)`, `+ 1`): a only.
                     let gi = g & 63;
-                    let hp = head_a.add(2 * gi).cast::<u64>();
-                    let hd = head_d.add(16 * gi);
-                    (
-                        vld1q_u64(hp),
-                        head_b_q,
-                        vld1q_u64(hp.add(2)),
-                        head_b_q,
-                        u64::from_le(core::ptr::read_unaligned(hd.cast::<u64>())),
-                        0u64,
-                        u64::from_le(core::ptr::read_unaligned(hd.add(8).cast::<u64>())),
-                        0u64,
-                    )
+                    let (ha0, ha1) = load_pair_q_off::<0>(head_a.add(2 * gi));
+                    let (hda0, hda1) = load_pair_u64_off::<0>(head_d.add(16 * gi));
+                    (ha0, head_b_q, ha1, head_b_q, hda0, 0u64, hda1, 0u64)
                 } else {
-                    let ap = anchors.add(4 * g).cast::<u64>();
+                    let ap = anchors.add(4 * g);
                     let dp = deltas.add(32 * g);
-                    (
-                        vld1q_u64(ap),
-                        vld1q_u64(ap.add(2)),
-                        vld1q_u64(ap.add(4)),
-                        vld1q_u64(ap.add(6)),
-                        u64::from_le(core::ptr::read_unaligned(dp.cast::<u64>())),
-                        u64::from_le(core::ptr::read_unaligned(dp.add(8).cast::<u64>())),
-                        u64::from_le(core::ptr::read_unaligned(dp.add(16).cast::<u64>())),
-                        u64::from_le(core::ptr::read_unaligned(dp.add(24).cast::<u64>())),
-                    )
+                    let (aa0, ab0) = load_pair_q_off::<0>(ap);
+                    let (aa1, ab1) = load_pair_q_off::<32>(ap);
+                    let (da0, db0) = load_pair_u64_off::<0>(dp);
+                    let (da1, db1) = load_pair_u64_off::<16>(dp);
+                    (aa0, ab0, aa1, ab1, da0, db0, da1, db1)
                 };
 
                 let xa0 = lookup8_acc_g::<F7>(table_r1, da0, anc_a0);
@@ -6158,8 +6222,145 @@ pub(crate) unsafe fn fold2_compact_and_round45_chunk_neon_8_fused_r1<
                         if win == 1 { k_group!(@ base, o0 + 4 * (base - t0), true, false, true, false); }
                         let mut t = base + 1;
                         while t < base + 7 {
-                            k_group!(@ t, o0 + 4 * (t - t0), true, false, false, false);
-                            k_group!(@ t + 1, o0 + 4 * (t + 1 - t0), true, false, false, false);
+                            if XB {
+                                let o_first = o0 + 4 * (t - t0);
+                                let mut b_flat0 = true;
+                                let ao0 = a_out.add(o_first);
+                                let bo0 = if bpack {
+                                    b_main.wrapping_add((4 * (t - bt0)).wrapping_sub(4))
+                                } else {
+                                    b_out.add(o_first)
+                                };
+                                let (a0, b0) = fold_lane!(4 * t, b_flat0, false);
+                                let (a1, b1) = fold_lane!(4 * t + 1, b_flat0, false);
+                                store_pair_nt_off::<0>(ao0, a0, a1);
+                                store_pair_nt_off::<0>(bo0, b0, b1);
+                                let (a2, b2) = fold_lane!(4 * t + 2, b_flat0, false);
+                                let (a3, b3) = fold_lane!(4 * t + 3, b_flat0, false);
+                                store_pair_nt_off::<32>(ao0, a2, a3);
+                                store_pair_nt_off::<32>(bo0, b2, b3);
+                                let xb0 = xb_q;
+                                let xb1 = vshlq_n_u64::<2>(xb0);
+                                xb_q = vshlq_n_u64::<2>(xb1);
+
+                                let t2 = t + 1;
+                                let o_second = o_first + 4;
+                                let mut b_flat1 = true;
+                                let ao1 = a_out.add(o_second);
+                                let bo1 = if bpack {
+                                    b_main.wrapping_add((4 * (t2 - bt0)).wrapping_sub(4))
+                                } else {
+                                    b_out.add(o_second)
+                                };
+                                let (c0, d0) = fold_lane!(4 * t2, b_flat1, false);
+                                let (c1, d1) = fold_lane!(4 * t2 + 1, b_flat1, false);
+                                store_pair_nt_off::<0>(ao1, c0, c1);
+                                store_pair_nt_off::<0>(bo1, d0, d1);
+                                let (c2, d2) = fold_lane!(4 * t2 + 2, b_flat1, false);
+                                let (c3, d3) = fold_lane!(4 * t2 + 3, b_flat1, false);
+                                store_pair_nt_off::<32>(ao1, c2, c3);
+                                if bpack && t2 == bt0 + 14 {
+                                    b58 = d2;
+                                    b_ok &= is_zero_q(veorq_u64(d3, one_q));
+                                } else {
+                                    store_pair_nt_off::<32>(bo1, d2, d3);
+                                }
+
+                                let f0 = b_flat0
+                                    && is_zero_q(vorrq_u64(
+                                        vorrq_u64(veorq_u64(b0, one_q), veorq_u64(b1, one_q)),
+                                        vorrq_u64(veorq_u64(b2, one_q), veorq_u64(b3, one_q)),
+                                    ));
+                                let f1 = b_flat1
+                                    && is_zero_q(vorrq_u64(
+                                        vorrq_u64(veorq_u64(d0, one_q), veorq_u64(d1, one_q)),
+                                        vorrq_u64(veorq_u64(d2, one_q), veorq_u64(d3, one_q)),
+                                    ));
+                                if !f0 && !f1 {
+                                    let (a0, a1, a2, a3) = (
+                                        mul_xb_q(a0, xb0, k87),
+                                        mul_xb_q(a1, xb0, k87),
+                                        mul_xb_q(a2, xb0, k87),
+                                        mul_xb_q(a3, xb0, k87),
+                                    );
+                                    let (c0, c1, c2, c3) = (
+                                        mul_xb_q(c0, xb1, k87),
+                                        mul_xb_q(c1, xb1, k87),
+                                        mul_xb_q(c2, xb1, k87),
+                                        mul_xb_q(c3, xb1, k87),
+                                    );
+                                    let (pa0, pa1, pa2, pa3) = (
+                                        kp_new(a0, c0),
+                                        kp_new(a1, c1),
+                                        kp_new(a2, c2),
+                                        kp_new(a3, c3),
+                                    );
+                                    let (pb0, pb1, pb2, pb3) = (
+                                        kp_new(b0, d0),
+                                        kp_new(b1, d1),
+                                        kp_new(b2, d2),
+                                        kp_new(b3, d3),
+                                    );
+                                    kp_acc(&mut kwacc.0[0], pa1, pb1);
+                                    kp_acc(&mut kwacc.0[1], kp_xor(pa0, pa1), kp_xor(pb0, pb1));
+                                    kp_acc(&mut kwacc.0[2], pa3, pb3);
+                                    kp_acc(&mut kwacc.0[3], kp_xor(pa2, pa3), kp_xor(pb2, pb3));
+                                    kp_acc(&mut kwacc.0[4], pa2, pb2);
+                                    let (e_aw, e_b) = (kp_xor(pa0, pa2), kp_xor(pb0, pb2));
+                                    let (o_aw, o_b) = (kp_xor(pa1, pa3), kp_xor(pb1, pb3));
+                                    kp_acc(&mut kwacc.0[5], e_aw, e_b);
+                                    kp_acc(&mut kwacc.0[6], o_aw, o_b);
+                                    kp_acc(&mut kwacc.0[7], kp_xor(e_aw, o_aw), kp_xor(e_b, o_b));
+                                } else {
+                                    if f0 {
+                                        wacc.0[0].ll = veorq_u64(wacc.0[0].ll, mul_xb_q(a1, xb0, k87));
+                                        wacc.0[2].ll = veorq_u64(wacc.0[2].ll, mul_xb_q(a3, xb0, k87));
+                                        wacc.0[4].ll = veorq_u64(wacc.0[4].ll, mul_xb_q(a2, xb0, k87));
+                                    } else {
+                                        let (a0, a1, a2, a3) = (
+                                            mul_xb_q(a0, xb0, k87),
+                                            mul_xb_q(a1, xb0, k87),
+                                            mul_xb_q(a2, xb0, k87),
+                                            mul_xb_q(a3, xb0, k87),
+                                        );
+                                        tri_acc_q(&mut wacc.0[0], a1, b1);
+                                        tri_acc_q(&mut wacc.0[1], veorq_u64(a0, a1), veorq_u64(b0, b1));
+                                        tri_acc_q(&mut wacc.0[2], a3, b3);
+                                        tri_acc_q(&mut wacc.0[3], veorq_u64(a2, a3), veorq_u64(b2, b3));
+                                        tri_acc_q(&mut wacc.0[4], a2, b2);
+                                        let (e_aw, e_b) = (veorq_u64(a0, a2), veorq_u64(b0, b2));
+                                        let (o_aw, o_b) = (veorq_u64(a1, a3), veorq_u64(b1, b3));
+                                        tri_acc_q(&mut wacc.0[5], e_aw, e_b);
+                                        tri_acc_q(&mut wacc.0[6], o_aw, o_b);
+                                        tri_acc_q(&mut wacc.0[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                                    }
+                                    if f1 {
+                                        wacc.0[0].ll = veorq_u64(wacc.0[0].ll, mul_xb_q(c1, xb1, k87));
+                                        wacc.0[2].ll = veorq_u64(wacc.0[2].ll, mul_xb_q(c3, xb1, k87));
+                                        wacc.0[4].ll = veorq_u64(wacc.0[4].ll, mul_xb_q(c2, xb1, k87));
+                                    } else {
+                                        let (c0, c1, c2, c3) = (
+                                            mul_xb_q(c0, xb1, k87),
+                                            mul_xb_q(c1, xb1, k87),
+                                            mul_xb_q(c2, xb1, k87),
+                                            mul_xb_q(c3, xb1, k87),
+                                        );
+                                        tri_acc_q(&mut wacc.0[0], c1, d1);
+                                        tri_acc_q(&mut wacc.0[1], veorq_u64(c0, c1), veorq_u64(d0, d1));
+                                        tri_acc_q(&mut wacc.0[2], c3, d3);
+                                        tri_acc_q(&mut wacc.0[3], veorq_u64(c2, c3), veorq_u64(d2, d3));
+                                        tri_acc_q(&mut wacc.0[4], c2, d2);
+                                        let (e_aw, e_b) = (veorq_u64(c0, c2), veorq_u64(d0, d2));
+                                        let (o_aw, o_b) = (veorq_u64(c1, c3), veorq_u64(d1, d3));
+                                        tri_acc_q(&mut wacc.0[5], e_aw, e_b);
+                                        tri_acc_q(&mut wacc.0[6], o_aw, o_b);
+                                        tri_acc_q(&mut wacc.0[7], veorq_u64(e_aw, o_aw), veorq_u64(e_b, o_b));
+                                    }
+                                }
+                            } else {
+                                k_group!(@ t, o0 + 4 * (t - t0), true, false, false, false);
+                                k_group!(@ t + 1, o0 + 4 * (t + 1 - t0), true, false, false, false);
+                            }
                             t += 2;
                         }
                         if win == 0 {
@@ -7381,7 +7582,7 @@ pub(crate) fn fold2_and_message_normal_expanded_aarch64(
     assert_eq!(b_in.len(), expected_in);
 
     let rho = unsafe {
-        Fold4RhoQ::new(
+        Fold4KaraQ::new(
             core::mem::transmute::<F128, uint64x2_t>(rho_a),
             core::mem::transmute::<F128, uint64x2_t>(rho_b),
             core::mem::transmute::<F128, uint64x2_t>(rho_ab),
@@ -7396,10 +7597,8 @@ pub(crate) fn fold2_and_message_normal_expanded_aarch64(
         let (a0, a1, b0, b1) = unsafe {
             // SAFETY: the release-mode geometry assertions and loop bound put
             // both eight-value pairs wholly inside their input tables.
-            let (a0, a1) =
-                fold4_pair_expanded_tri_q(a_in.as_ptr().add(i), &rho);
-            let (b0, b1) =
-                fold4_pair_expanded_tri_q(b_in.as_ptr().add(i), &rho);
+            let (a0, a1) = fold4_kara_pair_q(a_in.as_ptr().add(i), &rho);
+            let (b0, b1) = fold4_kara_pair_q(b_in.as_ptr().add(i), &rho);
             (
                 core::mem::transmute::<uint64x2_t, F128>(a0),
                 core::mem::transmute::<uint64x2_t, F128>(a1),
@@ -7598,7 +7797,7 @@ pub(crate) fn fold2_and_message_lookahead_normal_expanded_aarch64(
     assert_eq!(b_in.len(), expected_in);
 
     let rho = unsafe {
-        Fold4RhoQ::new(
+        Fold4KaraQ::new(
             core::mem::transmute::<F128, uint64x2_t>(rho_a),
             core::mem::transmute::<F128, uint64x2_t>(rho_b),
             core::mem::transmute::<F128, uint64x2_t>(rho_ab),
@@ -7613,14 +7812,10 @@ pub(crate) fn fold2_and_message_lookahead_normal_expanded_aarch64(
         let (a0, a1, a2, a3, b0, b1, b2, b3) = unsafe {
             // SAFETY: the geometry assertions and loop bound place each pair
             // wholly inside its corresponding 16-element source group.
-            let (a0, a1) =
-                fold4_pair_expanded_tri_q(a_in.as_ptr().add(i), &rho);
-            let (a2, a3) =
-                fold4_pair_expanded_tri_q(a_in.as_ptr().add(i + 8), &rho);
-            let (b0, b1) =
-                fold4_pair_expanded_tri_q(b_in.as_ptr().add(i), &rho);
-            let (b2, b3) =
-                fold4_pair_expanded_tri_q(b_in.as_ptr().add(i + 8), &rho);
+            let (a0, a1) = fold4_kara_pair_q(a_in.as_ptr().add(i), &rho);
+            let (a2, a3) = fold4_kara_pair_q(a_in.as_ptr().add(i + 8), &rho);
+            let (b0, b1) = fold4_kara_pair_q(b_in.as_ptr().add(i), &rho);
+            let (b2, b3) = fold4_kara_pair_q(b_in.as_ptr().add(i + 8), &rho);
             (
                 core::mem::transmute::<uint64x2_t, F128>(a0),
                 core::mem::transmute::<uint64x2_t, F128>(a1),
@@ -7714,7 +7909,7 @@ pub(crate) fn fold2_and_message_lookahead_nt_expanded_aarch64(
     }
 
     let rho = unsafe {
-        Fold4RhoQ::new(
+        Fold4KaraQ::new(
             core::mem::transmute::<F128, uint64x2_t>(rho_a),
             core::mem::transmute::<F128, uint64x2_t>(rho_b),
             core::mem::transmute::<F128, uint64x2_t>(rho_ab),
@@ -7731,14 +7926,10 @@ pub(crate) fn fold2_and_message_lookahead_nt_expanded_aarch64(
         let (a0, a1, a2, a3, b0, b1, b2, b3) = unsafe {
             // SAFETY: the geometry assertions and loop bound place each pair
             // wholly inside its corresponding 16-element source group.
-            let (a0, a1) =
-                fold4_pair_expanded_tri_q(a_in.as_ptr().add(i), &rho);
-            let (a2, a3) =
-                fold4_pair_expanded_tri_q(a_in.as_ptr().add(i + 8), &rho);
-            let (b0, b1) =
-                fold4_pair_expanded_tri_q(b_in.as_ptr().add(i), &rho);
-            let (b2, b3) =
-                fold4_pair_expanded_tri_q(b_in.as_ptr().add(i + 8), &rho);
+            let (a0, a1) = fold4_kara_pair_q(a_in.as_ptr().add(i), &rho);
+            let (a2, a3) = fold4_kara_pair_q(a_in.as_ptr().add(i + 8), &rho);
+            let (b0, b1) = fold4_kara_pair_q(b_in.as_ptr().add(i), &rho);
+            let (b2, b3) = fold4_kara_pair_q(b_in.as_ptr().add(i + 8), &rho);
             (
                 core::mem::transmute::<uint64x2_t, F128>(a0),
                 core::mem::transmute::<uint64x2_t, F128>(a1),
@@ -8347,15 +8538,56 @@ fn fold_tri_and_message_core_with<
             }
         }
 
+        #[derive(Clone, Copy)]
+        struct Kp {
+            lo: uint64x2_t,
+            hi: uint64x2_t,
+            mid: uint64x2_t,
+        }
+        #[inline(always)]
+        unsafe fn kp_new(a: uint64x2_t, b: uint64x2_t) -> Kp {
+            unsafe {
+                let (lo, hi) = (vuzp1q_u64(a, b), vuzp2q_u64(a, b));
+                Kp { lo, hi, mid: veorq_u64(lo, hi) }
+            }
+        }
+        #[inline(always)]
+        unsafe fn kp_xor(a: Kp, b: Kp) -> Kp {
+            unsafe {
+                Kp {
+                    lo: veorq_u64(a.lo, b.lo),
+                    hi: veorq_u64(a.hi, b.hi),
+                    mid: veorq_u64(a.mid, b.mid),
+                }
+            }
+        }
+        #[inline(always)]
+        unsafe fn kp_acc(acc: &mut TriNeon, a: Kp, b: Kp) {
+            unsafe {
+                #[cfg(target_feature = "sha3")]
+                {
+                    acc.ll = fused_cross_acc(acc.ll, a.lo, b.lo);
+                    acc.hh = fused_cross_acc(acc.hh, a.hi, b.hi);
+                    acc.cross = fused_cross_acc(acc.cross, a.mid, b.mid);
+                }
+                #[cfg(not(target_feature = "sha3"))]
+                {
+                    acc.ll = veorq_u64(acc.ll, cross_sum_q(a.lo, b.lo));
+                    acc.hh = veorq_u64(acc.hh, cross_sum_q(a.hi, b.hi));
+                    acc.cross = veorq_u64(acc.cross, cross_sum_q(a.mid, b.mid));
+                }
+            }
+        }
+
         const TG: usize = 16;
         let ng = n_out / 8;
-        let mut ta = [core::mem::MaybeUninit::<[uint64x2_t; 8]>::uninit(); TG];
-        let mut tb = [core::mem::MaybeUninit::<[uint64x2_t; 8]>::uninit(); TG];
+        let mut pa = [core::mem::MaybeUninit::<[Kp; 8]>::uninit(); TG / 2];
+        let mut pb = [core::mem::MaybeUninit::<[Kp; 8]>::uninit(); TG / 2];
         let mut g0 = 0usize;
         while g0 < ng {
             let gn = (ng - g0).min(TG);
-            for t in 0..gn {
-                let y = g0 + t;
+            let np = gn.div_ceil(2);
+            let mut fold_one = |y: usize| -> ([uint64x2_t; 8], [uint64x2_t; 8]) {
                 let a = if INL {
                     fold_group_inl::<DEPTH, PACK, SL, FF>(a_ip, y, &rho, rc, rc_sw, &pp, &w8, one_in, &op, seeded)
                 } else {
@@ -8366,19 +8598,21 @@ fn fold_tri_and_message_core_with<
                 } else {
                     for h in 0..8 { sink = veorq_u64(sink, a[h]); }
                 }
-                if ABL & 1 == 0 {
-                    let ta_p = ta[t].as_mut_ptr().cast::<uint64x2_t>();
+                let aw = if ABL & 1 == 0 {
                     if FF {
                         let p0 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 2).cast::<u64>());
                         let p1 = vld1q_u64(eq_prep.as_ptr().add(4 * y + 3).cast::<u64>());
-                        if seeded { for i in 0..8 { ta_p.add(i).write(mul_prep86_seeded_q(p0, p1, a[i], pp.k)); } }
-                        else { for i in 0..8 { ta_p.add(i).write(mul_prep86_q(p0, p1, a[i], pp.k)); } }
+                        if seeded { core::array::from_fn(|i| mul_prep86_seeded_q(p0, p1, a[i], pp.k)) }
+                        else { core::array::from_fn(|i| mul_prep86_q(p0, p1, a[i], pp.k)) }
                     } else {
                         let w = vld1q_u64(eq_lo.as_ptr().add(4 * y + 3).cast::<u64>());
                         let w_sum = vgetq_lane_u64::<0>(w) ^ vgetq_lane_u64::<1>(w);
-                        for i in 0..8 { ta_p.add(i).write(mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i])); }
+                        core::array::from_fn(|i| mul_sw_tri_binius_karatsuba_q(w, w_sum, a[i]))
                     }
-                } else { sink = veorq_u64(sink, a[0]); }
+                } else {
+                    sink = veorq_u64(sink, a[0]);
+                    [zero; 8]
+                };
                 let b = if INL {
                     if PACK && bpack {
                         fold_group_bpack::<FF>(b_ip, y, &rho, &pp, one_in, &op, seeded)
@@ -8395,8 +8629,28 @@ fn fold_tri_and_message_core_with<
                 } else {
                     for h in 0..8 { sink = veorq_u64(sink, b[h]); }
                 }
-                if ABL & 1 != 0 { sink = veorq_u64(sink, b[7]); continue; }
-                tb[t].write(b);
+                if ABL & 1 != 0 {
+                    sink = veorq_u64(sink, b[7]);
+                }
+                (aw, b)
+            };
+            for k in 0..np {
+                let y0 = g0 + 2 * k;
+                let (aw0, b0) = fold_one(y0);
+                if 2 * k + 1 < gn {
+                    let (aw1, b1) = fold_one(y0 + 1);
+                    if ABL & 1 != 0 {
+                        continue;
+                    }
+                    pa[k].write(core::array::from_fn(|i| kp_new(aw0[i], aw1[i])));
+                    pb[k].write(core::array::from_fn(|i| kp_new(b0[i], b1[i])));
+                } else {
+                    if ABL & 1 != 0 {
+                        continue;
+                    }
+                    pa[k].write(core::array::from_fn(|i| kp_new(aw0[i], zero)));
+                    pb[k].write(core::array::from_fn(|i| kp_new(b0[i], zero)));
+                }
             }
             g0 += gn;
             if ABL & 1 != 0 {
@@ -8404,14 +8658,14 @@ fn fold_tri_and_message_core_with<
             }
             {
                 let mut e = [acc[0], acc[1], acc[2], acc[3], acc[4], acc[5], acc[6], acc[7]];
-                for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
+                for k in 0..np {
+                    let (aw, b) = (pa[k].assume_init_ref(), pb[k].assume_init_ref());
                     for j in 0..4 {
-                        tri_acc_q(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
-                        tri_acc_q(
+                        kp_acc(&mut e[j], aw[2 * j + 1], b[2 * j + 1]);
+                        kp_acc(
                             &mut e[4 + j],
-                            veorq_u64(aw[2 * j], aw[2 * j + 1]),
-                            veorq_u64(b[2 * j], b[2 * j + 1]),
+                            kp_xor(aw[2 * j], aw[2 * j + 1]),
+                            kp_xor(b[2 * j], b[2 * j + 1]),
                         );
                     }
                 }
@@ -8421,36 +8675,35 @@ fn fold_tri_and_message_core_with<
                 let mut l = [
                     acc[8], acc[9], acc[10], acc[11], acc[12], acc[13], acc[14], acc[15],
                 ];
-                for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
-                    for k in 0..2 {
-                        let o = 4 * k;
-                        tri_acc_q(&mut l[k], aw[o + 2], b[o + 2]);
-                        let (ea, eb) = (veorq_u64(aw[o], aw[o + 2]), veorq_u64(b[o], b[o + 2]));
-                        let (oa, ob) =
-                            (veorq_u64(aw[o + 1], aw[o + 3]), veorq_u64(b[o + 1], b[o + 3]));
-                        tri_acc_q(&mut l[2 + k], ea, eb);
-                        tri_acc_q(&mut l[4 + k], oa, ob);
-                        tri_acc_q(&mut l[6 + k], veorq_u64(ea, oa), veorq_u64(eb, ob));
+                for k in 0..np {
+                    let (aw, b) = (pa[k].assume_init_ref(), pb[k].assume_init_ref());
+                    for j in 0..2 {
+                        let o = 4 * j;
+                        kp_acc(&mut l[j], aw[o + 2], b[o + 2]);
+                        let (ea, eb) = (kp_xor(aw[o], aw[o + 2]), kp_xor(b[o], b[o + 2]));
+                        let (oa, ob) = (kp_xor(aw[o + 1], aw[o + 3]), kp_xor(b[o + 1], b[o + 3]));
+                        kp_acc(&mut l[2 + j], ea, eb);
+                        kp_acc(&mut l[4 + j], oa, ob);
+                        kp_acc(&mut l[6 + j], kp_xor(ea, oa), kp_xor(eb, ob));
                     }
                 }
                 acc[8..16].copy_from_slice(&l);
             }
             {
                 let mut g = [acc[16], acc[17], acc[18], acc[20], acc[21]];
-                for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_mut(), tb[t].assume_init_mut());
-                    tri_acc_q(&mut g[0], aw[4], b[4]);
-                    let (s0a, s0b) = (veorq_u64(aw[0], aw[4]), veorq_u64(b[0], b[4]));
-                    let (s1a, s1b) = (veorq_u64(aw[1], aw[5]), veorq_u64(b[1], b[5]));
-                    let (s2a, s2b) = (veorq_u64(aw[2], aw[6]), veorq_u64(b[2], b[6]));
-                    let (s3a, s3b) = (veorq_u64(aw[3], aw[7]), veorq_u64(b[3], b[7]));
+                for k in 0..np {
+                    let (aw, b) = (pa[k].assume_init_mut(), pb[k].assume_init_mut());
+                    kp_acc(&mut g[0], aw[4], b[4]);
+                    let (s0a, s0b) = (kp_xor(aw[0], aw[4]), kp_xor(b[0], b[4]));
+                    let (s1a, s1b) = (kp_xor(aw[1], aw[5]), kp_xor(b[1], b[5]));
+                    let (s2a, s2b) = (kp_xor(aw[2], aw[6]), kp_xor(b[2], b[6]));
+                    let (s3a, s3b) = (kp_xor(aw[3], aw[7]), kp_xor(b[3], b[7]));
                     aw[..4].copy_from_slice(&[s0a, s1a, s2a, s3a]);
                     b[..4].copy_from_slice(&[s0b, s1b, s2b, s3b]);
-                    tri_acc_q(&mut g[1], s0a, s0b);
-                    tri_acc_q(&mut g[2], s2a, s2b);
-                    tri_acc_q(&mut g[3], s1a, s1b);
-                    tri_acc_q(&mut g[4], s3a, s3b);
+                    kp_acc(&mut g[1], s0a, s0b);
+                    kp_acc(&mut g[2], s2a, s2b);
+                    kp_acc(&mut g[3], s1a, s1b);
+                    kp_acc(&mut g[4], s3a, s3b);
                 }
                 acc[16] = g[0];
                 acc[17] = g[1];
@@ -8460,19 +8713,19 @@ fn fold_tri_and_message_core_with<
             }
             {
                 let mut g = [acc[19], acc[22], acc[23], acc[24], acc[25]];
-                for t in 0..gn {
-                    let (aw, b) = (ta[t].assume_init_ref(), tb[t].assume_init_ref());
+                for k in 0..np {
+                    let (aw, b) = (pa[k].assume_init_ref(), pb[k].assume_init_ref());
                     let (s0a, s1a, s2a, s3a) = (aw[0], aw[1], aw[2], aw[3]);
                     let (s0b, s1b, s2b, s3b) = (b[0], b[1], b[2], b[3]);
-                    let (s02a, s02b) = (veorq_u64(s0a, s2a), veorq_u64(s0b, s2b));
-                    let (s13a, s13b) = (veorq_u64(s1a, s3a), veorq_u64(s1b, s3b));
-                    let (s01a, s01b) = (veorq_u64(s0a, s1a), veorq_u64(s0b, s1b));
-                    let (s23a, s23b) = (veorq_u64(s2a, s3a), veorq_u64(s2b, s3b));
-                    tri_acc_q(&mut g[0], s02a, s02b);
-                    tri_acc_q(&mut g[1], s13a, s13b);
-                    tri_acc_q(&mut g[2], s01a, s01b);
-                    tri_acc_q(&mut g[3], s23a, s23b);
-                    tri_acc_q(&mut g[4], veorq_u64(s01a, s23a), veorq_u64(s01b, s23b));
+                    let (s02a, s02b) = (kp_xor(s0a, s2a), kp_xor(s0b, s2b));
+                    let (s13a, s13b) = (kp_xor(s1a, s3a), kp_xor(s1b, s3b));
+                    let (s01a, s01b) = (kp_xor(s0a, s1a), kp_xor(s0b, s1b));
+                    let (s23a, s23b) = (kp_xor(s2a, s3a), kp_xor(s2b, s3b));
+                    kp_acc(&mut g[0], s02a, s02b);
+                    kp_acc(&mut g[1], s13a, s13b);
+                    kp_acc(&mut g[2], s01a, s01b);
+                    kp_acc(&mut g[3], s23a, s23b);
+                    kp_acc(&mut g[4], kp_xor(s01a, s23a), kp_xor(s01b, s23b));
                 }
                 acc[19] = g[0];
                 acc[22] = g[1];
@@ -8484,7 +8737,14 @@ fn fold_tri_and_message_core_with<
         if ABL != 0 {
             core::hint::black_box(sink);
         }
-        acc.map(|t| core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(t)))
+        acc.map(|t| {
+            let tri = TriNeon {
+                ll: t.ll,
+                cross: xor3_u64(t.cross, t.ll, t.hh),
+                hh: t.hh,
+            };
+            core::mem::transmute::<uint64x2_t, F128>(reduce_tri_q(tri))
+        })
     }
 }
 
@@ -11773,14 +12033,14 @@ mod tests {
                                 OUT_PAIRS, true, out.as_mut_ptr(),
                             ),
                             (false, false) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<false, false, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
                                 );
                             }
                             (false, true) => {
-                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
+                                fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
                                     r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                     a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), OUT_PAIRS, true,
                                     out.as_mut_ptr(), false, false, false, F128::ONE,
@@ -11864,12 +12124,12 @@ mod tests {
                 let (mut ap, mut bp) = (vec![poison; n_out], vec![poison; n_out]);
                 let (mut o_full, mut o_pack) = ([F128::ZERO; 8], [F128::ZERO; 8]);
                 unsafe {
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, false, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_full.as_mut_ptr(), false, false, false, F128::ONE,
                     );
-                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                    fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
                         r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                         ap.as_mut_ptr(), bp.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                         o_pack.as_mut_ptr(), false, false, false, F128::ONE,
@@ -11953,7 +12213,7 @@ mod tests {
                     let (mut a, mut b) = (vec![poison; n_out], vec![poison; n_out]);
                     let mut o = [F128::ZERO; 8];
                     let ok = unsafe {
-                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                        fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
                             r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                             a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                             o.as_mut_ptr(), bpack, false, false, F128::ONE,
@@ -12026,13 +12286,13 @@ mod tests {
                     let mut o = [F128::ZERO; 8];
                     let ok = unsafe {
                         if pieces {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1_pieces7::<false>(
                                 t7.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                                 o.as_mut_ptr(), bpack, false, false, F128::ONE,
                             )
                         } else {
-                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false>(
+                            fold2_compact_and_round45_chunk_neon_8_fused_r1::<true, true, false, false>(
                                 r1.as_ptr().cast(), rho2, anchors.as_ptr(), deltas.as_ptr(),
                                 a.as_mut_ptr(), b.as_mut_ptr(), eq_prep.as_ptr(), out_pairs, degen,
                                 o.as_mut_ptr(), bpack, false, false, F128::ONE,
