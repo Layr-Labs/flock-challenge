@@ -20723,6 +20723,10 @@ kernel void zc_eq_rows(
         k: usize,
         claim_lo: usize,
         n_claims: usize,
+        /// A cap-limited prefix is an overlap opportunistically launched
+        /// before the normal window. It must not retune the process-wide
+        /// full-window split from its different head/suffix timing.
+        sample_retune: bool,
         submitted: std::time::Instant,
         /// Exact challenge vector the staged eq/plan derives from.
         r: Vec<F128>,
@@ -21183,14 +21187,20 @@ kernel void zc_eq_rows(
         /// nothing here may be pointed at memory that can be freed and
         /// re-allocated at the same address.
         unsafe fn wrap_z(&mut self, z: &[u8]) -> Result<Id, String> {
+            unsafe { self.wrap_z_raw(z.as_ptr(), z.len()) }
+        }
+
+        /// Retain a full allocation's cache identity without constructing a
+        /// slice over a concurrently-produced suffix. The caller separately
+        /// proves its GPU dispatch reads only its initialized prefix.
+        unsafe fn wrap_z_raw(&mut self, ptr: *const u8, len: usize) -> Result<Id, String> {
             const MAX_WRAPS: usize = 3;
-            let ptr = z.as_ptr() as usize;
-            let len = z.len();
+            let ptr = ptr as usize;
             if let Some(&(_, _, buf)) = self.z_wraps.iter().find(|(p, l, _)| *p == ptr && *l == len)
             {
                 return Ok(buf);
             }
-            let buf = unsafe { self.gpu.wrap_buffer(z.as_ptr() as *mut u8, len)? };
+            let buf = unsafe { self.gpu.wrap_buffer(ptr as *mut u8, len)? };
             if self.z_wraps.len() == MAX_WRAPS {
                 let (_, _, old) = self.z_wraps.remove(0);
                 unsafe { self.gpu.release(old) };
@@ -21545,6 +21555,7 @@ kernel void zc_eq_rows(
         n_claims: usize,
         submitted: std::time::Instant,
         arm: FoldArm,
+        sample_retune: bool,
         /// Completion signal (lincheck arm only; see `ENV_NO_GPU_DONE_EVENT`).
         sig: Option<DoneSig>,
     }
@@ -21878,15 +21889,17 @@ kernel void zc_eq_rows(
                     gpu.pool_pop(pool);
                 }
             }
-            fold_note_sample(
-                self.arm,
-                self.claim_lo,
-                self.n_claims,
-                sample_ms,
-                head_ms,
-                suffix_ms,
-                self.plan.byte_fold,
-            );
+            if self.sample_retune {
+                fold_note_sample(
+                    self.arm,
+                    self.claim_lo,
+                    self.n_claims,
+                    sample_ms,
+                    head_ms,
+                    suffix_ms,
+                    self.plan.byte_fold,
+                );
+            }
             Ok(())
         }
     }
@@ -22653,7 +22666,7 @@ kernel void zc_eq_rows(
         if !super::gpu_zerocheck_enabled() {
             return None;
         }
-        launch_fold_prefix(FoldArm::Zc, z_packed, m, k_log, useful_bits, eq_outer)
+        launch_fold_prefix(FoldArm::Zc, z_packed, m, k_log, useful_bits, eq_outer, None, None)
     }
 
     /// Commit-tail fill, GPU half (see `ENV_NO_COMMIT_TAIL_FILL`): build the
@@ -22662,8 +22675,10 @@ kernel void zc_eq_rows(
     /// job in the fold state (guard released) instead of returning it — the
     /// staging thread is a rayon pool worker inside the commit join, not the
     /// thread that runs zerocheck. Returns whether a prefix was parked.
-    pub(crate) fn stage_zerocheck_c_fold_prefix(
+    fn stage_zerocheck_c_fold_prefix_inner(
         z_packed: &[u8],
+        identity: (usize, usize),
+        claim_cap: Option<usize>,
         m: usize,
         k_log: usize,
         useful_bits: usize,
@@ -22688,6 +22703,8 @@ kernel void zc_eq_rows(
                 k_log,
                 useful_bits,
                 EqSrc::GpuRows(&r[k_log..]),
+                claim_cap,
+                Some(identity),
             ) else {
                 return false;
             };
@@ -22713,6 +22730,8 @@ kernel void zc_eq_rows(
                 k_log,
                 useful_bits,
                 eq_outer.as_slice(),
+                claim_cap,
+                Some(identity),
             ) else {
                 return false;
             };
@@ -22747,10 +22766,11 @@ kernel void zc_eq_rows(
                     k,
                     claim_lo,
                     n_claims,
+                    sample_retune: claim_cap.is_none(),
                     submitted,
                     r: r.to_vec(),
-                    z_ptr: z_packed.as_ptr() as usize,
-                    z_len: z_packed.len(),
+                    z_ptr: identity.0,
+                    z_len: identity.1,
                     eq_len,
                     eq_owned,
                     eq_gpu,
@@ -22770,6 +22790,39 @@ kernel void zc_eq_rows(
             }
         }
         // `guard` drops here: the lock is released with the prefix parked.
+    }
+
+    pub(crate) fn stage_zerocheck_c_fold_prefix(
+        z_packed: &[u8], m: usize, k_log: usize, useful_bits: usize, r: &[F128],
+    ) -> bool {
+        stage_zerocheck_c_fold_prefix_inner(
+            z_packed, (z_packed.as_ptr() as usize, z_packed.len()), None, m, k_log, useful_bits, r)
+    }
+
+    /// Submit only when this initialized prefix covers every stripe the
+    /// current tuned GPU share will read. The backing allocation identity is
+    /// retained for full-stripe adoption, while Metal wraps only `prefix`.
+    pub(crate) fn stage_zerocheck_c_fold_prefix_ready(
+        prefix: &[u8], full_ptr: usize, full_len: usize, m: usize, k_log: usize,
+        useful_bits: usize, r: &[F128],
+    ) -> bool {
+        // The untimed warm-up must use the incumbent full-ready route to
+        // calibrate its split; never let a prefix race choose its startup
+        // heuristic.
+        if FoldArm::Zc.tuned().load(std::sync::atomic::Ordering::Acquire) == usize::MAX {
+            return false;
+        }
+        let k = 1usize << k_log;
+        if prefix.as_ptr() as usize != full_ptr || prefix.len() > full_len || prefix.len() % k != 0 {
+            return false;
+        }
+        let claims = crate::lincheck::oblock_claim_count(m, k_log);
+        let tuned = FoldArm::Zc.claims_for(claims);
+        let available = (prefix.len() / k) / (crate::lincheck::oblock_claim_stripe_base(1));
+        let claim_lo = tuned.min(available);
+        let required = crate::lincheck::oblock_claim_stripe_base(claim_lo);
+        if claim_lo == 0 || required > prefix.len() / k { return false; }
+        stage_zerocheck_c_fold_prefix_inner(prefix, (full_ptr, full_len), Some(claim_lo), m, k_log, useful_bits, r)
     }
 
     /// Commit-tail fill, adoption half: if a parked prefix matches this
@@ -22833,6 +22886,7 @@ kernel void zc_eq_rows(
             submitted,
             arm: FoldArm::Zc,
             sig: None,
+            sample_retune: staged.sample_retune,
         };
         Some((eq, job, submitted))
     }
@@ -22934,7 +22988,7 @@ kernel void zc_eq_rows(
         if !super::gpu_lincheck_enabled() {
             return None;
         }
-        launch_fold_prefix(FoldArm::Lincheck, z_packed, m, k_log, useful_bits, eq_outer)
+        launch_fold_prefix(FoldArm::Lincheck, z_packed, m, k_log, useful_bits, eq_outer, None, None)
     }
 
     /// Where a fold prefix's eq table comes from.
@@ -22955,8 +23009,10 @@ kernel void zc_eq_rows(
         k_log: usize,
         useful_bits: usize,
         eq_outer: &[F128],
+        claim_cap: Option<usize>,
+        wrap_identity: Option<(usize, usize)>,
     ) -> Option<ZcFoldJob> {
-        launch_fold_prefix_src(arm, z_packed, m, k_log, useful_bits, EqSrc::Table(eq_outer))
+        launch_fold_prefix_src(arm, z_packed, m, k_log, useful_bits, EqSrc::Table(eq_outer), claim_cap, wrap_identity)
             .map(|(job, _)| job)
     }
 
@@ -22971,13 +23027,15 @@ kernel void zc_eq_rows(
         k_log: usize,
         useful_bits: usize,
         eq: EqSrc<'_>,
+        claim_cap: Option<usize>,
+        wrap_identity: Option<(usize, usize)>,
     ) -> Option<(ZcFoldJob, Option<GpuEqRows>)> {
         let k = 1usize << k_log;
         if !k.is_multiple_of(ZC_FOLD_COLS_PER_TG) || m <= k_log + 3 {
             return None;
         }
         let n_claims = crate::lincheck::oblock_claim_count(m, k_log);
-        let claim_lo = arm.claims_for(n_claims);
+        let claim_lo = claim_cap.unwrap_or_else(|| arm.claims_for(n_claims));
         if claim_lo == 0 || claim_lo > n_claims {
             return None;
         }
@@ -23062,7 +23120,10 @@ kernel void zc_eq_rows(
                 let pool = gpu.pool_push();
                 type Built = (Id, ZcFoldPlan, Option<DoneSig>, Option<GpuEqRows>);
                 let built = (|| -> Result<Built, String> {
-                    let z_buf = state.wrap_z(z_packed)?;
+                    let z_buf = match wrap_identity {
+                        Some((ptr, len)) => state.wrap_z_raw(ptr as *const u8, len)?,
+                        None => state.wrap_z(z_packed)?,
+                    };
                     let (mut eq_buf, mut eq_cap) = (state.eq_buf, state.eq_cap);
                     state.ensure(&mut eq_buf, &mut eq_cap, n_outer * 16)?;
                     state.eq_buf = eq_buf;
@@ -23190,6 +23251,7 @@ kernel void zc_eq_rows(
                 submitted,
                 arm,
                 sig,
+                sample_retune: claim_cap.is_none(),
             },
             eq_rows,
         ))
@@ -31709,7 +31771,7 @@ pub(crate) use imp::zc_fold_prewarm;
 /// `ENV_NO_COMMIT_TAIL_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix};
+pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix, stage_zerocheck_c_fold_prefix_ready};
 
 /// Round-one C fold tune fix: warm-up input hooks (see
 /// `ENV_NO_ZC_FOLD_TUNE_FIX`).

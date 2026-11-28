@@ -208,6 +208,18 @@ pub(crate) fn stripe_fold_useful(stripe: &[u8], useful_bits: usize) -> (usize, O
     }
 }
 
+/// Prefix-ready counterpart: identifies a registered root stripe without
+/// constructing a slice over a concurrently written suffix.
+pub(crate) fn stripe_fold_useful_identity(
+    ptr: usize, len: usize, useful_bits: usize,
+) -> (usize, Option<RootStripe>) {
+    let guard = ROOT_STRIPE.lock().unwrap_or_else(|e| e.into_inner());
+    match *guard {
+        Some((p, l, roots)) if (p, l) == (ptr, len) => (roots.n_roots, Some(roots)),
+        _ => (useful_bits, None),
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub use kernels::partial_fold_packed_z_x86_tiled_padded;
 #[cfg(target_arch = "aarch64")]

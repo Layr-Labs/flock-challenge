@@ -4742,6 +4742,24 @@ pub(crate) fn stage_c_prelude_for_tail_fill(
     }
 }
 
+/// As above, but `c_prefix` is the only initialized readable part of the
+/// stripe. `full_ptr/full_len` are an adoption identity, not a Rust slice.
+pub(crate) fn stage_c_prelude_for_tail_fill_prefix(
+    c_prefix: &[u8], full_ptr: usize, full_len: usize, m: usize, k_log: usize,
+    useful_bits: usize, r: &[F128],
+) -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if !ranked_c_fold_shape(m, k_log) { return false; }
+        let (useful_bits, _) = crate::lincheck::stripe_fold_useful_identity(
+            full_ptr, full_len, useful_bits);
+        crate::gpu_commit::stage_zerocheck_c_fold_prefix_ready(
+            c_prefix, full_ptr, full_len, m, k_log, useful_bits, r)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    { let _ = (c_prefix, full_ptr, full_len, m, k_log, useful_bits, r); false }
+}
+
 /// The one production shape the GPU C-fold arm is tuned and gated for
 /// (`m = 32`, `k_log = 14`). Everything else takes the exact CPU path.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

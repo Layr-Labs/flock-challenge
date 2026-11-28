@@ -517,6 +517,37 @@ pub fn stage_commit_tail_fill<C: Challenger>(
     }
 }
 
+/// Prefix-ready variant. `prefix_len` bytes beginning at `stripe_ptr` are
+/// initialized and immutable; the allocation is `stripe_len` bytes and stays
+/// live through adoption.  It deliberately never constructs a slice over the
+/// concurrently-produced suffix.
+pub unsafe fn stage_commit_tail_fill_prefix<C: Challenger>(
+    forked: C, r1cs: &crate::r1cs::BlockR1cs, commitment: &crate::pcs::Commitment,
+    stripe_ptr: usize, prefix_len: usize, stripe_len: usize, padding: &PaddingSpec,
+) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if prefix_len == 0 || prefix_len > stripe_len { return; }
+        let prefix = unsafe { std::slice::from_raw_parts(stripe_ptr as *const u8, prefix_len) };
+        let mut forked = forked;
+        let m = r1cs.m;
+        if m < K_SKIP + 7 { return; }
+        crate::proof::bind_statement(&mut forked, r1cs, commitment);
+        forked.observe_label(b"flock-zerocheck-v0");
+        let r_skip = forked.sample_f128_vec(K_SKIP);
+        let r_outer = forked.sample_f128_vec(m - K_SKIP - 7);
+        let mut r = vec![F128::ZERO; m];
+        r[..K_SKIP].copy_from_slice(&r_skip);
+        for (i, val) in small_challenges_ghash().iter().enumerate() { r[K_SKIP + i] = *val; }
+        for (i, val) in medium_challenges_ghash().iter().enumerate() { r[K_SKIP + 3 + i] = *val; }
+        r[K_SKIP + 7..].copy_from_slice(&r_outer);
+        let _ = univariate_skip_optimized::stage_c_prelude_for_tail_fill_prefix(
+            prefix, stripe_ptr, stripe_len, m, padding.k_log, padding.useful_bits_per_block, &r);
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    { let _ = (forked, r1cs, commitment, stripe_ptr, prefix_len, stripe_len, padding); }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_packed_padded_inner<C: Challenger>(
     a_packed: &[u8],

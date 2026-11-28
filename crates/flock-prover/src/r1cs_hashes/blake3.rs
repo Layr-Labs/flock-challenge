@@ -189,13 +189,17 @@ pub const G_MSG_IDX: [[usize; 2]; N_G_PER_ROUND] = [
 /// No packed-buffer scan is added to the production path.
 pub(crate) struct Blake3IdentityPrefixWitness {
     buffers: [(usize, usize); 3],
+    fixed_inputs: bool,
 }
 
 impl Blake3IdentityPrefixWitness {
-    fn from_row_major_generator(z: &[F128], a: &[F128], b: &[F128]) -> Self {
+    fn from_row_major_generator(z: &[F128], a: &[F128], b: &[F128], blocks: &[Compression]) -> Self {
         assert_eq!(a.len(), z.len());
         assert_eq!(b.len(), z.len());
-        Self { buffers: Self::identities(z, a, b) }
+        let fixed_inputs = blocks.iter().all(|block| {
+            block.3 == FIXED_BLOCK_LEN && block.4 == FIXED_FLAGS
+        });
+        Self { buffers: Self::identities(z, a, b), fixed_inputs }
     }
 
     fn identities(z: &[F128], a: &[F128], b: &[F128]) -> [(usize, usize); 3] {
@@ -205,6 +209,8 @@ impl Blake3IdentityPrefixWitness {
     pub(crate) fn matches(&self, z: &[F128], a: &[F128], b: &[F128]) -> bool {
         self.buffers == Self::identities(z, a, b)
     }
+
+    pub(crate) fn fixed_inputs(&self) -> bool { self.fixed_inputs }
 }
 
 /// Deferred A/B rows of a ranked streamed witness.
@@ -5844,7 +5850,7 @@ impl Blake3Setup {
                 flock_core::cpu_keepalive::pool_spin_witness_done();
                 let identity_prefix_witness = Some(
                     Blake3IdentityPrefixWitness::from_row_major_generator(
-                        &z_packed, &a_packed_f128, &b_packed_f128,
+                        &z_packed, &a_packed_f128, &b_packed_f128, blocks,
                     ),
                 );
                 if phase_timing {
@@ -5911,7 +5917,7 @@ impl Blake3Setup {
                 self.generate_witness_ab_with_rate2_codeword(blocks);
             let identity_prefix_witness = Some(
                 Blake3IdentityPrefixWitness::from_row_major_generator(
-                    &z_packed, &a_packed_f128, &b_packed_f128,
+                    &z_packed, &a_packed_f128, &b_packed_f128, blocks,
                 ),
             );
             if phase_timing {
@@ -5943,7 +5949,7 @@ impl Blake3Setup {
         let identity_prefix_witness =
             (self.r1cs.layout == flock_core::r1cs::WitnessLayout::RowMajor).then(|| {
                 Blake3IdentityPrefixWitness::from_row_major_generator(
-                    &z_packed, &a_packed_f128, &b_packed_f128,
+                &z_packed, &a_packed_f128, &b_packed_f128, blocks,
                 )
             });
         let lc_circuit = self.lincheck_circuit();
@@ -6343,6 +6349,16 @@ pub fn generate_witness_batch_major(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_receipt_certifies_only_ranked_fixed_inputs() {
+        let (z, a, b) = (vec![F128::ZERO; 2], vec![F128::ZERO; 2], vec![F128::ZERO; 2]);
+        let good: Vec<Compression> = vec![([0; 8], [0; 16], 0, FIXED_BLOCK_LEN, FIXED_FLAGS)];
+        let receipt = Blake3IdentityPrefixWitness::from_row_major_generator(&z, &a, &b, &good);
+        assert!(receipt.fixed_inputs() && receipt.matches(&z, &a, &b));
+        let bad: Vec<Compression> = vec![([0; 8], [0; 16], 0, FIXED_BLOCK_LEN - 1, FIXED_FLAGS)];
+        assert!(!Blake3IdentityPrefixWitness::from_row_major_generator(&z, &a, &b, &bad).fixed_inputs());
+    }
 
     /// SplitMix64.
     struct Rng(u64);
