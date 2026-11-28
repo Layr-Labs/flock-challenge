@@ -44,6 +44,20 @@ static LINCHECK_ACC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static LINCHECK_EQ_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static LINCHECK_Z_VEC_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
 static SPARSE_NTT_DATA_SCRATCH: Mutex<Option<Vec<F128>>> = Mutex::new(None);
+static FOLD8_SCRATCH: Mutex<Vec<Vec<F128>>> = Mutex::new(Vec::new());
+pub fn take_fold8_f128(len: usize) -> Vec<F128> {
+    if let Ok(mut pool) = FOLD8_SCRATCH.lock() && let Some(i) = pool.iter().position(|v| v.capacity() >= len) {
+        let mut v = pool.swap_remove(i);
+        unsafe { v.set_len(len) };
+        return v;
+    }
+    crate::alloc_uninit_vec(len)
+}
+pub fn give_fold8_f128(mut v: Vec<F128>) {
+    if (8192..=16384).contains(&v.capacity()) && let Ok(mut pool) = FOLD8_SCRATCH.lock() && pool.len() < 8 {
+        v.clear(); pool.push(v);
+    }
+}
 
 /// Take an uninitialized `F128` vector of length `len` for `transpose_forward_ntt_sparse_impl`.
 pub fn take_sparse_ntt_data(len: usize) -> Vec<F128> {
