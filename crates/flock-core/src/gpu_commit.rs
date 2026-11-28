@@ -22662,8 +22662,9 @@ kernel void zc_eq_rows(
     /// job in the fold state (guard released) instead of returning it — the
     /// staging thread is a rayon pool worker inside the commit join, not the
     /// thread that runs zerocheck. Returns whether a prefix was parked.
-    pub(crate) fn stage_zerocheck_c_fold_prefix(
+    fn stage_zerocheck_c_fold_prefix_inner(
         z_packed: &[u8],
+        identity: (usize, usize),
         m: usize,
         k_log: usize,
         useful_bits: usize,
@@ -22749,8 +22750,8 @@ kernel void zc_eq_rows(
                     n_claims,
                     submitted,
                     r: r.to_vec(),
-                    z_ptr: z_packed.as_ptr() as usize,
-                    z_len: z_packed.len(),
+                    z_ptr: identity.0,
+                    z_len: identity.1,
                     eq_len,
                     eq_owned,
                     eq_gpu,
@@ -22770,6 +22771,37 @@ kernel void zc_eq_rows(
             }
         }
         // `guard` drops here: the lock is released with the prefix parked.
+    }
+
+    pub(crate) fn stage_zerocheck_c_fold_prefix(
+        z_packed: &[u8], m: usize, k_log: usize, useful_bits: usize, r: &[F128],
+    ) -> bool {
+        stage_zerocheck_c_fold_prefix_inner(
+            z_packed, (z_packed.as_ptr() as usize, z_packed.len()), m, k_log, useful_bits, r)
+    }
+
+    /// Submit only when this initialized prefix covers every stripe the
+    /// current tuned GPU share will read. The backing allocation identity is
+    /// retained for full-stripe adoption, while Metal wraps only `prefix`.
+    pub(crate) fn stage_zerocheck_c_fold_prefix_ready(
+        prefix: &[u8], full_ptr: usize, full_len: usize, m: usize, k_log: usize,
+        useful_bits: usize, r: &[F128],
+    ) -> bool {
+        // The untimed warm-up must use the incumbent full-ready route to
+        // calibrate its split; never let a prefix race choose its startup
+        // heuristic.
+        if FoldArm::Zc.tuned().load(std::sync::atomic::Ordering::Acquire) == usize::MAX {
+            return false;
+        }
+        let k = 1usize << k_log;
+        if prefix.as_ptr() as usize != full_ptr || prefix.len() > full_len || prefix.len() % k != 0 {
+            return false;
+        }
+        let claims = crate::lincheck::oblock_claim_count(m, k_log);
+        let claim_lo = FoldArm::Zc.claims_for(claims);
+        let required = crate::lincheck::oblock_claim_stripe_base(claim_lo);
+        if claim_lo == 0 || required > prefix.len() / k { return false; }
+        stage_zerocheck_c_fold_prefix_inner(prefix, (full_ptr, full_len), m, k_log, useful_bits, r)
     }
 
     /// Commit-tail fill, adoption half: if a parked prefix matches this
@@ -31709,7 +31741,7 @@ pub(crate) use imp::zc_fold_prewarm;
 /// `ENV_NO_COMMIT_TAIL_FILL`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix};
+pub(crate) use imp::{adopt_staged_zc_fold, stage_zerocheck_c_fold_prefix, stage_zerocheck_c_fold_prefix_ready};
 
 /// Round-one C fold tune fix: warm-up input hooks (see
 /// `ENV_NO_ZC_FOLD_TUNE_FIX`).

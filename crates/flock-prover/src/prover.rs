@@ -1141,6 +1141,9 @@ struct AbStripeEmitter<'a> {
     /// byte lets producers publish with a store rather than an RMW shared
     /// by 64 groups. `finish` reads these marks after AB production completes.
     emitted: Box<[std::sync::atomic::AtomicU8]>,
+    /// The contiguous Release-published prefix.  A consumer must still round
+    /// this down to its own work-unit geometry.
+    published: std::sync::atomic::AtomicUsize,
     epoch: u64,
     /// Words of a block the rows and the fixed-input checks read.
     read_words: usize,
@@ -1189,6 +1192,7 @@ impl<'a> AbStripeEmitter<'a> {
             emitted: (0..n_groups)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
+            published: std::sync::atomic::AtomicUsize::new(0),
             epoch: AB_STRIPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             read_words: rows
                 .iter()
@@ -1201,6 +1205,17 @@ impl<'a> AbStripeEmitter<'a> {
             segments,
             checks: crate::r1cs_hashes::blake3::FIXED_INPUT_CHECKS.iter().copied().collect(),
         }
+    }
+
+    fn ready_prefix_groups(&self) -> usize {
+        let mut next = self.published.load(std::sync::atomic::Ordering::Acquire);
+        while next < self.n_groups
+            && self.emitted[next].load(std::sync::atomic::Ordering::Acquire) != 0
+        {
+            next += 1;
+        }
+        self.published.store(next, std::sync::atomic::Ordering::Release);
+        next
     }
 
     /// Called right after the producer wrote quad `unit`'s complete a and b
@@ -1261,7 +1276,7 @@ impl<'a> AbStripeEmitter<'a> {
             if self.fixed_inputs && !fixed_inputs_hold(&st.words, 0, group_f128, AB_STRIPE_WORDS) {
                 self.mismatch.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
+            self.emitted[group].store(1, std::sync::atomic::Ordering::Release);
         });
     }
 
@@ -1329,7 +1344,7 @@ impl<'a> AbStripeEmitter<'a> {
                 }
             }
         }
-        self.emitted[group].store(1, std::sync::atomic::Ordering::Relaxed);
+        self.emitted[group].store(1, std::sync::atomic::Ordering::Release);
     }
 
     /// After every unit was produced (the AB arm has joined its workers):
@@ -2850,6 +2865,8 @@ fn make_commit_tail_fill_hook<'a, Ch: Challenger>(
     stripe_ready: &'a std::sync::atomic::AtomicBool,
     stripe_ptr: usize,
     stripe_len: usize,
+    prefix: Option<&'a AbStripeEmitter<'a>>,
+    fixed_inputs_certified: bool,
 ) -> Option<CommitTailFillHook<'a>>
 where
     Ch: 'a,
@@ -2861,6 +2878,25 @@ where
     let forked = challenger.fork()?;
     Some(Box::new(move |commitment: &Commitment| {
         if !stripe_ready.load(std::sync::atomic::Ordering::Acquire) {
+            if fixed_inputs_certified {
+                if let Some(prefix) = prefix {
+                    if prefix.mismatch.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    let prefix_len = prefix.ready_prefix_groups() * prefix.group_bytes;
+                    if prefix_len != 0 {
+                        // Do not form a slice over bytes an AB worker may still
+                        // write.  The lower layer receives the logical full
+                        // identity separately for later adoption.
+                        unsafe {
+                            flock_core::zerocheck::stage_commit_tail_fill_prefix(
+                                forked, r1cs, commitment, stripe_ptr, prefix_len, stripe_len, padding,
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
             // The stripe fill lost the race to the graph; staging would
             // read torn bytes. Skip — the incumbent zerocheck-entry
             // submit runs.
@@ -3157,6 +3193,9 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
     challenger: &mut Ch,
 ) -> (ProveCore, bool, Option<Vec<F128>>) {
     let padding = r1cs.padding_spec();
+    let fixed_inputs_certified = identity_prefix_witness.as_ref().is_some_and(|w| {
+        w.fixed_inputs() && w.matches(&z_packed, &a_packed_f128, &b_packed_f128)
+    });
     let identity_prefix_contract = ranked_identity_prefix_omission_contract(
         r1cs, identity_prefix_witness.as_ref(), &z_packed, &a_packed_f128, &b_packed_f128,
     );
@@ -3219,6 +3258,8 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                 &stripe_ready,
                 stripe.as_ptr() as usize,
                 stripe.len(),
+                None,
+                false,
             );
             (run_commit(hook, None, ab_producer, None), stripe)
         }
@@ -3274,14 +3315,6 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
             let stripe_ready = std::sync::atomic::AtomicBool::new(false);
             let stripe_ptr = stripe.as_ptr() as usize;
             let stripe_len = stripe.len();
-            let tail_fill_hook = make_commit_tail_fill_hook(
-                &*challenger,
-                r1cs,
-                &padding,
-                &stripe_ready,
-                stripe_ptr,
-                stripe_len,
-            );
             // One shared chunk queue for the stripe. The E-workers own it
             // (helper-only broadcast, as before); main-pool workers that
             // finish the AB precompute queue help drain what is left, so a
@@ -3336,6 +3369,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     fixed_root_rows.is_some(),
                     &input_mismatch,
                 );
+                let tail_fill_hook = make_commit_tail_fill_hook(
+                    &*challenger, r1cs, &padding, &stripe_ready, stripe_ptr, stripe_len,
+                    Some(&emitter), fixed_inputs_certified,
+                );
                 // `primed`: the scratch pair has been filled before by this
                 // producer, which may then leave its per-block constants in
                 // place.  Either way the pair holds the unit's complete a and
@@ -3349,6 +3386,7 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     let missing = emitter.finish(&z_packed, &stripe_job_fn);
                     let mismatch = input_mismatch.load(std::sync::atomic::Ordering::Acquire);
                     if mismatch {
+                        assert!(!fixed_inputs_certified, "certified fixed inputs cannot fall back");
                         if let Some((n_jobs, job)) = &fallback_job {
                             use rayon::prelude::*;
                             (0..*n_jobs).into_par_iter().for_each(|j| job(j));
@@ -3378,6 +3416,10 @@ fn prove_fast_core_with_commit_codeword<Ch: Challenger>(
                     Some(&finish),
                 )
             } else {
+                let tail_fill_hook = make_commit_tail_fill_hook(
+                    &*challenger, r1cs, &padding, &stripe_ready, stripe_ptr, stripe_len,
+                    None, false,
+                );
                 std::thread::scope(|scope| {
                     let stripe_ready = &stripe_ready;
                     let stripe_queue = &stripe_queue;
