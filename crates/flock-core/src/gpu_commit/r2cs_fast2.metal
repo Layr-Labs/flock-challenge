@@ -22,6 +22,9 @@
 // whose pairs are all padded (the lean form's skip) as a b == 1 step with no
 // live pair.
 
+// Kept in lockstep with the lean fallback: the host always dispatches 256
+// threads, so specialize register allocation to that eight-SIMD-group shape.
+[[max_total_threads_per_threadgroup(256)]]
 kernel void zc_r2_products_horner_cs(
     device const uint4* a_in  [[buffer(0)]],
     device const uint4* b_in  [[buffer(1)]],

@@ -155,6 +155,10 @@ static inline U256k zc_r2_cs_clmul128p(uint4 a, uint4 b) {
     return r;
 }
 
+// The host always dispatches this entry with exactly 256 threads.  Telling
+// the Metal compiler that bound lets it allocate registers for the actual
+// eight-SIMD-group shape rather than the device maximum.
+[[max_total_threads_per_threadgroup(256)]]
 kernel void zc_r2_products_horner_cs(
     device const uint4* a_in  [[buffer(0)]],
     device const uint4* b_in  [[buffer(1)]],
